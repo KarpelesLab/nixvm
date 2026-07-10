@@ -13,6 +13,7 @@
 //! Phase 3 (files/stat/tty), Phase 6 (clone/futex/signals), Phase 8 (sockets).
 
 use std::collections::BTreeMap;
+use std::io::Write;
 
 use crate::abi::Arch;
 use crate::abi::arch::{self, Sysno};
@@ -28,7 +29,6 @@ pub use fd::{Fd, FdTable};
 ///
 /// (Multi-process / threads arrive in Phase 6; for now this models a single
 /// address space and fd table.)
-#[derive(Debug)]
 pub struct Kernel {
     arch: Arch,
     #[allow(dead_code)] // wired into file syscalls in Phase 3/4
@@ -41,11 +41,25 @@ pub struct Kernel {
     /// Bump pointer for anonymous `mmap`.
     #[allow(dead_code)]
     mmap_top: u64,
+    /// Sinks for guest fd 1 and 2. Configurable so callers (and tests) can
+    /// capture or redirect guest output.
+    stdout: Box<dyn Write + Send>,
+    stderr: Box<dyn Write + Send>,
     /// Set by `exit`/`exit_group`; ends the run loop.
     exit_code: Option<i32>,
     /// Raw guest syscall numbers we don't handle yet, with hit counts — an
     /// honest "what's missing" ledger surfaced at shutdown.
     unsupported: BTreeMap<u64, u64>,
+}
+
+impl std::fmt::Debug for Kernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Kernel")
+            .field("arch", &self.arch)
+            .field("exit_code", &self.exit_code)
+            .field("unsupported", &self.unsupported)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Kernel {
@@ -57,15 +71,27 @@ impl Kernel {
             fds: FdTable::with_standard_streams(),
             brk: 0,
             mmap_top: 0,
+            stdout: Box::new(std::io::stdout()),
+            stderr: Box::new(std::io::stderr()),
             exit_code: None,
             unsupported: BTreeMap::new(),
         }
     }
 
+    /// Redirect the sink backing guest fd 1 (`stdout`).
+    pub fn set_stdout(&mut self, w: Box<dyn Write + Send>) {
+        self.stdout = w;
+    }
+
+    /// Redirect the sink backing guest fd 2 (`stderr`).
+    pub fn set_stderr(&mut self, w: Box<dyn Write + Send>) {
+        self.stderr = w;
+    }
+
     /// Drive one vcpu until the guest exits, returning its exit code.
     pub fn run(&mut self, vcpu: &mut dyn Vcpu, mem: &mut GuestMemory) -> Result<i32, VcpuError> {
         loop {
-            match vcpu.run()? {
+            match vcpu.run(mem)? {
                 Exit::Syscall => {
                     let raw = vcpu.syscall_nr();
                     let sys = arch::decode(self.arch, raw);
@@ -99,9 +125,10 @@ impl Kernel {
         raw: u64,
         args: &[u64; 6],
         _vcpu: &mut dyn Vcpu,
-        _mem: &mut GuestMemory,
+        mem: &mut GuestMemory,
     ) -> i64 {
         match sys {
+            Sysno::Write => self.sys_write(args[0], args[1], args[2], mem),
             Sysno::ExitGroup | Sysno::Exit => {
                 self.exit_code = Some(args[0] as i32);
                 0
@@ -117,6 +144,23 @@ impl Kernel {
                 *self.unsupported.entry(raw).or_default() += 1;
                 err(Errno::ENOSYS)
             }
+        }
+    }
+
+    /// `write(fd, buf, count)` — currently only the stdio sinks (fd 1/2). File
+    /// and pipe/socket descriptors arrive in Phases 4/7/8.
+    fn sys_write(&mut self, fd: u64, buf: u64, count: u64, mem: &GuestMemory) -> i64 {
+        let Ok(data) = mem.read_vec(buf, count as usize) else {
+            return err(Errno::EFAULT);
+        };
+        let sink: &mut dyn Write = match fd {
+            1 => &mut *self.stdout,
+            2 => &mut *self.stderr,
+            _ => return err(Errno::EBADF),
+        };
+        match sink.write_all(&data) {
+            Ok(()) => count as i64,
+            Err(_) => err(Errno::EIO),
         }
     }
 

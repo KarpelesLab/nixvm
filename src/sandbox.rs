@@ -144,7 +144,7 @@ impl Sandbox {
 
         // 4. Pick a backend and (Phase 1) create the first vcpu.
         let backend = vcpu::select(self.config.arch)?;
-        let mut vcpu = backend.new_vcpu(&mem, /*entry=*/ 0, /*stack=*/ 0)?;
+        let mut vcpu = backend.new_vcpu(/*entry=*/ 0, /*stack=*/ 0)?;
 
         // 5. Run/serve loop.
         let mut kernel = Kernel::new(self.config.arch, mounts);

@@ -77,7 +77,11 @@ impl From<MemError> for VcpuError {
 /// ABI* so the kernel never needs to know which backend or arch is underneath.
 pub trait Vcpu: Send {
     /// Run guest code until the next [`Exit`].
-    fn run(&mut self) -> Result<Exit, VcpuError>;
+    ///
+    /// `mem` is the guest address space. The software interpreter reads and
+    /// writes it directly as it executes; hardware backends map it into the
+    /// hypervisor (once) and the guest writes through to the same buffer.
+    fn run(&mut self, mem: &mut GuestMemory) -> Result<Exit, VcpuError>;
 
     /// The syscall number the guest requested (arm64 `x8` / x86-64 `rax`).
     fn syscall_nr(&self) -> u64;
@@ -108,14 +112,10 @@ pub trait Backend {
     fn name(&self) -> &'static str;
     fn guest_arch(&self) -> Arch;
 
-    /// Create a vcpu with its PC and SP set for a fresh thread. `mem` is the
-    /// shared guest address space; the backend maps it into the hypervisor.
-    fn new_vcpu(
-        &self,
-        mem: &GuestMemory,
-        entry: u64,
-        stack: u64,
-    ) -> Result<Box<dyn Vcpu>, VcpuError>;
+    /// Create a vcpu with its PC and SP set for a fresh thread. The guest
+    /// address space is provided to [`Vcpu::run`], not here, so one backend can
+    /// spawn several vcpus over the same memory.
+    fn new_vcpu(&self, entry: u64, stack: u64) -> Result<Box<dyn Vcpu>, VcpuError>;
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

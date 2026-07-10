@@ -10,7 +10,7 @@
 
 use crate::abi::Arch;
 
-use super::{Backend, GuestMemory, Vcpu, VcpuError};
+use super::{Backend, Vcpu, VcpuError};
 
 #[derive(Debug)]
 pub struct HvfBackend {
@@ -33,12 +33,7 @@ impl Backend for HvfBackend {
         Arch::Aarch64
     }
 
-    fn new_vcpu(
-        &self,
-        _mem: &GuestMemory,
-        _entry: u64,
-        _stack: u64,
-    ) -> Result<Box<dyn Vcpu>, VcpuError> {
+    fn new_vcpu(&self, _entry: u64, _stack: u64) -> Result<Box<dyn Vcpu>, VcpuError> {
         Err(VcpuError::Backend(
             "hvf vcpu not implemented yet (ROADMAP Phase 1)".into(),
         ))
