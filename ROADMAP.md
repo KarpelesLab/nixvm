@@ -282,7 +282,33 @@ Run continuously alongside the phases:
   `Kernel::unsupported()` ledger so "what's missing to run program X" is always
   answerable.
 - **CI:** build + clippy + test on macOS/arm64 and Linux/x86-64; MSRV (1.89)
-  job; the interpreter backend makes syscall tests host-independent.
+  job; the interpreter backend makes syscall tests host-independent. GitHub
+  Actions also builds the wasm demo (below) and deploys it to GitHub Pages.
+
+### Browser demo (wasm)
+
+A zero-install *try-before-you-install* page: a real Alpine shell in a browser
+tab, running entirely client-side on the software interpreter — nothing touches
+the visitor's machine, which is the whole value proposition demonstrated by
+construction. It doubles as (a) a **host-independent correctness oracle** — the
+same syscall engine as the native build, so a browser test corpus validates the
+kernel on any machine with no toolchain — and (b) a **compile-time check** that
+the portable path leaked no host dependencies (if it builds for wasm, the
+`cfg`/feature discipline held).
+
+- **Target:** `wasm32-unknown-unknown`, `interp` backend only (no HVF/KVM in a
+  browser); in-memory / overlay / tmpfs fs backends; the Alpine squashfs
+  `fetch()`ed into memory. `passthrough`, `kvm`, `hvf` and host networking are
+  all `cfg`-ed out — wasm is the enforcement mechanism for that boundary.
+- **Glue:** a wasm-bindgen shim for stdio (xterm.js), time, and
+  `crypto.getRandomValues`; networking disabled by default (optional WebSocket
+  proxy later). Cooperative single-thread scheduling by default; Web Workers +
+  `SharedArrayBuffer` (needs COOP/COEP cross-origin isolation) optional for
+  parallelism.
+- **Delivery:** built and deployed by **GitHub Actions → GitHub Pages** on push
+  to `master`; the same wasm artifact backs the in-browser test corpus in CI.
+- **Depends on:** a minimal interpreter + the Phase 4 filesystem — *not* on HVF.
+  See the sequencing question in §4.
 
 ---
 
@@ -296,6 +322,7 @@ Run continuously alongside the phases:
 | **Networking fidelity** — userspace TCP/IP vs host passthrough.                  | `smoltcp` NAT by default for isolation; opt-in host passthrough under policy. |
 | **`/work` passthrough safety** — symlink/`..` escapes, TOCTOU.                   | Resolve every path inside the kernel against the mount root; `openat2(RESOLVE_BENEATH)`-style containment on the host side. |
 | **Performance of the trap-per-syscall model.**                                  | Benchmark continuously from Phase 1; fast-path hot syscalls; the point of comparison is Docker/gVisor, not a bare VM. |
+| **Demo-vs-native sequencing** — the interpreter sits at Phase 10, but the browser demo needs only it + the Phase 4 fs (not HVF). | If try-before-install is an adoption priority, pull a *minimal* interpreter (arm64 integer ISA) forward as its own early public milestone, decoupled from the full Phase 10 backend. Decide before Phase 4 lands. |
 
 ---
 
