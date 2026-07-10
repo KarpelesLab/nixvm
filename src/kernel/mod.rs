@@ -19,6 +19,7 @@ use crate::abi::Arch;
 use crate::abi::arch::{self, Sysno};
 use crate::abi::errno::Errno;
 use crate::fs::MountTable;
+use crate::vcpu::mem::{PAGE_SIZE, Prot};
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 
 mod fd;
@@ -35,12 +36,13 @@ pub struct Kernel {
     mounts: MountTable,
     #[allow(dead_code)]
     fds: FdTable,
-    /// Program break for `brk`.
-    #[allow(dead_code)]
+    /// Current program break (top of the heap).
     brk: u64,
-    /// Bump pointer for anonymous `mmap`.
-    #[allow(dead_code)]
-    mmap_top: u64,
+    /// Lowest heap address (the program break at start-up); `brk` never drops
+    /// below this.
+    heap_start: u64,
+    /// Upper bound the heap may not grow past (start of the mmap/stack area).
+    heap_limit: u64,
     /// Sinks for guest fd 1 and 2. Configurable so callers (and tests) can
     /// capture or redirect guest output.
     stdout: Box<dyn Write + Send>,
@@ -70,7 +72,8 @@ impl Kernel {
             mounts,
             fds: FdTable::with_standard_streams(),
             brk: 0,
-            mmap_top: 0,
+            heap_start: 0,
+            heap_limit: 0,
             stdout: Box::new(std::io::stdout()),
             stderr: Box::new(std::io::stderr()),
             exit_code: None,
@@ -86,6 +89,15 @@ impl Kernel {
     /// Redirect the sink backing guest fd 2 (`stderr`).
     pub fn set_stderr(&mut self, w: Box<dyn Write + Send>) {
         self.stderr = w;
+    }
+
+    /// Set the heap window: `start` is the initial program break (page-aligned,
+    /// just past the loaded image) and `limit` is the highest address the heap
+    /// may reach (the bottom of the mmap/stack area).
+    pub fn set_heap(&mut self, start: u64, limit: u64) {
+        self.heap_start = start;
+        self.brk = start;
+        self.heap_limit = limit;
     }
 
     /// Drive one vcpu until the guest exits, returning its exit code.
@@ -129,6 +141,7 @@ impl Kernel {
     ) -> i64 {
         match sys {
             Sysno::Write => self.sys_write(args[0], args[1], args[2], mem),
+            Sysno::Brk => self.sys_brk(args[0], mem),
             Sysno::ExitGroup | Sysno::Exit => {
                 self.exit_code = Some(args[0] as i32);
                 0
@@ -162,6 +175,32 @@ impl Kernel {
             Ok(()) => count as i64,
             Err(_) => err(Errno::EIO),
         }
+    }
+
+    /// `brk(addr)` — move the program break. Returns the new break on success,
+    /// or the unchanged break on failure (the Linux convention; libc computes
+    /// success by comparing the result to what it asked for). `brk(0)` queries.
+    fn sys_brk(&mut self, addr: u64, mem: &mut GuestMemory) -> i64 {
+        if addr == 0 || addr < self.heap_start {
+            return self.brk as i64;
+        }
+        if addr > self.brk {
+            // Grow: map the pages newly covered by [old_brk, addr).
+            let from = self.brk - self.brk % PAGE_SIZE;
+            let to = addr.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+            if to > self.heap_limit || mem.map(from, to - from, Prot::rw()).is_err() {
+                return self.brk as i64; // failure: break unchanged
+            }
+        } else if addr < self.brk {
+            // Shrink: release whole pages above the new break.
+            let from = addr.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+            let to = self.brk.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+            if to > from {
+                let _ = mem.unmap(from, to - from);
+            }
+        }
+        self.brk = addr;
+        self.brk as i64
     }
 
     /// Syscalls the guest attempted that nixvm does not implement yet.
