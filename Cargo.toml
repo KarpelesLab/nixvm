@@ -47,6 +47,9 @@ pedantic = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
+# Docs are dense with spec acronyms (PT_LOAD, ELF, RWX, EL0, SVC, TPIDR …);
+# don't force backticks around every one.
+doc_markdown = "allow"
 # ABI field names mirror the Linux/kernel spec deliberately (st_mode, e_phoff …).
 similar_names = "allow"
 # Syscall/ABI code intentionally does register-width casts (guest u64 registers
