@@ -11,7 +11,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/magicaltux/nixvm"
+repository = "https://github.com/KarpelesLab/nixvm"
 authors = ["Mark Karpeles <magicaltux@gmail.com>"]
 description = "A portable VM-style sandbox that runs a real Linux userland by emulating Linux syscalls directly (no guest kernel, no device emulation)."
 
