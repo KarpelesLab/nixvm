@@ -353,6 +353,50 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- load/store pair: LDP/STP (signed offset / pre / post index) ----
+        if (instr >> 27) & 0x7 == 0b101 && (instr >> 26) & 1 == 0 {
+            let opc = (instr >> 30) & 3;
+            let is64 = match opc {
+                0b00 => false,
+                0b10 => true,
+                _ => return Step::Illegal, // SIMD/other pairs: Phase 10
+            };
+            let class = (instr >> 23) & 3; // 1 = post, 2 = signed offset, 3 = pre
+            let is_load = (instr >> 22) & 1 == 1;
+            let imm7 = sign_extend(u64::from((instr >> 15) & 0x7f), 7);
+            let rt2 = reg_field(instr, 10);
+            let rn = reg_field(instr, 5);
+            let rt = reg_field(instr, 0);
+            let nbytes = if is64 { 8usize } else { 4 };
+            let offset = imm7 * nbytes as i64;
+            let base = self.read_sp(rn);
+            let addr = if class == 1 {
+                base
+            } else {
+                (base as i64).wrapping_add(offset) as u64
+            };
+            for (i, r) in [rt, rt2].into_iter().enumerate() {
+                let a = addr.wrapping_add((i * nbytes) as u64);
+                if is_load {
+                    let mut buf = [0u8; 8];
+                    if mem.read(a, &mut buf[..nbytes]).is_err() {
+                        return Step::Fault { addr: a, write: false };
+                    }
+                    self.write_x(r, u64::from_le_bytes(buf));
+                } else {
+                    let val = self.read_x(r).to_le_bytes();
+                    if mem.write(a, &val[..nbytes]).is_err() {
+                        return Step::Fault { addr: a, write: true };
+                    }
+                }
+            }
+            if class == 1 || class == 3 {
+                // post/pre index write the updated base back.
+                self.write_sp(rn, (base as i64).wrapping_add(offset) as u64);
+            }
+            return Step::Next;
+        }
+
         // ---- load/store register, unsigned immediate offset ----
         if (instr >> 27) & 0x7 == 0b111 && (instr >> 24) & 0x3 == 0b01 && (instr >> 26) & 1 == 0 {
             let size = (instr >> 30) & 3;
@@ -620,6 +664,38 @@ mod tests {
         assert_eq!(c.run(&mut mem).unwrap(), Exit::Syscall);
         assert_eq!(c.x[0], 7, "subroutine set x0");
         assert_eq!(c.x[8], 93);
+    }
+
+    /// STP pre-index pushes a register pair; LDP post-index pops it and
+    /// restores SP — the shape of every function prologue/epilogue.
+    #[test]
+    fn stp_ldp_push_pop_roundtrip() {
+        let base = 0x1_0000u64;
+        let mut mem = GuestMemory::new(base, 8 * PAGE_SIZE);
+        mem.map(base, PAGE_SIZE, Prot::rx()).unwrap();
+        mem.map(base + 4 * PAGE_SIZE, PAGE_SIZE, Prot::rw()).unwrap();
+        let sp = base + 5 * PAGE_SIZE;
+
+        let program: [u32; 7] = [
+            0xD282_4680, // movz x0,#0x1234
+            0xD28A_CF01, // movz x1,#0x5678
+            0xA9BF_07E0, // stp x0,x1,[sp,#-16]!
+            0xD280_0000, // movz x0,#0    (clobber)
+            0xD280_0001, // movz x1,#0
+            0xA8C1_07E0, // ldp x0,x1,[sp],#16
+            0xD400_0001, // svc
+        ];
+        let mut bytes = Vec::new();
+        for w in program {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mem.write_init(base, &bytes).unwrap();
+
+        let mut c = Aarch64Interp::new(base, sp);
+        assert_eq!(c.run(&mut mem).unwrap(), Exit::Syscall);
+        assert_eq!(c.x[0], 0x1234, "x0 restored from stack");
+        assert_eq!(c.x[1], 0x5678, "x1 restored from stack");
+        assert_eq!(c.sp, sp, "sp restored to its original value");
     }
 
     #[test]
