@@ -43,6 +43,10 @@ pub struct Kernel {
     heap_start: u64,
     /// Upper bound the heap may not grow past (start of the mmap/stack area).
     heap_limit: u64,
+    /// Downward-growing cursor for anonymous `mmap` allocations.
+    mmap_cursor: u64,
+    /// Lowest address `mmap` may reach.
+    mmap_floor: u64,
     /// Sinks for guest fd 1 and 2. Configurable so callers (and tests) can
     /// capture or redirect guest output.
     stdout: Box<dyn Write + Send>,
@@ -74,6 +78,8 @@ impl Kernel {
             brk: 0,
             heap_start: 0,
             heap_limit: 0,
+            mmap_cursor: 0,
+            mmap_floor: 0,
             stdout: Box::new(std::io::stdout()),
             stderr: Box::new(std::io::stderr()),
             exit_code: None,
@@ -98,6 +104,13 @@ impl Kernel {
         self.heap_start = start;
         self.brk = start;
         self.heap_limit = limit;
+    }
+
+    /// Set the anonymous-`mmap` arena: allocations grow down from `top` and may
+    /// not drop below `floor`.
+    pub fn set_mmap_area(&mut self, top: u64, floor: u64) {
+        self.mmap_cursor = top;
+        self.mmap_floor = floor;
     }
 
     /// Drive one vcpu until the guest exits, returning its exit code.
@@ -142,6 +155,9 @@ impl Kernel {
         match sys {
             Sysno::Write => self.sys_write(args[0], args[1], args[2], mem),
             Sysno::Brk => self.sys_brk(args[0], mem),
+            Sysno::Mmap => self.sys_mmap(args, mem),
+            Sysno::Munmap => self.sys_munmap(args[0], args[1], mem),
+            Sysno::Mprotect => self.sys_mprotect(args[0], args[1], args[2], mem),
             Sysno::ExitGroup | Sysno::Exit => {
                 self.exit_code = Some(args[0] as i32);
                 0
@@ -201,6 +217,65 @@ impl Kernel {
         }
         self.brk = addr;
         self.brk as i64
+    }
+
+    /// `mmap(addr, len, prot, flags, fd, off)` — anonymous mappings only for
+    /// now (file-backed mappings arrive with dynamic linking, Phase 5).
+    /// Non-fixed anonymous requests are placed in a downward-growing arena.
+    fn sys_mmap(&mut self, a: &[u64; 6], mem: &mut GuestMemory) -> i64 {
+        const MAP_FIXED: u64 = 0x10;
+        const MAP_ANONYMOUS: u64 = 0x20;
+
+        let (addr, len, prot, flags) = (a[0], a[1], a[2], a[3]);
+        if len == 0 {
+            return err(Errno::EINVAL);
+        }
+        if flags & MAP_ANONYMOUS == 0 {
+            return err(Errno::ENOSYS); // file-backed mmap: Phase 5
+        }
+        let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let prot = Prot((prot as u8) & 0x7);
+
+        let base = if flags & MAP_FIXED != 0 && addr != 0 {
+            addr - addr % PAGE_SIZE
+        } else {
+            let Some(new_top) = self.mmap_cursor.checked_sub(len) else {
+                return err(Errno::ENOMEM);
+            };
+            if new_top < self.mmap_floor {
+                return err(Errno::ENOMEM);
+            }
+            self.mmap_cursor = new_top;
+            new_top
+        };
+        if mem.map(base, len, prot).is_err() {
+            return err(Errno::ENOMEM);
+        }
+        base as i64
+    }
+
+    /// `munmap(addr, len)` — release the covered pages.
+    #[allow(clippy::unused_self)] // will reclaim arena space / update accounting later
+    fn sys_munmap(&mut self, addr: u64, len: u64, mem: &mut GuestMemory) -> i64 {
+        if len == 0 {
+            return err(Errno::EINVAL);
+        }
+        let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let _ = mem.unmap(addr - addr % PAGE_SIZE, len);
+        0
+    }
+
+    /// `mprotect(addr, len, prot)` — change protection on mapped pages.
+    #[allow(clippy::unused_self)] // stays a method alongside the other mm syscalls
+    fn sys_mprotect(&mut self, addr: u64, len: u64, prot: u64, mem: &mut GuestMemory) -> i64 {
+        if len == 0 {
+            return 0;
+        }
+        let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        match mem.protect(addr - addr % PAGE_SIZE, len, Prot((prot as u8) & 0x7)) {
+            Ok(()) => 0,
+            Err(_) => err(Errno::ENOMEM),
+        }
     }
 
     /// Syscalls the guest attempted that nixvm does not implement yet.
