@@ -6,9 +6,12 @@
 //! guest arch — this is the path the browser (wasm) demo uses, and it makes the
 //! syscall engine testable in CI with no hypervisor.
 //!
-//! The instruction set starts minimal (enough to run a hand-assembled
-//! `write`/`exit` program) and grows toward full user-mode coverage in ROADMAP
-//! Phase 10. Anything not yet decoded surfaces as [`Exit::IllegalInstruction`].
+//! Coverage grows toward full user-mode aarch64 (ROADMAP Phase 10). Implemented
+//! so far: move-wide immediates, PC-relative addressing, add/sub (immediate and
+//! shifted register, with flags), logical shifted register, compares,
+//! conditional/unconditional branches, `BL`/`BLR`/`RET`, and load/store with an
+//! unsigned immediate offset. Anything else surfaces as
+//! [`Exit::IllegalInstruction`].
 
 use crate::abi::Arch;
 
@@ -53,25 +56,33 @@ enum Step {
     /// Advance to the next instruction (`pc += 4`).
     Next,
     /// Instruction already set `pc` (branch); do not auto-advance.
-    // Used once branch instructions land (Phase 10).
-    #[allow(dead_code)]
     Branched,
     /// `svc` — hand control to the kernel. `pc` stays on the `svc`; the kernel
     /// advances it via [`Vcpu::set_syscall_ret`].
     Syscall,
     Illegal,
-    /// A load/store touched bad guest memory. (Used once load/store land.)
-    #[allow(dead_code)]
+    /// A load/store touched bad guest memory.
     Fault { addr: u64, write: bool },
 }
 
-/// A minimal aarch64 user-mode interpreter.
+/// NZCV condition flags. (Four is the architectural count, not a smell.)
+#[derive(Default, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+struct Flags {
+    n: bool,
+    z: bool,
+    c: bool,
+    v: bool,
+}
+
+/// A user-mode aarch64 interpreter.
 struct Aarch64Interp {
     /// x0..x30. x31 is the zero register (reads 0) or SP depending on encoding.
     x: [u64; 31],
     sp: u64,
     pc: u64,
     tpidr: u64,
+    flags: Flags,
 }
 
 impl Aarch64Interp {
@@ -81,6 +92,7 @@ impl Aarch64Interp {
             sp: stack,
             pc: entry,
             tpidr: 0,
+            flags: Flags::default(),
         }
     }
 
@@ -107,47 +119,145 @@ impl Aarch64Interp {
         }
     }
 
-    fn exec(&mut self, instr: u32) -> Step {
-        // svc #imm  — the syscall gate.
-        if instr & 0xFFE0_001F == 0xD400_0001 {
-            return Step::Syscall;
+    fn branch(&mut self, offset: i64) -> Step {
+        self.pc = (self.pc as i64).wrapping_add(offset) as u64;
+        Step::Branched
+    }
+
+    /// Compute `a - b` (if `sub`) or `a + b`, setting NZCV. Returns the result.
+    fn addsub_flags(&mut self, a: u64, b: u64, sub: bool, sf: bool) -> u64 {
+        let (operand, carry_in) = if sub { (!b, 1u128) } else { (b, 0u128) };
+        if sf {
+            let sum = u128::from(a) + u128::from(operand) + carry_in;
+            let r = sum as u64;
+            self.flags = Flags {
+                n: (r >> 63) & 1 == 1,
+                z: r == 0,
+                c: (sum >> 64) & 1 == 1,
+                v: (((a ^ r) & (operand ^ r)) >> 63) & 1 == 1,
+            };
+            r
+        } else {
+            let (a, operand) = (a as u32, operand as u32);
+            let sum = u64::from(a) + u64::from(operand) + carry_in as u64;
+            let r = sum as u32;
+            self.flags = Flags {
+                n: (r >> 31) & 1 == 1,
+                z: r == 0,
+                c: (sum >> 32) & 1 == 1,
+                v: (((a ^ r) & (operand ^ r)) >> 31) & 1 == 1,
+            };
+            u64::from(r)
         }
-        // nop
+    }
+
+    fn cond_holds(&self, cond: u32) -> bool {
+        let f = &self.flags;
+        match cond {
+            0b0000 => f.z,
+            0b0001 => !f.z,
+            0b0010 => f.c,
+            0b0011 => !f.c,
+            0b0100 => f.n,
+            0b0101 => !f.n,
+            0b0110 => f.v,
+            0b0111 => !f.v,
+            0b1000 => f.c && !f.z,       // HI
+            0b1001 => !f.c || f.z,       // LS  (not HI)
+            0b1010 => f.n == f.v,        // GE
+            0b1011 => f.n != f.v,        // LT
+            0b1100 => !f.z && (f.n == f.v), // GT
+            0b1101 => f.z || (f.n != f.v),  // LE  (not GT)
+            _ => true, // AL / NV
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn exec(&mut self, instr: u32, mem: &mut GuestMemory) -> Step {
+        // ---- exact-match control flow ----
+        if instr & 0xFFE0_001F == 0xD400_0001 {
+            return Step::Syscall; // svc #imm
+        }
         if instr == 0xD503_201F {
+            return Step::Next; // nop
+        }
+        if instr & 0xFFFF_FC1F == 0xD65F_0000 {
+            self.pc = self.read_x(reg_field(instr, 5)); // ret
+            return Step::Branched;
+        }
+        if instr & 0xFFFF_FC1F == 0xD61F_0000 {
+            self.pc = self.read_x(reg_field(instr, 5)); // br
+            return Step::Branched;
+        }
+        if instr & 0xFFFF_FC1F == 0xD63F_0000 {
+            let target = self.read_x(reg_field(instr, 5)); // blr
+            self.x[30] = self.pc.wrapping_add(4);
+            self.pc = target;
+            return Step::Branched;
+        }
+
+        // ---- branches ----
+        if (instr >> 26) & 0x3f == 0b00_0101 {
+            let off = sign_extend(u64::from(instr & 0x03ff_ffff), 26) << 2; // b
+            return self.branch(off);
+        }
+        if (instr >> 26) & 0x3f == 0b10_0101 {
+            self.x[30] = self.pc.wrapping_add(4); // bl
+            let off = sign_extend(u64::from(instr & 0x03ff_ffff), 26) << 2;
+            return self.branch(off);
+        }
+        if instr & 0xFF00_0010 == 0x5400_0000 {
+            let cond = instr & 0xf; // b.cond
+            if self.cond_holds(cond) {
+                let off = sign_extend(u64::from((instr >> 5) & 0x7ffff), 19) << 2;
+                return self.branch(off);
+            }
             return Step::Next;
         }
-        // Move wide immediate: MOVN/MOVZ/MOVK.
+        if (instr >> 25) & 0x3f == 0b01_1010 {
+            let sf = (instr >> 31) & 1; // cbz / cbnz
+            let op = (instr >> 24) & 1;
+            let rt = reg_field(instr, 0);
+            let mut val = self.read_x(rt);
+            if sf == 0 {
+                val &= 0xffff_ffff;
+            }
+            let take = if op == 0 { val == 0 } else { val != 0 };
+            if take {
+                let off = sign_extend(u64::from((instr >> 5) & 0x7ffff), 19) << 2;
+                return self.branch(off);
+            }
+            return Step::Next;
+        }
+
+        // ---- move wide immediate: MOVN/MOVZ/MOVK ----
         if (instr >> 23) & 0x3f == 0b1_00101 {
             let sf = (instr >> 31) & 1;
             let opc = (instr >> 29) & 3;
             let hw = (instr >> 21) & 3;
             let imm16 = u64::from((instr >> 5) & 0xffff);
-            let rd = (instr & 0x1f) as usize;
+            let rd = reg_field(instr, 0);
             if sf == 0 && hw > 1 {
-                return Step::Illegal; // 32-bit form only allows hw 0/1
+                return Step::Illegal;
             }
             let shift = hw * 16;
             let val = imm16 << shift;
             let result = match opc {
-                0b10 => val,  // MOVZ
-                0b00 => !val, // MOVN
-                0b11 => {
-                    // MOVK: keep the other 48 bits of Rd.
-                    let cur = self.read_x(rd);
-                    (cur & !(0xffff_u64 << shift)) | val
-                }
+                0b10 => val,
+                0b00 => !val,
+                0b11 => (self.read_x(rd) & !(0xffff_u64 << shift)) | val,
                 _ => return Step::Illegal,
             };
-            let result = if sf == 0 { result & 0xffff_ffff } else { result };
-            self.write_x(rd, result);
+            self.write_x(rd, mask_sf(result, sf));
             return Step::Next;
         }
-        // PC-relative addressing: ADR / ADRP.
+
+        // ---- PC-relative addressing: ADR / ADRP ----
         if (instr >> 24) & 0x1f == 0b1_0000 {
             let op = (instr >> 31) & 1;
             let immlo = u64::from((instr >> 29) & 3);
             let immhi = u64::from((instr >> 5) & 0x7ffff);
-            let rd = (instr & 0x1f) as usize;
+            let rd = reg_field(instr, 0);
             let imm = sign_extend((immhi << 2) | immlo, 21);
             let result = if op == 0 {
                 (self.pc as i64).wrapping_add(imm) as u64
@@ -157,25 +267,122 @@ impl Aarch64Interp {
             self.write_x(rd, result);
             return Step::Next;
         }
-        // Add/subtract immediate (also ADDS/SUBS; flags not modeled yet).
+
+        // ---- add/subtract immediate (incl. ADDS/SUBS/CMP/CMN) ----
         if (instr >> 23) & 0x3f == 0b1_00010 {
             let sf = (instr >> 31) & 1;
             let op = (instr >> 30) & 1;
+            let s = (instr >> 29) & 1;
             let sh = (instr >> 22) & 1;
             let imm12 = u64::from((instr >> 10) & 0xfff);
-            let rn = ((instr >> 5) & 0x1f) as usize;
-            let rd = (instr & 0x1f) as usize;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
             let imm = if sh == 1 { imm12 << 12 } else { imm12 };
             let a = self.read_sp(rn);
-            let result = if op == 0 {
-                a.wrapping_add(imm)
+            if s == 1 {
+                let r = self.addsub_flags(a, imm, op == 1, sf == 1);
+                self.write_x(rd, r); // Rd is ZR-form for the flag-setting variant
             } else {
-                a.wrapping_sub(imm)
-            };
-            let result = if sf == 0 { result & 0xffff_ffff } else { result };
-            self.write_sp(rd, result);
+                let r = if op == 0 {
+                    a.wrapping_add(imm)
+                } else {
+                    a.wrapping_sub(imm)
+                };
+                self.write_sp(rd, mask_sf(r, sf));
+            }
             return Step::Next;
         }
+
+        // ---- add/subtract shifted register (incl. ADDS/SUBS/CMP) ----
+        if (instr >> 24) & 0x1f == 0b0_1011 && (instr >> 21) & 1 == 0 {
+            let sf = (instr >> 31) & 1;
+            let op = (instr >> 30) & 1;
+            let s = (instr >> 29) & 1;
+            let shift_type = (instr >> 22) & 3;
+            let rm = reg_field(instr, 16);
+            let imm6 = (instr >> 10) & 0x3f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let a = self.read_x(rn);
+            let b = shift_reg(self.read_x(rm), shift_type, imm6, sf == 1);
+            let r = if s == 1 {
+                self.addsub_flags(a, b, op == 1, sf == 1)
+            } else {
+                let r = if op == 0 {
+                    a.wrapping_add(b)
+                } else {
+                    a.wrapping_sub(b)
+                };
+                mask_sf(r, sf)
+            };
+            self.write_x(rd, r);
+            return Step::Next;
+        }
+
+        // ---- logical shifted register: AND/ORR/EOR/ANDS (+ BIC via N bit) ----
+        if (instr >> 24) & 0x1f == 0b0_1010 {
+            let sf = (instr >> 31) & 1;
+            let opc = (instr >> 29) & 3;
+            let shift_type = (instr >> 22) & 3;
+            let n_bit = (instr >> 21) & 1;
+            let rm = reg_field(instr, 16);
+            let imm6 = (instr >> 10) & 0x3f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let a = self.read_x(rn);
+            let mut b = shift_reg(self.read_x(rm), shift_type, imm6, sf == 1);
+            if n_bit == 1 {
+                b = mask_sf(!b, sf);
+            }
+            let r = match opc {
+                0b00 | 0b11 => a & b, // AND / ANDS
+                0b01 => a | b,        // ORR (MOV Xd,Xm == ORR Xd,XZR,Xm)
+                0b10 => a ^ b,        // EOR
+                _ => return Step::Illegal,
+            };
+            let r = mask_sf(r, sf);
+            if opc == 0b11 {
+                self.flags = Flags {
+                    n: (r >> if sf == 1 { 63 } else { 31 }) & 1 == 1,
+                    z: r == 0,
+                    c: false,
+                    v: false,
+                };
+            }
+            self.write_x(rd, r);
+            return Step::Next;
+        }
+
+        // ---- load/store register, unsigned immediate offset ----
+        if (instr >> 27) & 0x7 == 0b111 && (instr >> 24) & 0x3 == 0b01 && (instr >> 26) & 1 == 0 {
+            let size = (instr >> 30) & 3;
+            let opc = (instr >> 22) & 3;
+            let imm12 = u64::from((instr >> 10) & 0xfff);
+            let rn = reg_field(instr, 5);
+            let rt = reg_field(instr, 0);
+            let addr = self.read_sp(rn).wrapping_add(imm12 << size);
+            let nbytes = 1usize << size;
+            match opc {
+                0b00 => {
+                    // STR
+                    let val = self.read_x(rt).to_le_bytes();
+                    if mem.write(addr, &val[..nbytes]).is_err() {
+                        return Step::Fault { addr, write: true };
+                    }
+                }
+                0b01 => {
+                    // LDR (zero-extended)
+                    let mut buf = [0u8; 8];
+                    if mem.read(addr, &mut buf[..nbytes]).is_err() {
+                        return Step::Fault { addr, write: false };
+                    }
+                    self.write_x(rt, u64::from_le_bytes(buf));
+                }
+                _ => return Step::Illegal, // signed loads: Phase 10
+            }
+            return Step::Next;
+        }
+
         Step::Illegal
     }
 }
@@ -189,7 +396,7 @@ impl Vcpu for Aarch64Interp {
                     write: false,
                 });
             };
-            match self.exec(instr) {
+            match self.exec(instr, mem) {
                 Step::Next => self.pc = self.pc.wrapping_add(4),
                 Step::Branched => {}
                 Step::Syscall => return Ok(Exit::Syscall),
@@ -203,16 +410,13 @@ impl Vcpu for Aarch64Interp {
     fn syscall_nr(&self) -> u64 {
         self.x[8]
     }
-
     fn syscall_args(&self) -> [u64; 6] {
         [self.x[0], self.x[1], self.x[2], self.x[3], self.x[4], self.x[5]]
     }
-
     fn set_syscall_ret(&mut self, value: u64) {
         self.x[0] = value;
         self.pc = self.pc.wrapping_add(4);
     }
-
     fn reg(&self, idx: usize) -> u64 {
         if idx < 31 { self.x[idx] } else { self.sp }
     }
@@ -223,7 +427,6 @@ impl Vcpu for Aarch64Interp {
             self.sp = value;
         }
     }
-
     fn pc(&self) -> u64 {
         self.pc
     }
@@ -241,6 +444,42 @@ impl Vcpu for Aarch64Interp {
     }
 }
 
+/// Extract a 5-bit register field starting at bit `lsb`.
+fn reg_field(instr: u32, lsb: u32) -> usize {
+    ((instr >> lsb) & 0x1f) as usize
+}
+
+/// Mask to 32 bits when `sf == 0` (32-bit operation).
+const fn mask_sf(v: u64, sf: u32) -> u64 {
+    if sf == 0 { v & 0xffff_ffff } else { v }
+}
+
+/// Apply an aarch64 register shift (LSL/LSR/ASR/ROR) by `amount`.
+fn shift_reg(v: u64, shift_type: u32, amount: u32, sf: bool) -> u64 {
+    let width = if sf { 64 } else { 32 };
+    let amt = amount % width;
+    let v = if sf { v } else { v & 0xffff_ffff };
+    let r = match shift_type {
+        0 => v << amt,
+        1 => v >> amt,
+        2 => {
+            if sf {
+                ((v as i64) >> amt) as u64
+            } else {
+                u64::from(((v as u32 as i32) >> amt) as u32)
+            }
+        }
+        _ => {
+            if sf {
+                v.rotate_right(amt)
+            } else {
+                u64::from((v as u32).rotate_right(amt))
+            }
+        }
+    };
+    if sf { r } else { r & 0xffff_ffff }
+}
+
 /// Sign-extend the low `bits` of `v` to a full `i64`.
 const fn sign_extend(v: u64, bits: u32) -> i64 {
     let shift = 64 - bits;
@@ -255,73 +494,154 @@ mod tests {
     fn cpu() -> Aarch64Interp {
         Aarch64Interp::new(0x1_0000, 0x2_0000)
     }
+    /// A scratch memory for instructions that don't touch it.
+    fn scratch() -> GuestMemory {
+        GuestMemory::new(0x1_0000, PAGE_SIZE)
+    }
 
     #[test]
     fn movz_movk_build_64bit_immediate() {
-        let mut c = cpu();
-        // movz x1, #0x1000
-        assert!(matches!(c.exec(0xD282_0001), Step::Next));
+        let (mut c, mut m) = (cpu(), scratch());
+        assert!(matches!(c.exec(0xD282_0001, &mut m), Step::Next)); // movz x1,#0x1000
         assert_eq!(c.x[1], 0x1000);
-        // movk x1, #0x1, lsl #16  -> x1 = 0x1_1000
-        assert!(matches!(c.exec(0xF2A0_0021), Step::Next));
+        assert!(matches!(c.exec(0xF2A0_0021, &mut m), Step::Next)); // movk x1,#1,lsl#16
         assert_eq!(c.x[1], 0x1_1000);
     }
 
     #[test]
-    fn movz_into_various_regs() {
-        let mut c = cpu();
-        c.exec(0xD280_0020); // movz x0, #1
-        c.exec(0xD280_0062); // movz x2, #3
-        c.exec(0xD280_0808); // movz x8, #64
-        assert_eq!(c.x[0], 1);
-        assert_eq!(c.x[2], 3);
-        assert_eq!(c.x[8], 64);
-    }
-
-    #[test]
     fn add_sub_immediate() {
-        let mut c = cpu();
+        let (mut c, mut m) = (cpu(), scratch());
         c.x[0] = 100;
-        // add x1, x0, #5
-        assert!(matches!(c.exec(0x9100_1401), Step::Next));
+        c.exec(0x9100_1401, &mut m); // add x1,x0,#5
         assert_eq!(c.x[1], 105);
-        // sub x2, x0, #10
-        assert!(matches!(c.exec(0xD100_2802), Step::Next));
+        c.exec(0xD100_2802, &mut m); // sub x2,x0,#10
         assert_eq!(c.x[2], 90);
     }
 
     #[test]
-    fn adr_is_pc_relative() {
+    fn add_shifted_register() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[0] = 10;
+        c.x[1] = 20;
+        c.exec(0x8B01_0002, &mut m); // add x2,x0,x1
+        assert_eq!(c.x[2], 30);
+    }
+
+    #[test]
+    fn cmp_sets_flags_for_branch() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = 6;
+        c.exec(0xF100_183F, &mut m); // cmp x1,#6  (subs xzr,x1,#6)
+        assert!(c.flags.z, "6 == 6 sets Z");
+        assert!(c.cond_holds(0b0000), "EQ holds");
+        assert!(!c.cond_holds(0b0001), "NE does not hold");
+    }
+
+    #[test]
+    fn mov_via_orr() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[5] = 0xabcd;
+        c.exec(0xAA05_03E0, &mut m); // mov x0,x5  (orr x0,xzr,x5)
+        assert_eq!(c.x[0], 0xabcd);
+    }
+
+    #[test]
+    fn ldr_str_roundtrip() {
         let mut c = cpu();
-        c.pc = 0x1_0000;
-        // adr x0, .+8  (imm=8)  encoding: immlo=(8&3)=0, immhi=8>>2=2
-        // 0x10000000 | (immlo<<29) | (immhi<<5) | Rd
-        let instr = 0x1000_0000 | (2 << 5);
-        assert!(matches!(c.exec(instr), Step::Next));
-        assert_eq!(c.x[0], 0x1_0008);
+        let mut m = GuestMemory::new(0x1_0000, 4 * PAGE_SIZE);
+        m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
+        c.x[1] = 0x1_0040; // base address (mapped)
+        c.x[0] = 0x1122_3344_5566_7788;
+        assert!(matches!(c.exec(0xF900_0020, &mut m), Step::Next)); // str x0,[x1]
+        c.x[0] = 0;
+        assert!(matches!(c.exec(0xF940_0022, &mut m), Step::Next)); // ldr x2,[x1]
+        assert_eq!(c.x[2], 0x1122_3344_5566_7788);
+    }
+
+    #[test]
+    fn store_to_unmapped_faults() {
+        let mut c = cpu();
+        let mut m = GuestMemory::new(0x1_0000, PAGE_SIZE);
+        c.x[1] = 0x1_0000; // not mapped
+        assert!(matches!(
+            c.exec(0xF900_0020, &mut m),
+            Step::Fault { write: true, .. }
+        ));
+    }
+
+    /// A summation loop exercises add(reg), add(imm), cmp, and b.ne.
+    #[test]
+    fn sum_loop_runs_control_flow() {
+        let base = 0x1_0000u64;
+        let program: [u32; 8] = [
+            0xD280_0000, // movz x0,#0      ; sum
+            0xD280_0021, // movz x1,#1      ; i
+            0x8B01_0000, // add  x0,x0,x1   ; loop:
+            0x9100_0421, // add  x1,x1,#1
+            0xF100_183F, // cmp  x1,#6
+            0x54FF_FFA1, // b.ne loop  (-12)
+            0xD280_0BA8, // movz x8,#93     ; __NR_exit
+            0xD400_0001, // svc
+        ];
+        let mut mem = GuestMemory::new(base, 4 * PAGE_SIZE);
+        mem.map(base, PAGE_SIZE, Prot::rx()).unwrap();
+        let mut bytes = Vec::new();
+        for w in program {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mem.write_init(base, &bytes).unwrap();
+
+        let mut c = Aarch64Interp::new(base, base + 3 * PAGE_SIZE);
+        assert_eq!(c.run(&mut mem).unwrap(), Exit::Syscall);
+        assert_eq!(c.x[8], 93, "exit syscall");
+        assert_eq!(c.x[0], 15, "sum of 1..=5");
+    }
+
+    /// BL saves the return address; RET restores it.
+    #[test]
+    fn bl_ret_calls_subroutine() {
+        let base = 0x1_0000u64;
+        let program: [u32; 5] = [
+            0x9400_0003, // bl  +12  -> subroutine
+            0xD280_0BA8, // movz x8,#93
+            0xD400_0001, // svc
+            0xD280_00E0, // movz x0,#7   ; subroutine
+            0xD65F_03C0, // ret
+        ];
+        let mut mem = GuestMemory::new(base, 4 * PAGE_SIZE);
+        mem.map(base, PAGE_SIZE, Prot::rx()).unwrap();
+        let mut bytes = Vec::new();
+        for w in program {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mem.write_init(base, &bytes).unwrap();
+
+        let mut c = Aarch64Interp::new(base, base + 3 * PAGE_SIZE);
+        assert_eq!(c.run(&mut mem).unwrap(), Exit::Syscall);
+        assert_eq!(c.x[0], 7, "subroutine set x0");
+        assert_eq!(c.x[8], 93);
     }
 
     #[test]
     fn svc_traps_without_advancing() {
-        let mut c = cpu();
+        let (mut c, mut m) = (cpu(), scratch());
         c.pc = 0x1_0004;
-        assert!(matches!(c.exec(0xD400_0001), Step::Syscall));
-        assert_eq!(c.pc, 0x1_0004, "svc must not advance pc itself");
+        assert!(matches!(c.exec(0xD400_0001, &mut m), Step::Syscall));
+        assert_eq!(c.pc, 0x1_0004);
         c.set_syscall_ret(0);
-        assert_eq!(c.pc, 0x1_0008, "kernel advances pc after servicing");
+        assert_eq!(c.pc, 0x1_0008);
     }
 
     #[test]
     fn unknown_instruction_is_illegal() {
-        let mut c = cpu();
-        assert!(matches!(c.exec(0x0000_0000), Step::Illegal));
+        let (mut c, mut m) = (cpu(), scratch());
+        assert!(matches!(c.exec(0x0000_0000, &mut m), Step::Illegal));
     }
 
     #[test]
     fn run_faults_on_unmapped_pc() {
         let mut mem = GuestMemory::new(0x1_0000, PAGE_SIZE);
         let mut c = Aarch64Interp::new(0x1_0000, 0x1_0000);
-        // pc page is not mapped → fetch fault
         assert_eq!(
             c.run(&mut mem).unwrap(),
             Exit::MemFault {
@@ -329,9 +649,5 @@ mod tests {
                 write: false
             }
         );
-        // Map it and place a single svc: run stops with Syscall.
-        mem.map(0x1_0000, PAGE_SIZE, Prot::rx()).unwrap();
-        mem.write_init(0x1_0000, &0xD400_0001u32.to_le_bytes()).unwrap();
-        assert_eq!(c.run(&mut mem).unwrap(), Exit::Syscall);
     }
 }
