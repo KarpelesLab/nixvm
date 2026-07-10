@@ -21,6 +21,15 @@ pub fn decode(nr: u64) -> Sysno {
         96 => Sysno::SetTidAddress,
         29 => Sysno::Ioctl,
         66 => Sysno::Writev,
+        160 => Sysno::Uname,
+        172 => Sysno::Getpid,
+        173 => Sysno::Getppid,
+        178 => Sysno::Gettid,
+        174 => Sysno::Getuid,
+        175 => Sysno::Geteuid,
+        176 => Sysno::Getgid,
+        177 => Sysno::Getegid,
+        113 => Sysno::ClockGettime,
         other => Sysno::Unknown(other),
     }
 }

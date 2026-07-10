@@ -158,11 +158,19 @@ impl Kernel {
             Sysno::Mmap => self.sys_mmap(args, mem),
             Sysno::Munmap => self.sys_munmap(args[0], args[1], mem),
             Sysno::Mprotect => self.sys_mprotect(args[0], args[1], args[2], mem),
+            Sysno::Uname => self.sys_uname(args[0], mem),
+            Sysno::ClockGettime => sys_clock_gettime(args[1], mem),
             Sysno::ExitGroup | Sysno::Exit => {
                 self.exit_code = Some(args[0] as i32);
                 0
             }
-            Sysno::SetTidAddress => 1, // pretend tid == 1 for now
+            // Single-process identity: pid/tid 1, ppid 0, running as root.
+            Sysno::SetTidAddress | Sysno::Getpid | Sysno::Gettid => 1,
+            Sysno::Getppid
+            | Sysno::Getuid
+            | Sysno::Geteuid
+            | Sysno::Getgid
+            | Sysno::Getegid => 0,
             // Everything else is not wired up yet. Record and return -ENOSYS so
             // the guest gets a well-formed failure rather than a crash.
             Sysno::Unknown(nr) => {
@@ -278,10 +286,48 @@ impl Kernel {
         }
     }
 
+    /// `uname(buf)` — fill a `struct utsname` (six 65-byte NUL-padded fields).
+    fn sys_uname(&self, buf: u64, mem: &mut GuestMemory) -> i64 {
+        const FIELD: usize = 65;
+        let mut data = [0u8; FIELD * 6];
+        let fields: [&[u8]; 6] = [
+            b"Linux",                    // sysname
+            b"nixvm",                    // nodename
+            b"6.1.0-nixvm",              // release
+            b"#1 nixvm",                 // version
+            self.arch.as_str().as_bytes(), // machine
+            b"(none)",                   // domainname
+        ];
+        for (i, f) in fields.iter().enumerate() {
+            let n = f.len().min(FIELD - 1);
+            data[i * FIELD..i * FIELD + n].copy_from_slice(&f[..n]);
+        }
+        match mem.write(buf, &data) {
+            Ok(()) => 0,
+            Err(_) => err(Errno::EFAULT),
+        }
+    }
+
     /// Syscalls the guest attempted that nixvm does not implement yet.
     #[must_use]
     pub fn unsupported(&self) -> &BTreeMap<u64, u64> {
         &self.unsupported
+    }
+}
+
+/// `clock_gettime(clk_id, timespec)` — write host wall-clock time as a 16-byte
+/// `struct timespec { i64 tv_sec; i64 tv_nsec; }`. All clock ids report the
+/// same host time for now (per-clock semantics arrive with Phase 9 deadlines).
+fn sys_clock_gettime(ts: u64, mem: &mut GuestMemory) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&(now.as_secs()).to_le_bytes());
+    b[8..16].copy_from_slice(&u64::from(now.subsec_nanos()).to_le_bytes());
+    match mem.write(ts, &b) {
+        Ok(()) => 0,
+        Err(_) => err(Errno::EFAULT),
     }
 }
 

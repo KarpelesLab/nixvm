@@ -29,6 +29,15 @@ pub enum Sysno {
     SetTidAddress,
     Ioctl,
     Writev,
+    Uname,
+    Getpid,
+    Getppid,
+    Gettid,
+    Getuid,
+    Geteuid,
+    Getgid,
+    Getegid,
+    ClockGettime,
     /// A raw guest number with no mapping yet — handled as ENOSYS but logged.
     Unknown(u64),
 }
