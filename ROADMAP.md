@@ -95,6 +95,15 @@ Each phase is a vertical slice that ends in something runnable and testable.
 "Syscalls" lists the *new* surface introduced. Numbers are guidance, not
 contracts.
 
+> **Build order note (in progress, 2026-07-11).** The **interpreter path is
+> being built first**, ahead of HVF: the hardware backend needs macOS
+> entitlements and can't run in CI, whereas the interpreter makes the entire
+> syscall engine testable on any machine (and is exactly what the wasm demo
+> needs). So Phase 1's *observable outcome* (a guest makes a syscall and exits)
+> and much of Phase 2/3 already work on the interpreter, with a growing subset
+> of Phase 10's ISA, while `vcpu::hvf` remains a stub. Every step ships with
+> tests. Status is marked per-phase below.
+
 ### Phase 0 — Scaffold ✅ (this commit)
 
 Workspace-free single crate; module seams (`abi`, `vcpu`, `loader`, `fs`,
@@ -105,7 +114,7 @@ its first unimplemented frontier; `nixvm` CLI (`run`/`shell`/`version`).
 - **Exit criteria:** `cargo build`, `cargo test`, `cargo clippy` all clean;
   `nixvm run -- <cmd>` walks the pipeline and reports the current frontier.
 
-### Phase 1 — HVF backend + first syscall
+### Phase 1 — HVF backend + first syscall  🟡 outcome met on interpreter; HVF pending
 
 Bring up Hypervisor.framework on macOS/arm64. Create a VM, map a flat
 `GuestMemory`, create a vcpu at EL0/EL1, and trap `svc #0` into `Exit::Syscall`.
@@ -118,7 +127,7 @@ Hand-load a tiny **static** arm64 program (raw bytes, no ELF yet) that does
 - **Exit criteria:** a static arm64 blob prints to stdout and exits with a
   chosen code, entirely through the HVF run/serve loop.
 
-### Phase 2 — Memory manager + static ELF loader
+### Phase 2 — Memory manager + static ELF loader  ✅ (interpreter path)
 
 Replace the flat stub with a page-granular `GuestMemory` (region tree,
 protections, host-backed pages mapped into HVF). Implement `loader::load_static`
@@ -131,7 +140,7 @@ report entry + SP. Wire `brk`/`mmap`(anon)/`munmap`/`mprotect`.
 - **Exit criteria:** a **statically-linked musl** `busybox echo`/`true` runs from
   a real ELF and exits correctly.
 
-### Phase 3 — Syscall breadth for static binaries
+### Phase 3 — Syscall breadth for static binaries  🟡 in progress
 
 Enough of the syscall surface to run non-trivial static programs against an
 in-memory VFS. Reads/writes of guest pointers go through `GuestMemory`; file ops
@@ -232,9 +241,11 @@ safe.
 - **Exit criteria:** a fork bomb, a memory hog, and an infinite loop are each
   contained and terminated with a clear diagnostic; policy denials are logged.
 
-### Phase 10 — Portability backends (KVM + interpreter) & x86-64 guests
+### Phase 10 — Portability backends (KVM + interpreter) & x86-64 guests  🟡 interpreter partially live
 
-Second and third backends, and the second guest arch.
+Second and third backends, and the second guest arch. (A usable subset of the
+aarch64 interpreter already exists — it's the primary development backend; the
+work remaining here is full ISA coverage, KVM, and the x86-64 guest.)
 
 - `vcpu::kvm` — Linux; the `syscall`-trap-via-trampoline technique proven in
   univdreams' `kvm.rs` (LSTAR → `hlt;sysretq`, `KVM_EXIT_HLT` serviced by the
