@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Downloaded/cached guest images (alpine squashfs, etc.)
+/.nixvm
+/images/*.sqfs
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/

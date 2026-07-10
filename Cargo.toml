@@ -1,0 +1,61 @@
+# nixvm — a userland Linux kernel + VM-style sandbox.
+#
+# One crate. Internal structure (abi / vcpu / kernel / fs / loader / image /
+# sandbox) lives as modules, and heavy or platform-specific dependencies are
+# feature-gated rather than split into separate crates. `unsafe` is confined to
+# the `vcpu::hvf` backend. See ROADMAP.md for the plan.
+
+[package]
+name = "nixvm"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/magicaltux/nixvm"
+authors = ["Mark Karpeles <magicaltux@gmail.com>"]
+description = "A portable VM-style sandbox that runs a real Linux userland by emulating Linux syscalls directly (no guest kernel, no device emulation)."
+
+# The binary. Kept out of a default library build via `required-features` so the
+# embeddable library never has to pull CLI deps.
+[[bin]]
+name = "nixvm"
+path = "src/bin/nixvm.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# CLI-only deps (clap, tracing-subscriber, …) get added here in a later phase.
+cli = []
+# Hardware virtualization backends (per-phase, target-gated deps land with them).
+hvf = []    # Hypervisor.framework, macOS/arm64  (Phase 1)
+kvm = []    # KVM, Linux                          (Phase 10)
+# Software CPU interpreter — the no-acceleration fallback (Phase 10).
+interp = []
+
+[dependencies]
+# None yet — the scaffold builds fully offline. Per-phase additions arrive gated
+# by the features above (object, a squashfs reader, kvm-ioctls, sha2, a fetch
+# stack, …).
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+# ABI field names mirror the Linux/kernel spec deliberately (st_mode, e_phoff …).
+similar_names = "allow"
+# Syscall/ABI code intentionally does register-width casts (guest u64 registers
+# <-> i32 args, `-errno`, truncation to the guest word). These lints fight that.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
