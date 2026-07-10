@@ -15,12 +15,15 @@
 
 use std::path::PathBuf;
 
+use crate::Error;
 use crate::abi::Arch;
 use crate::fs::MountTable;
 use crate::image::{ImageRef, ImageStore};
 use crate::kernel::Kernel;
-use crate::vcpu::{self, GuestMemory};
-use crate::Error;
+use crate::loader::{ProcessSpec, load_static};
+use crate::vcpu::interp::InterpBackend;
+use crate::vcpu::mem::PAGE_SIZE;
+use crate::vcpu::{self, Backend, GuestMemory};
 
 /// Default guest RAM ceiling: 512 MiB.
 const DEFAULT_MEM_BYTES: u64 = 512 * 1024 * 1024;
@@ -40,6 +43,9 @@ pub struct Config {
     pub mem_bytes: u64,
     /// Guest architecture (defaults to the host's native arch).
     pub arch: Arch,
+    /// Force the software interpreter instead of the best hardware backend.
+    /// Used by CI, the browser (wasm) target, and for portability.
+    pub prefer_interp: bool,
 }
 
 impl Config {
@@ -64,6 +70,7 @@ impl Default for SandboxBuilder {
                 image: ImageRef::default_for(arch),
                 mem_bytes: DEFAULT_MEM_BYTES,
                 arch,
+                prefer_interp: false,
             },
         }
     }
@@ -92,6 +99,13 @@ impl SandboxBuilder {
     #[must_use]
     pub fn mem_bytes(mut self, bytes: u64) -> Self {
         self.config.mem_bytes = bytes;
+        self
+    }
+
+    /// Force the software interpreter backend (portable / wasm / CI).
+    #[must_use]
+    pub fn prefer_interp(mut self, yes: bool) -> Self {
+        self.config.prefer_interp = yes;
         self
     }
 
@@ -152,6 +166,52 @@ impl Sandbox {
         Ok(code)
     }
 
+    /// Load and run a statically-linked ELF64 image, returning its exit code.
+    ///
+    /// This is the full pipeline — loader → backend → kernel run/serve loop —
+    /// that [`Sandbox::run`] will call once image/filesystem resolution reads
+    /// the target binary out of the guest root. Exposed now so it's testable
+    /// and embeddable ahead of that.
+    pub fn exec_elf(&self, elf: &[u8]) -> Result<i32, Error> {
+        let arch = self.config.arch;
+        let mut mem = GuestMemory::new(GUEST_BASE, round_up_page(self.config.mem_bytes));
+
+        let argv = if self.config.command.is_empty() {
+            vec!["prog".to_string()]
+        } else {
+            self.config.command.clone()
+        };
+        let spec = ProcessSpec {
+            argv,
+            envp: default_env(),
+        };
+        let img = load_static(&mut mem, elf, &spec)?;
+
+        // Lay out heap and mmap in the gap between the image and the stack: the
+        // heap grows up from the program break, mmap grows down from the stack,
+        // meeting at a midpoint so the two arenas can't collide.
+        let mid =
+            page_align_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
+
+        let backend = self.backend()?;
+        let mut vcpu = backend.new_vcpu(img.entry, img.stack_pointer)?;
+
+        let mut kernel = Kernel::new(arch, self.build_mounts());
+        kernel.set_heap(img.program_break, mid);
+        kernel.set_mmap_area(img.stack_bottom, mid);
+        Ok(kernel.run(vcpu.as_mut(), &mut mem)?)
+    }
+
+    /// Select the execution backend per config: the interpreter when forced,
+    /// otherwise the best hardware backend for the host.
+    fn backend(&self) -> Result<Box<dyn Backend>, Error> {
+        if self.config.prefer_interp {
+            Ok(Box::new(InterpBackend::new(self.config.arch)?))
+        } else {
+            Ok(vcpu::select(self.config.arch)?)
+        }
+    }
+
     /// Build the default mount layout. Backends are added in Phase 4; for now
     /// this is the empty table that later phases populate.
     #[allow(clippy::unused_self)] // will read self.config (work_dir, image) once backends land
@@ -164,4 +224,22 @@ impl Sandbox {
         //   mounts.mount("/dev",  DevFs::new());
         MountTable::new()
     }
+}
+
+/// A minimal default environment for the guest.
+fn default_env() -> Vec<String> {
+    vec![
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+        "HOME=/root".into(),
+        "TERM=xterm".into(),
+        "PWD=/work".into(),
+    ]
+}
+
+fn round_up_page(v: u64) -> u64 {
+    v.div_ceil(PAGE_SIZE) * PAGE_SIZE
+}
+
+fn page_align_down(v: u64) -> u64 {
+    v - v % PAGE_SIZE
 }

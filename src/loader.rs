@@ -61,6 +61,9 @@ pub struct LoadedImage {
     pub stack_pointer: u64,
     /// Program break (end of the highest `PT_LOAD`), where `brk` starts.
     pub program_break: u64,
+    /// Lowest address of the initial stack region (top of the address space
+    /// minus the reserved stack). The mmap arena lives below this.
+    pub stack_bottom: u64,
 }
 
 /// What the guest should be started with.
@@ -154,6 +157,7 @@ pub fn load_static(
         entry: ehdr.entry,
         stack_pointer,
         program_break,
+        stack_bottom: (mem.base() + mem.size()) - STACK_SIZE,
     })
 }
 
