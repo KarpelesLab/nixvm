@@ -353,6 +353,76 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- 3-source multiply: MADD/MSUB (MUL/MNEG are aliases) ----
+        if (instr >> 24) & 0x1f == 0b1_1011 && (instr >> 21) & 0x7 == 0 {
+            let sf = (instr >> 31) & 1;
+            let o0 = (instr >> 15) & 1;
+            let rm = reg_field(instr, 16);
+            let ra = reg_field(instr, 10);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let prod = self.read_x(rn).wrapping_mul(self.read_x(rm));
+            let acc = self.read_x(ra);
+            let r = if o0 == 0 {
+                acc.wrapping_add(prod)
+            } else {
+                acc.wrapping_sub(prod)
+            };
+            self.write_x(rd, mask_sf(r, sf));
+            return Step::Next;
+        }
+
+        // ---- 2-source: UDIV/SDIV and variable shifts LSLV/LSRV/ASRV/RORV ----
+        if (instr >> 21) & 0xff == 0b1101_0110 {
+            let sf = (instr >> 31) & 1;
+            let opcode = (instr >> 10) & 0x3f;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let a = self.read_x(rn);
+            let b = self.read_x(rm);
+            let width = if sf == 1 { 64u32 } else { 32 };
+            let amount = (b % u64::from(width)) as u32;
+            let r = match opcode {
+                0b00_0010 => udiv(a, b, sf == 1),
+                0b00_0011 => sdiv(a, b, sf == 1),
+                0b00_1000 => shift_reg(a, 0, amount, sf == 1),
+                0b00_1001 => shift_reg(a, 1, amount, sf == 1),
+                0b00_1010 => shift_reg(a, 2, amount, sf == 1),
+                0b00_1011 => shift_reg(a, 3, amount, sf == 1),
+                _ => return Step::Illegal,
+            };
+            self.write_x(rd, mask_sf(r, sf));
+            return Step::Next;
+        }
+
+        // ---- conditional select: CSEL/CSINC/CSINV/CSNEG ----
+        if (instr >> 21) & 0xff == 0b1101_0100 && (instr >> 29) & 1 == 0 {
+            let sf = (instr >> 31) & 1;
+            let op = (instr >> 30) & 1;
+            let op2 = (instr >> 10) & 3;
+            if op2 > 1 {
+                return Step::Illegal;
+            }
+            let cond = (instr >> 12) & 0xf;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let r = if self.cond_holds(cond) {
+                self.read_x(rn)
+            } else {
+                let m = self.read_x(rm);
+                match (op, op2) {
+                    (0, 0) => m,                 // CSEL
+                    (0, 1) => m.wrapping_add(1), // CSINC
+                    (1, 0) => !m,                // CSINV
+                    _ => m.wrapping_neg(),       // CSNEG (1,1)
+                }
+            };
+            self.write_x(rd, mask_sf(r, sf));
+            return Step::Next;
+        }
+
         // ---- load/store pair: LDP/STP (signed offset / pre / post index) ----
         if (instr >> 27) & 0x7 == 0b101 && (instr >> 26) & 1 == 0 {
             let opc = (instr >> 30) & 3;
@@ -524,6 +594,27 @@ fn shift_reg(v: u64, shift_type: u32, amount: u32, sf: bool) -> u64 {
     if sf { r } else { r & 0xffff_ffff }
 }
 
+/// Unsigned divide with aarch64 semantics (division by zero yields 0).
+fn udiv(a: u64, b: u64, sf: bool) -> u64 {
+    if sf {
+        a.checked_div(b).unwrap_or(0)
+    } else {
+        (a as u32).checked_div(b as u32).map_or(0, u64::from)
+    }
+}
+
+/// Signed divide with aarch64 semantics (division by zero yields 0;
+/// `INT_MIN / -1` wraps to `INT_MIN`).
+fn sdiv(a: u64, b: u64, sf: bool) -> u64 {
+    if sf {
+        let (a, b) = (a as i64, b as i64);
+        if b == 0 { 0 } else { a.wrapping_div(b) as u64 }
+    } else {
+        let (a, b) = (a as i32, b as i32);
+        if b == 0 { 0 } else { u64::from(a.wrapping_div(b) as u32) }
+    }
+}
+
 /// Sign-extend the low `bits` of `v` to a full `i64`.
 const fn sign_extend(v: u64, bits: u32) -> i64 {
     let shift = 64 - bits;
@@ -579,6 +670,58 @@ mod tests {
         assert!(c.flags.z, "6 == 6 sets Z");
         assert!(c.cond_holds(0b0000), "EQ holds");
         assert!(!c.cond_holds(0b0001), "NE does not hold");
+    }
+
+    #[test]
+    fn mul_and_madd() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = 6;
+        c.x[2] = 7;
+        c.exec(0x9B02_7C20, &mut m); // mul x0,x1,x2
+        assert_eq!(c.x[0], 42);
+        c.x[3] = 1;
+        c.exec(0x9B02_0C20, &mut m); // madd x0,x1,x2,x3
+        assert_eq!(c.x[0], 43);
+    }
+
+    #[test]
+    fn udiv_sdiv_and_div_by_zero() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = 100;
+        c.x[2] = 7;
+        c.exec(0x9AC2_0820, &mut m); // udiv x0,x1,x2
+        assert_eq!(c.x[0], 14);
+        c.x[1] = (-100i64) as u64;
+        c.exec(0x9AC2_0C20, &mut m); // sdiv x0,x1,x2
+        assert_eq!(c.x[0] as i64, -14);
+        c.x[2] = 0;
+        c.exec(0x9AC2_0820, &mut m); // udiv by zero -> 0
+        assert_eq!(c.x[0], 0);
+    }
+
+    #[test]
+    fn lslv_variable_shift() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = 1;
+        c.x[2] = 4;
+        c.exec(0x9AC2_2020, &mut m); // lslv x0,x1,x2
+        assert_eq!(c.x[0], 16);
+    }
+
+    #[test]
+    fn csel_and_csinc_use_flags() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = 111;
+        c.x[2] = 222;
+        c.flags.z = true; // EQ holds
+        c.exec(0x9A82_0020, &mut m); // csel x0,x1,x2,eq -> x1
+        assert_eq!(c.x[0], 111);
+        c.flags.z = false; // EQ fails
+        c.exec(0x9A82_0020, &mut m); // csel -> x2
+        assert_eq!(c.x[0], 222);
+        // csinc x0,x1,x2,eq with EQ false -> x2 + 1
+        c.exec(0x9A82_0420, &mut m);
+        assert_eq!(c.x[0], 223);
     }
 
     #[test]

@@ -57,6 +57,8 @@ similar_names = "allow"
 cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_possible_wrap = "allow"
+# Instruction decode legitimately tests fixed opcode fields as `x & mask == n`.
+verbose_bit_mask = "allow"
 
 [profile.release]
 lto = "thin"
