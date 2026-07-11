@@ -65,6 +65,43 @@ const PATHS: &[&str] = &[
     "self/cwd",
     "self/auxv",
     "self/fd",
+    "net",
+    "net/tcp",
+    "net/tcp6",
+    "net/udp",
+    "net/udp6",
+    "net/unix",
+    "net/dev",
+    "net/route",
+    "net/snmp",
+    "net/protocols",
+    "sys/net",
+    "sys/net/core",
+    "sys/net/core/somaxconn",
+    "sys/net/ipv4",
+    "sys/net/ipv4/tcp_rmem",
+    "sys/net/ipv4/tcp_wmem",
+    "sys/net/ipv4/ip_local_port_range",
+    "sys/vm",
+    "sys/vm/overcommit_memory",
+    "sys/vm/max_map_count",
+    "sys/fs",
+    "sys/fs/file-max",
+    "sys/fs/nr_open",
+    "diskstats",
+    "partitions",
+    "swaps",
+    "modules",
+    "devices",
+    "self/mountinfo",
+    "self/mounts",
+    "self/smaps",
+    "self/statm",
+    "self/limits",
+    "self/io",
+    "self/oom_score",
+    "self/oom_score_adj",
+    "self/wchan",
 ];
 
 /// Static top-level file names, in `readdir("")` order.
@@ -78,16 +115,63 @@ const ROOT_FILES: &[&str] = &[
     "filesystems",
     "mounts",
     "cmdline",
+    "diskstats",
+    "partitions",
+    "swaps",
+    "modules",
+    "devices",
 ];
 
 /// Per-process entry names under `self/`, in `readdir("self")` order. `exe`
 /// and `cwd` are symlinks, `fd` is a directory, the rest are files.
 const SELF_FILES: &[&str] = &[
-    "cmdline", "status", "stat", "comm", "maps", "exe", "cwd", "auxv", "fd",
+    "cmdline",
+    "status",
+    "stat",
+    "comm",
+    "maps",
+    "exe",
+    "cwd",
+    "auxv",
+    "fd",
+    "mountinfo",
+    "mounts",
+    "smaps",
+    "statm",
+    "limits",
+    "io",
+    "oom_score",
+    "oom_score_adj",
+    "wchan",
 ];
 
 /// Tunables exposed under `sys/kernel/`.
 const SYS_KERNEL_FILES: &[&str] = &["ostype", "osrelease", "hostname", "pid_max"];
+
+/// File names under `net/`, in `readdir("net")` order.
+const NET_FILES: &[&str] = &[
+    "tcp",
+    "tcp6",
+    "udp",
+    "udp6",
+    "unix",
+    "dev",
+    "route",
+    "snmp",
+    "protocols",
+];
+
+/// Tunables exposed under `sys/net/core/`.
+const SYS_NET_CORE_FILES: &[&str] = &["somaxconn"];
+
+/// Tunables exposed under `sys/net/ipv4/`.
+const SYS_NET_IPV4_FILES: &[&str] = &["tcp_rmem", "tcp_wmem", "ip_local_port_range"];
+
+/// Tunables exposed under `sys/vm/`.
+const SYS_VM_FILES: &[&str] = &["overcommit_memory", "max_map_count"];
+
+/// Tunables exposed under `sys/fs/`.
+const SYS_FS_FILES: &[&str] = &["file-max", "nr_open"];
 
 // ---- static file bodies (each ends with a newline) ----
 
@@ -112,7 +196,15 @@ nodev\tdevtmpfs\n";
 
 const MOUNTS: &str = "tmpfs / tmpfs rw 0 0\n\
 proc /proc proc rw 0 0\n\
-sysfs /sys sysfs rw 0 0\n";
+sysfs /sys sysfs rw 0 0\n\
+devtmpfs /dev devtmpfs rw 0 0\n";
+
+/// `self/mountinfo`'s body, in the `36 35 98:0 /mnt1 /mnt2 rw,noatime … - fstype source opts`
+/// format documented in `proc(5)`.
+const MOUNTINFO: &str = "1 0 0:1 / / rw,relatime shared:1 - tmpfs tmpfs rw\n\
+2 1 0:2 / /proc rw,nosuid,nodev,noexec,relatime shared:2 - proc proc rw\n\
+3 1 0:3 / /sys rw,nosuid,nodev,noexec,relatime shared:3 - sysfs sysfs rw\n\
+4 1 0:4 / /dev rw,nosuid,relatime shared:4 - devtmpfs devtmpfs rw\n";
 
 const CMDLINE: &str = "\n";
 
@@ -120,6 +212,107 @@ const OSTYPE: &str = "Linux\n";
 const OSRELEASE: &str = "6.1.0-nixvm\n";
 const HOSTNAME: &str = "nixvm\n";
 const PID_MAX: &str = "32768\n";
+
+// ---- /proc/net/* ----
+
+const NET_TCP_HEADER: &str =
+    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+
+const NET_TCP6_HEADER: &str = "  sl  \
+local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+
+const NET_UDP_HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when \
+retrnsmt   uid  timeout inode ref pointer drops\n";
+
+const NET_UDP6_HEADER: &str = "  sl  \
+local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n";
+
+const NET_UNIX: &str = "Num       RefCount Protocol Flags    Type St Inode Path\n";
+
+const NET_DEV: &str = "Inter-|   Receive                                                |  Transmit\n\
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
+    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n";
+
+const NET_ROUTE: &str = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n";
+
+const NET_SNMP: &str = "Ip: Forwarding DefaultTTL InReceives InHdrErrors InAddrErrors ForwDatagrams InUnknownProtos InDiscards InDelivers OutRequests OutDiscards OutNoRoutes ReasmTimeout ReasmReqds ReasmOKs ReasmFails FragOKs FragFails FragCreates\n\
+Ip: 1 64 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+Icmp: InMsgs InErrors InCsumErrors InDestUnreachs InTimeExcds InParmProbs InSrcQuenchs InRedirects InEchos InEchoReps InTimestamps InTimestampReps InAddrMasks InAddrMaskReps OutMsgs OutErrors OutDestUnreachs OutTimeExcds OutParmProbs OutSrcQuenchs OutRedirects OutEchos OutEchoReps OutTimestamps OutTimestampReps OutAddrMasks OutAddrMaskReps\n\
+Icmp: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+Tcp: RtoAlgorithm RtoMin RtoMax MaxConn ActiveOpens PassiveOpens AttemptFails EstabResets CurrEstab InSegs OutSegs RetransSegs InErrs OutRsts InCsumErrors\n\
+Tcp: 1 200 120000 -1 0 0 0 0 0 0 0 0 0 0 0\n\
+Udp: InDatagrams NoPorts InErrors OutDatagrams RcvbufErrors SndbufErrors InCsumErrors IgnoredMulti\n\
+Udp: 0 0 0 0 0 0 0 0\n";
+
+const NET_PROTOCOLS: &str = "protocol  size sockets  memory press maxhdr  slab module     cl co di ac io in de sh ss gs se re sp bi br ha uh gp em\n\
+TCP        2144   0       -1     no     20     yes   kernel     y  y  y  y  y  y  y  y  y  y  y  y  n  n  y  y  y  n\n\
+UDP        1408   0       -1     no      0     yes   kernel     y  y  y  n  n  n  y  y  y  y  y  n  n  n  y  y  y  n\n";
+
+// ---- /proc/sys/{net,vm,fs}/* ----
+
+const SOMAXCONN: &str = "4096\n";
+const TCP_RMEM: &str = "4096\t131072\t6291456\n";
+const TCP_WMEM: &str = "4096\t16384\t4194304\n";
+const IP_LOCAL_PORT_RANGE: &str = "32768\t60999\n";
+const OVERCOMMIT_MEMORY: &str = "0\n";
+const MAX_MAP_COUNT: &str = "65530\n";
+const FILE_MAX: &str = "1048576\n";
+const NR_OPEN: &str = "1048576\n";
+
+// ---- misc top-level files ----
+
+const DISKSTATS: &str = "   8       0 vda 0 0 0 0 0 0 0 0 0 0 0\n";
+const PARTITIONS: &str = "major minor  #blocks  name\n\n   8        0     102400 vda\n";
+const SWAPS: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+/// No modules are ever loaded in a synthetic kernel; an empty file is the
+/// valid, real-world rendering of that state.
+const MODULES: &str = "";
+const DEVICES: &str = "Character devices:\n\
+  1 mem\n\
+  4 tty\n\
+  5 /dev/tty\n\
+  5 /dev/console\n\
+ 10 misc\n\
+136 pts\n\
+\n\
+Block devices:\n\
+  8 sd\n\
+  9 md\n\
+259 blkext\n";
+
+// ---- self/* static bodies (independent of injected ProcData) ----
+
+const LIMITS: &str = "Limit                     Soft Limit           Hard Limit           Units     \n\
+Max cpu time              unlimited            unlimited            seconds   \n\
+Max file size             unlimited            unlimited            bytes     \n\
+Max data size             unlimited            unlimited            bytes     \n\
+Max stack size            8388608              unlimited            bytes     \n\
+Max core file size        0                    unlimited            bytes     \n\
+Max resident set          unlimited            unlimited            bytes     \n\
+Max processes             15746                15746                processes \n\
+Max open files            1024                 4096                 files     \n\
+Max locked memory         65536                65536                bytes     \n\
+Max address space         unlimited            unlimited            bytes     \n\
+Max file locks            unlimited            unlimited            locks     \n\
+Max pending signals       15746                15746                signals   \n\
+Max msgqueue size         819200               819200               bytes     \n\
+Max nice priority         0                    0                              \n\
+Max realtime priority     0                    0                              \n\
+Max realtime timeout      unlimited            unlimited            us        \n";
+
+const IO: &str = "rchar: 0\n\
+wchar: 0\n\
+syscr: 0\n\
+syscw: 0\n\
+read_bytes: 0\n\
+write_bytes: 0\n\
+cancelled_write_bytes: 0\n";
+
+const OOM_SCORE: &str = "0\n";
+const OOM_SCORE_ADJ: &str = "0\n";
+/// `self/wchan` has no trailing newline on a real kernel — it's a single
+/// symbol name (or `0` when idle), not a line-oriented text file.
+const WCHAN: &str = "0";
 
 /// Running-process (and lightweight system) data backing the `self/` files
 /// plus the CPU-count-sensitive system files.
@@ -269,6 +462,15 @@ impl ProcFs {
             "self/auxv" => return Some(d.auxv.clone()),
             "self/comm" => format!("{}\n", d.comm),
             "self/stat" => self_stat_body(d),
+            "self/statm" => statm_body(d),
+            "self/smaps" => {
+                let text = if d.maps.is_empty() {
+                    default_maps(&d.exe)
+                } else {
+                    d.maps.clone()
+                };
+                smaps_body(&text)
+            }
             "self/status" => format!(
                 "Name:\t{comm}\n\
                  State:\t{state} ({state_desc})\n\
@@ -314,12 +516,40 @@ fn static_content(rel: &str) -> Option<&'static [u8]> {
         "uptime" => UPTIME,
         "loadavg" => LOADAVG,
         "filesystems" => FILESYSTEMS,
-        "mounts" => MOUNTS,
+        "mounts" | "self/mounts" => MOUNTS,
         "cmdline" => CMDLINE,
         "sys/kernel/ostype" => OSTYPE,
         "sys/kernel/osrelease" => OSRELEASE,
         "sys/kernel/hostname" => HOSTNAME,
         "sys/kernel/pid_max" => PID_MAX,
+        "net/tcp" => NET_TCP_HEADER,
+        "net/tcp6" => NET_TCP6_HEADER,
+        "net/udp" => NET_UDP_HEADER,
+        "net/udp6" => NET_UDP6_HEADER,
+        "net/unix" => NET_UNIX,
+        "net/dev" => NET_DEV,
+        "net/route" => NET_ROUTE,
+        "net/snmp" => NET_SNMP,
+        "net/protocols" => NET_PROTOCOLS,
+        "sys/net/core/somaxconn" => SOMAXCONN,
+        "sys/net/ipv4/tcp_rmem" => TCP_RMEM,
+        "sys/net/ipv4/tcp_wmem" => TCP_WMEM,
+        "sys/net/ipv4/ip_local_port_range" => IP_LOCAL_PORT_RANGE,
+        "sys/vm/overcommit_memory" => OVERCOMMIT_MEMORY,
+        "sys/vm/max_map_count" => MAX_MAP_COUNT,
+        "sys/fs/file-max" => FILE_MAX,
+        "sys/fs/nr_open" => NR_OPEN,
+        "diskstats" => DISKSTATS,
+        "partitions" => PARTITIONS,
+        "swaps" => SWAPS,
+        "modules" => MODULES,
+        "devices" => DEVICES,
+        "self/mountinfo" => MOUNTINFO,
+        "self/limits" => LIMITS,
+        "self/io" => IO,
+        "self/oom_score" => OOM_SCORE,
+        "self/oom_score_adj" => OOM_SCORE_ADJ,
+        "self/wchan" => WCHAN,
         _ => return None,
     };
     Some(text.as_bytes())
@@ -439,6 +669,94 @@ fn self_stat_body(d: &ProcData) -> String {
     format!("{}\n", f.join(" "))
 }
 
+/// Render `self/statm`'s 7 whitespace-separated page counts (see `proc(5)`):
+/// `size resident shared text lib data dt`. Sizes are derived from the
+/// injected kB figures assuming 4 kB pages.
+fn statm_body(d: &ProcData) -> String {
+    const PAGE_KB: u64 = 4;
+    let size = (d.vm_size_kb / PAGE_KB).max(1);
+    let resident = (d.vm_rss_kb / PAGE_KB).max(1);
+    let shared = 0u64;
+    let text = 1u64.min(size);
+    let lib = 0u64;
+    let data = size.saturating_sub(text);
+    let dt = 0u64;
+    format!("{size} {resident} {shared} {text} {lib} {data} {dt}\n")
+}
+
+/// The `VmFlags` shorthand for a `self/maps` permission token (e.g. `r-xp`),
+/// approximating what the kernel reports for a mapping with those
+/// permissions.
+fn vmflags_for(perms: &str) -> String {
+    let mut flags = Vec::new();
+    if perms.contains('r') {
+        flags.push("rd");
+    }
+    if perms.contains('w') {
+        flags.push("wr");
+    }
+    if perms.contains('x') {
+        flags.push("ex");
+    }
+    flags.push("mr");
+    flags.push("mw");
+    flags.push("me");
+    if perms.contains('w') {
+        flags.push("dw");
+    }
+    flags.join(" ")
+}
+
+/// Render `self/smaps`: every line of `maps` (see [`default_maps`]) followed
+/// by its per-mapping statistics block, sized from the line's own address
+/// range.
+fn smaps_body(maps: &str) -> String {
+    let mut out = String::new();
+    for line in maps.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "{line}");
+        let mut fields = line.split_whitespace();
+        let range = fields.next().unwrap_or("");
+        let perms = fields.next().unwrap_or("----");
+        let size_kb = range
+            .split_once('-')
+            .and_then(|(s, e)| {
+                let s = u64::from_str_radix(s, 16).ok()?;
+                let e = u64::from_str_radix(e, 16).ok()?;
+                Some(e.saturating_sub(s) / 1024)
+            })
+            .unwrap_or(4)
+            .max(4);
+        let writable = perms.contains('w');
+        let (private_clean, private_dirty) = if writable { (0, size_kb) } else { (size_kb, 0) };
+        let zero = 0u64;
+        let page_kb = 4u64;
+        let flags = vmflags_for(perms);
+        let _ = write!(
+            out,
+            "Size:           {size_kb:>10} kB\n\
+             KernelPageSize: {page_kb:>10} kB\n\
+             MMUPageSize:    {page_kb:>10} kB\n\
+             Rss:            {size_kb:>10} kB\n\
+             Pss:            {size_kb:>10} kB\n\
+             Shared_Clean:   {zero:>10} kB\n\
+             Shared_Dirty:   {zero:>10} kB\n\
+             Private_Clean:  {private_clean:>10} kB\n\
+             Private_Dirty:  {private_dirty:>10} kB\n\
+             Referenced:     {size_kb:>10} kB\n\
+             Anonymous:      {zero:>10} kB\n\
+             AnonHugePages:  {zero:>10} kB\n\
+             Swap:           {zero:>10} kB\n\
+             SwapPss:        {zero:>10} kB\n\
+             Locked:         {zero:>10} kB\n\
+             VmFlags: {flags}\n"
+        );
+    }
+    out
+}
+
 /// The inode for a known static path (its 1-based position in [`PATHS`]).
 fn inode_of(rel: &str) -> Option<u64> {
     PATHS.iter().position(|p| *p == rel).map(|i| i as u64 + 1)
@@ -453,7 +771,19 @@ fn fd_inode(fd: u32) -> u64 {
 /// Whether `rel` (already [`ProcFs::normalize`]d) names one of the fixed
 /// directories.
 fn is_dir(rel: &str) -> bool {
-    matches!(rel, "" | "self" | "self/fd" | "sys" | "sys/kernel")
+    matches!(
+        rel,
+        "" | "self"
+            | "self/fd"
+            | "sys"
+            | "sys/kernel"
+            | "net"
+            | "sys/net"
+            | "sys/net/core"
+            | "sys/net/ipv4"
+            | "sys/vm"
+            | "sys/fs"
+    )
 }
 
 /// Build a directory entry, looking the inode up from the full path.
@@ -569,6 +899,7 @@ impl MountFs for ProcFs {
                     });
                 }
                 out.push(entry("sys", "sys", NodeKind::Dir));
+                out.push(entry("net", "net", NodeKind::Dir));
                 Ok(out)
             }
             "self" => Ok(SELF_FILES
@@ -593,11 +924,55 @@ impl MountFs for ProcFs {
                     inode: fd_inode(*fd),
                 })
                 .collect()),
-            "sys" => Ok(vec![entry("kernel", "sys/kernel", NodeKind::Dir)]),
+            "sys" => Ok(vec![
+                entry("kernel", "sys/kernel", NodeKind::Dir),
+                entry("net", "sys/net", NodeKind::Dir),
+                entry("vm", "sys/vm", NodeKind::Dir),
+                entry("fs", "sys/fs", NodeKind::Dir),
+            ]),
             "sys/kernel" => Ok(SYS_KERNEL_FILES
                 .iter()
                 .map(|n| {
                     let path = format!("sys/kernel/{n}");
+                    entry(n, &path, NodeKind::File)
+                })
+                .collect()),
+            "net" => Ok(NET_FILES
+                .iter()
+                .map(|n| {
+                    let path = format!("net/{n}");
+                    entry(n, &path, NodeKind::File)
+                })
+                .collect()),
+            "sys/net" => Ok(vec![
+                entry("core", "sys/net/core", NodeKind::Dir),
+                entry("ipv4", "sys/net/ipv4", NodeKind::Dir),
+            ]),
+            "sys/net/core" => Ok(SYS_NET_CORE_FILES
+                .iter()
+                .map(|n| {
+                    let path = format!("sys/net/core/{n}");
+                    entry(n, &path, NodeKind::File)
+                })
+                .collect()),
+            "sys/net/ipv4" => Ok(SYS_NET_IPV4_FILES
+                .iter()
+                .map(|n| {
+                    let path = format!("sys/net/ipv4/{n}");
+                    entry(n, &path, NodeKind::File)
+                })
+                .collect()),
+            "sys/vm" => Ok(SYS_VM_FILES
+                .iter()
+                .map(|n| {
+                    let path = format!("sys/vm/{n}");
+                    entry(n, &path, NodeKind::File)
+                })
+                .collect()),
+            "sys/fs" => Ok(SYS_FS_FILES
+                .iter()
+                .map(|n| {
+                    let path = format!("sys/fs/{n}");
                     entry(n, &path, NodeKind::File)
                 })
                 .collect()),
@@ -866,5 +1241,166 @@ mod tests {
         assert_eq!(text, "nixvm\n");
         let pid_max = String::from_utf8(read_all(&mut fs, "sys/kernel/pid_max")).unwrap();
         assert_eq!(pid_max, "32768\n");
+    }
+
+    #[test]
+    fn net_tcp_has_expected_header() {
+        let mut fs = ProcFs::new();
+        let text = String::from_utf8(read_all(&mut fs, "net/tcp")).unwrap();
+        assert!(text.contains("sl"));
+        assert!(text.contains("local_address"));
+        assert!(text.contains("rem_address"));
+        assert!(text.contains("st"));
+        assert!(text.contains("uid"));
+        assert!(text.contains("inode"));
+    }
+
+    #[test]
+    fn net_dev_has_headers_and_lo_row() {
+        let mut fs = ProcFs::new();
+        let text = String::from_utf8(read_all(&mut fs, "net/dev")).unwrap();
+        assert!(text.contains("Inter-|"));
+        assert!(text.contains("face |bytes"));
+        assert!(text.contains("lo:"));
+    }
+
+    #[test]
+    fn net_unix_has_expected_header() {
+        let mut fs = ProcFs::new();
+        let text = String::from_utf8(read_all(&mut fs, "net/unix")).unwrap();
+        assert!(text.starts_with("Num"));
+        assert!(text.contains("RefCount"));
+        assert!(text.contains("Protocol"));
+        assert!(text.contains("Flags"));
+        assert!(text.contains("Type"));
+        assert!(text.contains("St"));
+        assert!(text.contains("Inode"));
+        assert!(text.contains("Path"));
+    }
+
+    #[test]
+    fn net_directory_listing() {
+        let mut fs = ProcFs::new();
+        let names: Vec<String> = fs
+            .readdir("net")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        for want in ["tcp", "tcp6", "udp", "udp6", "unix", "dev", "route", "snmp", "protocols"] {
+            assert!(names.contains(&want.to_string()), "missing {want}");
+        }
+        // Root readdir lists the new `net` directory.
+        let root_names: Vec<String> = fs.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        assert!(root_names.contains(&"net".to_string()));
+    }
+
+    #[test]
+    fn sys_net_core_directory_listing() {
+        let mut fs = ProcFs::new();
+        let names: Vec<String> = fs
+            .readdir("sys/net/core")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"somaxconn".to_string()));
+        let somaxconn = String::from_utf8(read_all(&mut fs, "sys/net/core/somaxconn")).unwrap();
+        assert_eq!(somaxconn, "4096\n");
+    }
+
+    #[test]
+    fn sys_net_ipv4_and_vm_and_fs_files() {
+        let mut fs = ProcFs::new();
+        assert_eq!(
+            String::from_utf8(read_all(&mut fs, "sys/net/ipv4/tcp_rmem")).unwrap(),
+            "4096\t131072\t6291456\n"
+        );
+        assert_eq!(
+            String::from_utf8(read_all(&mut fs, "sys/vm/overcommit_memory")).unwrap(),
+            "0\n"
+        );
+        assert_eq!(
+            String::from_utf8(read_all(&mut fs, "sys/fs/file-max")).unwrap(),
+            "1048576\n"
+        );
+    }
+
+    #[test]
+    fn self_statm_has_seven_numbers() {
+        let mut fs = ProcFs::new();
+        fs.set_self(sample());
+        let text = String::from_utf8(read_all(&mut fs, "self/statm")).unwrap();
+        let fields: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(fields.len(), 7);
+        for f in &fields {
+            assert!(f.parse::<u64>().is_ok(), "not a number: {f}");
+        }
+    }
+
+    #[test]
+    fn self_limits_contains_max_open_files() {
+        let mut fs = ProcFs::new();
+        let text = String::from_utf8(read_all(&mut fs, "self/limits")).unwrap();
+        assert!(text.contains("Max open files"));
+        assert!(text.contains("Soft Limit"));
+        assert!(text.contains("Hard Limit"));
+    }
+
+    #[test]
+    fn self_io_and_oom_and_wchan() {
+        let mut fs = ProcFs::new();
+        let io = String::from_utf8(read_all(&mut fs, "self/io")).unwrap();
+        assert!(io.contains("rchar:"));
+        assert!(io.contains("read_bytes:"));
+        assert_eq!(read_all(&mut fs, "self/oom_score"), b"0\n");
+        assert_eq!(read_all(&mut fs, "self/oom_score_adj"), b"0\n");
+        assert_eq!(read_all(&mut fs, "self/wchan"), b"0");
+    }
+
+    #[test]
+    fn self_mountinfo_and_mounts() {
+        let mut fs = ProcFs::new();
+        let mountinfo = String::from_utf8(read_all(&mut fs, "self/mountinfo")).unwrap();
+        assert!(mountinfo.contains(" / / "));
+        assert!(mountinfo.contains(" - tmpfs tmpfs rw"));
+        let mounts = String::from_utf8(read_all(&mut fs, "self/mounts")).unwrap();
+        assert!(mounts.contains("tmpfs / tmpfs rw"));
+    }
+
+    #[test]
+    fn self_smaps_tracks_maps() {
+        let mut fs = ProcFs::new();
+        let text = String::from_utf8(read_all(&mut fs, "self/smaps")).unwrap();
+        assert!(text.contains("[stack]"));
+        assert!(text.contains("Rss:"));
+        assert!(text.contains("VmFlags:"));
+    }
+
+    #[test]
+    fn pid_alias_reaches_new_self_files() {
+        let mut fs = ProcFs::new();
+        fs.set_self(sample());
+        assert_eq!(read_all(&mut fs, "42/oom_score"), b"0\n");
+        let statm = String::from_utf8(read_all(&mut fs, "42/statm")).unwrap();
+        assert_eq!(statm.split_whitespace().count(), 7);
+    }
+
+    #[test]
+    fn top_level_misc_files_present() {
+        let mut fs = ProcFs::new();
+        assert!(String::from_utf8(read_all(&mut fs, "diskstats")).unwrap().contains("vda"));
+        assert!(String::from_utf8(read_all(&mut fs, "partitions")).unwrap().contains("#blocks"));
+        assert!(
+            String::from_utf8(read_all(&mut fs, "swaps"))
+                .unwrap()
+                .contains("Filename")
+        );
+        assert!(read_all(&mut fs, "modules").is_empty());
+        assert!(
+            String::from_utf8(read_all(&mut fs, "devices"))
+                .unwrap()
+                .contains("Character devices:")
+        );
     }
 }
