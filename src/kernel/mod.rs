@@ -27,6 +27,7 @@ mod fs_ext;
 mod net;
 mod path;
 mod stat;
+mod sys_misc;
 
 pub use fd::{Fd, FdTable};
 use net::Net;
@@ -102,6 +103,8 @@ pub struct Kernel {
     trace: bool,
     /// The process file-creation mask (`umask`); global for our single session.
     umask: u32,
+    /// The process name (`prctl(PR_SET_NAME)`); a fixed 16-byte, NUL-padded field.
+    procname: [u8; 16],
     unsupported: BTreeMap<u64, u64>,
     /// The running process's per-process state (swapped in for the slice).
     cur: ProcInfo,
@@ -140,6 +143,7 @@ impl Kernel {
             rng_state: 0,
             trace: std::env::var_os("NIXVM_TRACE").is_some(),
             umask: 0o022,
+            procname: [0u8; 16],
             unsupported: BTreeMap::new(),
             cur: ProcInfo::default(),
             procs: Vec::new(),
@@ -298,6 +302,7 @@ impl Kernel {
 
     /// The syscall table. Returns the value the guest sees in its result
     /// register: a non-negative result, or a negative errno.
+    #[allow(clippy::too_many_lines)] // one arm per syscall; a flat table is clearest.
     fn dispatch(
         &mut self,
         sys: Sysno,
@@ -376,9 +381,22 @@ impl Kernel {
             // set_tid_address also returns the tid.
             Sysno::Getpid | Sysno::Gettid | Sysno::SetTidAddress => i64::from(self.cur.pid),
             Sysno::Getppid => i64::from(self.cur.ppid),
+            // Resource / scheduling / process-attribute syscalls (informational).
+            Sysno::SchedGetaffinity => {
+                sys_misc::sys_sched_getaffinity(args[1], args[2], mem)
+            }
+            Sysno::SchedGetparam => sys_misc::sys_sched_getparam(args[1], mem),
+            Sysno::Getrusage => sys_misc::sys_getrusage(args[1], mem),
+            Sysno::Sysinfo => sys_misc::sys_sysinfo(args[0], mem),
+            Sysno::Times => sys_misc::sys_times(args[0], mem),
+            Sysno::Getcpu => sys_misc::sys_getcpu(args[0], args[1], mem),
+            Sysno::Capget => sys_misc::sys_capget(args[1], mem),
+            Sysno::Prlimit64 => sys_misc::sys_prlimit64(args[1], args[3], mem),
+            Sysno::Getrlimit => sys_misc::sys_getrlimit(args[0], args[1], mem),
+            Sysno::Prctl => self.sys_prctl(args, mem),
             // Succeed as root / no-op: uid queries, signal setup, robust list,
-            // permission/ownership/timestamp changes, and socket options —
-            // none modeled yet.
+            // permission/ownership/timestamp changes, socket options, and the
+            // scheduling/process-attribute setters — none modeled yet.
             Sysno::Getuid
             | Sysno::Geteuid
             | Sysno::Getgid
@@ -392,7 +410,21 @@ impl Kernel {
             | Sysno::Fchown
             | Sysno::Utimensat
             | Sysno::Setsockopt
-            | Sysno::Getsockopt => 0,
+            | Sysno::Getsockopt
+            | Sysno::SchedYield
+            | Sysno::SchedSetaffinity
+            | Sysno::SchedGetscheduler
+            | Sysno::SchedSetscheduler
+            | Sysno::SchedGetPriorityMax
+            | Sysno::SchedGetPriorityMin
+            | Sysno::Setrlimit
+            | Sysno::Getpriority
+            | Sysno::Setpriority
+            | Sysno::Personality
+            | Sysno::Sethostname
+            | Sysno::Setdomainname
+            | Sysno::Capset
+            | Sysno::Membarrier => 0,
             _ => {
                 *self.unsupported.entry(raw).or_default() += 1;
                 err(Errno::ENOSYS)
