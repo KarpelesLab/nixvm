@@ -18,8 +18,19 @@
 //! `CL`, `XCHG`, the `REP`/`REPE`/`REPNE`-prefixed string ops (`MOVS`/`STOS`/
 //! `LODS`/`SCAS`/`CMPS`, honoring `DF` via `CLD`/`STD`), and `SYSCALL`. The
 //! `0x66` operand-size prefix is decoded (16-bit width) even though most
-//! flag/overflow edge cases are only exercised at 32/64-bit widths. Anything
-//! else surfaces as [`Exit::IllegalInstruction`].
+//! flag/overflow edge cases are only exercised at 32/64-bit widths.
+//!
+//! Also covers SSE/SSE2: a 16-entry `xmm` register file plus `MOVSS`/`MOVSD`/
+//! `MOVAPS`/`MOVUPS`/`MOVAPD`/`MOVUPD`/`MOVDQA`/`MOVDQU`/`MOVD`/`MOVQ`,
+//! scalar `ADDSD`/`SUBSD`/`MULSD`/`DIVSD`/`SQRTSD`/`MINSD`/`MAXSD` (and their
+//! `SS` single-precision counterparts), packed `PS`/`PD` arithmetic sharing
+//! the same opcodes, `CVTSI2SD`/`CVTSI2SS`/`CVTTSD2SI`/`CVTTSS2SI`/
+//! `CVTSD2SI`/`CVTSS2SI`/`CVTSD2SS`/`CVTSS2SD`, `UCOMISD`/`COMISD`/
+//! `UCOMISS`/`COMISS`, the packed-integer `PXOR`/`POR`/`PAND`/`PANDN`/
+//! `PCMPEQB`/`PCMPEQD`/`PADDB`/`PSUBB`, `PMOVMSKB`, and `XORPS`/`XORPD`/
+//! `ANDPS`/`ANDPD` (the mandatory `0x66`/`0xF2`/`0xF3` prefixes are decoded
+//! as opcode-selectors here, not as operand-size/`REP`). Anything else
+//! surfaces as [`Exit::IllegalInstruction`].
 
 use crate::abi::Arch;
 
@@ -188,6 +199,89 @@ enum AluOp {
     Test,
 }
 
+/// SSE scalar/packed floating-point operation selected by the `0F 51/54..5F`
+/// opcode group (`Sqrt` is unary; the rest read `dst op src`).
+#[derive(Clone, Copy)]
+enum SseOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+    Sqrt,
+}
+
+/// The 128-bit bitwise op selected by `ANDPS`/`XORPS`/`PAND`/`PANDN`/`POR`/
+/// `PXOR` — all four opcodes (float-tagged or integer-tagged) compute the
+/// same bit pattern, so one enum covers both opcode families.
+#[derive(Clone, Copy)]
+enum BitOp {
+    And,
+    Andn,
+    Or,
+    Xor,
+}
+
+/// Apply `f` lane-wise (`f64`) to the low `lanes` 8-byte lanes of `dst`/`src`,
+/// leaving the untouched upper lanes of `dst` as-is — this is exactly the
+/// "scalar op preserves the destination's upper bits" rule SSE arithmetic
+/// follows (`lanes == 1`), generalized to the packed form (`lanes == 2`).
+#[allow(clippy::many_single_char_names)] // dst/src/lanes/f is the natural naming for a lane op
+fn f64_lane_binop(dst: u128, src: u128, lanes: usize, f: impl Fn(f64, f64) -> f64) -> u128 {
+    let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+    let mut out = d;
+    for i in 0..lanes {
+        let o = i * 8;
+        let a = f64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+        let b = f64::from_le_bytes(s[o..o + 8].try_into().unwrap());
+        out[o..o + 8].copy_from_slice(&f(a, b).to_le_bytes());
+    }
+    u128::from_le_bytes(out)
+}
+
+/// Unary counterpart of [`f64_lane_binop`] (e.g. `SQRTSD`/`SQRTPD`): each
+/// touched lane comes from `src`, not from combining it with `dst`.
+#[allow(clippy::many_single_char_names)] // dst/src/lanes/f is the natural naming for a lane op
+fn f64_lane_unop(dst: u128, src: u128, lanes: usize, f: impl Fn(f64) -> f64) -> u128 {
+    let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+    let mut out = d;
+    for i in 0..lanes {
+        let o = i * 8;
+        let b = f64::from_le_bytes(s[o..o + 8].try_into().unwrap());
+        out[o..o + 8].copy_from_slice(&f(b).to_le_bytes());
+    }
+    u128::from_le_bytes(out)
+}
+
+/// `f32` counterpart of [`f64_lane_binop`] (4-byte lanes, up to 4 of them for
+/// the packed `PS` forms).
+#[allow(clippy::many_single_char_names)] // dst/src/lanes/f is the natural naming for a lane op
+fn f32_lane_binop(dst: u128, src: u128, lanes: usize, f: impl Fn(f32, f32) -> f32) -> u128 {
+    let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+    let mut out = d;
+    for i in 0..lanes {
+        let o = i * 4;
+        let a = f32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+        let b = f32::from_le_bytes(s[o..o + 4].try_into().unwrap());
+        out[o..o + 4].copy_from_slice(&f(a, b).to_le_bytes());
+    }
+    u128::from_le_bytes(out)
+}
+
+/// `f32` counterpart of [`f64_lane_unop`].
+#[allow(clippy::many_single_char_names)] // dst/src/lanes/f is the natural naming for a lane op
+fn f32_lane_unop(dst: u128, src: u128, lanes: usize, f: impl Fn(f32) -> f32) -> u128 {
+    let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+    let mut out = d;
+    for i in 0..lanes {
+        let o = i * 4;
+        let b = f32::from_le_bytes(s[o..o + 4].try_into().unwrap());
+        out[o..o + 4].copy_from_slice(&f(b).to_le_bytes());
+    }
+    u128::from_le_bytes(out)
+}
+
 /// Mask `v` to `width` bits (8/16/32/64); a no-op at `width == 64`.
 const fn mask_w(v: u64, width: u32) -> u64 {
     match width {
@@ -321,6 +415,9 @@ macro_rules! fetch {
 struct X86Interp {
     /// rax..r15, in the standard ModRM/REX numbering.
     gpr: [u64; 16],
+    /// xmm0..xmm15, in the standard ModRM/REX numbering (extended the same
+    /// way as `gpr` via `REX.R`/`REX.B`).
+    xmm: [u128; 16],
     rip: u64,
     flags: Flags,
     /// The direction flag: `false` (`CLD`) advances string-op pointers
@@ -336,6 +433,7 @@ impl X86Interp {
         gpr[RSP] = stack;
         Self {
             gpr,
+            xmm: [0u128; 16],
             rip: entry,
             flags: Flags::default(),
             df: false,
@@ -488,6 +586,56 @@ impl X86Interp {
                 mem.write(a, &bytes[..n])
                     .map_err(|_| Step::Fault { addr: a, write: true })
             }
+        }
+    }
+
+    // ---- XMM operand read/write. Separate from `read_operand`/
+    // `write_operand` because those two address the GPR file (`self.gpr`);
+    // an SSE `Operand::Reg(r)` instead names `self.xmm[r]`. Only the `Mem`
+    // case is shared logic (re-derived here at the widths SSE needs: 32/64
+    // scalar lanes and the full 128-bit `xmm/m128` forms). ----
+
+    /// Read a 32- or 64-bit scalar lane from an SSE r/m operand (`xmm/m32`
+    /// or `xmm/m64`) — the low bits of an `xmm` register, or a memory load.
+    fn xmm_read_lo(&self, mem: &GuestMemory, op: Operand, width: u32) -> Result<u64, Step> {
+        match op {
+            Operand::Reg(r) => Ok(mask_w(self.xmm[r] as u64, width)),
+            Operand::Mem(a) => {
+                let n = (width / 8) as usize;
+                let mut b = [0u8; 8];
+                mem.read(a, &mut b[..n])
+                    .map_err(|_| Step::Fault { addr: a, write: false })?;
+                Ok(u64::from_le_bytes(b))
+            }
+            Operand::Reg8Hi(_) => unreachable!("SSE decode never yields an 8-bit-high operand"),
+        }
+    }
+
+    /// Read a full 128-bit SSE r/m operand (`xmm/m128`).
+    fn xmm_read128(&self, mem: &GuestMemory, op: Operand) -> Result<u128, Step> {
+        match op {
+            Operand::Reg(r) => Ok(self.xmm[r]),
+            Operand::Mem(a) => {
+                let mut b = [0u8; 16];
+                mem.read(a, &mut b)
+                    .map_err(|_| Step::Fault { addr: a, write: false })?;
+                Ok(u128::from_le_bytes(b))
+            }
+            Operand::Reg8Hi(_) => unreachable!("SSE decode never yields an 8-bit-high operand"),
+        }
+    }
+
+    /// Write a full 128-bit value to an SSE r/m operand (`xmm/m128`).
+    fn xmm_write128(&mut self, mem: &mut GuestMemory, op: Operand, val: u128) -> Result<(), Step> {
+        match op {
+            Operand::Reg(r) => {
+                self.xmm[r] = val;
+                Ok(())
+            }
+            Operand::Mem(a) => mem
+                .write(a, &val.to_le_bytes())
+                .map_err(|_| Step::Fault { addr: a, write: true }),
+            Operand::Reg8Hi(_) => unreachable!("SSE decode never yields an 8-bit-high operand"),
         }
     }
 
@@ -1237,7 +1385,10 @@ impl X86Interp {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    // `opsize16`/`rep` are only consulted by the SSE fallback (see
+    // `exec_0f_sse`); the two-byte opcode map is wide enough that threading
+    // them through here is simpler than re-decoding prefixes twice.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn exec_0f(
         &mut self,
         mem: &mut GuestMemory,
@@ -1245,6 +1396,8 @@ impl X86Interp {
         rex: Rex,
         has_rex: bool,
         width: u32,
+        opsize16: bool,
+        rep: u8,
     ) -> Step {
         let (op2, pc) = fetch!(fetch_u8(mem, pc));
         match op2 {
@@ -1309,8 +1462,412 @@ impl X86Interp {
                 self.gpr[modrm.reg] = mask_w(val, width);
                 self.next(pc2)
             }
+            _ => self.exec_0f_sse(mem, pc, rex, opsize16, rep, op2),
+        }
+    }
+
+    /// The SSE/SSE2 subset of the two-byte `0F` opcode map: everything
+    /// [`exec_0f`] doesn't already claim. `opsize16` (`0x66`) and `rep`
+    /// (`1` = `0xF3`, `2` = `0xF2`) are the *mandatory* prefixes that select
+    /// among the `PS`/`PD`/`SS`/`SD` (or plain/`66` integer) variants each
+    /// opcode packs together — not the operand-size/`REP` prefixes they'd be
+    /// on a non-`0F` opcode.
+    #[allow(clippy::too_many_lines)] // one flat opcode dispatch, same style as exec_0f
+    fn exec_0f_sse(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        opsize16: bool,
+        rep: u8,
+        op2: u8,
+    ) -> Step {
+        // REX.W selects a 64-bit GPR operand for the SSE<->GPR forms
+        // (MOVD/MOVQ, CVTSI2S*, CVTS*2SI); the `0x66` mandatory prefix here
+        // is *not* the 16-bit operand-size prefix, so it must not shrink it.
+        let gw = if rex.w { 64 } else { 32 };
+        match op2 {
+            0x10 | 0x11 => self.sse_move(mem, pc, rex, rep, op2 == 0x11),
+            0x28 | 0x29 | 0x6F | 0x7F => self.sse_movaps(mem, pc, rex, matches!(op2, 0x29 | 0x7F)),
+            0x6E => self.sse_movd_load(mem, pc, rex, gw),
+            0x7E if rep == 1 => self.sse_movq_xmm_load(mem, pc, rex),
+            0x7E => self.sse_movd_store(mem, pc, rex, gw),
+            0xD6 => self.sse_movq_store(mem, pc, rex),
+            0xD7 => self.sse_pmovmskb(mem, pc, rex),
+            0x2A => self.sse_cvtsi2sx(mem, pc, rex, gw, rep),
+            0x2C => self.sse_cvt_sx2si(mem, pc, rex, gw, rep, false),
+            0x2D => self.sse_cvt_sx2si(mem, pc, rex, gw, rep, true),
+            0x2E | 0x2F => self.sse_comis(mem, pc, rex, opsize16),
+            0x51 => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Sqrt),
+            0x54 | 0xDB => self.sse_bitwise(mem, pc, rex, BitOp::And),
+            0x57 | 0xEF => self.sse_bitwise(mem, pc, rex, BitOp::Xor),
+            0x58 => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Add),
+            0x59 => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Mul),
+            0x5A => self.sse_cvt_ss_sd(mem, pc, rex, rep),
+            0x5C => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Sub),
+            0x5D => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Min),
+            0x5E => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Div),
+            0x5F => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Max),
+            0x74 => self.sse_pcmpeq(mem, pc, rex, 1),
+            0x76 => self.sse_pcmpeq(mem, pc, rex, 4),
+            0xDF => self.sse_bitwise(mem, pc, rex, BitOp::Andn),
+            0xEB => self.sse_bitwise(mem, pc, rex, BitOp::Or),
+            0xFC => self.sse_paddsubb(mem, pc, rex, true),
+            0xF8 => self.sse_paddsubb(mem, pc, rex, false),
             _ => Step::Illegal,
         }
+    }
+
+    /// `MOVUPS`/`MOVUPD` (no mandatory prefix / `0x66`, full 128-bit) and
+    /// `MOVSS`/`MOVSD` (`0xF3`/`0xF2`, 32-/64-bit scalar): load (`store ==
+    /// false`) or store (`store == true`) between `xmm(reg)` and `xmm/m
+    /// (r/m)`. The scalar forms only ever touch the low lane; a *register*
+    /// destination keeps its upper bits, while a *memory* destination or
+    /// source has none to preserve (mem-to-reg zeroes the upper lanes, per
+    /// the `MOVSS`/`MOVSD` spec).
+    fn sse_move(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, rep: u8, store: bool) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let lane_bits = match rep {
+            1 => Some(32u32),
+            2 => Some(64u32),
+            _ => None,
+        };
+        match (lane_bits, store) {
+            (None, false) => {
+                let v = fetch!(self.xmm_read128(mem, rm_op));
+                self.xmm[modrm.reg] = v;
+            }
+            (None, true) => {
+                let v = self.xmm[modrm.reg];
+                fetch!(self.xmm_write128(mem, rm_op, v));
+            }
+            (Some(w), false) => {
+                let is_reg = matches!(rm_op, Operand::Reg(_));
+                let lo = fetch!(self.xmm_read_lo(mem, rm_op, w));
+                self.xmm[modrm.reg] = if is_reg {
+                    (self.xmm[modrm.reg] & !u128::from(mask_w(u64::MAX, w))) | u128::from(lo)
+                } else {
+                    u128::from(lo)
+                };
+            }
+            (Some(w), true) => match rm_op {
+                Operand::Reg(r) => {
+                    let src = self.xmm[modrm.reg];
+                    self.xmm[r] = (self.xmm[r] & !u128::from(mask_w(u64::MAX, w))) | u128::from(mask_w(src as u64, w));
+                }
+                Operand::Mem(a) => {
+                    let src = mask_w(self.xmm[modrm.reg] as u64, w);
+                    let n = (w / 8) as usize;
+                    let bytes = src.to_le_bytes();
+                    fetch!(mem.write(a, &bytes[..n]).map_err(|_| Step::Fault { addr: a, write: true }));
+                }
+                Operand::Reg8Hi(_) => unreachable!("SSE decode never yields an 8-bit-high operand"),
+            },
+        }
+        self.next(pc2)
+    }
+
+    /// `MOVAPS`/`MOVAPD`/`MOVDQA`/`MOVDQU`: an unconditional full 128-bit
+    /// load or store (alignment isn't enforced by this interpreter, so the
+    /// aligned/unaligned and float/int-tagged variants all collapse to the
+    /// same move).
+    fn sse_movaps(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, store: bool) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        if store {
+            let v = self.xmm[modrm.reg];
+            fetch!(self.xmm_write128(mem, rm_op, v));
+        } else {
+            let v = fetch!(self.xmm_read128(mem, rm_op));
+            self.xmm[modrm.reg] = v;
+        }
+        self.next(pc2)
+    }
+
+    /// `MOVD`/`MOVQ` load (`66 0F 6E`): `xmm(reg) <- r/m32` (or `r/m64`
+    /// under `REX.W`), zero-extended to 128 bits. The r/m side is a GPR or
+    /// memory, so this reuses [`Self::read_operand`] (the GPR file), not the
+    /// `xmm` helpers.
+    fn sse_movd_load(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, gw: u32) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let val = fetch!(self.read_operand(mem, rm_op, gw));
+        self.xmm[modrm.reg] = u128::from(val);
+        self.next(pc2)
+    }
+
+    /// `MOVD`/`MOVQ` store (`66 0F 7E`): `r/m32` (or `r/m64` under `REX.W`)
+    /// `<- xmm(reg)`'s low lane.
+    fn sse_movd_store(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, gw: u32) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let val = mask_w(self.xmm[modrm.reg] as u64, gw);
+        fetch!(self.write_operand(mem, rm_op, val, gw));
+        self.next(pc2)
+    }
+
+    /// `MOVQ xmm1, xmm2/m64` (`F3 0F 7E`): load form — `xmm(reg) <- r/m64`,
+    /// zeroing the upper 64 bits (unlike `MOVD`/`MOVQ`'s `66`-prefixed GPR
+    /// form, the r/m side here is another `xmm`/memory).
+    fn sse_movq_xmm_load(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let lo = fetch!(self.xmm_read_lo(mem, rm_op, 64));
+        self.xmm[modrm.reg] = u128::from(lo);
+        self.next(pc2)
+    }
+
+    /// `MOVQ xmm2/m64, xmm1` (`66 0F D6`): store form — `r/m64 <-
+    /// xmm(reg)`'s low 64 bits; when the destination is itself an `xmm`
+    /// register, its upper 64 bits are zeroed (not preserved).
+    fn sse_movq_store(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let lo = self.xmm[modrm.reg] as u64;
+        match rm_op {
+            Operand::Reg(r) => self.xmm[r] = u128::from(lo),
+            Operand::Mem(a) => {
+                fetch!(mem.write(a, &lo.to_le_bytes()).map_err(|_| Step::Fault { addr: a, write: true }));
+            }
+            Operand::Reg8Hi(_) => unreachable!("SSE decode never yields an 8-bit-high operand"),
+        }
+        self.next(pc2)
+    }
+
+    /// `PMOVMSKB Gd, xmm` (`66 0F D7`): each of the 16 bytes' sign bit packs
+    /// into the corresponding bit of a GPR, zero-extended.
+    fn sse_pmovmskb(&mut self, mem: &GuestMemory, pc: u64, rex: Rex) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let bytes = src.to_le_bytes();
+        let mut mask = 0u64;
+        for (i, b) in bytes.iter().enumerate() {
+            if b & 0x80 != 0 {
+                mask |= 1 << i;
+            }
+        }
+        self.gpr[modrm.reg] = mask;
+        self.next(pc2)
+    }
+
+    /// `CVTSI2SD`/`CVTSI2SS` (`F2`/`F3` `0F 2A`): `xmm(reg)`'s low lane `<-
+    /// (f64|f32) r/m` (a signed GPR or memory integer, `gw`-bits wide); the
+    /// destination's upper bits are preserved (this is an arithmetic-style
+    /// op, not a move).
+    #[allow(clippy::cast_precision_loss)] // int->float is exactly what CVTSI2S* does
+    fn sse_cvtsi2sx(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, gw: u32, rep: u8) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let raw = fetch!(self.read_operand(mem, rm_op, gw));
+        let ival = sign_extend_w(raw, gw);
+        self.xmm[modrm.reg] = if rep == 2 {
+            let bits = u128::from((ival as f64).to_bits());
+            (self.xmm[modrm.reg] & !u128::from(u64::MAX)) | bits
+        } else {
+            let bits = u128::from((ival as f32).to_bits());
+            (self.xmm[modrm.reg] & !u128::from(u32::MAX)) | bits
+        };
+        self.next(pc2)
+    }
+
+    /// `CVTTSD2SI`/`CVTTSS2SI` (`truncate == false` is misleading — see
+    /// below) and `CVTSD2SI`/`CVTSS2SI`: `Gd/Gq(reg) <- (i64) xmm/m` (a
+    /// `F2`/`F3`-selected `f64`/`f32` source), either truncated toward zero
+    /// (`CVTT*`, `round == false`) or rounded to nearest-even (`CVT*`,
+    /// `round == true`).
+    fn sse_cvt_sx2si(
+        &mut self,
+        mem: &GuestMemory,
+        pc: u64,
+        rex: Rex,
+        gw: u32,
+        rep: u8,
+        round: bool,
+    ) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let result: i64 = if rep == 2 {
+            let bits = fetch!(self.xmm_read_lo(mem, rm_op, 64));
+            let f = f64::from_bits(bits);
+            if round { f.round_ties_even() as i64 } else { f.trunc() as i64 }
+        } else {
+            let bits = fetch!(self.xmm_read_lo(mem, rm_op, 32));
+            let f = f32::from_bits(bits as u32);
+            if round { f.round_ties_even() as i64 } else { f.trunc() as i64 }
+        };
+        self.gpr[modrm.reg] = if gw == 64 { result as u64 } else { mask_w(result as u64, 32) };
+        self.next(pc2)
+    }
+
+    /// `CVTSD2SS`/`CVTSS2SD` (`F2`/`F3 0F 5A`): narrow or widen the low lane
+    /// between `f64` and `f32`, preserving the destination's other bits.
+    fn sse_cvt_ss_sd(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, rep: u8) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        match rep {
+            2 => {
+                let bits = fetch!(self.xmm_read_lo(mem, rm_op, 64));
+                let f = f64::from_bits(bits) as f32;
+                self.xmm[modrm.reg] =
+                    (self.xmm[modrm.reg] & !u128::from(u32::MAX)) | u128::from(f.to_bits());
+            }
+            1 => {
+                let bits = fetch!(self.xmm_read_lo(mem, rm_op, 32));
+                let f = f64::from(f32::from_bits(bits as u32));
+                self.xmm[modrm.reg] =
+                    (self.xmm[modrm.reg] & !u128::from(u64::MAX)) | u128::from(f.to_bits());
+            }
+            _ => return Step::Illegal, // CVTPS2PD/CVTPD2PS (packed): not in our documented subset
+        }
+        self.next(pc2)
+    }
+
+    /// `UCOMISD`/`COMISD` (`66 0F 2E`/`2F`) and `UCOMISS`/`COMISS` (`0F
+    /// 2E`/`2F`): compare `xmm(reg)` against `xmm/m (r/m)` and set `ZF`/
+    /// `PF`/`CF` per the IEEE-754 ordered-compare predicate table (unordered
+    /// — either operand `NaN` — sets all three; otherwise exactly one of
+    /// less-than/equal/greater-than holds). `OF`/`SF` are always cleared; we
+    /// don't distinguish the signaling (`COMIS*`) and quiet (`UCOMIS*`)
+    /// `#I` exception behavior since this interpreter doesn't model FP
+    /// exceptions at all.
+    fn sse_comis(&mut self, mem: &GuestMemory, pc: u64, rex: Rex, opsize16: bool) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let (unordered, gt, lt) = if opsize16 {
+            let a = f64::from_bits(self.xmm[modrm.reg] as u64);
+            let bits = fetch!(self.xmm_read_lo(mem, rm_op, 64));
+            let b = f64::from_bits(bits);
+            (a.is_nan() || b.is_nan(), a > b, a < b)
+        } else {
+            let a = f32::from_bits(self.xmm[modrm.reg] as u32);
+            let bits = fetch!(self.xmm_read_lo(mem, rm_op, 32));
+            let b = f32::from_bits(bits as u32);
+            (a.is_nan() || b.is_nan(), a > b, a < b)
+        };
+        self.flags = Flags {
+            cf: unordered || lt,
+            zf: unordered || (!gt && !lt),
+            pf: unordered,
+            of: false,
+            sf: false,
+        };
+        self.next(pc2)
+    }
+
+    /// The `0F 51`/`54..5F` scalar+packed arithmetic group: `ADD`/`SUB`/
+    /// `MUL`/`DIV`/`MIN`/`MAX`/`SQRT`, each packing four variants into one
+    /// opcode via the mandatory prefix — no prefix = packed `PS` (4x
+    /// `f32`), `0x66` = packed `PD` (2x `f64`), `0xF3` = scalar `SS`,
+    /// `0xF2` = scalar `SD`. The scalar/packed distinction is just the lane
+    /// count; [`f64_lane_binop`]/[`f32_lane_binop`] (and their unary
+    /// counterparts for `SQRT`) already leave a scalar op's upper lanes as
+    /// `dst`'s original bits.
+    fn sse_arith(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        opsize16: bool,
+        rep: u8,
+        op: SseOp,
+    ) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let dst = self.xmm[modrm.reg];
+        let apply_f64 = |dst: u128, src: u128, lanes: usize| match op {
+            SseOp::Add => f64_lane_binop(dst, src, lanes, |a, b| a + b),
+            SseOp::Sub => f64_lane_binop(dst, src, lanes, |a, b| a - b),
+            SseOp::Mul => f64_lane_binop(dst, src, lanes, |a, b| a * b),
+            SseOp::Div => f64_lane_binop(dst, src, lanes, |a, b| a / b),
+            SseOp::Min => f64_lane_binop(dst, src, lanes, |a, b| if a < b { a } else { b }),
+            SseOp::Max => f64_lane_binop(dst, src, lanes, |a, b| if a > b { a } else { b }),
+            SseOp::Sqrt => f64_lane_unop(dst, src, lanes, f64::sqrt),
+        };
+        let apply_f32 = |dst: u128, src: u128, lanes: usize| match op {
+            SseOp::Add => f32_lane_binop(dst, src, lanes, |a, b| a + b),
+            SseOp::Sub => f32_lane_binop(dst, src, lanes, |a, b| a - b),
+            SseOp::Mul => f32_lane_binop(dst, src, lanes, |a, b| a * b),
+            SseOp::Div => f32_lane_binop(dst, src, lanes, |a, b| a / b),
+            SseOp::Min => f32_lane_binop(dst, src, lanes, |a, b| if a < b { a } else { b }),
+            SseOp::Max => f32_lane_binop(dst, src, lanes, |a, b| if a > b { a } else { b }),
+            SseOp::Sqrt => f32_lane_unop(dst, src, lanes, f32::sqrt),
+        };
+        let result = match rep {
+            2 => {
+                let bits = fetch!(self.xmm_read_lo(mem, rm_op, 64));
+                apply_f64(dst, u128::from(bits), 1)
+            }
+            1 => {
+                let bits = fetch!(self.xmm_read_lo(mem, rm_op, 32));
+                apply_f32(dst, u128::from(bits), 1)
+            }
+            _ if opsize16 => {
+                let src = fetch!(self.xmm_read128(mem, rm_op));
+                apply_f64(dst, src, 2)
+            }
+            _ => {
+                let src = fetch!(self.xmm_read128(mem, rm_op));
+                apply_f32(dst, src, 4)
+            }
+        };
+        self.xmm[modrm.reg] = result;
+        self.next(pc2)
+    }
+
+    /// `ANDPS`/`ANDPD`/`PAND` (`0F 54`/`66 0F 54`/`66 0F DB`), `XORPS`/
+    /// `XORPD`/`PXOR` (`0F 57`/`66 0F 57`/`66 0F EF`), `POR` (`66 0F EB`)
+    /// and `PANDN` (`66 0F DF`): a plain 128-bit bitwise op, `dst = dst OP
+    /// src`. The float-tagged (`ANDPS`/`XORPS`) and integer-tagged (`PAND`/
+    /// `PXOR`) opcodes compute an identical bit pattern, so [`BitOp`]
+    /// doesn't need to distinguish which opcode selected it.
+    fn sse_bitwise(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, op: BitOp) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let dst = self.xmm[modrm.reg];
+        self.xmm[modrm.reg] = match op {
+            BitOp::And => dst & src,
+            BitOp::Andn => !dst & src,
+            BitOp::Or => dst | src,
+            BitOp::Xor => dst ^ src,
+        };
+        self.next(pc2)
+    }
+
+    /// `PCMPEQB`/`PCMPEQD` (`66 0F 74`/`76`): compare `dst` and `src`
+    /// lane-wise (`lane_bytes` = 1 for `PCMPEQB`, 4 for `PCMPEQD`), setting
+    /// each equal lane to all-1s and each unequal lane to all-0s.
+    fn sse_pcmpeq(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, lane_bytes: usize) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let dst = self.xmm[modrm.reg];
+        let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+        let mut out = [0u8; 16];
+        for lane in (0..16).step_by(lane_bytes) {
+            let eq = d[lane..lane + lane_bytes] == s[lane..lane + lane_bytes];
+            let fill = if eq { 0xffu8 } else { 0u8 };
+            out[lane..lane + lane_bytes].fill(fill);
+        }
+        self.xmm[modrm.reg] = u128::from_le_bytes(out);
+        self.next(pc2)
+    }
+
+    /// `PADDB`/`PSUBB` (`66 0F FC`/`F8`): wrapping byte-lane add/subtract.
+    fn sse_paddsubb(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, add: bool) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let dst = self.xmm[modrm.reg];
+        let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+        let mut out = [0u8; 16];
+        for i in 0..16 {
+            out[i] = if add { d[i].wrapping_add(s[i]) } else { d[i].wrapping_sub(s[i]) };
+        }
+        self.xmm[modrm.reg] = u128::from_le_bytes(out);
+        self.next(pc2)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1556,7 +2113,7 @@ impl X86Interp {
                 }
             }
             0x90 => self.next(pc), // NOP (also XCHG eax,eax, a no-op either way)
-            0x0F => self.exec_0f(mem, pc, rex, has_rex, width),
+            0x0F => self.exec_0f(mem, pc, rex, has_rex, width, opsize16, rep),
             _ => Step::Illegal,
         }
     }
@@ -1631,6 +2188,7 @@ impl Vcpu for X86Interp {
 
     fn reset(&mut self, entry: u64, sp: u64) {
         self.gpr = [0; 16];
+        self.xmm = [0; 16];
         self.gpr[RSP] = sp;
         self.rip = entry;
         self.flags = Flags::default();
@@ -1641,6 +2199,12 @@ impl Vcpu for X86Interp {
 
 #[cfg(test)]
 mod tests {
+    // The SSE arithmetic tests below compare against IEEE-754 values that
+    // are exactly representable (integers, halves, and sqrt() of a value
+    // computed the same way) and produced by the exact same deterministic
+    // operation being tested, so an exact comparison is the right check.
+    #![allow(clippy::float_cmp)]
+
     use super::*;
     use crate::vcpu::Prot;
 
@@ -2545,5 +3109,165 @@ mod tests {
             other => panic!("unexpected exit before the loop could fall through: {other:?}"),
         }
         assert_eq!(cpu.gpr[RDX] & 0xffff_ffff, 15, "1+2+3+4+5 == 15");
+    }
+
+    #[test]
+    fn sse_movsd_load_store_and_scalar_arith() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let a_addr = 0x1_2000u64;
+        let b_addr = 0x1_2008u64;
+        let out_addr = 0x1_2010u64;
+        m.write_init(a_addr, &3.0f64.to_le_bytes()).unwrap();
+        m.write_init(b_addr, &4.0f64.to_le_bytes()).unwrap();
+        cpu.gpr[RAX] = a_addr;
+        cpu.gpr[RBX] = b_addr;
+        cpu.gpr[RCX] = out_addr;
+
+        // movsd xmm0, [rax]  (F2 0F 10 /r, modrm=00 000 000)
+        m.write_init(CODE, &[0xF2, 0x0F, 0x10, 0x00]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.xmm[0] as u64, 3.0f64.to_bits(), "MOVSD load from [rax]");
+        assert_eq!(cpu.xmm[0] >> 64, 0, "MOVSD mem-load zeroes the upper 64 bits");
+
+        // movsd xmm1, [rbx]  (F2 0F 10 /r, modrm=00 001 011)
+        m.write_init(CODE, &[0xF2, 0x0F, 0x10, 0x0B]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.xmm[1] as u64, 4.0f64.to_bits());
+
+        // Reg-reg MOVSD must preserve the destination's upper 64 bits.
+        cpu.xmm[3] = 0xdead_beefu128 << 64;
+        // movsd xmm3, xmm1  (F2 0F 10 /r, modrm=11 011 001)
+        m.write_init(CODE, &[0xF2, 0x0F, 0x10, 0xD9]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.xmm[3] >> 64, 0xdead_beef, "reg-reg MOVSD preserves dest's upper bits");
+        assert_eq!(cpu.xmm[3] as u64, 4.0f64.to_bits());
+
+        // addsd xmm0, xmm1  (F2 0F 58 /r, modrm=11 000 001) -> 3.0 + 4.0 = 7.0
+        m.write_init(CODE, &[0xF2, 0x0F, 0x58, 0xC1]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(f64::from_bits(cpu.xmm[0] as u64), 7.0);
+
+        // movsd [rcx], xmm0  (F2 0F 11 /r, modrm=00 000 001) -> store 7.0
+        m.write_init(CODE, &[0xF2, 0x0F, 0x11, 0x01]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(f64::from_bits(m.read_u64(out_addr).unwrap()), 7.0);
+
+        // mulsd xmm0, xmm1  (F2 0F 59 /r, modrm=11 000 001) -> 7.0 * 4.0 = 28.0
+        m.write_init(CODE, &[0xF2, 0x0F, 0x59, 0xC1]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(f64::from_bits(cpu.xmm[0] as u64), 28.0);
+
+        // divsd xmm0, xmm1  (F2 0F 5E /r, modrm=11 000 001) -> 28.0 / 4.0 = 7.0
+        m.write_init(CODE, &[0xF2, 0x0F, 0x5E, 0xC1]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(f64::from_bits(cpu.xmm[0] as u64), 7.0);
+
+        // sqrtsd xmm2, xmm0  (F2 0F 51 /r, modrm=11 010 000) -> sqrt(7.0)
+        m.write_init(CODE, &[0xF2, 0x0F, 0x51, 0xD0]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(f64::from_bits(cpu.xmm[2] as u64), 7.0f64.sqrt());
+    }
+
+    #[test]
+    fn sse_cvtsi2sd_and_cvttsd2si_round_trip() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = (-42i64) as u64;
+        // cvtsi2sd xmm0, eax  (F2 0F 2A /r, modrm=11 000 000)
+        m.write_init(CODE, &[0xF2, 0x0F, 0x2A, 0xC0]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(f64::from_bits(cpu.xmm[0] as u64), -42.0);
+
+        // cvttsd2si ecx, xmm0  (F2 0F 2C /r, modrm=11 001 000)
+        m.write_init(CODE, &[0xF2, 0x0F, 0x2C, 0xC8]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RCX] as u32 as i32, -42, "CVTTSD2SI truncates back to the original int");
+    }
+
+    #[test]
+    fn sse_ucomisd_sets_zf_cf_pf() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+
+        // xmm0 = 1.0 < xmm1 = 2.0
+        cpu.xmm[0] = u128::from(1.0f64.to_bits());
+        cpu.xmm[1] = u128::from(2.0f64.to_bits());
+        // ucomisd xmm0, xmm1  (66 0F 2E /r, modrm=11 000 001)
+        m.write_init(CODE, &[0x66, 0x0F, 0x2E, 0xC1]).unwrap();
+        cpu.exec(&mut m);
+        assert!(cpu.flags.cf, "1.0 < 2.0 sets CF");
+        assert!(!cpu.flags.zf);
+        assert!(!cpu.flags.pf);
+
+        // equal
+        cpu.xmm[1] = u128::from(1.0f64.to_bits());
+        m.write_init(CODE, &[0x66, 0x0F, 0x2E, 0xC1]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert!(!cpu.flags.cf);
+        assert!(cpu.flags.zf, "1.0 == 1.0 sets ZF");
+        assert!(!cpu.flags.pf);
+
+        // greater
+        cpu.xmm[1] = u128::from(0.5f64.to_bits());
+        m.write_init(CODE, &[0x66, 0x0F, 0x2E, 0xC1]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert!(!cpu.flags.cf);
+        assert!(!cpu.flags.zf);
+        assert!(!cpu.flags.pf, "1.0 > 0.5 clears CF/ZF/PF");
+
+        // unordered (NaN)
+        cpu.xmm[1] = u128::from(f64::NAN.to_bits());
+        m.write_init(CODE, &[0x66, 0x0F, 0x2E, 0xC1]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert!(cpu.flags.cf && cpu.flags.zf && cpu.flags.pf, "an unordered compare sets CF/ZF/PF");
+        assert!(!cpu.flags.of && !cpu.flags.sf, "OF/SF are always cleared");
+    }
+
+    #[test]
+    fn sse_pxor_zeroes_register() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.xmm[0] = 0xdead_beef_dead_beef_dead_beef_dead_beefu128;
+        // pxor xmm0, xmm0  (66 0F EF /r, modrm=11 000 000)
+        m.write_init(CODE, &[0x66, 0x0F, 0xEF, 0xC0]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.xmm[0], 0);
+    }
+
+    #[test]
+    fn sse_pcmpeqb_and_pmovmskb() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let a: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let mut b = a;
+        b[0] = 0xFF; // byte 0 differs
+        b[15] = 0xFF; // byte 15 differs
+        cpu.xmm[0] = u128::from_le_bytes(a);
+        cpu.xmm[1] = u128::from_le_bytes(b);
+        // pcmpeqb xmm0, xmm1  (66 0F 74 /r, modrm=11 000 001)
+        m.write_init(CODE, &[0x66, 0x0F, 0x74, 0xC1]).unwrap();
+        cpu.exec(&mut m);
+        let mask_bytes = cpu.xmm[0].to_le_bytes();
+        assert_eq!(mask_bytes[0], 0x00, "unequal byte 0 -> all-zero lane");
+        assert_eq!(mask_bytes[1], 0xff, "equal byte 1 -> all-one lane");
+        assert_eq!(mask_bytes[15], 0x00, "unequal byte 15 -> all-zero lane");
+
+        // pmovmskb eax, xmm0  (66 0F D7 /r, modrm=11 000 000)
+        m.write_init(CODE, &[0x66, 0x0F, 0xD7, 0xC0]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 0x7ffe, "bits 1..=14 set, bits 0 and 15 clear");
     }
 }
