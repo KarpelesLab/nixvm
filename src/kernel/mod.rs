@@ -27,6 +27,7 @@ mod fs_ext;
 mod mem_syscalls;
 mod net;
 mod path;
+mod signal;
 mod stat;
 mod sys_misc;
 mod time;
@@ -52,6 +53,13 @@ struct ProcInfo {
     pid: i32,
     ppid: i32,
     run: RunState,
+    /// Per-signal disposition: `SIG_DFL` (0), `SIG_IGN` (1), or a handler
+    /// address. Indexed by signal number (1..=64); index 0 is unused.
+    handlers: [u64; 65],
+    /// Blocked-signal mask (bit `sig-1` set = blocked).
+    blocked: u64,
+    /// Pending-signal mask (bit `sig-1` set = pending).
+    pending: u64,
 }
 
 impl Default for ProcInfo {
@@ -67,6 +75,9 @@ impl Default for ProcInfo {
             pid: 0,
             ppid: 0,
             run: RunState::Running,
+            handlers: [0; 65],
+            blocked: 0,
+            pending: 0,
         }
     }
 }
@@ -264,6 +275,7 @@ impl Kernel {
                     self.block = false;
                     self.exec_ok = false;
                     let ret = self.dispatch(sys, raw, &args, vcpu.as_mut(), mem);
+                    self.deliver_pending_signals();
                     if let RunState::Zombie(_) = self.cur.run {
                         return Ok(true);
                     }
@@ -391,6 +403,12 @@ impl Kernel {
             Sysno::Execve => self.sys_execve(args[0], args[1], args[2], vcpu, mem),
             Sysno::Wait4 => self.sys_wait4(args[0] as i64, args[1], args[2], mem),
             Sysno::ExitGroup | Sysno::Exit => self.sys_exit(args[0] as i32),
+            Sysno::RtSigaction => self.sys_rt_sigaction(args[0], args[1], args[2], mem),
+            Sysno::RtSigprocmask => self.sys_rt_sigprocmask(args[0], args[1], args[2], mem),
+            Sysno::RtSigpending => self.sys_rt_sigpending(args[0], mem),
+            Sysno::RtSigtimedwait => err(Errno::EAGAIN),
+            Sysno::Kill | Sysno::Tkill => self.sys_kill(args[0] as i64, args[1]),
+            Sysno::Tgkill => self.sys_kill(args[1] as i64, args[2]),
             // pid/tid = this process's pid (single-thread so tid == pid);
             // set_tid_address also returns the tid.
             Sysno::Getpid | Sysno::Gettid | Sysno::SetTidAddress => i64::from(self.cur.pid),
@@ -418,8 +436,9 @@ impl Kernel {
             | Sysno::Geteuid
             | Sysno::Getgid
             | Sysno::Getegid
-            | Sysno::RtSigaction
-            | Sysno::RtSigprocmask
+            | Sysno::Sigaltstack
+            | Sysno::RtSigsuspend
+            | Sysno::RtSigreturn
             | Sysno::SetRobustList
             | Sysno::Fchmodat
             | Sysno::Fchmod
@@ -1701,5 +1720,103 @@ mod tests {
         );
         assert_eq!(len, 2);
         assert_eq!(mem.read_vec(cbuf, 1).unwrap(), b"/");
+    }
+
+    #[test]
+    fn rt_sigaction_stores_and_returns_old_handler() {
+        let (mut k, mut mem, mut v) = setup();
+        let act = 0x1_0000;
+        let oldact = 0x1_0100;
+
+        // Install handler 0xdead for SIGINT (2).
+        mem.write_init(act, &0xdeadu64.to_le_bytes()).unwrap();
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::RtSigaction, [2, act, 0, 8, 0, 0]),
+            0
+        );
+        assert_eq!(k.cur.handlers[2], 0xdead);
+
+        // Install 0xbeef and read back the previous (0xdead) via oldact.
+        mem.write_init(act, &0xbeefu64.to_le_bytes()).unwrap();
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::RtSigaction,
+                [2, act, oldact, 8, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(mem.read_u64(oldact).unwrap(), 0xdead);
+        assert_eq!(k.cur.handlers[2], 0xbeef);
+    }
+
+    #[test]
+    fn rt_sigaction_rejects_sigkill() {
+        let (mut k, mut mem, mut v) = setup();
+        let act = 0x1_0000;
+        mem.write_init(act, &1u64.to_le_bytes()).unwrap();
+        // SIGKILL (9) and SIGSTOP (19) dispositions cannot change.
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::RtSigaction, [9, act, 0, 8, 0, 0]),
+            -22
+        );
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::RtSigaction, [19, act, 0, 8, 0, 0]),
+            -22
+        );
+    }
+
+    #[test]
+    fn rt_sigprocmask_setmask_and_readback() {
+        let (mut k, mut mem, mut v) = setup();
+        let set = 0x1_0000;
+        let oldset = 0x1_0100;
+        mem.write_init(set, &0b1010u64.to_le_bytes()).unwrap();
+
+        // SIG_SETMASK (2) replaces the mask.
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::RtSigprocmask, [2, set, 0, 8, 0, 0]),
+            0
+        );
+        assert_eq!(k.cur.blocked, 0b1010);
+
+        // Read it back through oldset (set == 0 leaves the mask unchanged).
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::RtSigprocmask,
+                [0, 0, oldset, 8, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(mem.read_u64(oldset).unwrap(), 0b1010);
+    }
+
+    #[test]
+    fn kill_self_then_deliver_terminates() {
+        let (mut k, mut mem, mut v) = setup();
+        // kill(pid 1 == self, SIGTERM=15) sets the pending bit.
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Kill, [1, 15, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(k.cur.pending, 1 << 14);
+
+        // Default disposition of SIGTERM is TERMINATE -> exit code 128 + 15.
+        k.deliver_pending_signals();
+        assert!(matches!(k.cur.run, RunState::Zombie(143)));
+    }
+
+    #[test]
+    fn kill_nonexistent_pid_is_esrch() {
+        let (mut k, mut mem, mut v) = setup();
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Kill, [999, 15, 0, 0, 0, 0]),
+            -3
+        );
     }
 }

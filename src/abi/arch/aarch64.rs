@@ -6,6 +6,7 @@ use super::Sysno;
 
 /// Map a raw aarch64 syscall number to the normalized [`Sysno`].
 #[must_use]
+#[allow(clippy::too_many_lines)] // a flat syscall-number match table
 pub fn decode(nr: u64) -> Sysno {
     match nr {
         63 => Sysno::Read,
@@ -56,6 +57,14 @@ pub fn decode(nr: u64) -> Sysno {
         278 => Sysno::Getrandom,
         134 => Sysno::RtSigaction,
         135 => Sysno::RtSigprocmask,
+        136 => Sysno::RtSigpending,
+        137 => Sysno::RtSigtimedwait,
+        139 => Sysno::RtSigreturn,
+        133 => Sysno::RtSigsuspend,
+        132 => Sysno::Sigaltstack,
+        129 => Sysno::Kill,
+        130 => Sysno::Tkill,
+        131 => Sysno::Tgkill,
         98 => Sysno::Futex,
         25 => Sysno::Fcntl,
         59 => Sysno::Pipe2,
