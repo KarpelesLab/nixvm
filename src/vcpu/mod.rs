@@ -138,6 +138,7 @@ pub trait Backend {
 pub mod hvf;
 
 pub mod interp;
+pub mod interp_x86;
 
 /// Pick the best backend available for the host, targeting `guest`.
 ///
@@ -151,5 +152,10 @@ pub fn select(guest: Arch) -> Result<Box<dyn Backend>, VcpuError> {
         }
     }
     // TODO(Phase 10): KVM on Linux.
+    // x86-64 guests run on the dedicated x86 software interpreter; other guest
+    // arches fall back to `interp::InterpBackend`.
+    if guest == Arch::X86_64 {
+        return interp_x86::X86Backend::new(guest).map(|b| Box::new(b) as Box<dyn Backend>);
+    }
     interp::InterpBackend::new(guest).map(|b| Box::new(b) as Box<dyn Backend>)
 }
