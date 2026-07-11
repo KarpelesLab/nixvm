@@ -44,11 +44,11 @@ jobs:
           version: "latest"
 
       - name: Build the wasm demo (src/wasm.rs, `wasm` feature)
-        # `-- --lib` restricts the underlying `cargo build` to the library
-        # target only. Without it, cargo also tries to build src/bin/run-elf.rs
-        # (a native dev harness that mounts a host directory via a `cfg(unix)`
-        # Passthrough backend), which doesn't compile for wasm32-unknown-unknown.
-        run: wasm-pack build --target web --no-default-features --features wasm -- --lib
+        # wasm-pack already builds only the library target (`cargo build --lib`)
+        # internally, so it never touches src/bin/run-elf.rs (a native dev
+        # harness gated on `cfg(unix)`). Passing an extra `-- --lib` is a
+        # duplicate arg that wasm-pack rejects.
+        run: wasm-pack build --target web --no-default-features --features wasm
 
       - name: Assemble the Pages site
         run: |

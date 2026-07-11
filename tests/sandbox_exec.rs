@@ -3,6 +3,7 @@
 //! pipeline exercised through the embeddable entry point (ROADMAP Phases 1-2).
 
 use nixvm::Sandbox;
+use nixvm::abi::Arch;
 
 const EHDR_LEN: usize = 64;
 const PHDR_LEN: usize = 56;
@@ -49,6 +50,9 @@ fn sandbox_runs_static_elf_and_returns_exit_code() {
     let elf = build_elf(0x1_0000, &body);
 
     let code = Sandbox::builder()
+        // The ELF is aarch64; force that arch so the test is host-independent
+        // (the default arch follows the host — x86-64 on a Linux CI runner).
+        .arch(Arch::Aarch64)
         .command(["prog"])
         .prefer_interp(true)
         .mem_bytes(8 * 1024 * 1024)
