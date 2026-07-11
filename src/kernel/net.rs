@@ -1965,6 +1965,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // a linear socket round-trip; splitting hurts readability
     fn tcp_inet4_loopback_roundtrip() {
         let (mut k, mut mem, mut v) = setup();
         let addr = 0x1_1000;
