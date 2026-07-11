@@ -35,6 +35,10 @@ const S_IFREG: u32 = 0o100_000;
 /// Unix mode type bit for a symbolic link.
 const S_IFLNK: u32 = 0o120_000;
 
+/// `self/root`'s symlink target. A sandboxed process is never chrooted in
+/// this backend, so it always resolves to the filesystem root.
+const ROOT_TARGET: &str = "/";
+
 /// Every static path this backend knows, in a fixed order. The 1-based index
 /// into this table is the node's inode, which keeps every inode distinct for
 /// free. `self/fd/<n>` entries are not listed here — see [`fd_inode`].
@@ -102,6 +106,32 @@ const PATHS: &[&str] = &[
     "self/oom_score",
     "self/oom_score_adj",
     "self/wchan",
+    "self/environ",
+    "self/root",
+    "self/sched",
+    "self/schedstat",
+    "self/personality",
+    "self/setgroups",
+    "self/gid_map",
+    "self/uid_map",
+    "sys/kernel/random",
+    "sys/kernel/random/boot_id",
+    "sys/kernel/random/uuid",
+    "sys/kernel/random/entropy_avail",
+    "sys/kernel/random/poolsize",
+    "sys/kernel/version",
+    "sys/kernel/threads-max",
+    "sys/kernel/ngroups_max",
+    "sys/kernel/cap_last_cap",
+    "sys/kernel/sched_rr_timeslice_ms",
+    "kallsyms",
+    "keys",
+    "key-users",
+    "locks",
+    "vmstat",
+    "zoneinfo",
+    "buddyinfo",
+    "consoles",
 ];
 
 /// Static top-level file names, in `readdir("")` order.
@@ -120,6 +150,14 @@ const ROOT_FILES: &[&str] = &[
     "swaps",
     "modules",
     "devices",
+    "kallsyms",
+    "keys",
+    "key-users",
+    "locks",
+    "vmstat",
+    "zoneinfo",
+    "buddyinfo",
+    "consoles",
 ];
 
 /// Per-process entry names under `self/`, in `readdir("self")` order. `exe`
@@ -143,10 +181,34 @@ const SELF_FILES: &[&str] = &[
     "oom_score",
     "oom_score_adj",
     "wchan",
+    "environ",
+    "root",
+    "sched",
+    "schedstat",
+    "personality",
+    "setgroups",
+    "gid_map",
+    "uid_map",
 ];
 
-/// Tunables exposed under `sys/kernel/`.
-const SYS_KERNEL_FILES: &[&str] = &["ostype", "osrelease", "hostname", "pid_max"];
+/// Tunables exposed under `sys/kernel/`, excluding the `random/` subdirectory
+/// (which [`ProcFs::readdir`] appends separately since it's a directory, not
+/// a file).
+const SYS_KERNEL_FILES: &[&str] = &[
+    "ostype",
+    "osrelease",
+    "hostname",
+    "pid_max",
+    "version",
+    "threads-max",
+    "ngroups_max",
+    "cap_last_cap",
+    "sched_rr_timeslice_ms",
+];
+
+/// File names under `sys/kernel/random/`, in `readdir("sys/kernel/random")`
+/// order.
+const SYS_KERNEL_RANDOM_FILES: &[&str] = &["boot_id", "uuid", "entropy_avail", "poolsize"];
 
 /// File names under `net/`, in `readdir("net")` order.
 const NET_FILES: &[&str] = &[
@@ -212,6 +274,23 @@ const OSTYPE: &str = "Linux\n";
 const OSRELEASE: &str = "6.1.0-nixvm\n";
 const HOSTNAME: &str = "nixvm\n";
 const PID_MAX: &str = "32768\n";
+/// `sys/kernel/version`'s body — distinct from top-level `version`
+/// ([`VERSION`]): this one is just the build tag, as `proc(5)` documents.
+const KERNEL_VERSION: &str = "#1 SMP nixvm\n";
+const THREADS_MAX: &str = "127871\n";
+const NGROUPS_MAX: &str = "65536\n";
+/// Last valid capability index (`CAP_CHECKPOINT_RESTORE` on a modern kernel).
+const CAP_LAST_CAP: &str = "40\n";
+const SCHED_RR_TIMESLICE_MS: &str = "100\n";
+
+// ---- sys/kernel/random/* ----
+
+/// Fixed-but-valid UUIDs: a synthetic sandbox has no real boot entropy, but
+/// userland only ever checks the shape, not the value.
+const BOOT_ID: &str = "2f38a1c4-9b3e-4d3a-8f2b-6b6f2a9c1e10\n";
+const RANDOM_UUID: &str = "b6d1a0f4-7c3d-4a2e-9f1b-3c5d7e9a2b41\n";
+const ENTROPY_AVAIL: &str = "256\n";
+const POOLSIZE: &str = "4096\n";
 
 // ---- /proc/net/* ----
 
@@ -280,6 +359,44 @@ Block devices:\n\
   9 md\n\
 259 blkext\n";
 
+/// No kernel modules ever register symbols in a synthetic kernel; a couple of
+/// placeholder entries are a valid, minimal rendering (a fully empty file
+/// would be valid too, but this exercises callers that expect at least one
+/// parseable line).
+const KALLSYMS: &str = "0000000000000000 t placeholder\n\
+0000000000000000 t placeholder2\n";
+/// No keys are ever created in a synthetic kernel; empty is the valid,
+/// real-world rendering of that state.
+const KEYS: &str = "";
+const KEY_USERS: &str = "";
+/// No file locks are ever held in a synthetic kernel; empty is valid.
+const LOCKS: &str = "";
+
+const VMSTAT: &str = "nr_free_pages 262144\n\
+nr_zone_inactive_anon 0\n\
+nr_zone_active_anon 0\n\
+nr_zone_inactive_file 0\n\
+nr_zone_active_file 0\n\
+nr_zone_unevictable 0\n\
+nr_slab_reclaimable 1024\n\
+nr_slab_unreclaimable 2048\n\
+pgfault 0\n\
+pgmajfault 0\n";
+
+const ZONEINFO: &str = "Node 0, zone   Normal\n\
+  pages free     262144\n\
+        min      1024\n\
+        low      1280\n\
+        high     1536\n\
+        spanned  524288\n\
+        present  524288\n\
+        managed  512000\n";
+
+const BUDDYINFO: &str =
+    "Node 0, zone   Normal    100    50    25    12     6     3     1     0     0     0     0\n";
+
+const CONSOLES: &str = "ttyS0                -W- (EC p a)    4:64\n";
+
 // ---- self/* static bodies (independent of injected ProcData) ----
 
 const LIMITS: &str = "Limit                     Soft Limit           Hard Limit           Units     \n\
@@ -313,6 +430,25 @@ const OOM_SCORE_ADJ: &str = "0\n";
 /// `self/wchan` has no trailing newline on a real kernel — it's a single
 /// symbol name (or `0` when idle), not a line-oriented text file.
 const WCHAN: &str = "0";
+
+/// `self/environ`'s body: NUL-separated `KEY=value` pairs, as the kernel
+/// presents them (including the trailing NUL after the last entry).
+/// [`ProcData`] carries no environment yet, so this is a minimal-but-plausible
+/// static default rather than an injected value.
+const ENVIRON: &str =
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0HOME=/root\0TERM=xterm\0";
+/// `self/schedstat`'s three whitespace-separated fields: time spent on the
+/// CPU, time spent waiting to run, and timeslices run — all `0` since a
+/// synthetic process hasn't actually been scheduled.
+const SCHEDSTAT: &str = "0 0 0\n";
+/// `self/personality`'s body: `PER_LINUX`, the standard Linux personality.
+const PERSONALITY: &str = "0\n";
+/// `self/setgroups`'s body: `allow`, the default before a user namespace
+/// restricts `setgroups(2)`.
+const SETGROUPS: &str = "allow\n";
+/// Shared body for `self/uid_map` and `self/gid_map`: a single line mapping
+/// the whole id range to itself (`id-inside-ns id-outside-ns length`).
+const UID_GID_MAP: &str = "0 0 4294967295\n";
 
 /// Running-process (and lightweight system) data backing the `self/` files
 /// plus the CPU-count-sensitive system files.
@@ -463,6 +599,7 @@ impl ProcFs {
             "self/comm" => format!("{}\n", d.comm),
             "self/stat" => self_stat_body(d),
             "self/statm" => statm_body(d),
+            "self/sched" => sched_body(d),
             "self/smaps" => {
                 let text = if d.maps.is_empty() {
                     default_maps(&d.exe)
@@ -522,6 +659,15 @@ fn static_content(rel: &str) -> Option<&'static [u8]> {
         "sys/kernel/osrelease" => OSRELEASE,
         "sys/kernel/hostname" => HOSTNAME,
         "sys/kernel/pid_max" => PID_MAX,
+        "sys/kernel/version" => KERNEL_VERSION,
+        "sys/kernel/threads-max" => THREADS_MAX,
+        "sys/kernel/ngroups_max" => NGROUPS_MAX,
+        "sys/kernel/cap_last_cap" => CAP_LAST_CAP,
+        "sys/kernel/sched_rr_timeslice_ms" => SCHED_RR_TIMESLICE_MS,
+        "sys/kernel/random/boot_id" => BOOT_ID,
+        "sys/kernel/random/uuid" => RANDOM_UUID,
+        "sys/kernel/random/entropy_avail" => ENTROPY_AVAIL,
+        "sys/kernel/random/poolsize" => POOLSIZE,
         "net/tcp" => NET_TCP_HEADER,
         "net/tcp6" => NET_TCP6_HEADER,
         "net/udp" => NET_UDP_HEADER,
@@ -544,12 +690,25 @@ fn static_content(rel: &str) -> Option<&'static [u8]> {
         "swaps" => SWAPS,
         "modules" => MODULES,
         "devices" => DEVICES,
+        "kallsyms" => KALLSYMS,
+        "keys" => KEYS,
+        "key-users" => KEY_USERS,
+        "locks" => LOCKS,
+        "vmstat" => VMSTAT,
+        "zoneinfo" => ZONEINFO,
+        "buddyinfo" => BUDDYINFO,
+        "consoles" => CONSOLES,
         "self/mountinfo" => MOUNTINFO,
         "self/limits" => LIMITS,
         "self/io" => IO,
         "self/oom_score" => OOM_SCORE,
         "self/oom_score_adj" => OOM_SCORE_ADJ,
         "self/wchan" => WCHAN,
+        "self/environ" => ENVIRON,
+        "self/schedstat" => SCHEDSTAT,
+        "self/personality" => PERSONALITY,
+        "self/setgroups" => SETGROUPS,
+        "self/gid_map" | "self/uid_map" => UID_GID_MAP,
         _ => return None,
     };
     Some(text.as_bytes())
@@ -560,11 +719,36 @@ fn static_content(rel: &str) -> Option<&'static [u8]> {
 fn cpuinfo_body(nproc: usize) -> String {
     let mut out = String::new();
     for i in 0..nproc.max(1) {
+        write_cpuinfo_block(&mut out, i);
+    }
+    out
+}
+
+/// Append one core's block to `cpuinfo`. The fields track the build's own
+/// target architecture — the ISA nixvm's interpreter actually executes on —
+/// falling back to the aarch64 shape (matching this backend's long-standing
+/// default) on anything else.
+fn write_cpuinfo_block(out: &mut String, i: usize) {
+    if cfg!(target_arch = "x86_64") {
+        let _ = write!(
+            out,
+            "processor\t: {i}\n\
+             vendor_id\t: GenuineIntel\n\
+             cpu family\t: 6\n\
+             model name\t: nixvm Virtual CPU\n\
+             flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov \
+             pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc \
+             rep_good nopl cpuid pni pclmulqdq ssse3 cx16 sse4_1 sse4_2 x2apic \
+             popcnt aes xsave avx rdrand hypervisor lahf_lm abm 3dnowprefetch\n\
+             bogomips\t: 100.00\n\n"
+        );
+    } else {
         let _ = write!(
             out,
             "processor\t: {i}\n\
              BogoMIPS\t: 100.00\n\
-             Features\t: fp asimd\n\
+             Features\t: fp asimd aes pmull sha1 sha2 crc32 atomics fphp asimdhp \
+             cpuid asimdrdm lrcpc dcpop asimddp\n\
              CPU implementer\t: 0x41\n\
              CPU architecture: 8\n\
              CPU variant\t: 0x0\n\
@@ -572,7 +756,6 @@ fn cpuinfo_body(nproc: usize) -> String {
              CPU revision\t: 0\n\n"
         );
     }
-    out
 }
 
 /// Render `/proc/stat`, with one `cpuN` line per injected core.
@@ -684,6 +867,30 @@ fn statm_body(d: &ProcData) -> String {
     format!("{size} {resident} {shared} {text} {lib} {data} {dt}\n")
 }
 
+/// Render `self/sched`'s human-readable scheduling-statistics dump (see
+/// `sched_show_task()` in the kernel): a header line naming the process,
+/// followed by the handful of `se.*`/`nr_*` fields userland tools actually
+/// scrape, all zeroed since a synthetic process has no real scheduling
+/// history.
+fn sched_body(d: &ProcData) -> String {
+    format!(
+        "{comm} ({pid}, #threads: {threads})\n\
+         ------------------------------------------------------------------\n\
+         se.exec_start                               :               0.000000\n\
+         se.vruntime                                 :               0.000000\n\
+         se.sum_exec_runtime                         :               0.000000\n\
+         nr_switches                                 :                      0\n\
+         nr_voluntary_switches                       :                      0\n\
+         nr_involuntary_switches                     :                      0\n\
+         se.load.weight                              :                   1024\n\
+         policy                                      :                      0\n\
+         prio                                        :                    120\n",
+        comm = d.comm,
+        pid = d.pid,
+        threads = d.threads,
+    )
+}
+
 /// The `VmFlags` shorthand for a `self/maps` permission token (e.g. `r-xp`),
 /// approximating what the kernel reports for a mapping with those
 /// permissions.
@@ -777,6 +984,7 @@ fn is_dir(rel: &str) -> bool {
             | "self/fd"
             | "sys"
             | "sys/kernel"
+            | "sys/kernel/random"
             | "net"
             | "sys/net"
             | "sys/net/core"
@@ -793,6 +1001,19 @@ fn entry(name: &str, path: &str, kind: NodeKind) -> DirEntry {
         kind,
         inode: inode_of(path).unwrap_or(0),
     }
+}
+
+/// Build directory entries for a flat list of file names under `prefix`
+/// (e.g. `"net"` + `["tcp", ...]` -> `net/tcp`, …) — the common shape for
+/// the many single-level tunable directories this backend exposes.
+fn list_files(prefix: &str, names: &[&str]) -> Vec<DirEntry> {
+    names
+        .iter()
+        .map(|n| {
+            let path = format!("{prefix}/{n}");
+            entry(n, &path, NodeKind::File)
+        })
+        .collect()
 }
 
 /// Copy `data[off..]` into `buf`, returning the byte count (0 at or past EOF).
@@ -849,6 +1070,8 @@ impl MountFs for ProcFs {
             (NodeKind::Symlink, S_IFLNK | 0o777, self.data.exe.len() as u64)
         } else if rel == "self/cwd" {
             (NodeKind::Symlink, S_IFLNK | 0o777, self.data.cwd.len() as u64)
+        } else if rel == "self/root" {
+            (NodeKind::Symlink, S_IFLNK | 0o777, ROOT_TARGET.len() as u64)
         } else {
             let data = self.content(rel)?;
             (NodeKind::File, S_IFREG | 0o444, data.len() as u64)
@@ -872,7 +1095,11 @@ impl MountFs for ProcFs {
         if is_dir(rel) {
             return Err(eisdir());
         }
-        if rel == "self/exe" || rel == "self/cwd" || rel.starts_with("self/fd/") {
+        if rel == "self/exe"
+            || rel == "self/cwd"
+            || rel == "self/root"
+            || rel.starts_with("self/fd/")
+        {
             return Err(einval()); // read on a symlink; use readlink
         }
         match self.content(rel) {
@@ -907,7 +1134,7 @@ impl MountFs for ProcFs {
                 .map(|n| {
                     let path = format!("self/{n}");
                     let kind = match *n {
-                        "exe" | "cwd" => NodeKind::Symlink,
+                        "exe" | "cwd" | "root" => NodeKind::Symlink,
                         "fd" => NodeKind::Dir,
                         _ => NodeKind::File,
                     };
@@ -930,52 +1157,21 @@ impl MountFs for ProcFs {
                 entry("vm", "sys/vm", NodeKind::Dir),
                 entry("fs", "sys/fs", NodeKind::Dir),
             ]),
-            "sys/kernel" => Ok(SYS_KERNEL_FILES
-                .iter()
-                .map(|n| {
-                    let path = format!("sys/kernel/{n}");
-                    entry(n, &path, NodeKind::File)
-                })
-                .collect()),
-            "net" => Ok(NET_FILES
-                .iter()
-                .map(|n| {
-                    let path = format!("net/{n}");
-                    entry(n, &path, NodeKind::File)
-                })
-                .collect()),
+            "sys/kernel" => {
+                let mut out = list_files("sys/kernel", SYS_KERNEL_FILES);
+                out.push(entry("random", "sys/kernel/random", NodeKind::Dir));
+                Ok(out)
+            }
+            "sys/kernel/random" => Ok(list_files("sys/kernel/random", SYS_KERNEL_RANDOM_FILES)),
+            "net" => Ok(list_files("net", NET_FILES)),
             "sys/net" => Ok(vec![
                 entry("core", "sys/net/core", NodeKind::Dir),
                 entry("ipv4", "sys/net/ipv4", NodeKind::Dir),
             ]),
-            "sys/net/core" => Ok(SYS_NET_CORE_FILES
-                .iter()
-                .map(|n| {
-                    let path = format!("sys/net/core/{n}");
-                    entry(n, &path, NodeKind::File)
-                })
-                .collect()),
-            "sys/net/ipv4" => Ok(SYS_NET_IPV4_FILES
-                .iter()
-                .map(|n| {
-                    let path = format!("sys/net/ipv4/{n}");
-                    entry(n, &path, NodeKind::File)
-                })
-                .collect()),
-            "sys/vm" => Ok(SYS_VM_FILES
-                .iter()
-                .map(|n| {
-                    let path = format!("sys/vm/{n}");
-                    entry(n, &path, NodeKind::File)
-                })
-                .collect()),
-            "sys/fs" => Ok(SYS_FS_FILES
-                .iter()
-                .map(|n| {
-                    let path = format!("sys/fs/{n}");
-                    entry(n, &path, NodeKind::File)
-                })
-                .collect()),
+            "sys/net/core" => Ok(list_files("sys/net/core", SYS_NET_CORE_FILES)),
+            "sys/net/ipv4" => Ok(list_files("sys/net/ipv4", SYS_NET_IPV4_FILES)),
+            "sys/vm" => Ok(list_files("sys/vm", SYS_VM_FILES)),
+            "sys/fs" => Ok(list_files("sys/fs", SYS_FS_FILES)),
             _ if rel.starts_with("self/fd/") => Err(enotdir()),
             _ if inode_of(rel).is_some() => Err(enotdir()),
             _ => Err(enoent()),
@@ -990,6 +1186,9 @@ impl MountFs for ProcFs {
         }
         if rel == "self/cwd" {
             return Ok(self.data.cwd.clone());
+        }
+        if rel == "self/root" {
+            return Ok(ROOT_TARGET.to_string());
         }
         if let Some(n) = rel
             .strip_prefix("self/fd/")
@@ -1402,5 +1601,152 @@ mod tests {
                 .unwrap()
                 .contains("Character devices:")
         );
+    }
+
+    #[test]
+    fn self_environ_contains_path() {
+        let mut fs = ProcFs::new();
+        let text = String::from_utf8(read_all(&mut fs, "self/environ")).unwrap();
+        assert!(text.contains("PATH="));
+        // NUL-separated, as the kernel presents it.
+        assert!(text.contains('\0'));
+    }
+
+    #[test]
+    fn self_root_is_a_symlink_to_slash() {
+        let mut fs = ProcFs::new();
+        assert_eq!(fs.stat("self/root").unwrap().kind, NodeKind::Symlink);
+        assert_eq!(fs.readlink("self/root").unwrap(), "/");
+    }
+
+    #[test]
+    fn cpuinfo_contains_arch_feature_line() {
+        let mut fs = ProcFs::new();
+        let text = String::from_utf8(read_all(&mut fs, "cpuinfo")).unwrap();
+        assert!(text.contains("Features") || text.contains("flags"));
+    }
+
+    /// Checks the `8-4-4-4-12` hex shape `proc(5)` documents for
+    /// `sys/kernel/random/{boot_id,uuid}`.
+    fn is_uuid_shaped(s: &str) -> bool {
+        let parts: Vec<&str> = s.split('-').collect();
+        let widths = [8, 4, 4, 4, 12];
+        parts.len() == widths.len()
+            && parts
+                .iter()
+                .zip(widths)
+                .all(|(p, w)| p.len() == w && p.chars().all(|c| c.is_ascii_hexdigit()))
+    }
+
+    #[test]
+    fn random_uuid_matches_uuid_shape() {
+        let mut fs = ProcFs::new();
+        let uuid = String::from_utf8(read_all(&mut fs, "sys/kernel/random/uuid")).unwrap();
+        assert!(is_uuid_shaped(uuid.trim()), "not UUID-shaped: {uuid}");
+        let boot_id = String::from_utf8(read_all(&mut fs, "sys/kernel/random/boot_id")).unwrap();
+        assert!(is_uuid_shaped(boot_id.trim()), "not UUID-shaped: {boot_id}");
+    }
+
+    #[test]
+    fn random_entropy_and_poolsize() {
+        let mut fs = ProcFs::new();
+        assert_eq!(
+            read_all(&mut fs, "sys/kernel/random/entropy_avail"),
+            b"256\n"
+        );
+        assert_eq!(read_all(&mut fs, "sys/kernel/random/poolsize"), b"4096\n");
+    }
+
+    #[test]
+    fn self_uid_map_contains_0_0() {
+        let mut fs = ProcFs::new();
+        let text = String::from_utf8(read_all(&mut fs, "self/uid_map")).unwrap();
+        assert!(text.contains("0 0"));
+        let text = String::from_utf8(read_all(&mut fs, "self/gid_map")).unwrap();
+        assert!(text.contains("0 0"));
+    }
+
+    #[test]
+    fn sys_kernel_extra_tunables_present() {
+        let mut fs = ProcFs::new();
+        assert_eq!(
+            String::from_utf8(read_all(&mut fs, "sys/kernel/ngroups_max")).unwrap(),
+            "65536\n"
+        );
+        assert_eq!(
+            String::from_utf8(read_all(&mut fs, "sys/kernel/cap_last_cap")).unwrap(),
+            "40\n"
+        );
+        assert!(
+            String::from_utf8(read_all(&mut fs, "sys/kernel/threads-max"))
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn new_top_level_files_present() {
+        let mut fs = ProcFs::new();
+        assert!(read_all(&mut fs, "kallsyms").starts_with(b"0000000000000000"));
+        assert!(read_all(&mut fs, "keys").is_empty());
+        assert!(read_all(&mut fs, "key-users").is_empty());
+        assert!(read_all(&mut fs, "locks").is_empty());
+        let vmstat = String::from_utf8(read_all(&mut fs, "vmstat")).unwrap();
+        assert!(vmstat.contains("nr_free_pages"));
+        let zoneinfo = String::from_utf8(read_all(&mut fs, "zoneinfo")).unwrap();
+        assert!(zoneinfo.contains("Node 0"));
+        let buddyinfo = String::from_utf8(read_all(&mut fs, "buddyinfo")).unwrap();
+        assert!(buddyinfo.contains("Node 0"));
+        let consoles = String::from_utf8(read_all(&mut fs, "consoles")).unwrap();
+        assert!(!consoles.is_empty());
+    }
+
+    #[test]
+    fn self_sched_and_schedstat_and_personality() {
+        let mut fs = ProcFs::new();
+        fs.set_self(sample());
+        let sched = String::from_utf8(read_all(&mut fs, "self/sched")).unwrap();
+        assert!(sched.starts_with("prog (42, #threads: 3)"));
+        assert_eq!(read_all(&mut fs, "self/schedstat"), b"0 0 0\n");
+        assert_eq!(read_all(&mut fs, "self/personality"), b"0\n");
+        assert_eq!(read_all(&mut fs, "self/setgroups"), b"allow\n");
+    }
+
+    #[test]
+    fn new_listings_include_environ_and_random() {
+        let mut fs = ProcFs::new();
+        let self_names: Vec<String> = fs
+            .readdir("self")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(self_names.contains(&"environ".to_string()));
+        assert!(self_names.contains(&"root".to_string()));
+        assert!(self_names.contains(&"sched".to_string()));
+        assert!(self_names.contains(&"uid_map".to_string()));
+
+        let kernel_names: Vec<String> = fs
+            .readdir("sys/kernel")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(kernel_names.contains(&"random".to_string()));
+
+        let random_names: Vec<String> = fs
+            .readdir("sys/kernel/random")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(random_names.contains(&"uuid".to_string()));
+        assert!(random_names.contains(&"boot_id".to_string()));
+
+        let root_names: Vec<String> = fs.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        assert!(root_names.contains(&"kallsyms".to_string()));
+        assert!(root_names.contains(&"vmstat".to_string()));
     }
 }
