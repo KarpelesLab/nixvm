@@ -7,11 +7,19 @@
 //! syscall engine testable in CI with no hypervisor.
 //!
 //! Coverage grows toward full user-mode aarch64 (ROADMAP Phase 10). Implemented
-//! so far: move-wide immediates, PC-relative addressing, add/sub (immediate and
-//! shifted register, with flags), logical shifted register, compares,
-//! conditional/unconditional branches, `BL`/`BLR`/`RET`, and load/store with an
-//! unsigned immediate offset. Anything else surfaces as
-//! [`Exit::IllegalInstruction`].
+//! so far: move-wide immediates, PC-relative addressing (`ADR`/`ADRP` and
+//! `LDR` literal), add/sub (immediate, shifted, and extended register, with
+//! flags), logical (immediate and shifted register), bitfield move
+//! (`SBFM`/`UBFM`/`BFM` and their `LSL`/`LSR`/`ASR`/`SXT*`/`UXT*`/`*BFX`/`BFI`
+//! aliases), conditional compare/select (`CCMP`/`CCMN`, `CSEL`/`CSINC`/
+//! `CSINV`/`CSNEG`), bit manipulation (`REV`/`REV16`/`REV32`/`RBIT`/`CLZ`/
+//! `CLS`), compares, conditional/unconditional branches, `BL`/`BLR`/`RET`,
+//! load/store (unsigned immediate, unscaled/pre/post-index, register offset,
+//! pair including `LDPSW`, and exclusive/acquire-release treated as
+//! non-atomic single-core operations), and a growing slice of NEON/SIMD
+//! (`DUP`/`INS`/`UMOV`/`SMOV`, `LD1`/`ST1`, vector `ADD`/`SUB`/compares/
+//! `SSHL`/`USHL`/`NOT`, `ADDV`/`UADDLV`) plus scalar FP. Anything else
+//! surfaces as [`Exit::IllegalInstruction`].
 
 use crate::abi::Arch;
 
@@ -846,6 +854,28 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- load/store register (literal, PC-relative): LDR/LDRSW/PRFM ----
+        if (instr >> 24) & 0x3f == 0b01_1000 {
+            let opc = (instr >> 30) & 3;
+            let v = (instr >> 26) & 1;
+            let imm19 = sign_extend(u64::from((instr >> 5) & 0x7ffff), 19) << 2;
+            let rt = reg_field(instr, 0);
+            let addr = (self.pc as i64).wrapping_add(imm19) as u64;
+            if v == 1 {
+                // SIMD&FP: opc 00=S(4B) 01=D(8B) 10=Q(16B) 11=reserved.
+                if opc == 3 {
+                    return Step::Illegal;
+                }
+                return self.ldst_vec(addr, opc + 2, true, rt, mem);
+            }
+            return match opc {
+                0 => self.ldst(addr, 2, 0b01, rt, mem), // LDR Wt (zero-extend)
+                1 => self.ldst(addr, 3, 0b01, rt, mem), // LDR Xt
+                2 => self.ldst(addr, 2, 0b10, rt, mem), // LDRSW Xt (sign-extend)
+                _ => Step::Next,                        // PRFM: prefetch hint, no-op
+            };
+        }
+
         // ---- SIMD/FP load/store pair: LDP/STP q/d/s ----
         // bit25 == 0 distinguishes real pairs from SIMD modified-immediate
         // (MOVI/MVNI), which also has bits[29:27]==101 with V==1.
@@ -923,13 +953,15 @@ impl Aarch64Interp {
         // ---- load/store pair: LDP/STP (signed offset / pre / post index) ----
         if (instr >> 27) & 0x7 == 0b101 && (instr >> 26) & 1 == 0 && (instr >> 25) & 1 == 0 {
             let opc = (instr >> 30) & 3;
-            let is64 = match opc {
-                0b00 => false,
-                0b10 => true,
-                _ => return Step::Illegal, // SIMD/other pairs: Phase 10
-            };
-            let class = (instr >> 23) & 3; // 1 = post, 2 = signed offset, 3 = pre
+            if opc == 0b11 {
+                return Step::Illegal; // reserved
+            }
+            let is64 = opc == 0b10;
             let is_load = (instr >> 22) & 1 == 1;
+            if opc == 0b01 && !is_load {
+                return Step::Illegal; // STP has no signed-word form
+            }
+            let class = (instr >> 23) & 3; // 1 = post, 2 = signed offset, 3 = pre
             let imm7 = sign_extend(u64::from((instr >> 15) & 0x7f), 7);
             let rt2 = reg_field(instr, 10);
             let rn = reg_field(instr, 5);
@@ -952,7 +984,13 @@ impl Aarch64Interp {
                             write: false,
                         };
                     }
-                    self.write_x(r, u64::from_le_bytes(buf));
+                    let raw = u64::from_le_bytes(buf);
+                    let val = if opc == 0b01 {
+                        sign_extend(raw, 32) as u64 // LDPSW
+                    } else {
+                        raw
+                    };
+                    self.write_x(r, val);
                 } else {
                     self.note_store(a, u128::from(self.read_x(r)), nbytes);
                     let val = self.read_x(r).to_le_bytes();
@@ -1066,6 +1104,32 @@ impl Aarch64Interp {
             return step;
         }
 
+        // ---- LD1/ST1 (single register, multiple structures: 8B/16B) ----
+        // Covers `ld1 {Vt.16b},[Xn]` and the post-indexed (reg or #16/#8)
+        // forms used heavily by memcpy-style code; element arrangement
+        // (`size`) is irrelevant to us since we move the raw bytes as-is.
+        if (instr >> 31) & 1 == 0
+            && (instr >> 29) & 1 == 0
+            && (instr >> 24) & 0x1f == 0b0_1100
+            && (instr >> 21) & 1 == 0
+            && (instr >> 12) & 0xf == 0b0111
+        {
+            let q = (instr >> 30) & 1;
+            let post = (instr >> 23) & 1 == 1;
+            let l = (instr >> 22) & 1;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rt = reg_field(instr, 0);
+            let (nbytes, scale) = if q == 1 { (16u64, 4) } else { (8u64, 3) };
+            let addr = self.read_sp(rn);
+            let step = self.ldst_vec(addr, scale, l == 1, rt, mem);
+            if matches!(step, Step::Next) && post {
+                let inc = if rm == 31 { nbytes } else { self.read_x(rm) };
+                self.write_sp(rn, addr.wrapping_add(inc));
+            }
+            return step;
+        }
+
         // ---- SIMD modified immediate: MOVI/MVNI/ORR/BIC (vector immediate) ----
         if (instr >> 19) & 0x3ff == 0b0111100000 && (instr >> 10) & 1 == 1 {
             let q = (instr >> 30) & 1;
@@ -1097,6 +1161,26 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- DUP Vd.T, Vn.Ts[index] (replicate a vector lane across lanes) ----
+        if (instr >> 21) & 0x1ff == 0b0_0111_0000 && (instr >> 10) & 0x3f == 0b00_0001 {
+            let q = (instr >> 30) & 1;
+            let imm5 = (instr >> 16) & 0x1f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize = elem_bits(imm5);
+            let index = imm5 >> (esize / 8).trailing_zeros().wrapping_add(1);
+            let elem = (self.v[rn] >> (u128::from(index) * u128::from(esize))) & ones_u128(esize);
+            let width = if q == 1 { 128 } else { 64 };
+            let mut val = 0u128;
+            let mut shift = 0;
+            while shift < width {
+                val |= elem << shift;
+                shift += esize;
+            }
+            self.v[rd] = val;
+            return Step::Next;
+        }
+
         // ---- DUP Vd.T, Rn (replicate a GP register across lanes) ----
         if (instr >> 21) & 0x1ff == 0b0_0111_0000 && (instr >> 10) & 0x3f == 0b00_0011 {
             let q = (instr >> 30) & 1;
@@ -1125,6 +1209,21 @@ impl Aarch64Interp {
             let index = imm5 >> (esize / 8).trailing_zeros().wrapping_add(1);
             let elem = (self.v[rn] >> (u128::from(index) * u128::from(esize))) & ones_u128(esize);
             self.write_x(rd, elem as u64);
+            return Step::Next;
+        }
+
+        // ---- SMOV Rd, Vn.Ts[index] (extract a lane, sign-extended) ----
+        if (instr >> 21) & 0x1ff == 0b0_0111_0000 && (instr >> 10) & 0x3f == 0b00_1011 {
+            let q = (instr >> 30) & 1;
+            let imm5 = (instr >> 16) & 0x1f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize = elem_bits(imm5);
+            let index = imm5 >> (esize / 8).trailing_zeros().wrapping_add(1);
+            let elem = (self.v[rn] >> (u128::from(index) * u128::from(esize))) & ones_u128(esize);
+            let se = sign_extend(elem as u64, esize);
+            let result = if q == 1 { se as u64 } else { u64::from(se as u32) };
+            self.write_x(rd, result);
             return Step::Next;
         }
 
@@ -1423,7 +1522,7 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
-        // ---- SIMD three-same (integer): ADD/SUB (vector) and CMEQ (register) ----
+        // ---- SIMD three-same (integer): ADD/SUB/compares/SSHL/USHL (vector) ----
         if (instr >> 24) & 0x9f == 0b0_0001110 && (instr >> 21) & 1 == 1 && (instr >> 10) & 1 == 1 {
             let q = (instr >> 30) & 1;
             let u = (instr >> 29) & 1;
@@ -1432,11 +1531,17 @@ impl Aarch64Interp {
             let rm = reg_field(instr, 16);
             let rn = reg_field(instr, 5);
             let rd = reg_field(instr, 0);
-            // 0 = ADD, 1 = SUB, 2 = CMEQ.
+            // 0=ADD 1=SUB 2=CMEQ 3=CMGT 4=CMGE 5=CMHI 6=CMHS 7=SSHL 8=USHL.
             let op = match (u, opcode) {
                 (0, 0b10000) => 0u8,
                 (1, 0b10000) => 1,
                 (1, 0b10001) => 2,
+                (0, 0b00110) => 3,
+                (0, 0b00111) => 4,
+                (1, 0b00110) => 5,
+                (1, 0b00111) => 6,
+                (0, 0b01000) => 7,
+                (1, 0b01000) => 8,
                 _ => return Step::Illegal,
             };
             let esize = 8u32 << size;
@@ -1450,17 +1555,107 @@ impl Aarch64Interp {
                 let lane = match op {
                     0 => x.wrapping_add(y) & mask,
                     1 => x.wrapping_sub(y) & mask,
-                    _ => {
+                    2 => {
                         if x == y {
                             mask
                         } else {
                             0
                         }
                     }
+                    3 => {
+                        if sign_extend(x as u64, esize) > sign_extend(y as u64, esize) {
+                            mask
+                        } else {
+                            0
+                        }
+                    }
+                    4 => {
+                        if sign_extend(x as u64, esize) >= sign_extend(y as u64, esize) {
+                            mask
+                        } else {
+                            0
+                        }
+                    }
+                    5 => {
+                        if x > y {
+                            mask
+                        } else {
+                            0
+                        }
+                    }
+                    6 => {
+                        if x >= y {
+                            mask
+                        } else {
+                            0
+                        }
+                    }
+                    _ => {
+                        // SSHL (op==7, signed) / USHL (op==8, unsigned): shift amount is
+                        // the low signed byte of the corresponding y-lane.
+                        let amt = sign_extend(y as u64 & 0xff, 8);
+                        simd_shl(x, amt, esize, op == 7)
+                    }
                 };
                 result |= lane << sh;
             }
             self.v[rd] = result;
+            return Step::Next;
+        }
+
+        // ---- NOT/MVN (vector): bitwise complement ----
+        if (instr >> 24) & 0x1f == 0b0_1110
+            && (instr >> 29) & 1 == 1
+            && (instr >> 22) & 3 == 0
+            && (instr >> 17) & 0x1f == 0b1_0000
+            && (instr >> 12) & 0x1f == 0b0_0101
+            && (instr >> 10) & 3 == 0b10
+        {
+            let q = (instr >> 30) & 1;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let mask = if q == 1 { u128::MAX } else { ones_u128(64) };
+            self.v[rd] = !self.v[rn] & mask;
+            return Step::Next;
+        }
+
+        // ---- ADDV / UADDLV (across-lanes reduction) ----
+        if (instr >> 24) & 0x1f == 0b0_1110
+            && (instr >> 17) & 0x1f == 0b1_1000
+            && (instr >> 10) & 3 == 0b10
+        {
+            let q = (instr >> 30) & 1;
+            let u = (instr >> 29) & 1;
+            let size = (instr >> 22) & 3;
+            let opcode = (instr >> 12) & 0x1f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            if size == 3 {
+                return Step::Illegal;
+            }
+            let esize = 8u32 << size;
+            let width = if q == 1 { 128 } else { 64 };
+            let lanes = width / esize;
+            let mask = ones_u128(esize);
+            match (u, opcode) {
+                (0, 0b1_1011) => {
+                    // ADDV: sum all lanes, esize-bit result.
+                    let mut sum = 0u128;
+                    for i in 0..lanes {
+                        sum = sum.wrapping_add((self.v[rn] >> (i * esize)) & mask);
+                    }
+                    self.v[rd] = sum & mask;
+                }
+                (1, 0b0_0011) => {
+                    // UADDLV: sum all lanes zero-extended, 2*esize-bit result.
+                    let mut sum = 0u128;
+                    for i in 0..lanes {
+                        sum = sum.wrapping_add((self.v[rn] >> (i * esize)) & mask);
+                    }
+                    self.v[rd] = sum & ones_u128(esize * 2);
+                }
+                _ => return Step::Illegal,
+            }
             return Step::Next;
         }
 
@@ -1837,6 +2032,33 @@ fn vfp_expand_imm64(imm8: u32) -> u64 {
     let exp = ((1 - b6) << 10) | (if b6 == 1 { 0xff } else { 0 } << 2) | u64::from((imm8 >> 4) & 3);
     let frac = u64::from(imm8 & 0xf) << 48;
     (sign << 63) | (exp << 52) | frac
+}
+
+/// ARM `SSHL`/`USHL` per-lane shift: `x` is an `esize`-bit lane, `amt` is a
+/// signed shift amount (positive = left, negative = right, saturating at
+/// `esize` in either direction). `signed` selects an arithmetic (vs logical)
+/// right shift.
+fn simd_shl(x: u128, amt: i64, esize: u32, signed: bool) -> u128 {
+    let mask = ones_u128(esize);
+    if amt >= 0 {
+        let sh = amt.min(i64::from(esize)) as u32;
+        if sh >= esize { 0 } else { (x << sh) & mask }
+    } else {
+        let sh = (-amt).min(i64::from(esize)) as u32;
+        if signed {
+            let se = sign_extend(x as u64, esize);
+            let shifted = if sh >= 64 {
+                if se < 0 { -1i64 } else { 0 }
+            } else {
+                se >> sh.min(63)
+            };
+            u128::from(shifted as u64) & mask
+        } else if sh >= esize {
+            0
+        } else {
+            (x >> sh) & mask
+        }
+    }
 }
 
 /// `n` low bits set, as a `u128`.
@@ -2590,6 +2812,167 @@ mod tests {
             0xffff_ffff,
             "high lane equal -> all ones"
         );
+    }
+
+    #[test]
+    fn sbfx_ubfx_extract_bitfield() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = 0x1234_5678_9abc_def0;
+        // sbfx x0,x1,#4,#8 -> bits[11:4] = 0xef, sign-extended (top bit set)
+        c.exec(0x9344_2C20, &mut m);
+        assert_eq!(c.x[0] as i64, -17);
+        // ubfx x0,x1,#4,#8 -> same bits, zero-extended
+        c.exec(0xD344_2C20, &mut m);
+        assert_eq!(c.x[0], 0xef);
+    }
+
+    #[test]
+    fn ccmp_feeds_csel() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = 5;
+        c.x[3] = 111;
+        c.x[4] = 222;
+        // ccmp x1,#5,#0,eq with EQ holding -> real compare: 5-5=0 -> Z set
+        c.flags.z = true;
+        assert!(matches!(c.exec(0xFA45_0820, &mut m), Step::Next));
+        assert!(c.flags.z && c.flags.c, "5 == 5 sets Z and C");
+        // csel x0,x3,x4,eq now sees Z set -> picks x3
+        assert!(matches!(c.exec(0x9A84_0060, &mut m), Step::Next));
+        assert_eq!(c.x[0], 111);
+
+        // ccmp x1,#5,#0xf,ne with NE failing -> flags loaded from nzcv=0xf
+        c.flags = Flags::default();
+        c.flags.z = true; // NE fails since Z is set
+        assert!(matches!(c.exec(0xFA45_182F, &mut m), Step::Next));
+        assert!(
+            c.flags.n && c.flags.z && c.flags.c && c.flags.v,
+            "nzcv literal loaded when outer cond fails"
+        );
+        // csel x0,x3,x4,eq still sees Z set -> picks x3 again
+        assert!(matches!(c.exec(0x9A84_0060, &mut m), Step::Next));
+        assert_eq!(c.x[0], 111);
+        // flip Z off directly and re-run csel -> now picks x4
+        c.flags.z = false;
+        assert!(matches!(c.exec(0x9A84_0060, &mut m), Step::Next));
+        assert_eq!(c.x[0], 222);
+    }
+
+    #[test]
+    fn rev_rbit_clz_ops() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = 0x1122_3344_5566_7788;
+        c.exec(0xDAC0_0C20, &mut m); // rev x0,x1
+        assert_eq!(c.x[0], 0x8877_6655_4433_2211);
+        c.exec(0xDAC0_0020, &mut m); // rbit x0,x1
+        assert_eq!(c.x[0], 0x11ee_66aa_22cc_4488);
+        c.exec(0xDAC0_1020, &mut m); // clz x0,x1
+        assert_eq!(c.x[0], 3);
+    }
+
+    #[test]
+    fn ldr_literal_and_ldpsw() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        c.pc = base;
+        m.write(base + 16, &0x1122_3344_5566_7788u64.to_le_bytes())
+            .unwrap();
+        // ldr x2, .+16  (imm19=4 -> byte offset 16)
+        assert!(matches!(c.exec(0x5800_0082, &mut m), Step::Next));
+        assert_eq!(c.x[2], 0x1122_3344_5566_7788);
+
+        // ldpsw x0,x1,[x2]: two consecutive words, first sign-extended
+        c.x[2] = base + 0x100;
+        m.write(base + 0x100, &(-1i32).to_le_bytes()).unwrap();
+        m.write(base + 0x104, &5i32.to_le_bytes()).unwrap();
+        assert!(matches!(c.exec(0x6940_0440, &mut m), Step::Next));
+        assert_eq!(c.x[0] as i64, -1, "LDPSW sign-extends the first word");
+        assert_eq!(c.x[1], 5);
+    }
+
+    #[test]
+    fn neon_dup_umov_roundtrip() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = 0xDEAD_BEEF;
+        c.exec(0x4E04_0C20, &mut m); // dup v0.4s, w1
+        let expect = (0xDEAD_BEEFu128 << 96)
+            | (0xDEAD_BEEFu128 << 64)
+            | (0xDEAD_BEEFu128 << 32)
+            | 0xDEAD_BEEFu128;
+        assert_eq!(c.v[0], expect);
+        c.exec(0x0E0C_3C00, &mut m); // umov w0, v0.s[1]
+        assert_eq!(c.x[0], 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn neon_dup_element_and_smov() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = 0x8442_0201;
+        c.exec(0x0E07_0420, &mut m); // dup v0.8b, v1.b[3]  (byte 3 = 0x84)
+        assert_eq!(c.v[0], 0x8484_8484_8484_8484);
+        c.exec(0x4E07_2C20, &mut m); // smov x0, v1.b[3]  (sign-extend 0x84)
+        assert_eq!(c.x[0] as i64, -124);
+    }
+
+    #[test]
+    fn neon_vector_compares() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = 0x0000_0000_0000_000A_FFFF_FFFD_0000_0005u128;
+        c.v[2] = 0x0000_0001_0000_000A_FFFF_FFFD_0000_0003u128;
+        c.exec(0x4EA2_3420, &mut m); // cmgt v0.4s,v1.4s,v2.4s
+        assert_eq!(c.v[0], 0xffff_ffffu128);
+        c.exec(0x4EA2_3C20, &mut m); // cmge v0.4s,v1.4s,v2.4s
+        assert_eq!(c.v[0], 0xffff_ffff_ffff_ffff_ffff_ffffu128);
+        c.exec(0x6EA2_3420, &mut m); // cmhi v0.4s,v1.4s,v2.4s
+        assert_eq!(c.v[0], 0xffff_ffffu128);
+        c.exec(0x6EA2_3C20, &mut m); // cmhs v0.4s,v1.4s,v2.4s
+        assert_eq!(c.v[0], 0xffff_ffff_ffff_ffff_ffff_ffffu128);
+    }
+
+    #[test]
+    fn neon_sshl_ushl_signed_shift_amount() {
+        let (mut c, mut m) = (cpu(), scratch());
+        // lanes: [1, 0x8000_0000, 0x1000_0000, 0xFFFF_FFFF]
+        c.v[1] = 0xFFFF_FFFF_1000_0000_8000_0000_0000_0001u128;
+        // shift amounts (low byte, signed): [4, -4, 31, -1]
+        c.v[2] = 0xFFFF_FFFF_0000_001F_FFFF_FFFC_0000_0004u128;
+        c.exec(0x4EA2_4420, &mut m); // sshl v0.4s,v1.4s,v2.4s
+        assert_eq!(c.v[0], 0xFFFF_FFFF_0000_0000_F800_0000_0000_0010u128);
+        c.exec(0x6EA2_4420, &mut m); // ushl v0.4s,v1.4s,v2.4s
+        assert_eq!(c.v[0], 0x7FFF_FFFF_0000_0000_0800_0000_0000_0010u128);
+    }
+
+    #[test]
+    fn neon_not_addv_uaddlv() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = 0x1234_5678_9ABC_DEF0_1122_3344_5566_7788u128;
+        c.exec(0x6E20_5820, &mut m); // not v0.16b, v1.16b (mvn)
+        assert_eq!(c.v[0], !c.v[1]);
+
+        // bytes 1..=16 (little-endian lane order)
+        c.v[1] = 0x100F_0E0D_0C0B_0A09_0807_0605_0403_0201u128;
+        c.exec(0x4E31_B820, &mut m); // addv b0, v1.16b
+        assert_eq!(c.v[0], 136);
+        c.exec(0x6E30_3820, &mut m); // uaddlv h0, v1.16b
+        assert_eq!(c.v[0], 136);
+    }
+
+    #[test]
+    fn neon_ld1_st1_multiple_structures() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        c.x[1] = base + 0x40;
+        c.v[0] = 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00u128;
+        // st1 {v0.16b},[x1]
+        assert!(matches!(c.exec(0x4C00_7020, &mut m), Step::Next));
+        // ld1 {v0.16b},[x1],#16 (post-index, clobber v0 first)
+        c.v[0] = 0;
+        assert!(matches!(c.exec(0x4CDF_7020, &mut m), Step::Next));
+        assert_eq!(c.v[0], 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00u128);
+        assert_eq!(c.x[1], base + 0x50, "post-index advanced by 16 bytes");
     }
 
     #[test]
