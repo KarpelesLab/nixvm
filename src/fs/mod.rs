@@ -21,9 +21,11 @@
 use std::io;
 
 pub mod mount;
+pub mod overlay;
 pub mod tmpfs;
 
 pub use mount::MountTable;
+pub use overlay::Overlay;
 pub use tmpfs::TmpFs;
 
 /// The kind of a filesystem node.
