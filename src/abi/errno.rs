@@ -61,4 +61,8 @@ errnos! {
     ENOSYS = 38,
     ENOTEMPTY = 39,
     ELOOP = 40,
+    ENOTSOCK = 88,
+    EOPNOTSUPP = 95,
+    EAFNOSUPPORT = 97,
+    ECONNREFUSED = 111,
 }

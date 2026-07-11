@@ -23,10 +23,12 @@ use crate::vcpu::mem::{PAGE_SIZE, Prot};
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 
 mod fd;
+mod net;
 mod path;
 mod stat;
 
 pub use fd::{Fd, FdTable};
+use net::Net;
 
 /// `dirfd` value meaning "resolve relative to the current working directory".
 const AT_FDCWD: i64 = -100;
@@ -91,6 +93,7 @@ pub struct Kernel {
     arch: Arch,
     mounts: MountTable,
     pipes: Vec<Pipe>,
+    net: Net,
     stdin: Box<dyn Read + Send>,
     stdout: Box<dyn Write + Send>,
     stderr: Box<dyn Write + Send>,
@@ -127,6 +130,7 @@ impl Kernel {
             arch,
             mounts,
             pipes: Vec::new(),
+            net: Net::default(),
             stdin: Box::new(std::io::stdin()),
             stdout: Box::new(std::io::stdout()),
             stderr: Box::new(std::io::stderr()),
@@ -303,7 +307,9 @@ impl Kernel {
             );
         }
         match sys {
-            Sysno::Write => self.sys_write(args[0], args[1], args[2], mem),
+            // sendto/recvfrom on a connected socket are just write/read.
+            Sysno::Write | Sysno::Sendto => self.sys_write(args[0], args[1], args[2], mem),
+            Sysno::Read | Sysno::Recvfrom => self.sys_read(args[0], args[1], args[2], mem),
             Sysno::Brk => self.sys_brk(args[0], mem),
             Sysno::Mmap => self.sys_mmap(args, mem),
             Sysno::Munmap => self.sys_munmap(args[0], args[1], mem),
@@ -311,7 +317,6 @@ impl Kernel {
             Sysno::Uname => self.sys_uname(args[0], mem),
             Sysno::ClockGettime => sys_clock_gettime(args[1], mem),
             Sysno::Openat => self.sys_openat(args[0] as i64, args[1], args[2], args[3], mem),
-            Sysno::Read => self.sys_read(args[0], args[1], args[2], mem),
             Sysno::Close => self.sys_close(args[0] as i32),
             Sysno::Lseek => self.sys_lseek(args[0], args[1] as i64, args[2]),
             Sysno::Fstat => self.sys_fstat(args[0], args[1], mem),
@@ -327,6 +332,15 @@ impl Kernel {
             Sysno::Fcntl => self.sys_fcntl(args[0], args[1]),
             Sysno::Futex => sys_futex(args, mem),
             Sysno::Pipe2 => self.sys_pipe2(args[0], mem),
+            Sysno::Socket => self.sys_socket(args[0], args[1], args[2]),
+            Sysno::Socketpair => self.sys_socketpair(args[0], args[1], args[2], args[3], mem),
+            Sysno::Bind => self.sys_bind(args[0], args[1], args[2], mem),
+            Sysno::Listen => self.sys_listen(args[0]),
+            Sysno::Accept4 => self.sys_accept4(args[0], args[1], args[2], args[3], mem),
+            Sysno::Connect => self.sys_connect(args[0], args[1], args[2], mem),
+            Sysno::Getsockname => self.sys_getsockname(args[0], args[1], args[2], mem),
+            Sysno::Getpeername => self.sys_getpeername(args[0], args[1], args[2], mem),
+            Sysno::Shutdown => self.sys_shutdown(args[0], args[1]),
             Sysno::Dup => self.sys_dup(args[0]),
             Sysno::Dup2 | Sysno::Dup3 => self.sys_dup2(args[0], args[1]),
             Sysno::Clone => self.sys_clone(args, vcpu, mem),
@@ -337,14 +351,17 @@ impl Kernel {
             // set_tid_address also returns the tid.
             Sysno::Getpid | Sysno::Gettid | Sysno::SetTidAddress => i64::from(self.cur.pid),
             Sysno::Getppid => i64::from(self.cur.ppid),
-            // signal setup / robust list / uid all succeed as root.
+            // signal setup / robust list / uid all succeed as root; socket
+            // options are accepted and ignored.
             Sysno::Getuid
             | Sysno::Geteuid
             | Sysno::Getgid
             | Sysno::Getegid
             | Sysno::RtSigaction
             | Sysno::RtSigprocmask
-            | Sysno::SetRobustList => 0,
+            | Sysno::SetRobustList
+            | Sysno::Setsockopt
+            | Sysno::Getsockopt => 0,
             _ => {
                 *self.unsupported.entry(raw).or_default() += 1;
                 err(Errno::ENOSYS)
@@ -375,6 +392,7 @@ impl Kernel {
             match fd {
                 Fd::PipeRead(i) => r.push(*i),
                 Fd::PipeWrite(i) => w.push(*i),
+                Fd::Socket { .. } => self.net.bump(fd, true),
                 _ => {}
             }
         }
@@ -512,6 +530,7 @@ impl Kernel {
                 Err(e) => io_errno(&e),
             },
             Some(Fd::PipeWrite(i)) => self.write_pipe(i, &data),
+            Some(Fd::Socket { sock, end }) => self.write_socket(sock, end, &data),
             _ => err(Errno::EBADF),
         }
     }
@@ -532,6 +551,7 @@ impl Kernel {
                 }
             }
             Some(Fd::PipeRead(i)) => self.read_pipe(i, buf, count, mem),
+            Some(Fd::Socket { sock, end }) => self.read_socket(sock, end, buf, count, mem),
             Some(Fd::File { path, offset }) => {
                 let mut tmp = vec![0u8; count as usize];
                 match self.mounts.read_at(&path, offset, &mut tmp) {
@@ -726,7 +746,7 @@ impl Kernel {
         match fd {
             Fd::PipeRead(i) => apply(&mut self.pipes[*i].readers),
             Fd::PipeWrite(i) => apply(&mut self.pipes[*i].writers),
-            _ => {}
+            f => self.net.bump(f, inc),
         }
     }
 
@@ -765,6 +785,7 @@ impl Kernel {
             }
             Some(Fd::Stdin | Fd::Stdout | Fd::Stderr) => stat::char_device_attrs(),
             Some(Fd::PipeRead(_) | Fd::PipeWrite(_)) => stat::fifo_attrs(),
+            Some(Fd::Socket { .. }) => stat::socket_attrs(),
             None => return err(Errno::EBADF),
         };
         write_stat_or_fault(mem, statbuf, &attrs)
