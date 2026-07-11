@@ -47,6 +47,8 @@ pub enum Sysno {
     Getrandom,
     RtSigaction,
     RtSigprocmask,
+    Futex,
+    Fcntl,
     /// A raw guest number with no mapping yet — handled as ENOSYS but logged.
     Unknown(u64),
 }

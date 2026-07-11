@@ -64,6 +64,8 @@ pub struct Kernel {
     /// Raw guest syscall numbers we don't handle yet, with hit counts — an
     /// honest "what's missing" ledger surfaced at shutdown.
     unsupported: BTreeMap<u64, u64>,
+    /// Print each syscall to stderr (set by the `NIXVM_TRACE` env var).
+    trace: bool,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -95,6 +97,7 @@ impl Kernel {
             stderr: Box::new(std::io::stderr()),
             exit_code: None,
             unsupported: BTreeMap::new(),
+            trace: std::env::var_os("NIXVM_TRACE").is_some(),
         }
     }
 
@@ -170,9 +173,12 @@ impl Kernel {
         sys: Sysno,
         raw: u64,
         args: &[u64; 6],
-        _vcpu: &mut dyn Vcpu,
+        vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
     ) -> i64 {
+        if self.trace {
+            eprintln!("[trace] pc={:#x} {sys:?} raw={raw} args={args:x?}", vcpu.pc());
+        }
         match sys {
             Sysno::Write => self.sys_write(args[0], args[1], args[2], mem),
             Sysno::Brk => self.sys_brk(args[0], mem),
@@ -196,6 +202,8 @@ impl Kernel {
             Sysno::Getrandom => self.sys_getrandom(args[0], args[1], mem),
             // Terminal ioctls: report "not a tty" for our plain stdio pipes.
             Sysno::Ioctl => err(Errno::ENOTTY),
+            Sysno::Fcntl => self.sys_fcntl(args[0], args[1]),
+            Sysno::Futex => sys_futex(args, mem),
             Sysno::ExitGroup | Sysno::Exit => {
                 self.exit_code = Some(args[0] as i32);
                 0
@@ -273,6 +281,21 @@ impl Kernel {
             }
         }
         total
+    }
+
+    /// `fcntl(fd, cmd, ...)` — the subset real programs need at startup.
+    fn sys_fcntl(&mut self, fd: u64, cmd: u64) -> i64 {
+        const F_DUPFD: u64 = 0;
+        const F_GETFL: u64 = 3;
+        const F_DUPFD_CLOEXEC: u64 = 1030;
+        match cmd {
+            F_DUPFD | F_DUPFD_CLOEXEC => match self.fds.get(fd as i32).cloned() {
+                Some(f) => i64::from(self.fds.alloc(f)),
+                None => err(Errno::EBADF),
+            },
+            F_GETFL => 2, // O_RDWR
+            _ => 0,       // F_GETFD/F_SETFD/F_SETFL: accept
+        }
     }
 
     /// `getrandom(buf, len, flags)` — fill `buf` with pseudorandom bytes.
@@ -615,6 +638,28 @@ impl Kernel {
     #[must_use]
     pub fn unsupported(&self) -> &BTreeMap<u64, u64> {
         &self.unsupported
+    }
+}
+
+/// `futex(uaddr, op, val, ...)` — the single-thread subset.
+///
+/// `FUTEX_WAIT` returns `EAGAIN` when `*uaddr` already differs from `val`
+/// (the common case: the lock was released), and otherwise reports a spurious
+/// wake (return 0) so the caller re-checks its condition rather than blocking.
+/// `FUTEX_WAKE` has no waiters to wake. Real blocking/waking arrives with the
+/// scheduler (Phase 6).
+fn sys_futex(args: &[u64; 6], mem: &GuestMemory) -> i64 {
+    const FUTEX_WAIT: u64 = 0;
+    let uaddr = args[0];
+    let op = args[1] & 0x7f; // strip FUTEX_PRIVATE_FLAG / FUTEX_CLOCK_REALTIME
+    let val = args[2] as u32;
+    match op {
+        FUTEX_WAIT => match mem.read_u32(uaddr) {
+            Ok(cur) if cur != val => err(Errno::EAGAIN),
+            Ok(_) => 0,
+            Err(_) => err(Errno::EFAULT),
+        },
+        _ => 0, // FUTEX_WAKE (no waiters) and unsupported ops
     }
 }
 

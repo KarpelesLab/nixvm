@@ -39,6 +39,8 @@ pub fn decode(nr: u64) -> Sysno {
         278 => Sysno::Getrandom,
         134 => Sysno::RtSigaction,
         135 => Sysno::RtSigprocmask,
+        98 => Sysno::Futex,
+        25 => Sysno::Fcntl,
         other => Sysno::Unknown(other),
     }
 }

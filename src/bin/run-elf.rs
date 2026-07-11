@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use nixvm::abi::Arch;
-use nixvm::fs::{MountTable, Passthrough, TmpFs};
+use nixvm::fs::{MountTable, Overlay, Passthrough, TmpFs};
 use nixvm::kernel::Kernel;
 use nixvm::loader::{ProcessSpec, load_static};
 use nixvm::vcpu::GuestMemory;
@@ -66,7 +66,14 @@ fn main() {
     let mut vcpu = backend.new_vcpu(img.entry, img.stack_pointer).unwrap();
 
     let mut mounts = MountTable::new();
-    mounts.mount("/", Box::new(TmpFs::new()));
+    // NIXVM_ROOT points `/` at a host Alpine rootfs (read-only lower) with a
+    // tmpfs upper (copy-on-write) — the real multi-instance layout.
+    if let Ok(root) = std::env::var("NIXVM_ROOT") {
+        let lower = Box::new(Passthrough::read_only(root));
+        mounts.mount("/", Box::new(Overlay::new(lower, Box::new(TmpFs::new()))));
+    } else {
+        mounts.mount("/", Box::new(TmpFs::new()));
+    }
     mounts.mount("/tmp", Box::new(TmpFs::new()));
     if let Ok(cwd) = std::env::current_dir() {
         mounts.mount("/work", Box::new(Passthrough::new(cwd)));
