@@ -27,10 +27,17 @@
 //! the same opcodes, `CVTSI2SD`/`CVTSI2SS`/`CVTTSD2SI`/`CVTTSS2SI`/
 //! `CVTSD2SI`/`CVTSS2SI`/`CVTSD2SS`/`CVTSS2SD`, `UCOMISD`/`COMISD`/
 //! `UCOMISS`/`COMISS`, the packed-integer `PXOR`/`POR`/`PAND`/`PANDN`/
-//! `PCMPEQB`/`PCMPEQD`/`PADDB`/`PSUBB`, `PMOVMSKB`, and `XORPS`/`XORPD`/
-//! `ANDPS`/`ANDPD` (the mandatory `0x66`/`0xF2`/`0xF3` prefixes are decoded
-//! as opcode-selectors here, not as operand-size/`REP`). Anything else
-//! surfaces as [`Exit::IllegalInstruction`].
+//! `PCMPEQB`/`PCMPEQD`/`PADDB`/`PSUBB`/`PADDD`/`PADDQ`/`PSUBD`/`PSUBQ`/
+//! `PCMPGTB`/`PCMPGTD`/`PMINUB`/`PMAXUB`, `PMOVMSKB`, `MOVMSKPS`/
+//! `MOVMSKPD`, and `XORPS`/`XORPD`/`ANDPS`/`ANDPD` (the mandatory
+//! `0x66`/`0xF2`/`0xF3` prefixes are decoded as opcode-selectors here, not
+//! as operand-size/`REP`). Also: the bit-scan/count group `BSF`/`BSR`/
+//! `POPCNT`/`LZCNT`/`TZCNT`, the `BT`/`BTS`/`BTR`/`BTC` register and
+//! immediate forms, `SHLD`/`SHRD`, `BSWAP`, and the SSE shuffle/unpack/
+//! shift group `PSHUFD`/`PSHUFLW`/`PSHUFHW`/`PSHUFB`/`SHUFPS`/`SHUFPD`/
+//! `UNPCKLPS`/`UNPCKHPS`/`PUNPCKL*`/`PUNPCKH*`/`MOVLHPS`/`MOVHLPS`/
+//! `PSLLDQ`/`PSRLDQ`/`PSLLD`/`PSRLD`/`PSLLQ`/`PSRLQ`. Anything else surfaces
+//! as [`Exit::IllegalInstruction`].
 
 use crate::abi::Arch;
 
@@ -223,6 +230,17 @@ enum BitOp {
     Xor,
 }
 
+/// The four `BT`/`BTS`/`BTR`/`BTC` variants (`0F A3/AB/B3/BB` register
+/// forms, `0F BA /4../7` immediate group): all four start by copying the
+/// tested bit into `CF`; only `BTS`/`BTR`/`BTC` then modify it.
+#[derive(Clone, Copy)]
+enum BitTestOp {
+    Bt,
+    Bts,
+    Btr,
+    Btc,
+}
+
 /// Apply `f` lane-wise (`f64`) to the low `lanes` 8-byte lanes of `dst`/`src`,
 /// leaving the untouched upper lanes of `dst` as-is — this is exactly the
 /// "scalar op preserves the destination's upper bits" rule SSE arithmetic
@@ -280,6 +298,69 @@ fn f32_lane_unop(dst: u128, src: u128, lanes: usize, f: impl Fn(f32) -> f32) -> 
         out[o..o + 4].copy_from_slice(&f(b).to_le_bytes());
     }
     u128::from_le_bytes(out)
+}
+
+/// Zero-extend up to 8 little-endian bytes into a `u64` — a lane-width-
+/// generic byte read for the packed-integer lane ops below.
+fn u64_from_le(bytes: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    b[..bytes.len()].copy_from_slice(bytes);
+    u64::from_le_bytes(b)
+}
+
+/// The interleave shared by `PUNPCKL*`/`PUNPCKH*` (`66 0F 60/61/62/68/69/
+/// 6A/6C/6D`) and `UNPCKLPS`/`UNPCKHPS`/`UNPCKLPD`/`UNPCKHPD` (`0F 14/15`,
+/// `66 0F 14/15`): merge alternating `lane_bytes`-wide lanes from the low
+/// (`high == false`) or high (`high == true`) half of `dst`/`src` into one
+/// interleaved result. The float-tagged and integer-tagged opcodes that
+/// share a lane width compute an identical bit pattern, so one function
+/// covers both.
+fn unpck(dst: u128, src: u128, lane_bytes: usize, high: bool) -> u128 {
+    let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+    let half = 16 / lane_bytes / 2;
+    let base = if high { half } else { 0 };
+    let mut out = [0u8; 16];
+    for i in 0..half {
+        let src_off = (base + i) * lane_bytes;
+        let o0 = (2 * i) * lane_bytes;
+        let o1 = (2 * i + 1) * lane_bytes;
+        out[o0..o0 + lane_bytes].copy_from_slice(&d[src_off..src_off + lane_bytes]);
+        out[o1..o1 + lane_bytes].copy_from_slice(&s[src_off..src_off + lane_bytes]);
+    }
+    u128::from_le_bytes(out)
+}
+
+/// Logical right-shift each `lane_bits`-wide lane of `v` independently by
+/// `count` bits (`PSRLD`/`PSRLQ`), zeroing a lane outright once `count`
+/// reaches its width — packed shifts saturate rather than wrap, unlike a
+/// scalar shift.
+fn pack_shift_right(v: u128, lane_bits: u32, count: u32) -> u128 {
+    if count >= lane_bits {
+        return 0;
+    }
+    let mask = (1u128 << lane_bits) - 1;
+    let lanes = 128 / lane_bits;
+    let mut out = 0u128;
+    for i in 0..lanes {
+        let lane = (v >> (i * lane_bits)) & mask;
+        out |= (lane >> count) << (i * lane_bits);
+    }
+    out
+}
+
+/// Left-shift counterpart of [`pack_shift_right`] (`PSLLD`/`PSLLQ`).
+fn pack_shift_left(v: u128, lane_bits: u32, count: u32) -> u128 {
+    if count >= lane_bits {
+        return 0;
+    }
+    let mask = (1u128 << lane_bits) - 1;
+    let lanes = 128 / lane_bits;
+    let mut out = 0u128;
+    for i in 0..lanes {
+        let lane = (v >> (i * lane_bits)) & mask;
+        out |= ((lane << count) & mask) << (i * lane_bits);
+    }
+    out
 }
 
 /// Mask `v` to `width` bits (8/16/32/64); a no-op at `width == 64`.
@@ -1236,6 +1317,157 @@ impl X86Interp {
         self.next(pc3)
     }
 
+    /// `BSF`/`BSR` (`0F BC`/`BD`, no mandatory prefix) and their `F3`-
+    /// prefixed counterparts `TZCNT`/`LZCNT`: `Gv <- Ev`, finding the index
+    /// of the least (`BSF`/`TZCNT`) or most (`BSR`/`LZCNT`) significant set
+    /// bit. `BSF`/`BSR` leave `reg` unmodified when the source is zero
+    /// (architecturally undefined; this matches common hardware behavior);
+    /// `TZCNT`/`LZCNT` instead define the result as `width` and set `CF`.
+    fn bit_scan(&mut self, mem: &GuestMemory, pc: u64, rex: Rex, width: u32, rep: u8, reverse: bool) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.read_operand(mem, rm_op, width));
+        let count_form = rep == 1; // F3-prefixed: TZCNT/LZCNT instead of BSF/BSR
+        if src == 0 {
+            self.flags = Flags { zf: true, cf: count_form, sf: false, of: false, pf: false };
+            if count_form {
+                self.gpr[modrm.reg] = mask_w(u64::from(width), width);
+            }
+        } else {
+            let lz_in_width = src.leading_zeros() - (64 - width);
+            let result = if reverse { width - 1 - lz_in_width } else { src.trailing_zeros() };
+            self.gpr[modrm.reg] = mask_w(u64::from(result), width);
+            self.flags = Flags { zf: count_form && result == 0, cf: false, sf: false, of: false, pf: false };
+        }
+        self.next(pc2)
+    }
+
+    /// `POPCNT Gv, Ev` (`F3 0F B8`, the `F3` mandatory): `reg` = the number
+    /// of set bits in `r/m`; `ZF` = (result == 0), all other flags cleared.
+    fn popcnt(&mut self, mem: &GuestMemory, pc: u64, rex: Rex, width: u32) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.read_operand(mem, rm_op, width));
+        let count = src.count_ones();
+        self.gpr[modrm.reg] = u64::from(count);
+        self.flags = Flags { zf: count == 0, cf: false, sf: false, of: false, pf: false };
+        self.next(pc2)
+    }
+
+    /// Shared body of `BT`/`BTS`/`BTR`/`BTC`: test bit `bit_idx % width` of
+    /// `rm_op` into `CF`, then leave it (`Bt`), set it (`Bts`), clear it
+    /// (`Btr`), or complement it (`Btc`). We always take the bit index
+    /// modulo the operand width even for a memory destination (real
+    /// hardware lets a register-index form address bits beyond the operand
+    /// by adjusting the effective byte address; this scaffold doesn't model
+    /// that).
+    fn apply_bit_test(
+        &mut self,
+        mem: &mut GuestMemory,
+        rm_op: Operand,
+        width: u32,
+        bit_idx: u64,
+        op: BitTestOp,
+    ) -> Result<(), Step> {
+        let a = self.read_operand(mem, rm_op, width)?;
+        let bit = (bit_idx % u64::from(width)) as u32;
+        self.flags.cf = (a >> bit) & 1 == 1;
+        let mask = 1u64 << bit;
+        let r = match op {
+            BitTestOp::Bt => return Ok(()),
+            BitTestOp::Bts => a | mask,
+            BitTestOp::Btr => a & !mask,
+            BitTestOp::Btc => a ^ mask,
+        };
+        self.write_operand(mem, rm_op, r, width)
+    }
+
+    /// `BT`/`BTS`/`BTR`/`BTC Ev, Gv` (`0F A3/AB/B3/BB`): the bit index comes
+    /// from a GPR.
+    fn bt_ev_gv(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, width: u32, op: BitTestOp) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let bit_idx = self.gpr[modrm.reg];
+        fetch!(self.apply_bit_test(mem, rm_op, width, bit_idx, op));
+        self.next(pc2)
+    }
+
+    /// Group 8: `BT`/`BTS`/`BTR`/`BTC Ev, ib` (`0F BA /4../7`): the bit
+    /// index is an immediate byte.
+    fn bt_group_imm(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, width: u32) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let (imm, pc3) = fetch!(fetch_u8(mem, pc2));
+        let op = match modrm.reg {
+            4 => BitTestOp::Bt,
+            5 => BitTestOp::Bts,
+            6 => BitTestOp::Btr,
+            7 => BitTestOp::Btc,
+            _ => return Step::Illegal, // /0../3: not in our documented subset
+        };
+        let rm_op = resolve(modrm.kind, pc3);
+        fetch!(self.apply_bit_test(mem, rm_op, width, u64::from(imm), op));
+        self.next(pc3)
+    }
+
+    /// `SHLD`/`SHRD Ev, Gv, ib|CL` (`0F A4/A5`, `0F AC/AD`): a double-
+    /// precision shift where the vacated bits of `dest` come from `src`
+    /// rather than zeros/sign bits. `CF` is the last bit shifted out of
+    /// `dest`; `OF` is only architecturally defined (a sign-change
+    /// indicator) when the shift count is 1; `ZF`/`SF`/`PF` are set from the
+    /// result like the ordinary shift group.
+    fn shift_double(&mut self, dest: u64, src: u64, count: u32, width: u32, left: bool) -> u64 {
+        let d = mask_w(dest, width);
+        let s = mask_w(src, width);
+        let (result, cf) = if left {
+            let wide = (u128::from(d) << width) | u128::from(s);
+            let result = mask_w(((wide << count) >> width) as u64, width);
+            (result, (d >> (width - count)) & 1 == 1)
+        } else {
+            let wide = (u128::from(s) << width) | u128::from(d);
+            let result = mask_w((wide >> count) as u64, width);
+            (result, (d >> (count - 1)) & 1 == 1)
+        };
+        self.flags.cf = cf;
+        self.flags.zf = result == 0;
+        self.flags.sf = sign_bit(result, width);
+        self.flags.pf = parity(result as u8);
+        if count == 1 {
+            self.flags.of = sign_bit(result, width) != sign_bit(d, width);
+        }
+        result
+    }
+
+    /// Decode-and-dispatch wrapper for [`Self::shift_double`]: fetches the
+    /// count (`imm8` or `CL`, masked the same way as [`Self::group2`]) and
+    /// leaves the r/m operand and flags untouched when it's zero.
+    fn shld_shrd(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        width: u32,
+        left: bool,
+        by_cl: bool,
+    ) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let (count, pc3) = if by_cl {
+            (self.gpr[RCX] as u8, pc2)
+        } else {
+            fetch!(fetch_u8(mem, pc2))
+        };
+        let mask = if width == 64 { 63 } else { 31 };
+        let amt = count & mask;
+        let rm_op = resolve(modrm.kind, pc3);
+        if amt == 0 {
+            return self.next(pc3);
+        }
+        let dest = fetch!(self.read_operand(mem, rm_op, width));
+        let src = mask_w(self.gpr[modrm.reg], width);
+        let r = self.shift_double(dest, src, u32::from(amt), width, left);
+        fetch!(self.write_operand(mem, rm_op, r, width));
+        self.next(pc3)
+    }
+
     // ---- REP-prefixed string ops. `rep` is `0` (no prefix, run once and
     // leave rCX alone), `1` (REP/REPE, `0xF3`) or `2` (REPNE, `0xF2`). Each
     // handler runs its whole repeat count in a single `Step` rather than
@@ -1462,6 +1694,29 @@ impl X86Interp {
                 self.gpr[modrm.reg] = mask_w(val, width);
                 self.next(pc2)
             }
+            0xA3 => self.bt_ev_gv(mem, pc, rex, width, BitTestOp::Bt),
+            0xAB => self.bt_ev_gv(mem, pc, rex, width, BitTestOp::Bts),
+            0xB3 => self.bt_ev_gv(mem, pc, rex, width, BitTestOp::Btr),
+            0xBB => self.bt_ev_gv(mem, pc, rex, width, BitTestOp::Btc),
+            0xBA => self.bt_group_imm(mem, pc, rex, width),
+            0xA4 => self.shld_shrd(mem, pc, rex, width, true, false),
+            0xA5 => self.shld_shrd(mem, pc, rex, width, true, true),
+            0xAC => self.shld_shrd(mem, pc, rex, width, false, false),
+            0xAD => self.shld_shrd(mem, pc, rex, width, false, true),
+            0xBC => self.bit_scan(mem, pc, rex, width, rep, false), // BSF, or TZCNT under F3
+            0xBD => self.bit_scan(mem, pc, rex, width, rep, true),  // BSR, or LZCNT under F3
+            0xB8 if rep == 1 => self.popcnt(mem, pc, rex, width),
+            0xC8..=0xCF => {
+                // BSWAP r (register embedded in the low 3 bits of op2, no ModRM).
+                let r = usize::from(op2 - 0xC8) | (usize::from(rex.b) << 3);
+                let bs = match width {
+                    64 => self.gpr[r].swap_bytes(),
+                    16 => u64::from((self.gpr[r] as u16).swap_bytes()),
+                    _ => u64::from((self.gpr[r] as u32).swap_bytes()),
+                };
+                fetch!(self.write_operand(mem, Operand::Reg(r), bs, width));
+                self.next(pc)
+            }
             _ => self.exec_0f_sse(mem, pc, rex, opsize16, rep, op2),
         }
     }
@@ -1488,7 +1743,23 @@ impl X86Interp {
         let gw = if rex.w { 64 } else { 32 };
         match op2 {
             0x10 | 0x11 => self.sse_move(mem, pc, rex, rep, op2 == 0x11),
+            0x12 => self.sse_movhlps(mem, pc, rex),
+            0x14 => self.sse_unpck(mem, pc, rex, if opsize16 { 8 } else { 4 }, false),
+            0x15 => self.sse_unpck(mem, pc, rex, if opsize16 { 8 } else { 4 }, true),
+            0x16 => self.sse_movlhps(mem, pc, rex),
             0x28 | 0x29 | 0x6F | 0x7F => self.sse_movaps(mem, pc, rex, matches!(op2, 0x29 | 0x7F)),
+            0x38 => self.exec_0f_38(mem, pc, rex),
+            0x50 => self.sse_movmskp(mem, pc, rex, opsize16),
+            0x60 => self.sse_unpck(mem, pc, rex, 1, false), // PUNPCKLBW
+            0x61 => self.sse_unpck(mem, pc, rex, 2, false), // PUNPCKLWD
+            0x62 => self.sse_unpck(mem, pc, rex, 4, false), // PUNPCKLDQ
+            0x64 => self.sse_pcmpgt(mem, pc, rex, 1), // PCMPGTB
+            0x66 => self.sse_pcmpgt(mem, pc, rex, 4), // PCMPGTD
+            0x68 => self.sse_unpck(mem, pc, rex, 1, true), // PUNPCKHBW
+            0x69 => self.sse_unpck(mem, pc, rex, 2, true), // PUNPCKHWD
+            0x6A => self.sse_unpck(mem, pc, rex, 4, true), // PUNPCKHDQ
+            0x6C => self.sse_unpck(mem, pc, rex, 8, false), // PUNPCKLQDQ
+            0x6D => self.sse_unpck(mem, pc, rex, 8, true), // PUNPCKHQDQ
             0x6E => self.sse_movd_load(mem, pc, rex, gw),
             0x7E if rep == 1 => self.sse_movq_xmm_load(mem, pc, rex),
             0x7E => self.sse_movd_store(mem, pc, rex, gw),
@@ -1508,12 +1779,22 @@ impl X86Interp {
             0x5D => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Min),
             0x5E => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Div),
             0x5F => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Max),
+            0x70 => self.sse_pshuf(mem, pc, rex, rep, opsize16),
+            0x72 => self.sse_shift_imm_group(mem, pc, rex, 4),
+            0x73 => self.sse_shift_imm_group(mem, pc, rex, 8),
             0x74 => self.sse_pcmpeq(mem, pc, rex, 1),
             0x76 => self.sse_pcmpeq(mem, pc, rex, 4),
+            0xC6 => self.sse_shuf(mem, pc, rex, opsize16),
+            0xD4 => self.sse_paddsub(mem, pc, rex, 8, true), // PADDQ
+            0xDA => self.sse_pminmaxub(mem, pc, rex, true),  // PMINUB
+            0xDE => self.sse_pminmaxub(mem, pc, rex, false), // PMAXUB
             0xDF => self.sse_bitwise(mem, pc, rex, BitOp::Andn),
             0xEB => self.sse_bitwise(mem, pc, rex, BitOp::Or),
+            0xFA => self.sse_paddsub(mem, pc, rex, 4, false), // PSUBD
+            0xFB => self.sse_paddsub(mem, pc, rex, 8, false), // PSUBQ
             0xFC => self.sse_paddsubb(mem, pc, rex, true),
             0xF8 => self.sse_paddsubb(mem, pc, rex, false),
+            0xFE => self.sse_paddsub(mem, pc, rex, 4, true), // PADDD
             _ => Step::Illegal,
         }
     }
@@ -1865,6 +2146,242 @@ impl X86Interp {
         let mut out = [0u8; 16];
         for i in 0..16 {
             out[i] = if add { d[i].wrapping_add(s[i]) } else { d[i].wrapping_sub(s[i]) };
+        }
+        self.xmm[modrm.reg] = u128::from_le_bytes(out);
+        self.next(pc2)
+    }
+
+    /// `MOVMSKPS`/`MOVMSKPD` (`0F 50`/`66 0F 50`): `Gd` gets each packed
+    /// lane's sign bit (4 `f32` lanes, or 2 `f64` lanes under `66`), packed
+    /// into consecutive low bits and zero-extended.
+    fn sse_movmskp(&mut self, mem: &GuestMemory, pc: u64, rex: Rex, opsize16: bool) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let bytes = src.to_le_bytes();
+        let lane_bytes = if opsize16 { 8 } else { 4 };
+        let mut result = 0u64;
+        for (lane, chunk) in bytes.chunks(lane_bytes).enumerate() {
+            if chunk[lane_bytes - 1] & 0x80 != 0 {
+                result |= 1 << lane;
+            }
+        }
+        self.gpr[modrm.reg] = result;
+        self.next(pc2)
+    }
+
+    /// `MOVHLPS xmm1, xmm2` (`0F 12`, register form only — the memory form
+    /// is the unrelated `MOVLPS`, not in our documented subset): `dst`'s low
+    /// 64 bits `<- src`'s high 64 bits; `dst`'s high 64 bits are unchanged.
+    fn sse_movhlps(&mut self, mem: &GuestMemory, pc: u64, rex: Rex) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let Operand::Reg(r) = rm_op else { return Step::Illegal };
+        let src_hi = self.xmm[r] >> 64;
+        self.xmm[modrm.reg] = (self.xmm[modrm.reg] & !u128::from(u64::MAX)) | src_hi;
+        self.next(pc2)
+    }
+
+    /// `MOVLHPS xmm1, xmm2` (`0F 16`, register form only — the memory form
+    /// is the unrelated `MOVHPS`): `dst`'s high 64 bits `<- src`'s low 64
+    /// bits; `dst`'s low 64 bits are unchanged.
+    fn sse_movlhps(&mut self, mem: &GuestMemory, pc: u64, rex: Rex) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let Operand::Reg(r) = rm_op else { return Step::Illegal };
+        let src_lo = self.xmm[r] & u128::from(u64::MAX);
+        self.xmm[modrm.reg] = (self.xmm[modrm.reg] & u128::from(u64::MAX)) | (src_lo << 64);
+        self.next(pc2)
+    }
+
+    /// `UNPCKLPS`/`UNPCKHPS`/`UNPCKLPD`/`UNPCKHPD` (`0F 14/15`, `66 0F
+    /// 14/15`) and `PUNPCKL*`/`PUNPCKH*` (`66 0F 60/61/62/68/69/6A/6C/6D`):
+    /// see [`unpck`].
+    fn sse_unpck(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, lane_bytes: usize, high: bool) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let dst = self.xmm[modrm.reg];
+        self.xmm[modrm.reg] = unpck(dst, src, lane_bytes, high);
+        self.next(pc2)
+    }
+
+    /// `PSHUFD` (`66 0F 70`), `PSHUFHW` (`F3 0F 70`) and `PSHUFLW` (`F2 0F
+    /// 70`): permute `src`'s dwords (`PSHUFD`, all four lanes) or words
+    /// (`PSHUFHW`/`PSHUFLW`, only the high/low four) into `dst` per the
+    /// two-bit lane selectors packed into `imm8`; `PSHUFHW`/`PSHUFLW` pass
+    /// their untouched half through unchanged.
+    fn sse_pshuf(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, rep: u8, opsize16: bool) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let (imm, pc3) = fetch!(fetch_u8(mem, pc2));
+        let rm_op = resolve(modrm.kind, pc3);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let s = src.to_le_bytes();
+        let mut out = [0u8; 16];
+        if opsize16 {
+            for i in 0..4 {
+                let sel = usize::from((imm >> (2 * i)) & 3);
+                out[i * 4..i * 4 + 4].copy_from_slice(&s[sel * 4..sel * 4 + 4]);
+            }
+        } else if rep == 1 || rep == 2 {
+            let shuf_base = if rep == 1 { 4 } else { 0 }; // F3 = PSHUFHW (high words)
+            let pass_base = 4 - shuf_base;
+            for w in 0..4 {
+                let o = (pass_base + w) * 2;
+                out[o..o + 2].copy_from_slice(&s[o..o + 2]);
+            }
+            for i in 0..4 {
+                let sel = shuf_base + usize::from((imm >> (2 * i)) & 3);
+                let o = (shuf_base + i) * 2;
+                out[o..o + 2].copy_from_slice(&s[sel * 2..sel * 2 + 2]);
+            }
+        } else {
+            return Step::Illegal; // plain PSHUFW (MMX): not in our documented subset
+        }
+        self.xmm[modrm.reg] = u128::from_le_bytes(out);
+        self.next(pc3)
+    }
+
+    /// `SHUFPS`/`SHUFPD` (`0F C6`/`66 0F C6`): pick `dst`'s low half-lanes
+    /// from `dst` and its high half-lanes from `src`, per the two-bit
+    /// (`SHUFPS`) or one-bit (`SHUFPD`) selectors packed into `imm8`.
+    fn sse_shuf(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, opsize16: bool) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let (imm, pc3) = fetch!(fetch_u8(mem, pc2));
+        let rm_op = resolve(modrm.kind, pc3);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let dst = self.xmm[modrm.reg];
+        let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+        let mut out = [0u8; 16];
+        if opsize16 {
+            let sel0 = usize::from(imm & 1);
+            let sel1 = usize::from((imm >> 1) & 1);
+            out[0..8].copy_from_slice(&d[sel0 * 8..sel0 * 8 + 8]);
+            out[8..16].copy_from_slice(&s[sel1 * 8..sel1 * 8 + 8]);
+        } else {
+            let sels = [imm & 3, (imm >> 2) & 3, (imm >> 4) & 3, (imm >> 6) & 3];
+            for (i, &sel) in sels.iter().enumerate() {
+                let sel = usize::from(sel);
+                let o = i * 4;
+                if i < 2 {
+                    out[o..o + 4].copy_from_slice(&d[sel * 4..sel * 4 + 4]);
+                } else {
+                    out[o..o + 4].copy_from_slice(&s[sel * 4..sel * 4 + 4]);
+                }
+            }
+        }
+        self.xmm[modrm.reg] = u128::from_le_bytes(out);
+        self.next(pc3)
+    }
+
+    /// `0F 72`/`73` (`lane_bytes` = 4 or 8): the packed-shift-by-immediate
+    /// group — `PSRLD`/`PSLLD` (`/2`/`/6`, `lane_bytes == 4`) or `PSRLQ`/
+    /// `PSLLQ`/`PSRLDQ`/`PSLLDQ` (`/2`/`/6`/`/3`/`/7`, `lane_bytes == 8`).
+    /// `PSRLDQ`/`PSLLDQ` shift the whole 128-bit register by whole *bytes*
+    /// (zero-filling); the others shift each `lane_bytes`-wide lane
+    /// independently by *bits* (see [`pack_shift_right`]/
+    /// [`pack_shift_left`]).
+    fn sse_shift_imm_group(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, lane_bytes: u32) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let (imm, pc3) = fetch!(fetch_u8(mem, pc2));
+        let rm_op = resolve(modrm.kind, pc3);
+        let dst = fetch!(self.xmm_read128(mem, rm_op));
+        let count = u32::from(imm);
+        let result = match (lane_bytes, modrm.reg) {
+            (4, 2) => pack_shift_right(dst, 32, count),
+            (4, 6) => pack_shift_left(dst, 32, count),
+            (8, 2) => pack_shift_right(dst, 64, count),
+            (8, 6) => pack_shift_left(dst, 64, count),
+            (8, 3) => {
+                if count >= 16 { 0 } else { dst >> (count * 8) } // PSRLDQ
+            }
+            (8, 7) => {
+                if count >= 16 { 0 } else { dst << (count * 8) } // PSLLDQ
+            }
+            _ => return Step::Illegal, // PSRAW/PSRAD (/4) and other sub-ops: not in our documented subset
+        };
+        fetch!(self.xmm_write128(mem, rm_op, result));
+        self.next(pc3)
+    }
+
+    /// The three-byte `0F 38` opcode map: only `PSHUFB` (`66 0F 38 00`) is
+    /// in our documented subset.
+    fn exec_0f_38(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex) -> Step {
+        let (op3, pc) = fetch!(fetch_u8(mem, pc));
+        match op3 {
+            0x00 => self.sse_pshufb(mem, pc, rex),
+            _ => Step::Illegal,
+        }
+    }
+
+    /// `PSHUFB xmm1, xmm2/m128` (`66 0F 38 00`): each byte of `dst` becomes
+    /// `src`'s byte at the index given by the low nibble of the
+    /// corresponding `dst` byte, or zero if that byte's high bit is set.
+    fn sse_pshufb(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let dst = self.xmm[modrm.reg];
+        let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+        let mut out = [0u8; 16];
+        for i in 0..16 {
+            out[i] = if d[i] & 0x80 != 0 { 0 } else { s[usize::from(d[i] & 0x0f)] };
+        }
+        self.xmm[modrm.reg] = u128::from_le_bytes(out);
+        self.next(pc2)
+    }
+
+    /// `PADDD`/`PADDQ`/`PSUBD`/`PSUBQ` (`66 0F FE`/`D4`/`FA`/`FB`): wrapping
+    /// `lane_bytes`-wide lane add/subtract — a 32-/64-bit-lane
+    /// generalization of [`Self::sse_paddsubb`]'s byte lanes.
+    #[allow(clippy::many_single_char_names)] // dst/src/lane_bytes/add is the natural naming here
+    fn sse_paddsub(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, lane_bytes: usize, add: bool) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let dst = self.xmm[modrm.reg];
+        let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+        let mut out = [0u8; 16];
+        for lane in (0..16).step_by(lane_bytes) {
+            let a = u64_from_le(&d[lane..lane + lane_bytes]);
+            let b = u64_from_le(&s[lane..lane + lane_bytes]);
+            let r = if add { a.wrapping_add(b) } else { a.wrapping_sub(b) };
+            out[lane..lane + lane_bytes].copy_from_slice(&r.to_le_bytes()[..lane_bytes]);
+        }
+        self.xmm[modrm.reg] = u128::from_le_bytes(out);
+        self.next(pc2)
+    }
+
+    /// `PMINUB`/`PMAXUB` (`66 0F DA`/`DE`): unsigned byte-lane min/max.
+    fn sse_pminmaxub(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, is_min: bool) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let dst = self.xmm[modrm.reg];
+        let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+        let mut out = [0u8; 16];
+        for i in 0..16 {
+            out[i] = if is_min { d[i].min(s[i]) } else { d[i].max(s[i]) };
+        }
+        self.xmm[modrm.reg] = u128::from_le_bytes(out);
+        self.next(pc2)
+    }
+
+    /// `PCMPGTB`/`PCMPGTD` (`66 0F 64`/`66`): signed `lane_bytes`-wide
+    /// per-lane greater-than compare, filling each lane with all-1s (true)
+    /// or all-0s (false) — the signed counterpart of [`Self::sse_pcmpeq`].
+    fn sse_pcmpgt(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, lane_bytes: usize) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let dst = self.xmm[modrm.reg];
+        let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+        let mut out = [0u8; 16];
+        for lane in (0..16).step_by(lane_bytes) {
+            let a = sign_extend_w(u64_from_le(&d[lane..lane + lane_bytes]), lane_bytes as u32 * 8);
+            let b = sign_extend_w(u64_from_le(&s[lane..lane + lane_bytes]), lane_bytes as u32 * 8);
+            let fill = if a > b { 0xffu8 } else { 0u8 };
+            out[lane..lane + lane_bytes].fill(fill);
         }
         self.xmm[modrm.reg] = u128::from_le_bytes(out);
         self.next(pc2)
@@ -3269,5 +3786,198 @@ mod tests {
         cpu.rip = CODE;
         cpu.exec(&mut m);
         assert_eq!(cpu.gpr[RAX], 0x7ffe, "bits 1..=14 set, bits 0 and 15 clear");
+    }
+
+    #[test]
+    fn bsf_bsr_and_zero_source_sets_zf() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 0b0101_0000; // lowest set bit at index 4, highest at index 6
+        // bsf ecx, eax  (0F BC /r, modrm=11 001 000)
+        m.write_init(CODE, &[0x0F, 0xBC, 0xC8]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RCX] & 0xffff_ffff, 4);
+        assert!(!cpu.flags.zf);
+
+        // bsr edx, eax  (0F BD /r, modrm=11 010 000)
+        m.write_init(CODE, &[0x0F, 0xBD, 0xD0]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RDX] & 0xffff_ffff, 6);
+        assert!(!cpu.flags.zf);
+
+        // bsf ebx, esi with esi == 0: ZF set, ebx left unmodified.
+        cpu.gpr[RSI] = 0;
+        cpu.gpr[RBX] = 0x1234;
+        // bsf ebx, esi  (0F BC /r, modrm=11 011 110)
+        m.write_init(CODE, &[0x0F, 0xBC, 0xDE]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert!(cpu.flags.zf, "BSF of a zero source sets ZF");
+        assert_eq!(cpu.gpr[RBX], 0x1234, "BSF must not modify the destination when the source is zero");
+    }
+
+    #[test]
+    fn popcnt_counts_bits_and_sets_zf() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 0b1011_0110; // 5 set bits
+        // popcnt ecx, eax  (F3 0F B8 /r, modrm=11 001 000)
+        m.write_init(CODE, &[0xF3, 0x0F, 0xB8, 0xC8]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RCX], 5);
+        assert!(!cpu.flags.zf);
+
+        cpu.gpr[RAX] = 0;
+        m.write_init(CODE, &[0xF3, 0x0F, 0xB8, 0xC8]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RCX], 0);
+        assert!(cpu.flags.zf);
+    }
+
+    #[test]
+    fn bt_register_and_immediate_forms_set_cf() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 0b0000_0100; // bit 2 set
+        cpu.gpr[RCX] = 2;
+        // bt eax, ecx  (0F A3 /r, modrm=11 001 000)
+        m.write_init(CODE, &[0x0F, 0xA3, 0xC8]).unwrap();
+        cpu.exec(&mut m);
+        assert!(cpu.flags.cf, "bit 2 of 0b100 is set");
+        assert_eq!(cpu.gpr[RAX], 0b0000_0100, "BT must not modify the operand");
+
+        cpu.gpr[RCX] = 1;
+        // bt eax, ecx (bit 1, clear)
+        m.write_init(CODE, &[0x0F, 0xA3, 0xC8]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert!(!cpu.flags.cf, "bit 1 of 0b100 is clear");
+
+        // bts eax, 0  (0F BA /5 ib, modrm=11 101 000)
+        m.write_init(CODE, &[0x0F, 0xBA, 0xE8, 0x00]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert!(!cpu.flags.cf, "bit 0 of 0b100 was clear before the set");
+        assert_eq!(cpu.gpr[RAX] & 0xff, 0b0000_0101, "BTS sets bit 0");
+    }
+
+    #[test]
+    fn shld_shrd_numeric_results() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 0x0000_0001; // dest
+        cpu.gpr[RCX] = 0x8000_0000; // src (top bit feeds dest's vacated low bits)
+        // shld eax, ecx, 4  (0F A4 /r ib, modrm=11 001 000)
+        m.write_init(CODE, &[0x0F, 0xA4, 0xC8, 0x04]).unwrap();
+        cpu.exec(&mut m);
+        // (0x1 << 4) | (0x8000_0000 >> 28) = 0x10 | 0x8 = 0x18
+        assert_eq!(cpu.gpr[RAX] & 0xffff_ffff, 0x18);
+
+        cpu.gpr[RAX] = 0x8000_0000; // dest
+        cpu.gpr[RCX] = 0x0000_000f; // src (low bits feed dest's vacated high bits)
+        // shrd eax, ecx, 4  (0F AC /r ib, modrm=11 001 000)
+        m.write_init(CODE, &[0x0F, 0xAC, 0xC8, 0x04]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        // (0x8000_0000 >> 4) | (0xf << 28) = 0x0800_0000 | 0xf000_0000 = 0xf800_0000
+        assert_eq!(cpu.gpr[RAX] & 0xffff_ffff, 0xf800_0000);
+    }
+
+    #[test]
+    fn bswap_reverses_byte_order() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 0x1122_3344;
+        // bswap eax  (0F C8)
+        m.write_init(CODE, &[0x0F, 0xC8]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 0x4433_2211);
+
+        cpu.gpr[RCX] = 0x0102_0304_0506_0708;
+        // bswap rcx  (REX.W 0F C9)
+        m.write_init(CODE, &[0x48, 0x0F, 0xC9]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RCX], 0x0807_0605_0403_0201);
+    }
+
+    #[test]
+    fn pshufd_permutes_dword_lanes() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let lanes: [u32; 4] = [0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444];
+        let mut bytes = [0u8; 16];
+        for (i, v) in lanes.iter().enumerate() {
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        cpu.xmm[1] = u128::from_le_bytes(bytes);
+        // pshufd xmm0, xmm1, 0x1B  (66 0F 70 /r ib, modrm=11 000 001):
+        // imm=0b00_01_10_11 reverses the four lanes.
+        m.write_init(CODE, &[0x66, 0x0F, 0x70, 0xC1, 0x1B]).unwrap();
+        cpu.exec(&mut m);
+        let out = cpu.xmm[0].to_le_bytes();
+        assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 0x4444_4444);
+        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 0x3333_3333);
+        assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 0x2222_2222);
+        assert_eq!(u32::from_le_bytes(out[12..16].try_into().unwrap()), 0x1111_1111);
+    }
+
+    #[test]
+    fn punpcklbw_interleaves_bytes() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.xmm[0] = u128::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        cpu.xmm[1] = u128::from_le_bytes([
+            101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116,
+        ]);
+        // punpcklbw xmm0, xmm1  (66 0F 60 /r, modrm=11 000 001)
+        m.write_init(CODE, &[0x66, 0x0F, 0x60, 0xC1]).unwrap();
+        cpu.exec(&mut m);
+        let out = cpu.xmm[0].to_le_bytes();
+        assert_eq!(out, [1, 101, 2, 102, 3, 103, 4, 104, 5, 105, 6, 106, 7, 107, 8, 108]);
+    }
+
+    #[test]
+    fn shufps_selects_lanes() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let d: [u32; 4] = [10, 20, 30, 40];
+        let s: [u32; 4] = [50, 60, 70, 80];
+        let (mut db, mut sb) = ([0u8; 16], [0u8; 16]);
+        for i in 0..4 {
+            db[i * 4..i * 4 + 4].copy_from_slice(&d[i].to_le_bytes());
+            sb[i * 4..i * 4 + 4].copy_from_slice(&s[i].to_le_bytes());
+        }
+        cpu.xmm[0] = u128::from_le_bytes(db);
+        cpu.xmm[1] = u128::from_le_bytes(sb);
+        // shufps xmm0, xmm1, imm  (0F C6 /r ib, modrm=11 000 001):
+        // lane0<-dst[2], lane1<-dst[3], lane2<-src[0], lane3<-src[1]
+        let imm = 0b01_00_11_10u8;
+        m.write_init(CODE, &[0x0F, 0xC6, 0xC1, imm]).unwrap();
+        cpu.exec(&mut m);
+        let out = cpu.xmm[0].to_le_bytes();
+        assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 30, "lane0 <- dst[2]");
+        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 40, "lane1 <- dst[3]");
+        assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 50, "lane2 <- src[0]");
+        assert_eq!(u32::from_le_bytes(out[12..16].try_into().unwrap()), 60, "lane3 <- src[1]");
+    }
+
+    #[test]
+    fn pslldq_shifts_whole_register_by_bytes() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.xmm[0] = u128::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        // pslldq xmm0, 2  (66 0F 73 /7 ib, modrm=11 111 000)
+        m.write_init(CODE, &[0x66, 0x0F, 0x73, 0xF8, 0x02]).unwrap();
+        cpu.exec(&mut m);
+        let out = cpu.xmm[0].to_le_bytes();
+        assert_eq!(&out[0..2], &[0, 0], "low 2 bytes are zero-filled");
+        assert_eq!(
+            &out[2..16],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+            "bytes shifted up by 2, top 2 bytes dropped"
+        );
     }
 }
