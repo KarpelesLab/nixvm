@@ -1407,19 +1407,19 @@ impl Aarch64Interp {
             let rm = reg_field(instr, 16);
             let rn = reg_field(instr, 5);
             let rd = reg_field(instr, 0);
-            let (a, b, d) = (self.v[rn], self.v[rm], self.v[rd]);
-            let r = match (u, size) {
-                (0, 0b00) => a & b,              // AND
-                (0, 0b01) => a & !b,             // BIC
-                (0, 0b10) => a | b,              // ORR (MOV when Rn==Rm)
-                (0, 0b11) => a | !b,             // ORN
-                (1, 0b00) => a ^ b,              // EOR
-                (1, 0b01) => (d & a) | (!d & b), // BSL
-                (1, 0b10) => (b & a) | (!b & d), // BIT
-                _ => (!b & a) | (b & d),         // BIF (1,0b11)
+            let (vn, vm, vd) = (self.v[rn], self.v[rm], self.v[rd]);
+            let out = match (u, size) {
+                (0, 0b00) => vn & vm,                 // AND
+                (0, 0b01) => vn & !vm,                // BIC
+                (0, 0b10) => vn | vm,                 // ORR (MOV when Rn==Rm)
+                (0, 0b11) => vn | !vm,                // ORN
+                (1, 0b00) => vn ^ vm,                 // EOR
+                (1, 0b01) => (vd & vn) | (!vd & vm),  // BSL
+                (1, 0b10) => (vm & vn) | (!vm & vd),  // BIT
+                _ => (!vm & vn) | (vm & vd),          // BIF (1,0b11)
             };
             let mask = if q == 1 { u128::MAX } else { ones_u128(64) };
-            self.v[rd] = r & mask;
+            self.v[rd] = out & mask;
             return Step::Next;
         }
 
