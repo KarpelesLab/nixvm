@@ -31,6 +31,12 @@ pub fn decode(nr: u64) -> Sysno {
         104 => Sysno::Getgid,
         108 => Sysno::Getegid,
         228 => Sysno::ClockGettime,
+        8 => Sysno::Lseek,
+        5 => Sysno::Fstat,
+        262 => Sysno::Newfstatat,
+        217 => Sysno::Getdents64,
+        79 => Sysno::Getcwd,
+        80 => Sysno::Chdir,
         other => Sysno::Unknown(other),
     }
 }

@@ -39,9 +39,8 @@ impl MountTable {
         });
     }
 
-    /// Find the backend owning `abs_path` and the path relative to its mount
-    /// point. Returns the longest matching mount.
-    fn resolve(&mut self, abs_path: &str) -> Option<(&mut dyn MountFs, String)> {
+    /// Index of the longest-prefix mount owning `abs_path`.
+    fn best_mount(&self, abs_path: &str) -> Option<usize> {
         let mut best: Option<usize> = None;
         let mut best_len = 0usize;
         for (i, m) in self.mounts.iter().enumerate() {
@@ -50,7 +49,13 @@ impl MountTable {
                 best_len = m.point.len();
             }
         }
-        let i = best?;
+        best
+    }
+
+    /// Find the backend owning `abs_path` and the path relative to its mount
+    /// point. Returns the longest matching mount.
+    fn resolve(&mut self, abs_path: &str) -> Option<(&mut dyn MountFs, String)> {
+        let i = self.best_mount(abs_path)?;
         let rel = relative_to(abs_path, &self.mounts[i].point);
         Some((self.mounts[i].fs.as_mut(), rel))
     }
@@ -68,6 +73,54 @@ impl MountTable {
     pub fn readdir(&mut self, abs_path: &str) -> io::Result<Vec<DirEntry>> {
         let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
         fs.readdir(&rel)
+    }
+
+    pub fn write_at(&mut self, abs_path: &str, off: u64, buf: &[u8]) -> io::Result<usize> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.write_at(&rel, off, buf)
+    }
+
+    pub fn create(&mut self, abs_path: &str, mode: u32) -> io::Result<()> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.create(&rel, mode)
+    }
+
+    pub fn mkdir(&mut self, abs_path: &str, mode: u32) -> io::Result<()> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.mkdir(&rel, mode)
+    }
+
+    pub fn unlink(&mut self, abs_path: &str) -> io::Result<()> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.unlink(&rel)
+    }
+
+    pub fn rmdir(&mut self, abs_path: &str) -> io::Result<()> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.rmdir(&rel)
+    }
+
+    pub fn truncate(&mut self, abs_path: &str, len: u64) -> io::Result<()> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.truncate(&rel, len)
+    }
+
+    pub fn readlink(&mut self, abs_path: &str) -> io::Result<String> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.readlink(&rel)
+    }
+
+    /// Rename within a single backend. Cross-mount renames return `EXDEV`.
+    pub fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
+        let from_idx = self.best_mount(from).ok_or_else(enoent)?;
+        let to_idx = self.best_mount(to).ok_or_else(enoent)?;
+        if from_idx != to_idx {
+            return Err(io::Error::from_raw_os_error(18)); // EXDEV
+        }
+        let point = self.mounts[from_idx].point.clone();
+        let from_rel = relative_to(from, &point);
+        let to_rel = relative_to(to, &point);
+        self.mounts[from_idx].fs.rename(&from_rel, &to_rel)
     }
 }
 

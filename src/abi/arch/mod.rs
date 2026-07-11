@@ -38,6 +38,12 @@ pub enum Sysno {
     Getgid,
     Getegid,
     ClockGettime,
+    Lseek,
+    Fstat,
+    Newfstatat,
+    Getdents64,
+    Getcwd,
+    Chdir,
     /// A raw guest number with no mapping yet — handled as ENOSYS but logged.
     Unknown(u64),
 }
