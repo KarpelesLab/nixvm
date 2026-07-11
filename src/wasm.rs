@@ -202,6 +202,78 @@ mod browser {
         run(bytes, argv).to_json()
     }
 
+    /// An interactive guest terminal: boot a distro root image (an *uncompressed*
+    /// tar — the page decompresses the `.tar.gz` via `DecompressionStream`) and
+    /// drive a shell. Wraps [`crate::vm::Vm`].
+    ///
+    /// Usage from JS (with an xterm-style widget):
+    /// ```js
+    /// const term = new Terminal(tarBytes, ["/bin/busybox", "sh"]);
+    /// term.write_stdin(new TextEncoder().encode("uname -a\n"));
+    /// const out = term.pump();        // Uint8Array of stdout+stderr
+    /// xterm.write(out);
+    /// if (!term.is_running()) { /* exited with term.exit_code() */ }
+    /// ```
+    #[wasm_bindgen]
+    pub struct Terminal {
+        vm: crate::vm::Vm,
+    }
+
+    #[wasm_bindgen]
+    impl Terminal {
+        /// Boot `argv[0]` from `rootfs_tar` (an uncompressed tar) in interactive
+        /// mode. Throws if the image lacks `argv[0]` or its dynamic linker.
+        #[wasm_bindgen(constructor)]
+        pub fn new(rootfs_tar: &[u8], argv: Vec<String>) -> Result<Terminal, JsError> {
+            console_error_panic_hook::set_once();
+            let argv = if argv.is_empty() {
+                vec!["/bin/busybox".to_string(), "sh".to_string()]
+            } else {
+                argv
+            };
+            let vm = crate::vm::Vm::boot(rootfs_tar, argv, MEM_BYTES)
+                .map_err(|e| JsError::new(&e))?;
+            Ok(Self { vm })
+        }
+
+        /// Feed keystrokes to the guest's stdin.
+        pub fn write_stdin(&mut self, bytes: &[u8]) {
+            self.vm.write_stdin(bytes);
+        }
+
+        /// Signal end-of-input (Ctrl-D).
+        pub fn close_stdin(&mut self) {
+            self.vm.close_stdin();
+        }
+
+        /// Run until the guest parks for input or exits; returns the bytes to
+        /// write to the terminal (stdout then stderr). Call again after
+        /// `write_stdin`.
+        #[must_use]
+        pub fn pump(&mut self) -> Vec<u8> {
+            match self.vm.pump() {
+                Ok(step) => {
+                    let mut out = step.stdout;
+                    out.extend_from_slice(&step.stderr);
+                    out
+                }
+                Err(_) => Vec::new(),
+            }
+        }
+
+        /// Whether the guest is still running (has not exited).
+        #[must_use]
+        pub fn is_running(&self) -> bool {
+            self.vm.exit_code().is_none()
+        }
+
+        /// The guest exit code once it has exited (`-1` while still running).
+        #[must_use]
+        pub fn exit_code(&self) -> i32 {
+            self.vm.exit_code().unwrap_or(-1)
+        }
+    }
+
     /// Peek the ELF header's `e_machine` field (offset 18, 2 bytes,
     /// little-endian) to pick a guest architecture, without duplicating the
     /// loader's own (private) full header parser. Mirrors `EM_AARCH64` (183)
@@ -337,4 +409,4 @@ mod browser {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use browser::{run_elf, run_elf_with_argv};
+pub use browser::{Terminal, run_elf, run_elf_with_argv};
