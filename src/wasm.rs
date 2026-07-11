@@ -1,9 +1,13 @@
 //! Browser demo entry point.
 //!
-//! `run_elf(bytes: &[u8]) -> String` loads a statically-linked ELF64 image,
-//! runs it to completion on the software interpreter ([`crate::vcpu::interp`]),
-//! and returns a JSON string with the guest's captured stdout/stderr and exit
-//! code, for `web/index.html` to print into a `<pre>`.
+//! [`run_elf`] loads a statically-linked ELF64 image (aarch64 or x86-64,
+//! auto-detected from the ELF header's `e_machine` field), runs it to
+//! completion on the matching software interpreter
+//! ([`crate::vcpu::interp`] for aarch64, [`crate::vcpu::interp_x86`] for
+//! x86-64), and returns a JSON string with the guest's captured
+//! stdout/stderr, exit code, and unsupported-syscall ledger, for
+//! `web/index.html` to render. [`run_elf_with_argv`] is the same but lets the
+//! caller supply `argv`.
 //!
 //! ## Manual verification
 //!
@@ -32,12 +36,21 @@
 //!
 //! [`crate::sandbox::Sandbox::exec_elf`] does not expose that hook (it always
 //! wires the real host stdout/stderr), so this module bypasses `Sandbox` and
-//! talks to [`crate::loader`], [`crate::vcpu::interp::InterpBackend`], and
-//! [`Kernel`] directly — mirroring the wiring in `src/bin/run-elf.rs`.
+//! talks to [`crate::loader`], the [`crate::vcpu`] backends, and [`Kernel`]
+//! directly — mirroring the wiring in `src/bin/run-elf.rs`.
 //!
 //! There is also no host filesystem to share into a browser tab, so the guest
 //! root here is an in-memory [`crate::fs::TmpFs`] only (no `/work` passthrough
 //! — that mount is `cfg(unix)`-gated and wouldn't build for wasm32 anyway).
+//!
+//! ## Diagnostics surfaced to the page
+//!
+//! Besides stdout/stderr/exit code, the JSON includes the guest architecture
+//! nixvm detected and [`Kernel::unsupported`]'s ledger of syscalls the guest
+//! attempted that nixvm doesn't implement (raw syscall number -> attempt
+//! count) — there is no public step/instruction counter on [`Kernel`] to
+//! surface a wall-independent step count, so this is the richest telemetry
+//! available through its public API today.
 
 #[cfg(target_arch = "wasm32")]
 mod browser {
@@ -51,7 +64,6 @@ mod browser {
     use crate::loader::{ProcessSpec, load_static};
     use crate::vcpu::Backend;
     use crate::vcpu::GuestMemory;
-    use crate::vcpu::interp::InterpBackend;
     use crate::vcpu::mem::PAGE_SIZE;
 
     /// Guest base address for the flat process address space (mirrors
@@ -93,41 +105,154 @@ mod browser {
         out
     }
 
-    /// Run a statically-linked ELF64 image on the software interpreter to
-    /// completion.
+    /// Everything gathered while attempting to run a guest image, in a shape
+    /// that always serializes — even a load failure before a single guest
+    /// instruction ran still reports what we know (e.g. the detected arch).
+    struct RunOutcome {
+        /// Detected guest architecture, once the ELF header could be parsed.
+        arch: Option<&'static str>,
+        /// Guest exit code, set only once the guest reached `exit`/`exit_group`
+        /// (or the whole vcpu loop otherwise returned cleanly).
+        exit_code: Option<i32>,
+        stdout: String,
+        stderr: String,
+        /// Set when some stage failed: a bad ELF, an unsupported machine type,
+        /// a backend that couldn't start, or a guest-side fault/illegal
+        /// instruction that ended the run early. `stdout`/`stderr`/`unsupported`
+        /// still hold whatever the guest produced before that happened.
+        error: Option<String>,
+        /// Unsupported syscall ledger: (raw guest syscall nr, attempt count),
+        /// straight from [`Kernel::unsupported`].
+        unsupported: Vec<(u64, u64)>,
+    }
+
+    impl RunOutcome {
+        fn failed(msg: String) -> Self {
+            Self {
+                arch: None,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: Some(msg),
+                unsupported: Vec::new(),
+            }
+        }
+
+        fn to_json(&self) -> String {
+            let exit_code = self
+                .exit_code
+                .map_or_else(|| "null".to_string(), |c| c.to_string());
+            let arch = self
+                .arch
+                .map_or_else(|| "null".to_string(), |a| format!("\"{a}\""));
+            let error = self
+                .error
+                .as_deref()
+                .map_or_else(|| "null".to_string(), |e| format!("\"{}\"", json_escape(e)));
+            let mut unsupported = String::from("[");
+            for (i, (nr, count)) in self.unsupported.iter().enumerate() {
+                if i > 0 {
+                    unsupported.push(',');
+                }
+                unsupported.push_str(&format!("{{\"nr\":{nr},\"count\":{count}}}"));
+            }
+            unsupported.push(']');
+            format!(
+                "{{\"ok\":{},\"arch\":{arch},\"exit_code\":{exit_code},\"stdout\":\"{}\",\"stderr\":\"{}\",\"error\":{error},\"unsupported_syscalls\":{unsupported}}}",
+                self.error.is_none(),
+                json_escape(&self.stdout),
+                json_escape(&self.stderr),
+            )
+        }
+    }
+
+    /// Run a statically-linked ELF64 image (aarch64 or x86-64) on the
+    /// software interpreter to completion, with the default single-element
+    /// `argv` (see [`run_elf_with_argv`] to override it).
     ///
     /// Returns a JSON string:
-    /// `{"ok":true,"exit_code":<i32>,"stdout":<str>,"stderr":<str>,"error":null}`
-    /// on a completed run (the guest's own exit code may be nonzero — that's
-    /// still `ok:true`), or
-    /// `{"ok":false,"exit_code":null,"stdout":"","stderr":"","error":<str>}`
-    /// if the interpreter itself couldn't load or run the image (bad ELF,
-    /// unsupported machine type, a fault, …).
+    /// ```text
+    /// {
+    ///   "ok": bool,               // true iff the guest reached a definitive exit code
+    ///   "arch": "aarch64"|"x86_64"|null,
+    ///   "exit_code": <i32>|null,
+    ///   "stdout": <str>,
+    ///   "stderr": <str>,
+    ///   "error": <str>|null,      // load/backend/fault message when ok is false
+    ///   "unsupported_syscalls": [{"nr": <u64>, "count": <u64>}, ...]
+    /// }
+    /// ```
+    /// `stdout`/`stderr`/`unsupported_syscalls` are populated with whatever
+    /// the guest produced even when `ok` is `false` (e.g. it faulted partway
+    /// through), so the page can still show partial output.
     #[wasm_bindgen]
     #[must_use]
     pub fn run_elf(bytes: &[u8]) -> String {
         console_error_panic_hook::set_once();
-        match run(bytes) {
-            Ok((code, out, err)) => format!(
-                "{{\"ok\":true,\"exit_code\":{code},\"stdout\":\"{}\",\"stderr\":\"{}\",\"error\":null}}",
-                json_escape(&out),
-                json_escape(&err)
-            ),
-            Err(msg) => format!(
-                "{{\"ok\":false,\"exit_code\":null,\"stdout\":\"\",\"stderr\":\"\",\"error\":\"{}\"}}",
-                json_escape(&msg)
-            ),
+        run(bytes, Vec::new()).to_json()
+    }
+
+    /// Same as [`run_elf`], but lets the caller supply `argv` (guest
+    /// `argv[0]` onward). An empty `argv` falls back to the same single
+    /// `"prog"` element [`run_elf`] uses.
+    #[wasm_bindgen]
+    #[must_use]
+    pub fn run_elf_with_argv(bytes: &[u8], argv: Vec<String>) -> String {
+        console_error_panic_hook::set_once();
+        run(bytes, argv).to_json()
+    }
+
+    /// Peek the ELF header's `e_machine` field (offset 18, 2 bytes,
+    /// little-endian) to pick a guest architecture, without duplicating the
+    /// loader's own (private) full header parser. Mirrors `EM_AARCH64` (183)
+    /// / `EM_X86_64` (62) from `src/loader.rs`; `load_static` re-validates the
+    /// full header (magic, class, endianness, ...) right after this, so a
+    /// bogus file still gets a proper [`crate::loader::LoadError`] message.
+    fn detect_arch(elf: &[u8]) -> Option<Arch> {
+        const EM_X86_64: u16 = 62;
+        const EM_AARCH64: u16 = 183;
+        let machine = u16::from_le_bytes([*elf.get(18)?, *elf.get(19)?]);
+        match machine {
+            EM_AARCH64 => Some(Arch::Aarch64),
+            EM_X86_64 => Some(Arch::X86_64),
+            _ => None,
         }
     }
 
-    fn run(elf: &[u8]) -> Result<(i32, String, String), String> {
-        // The interpreter (src/vcpu/interp.rs) targets aarch64 today; the
-        // browser demo runs aarch64 static binaries.
-        let arch = Arch::Aarch64;
+    /// Pick the software interpreter backend for `arch`. On wasm32 there is
+    /// no hardware-virtualization backend to prefer (`hvf`/`kvm` are host-OS
+    /// gated and don't build here), so this always lands on the portable
+    /// interpreters — aarch64 via [`crate::vcpu::interp`], x86-64 via
+    /// [`crate::vcpu::interp_x86`] — the same split [`crate::vcpu::select`]
+    /// falls back to off-macOS.
+    fn select_backend(arch: Arch) -> Result<Box<dyn Backend>, String> {
+        match arch {
+            Arch::Aarch64 => crate::vcpu::interp::InterpBackend::new(arch)
+                .map(|b| Box::new(b) as Box<dyn Backend>)
+                .map_err(|e| e.to_string()),
+            Arch::X86_64 => crate::vcpu::interp_x86::X86Backend::new(arch)
+                .map(|b| Box::new(b) as Box<dyn Backend>)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    fn run(elf: &[u8], argv: Vec<String>) -> RunOutcome {
+        let Some(arch) = detect_arch(elf) else {
+            return RunOutcome::failed(
+                "not a recognized ELF64 image (expected an EM_AARCH64 or EM_X86_64 e_machine)"
+                    .to_string(),
+            );
+        };
+        let arch_str = arch.as_str();
 
         let mut mem = GuestMemory::new(GUEST_BASE, MEM_BYTES);
+        let argv = if argv.is_empty() {
+            vec!["prog".to_string()]
+        } else {
+            argv
+        };
         let spec = ProcessSpec {
-            argv: vec!["prog".to_string()],
+            argv,
             envp: vec![
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
                 "HOME=/root".to_string(),
@@ -135,15 +260,34 @@ mod browser {
                 "PWD=/".to_string(),
             ],
         };
-        let img = load_static(&mut mem, elf, &spec).map_err(|e| e.to_string())?;
+        let img = match load_static(&mut mem, elf, &spec) {
+            Ok(i) => i,
+            Err(e) => {
+                let mut o = RunOutcome::failed(e.to_string());
+                o.arch = Some(arch_str);
+                return o;
+            }
+        };
 
         // Same heap/mmap midpoint split as sandbox::exec_elf / run-elf.
         let mid = page_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
 
-        let backend = InterpBackend::new(arch).map_err(|e| e.to_string())?;
-        let vcpu = backend
-            .new_vcpu(img.entry, img.stack_pointer)
-            .map_err(|e| e.to_string())?;
+        let backend = match select_backend(arch) {
+            Ok(b) => b,
+            Err(e) => {
+                let mut o = RunOutcome::failed(e);
+                o.arch = Some(arch_str);
+                return o;
+            }
+        };
+        let vcpu = match backend.new_vcpu(img.entry, img.stack_pointer) {
+            Ok(v) => v,
+            Err(e) => {
+                let mut o = RunOutcome::failed(e.to_string());
+                o.arch = Some(arch_str);
+                return o;
+            }
+        };
 
         let mut mounts = MountTable::new();
         mounts.mount("/", Box::new(TmpFs::new()));
@@ -162,11 +306,25 @@ mod browser {
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
 
-        let code = kernel.run(vcpu, mem).map_err(|e| e.to_string())?;
+        let result = kernel.run(vcpu, mem);
 
         let stdout = String::from_utf8_lossy(&stdout_buf.lock().unwrap()).into_owned();
         let stderr = String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned();
-        Ok((code, stdout, stderr))
+        let unsupported = kernel.unsupported().iter().map(|(&nr, &c)| (nr, c)).collect();
+
+        let (exit_code, error) = match result {
+            Ok(code) => (Some(code), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
+
+        RunOutcome {
+            arch: Some(arch_str),
+            exit_code,
+            stdout,
+            stderr,
+            error,
+            unsupported,
+        }
     }
 
     fn page_down(v: u64) -> u64 {
@@ -175,4 +333,4 @@ mod browser {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use browser::run_elf;
+pub use browser::{run_elf, run_elf_with_argv};
