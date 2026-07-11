@@ -19,7 +19,7 @@ use crate::Error;
 use crate::abi::Arch;
 #[cfg(unix)]
 use crate::fs::Passthrough;
-use crate::fs::{DevFs, MountTable, TmpFs};
+use crate::fs::{DevFs, MountTable, ProcFs, SysFs, TmpFs};
 use crate::image::{ImageRef, ImageStore};
 use crate::kernel::Kernel;
 use crate::loader::{ProcessSpec, load_static};
@@ -260,6 +260,8 @@ impl Sandbox {
         mounts.mount("/", Box::new(TmpFs::new()));
         mounts.mount("/tmp", Box::new(TmpFs::new()));
         mounts.mount("/dev", Box::new(DevFs::new()));
+        mounts.mount("/proc", Box::new(ProcFs::new()));
+        mounts.mount("/sys", Box::new(SysFs::new()));
 
         #[cfg(unix)]
         {
