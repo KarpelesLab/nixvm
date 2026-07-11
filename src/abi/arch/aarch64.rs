@@ -127,6 +127,16 @@ pub fn decode(nr: u64) -> Sysno {
         90 => Sysno::Capget,
         91 => Sysno::Capset,
         283 => Sysno::Membarrier,
+        73 => Sysno::Ppoll,
+        72 => Sysno::Pselect6,
+        20 => Sysno::EpollCreate1,
+        21 => Sysno::EpollCtl,
+        22 => Sysno::EpollPwait,
+        441 => Sysno::EpollPwait2,
+        19 => Sysno::Eventfd2,
+        85 => Sysno::TimerfdCreate,
+        86 => Sysno::TimerfdSettime,
+        87 => Sysno::TimerfdGettime,
         other => Sysno::Unknown(other),
     }
 }

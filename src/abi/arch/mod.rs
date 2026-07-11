@@ -140,6 +140,22 @@ pub enum Sysno {
     Capget,
     Capset,
     Membarrier,
+    // ---- event-notification / readiness syscalls ----
+    Poll,
+    Ppoll,
+    Select,
+    Pselect6,
+    EpollCreate,
+    EpollCreate1,
+    EpollCtl,
+    EpollWait,
+    EpollPwait,
+    EpollPwait2,
+    Eventfd,
+    Eventfd2,
+    TimerfdCreate,
+    TimerfdSettime,
+    TimerfdGettime,
     /// A raw guest number with no mapping yet — handled as ENOSYS but logged.
     Unknown(u64),
 }

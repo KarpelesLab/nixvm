@@ -27,6 +27,7 @@ mod fs_ext;
 mod mem_syscalls;
 mod net;
 mod path;
+mod poll;
 mod signal;
 mod stat;
 mod sys_misc;
@@ -34,6 +35,7 @@ mod time;
 
 pub use fd::{Fd, FdTable};
 use net::Net;
+use poll::{EpollInst, EventFdInst, TimerFdInst};
 
 /// `dirfd` value meaning "resolve relative to the current working directory".
 const AT_FDCWD: i64 = -100;
@@ -109,6 +111,12 @@ pub struct Kernel {
     mounts: MountTable,
     pipes: Vec<Pipe>,
     net: Net,
+    /// `eventfd2` counters, indexed by [`Fd::Eventfd`].
+    eventfds: Vec<EventFdInst>,
+    /// `timerfd_create` timers, indexed by [`Fd::Timerfd`].
+    timerfds: Vec<TimerFdInst>,
+    /// `epoll_create1` instances, indexed by [`Fd::Epoll`].
+    epolls: Vec<EpollInst>,
     stdin: Box<dyn Read + Send>,
     stdout: Box<dyn Write + Send>,
     stderr: Box<dyn Write + Send>,
@@ -150,6 +158,9 @@ impl Kernel {
             mounts,
             pipes: Vec::new(),
             net: Net::default(),
+            eventfds: Vec::new(),
+            timerfds: Vec::new(),
+            epolls: Vec::new(),
             stdin: Box::new(std::io::stdin()),
             stdout: Box::new(std::io::stdout()),
             stderr: Box::new(std::io::stderr()),
@@ -397,6 +408,26 @@ impl Kernel {
             Sysno::Getsockname => self.sys_getsockname(args[0], args[1], args[2], mem),
             Sysno::Getpeername => self.sys_getpeername(args[0], args[1], args[2], mem),
             Sysno::Shutdown => self.sys_shutdown(args[0], args[1]),
+            // Event-notification / readiness syscalls.
+            Sysno::Poll => self.sys_poll(args[0], args[1], args[2] as i64, mem),
+            Sysno::Ppoll => self.sys_ppoll(args[0], args[1], args[2], args[3], args[4], mem),
+            Sysno::Select => self.sys_select(args[0], args[1], args[2], args[3], args[4], mem),
+            Sysno::Pselect6 => {
+                self.sys_pselect6(args[0], args[1], args[2], args[3], args[4], args[5], mem)
+            }
+            Sysno::EpollCreate | Sysno::EpollCreate1 => self.sys_epoll_create1(args[0]),
+            Sysno::EpollCtl => self.sys_epoll_ctl(args[0], args[1], args[2], args[3], mem),
+            Sysno::EpollWait | Sysno::EpollPwait => {
+                self.sys_epoll_wait(args[0], args[1], args[2], args[3] as i64, mem)
+            }
+            Sysno::EpollPwait2 => self.sys_epoll_pwait2(args[0], args[1], args[2], args[3], mem),
+            Sysno::Eventfd => self.sys_eventfd2(args[0], 0),
+            Sysno::Eventfd2 => self.sys_eventfd2(args[0], args[1]),
+            Sysno::TimerfdCreate => self.sys_timerfd_create(args[0], args[1]),
+            Sysno::TimerfdSettime => {
+                self.sys_timerfd_settime(args[0], args[1], args[2], args[3], mem)
+            }
+            Sysno::TimerfdGettime => self.sys_timerfd_gettime(args[0], args[1], mem),
             Sysno::Dup => self.sys_dup(args[0]),
             Sysno::Dup2 | Sysno::Dup3 => self.sys_dup2(args[0], args[1]),
             Sysno::Clone => self.sys_clone(args, vcpu, mem),
@@ -637,6 +668,7 @@ impl Kernel {
             },
             Some(Fd::PipeWrite(i)) => self.write_pipe(i, &data),
             Some(Fd::Socket { sock, end }) => self.write_socket(sock, end, &data),
+            Some(Fd::Eventfd(i)) => self.write_eventfd(i, &data),
             _ => err(Errno::EBADF),
         }
     }
@@ -658,6 +690,8 @@ impl Kernel {
             }
             Some(Fd::PipeRead(i)) => self.read_pipe(i, buf, count, mem),
             Some(Fd::Socket { sock, end }) => self.read_socket(sock, end, buf, count, mem),
+            Some(Fd::Eventfd(i)) => self.read_eventfd(i, buf, count, mem),
+            Some(Fd::Timerfd(i)) => self.read_timerfd(i, buf, count, mem),
             Some(Fd::File { path, offset }) => {
                 let mut tmp = vec![0u8; count as usize];
                 match self.mounts.read_at(&path, offset, &mut tmp) {
@@ -892,7 +926,10 @@ impl Kernel {
                     None => return err(Errno::ENOENT),
                 }
             }
-            Some(Fd::Stdin | Fd::Stdout | Fd::Stderr) => stat::char_device_attrs(),
+            // eventfd/timerfd/epoll are anonymous-inode char-device-like fds.
+            Some(Fd::Stdin | Fd::Stdout | Fd::Stderr | Fd::Eventfd(_) | Fd::Timerfd(_) | Fd::Epoll(_)) => {
+                stat::char_device_attrs()
+            }
             Some(Fd::PipeRead(_) | Fd::PipeWrite(_)) => stat::fifo_attrs(),
             Some(Fd::Socket { .. }) => stat::socket_attrs(),
             None => return err(Errno::EBADF),
