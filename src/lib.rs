@@ -37,6 +37,8 @@ pub mod kernel;
 pub mod loader;
 pub mod sandbox;
 pub mod vcpu;
+#[cfg(feature = "wasm")]
+pub mod wasm;
 
 pub use abi::Arch;
 pub use sandbox::{Config, Sandbox};

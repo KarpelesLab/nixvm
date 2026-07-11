@@ -1,0 +1,78 @@
+name: Deploy browser demo to GitHub Pages
+
+# Builds src/wasm.rs (the `wasm` feature) to WebAssembly with wasm-pack and
+# publishes web/ + the wasm-pack `pkg/` output as a GitHub Pages site: a
+# try-before-install demo where visitors pick a static ELF and watch it run
+# on nixvm's software interpreter, entirely client-side.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "web/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one deployment at a time; let in-flight runs finish rather than racing.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: "latest"
+
+      - name: Build the wasm demo (src/wasm.rs, `wasm` feature)
+        # `-- --lib` restricts the underlying `cargo build` to the library
+        # target only. Without it, cargo also tries to build src/bin/run-elf.rs
+        # (a native dev harness that mounts a host directory via a `cfg(unix)`
+        # Passthrough backend), which doesn't compile for wasm32-unknown-unknown.
+        run: wasm-pack build --target web --no-default-features --features wasm -- --lib
+
+      - name: Assemble the Pages site
+        run: |
+          set -eu
+          rm -rf site
+          mkdir -p site
+          cp -r web/. site/
+          mkdir -p site/pkg
+          cp pkg/nixvm.js pkg/nixvm_bg.wasm site/pkg/
+          [ -f pkg/nixvm.d.ts ] && cp pkg/nixvm.d.ts site/pkg/ || true
+          [ -f pkg/nixvm_bg.wasm.d.ts ] && cp pkg/nixvm_bg.wasm.d.ts site/pkg/ || true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
