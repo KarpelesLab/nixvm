@@ -17,7 +17,9 @@ use std::path::PathBuf;
 
 use crate::Error;
 use crate::abi::Arch;
-use crate::fs::MountTable;
+use crate::fs::{MountTable, TmpFs};
+#[cfg(unix)]
+use crate::fs::Passthrough;
 use crate::image::{ImageRef, ImageStore};
 use crate::kernel::Kernel;
 use crate::loader::{ProcessSpec, load_static};
@@ -46,6 +48,17 @@ pub struct Config {
     /// Force the software interpreter instead of the best hardware backend.
     /// Used by CI, the browser (wasm) target, and for portability.
     pub prefer_interp: bool,
+    /// Extra host directories shared into the sandbox ("holes"): specific,
+    /// chosen paths — never the whole home.
+    pub binds: Vec<Bind>,
+}
+
+/// A host directory shared into the sandbox at a guest mount point.
+#[derive(Debug, Clone)]
+pub struct Bind {
+    pub host: PathBuf,
+    pub guest: String,
+    pub read_only: bool,
 }
 
 impl Config {
@@ -71,6 +84,7 @@ impl Default for SandboxBuilder {
                 mem_bytes: DEFAULT_MEM_BYTES,
                 arch,
                 prefer_interp: false,
+                binds: Vec::new(),
             },
         }
     }
@@ -106,6 +120,28 @@ impl SandboxBuilder {
     #[must_use]
     pub fn prefer_interp(mut self, yes: bool) -> Self {
         self.config.prefer_interp = yes;
+        self
+    }
+
+    /// Share a specific host directory into the sandbox at `guest`, read-write.
+    #[must_use]
+    pub fn bind(mut self, host: impl Into<PathBuf>, guest: impl Into<String>) -> Self {
+        self.config.binds.push(Bind {
+            host: host.into(),
+            guest: guest.into(),
+            read_only: false,
+        });
+        self
+    }
+
+    /// Share a specific host directory into the sandbox at `guest`, read-only.
+    #[must_use]
+    pub fn bind_ro(mut self, host: impl Into<PathBuf>, guest: impl Into<String>) -> Self {
+        self.config.binds.push(Bind {
+            host: host.into(),
+            guest: guest.into(),
+            read_only: true,
+        });
         self
     }
 
@@ -197,6 +233,7 @@ impl Sandbox {
         let mut vcpu = backend.new_vcpu(img.entry, img.stack_pointer)?;
 
         let mut kernel = Kernel::new(arch, self.build_mounts());
+        kernel.set_cwd("/work");
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
         Ok(kernel.run(vcpu.as_mut(), &mut mem)?)
@@ -212,17 +249,31 @@ impl Sandbox {
         }
     }
 
-    /// Build the default mount layout. Backends are added in Phase 4; for now
-    /// this is the empty table that later phases populate.
-    #[allow(clippy::unused_self)] // will read self.config (work_dir, image) once backends land
+    /// Assemble the sandbox mount layout.
+    ///
+    /// `/` is a writable in-memory root today; once image resolution lands it
+    /// becomes `Overlay::new(squashfs_lower, tmpfs_upper)` so many instances
+    /// share one read-only squashfs. `/tmp` is its own tmpfs. `/work` and any
+    /// configured binds are host passthroughs ("holes"). Synthetic `/proc`,
+    /// `/sys`, `/dev` arrive in Phase 7.
     fn build_mounts(&self) -> MountTable {
-        // TODO(Phase 4):
-        //   mounts.mount("/",     Overlay::new(Squashfs::open(root)?, Tmpfs::new()));
-        //   mounts.mount("/work", Passthrough::new(&self.config.work_dir));
-        //   mounts.mount("/tmp",  Tmpfs::new());
-        //   mounts.mount("/proc", ProcFs::new());
-        //   mounts.mount("/dev",  DevFs::new());
-        MountTable::new()
+        let mut mounts = MountTable::new();
+        mounts.mount("/", Box::new(TmpFs::new()));
+        mounts.mount("/tmp", Box::new(TmpFs::new()));
+
+        #[cfg(unix)]
+        {
+            mounts.mount("/work", Box::new(Passthrough::new(self.config.work_dir.clone())));
+            for b in &self.config.binds {
+                let pt = if b.read_only {
+                    Passthrough::read_only(b.host.clone())
+                } else {
+                    Passthrough::new(b.host.clone())
+                };
+                mounts.mount(b.guest.clone(), Box::new(pt));
+            }
+        }
+        mounts
     }
 }
 

@@ -667,6 +667,34 @@ mod tests {
         assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Close, [fd, 0, 0, 0, 0, 0]), 0);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reads_host_file_through_passthrough_hole() {
+        use crate::fs::Passthrough;
+        let dir = std::env::temp_dir().join(format!("nixvm-hole-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("probe"), b"Z").unwrap();
+
+        let mut mounts = MountTable::new();
+        mounts.mount("/", Box::new(TmpFs::new()));
+        mounts.mount("/work", Box::new(Passthrough::new(dir.clone())));
+        let mut k = Kernel::new(Arch::Aarch64, mounts);
+        let mut mem = GuestMemory::new(0x1_0000, 16 * PAGE);
+        mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
+        let mut v = DummyVcpu;
+
+        let path = 0x1_0000;
+        mem.write_init(path, b"/work/probe\0").unwrap();
+        let fd = call(&mut k, &mut mem, &mut v, Sysno::Openat, [AT_CWD, path, 0, 0, 0, 0]);
+        assert!(fd >= 3, "open through hole failed: {fd}");
+        let buf = 0x1_1000;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [fd as u64, buf, 1, 0, 0, 0]), 1);
+        assert_eq!(mem.read_vec(buf, 1).unwrap(), b"Z");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn getdents_and_getcwd() {
         let (mut k, mut mem, mut v) = setup();
