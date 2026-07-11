@@ -156,6 +156,10 @@ pub enum Sysno {
     TimerfdCreate,
     TimerfdSettime,
     TimerfdGettime,
+    /// x86-64-only: set the FS/GS segment base (used for TLS). No aarch64
+    /// equivalent (arm64 TLS goes through `TPIDR_EL0`, set directly by the
+    /// vcpu on thread creation).
+    ArchPrctl,
     /// A raw guest number with no mapping yet — handled as ENOSYS but logged.
     Unknown(u64),
 }
