@@ -82,10 +82,48 @@ const AT_UID: u64 = 11;
 const AT_EUID: u64 = 12;
 const AT_GID: u64 = 13;
 const AT_EGID: u64 = 14;
+const AT_PLATFORM: u64 = 15;
+const AT_HWCAP: u64 = 16;
 const AT_CLKTCK: u64 = 17;
 const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
+const AT_HWCAP2: u64 = 26;
 const AT_EXECFN: u64 = 31;
+// Deliberately never emitted: this loader never maps a vDSO, and a bogus
+// AT_SYSINFO_EHDR pointer would make libc's vDSO-symbol lookup at startup
+// dereference memory that isn't a valid ELF header.
+
+/// aarch64 `HWCAP` bits (`arch/arm64/include/uapi/asm/hwcap.h`) the loader
+/// advertises: the baseline float/SIMD/crypto/atomics set a modern
+/// `-mcpu=generic` musl/glibc build's startup code may probe for.
+const HWCAP_AARCH64: u64 = (1 << 0)   // FP
+    | (1 << 1)   // ASIMD
+    | (1 << 3)   // AES
+    | (1 << 4)   // PMULL
+    | (1 << 5)   // SHA1
+    | (1 << 6)   // SHA2
+    | (1 << 7)   // CRC32
+    | (1 << 8); // ATOMICS
+
+/// x86-64 `HWCAP` bits: the loader mirrors the low, universally-present
+/// subset of the CPUID leaf-1 `EDX` feature word the Linux kernel exposes via
+/// `AT_HWCAP` on that arch (`arch/x86/include/asm/elf.h`).
+const HWCAP_X86_64: u64 = (1 << 0)   // FPU
+    | (1 << 3)   // PSE
+    | (1 << 4)   // TSC
+    | (1 << 5)   // MSR
+    | (1 << 6)   // PAE
+    | (1 << 8)   // CX8
+    | (1 << 13)  // PGE
+    | (1 << 15)  // CMOV
+    | (1 << 23)  // MMX
+    | (1 << 24)  // FXSR
+    | (1 << 25)  // SSE
+    | (1 << 26); // SSE2
+
+/// No extended (`HWCAP2`) feature is emulated, so both arches report none —
+/// safer than claiming e.g. SVE2/MTE/AVX512 support the interpreter lacks.
+const HWCAP2_NONE: u64 = 0;
 
 /// Guest stack size reserved at the top of the address space.
 const STACK_SIZE: u64 = 256 * 1024;
@@ -479,6 +517,42 @@ fn seg_prot(flags: u32) -> Prot {
 
 // ---- initial stack -------------------------------------------------------
 
+/// `AT_HWCAP` mask and `AT_PLATFORM` string for `e_machine`. Defaults to
+/// aarch64 for any value other than `EM_X86_64` (in practice only
+/// `EM_AARCH64`, the only other machine `Ehdr::parse` accepts).
+fn arch_hints(machine: u16) -> (u64, &'static str) {
+    if machine == EM_X86_64 {
+        (HWCAP_X86_64, "x86_64")
+    } else {
+        (HWCAP_AARCH64, "aarch64")
+    }
+}
+
+/// Deterministic stand-in for the 16 bytes of kernel-supplied randomness
+/// glibc/musl read via `AT_RANDOM` to seed the stack-protector canary (and,
+/// on musl, `__stack_chk_guard`/`arc4random`'s initial state). Startup code
+/// only requires *some* 16 bytes here, never checking their entropy, so a
+/// host RNG or wall-clock timestamp isn't needed — and would make loading
+/// (and tests) non-reproducible. Instead this mixes a fixed seed with the
+/// process's own argv/envp bytes via a Knuth/PCG-style LCG, so the value is
+/// stable across runs of the same `ProcessSpec` but still varies with it.
+fn deterministic_random16(seed_material: &[u8]) -> [u8; 16] {
+    const MUL: u64 = 6_364_136_223_846_793_005;
+    const INC: u64 = 1_442_695_040_888_963_407;
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D ^ seed_material.len() as u64;
+    for &b in seed_material {
+        state = (state ^ u64::from(b)).wrapping_mul(MUL).wrapping_add(INC);
+    }
+    state = state.wrapping_mul(MUL).wrapping_add(INC);
+    let lo = state.to_le_bytes();
+    state = state.wrapping_mul(MUL).wrapping_add(INC);
+    let hi = state.to_le_bytes();
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&lo);
+    out[8..].copy_from_slice(&hi);
+    out
+}
+
 fn build_stack(
     mem: &mut GuestMemory,
     spec: &ProcessSpec,
@@ -490,7 +564,10 @@ fn build_stack(
     let stack_bottom = top - STACK_SIZE;
     mem.map(stack_bottom, STACK_SIZE, Prot::rw())?;
 
-    // String blob: argv then envp, each NUL-terminated, placed high.
+    let (hwcap, platform_name) = arch_hints(ehdr.machine);
+
+    // String blob: argv, then envp, then the AT_PLATFORM name, each
+    // NUL-terminated, placed high.
     let mut blob = Vec::new();
     let mut arg_off = Vec::with_capacity(spec.argv.len());
     for a in &spec.argv {
@@ -504,12 +581,17 @@ fn build_stack(
         blob.extend_from_slice(e.as_bytes());
         blob.push(0);
     }
+    let platform_off = blob.len() as u64;
+    blob.extend_from_slice(platform_name.as_bytes());
+    blob.push(0);
 
     let str_base = (top - blob.len() as u64) & !0x7;
     let random_addr = (str_base - 16) & !0xf;
     let execfn = str_base + arg_off.first().copied().unwrap_or(0);
+    let platform_addr = str_base + platform_off;
+    let random_bytes = deterministic_random16(&blob);
 
-    let auxv: [(u64, u64); 16] = [
+    let auxv: [(u64, u64); 19] = [
         (AT_PHDR, phdr_vaddr.unwrap_or(0)),
         (AT_PHENT, PHDR_LEN as u64),
         (AT_PHNUM, u64::from(ehdr.phnum)),
@@ -524,9 +606,12 @@ fn build_stack(
         (AT_EUID, 0),
         (AT_GID, 0),
         (AT_EGID, 0),
+        (AT_HWCAP, hwcap),
+        (AT_HWCAP2, HWCAP2_NONE),
         (AT_CLKTCK, 100),
         (AT_SECURE, 0),
         (AT_RANDOM, random_addr),
+        (AT_PLATFORM, platform_addr),
         (AT_EXECFN, execfn),
         (AT_NULL, 0),
     ];
@@ -536,6 +621,10 @@ fn build_stack(
         + spec.envp.len() + 1            // envp + NULL
         + auxv.len() * 2; // auxv pairs (incl. AT_NULL)
     let vec_bytes = nwords as u64 * 8;
+    // Rounding down to 16 bytes here is what makes `sp` land 16-byte aligned
+    // regardless of `vec_bytes`'s parity (the SysV ABI requires
+    // `sp % 16 == 0` at process entry, with argc at `[sp]`); any slack
+    // between `sp + vec_bytes` and `random_addr` is unused padding.
     let sp = (random_addr - vec_bytes) & !0xf;
 
     if sp < stack_bottom {
@@ -544,7 +633,7 @@ fn build_stack(
 
     // Populate the string/random areas, then the vector.
     mem.write_init(str_base, &blob)?;
-    mem.write_init(random_addr, &[0u8; 16])?;
+    mem.write_init(random_addr, &random_bytes)?;
 
     let mut cur = sp;
     let mut push = |val: u64, mem: &mut GuestMemory| -> Result<(), LoadError> {
@@ -791,6 +880,65 @@ mod tests {
             a += 16;
         }
         assert_eq!(found_entry, Some(img.entry), "AT_ENTRY matches entry");
+    }
+
+    #[test]
+    fn auxv_has_random_hwcap_platform_execfn_and_aligned_sp() {
+        let vaddr = 0x1_0000u64;
+        let elf = tiny_elf(EM_AARCH64, vaddr, &[0xD4, 0x00, 0x00, 0x01]);
+        let mut mem = GuestMemory::new(vaddr, 128 * PAGE_SIZE);
+        let img = load_static(&mut mem, &elf, &spec()).unwrap();
+        let sp = img.stack_pointer;
+
+        // ABI: sp is 16-byte aligned and argc sits at [sp].
+        assert_eq!(sp % 16, 0, "sp must be 16-byte aligned");
+        assert_eq!(mem.read_u64(sp).unwrap(), spec().argv.len() as u64);
+
+        // argv[0]'s address, to check AT_EXECFN against below.
+        let argv0 = mem.read_u64(sp + 8).unwrap();
+
+        // Walk the auxv (starts right after argc/argv/envp and their NULs).
+        let aux_start = sp + 8 * (1 + spec().argv.len() as u64 + 1 + spec().envp.len() as u64 + 1);
+        let mut a = aux_start;
+        let mut found_random = None;
+        let mut found_pagesz = None;
+        let mut found_phnum = None;
+        let mut found_execfn = None;
+        let mut found_hwcap = None;
+        let mut found_platform = None;
+        loop {
+            let tag = mem.read_u64(a).unwrap();
+            let val = mem.read_u64(a + 8).unwrap();
+            if tag == AT_NULL {
+                break;
+            }
+            match tag {
+                AT_RANDOM => found_random = Some(val),
+                AT_PAGESZ => found_pagesz = Some(val),
+                AT_PHNUM => found_phnum = Some(val),
+                AT_EXECFN => found_execfn = Some(val),
+                AT_HWCAP => found_hwcap = Some(val),
+                AT_PLATFORM => found_platform = Some(val),
+                _ => {}
+            }
+            a += 16;
+        }
+
+        assert_eq!(found_pagesz, Some(PAGE_SIZE));
+        assert_eq!(found_phnum, Some(1), "tiny_elf carries exactly one phdr");
+        assert_eq!(found_execfn, Some(argv0), "AT_EXECFN points at argv[0]");
+
+        let hwcap = found_hwcap.expect("AT_HWCAP present");
+        assert_ne!(hwcap, 0, "AT_HWCAP must advertise some feature bits");
+
+        // AT_RANDOM points at 16 readable bytes on the stack.
+        let random_addr = found_random.expect("AT_RANDOM present");
+        let random_bytes = mem.read_vec(random_addr, 16).unwrap();
+        assert_eq!(random_bytes.len(), 16);
+
+        // AT_PLATFORM points at the arch name string.
+        let platform_addr = found_platform.expect("AT_PLATFORM present");
+        assert_eq!(mem.read_cstr(platform_addr, 16).unwrap(), b"aarch64");
     }
 
     #[test]
