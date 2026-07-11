@@ -2057,20 +2057,29 @@ mod tests {
 
         // Empty buffer, not closed: the read parks (blocks).
         k.block = false;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]), 0);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]),
+            0
+        );
         assert!(k.block, "read of empty interactive stdin blocks");
 
         // Feed input: the read now delivers it.
         k.feed_stdin(b"hi\n");
         k.block = false;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]), 3);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]),
+            3
+        );
         assert_eq!(&mem.read_vec(buf, 3).unwrap(), b"hi\n");
         assert!(!k.block);
 
         // Closed + empty: EOF (0), no block.
         k.close_stdin();
         k.block = false;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]), 0);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]),
+            0
+        );
         assert!(!k.block, "EOF does not block");
     }
 
@@ -2083,7 +2092,13 @@ mod tests {
         let mut mem = GuestMemory::new(0x1_0000, 16 * PAGE);
         mem.map(0x1_0000, PAGE, Prot::rw()).unwrap();
 
-        k.boot(Box::new(ReadVcpu { buf: 0x1_0000, done: false }), mem);
+        k.boot(
+            Box::new(ReadVcpu {
+                buf: 0x1_0000,
+                done: false,
+            }),
+            mem,
+        );
 
         // Nothing to read yet: pump parks waiting for input.
         assert_eq!(k.pump().unwrap(), Pumped::Blocked);

@@ -231,8 +231,8 @@ mod browser {
             } else {
                 argv
             };
-            let vm = crate::vm::Vm::boot(rootfs_tar, argv, MEM_BYTES)
-                .map_err(|e| JsError::new(&e))?;
+            let vm =
+                crate::vm::Vm::boot(rootfs_tar, argv, MEM_BYTES).map_err(|e| JsError::new(&e))?;
             Ok(Self { vm })
         }
 
