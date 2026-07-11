@@ -52,6 +52,8 @@ pub struct Kernel {
     mmap_cursor: u64,
     /// Lowest address `mmap` may reach.
     mmap_floor: u64,
+    /// `getrandom` PRNG state (xorshift; seeded lazily from the host clock).
+    rng_state: u64,
     /// Sinks for guest fd 1 and 2. Configurable so callers (and tests) can
     /// capture or redirect guest output.
     stdout: Box<dyn Write + Send>,
@@ -86,6 +88,7 @@ impl Kernel {
             heap_limit: 0,
             mmap_cursor: 0,
             mmap_floor: 0,
+            rng_state: 0,
             stdout: Box::new(std::io::stdout()),
             stderr: Box::new(std::io::stderr()),
             exit_code: None,
@@ -182,6 +185,8 @@ impl Kernel {
             Sysno::Getdents64 => self.sys_getdents64(args[0], args[1], args[2], mem),
             Sysno::Getcwd => self.sys_getcwd(args[0], args[1], mem),
             Sysno::Chdir => self.sys_chdir(args[0], mem),
+            Sysno::Writev => self.sys_writev(args[0], args[1], args[2], mem),
+            Sysno::Getrandom => self.sys_getrandom(args[0], args[1], mem),
             Sysno::ExitGroup | Sysno::Exit => {
                 self.exit_code = Some(args[0] as i32);
                 0
@@ -235,6 +240,53 @@ impl Kernel {
                 }
             }
         }
+    }
+
+    /// `writev(fd, iov, iovcnt)` — gather `struct iovec { base; len }` entries.
+    fn sys_writev(&mut self, fd: u64, iov: u64, iovcnt: u64, mem: &GuestMemory) -> i64 {
+        let mut total = 0i64;
+        for i in 0..iovcnt {
+            let ent = iov + i * 16;
+            let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
+                return if total > 0 { total } else { err(Errno::EFAULT) };
+            };
+            if len == 0 {
+                continue;
+            }
+            let r = self.sys_write(fd, base, len, mem);
+            if r < 0 {
+                return if total > 0 { total } else { r };
+            }
+            total += r;
+            if (r as u64) < len {
+                break; // short write
+            }
+        }
+        total
+    }
+
+    /// `getrandom(buf, len, flags)` — fill `buf` with pseudorandom bytes.
+    fn sys_getrandom(&mut self, buf: u64, len: u64, mem: &mut GuestMemory) -> i64 {
+        if self.rng_state == 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0x9E37_79B9_7F4A_7C15, |d| d.as_nanos() as u64);
+            self.rng_state = now | 1;
+        }
+        let mut out = vec![0u8; len as usize];
+        for chunk in out.chunks_mut(8) {
+            let mut s = self.rng_state;
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            self.rng_state = s;
+            let bytes = s.to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+        if mem.write(buf, &out).is_err() {
+            return err(Errno::EFAULT);
+        }
+        len as i64
     }
 
     /// `read(fd, buf, count)` — stdin (currently EOF) and open files.
@@ -665,6 +717,48 @@ mod tests {
         assert_eq!(mem.read_u64(stbuf + 48).unwrap(), 2);
 
         assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Close, [fd, 0, 0, 0, 0, 0]), 0);
+    }
+
+    #[test]
+    fn writev_gathers_iovecs() {
+        use std::sync::{Arc, Mutex};
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (mut k, mut mem, mut v) = setup();
+        let cap = Arc::new(Mutex::new(Vec::new()));
+        k.set_stdout(Box::new(Buf(cap.clone())));
+
+        // Two data buffers and a two-entry iovec array.
+        let d0 = 0x1_0000;
+        let d1 = 0x1_0010;
+        let iov = 0x1_0100;
+        mem.write_init(d0, b"foo").unwrap();
+        mem.write_init(d1, b"bar!").unwrap();
+        mem.write_init(iov, &d0.to_le_bytes()).unwrap();
+        mem.write_init(iov + 8, &3u64.to_le_bytes()).unwrap();
+        mem.write_init(iov + 16, &d1.to_le_bytes()).unwrap();
+        mem.write_init(iov + 24, &4u64.to_le_bytes()).unwrap();
+
+        // writev(1, iov, 2)
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Writev, [1, iov, 2, 0, 0, 0]), 7);
+        assert_eq!(&*cap.lock().unwrap(), b"foobar!");
+    }
+
+    #[test]
+    fn getrandom_fills_buffer() {
+        let (mut k, mut mem, mut v) = setup();
+        let buf = 0x1_0000;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getrandom, [buf, 16, 0, 0, 0, 0]), 16);
+        // Extremely unlikely to be all-zero after fill.
+        assert!(mem.read_vec(buf, 16).unwrap().iter().any(|&b| b != 0));
     }
 
     #[cfg(unix)]

@@ -36,6 +36,7 @@ pub fn decode(nr: u64) -> Sysno {
         61 => Sysno::Getdents64,
         17 => Sysno::Getcwd,
         49 => Sysno::Chdir,
+        278 => Sysno::Getrandom,
         other => Sysno::Unknown(other),
     }
 }

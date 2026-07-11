@@ -44,6 +44,7 @@ pub enum Sysno {
     Getdents64,
     Getcwd,
     Chdir,
+    Getrandom,
     /// A raw guest number with no mapping yet — handled as ENOSYS but logged.
     Unknown(u64),
 }
