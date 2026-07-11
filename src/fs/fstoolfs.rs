@@ -119,6 +119,7 @@ impl MountFs for FsToolMount {
             mtime: i64::from(a.mtime),
             inode: u64::from(a.inode),
             nlink: a.nlink,
+            rdev: u64::from(a.rdev),
         })
     }
 

@@ -66,6 +66,9 @@ pub struct Attrs {
     pub mtime: i64,
     pub inode: u64,
     pub nlink: u32,
+    /// Device number (major/minor, `st_rdev`) for a character or block special
+    /// file; `0` for every other node kind.
+    pub rdev: u64,
 }
 
 /// One entry returned by [`MountFs::readdir`].

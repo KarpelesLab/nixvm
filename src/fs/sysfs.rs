@@ -131,6 +131,7 @@ impl MountFs for SysFs {
             mtime: 0,
             inode: node.inode(),
             nlink: 1,
+            rdev: 0,
         })
     }
 

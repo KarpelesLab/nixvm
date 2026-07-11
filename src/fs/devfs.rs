@@ -25,15 +25,23 @@ const CHR_MODE: u32 = S_IFCHR | 0o666;
 /// Inode of the `/dev` root directory.
 const ROOT_INODE: u64 = 1;
 
-/// The fixed device table: `(name, inode)`. Inodes are small distinct
-/// constants; the root reserves inode 1.
-const DEVICES: &[(&str, u64)] = &[
-    ("null", 2),
-    ("zero", 3),
-    ("full", 4),
-    ("random", 5),
-    ("urandom", 6),
-    ("tty", 7),
+/// Encode a device number from `major`/`minor` using the Linux glibc `makedev`
+/// layout (matching `crate::kernel::stat::makedev`). For the small in-range
+/// values in [`DEVICES`] this is simply `major * 256 + minor`.
+const fn makedev(major: u64, minor: u64) -> u64 {
+    ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
+}
+
+/// The fixed device table: `(name, inode, major, minor)`. Inodes are small
+/// distinct constants; the root reserves inode 1. Majors/minors are the
+/// canonical Linux numbers so `/dev/null` reports `1:3`, etc.
+const DEVICES: &[(&str, u64, u64, u64)] = &[
+    ("null", 2, 1, 3),
+    ("zero", 3, 1, 5),
+    ("full", 4, 1, 7),
+    ("random", 5, 1, 8),
+    ("urandom", 6, 1, 9),
+    ("tty", 7, 5, 0),
 ];
 
 /// The synthesized `/dev` backend.
@@ -56,16 +64,17 @@ impl DevFs {
         Self { rng: 0 }
     }
 
-    /// Look up a device name, returning its inode.
-    fn lookup(name: &str) -> Option<u64> {
+    /// Look up a device name, returning its `(inode, rdev)`.
+    fn lookup(name: &str) -> Option<(u64, u64)> {
         DEVICES
             .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, inode)| *inode)
+            .find(|(n, ..)| *n == name)
+            .map(|(_, inode, major, minor)| (*inode, makedev(*major, *minor)))
     }
 
-    /// Char-device attributes for the device with the given inode.
-    fn dev_attrs(inode: u64) -> Attrs {
+    /// Char-device attributes for a device with the given inode and device
+    /// number.
+    fn dev_attrs((inode, rdev): (u64, u64)) -> Attrs {
         Attrs {
             kind: NodeKind::CharDevice,
             size: 0,
@@ -75,6 +84,7 @@ impl DevFs {
             mtime: 0,
             inode,
             nlink: 1,
+            rdev,
         }
     }
 
@@ -129,6 +139,7 @@ impl MountFs for DevFs {
                 mtime: 0,
                 inode: ROOT_INODE,
                 nlink: 1,
+                rdev: 0,
             });
         }
         Self::lookup(rel).map(Self::dev_attrs)
@@ -156,7 +167,7 @@ impl MountFs for DevFs {
         }
         Ok(DEVICES
             .iter()
-            .map(|(name, inode)| DirEntry {
+            .map(|(name, inode, ..)| DirEntry {
                 name: (*name).to_string(),
                 kind: NodeKind::CharDevice,
                 inode: *inode,
@@ -260,6 +271,22 @@ mod tests {
         );
         // The root is a directory.
         assert_eq!(fs.stat("").unwrap().kind, NodeKind::Dir);
+    }
+
+    #[test]
+    fn stat_reports_canonical_device_numbers() {
+        let mut fs = DevFs::new();
+        // /dev/null is the canonical char device 1:3.
+        assert_eq!(fs.stat("null").unwrap().rdev, makedev(1, 3));
+        assert_eq!(fs.stat("zero").unwrap().rdev, makedev(1, 5));
+        assert_eq!(fs.stat("full").unwrap().rdev, makedev(1, 7));
+        assert_eq!(fs.stat("random").unwrap().rdev, makedev(1, 8));
+        assert_eq!(fs.stat("urandom").unwrap().rdev, makedev(1, 9));
+        assert_eq!(fs.stat("tty").unwrap().rdev, makedev(5, 0));
+        // Small values collapse to major*256 + minor.
+        assert_eq!(fs.stat("null").unwrap().rdev, 256 + 3);
+        // The /dev root directory carries no device number.
+        assert_eq!(fs.stat("").unwrap().rdev, 0);
     }
 
     #[test]

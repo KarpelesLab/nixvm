@@ -118,6 +118,7 @@ impl MountFs for Passthrough {
             mtime: m.mtime(),
             inode: m.ino(),
             nlink: m.nlink() as u32,
+            rdev: m.rdev(),
         })
     }
 

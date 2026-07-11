@@ -298,6 +298,7 @@ impl MountFs for ProcFs {
             mtime: 0,
             inode,
             nlink: 1,
+            rdev: 0,
         })
     }
 

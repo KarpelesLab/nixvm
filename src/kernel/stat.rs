@@ -10,6 +10,18 @@ const S_IFCHR: u32 = 0o020_000;
 const S_IFIFO: u32 = 0o010_000;
 const S_IFSOCK: u32 = 0o140_000;
 
+/// Encode a device number from its `major`/`minor` parts using the Linux glibc
+/// `makedev` layout (the encoding of `st_rdev`). For the small all-in-range
+/// values used by `/dev` nodes this reduces to `major * 256 + minor`.
+///
+/// Exposed for the kernel's `mknod`/`stat` path to build `st_rdev` values; the
+/// `allow` keeps the lib build warning-free until that call site lands.
+#[must_use]
+#[allow(dead_code)]
+pub fn makedev(major: u64, minor: u64) -> u64 {
+    ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
+}
+
 /// The 128-byte `struct stat` for `attrs`.
 pub fn encode_stat(attrs: &Attrs) -> [u8; 128] {
     let mut b = [0u8; 128];
@@ -24,7 +36,7 @@ pub fn encode_stat(attrs: &Attrs) -> [u8; 128] {
     put32(&mut b, 20, attrs.nlink); // st_nlink
     put32(&mut b, 24, attrs.uid);
     put32(&mut b, 28, attrs.gid);
-    put64(&mut b, 32, 0); // st_rdev
+    put64(&mut b, 32, attrs.rdev); // st_rdev
     // 40: __pad1
     put64(&mut b, 48, attrs.size); // st_size
     put32(&mut b, 56, 4096); // st_blksize
@@ -68,6 +80,7 @@ pub fn char_device_attrs() -> Attrs {
         mtime: 0,
         inode: 0,
         nlink: 1,
+        rdev: 0,
     }
 }
 
@@ -82,6 +95,7 @@ pub fn fifo_attrs() -> Attrs {
         mtime: 0,
         inode: 0,
         nlink: 1,
+        rdev: 0,
     }
 }
 
@@ -96,6 +110,7 @@ pub fn socket_attrs() -> Attrs {
         mtime: 0,
         inode: 0,
         nlink: 1,
+        rdev: 0,
     }
 }
 
@@ -155,11 +170,41 @@ mod tests {
             mtime: 0,
             inode: 42,
             nlink: 1,
+            rdev: 0,
         };
         let b = encode_stat(&attrs);
         assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 42); // st_ino
         assert_eq!(u32::from_le_bytes(b[16..20].try_into().unwrap()), 0o100_644);
         assert_eq!(u64::from_le_bytes(b[48..56].try_into().unwrap()), 1234); // st_size
+    }
+
+    #[test]
+    fn stat_encodes_rdev() {
+        let attrs = Attrs {
+            kind: NodeKind::CharDevice,
+            size: 0,
+            mode: S_IFCHR | 0o666,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            inode: 7,
+            nlink: 1,
+            rdev: makedev(1, 3), // /dev/null
+        };
+        let b = encode_stat(&attrs);
+        // st_rdev sits at offset 32 and must round-trip the attrs value.
+        assert_eq!(
+            u64::from_le_bytes(b[32..40].try_into().unwrap()),
+            attrs.rdev
+        );
+        assert_eq!(attrs.rdev, makedev(1, 3));
+    }
+
+    #[test]
+    fn makedev_small_values_are_major_times_256_plus_minor() {
+        assert_eq!(makedev(1, 3), 256 + 3);
+        assert_eq!(makedev(5, 0), 5 * 256);
+        assert_eq!(makedev(1, 9), 256 + 9);
     }
 
     #[test]
