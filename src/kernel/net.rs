@@ -32,14 +32,19 @@ impl Errno {
     /// socket). A second `impl Errno` block is legal: inherent impls may
     /// split across modules within the same crate.
     const ENOTCONN: Errno = Errno(107);
+    /// `socket(AF_NETLINK, _, protocol)` with an unsupported `protocol`.
+    const EPROTONOSUPPORT: Errno = Errno(93);
 }
 
 const AF_UNIX: u16 = 1;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
+const AF_NETLINK: u16 = 16;
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
+const SOCK_RAW: u64 = 3;
 const SOCK_NONBLOCK: u64 = 0o4000;
+const NETLINK_ROUTE: u64 = 0;
 
 const SOL_SOCKET: u64 = 1;
 const IPPROTO_IP: u64 = 0;
@@ -75,6 +80,49 @@ const MSG_WAITALL: u64 = 0x100;
 // MSG_NOSIGNAL (0x4000) is a documented no-op: this virtual transport never
 // raises SIGPIPE on a peer-closed write in the first place (it returns
 // `EPIPE`), so there is nothing to suppress.
+
+// `NETLINK_ROUTE` (rtnetlink) message types this module answers
+// (linux/rtnetlink.h). Only enough of the protocol to let guest tools
+// enumerate the always-up loopback interface: `RTM_GETLINK`/`RTM_GETADDR`
+// dumps, and a minimal `RTM_GETROUTE` reply.
+const RTM_NEWLINK: u16 = 16;
+const RTM_GETLINK: u16 = 18;
+const RTM_NEWADDR: u16 = 20;
+const RTM_GETADDR: u16 = 22;
+const RTM_GETROUTE: u16 = 26;
+/// Generic netlink control messages (linux/netlink.h): an error/ACK, and the
+/// end-of-dump marker.
+const NLMSG_ERROR: u16 = 2;
+const NLMSG_DONE: u16 = 3;
+
+// `nlmsghdr.nlmsg_flags` bits this module inspects (linux/netlink.h).
+const NLM_F_ACK: u16 = 0x04;
+/// `NLM_F_ROOT | NLM_F_MATCH` — "dump the whole table", the flag pair
+/// `ip`/`ifconfig`'s `RTM_GETLINK`/`RTM_GETADDR` requests always set.
+const NLM_F_DUMP: u16 = 0x100 | 0x200;
+
+/// `ifinfomsg.ifi_type` for the loopback device (linux/if_arp.h).
+const ARPHRD_LOOPBACK: u16 = 772;
+// `ifinfomsg.ifi_flags` / `IFF_*` bits (linux/if.h) set on `lo`.
+const IFF_UP: u32 = 0x1;
+const IFF_LOOPBACK: u32 = 0x8;
+const IFF_RUNNING: u32 = 0x40;
+
+// `IFLA_*` rtattr types (linux/if_link.h) filled in on the `RTM_NEWLINK` reply.
+const IFLA_ADDRESS: u16 = 1;
+const IFLA_IFNAME: u16 = 3;
+const IFLA_MTU: u16 = 4;
+
+// `IFA_*` rtattr types (linux/if_addr.h) filled in on the `RTM_NEWADDR` reply.
+const IFA_ADDRESS: u16 = 1;
+const IFA_LOCAL: u16 = 2;
+const IFA_LABEL: u16 = 3;
+/// `RT_SCOPE_HOST` (linux/rtnetlink.h): the scope of an address that is only
+/// valid on this host, e.g. `127.0.0.1`.
+const RT_SCOPE_HOST: u8 = 254;
+/// The loopback interface's fixed `ifindex`: this module models exactly one
+/// interface, so it never needs to be anything but `1`.
+const LOOPBACK_IFINDEX: i32 = 1;
 
 /// The kernel's socket table plus the AF_UNIX/AF_INET(6) address registries.
 #[derive(Debug, Default)]
@@ -174,6 +222,8 @@ enum Kind {
     Pair(Pair),
     /// A `SOCK_DGRAM` endpoint (AF_INET/AF_INET6 UDP).
     Dgram(Dgram),
+    /// An `AF_NETLINK`/`NETLINK_ROUTE` endpoint.
+    Netlink(Netlink),
 }
 
 /// A connected socket: `to[e]` holds bytes destined for end `e` (so end `e`
@@ -218,6 +268,26 @@ struct Dgram {
     local: Option<InetAddr>,
     peer: Option<InetAddr>,
     queue: VecDeque<(InetAddr, Vec<u8>)>,
+}
+
+/// An `AF_NETLINK` endpoint (only `NETLINK_ROUTE` is modeled). There is no
+/// "connection": a guest `send`/`sendto`/`write`s a request (an `nlmsghdr`
+/// stream, one or more messages back to back) which is answered synchronously
+/// by enqueuing the reply message(s) onto `queue`, in order, for a later
+/// `recv`/`recvfrom`/`read` to drain — mirroring how a real `rtnetlink` dump
+/// reply is a sequence of `nlmsghdr`s terminated by `NLMSG_DONE`, delivered
+/// across one or more `recvmsg` calls depending on the caller's buffer size.
+#[derive(Debug, Default)]
+struct Netlink {
+    /// This socket's `nl_pid`, assigned by `bind` (or lazily on first use);
+    /// echoed back in `getsockname` and as every reply's `nlmsg_pid`.
+    pid: u32,
+    /// The `SOCK_RAW`/`SOCK_DGRAM` requested at `socket()` time, echoed back
+    /// by `getsockopt(SO_TYPE)`.
+    sotype: u64,
+    /// Fully encoded (`nlmsghdr`-framed, `NLMSG_ALIGN`-ed) response messages
+    /// awaiting `recv`; each entry is one complete message.
+    queue: VecDeque<Vec<u8>>,
 }
 
 /// A decoded `sockaddr`: an AF_UNIX path, or an AF_INET/AF_INET6 endpoint.
@@ -360,8 +430,22 @@ impl Kernel {
     }
 
     /// `socket(domain, type, protocol)` — an unbound, unconnected endpoint.
-    pub(super) fn sys_socket(&mut self, domain: u64, sotype: u64, _protocol: u64) -> i64 {
+    pub(super) fn sys_socket(&mut self, domain: u64, sotype: u64, protocol: u64) -> i64 {
         let domain = domain as u16;
+        if domain == AF_NETLINK {
+            let base_type = sotype & 0xf;
+            if base_type != SOCK_RAW && base_type != SOCK_DGRAM {
+                return err(Errno::EOPNOTSUPP);
+            }
+            if protocol != NETLINK_ROUTE {
+                return err(Errno::EPROTONOSUPPORT);
+            }
+            let nonblock = sotype & SOCK_NONBLOCK != 0;
+            let kind = Kind::Netlink(Netlink { sotype: base_type, ..Netlink::default() });
+            let idx = self.net.socks.len();
+            self.net.socks.push(Sock { domain, kind, nonblock, opts: SockOpts::default() });
+            return i64::from(self.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 }));
+        }
         if domain != AF_UNIX && domain != AF_INET && domain != AF_INET6 {
             return err(Errno::EAFNOSUPPORT);
         }
@@ -425,6 +509,9 @@ impl Kernel {
         let Some((sock, _)) = self.sock_of(fd) else {
             return err(Errno::ENOTSOCK);
         };
+        if self.net.socks[sock].domain == AF_NETLINK {
+            return self.bind_netlink(sock, addr, addrlen, mem);
+        }
         let Some(parsed) = read_sockaddr(mem, addr, addrlen) else {
             return err(Errno::EINVAL);
         };
@@ -627,6 +714,33 @@ impl Kernel {
         }))
     }
 
+    /// `bind(fd, addr, addrlen)` for an `AF_NETLINK` socket: parse a
+    /// `struct sockaddr_nl` (`nl_family`, 2 bytes pad, `nl_pid`, `nl_groups`;
+    /// this module's guest architectures are always little-endian, so all
+    /// fields are read as such) and adopt its `nl_pid` as this
+    /// socket's identity, auto-assigning a nonzero one (the `1`-based socket
+    /// slot index — this module never needs it to match a real process id)
+    /// when the guest asks for `0` ("let the kernel pick"), exactly like a
+    /// real `AF_NETLINK` autobind.
+    fn bind_netlink(&mut self, sock: usize, addr: u64, addrlen: u64, mem: &GuestMemory) -> i64 {
+        if addrlen < 8 {
+            return err(Errno::EINVAL);
+        }
+        let Ok(b) = mem.read_vec(addr, 8) else {
+            return err(Errno::EFAULT);
+        };
+        if u16::from_le_bytes([b[0], b[1]]) != AF_NETLINK {
+            return err(Errno::EINVAL);
+        }
+        let requested = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+        let pid = if requested == 0 { sock as u32 + 1 } else { requested };
+        let Kind::Netlink(nl) = &mut self.net.socks[sock].kind else {
+            return err(Errno::EINVAL);
+        };
+        nl.pid = pid;
+        0
+    }
+
     /// `getsockname(fd, addr, addrlen)` — the local address (best-effort).
     pub(super) fn sys_getsockname(
         &mut self,
@@ -639,11 +753,19 @@ impl Kernel {
             return err(Errno::ENOTSOCK);
         };
         let domain = self.net.socks[sock].domain;
+        if domain == AF_NETLINK {
+            let pid = match &self.net.socks[sock].kind {
+                Kind::Netlink(nl) => nl.pid,
+                _ => 0,
+            };
+            return write_netlink_sockaddr(mem, addr, addrlen, pid);
+        }
         let resolved = match &self.net.socks[sock].kind {
             Kind::Idle { bound } => bound.clone(),
             Kind::Listener { addr, .. } => addr.clone(),
             Kind::Pair(p) => p.addrs[end].map(Addr::Inet),
             Kind::Dgram(d) => d.local.map(Addr::Inet),
+            Kind::Netlink(_) => None,
         };
         write_sockaddr(mem, addr, addrlen, domain, resolved.as_ref())
     }
@@ -825,8 +947,9 @@ impl Kernel {
         }
         let value: u32 = if level == SOL_SOCKET {
             match optname {
-                SO_TYPE => match self.net.socks[sock].kind {
+                SO_TYPE => match &self.net.socks[sock].kind {
                     Kind::Dgram(_) => SOCK_DGRAM as u32,
+                    Kind::Netlink(nl) => nl.sotype as u32,
                     _ => SOCK_STREAM as u32,
                 },
                 SO_ERROR => {
@@ -844,7 +967,7 @@ impl Kernel {
                 SO_DOMAIN => u32::from(self.net.socks[sock].domain),
                 SO_PROTOCOL => match (&self.net.socks[sock].kind, self.net.socks[sock].domain) {
                     (Kind::Dgram(_), _) => 17,     // IPPROTO_UDP
-                    (_, d) if d == AF_UNIX => 0,
+                    (_, d) if d == AF_UNIX || d == AF_NETLINK => 0, // NETLINK_ROUTE == 0
                     _ => 6,                        // IPPROTO_TCP
                 },
                 _ => 0,
@@ -882,7 +1005,11 @@ impl Kernel {
         let Some((sock, end)) = self.sock_of(fd) else {
             return err(Errno::ENOTSOCK);
         };
-        if dest_addr == 0 {
+        if dest_addr == 0 || self.net.socks[sock].domain == AF_NETLINK {
+            // An `AF_NETLINK` socket only ever has one valid peer (the
+            // kernel), so a `dest_addr` sockaddr_nl, if given at all, carries
+            // no information this module needs — it's the same request path
+            // as a plain `write`.
             let Ok(data) = mem.read_vec(buf, len as usize) else {
                 return err(Errno::EFAULT);
             };
@@ -932,6 +1059,23 @@ impl Kernel {
         let Some((sock, end)) = self.sock_of(fd) else {
             return err(Errno::ENOTSOCK);
         };
+        if matches!(self.net.socks[sock].kind, Kind::Netlink(_)) {
+            let nonblock = self.net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
+            let Some(data) = self.drain_netlink(sock, len as usize) else {
+                if nonblock {
+                    return err(Errno::EAGAIN);
+                }
+                self.block = true;
+                return 0;
+            };
+            // Every reply's source is the kernel, whose `nl_pid` is always `0`.
+            write_netlink_sockaddr(mem, src_addr, src_addrlen, 0);
+            let n = data.len();
+            if mem.write(buf, &data).is_err() {
+                return err(Errno::EFAULT);
+            }
+            return n as i64;
+        }
         if !matches!(self.net.socks[sock].kind, Kind::Dgram(_)) {
             let n = self.recv_stream(sock, end, buf, len, mem, flags);
             if n > 0 {
@@ -1004,7 +1148,53 @@ impl Kernel {
             }
             return n as i64;
         }
+        if matches!(self.net.socks[sock].kind, Kind::Netlink(_)) {
+            let nonblock = self.net.socks[sock].nonblock;
+            let Some(data) = self.drain_netlink(sock, count as usize) else {
+                if nonblock {
+                    return err(Errno::EAGAIN);
+                }
+                self.block = true;
+                return 0;
+            };
+            if mem.write(buf, &data).is_err() {
+                return err(Errno::EFAULT);
+            }
+            return data.len() as i64;
+        }
         self.recv_stream(sock, end, buf, count, mem, 0)
+    }
+
+    /// Drain up to `want` bytes' worth of complete, already-encoded messages
+    /// from netlink socket `sock`'s reply queue, in order — packing as many
+    /// whole messages as fit (never splitting one across two `recv` calls,
+    /// leaving the remainder queued for the next read, like a real netlink
+    /// socket packing a dump reply across skbs). `None` means the queue is
+    /// currently empty (the caller decides block/`EAGAIN`); `Some` is always
+    /// non-empty. If even the single next message doesn't fit `want`, it is
+    /// truncated to `want` bytes and dropped from the queue (datagram
+    /// semantics: an oversized read is truncated, not left partially queued).
+    fn drain_netlink(&mut self, sock: usize, want: usize) -> Option<Vec<u8>> {
+        let Kind::Netlink(nl) = &mut self.net.socks[sock].kind else {
+            unreachable!("checked by caller")
+        };
+        if nl.queue.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        while let Some(next) = nl.queue.front() {
+            if out.is_empty() && next.len() > want {
+                let msg = nl.queue.pop_front().expect("front just checked Some");
+                out.extend_from_slice(&msg[..want.min(msg.len())]);
+                break;
+            }
+            if out.len() + next.len() > want {
+                break;
+            }
+            let msg = nl.queue.pop_front().expect("front just checked Some");
+            out.extend_from_slice(&msg);
+        }
+        Some(out)
     }
 
     /// Shared stream-socket receive path for plain `read()` (`flags == 0`)
@@ -1073,6 +1263,9 @@ impl Kernel {
     /// fire-and-forget, like real UDP: no error if nothing is bound at the
     /// peer's port. Mirrors `write_pipe`.
     pub(super) fn write_socket(&mut self, sock: usize, end: usize, data: &[u8]) -> i64 {
+        if matches!(self.net.socks[sock].kind, Kind::Netlink(_)) {
+            return self.handle_netlink_request(sock, data);
+        }
         if matches!(self.net.socks[sock].kind, Kind::Dgram(_)) {
             let peer = match &self.net.socks[sock].kind {
                 Kind::Dgram(d) => d.peer,
@@ -1100,6 +1293,59 @@ impl Kernel {
             }
             _ => err(Errno::EINVAL),
         }
+    }
+
+    /// Handle a guest's `NETLINK_ROUTE` request on netlink socket `sock`:
+    /// `data` may hold one or more `nlmsghdr`-framed messages back to back
+    /// (`NLMSG_ALIGN`-ed, per the wire format); each is answered independently
+    /// and the reply message(s) are appended, in order, to the socket's reply
+    /// queue for a later `recv` to drain. Returns `data.len()` (the whole
+    /// request was consumed), matching a real `write`/`send`.
+    fn handle_netlink_request(&mut self, sock: usize, data: &[u8]) -> i64 {
+        let pid = match &self.net.socks[sock].kind {
+            Kind::Netlink(nl) => nl.pid,
+            _ => 0,
+        };
+        let mut offset = 0usize;
+        while offset + 16 <= data.len() {
+            let hdr = &data[offset..offset + 16];
+            let nlmsg_len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+            if nlmsg_len < 16 {
+                break; // malformed: too short to even hold this header
+            }
+            let nlmsg_type = u16::from_le_bytes([hdr[4], hdr[5]]);
+            let nlmsg_flags = u16::from_le_bytes([hdr[6], hdr[7]]);
+            let nlmsg_seq = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
+            let mut orig_hdr = [0u8; 16];
+            orig_hdr.copy_from_slice(hdr);
+            let want_ack = nlmsg_flags & NLM_F_ACK != 0;
+            let dump = nlmsg_flags & NLM_F_DUMP == NLM_F_DUMP;
+
+            let replies: Vec<Vec<u8>> = if nlmsg_type == RTM_GETLINK && dump {
+                vec![
+                    build_rtm_newlink(nlmsg_seq, pid),
+                    encode_nlmsg(NLMSG_DONE, 0, nlmsg_seq, pid, &0i32.to_le_bytes()),
+                ]
+            } else if nlmsg_type == RTM_GETADDR && dump {
+                vec![
+                    build_rtm_newaddr_v4(nlmsg_seq, pid),
+                    build_rtm_newaddr_v6(nlmsg_seq, pid),
+                    encode_nlmsg(NLMSG_DONE, 0, nlmsg_seq, pid, &0i32.to_le_bytes()),
+                ]
+            } else if nlmsg_type == RTM_GETROUTE {
+                // No routes beyond the implicit loopback one: just end the dump.
+                vec![encode_nlmsg(NLMSG_DONE, 0, nlmsg_seq, pid, &0i32.to_le_bytes())]
+            } else if want_ack {
+                vec![encode_nlmsgerr(0, &orig_hdr, nlmsg_seq, pid)]
+            } else {
+                vec![encode_nlmsgerr(-Errno::EOPNOTSUPP.0, &orig_hdr, nlmsg_seq, pid)]
+            };
+            if let Kind::Netlink(nl) = &mut self.net.socks[sock].kind {
+                nl.queue.extend(replies);
+            }
+            offset += nlmsg_align(nlmsg_len);
+        }
+        data.len() as i64
     }
 }
 
@@ -1212,6 +1458,114 @@ fn write_optval(mem: &mut GuestMemory, optval: u64, optlen_ptr: u64, value: &[u8
     if optlen_ptr != 0 {
         let _ = mem.write(optlen_ptr, &(value.len() as u32).to_le_bytes());
     }
+    0
+}
+
+/// Round `len` up to a 4-byte boundary — `NLMSG_ALIGN` and `RTA_ALIGN` share
+/// the same alignment (`NLMSG_ALIGNTO == RTA_ALIGNTO == 4`, linux/netlink.h).
+fn nlmsg_align(len: usize) -> usize {
+    (len + 3) & !3
+}
+
+/// Encode one complete `nlmsghdr` + `payload` message, `NLMSG_ALIGN`-ed (any
+/// trailing pad bytes are zero). `nlmsg_len` records the *unpadded* length,
+/// per the wire format — the padding exists only so a second message
+/// concatenated right after this one starts on a 4-byte boundary.
+fn encode_nlmsg(nlmsg_type: u16, flags: u16, seq: u32, pid: u32, payload: &[u8]) -> Vec<u8> {
+    let total = 16 + payload.len();
+    let mut b = vec![0u8; nlmsg_align(total)];
+    b[0..4].copy_from_slice(&(total as u32).to_le_bytes());
+    b[4..6].copy_from_slice(&nlmsg_type.to_le_bytes());
+    b[6..8].copy_from_slice(&flags.to_le_bytes());
+    b[8..12].copy_from_slice(&seq.to_le_bytes());
+    b[12..16].copy_from_slice(&pid.to_le_bytes());
+    b[16..total].copy_from_slice(payload);
+    b
+}
+
+/// Encode one `rtattr` (`struct rtattr { len; type; } data...`),
+/// `RTA_ALIGN`-ed. Concatenating several of these produces a valid rtattr
+/// stream: each one's padded length is already a multiple of 4, so the next
+/// attribute always starts aligned.
+fn encode_rtattr(rta_type: u16, data: &[u8]) -> Vec<u8> {
+    let len = 4 + data.len();
+    let mut b = vec![0u8; nlmsg_align(len)];
+    b[0..2].copy_from_slice(&(len as u16).to_le_bytes());
+    b[2..4].copy_from_slice(&rta_type.to_le_bytes());
+    b[4..4 + data.len()].copy_from_slice(data);
+    b
+}
+
+/// An `NLMSG_ERROR` reply: `struct nlmsgerr { int error; struct nlmsghdr msg; }`
+/// — `error` is `0` for a plain ACK, or a negative errno. `msg` is the
+/// requesting message's header, copied back verbatim, matching the real
+/// kernel's `netlink_ack`.
+fn encode_nlmsgerr(error: i32, orig_hdr: &[u8; 16], seq: u32, pid: u32) -> Vec<u8> {
+    let mut payload = vec![0u8; 4 + 16];
+    payload[0..4].copy_from_slice(&error.to_le_bytes());
+    payload[4..20].copy_from_slice(orig_hdr);
+    encode_nlmsg(NLMSG_ERROR, 0, seq, pid, &payload)
+}
+
+/// `RTM_NEWLINK` describing the single, always-up loopback interface: index
+/// `1`, `ARPHRD_LOOPBACK`, `IFF_UP|IFF_LOOPBACK|IFF_RUNNING`, plus
+/// `IFLA_IFNAME="lo"`, `IFLA_MTU=65536`, and a 6-zero-byte `IFLA_ADDRESS`.
+fn build_rtm_newlink(seq: u32, pid: u32) -> Vec<u8> {
+    let flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
+    let mut payload = vec![0u8; 16]; // struct ifinfomsg
+    payload[2..4].copy_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
+    payload[4..8].copy_from_slice(&LOOPBACK_IFINDEX.to_le_bytes());
+    payload[8..12].copy_from_slice(&flags.to_le_bytes());
+    payload.extend(encode_rtattr(IFLA_IFNAME, b"lo\0"));
+    payload.extend(encode_rtattr(IFLA_MTU, &65_536u32.to_le_bytes()));
+    payload.extend(encode_rtattr(IFLA_ADDRESS, &[0u8; 6]));
+    encode_nlmsg(RTM_NEWLINK, 0, seq, pid, &payload)
+}
+
+/// `RTM_NEWADDR` for `127.0.0.1/8` on `lo`.
+fn build_rtm_newaddr_v4(seq: u32, pid: u32) -> Vec<u8> {
+    let mut payload = vec![0u8; 8]; // struct ifaddrmsg
+    payload[0] = AF_INET as u8;
+    payload[1] = 8; // ifa_prefixlen
+    payload[3] = RT_SCOPE_HOST;
+    payload[4..8].copy_from_slice(&(LOOPBACK_IFINDEX as u32).to_le_bytes());
+    let ip = [127u8, 0, 0, 1];
+    payload.extend(encode_rtattr(IFA_ADDRESS, &ip));
+    payload.extend(encode_rtattr(IFA_LOCAL, &ip));
+    payload.extend(encode_rtattr(IFA_LABEL, b"lo\0"));
+    encode_nlmsg(RTM_NEWADDR, 0, seq, pid, &payload)
+}
+
+/// `RTM_NEWADDR` for `::1/128` on `lo`.
+fn build_rtm_newaddr_v6(seq: u32, pid: u32) -> Vec<u8> {
+    let mut payload = vec![0u8; 8]; // struct ifaddrmsg
+    payload[0] = AF_INET6 as u8;
+    payload[1] = 128; // ifa_prefixlen
+    payload[4..8].copy_from_slice(&(LOOPBACK_IFINDEX as u32).to_le_bytes());
+    let ip = loopback_ip(true);
+    payload.extend(encode_rtattr(IFA_ADDRESS, &ip));
+    payload.extend(encode_rtattr(IFA_LOCAL, &ip));
+    payload.extend(encode_rtattr(IFA_LABEL, b"lo\0"));
+    encode_nlmsg(RTM_NEWADDR, 0, seq, pid, &payload)
+}
+
+/// Write a `struct sockaddr_nl` (`nl_family`, 2 bytes pad, `nl_pid`,
+/// `nl_groups=0`) to `addr`, truncated to the caller's buffer, updating the
+/// `socklen_t` at `addrlen_ptr`. A no-op when `addrlen_ptr` is null. Always
+/// returns success (`0`), mirroring [`write_sockaddr`].
+fn write_netlink_sockaddr(mem: &mut GuestMemory, addr: u64, addrlen_ptr: u64, pid: u32) -> i64 {
+    if addrlen_ptr == 0 {
+        return 0;
+    }
+    let mut b = [0u8; 12];
+    b[0..2].copy_from_slice(&AF_NETLINK.to_le_bytes());
+    b[4..8].copy_from_slice(&pid.to_le_bytes());
+    let cap = mem.read_u32(addrlen_ptr).unwrap_or(0) as usize;
+    if addr != 0 {
+        let n = b.len().min(cap);
+        let _ = mem.write(addr, &b[..n]);
+    }
+    let _ = mem.write(addrlen_ptr, &(b.len() as u32).to_le_bytes());
     0
 }
 
@@ -1685,5 +2039,194 @@ mod tests {
         mem.write_init(peerlen, &16u32.to_le_bytes()).unwrap();
         let ret = call(&mut k, &mut mem, &mut v, Sysno::Getpeername, [s, peer, peerlen, 0, 0, 0]);
         assert_eq!(ret, -i64::from(Errno::ENOTCONN.0));
+    }
+
+    // --- AF_NETLINK / NETLINK_ROUTE -----------------------------------------
+
+    const NLM_F_REQUEST: u16 = 0x01;
+
+    /// Write a bare `nlmsghdr` (no payload, `nlmsg_len=16`) at `ptr`.
+    fn write_nlmsghdr(mem: &mut GuestMemory, ptr: u64, nlmsg_type: u16, flags: u16, seq: u32) {
+        let mut b = [0u8; 16];
+        b[0..4].copy_from_slice(&16u32.to_le_bytes());
+        b[4..6].copy_from_slice(&nlmsg_type.to_le_bytes());
+        b[6..8].copy_from_slice(&flags.to_le_bytes());
+        b[8..12].copy_from_slice(&seq.to_le_bytes());
+        mem.write_init(ptr, &b).unwrap();
+    }
+
+    /// Walk a buffer of `NLMSG_ALIGN`-ed `nlmsghdr` messages, asserting each
+    /// one's alignment along the way, and return `(nlmsg_type, nlmsg_seq,
+    /// payload)` per message.
+    fn parse_nlmsgs(buf: &[u8]) -> Vec<(u16, u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off + 16 <= buf.len() {
+            let len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+            assert!(len >= 16, "nlmsg_len must cover at least the header");
+            let ty = u16::from_le_bytes(buf[off + 4..off + 6].try_into().unwrap());
+            let seq = u32::from_le_bytes(buf[off + 8..off + 12].try_into().unwrap());
+            let payload = buf[off + 16..off + len].to_vec();
+            out.push((ty, seq, payload));
+            let aligned = (len + 3) & !3;
+            assert_eq!(aligned % 4, 0, "NLMSG_ALIGN must land on a 4-byte boundary");
+            off += aligned;
+        }
+        assert_eq!(off, buf.len(), "messages must exactly tile the buffer");
+        out
+    }
+
+    /// Find `rta_type`'s data within an rtattr stream starting at
+    /// `payload[hdr_len..]`, asserting `RTA_ALIGN` along the way.
+    fn find_rtattr(payload: &[u8], hdr_len: usize, rta_type: u16) -> Option<Vec<u8>> {
+        let mut off = hdr_len;
+        while off + 4 <= payload.len() {
+            let len = u16::from_le_bytes(payload[off..off + 2].try_into().unwrap()) as usize;
+            assert!(len >= 4, "rtattr len must cover at least its own header");
+            let ty = u16::from_le_bytes(payload[off + 2..off + 4].try_into().unwrap());
+            let data = payload[off + 4..off + len].to_vec();
+            let aligned = (len + 3) & !3;
+            assert_eq!(aligned % 4, 0, "RTA_ALIGN must land on a 4-byte boundary");
+            if ty == rta_type {
+                return Some(data);
+            }
+            off += aligned;
+        }
+        None
+    }
+
+    #[test]
+    fn netlink_getlink_dump_reports_lo() {
+        let (mut k, mut mem, mut v) = setup();
+        let fd = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Socket,
+            [u64::from(AF_NETLINK), SOCK_RAW | SOCK_NONBLOCK, NETLINK_ROUTE, 0, 0, 0],
+        ) as u64;
+        assert!(fd >= 3);
+
+        let req = 0x1_1000;
+        write_nlmsghdr(&mut mem, req, RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 42);
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [fd, req, 16, 0, 0, 0]), 16);
+
+        let out = 0x1_2000;
+        let n = call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, out, 2048, 0, 0, 0]);
+        assert!(n > 0, "expected a reply");
+        let buf = mem.read_vec(out, n as usize).unwrap();
+        let msgs = parse_nlmsgs(&buf);
+        assert_eq!(msgs.len(), 2, "one RTM_NEWLINK, then NLMSG_DONE");
+
+        let (ty, seq, payload) = &msgs[0];
+        assert_eq!(*ty, RTM_NEWLINK);
+        assert_eq!(*seq, 42);
+        let ifname = find_rtattr(payload, 16, IFLA_IFNAME).expect("IFLA_IFNAME present");
+        assert_eq!(ifname, b"lo\0");
+
+        let (ty, seq, _) = &msgs[1];
+        assert_eq!(*ty, NLMSG_DONE);
+        assert_eq!(*seq, 42);
+    }
+
+    #[test]
+    fn netlink_getaddr_dump_reports_127_0_0_1() {
+        let (mut k, mut mem, mut v) = setup();
+        let fd = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Socket,
+            [u64::from(AF_NETLINK), SOCK_RAW | SOCK_NONBLOCK, NETLINK_ROUTE, 0, 0, 0],
+        ) as u64;
+
+        let req = 0x1_1000;
+        write_nlmsghdr(&mut mem, req, RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 7);
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Sendto, [fd, req, 16, 0, 0, 0]), 16);
+
+        let out = 0x1_2000;
+        let n = call(&mut k, &mut mem, &mut v, Sysno::Recvfrom, [fd, out, 2048, 0, 0, 0]);
+        assert!(n > 0, "expected a reply");
+        let buf = mem.read_vec(out, n as usize).unwrap();
+        let msgs = parse_nlmsgs(&buf);
+        assert_eq!(*msgs.last().map(|(ty, ..)| ty).unwrap(), NLMSG_DONE);
+
+        let v4 = msgs
+            .iter()
+            .find(|(ty, ..)| *ty == RTM_NEWADDR)
+            .and_then(|(_, _, payload)| find_rtattr(payload, 8, IFA_LOCAL))
+            .expect("an RTM_NEWADDR with IFA_LOCAL");
+        assert_eq!(v4, [127, 0, 0, 1]);
+    }
+
+    #[test]
+    fn netlink_unknown_type_yields_nlmsg_error() {
+        let (mut k, mut mem, mut v) = setup();
+        let fd = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Socket,
+            [u64::from(AF_NETLINK), SOCK_RAW | SOCK_NONBLOCK, NETLINK_ROUTE, 0, 0, 0],
+        ) as u64;
+
+        let req = 0x1_1000;
+        write_nlmsghdr(&mut mem, req, 0xffff, NLM_F_REQUEST, 99);
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [fd, req, 16, 0, 0, 0]), 16);
+
+        let out = 0x1_2000;
+        let n = call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, out, 2048, 0, 0, 0]);
+        assert!(n > 0);
+        let buf = mem.read_vec(out, n as usize).unwrap();
+        let msgs = parse_nlmsgs(&buf);
+        assert_eq!(msgs.len(), 1);
+        let (ty, seq, payload) = &msgs[0];
+        assert_eq!(*ty, NLMSG_ERROR);
+        assert_eq!(*seq, 99);
+        let error = i32::from_le_bytes(payload[0..4].try_into().unwrap());
+        assert_eq!(error, -Errno::EOPNOTSUPP.0);
+    }
+
+    #[test]
+    fn netlink_bind_and_getsockname_roundtrip_pid() {
+        let (mut k, mut mem, mut v) = setup();
+        let fd = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Socket,
+            [u64::from(AF_NETLINK), SOCK_RAW | SOCK_NONBLOCK, NETLINK_ROUTE, 0, 0, 0],
+        ) as u64;
+
+        let addr = 0x1_1000;
+        let mut b = [0u8; 12];
+        b[0..2].copy_from_slice(&AF_NETLINK.to_le_bytes());
+        b[4..8].copy_from_slice(&4242u32.to_le_bytes());
+        mem.write_init(addr, &b).unwrap();
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Bind, [fd, addr, 12, 0, 0, 0]), 0);
+
+        let name = 0x1_2000;
+        let namelen = 0x1_2100;
+        mem.write_init(namelen, &12u32.to_le_bytes()).unwrap();
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getsockname, [fd, name, namelen, 0, 0, 0]), 0);
+        let b = mem.read_vec(name, 8).unwrap();
+        assert_eq!(u16::from_le_bytes([b[0], b[1]]), AF_NETLINK);
+        assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), 4242);
+    }
+
+    #[test]
+    fn netlink_nonblocking_recv_with_empty_queue_is_eagain() {
+        let (mut k, mut mem, mut v) = setup();
+        let fd = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Socket,
+            [u64::from(AF_NETLINK), SOCK_RAW | SOCK_NONBLOCK, NETLINK_ROUTE, 0, 0, 0],
+        ) as u64;
+        let out = 0x1_1000;
+        let ret = call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, out, 64, 0, 0, 0]);
+        assert_eq!(ret, -i64::from(Errno::EAGAIN.0));
+        assert!(!k.block);
     }
 }
