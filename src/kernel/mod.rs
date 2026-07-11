@@ -52,8 +52,27 @@ struct ProcInfo {
     heap_limit: u64,
     mmap_cursor: u64,
     mmap_floor: u64,
+    /// Task id (a.k.a. tid): unique per task, returned by `gettid`.
     pid: i32,
     ppid: i32,
+    /// Thread-group id, returned by `getpid`. For a single-threaded process
+    /// `tgid == pid`; threads created with `CLONE_THREAD` share the leader's
+    /// `tgid` but keep distinct `pid`s.
+    tgid: i32,
+    /// True for a `CLONE_THREAD` task (a thread, not a child process). Threads
+    /// are not reaped by their parent's `wait4`.
+    is_thread: bool,
+    /// Address-space id: an index into [`Kernel::spaces`]. Threads that share
+    /// memory (`CLONE_VM`) share one `mm`; a forked child gets a fresh copy.
+    mm: usize,
+    /// `set_tid_address` / `CLONE_CHILD_CLEARTID`: on exit, zero this guest
+    /// word and futex-wake it (lets `pthread_join` return). 0 = unset.
+    clear_child_tid: u64,
+    /// When `Some((mm, uaddr))`, this task is parked in `FUTEX_WAIT` on that
+    /// address; cleared when woken.
+    futex_wait: Option<(usize, u64)>,
+    /// Set by `FUTEX_WAKE` to release a parked waiter on its next slice.
+    futex_woken: bool,
     run: RunState,
     /// Per-signal disposition: `SIG_DFL` (0), `SIG_IGN` (1), or a handler
     /// address. Indexed by signal number (1..=64); index 0 is unused.
@@ -76,6 +95,12 @@ impl Default for ProcInfo {
             mmap_floor: 0,
             pid: 0,
             ppid: 0,
+            tgid: 0,
+            is_thread: false,
+            mm: 0,
+            clear_child_tid: 0,
+            futex_wait: None,
+            futex_woken: false,
             run: RunState::Running,
             handlers: [0; 65],
             blocked: 0,
@@ -84,16 +109,17 @@ impl Default for ProcInfo {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RunState {
     Running,
     Zombie(i32),
 }
 
-/// A guest process: its vcpu, address space, and per-process state.
+/// A guest task (process or thread): its vcpu and per-task state. Its address
+/// space lives in [`Kernel::spaces`] at `info.mm`, shared with any sibling
+/// threads created via `CLONE_VM`.
 struct Process {
     vcpu: Box<dyn Vcpu>,
-    mem: GuestMemory,
     info: ProcInfo,
 }
 
@@ -129,9 +155,13 @@ pub struct Kernel {
     unsupported: BTreeMap<u64, u64>,
     /// The running process's per-process state (swapped in for the slice).
     cur: ProcInfo,
-    /// All processes; the running one is `take`n out during its slice, so its
+    /// All tasks; the running one is `take`n out during its slice, so its
     /// slot is temporarily `None` (making `fork`/`wait4` on the table clean).
     procs: Vec<Option<Process>>,
+    /// Address-space table indexed by `ProcInfo::mm`. The running task's space
+    /// is `take`n out for the duration of its slice (only one task runs at a
+    /// time under the cooperative scheduler, so no aliasing), then restored.
+    spaces: Vec<Option<GuestMemory>>,
     next_pid: i32,
     /// Set by a handler when the syscall would block (re-trap it later).
     block: bool,
@@ -171,6 +201,7 @@ impl Kernel {
             unsupported: BTreeMap::new(),
             cur: ProcInfo::default(),
             procs: Vec::new(),
+            spaces: Vec::new(),
             next_pid: 2,
             block: false,
             exec_ok: false,
@@ -216,8 +247,11 @@ impl Kernel {
         let mut info = std::mem::take(&mut self.cur);
         info.pid = 1;
         info.ppid = 0;
+        info.tgid = 1;
+        info.mm = self.spaces.len();
         info.run = RunState::Running;
-        self.procs.push(Some(Process { vcpu, mem, info }));
+        self.spaces.push(Some(mem));
+        self.procs.push(Some(Process { vcpu, info }));
         self.schedule()
     }
 
@@ -237,9 +271,14 @@ impl Kernel {
                     continue;
                 }
                 let mut proc = self.procs[i].take().unwrap();
+                let mm = proc.info.mm;
+                let mut space = self.spaces[mm]
+                    .take()
+                    .expect("running task's address space must be present");
                 std::mem::swap(&mut self.cur, &mut proc.info);
-                let made = self.run_slice(&mut proc.vcpu, &mut proc.mem)?;
+                let made = self.run_slice(&mut proc.vcpu, &mut space)?;
                 std::mem::swap(&mut self.cur, &mut proc.info);
+                self.spaces[mm] = Some(space);
                 self.procs[i] = Some(proc);
                 progressed |= made;
             }
@@ -404,7 +443,7 @@ impl Kernel {
             Sysno::Getrandom => self.sys_getrandom(args[0], args[1], mem),
             Sysno::Ioctl => err(Errno::ENOTTY),
             Sysno::Fcntl => self.sys_fcntl(args[0], args[1]),
-            Sysno::Futex => sys_futex(args, mem),
+            Sysno::Futex => self.sys_futex(args, mem),
             Sysno::Pipe2 => self.sys_pipe2(args[0], mem),
             Sysno::Socket => self.sys_socket(args[0], args[1], args[2]),
             Sysno::Socketpair => self.sys_socketpair(args[0], args[1], args[2], args[3], mem),
@@ -446,16 +485,22 @@ impl Kernel {
             Sysno::Clone => self.sys_clone(args, vcpu, mem),
             Sysno::Execve => self.sys_execve(args[0], args[1], args[2], vcpu, mem),
             Sysno::Wait4 => self.sys_wait4(args[0] as i64, args[1], args[2], mem),
-            Sysno::ExitGroup | Sysno::Exit => self.sys_exit(args[0] as i32),
+            Sysno::Exit => self.sys_exit(args[0] as i32, mem),
+            Sysno::ExitGroup => self.sys_exit_group(args[0] as i32, mem),
             Sysno::RtSigaction => self.sys_rt_sigaction(args[0], args[1], args[2], mem),
             Sysno::RtSigprocmask => self.sys_rt_sigprocmask(args[0], args[1], args[2], mem),
             Sysno::RtSigpending => self.sys_rt_sigpending(args[0], mem),
             Sysno::RtSigtimedwait => err(Errno::EAGAIN),
             Sysno::Kill | Sysno::Tkill => self.sys_kill(args[0] as i64, args[1]),
             Sysno::Tgkill => self.sys_kill(args[1] as i64, args[2]),
-            // pid/tid = this process's pid (single-thread so tid == pid);
-            // set_tid_address also returns the tid.
-            Sysno::Getpid | Sysno::Gettid | Sysno::SetTidAddress => i64::from(self.cur.pid),
+            // getpid = thread-group id; gettid = this task's id.
+            Sysno::Getpid => i64::from(self.cur.tgid),
+            Sysno::Gettid => i64::from(self.cur.pid),
+            // set_tid_address records the CHILD_CLEARTID word and returns the tid.
+            Sysno::SetTidAddress => {
+                self.cur.clear_child_tid = args[0];
+                i64::from(self.cur.pid)
+            }
             Sysno::Getppid => i64::from(self.cur.ppid),
             // Resource / scheduling / process-attribute syscalls (informational).
             Sysno::SchedGetaffinity => {
@@ -519,22 +564,88 @@ impl Kernel {
 
     // ---- process lifecycle ------------------------------------------------
 
-    /// `clone(flags, stack, ...)` — implemented as `fork` (a full copy of the
-    /// address space, fd table, and registers). Threads that share memory
-    /// (`CLONE_THREAD`) arrive later; the fork/vfork-then-exec pattern that
-    /// shells use works with a copy.
+    /// `clone(flags, stack, ...)` — the one primitive behind both `fork` (a new
+    /// process with a copied address space) and `pthread_create` (a thread that
+    /// shares the caller's address space).
+    ///
+    /// `CLONE_VM` shares the address space (the new task's `mm` points at the
+    /// same [`Kernel::spaces`] slot); otherwise the space is copied. `CLONE_THREAD`
+    /// puts the new task in the caller's thread group (shared `tgid`, distinct
+    /// `pid`/tid, not reaped by `wait4`). `CLONE_SETTLS` seeds the thread pointer;
+    /// the `*_SETTID`/`CHILD_CLEARTID` flags write/clear the tid words musl's
+    /// pthread layer relies on. The fd table is still copied (a `CLONE_FILES`
+    /// approximation: correct for fork, and fine for threads that don't pass
+    /// fds between each other after creation).
     fn sys_clone(&mut self, args: &[u64; 6], vcpu: &mut dyn Vcpu, mem: &mut GuestMemory) -> i64 {
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        const CLONE_SETTLS: u64 = 0x0008_0000;
+        const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+        const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+        let flags = args[0];
         let stack = args[1];
-        let child_mem = mem.clone();
-        let mut child_vcpu = vcpu.fork();
-        let mut info = self.cur.clone();
+        // clone's tls/child_tid argument order differs by arch:
+        //   aarch64: clone(flags, stack, parent_tid, tls, child_tid)
+        //   x86-64:  clone(flags, stack, parent_tid, child_tid, tls)
+        let parent_tid = args[2];
+        let (tls, child_tid) = match self.arch {
+            Arch::X86_64 => (args[4], args[3]),
+            Arch::Aarch64 => (args[3], args[4]),
+        };
+        let share_vm = flags & CLONE_VM != 0;
+        let is_thread = flags & CLONE_THREAD != 0;
+
         let pid = self.next_pid;
         self.next_pid += 1;
+        let mut info = self.cur.clone();
         info.pid = pid;
-        info.ppid = self.cur.pid;
         info.run = RunState::Running;
+        info.futex_wait = None;
+        info.futex_woken = false;
+        if is_thread {
+            info.tgid = self.cur.tgid;
+            info.ppid = self.cur.ppid;
+            info.is_thread = true;
+        } else {
+            info.tgid = pid;
+            info.ppid = self.cur.pid;
+            info.is_thread = false;
+        }
 
-        // The child holds copies of every open fd; bump pipe refcounts.
+        // Address space: share the caller's slot (CLONE_VM) or take a fresh copy.
+        let mut child_mem = if share_vm { None } else { Some(mem.clone()) };
+        info.mm = if share_vm {
+            self.cur.mm
+        } else {
+            self.spaces.len()
+        };
+
+        info.clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 {
+            child_tid
+        } else {
+            0
+        };
+
+        // tid notifications. The parent word lives in the caller's space (`mem`);
+        // the child word lives in the child's space (shared `mem`, or the fresh
+        // copy we are about to install).
+        if flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
+            let _ = mem.write(parent_tid, &(pid as u32).to_le_bytes());
+        }
+        if flags & CLONE_CHILD_SETTID != 0 && child_tid != 0 {
+            match child_mem.as_mut() {
+                Some(cm) => {
+                    let _ = cm.write(child_tid, &(pid as u32).to_le_bytes());
+                }
+                None => {
+                    let _ = mem.write(child_tid, &(pid as u32).to_le_bytes());
+                }
+            }
+        }
+
+        // The child holds copies of every open fd; bump pipe/socket refcounts.
         let (mut r, mut w) = (Vec::new(), Vec::new());
         for fd in info.fds.values() {
             match fd {
@@ -551,13 +662,20 @@ impl Kernel {
             self.pipes[i].writers += 1;
         }
 
+        if let Some(cm) = child_mem.take() {
+            self.spaces.push(Some(cm));
+        }
+
+        let mut child_vcpu = vcpu.fork();
         if stack != 0 {
             child_vcpu.set_sp(stack);
+        }
+        if flags & CLONE_SETTLS != 0 {
+            child_vcpu.set_tls(tls);
         }
         child_vcpu.set_syscall_ret(0); // child returns 0 and advances past the svc
         self.procs.push(Some(Process {
             vcpu: child_vcpu,
-            mem: child_mem,
             info,
         }));
         i64::from(pid)
@@ -610,7 +728,8 @@ impl Kernel {
         let mut zombie = None;
         let mut has_child = false;
         for p in self.procs.iter().flatten() {
-            if p.info.ppid == cur {
+            // Threads (CLONE_THREAD) are not reaped by wait4; only child procs.
+            if p.info.ppid == cur && !p.info.is_thread {
                 has_child = true;
                 if let RunState::Zombie(code) = p.info.run {
                     zombie = Some((p.info.pid, code));
@@ -641,14 +760,120 @@ impl Kernel {
         0
     }
 
-    /// `exit`/`exit_group` — close all fds (so pipe peers see EOF) and become a
-    /// zombie until the parent reaps us.
-    fn sys_exit(&mut self, code: i32) -> i64 {
+    /// `exit` — terminate just this task: run its `CLONE_CHILD_CLEARTID`
+    /// notification (so a joiner wakes), close its fds (so pipe peers see EOF),
+    /// and become a zombie until reaped.
+    fn sys_exit(&mut self, code: i32, mem: &mut GuestMemory) -> i64 {
+        let ctid = self.cur.clear_child_tid;
+        let mm = self.cur.mm;
+        if ctid != 0 {
+            let _ = mem.write(ctid, &0u32.to_le_bytes());
+            self.futex_wake(mm, ctid, i32::MAX);
+        }
         for fd in self.cur.fds.drain() {
             self.bump_pipe(&fd, false);
         }
         self.cur.run = RunState::Zombie(code & 0xff);
         0
+    }
+
+    /// `exit_group` — terminate the whole thread group: this task plus every
+    /// sibling sharing our `tgid`. Each dying task closes its fds; the running
+    /// task also runs its `CLONE_CHILD_CLEARTID` notification.
+    fn sys_exit_group(&mut self, code: i32, mem: &mut GuestMemory) -> i64 {
+        let tgid = self.cur.tgid;
+        let status = code & 0xff;
+        // Collect the siblings' fds first: closing them touches `self.pipes` /
+        // `self.net`, which we cannot borrow while iterating `self.procs`.
+        let mut to_close: Vec<Fd> = Vec::new();
+        for slot in &mut self.procs {
+            let Some(p) = slot.as_mut() else { continue };
+            if p.info.tgid != tgid || matches!(p.info.run, RunState::Zombie(_)) {
+                continue;
+            }
+            to_close.extend(p.info.fds.drain());
+            p.info.run = RunState::Zombie(status);
+        }
+        for fd in to_close {
+            self.bump_pipe(&fd, false);
+        }
+        // `self.cur` is this task, taken out of the table for its slice.
+        self.sys_exit(code, mem)
+    }
+
+    /// `futex(uaddr, op, val, ...)` — the parking primitive under mutexes,
+    /// condvars, and `pthread_join`.
+    ///
+    /// `FUTEX_WAIT`: if `*uaddr != val` the caller is already past the wait, so
+    /// return `EAGAIN` immediately. Otherwise the caller parks — but only if
+    /// another task could ever wake it; when this is the sole runnable task
+    /// (the common single-threaded-musl case) parking would just deadlock, so
+    /// we report a spurious wake (return 0) instead. A parked task re-traps the
+    /// same `futex` on each slice (its PC never advanced) and returns once
+    /// `FUTEX_WAKE` flips its `futex_woken` flag — decoupled from the value, as
+    /// real futexes require. `FUTEX_WAKE` releases up to `val` parked waiters on
+    /// `(mm, uaddr)`.
+    fn sys_futex(&mut self, args: &[u64; 6], mem: &GuestMemory) -> i64 {
+        const FUTEX_WAIT: u64 = 0;
+        const FUTEX_WAKE: u64 = 1;
+        const FUTEX_WAIT_BITSET: u64 = 9;
+        const FUTEX_WAKE_BITSET: u64 = 10;
+        let uaddr = args[0];
+        let op = args[1] & 0x7f; // strip FUTEX_PRIVATE_FLAG / CLOCK_REALTIME
+        let val = args[2] as u32;
+        let mm = self.cur.mm;
+        match op {
+            FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+                // Already parked here: consult the wake flag only.
+                if self.cur.futex_wait == Some((mm, uaddr)) {
+                    if self.cur.futex_woken {
+                        self.cur.futex_wait = None;
+                        self.cur.futex_woken = false;
+                        return 0;
+                    }
+                    self.block = true;
+                    return 0;
+                }
+                match mem.read_u32(uaddr) {
+                    Ok(cur) if cur != val => err(Errno::EAGAIN),
+                    Ok(_) => {
+                        // Park only if some other task could wake us; otherwise a
+                        // lone waiter would deadlock, so fake a wake.
+                        let others = self
+                            .procs
+                            .iter()
+                            .flatten()
+                            .any(|p| p.info.pid != self.cur.pid && p.info.run == RunState::Running);
+                        if !others {
+                            return 0;
+                        }
+                        self.cur.futex_wait = Some((mm, uaddr));
+                        self.cur.futex_woken = false;
+                        self.block = true;
+                        0
+                    }
+                    Err(_) => err(Errno::EFAULT),
+                }
+            }
+            FUTEX_WAKE | FUTEX_WAKE_BITSET => self.futex_wake(mm, uaddr, val as i32),
+            _ => 0,
+        }
+    }
+
+    /// Release up to `n` tasks parked in `FUTEX_WAIT` on `(mm, uaddr)`; returns
+    /// how many were woken.
+    fn futex_wake(&mut self, mm: usize, uaddr: u64, n: i32) -> i64 {
+        let mut woken = 0i64;
+        for p in self.procs.iter_mut().flatten() {
+            if woken >= i64::from(n) {
+                break;
+            }
+            if p.info.futex_wait == Some((mm, uaddr)) && !p.info.futex_woken {
+                p.info.futex_woken = true;
+                woken += 1;
+            }
+        }
+        woken
     }
 
     // ---- files & fds ------------------------------------------------------
@@ -1236,22 +1461,6 @@ impl Kernel {
     }
 }
 
-/// `futex(uaddr, op, val, ...)` — the single-thread subset.
-fn sys_futex(args: &[u64; 6], mem: &GuestMemory) -> i64 {
-    const FUTEX_WAIT: u64 = 0;
-    let uaddr = args[0];
-    let op = args[1] & 0x7f;
-    let val = args[2] as u32;
-    match op {
-        FUTEX_WAIT => match mem.read_u32(uaddr) {
-            Ok(cur) if cur != val => err(Errno::EAGAIN),
-            Ok(_) => 0,
-            Err(_) => err(Errno::EFAULT),
-        },
-        _ => 0,
-    }
-}
-
 /// `clock_gettime(clk_id, timespec)`.
 fn sys_clock_gettime(ts: u64, mem: &mut GuestMemory) -> i64 {
     let now = std::time::SystemTime::now()
@@ -1373,6 +1582,7 @@ mod tests {
         mounts.mount("/", Box::new(TmpFs::new()));
         let mut kernel = Kernel::new(Arch::Aarch64, mounts);
         kernel.cur.pid = 1;
+        kernel.cur.tgid = 1;
         let mut mem = GuestMemory::new(0x1_0000, 16 * PAGE);
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
         (kernel, mem, DummyVcpu)
@@ -1612,6 +1822,172 @@ mod tests {
         assert_eq!(reaped, 2);
         // WIFEXITED status: (code & 0xff) << 8
         assert_eq!(mem.read_u32(ws).unwrap(), 7 << 8);
+    }
+
+    /// Build a bare task record for scheduler/thread-table tests.
+    fn make_proc(pid: i32, tgid: i32, mm: usize, is_thread: bool) -> Process {
+        let mut info = ProcInfo {
+            pid,
+            tgid,
+            is_thread,
+            mm,
+            ..ProcInfo::default()
+        };
+        info.run = RunState::Running;
+        Process {
+            vcpu: Box::new(DummyVcpu),
+            info,
+        }
+    }
+
+    #[test]
+    fn getpid_is_tgid_gettid_is_pid() {
+        let (mut k, mut mem, mut v) = setup();
+        k.cur.pid = 7; // a thread's tid
+        k.cur.tgid = 1; // its process
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getpid, [0; 6]), 1);
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Gettid, [0; 6]), 7);
+    }
+
+    #[test]
+    fn clone_thread_shares_tgid_and_address_space() {
+        let (mut k, mut mem, mut v) = setup();
+        // CLONE_VM | CLONE_THREAD | CLONE_SETTLS
+        let flags = 0x0000_0100 | 0x0001_0000 | 0x0008_0000;
+        let tid = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [flags, 0x2_0000, 0, 0xdead_beef, 0, 0],
+        );
+        assert_eq!(tid, 2, "new thread gets a fresh tid");
+        let spaces_before = k.spaces.len();
+        let child = k
+            .procs
+            .iter()
+            .flatten()
+            .find(|p| p.info.pid == 2)
+            .expect("thread in table");
+        assert!(child.info.is_thread);
+        assert_eq!(child.info.tgid, k.cur.tgid, "thread shares the tgid");
+        assert_eq!(child.info.mm, k.cur.mm, "thread shares the address space");
+        assert_eq!(
+            spaces_before, k.spaces.len(),
+            "CLONE_VM does not allocate a new address space"
+        );
+    }
+
+    #[test]
+    fn fork_gets_its_own_address_space() {
+        let (mut k, mut mem, mut v) = setup();
+        // Put the parent's space in the table (as run() would).
+        k.spaces.push(Some(GuestMemory::new(0x1_0000, PAGE)));
+        k.cur.mm = 0;
+        let before = k.spaces.len();
+        // flags = SIGCHLD only (a plain fork), no CLONE_VM.
+        let child = call(&mut k, &mut mem, &mut v, Sysno::Clone, [0x11, 0, 0, 0, 0, 0]);
+        assert_eq!(child, 2);
+        let c = k.procs.iter().flatten().find(|p| p.info.pid == 2).unwrap();
+        assert!(!c.info.is_thread);
+        assert_eq!(c.info.tgid, 2, "a forked process is its own group");
+        assert_ne!(c.info.mm, k.cur.mm, "fork copies the address space");
+        assert_eq!(k.spaces.len(), before + 1);
+    }
+
+    #[test]
+    fn exit_group_zombies_the_whole_thread_group() {
+        let (mut k, mut mem, mut v) = setup();
+        // Two sibling threads in the leader's group, plus an unrelated process.
+        k.procs.push(Some(make_proc(2, 1, 0, true)));
+        k.procs.push(Some(make_proc(3, 1, 0, true)));
+        k.procs.push(Some(make_proc(4, 4, 1, false)));
+
+        call(&mut k, &mut mem, &mut v, Sysno::ExitGroup, [42, 0, 0, 0, 0, 0]);
+
+        assert!(matches!(k.cur.run, RunState::Zombie(42)), "leader exits");
+        let state = |pid| {
+            k.procs
+                .iter()
+                .flatten()
+                .find(|p| p.info.pid == pid)
+                .map(|p| p.info.run)
+        };
+        assert_eq!(state(2), Some(RunState::Zombie(42)), "sibling thread killed");
+        assert_eq!(state(3), Some(RunState::Zombie(42)), "sibling thread killed");
+        assert_eq!(
+            state(4),
+            Some(RunState::Running),
+            "unrelated process untouched"
+        );
+    }
+
+    #[test]
+    fn futex_wake_releases_a_parked_waiter() {
+        let (mut k, mut mem, mut v) = setup();
+        let uaddr = 0x1_0000;
+        // A sibling parked in FUTEX_WAIT on (mm 0, uaddr).
+        let mut waiter = make_proc(2, 1, 0, true);
+        waiter.info.futex_wait = Some((0, uaddr));
+        k.procs.push(Some(waiter));
+
+        // FUTEX_WAKE(uaddr, op=1, val=1) wakes exactly one waiter.
+        let woken = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Futex,
+            [uaddr, 1, 1, 0, 0, 0],
+        );
+        assert_eq!(woken, 1);
+        let w = k.procs.iter().flatten().find(|p| p.info.pid == 2).unwrap();
+        assert!(w.info.futex_woken, "waiter flagged for release");
+    }
+
+    #[test]
+    fn futex_wait_single_thread_does_not_deadlock() {
+        let (mut k, mut mem, mut v) = setup();
+        let uaddr = 0x1_0000;
+        mem.write_init(uaddr, &42u32.to_le_bytes()).unwrap();
+        // Value matches and no other task could wake us: report a spurious wake
+        // rather than parking (which would be a false deadlock).
+        let r = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Futex,
+            [uaddr, 0, 42, 0, 0, 0],
+        );
+        assert_eq!(r, 0);
+        assert!(!k.block, "lone waiter is not parked");
+        // A mismatched value is EAGAIN.
+        let r = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Futex,
+            [uaddr, 0, 99, 0, 0, 0],
+        );
+        assert_eq!(r, -i64::from(Errno::EAGAIN.0));
+    }
+
+    #[test]
+    fn futex_wait_parks_when_a_sibling_can_wake() {
+        let (mut k, mut mem, mut v) = setup();
+        let uaddr = 0x1_0000;
+        mem.write_init(uaddr, &42u32.to_le_bytes()).unwrap();
+        // A runnable sibling exists, so a matching wait parks the caller.
+        k.procs.push(Some(make_proc(2, 1, 0, true)));
+        let r = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Futex,
+            [uaddr, 0, 42, 0, 0, 0],
+        );
+        assert_eq!(r, 0);
+        assert!(k.block, "caller parks awaiting a wake");
+        assert_eq!(k.cur.futex_wait, Some((0, uaddr)));
     }
 
     #[cfg(unix)]
