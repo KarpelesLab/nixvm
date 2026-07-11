@@ -2,15 +2,17 @@
 //!
 //! Presents the skeleton of a Linux `sysfs` tree — the top-level directories a
 //! userland expects (`kernel`, `devices`, `class`, `fs`, `block`, `bus`,
-//! `module`, `firmware`) plus a handful of fixed-content attribute files
-//! (`kernel/ostype`, `devices/system/cpu/online`, …). Nothing here reflects
-//! real hardware; the tree is entirely static and read-only, so every mutating
-//! method falls through to the `EROFS` default.
+//! `module`, `firmware`, `power`) plus a handful of fixed-content attribute
+//! files (`kernel/ostype`, `devices/system/cpu/online`, …). Nothing here
+//! reflects real hardware; the tree is entirely static and read-only, so every
+//! mutating method falls through to the `EROFS` default.
 //!
 //! The CPU topology (`devices/system/cpu/cpu0`, `cpu1`, …) is sized from
 //! [`std::thread::available_parallelism`] at first access, so it matches the
-//! host's reported core count (the guest's "nproc"). Everything else is a
-//! fixed, plausible placeholder.
+//! host's reported core count (the guest's "nproc"); each per-cpu directory
+//! also gets a `cpufreq/` and `cache/index0/` subtree of plausible
+//! placeholder values. Everything else — including `class/net/lo` (the
+//! loopback network interface) — is a fixed, plausible placeholder.
 //!
 //! The tree is a `BTreeMap` keyed by mount-relative path (`""` is the `/sys`
 //! root, then `"kernel"`, `"kernel/ostype"`, …); this keeps `readdir`
@@ -132,11 +134,16 @@ impl SysFs {
         b.dir("bus");
         b.dir("module");
         b.dir("firmware");
+        b.dir("power");
 
         // ---- kernel/ ----
         b.file("kernel/ostype", *b"Linux\n");
         b.file("kernel/osrelease", *b"6.1.0-nixvm\n");
         b.file("kernel/hostname", *b"nixvm\n");
+        // Optional-but-present attribute files userland occasionally probes.
+        b.file("kernel/profiling", *b"0\n");
+        b.file("kernel/vmcoreinfo", *b"0x0 0x0\n");
+        b.dir("kernel/security");
         b.dir("kernel/mm");
         b.dir("kernel/mm/transparent_hugepage");
         b.file(
@@ -153,11 +160,29 @@ impl SysFs {
         // The compile-time max CPU index the (synthetic) kernel was built
         // for; real kernels report a value well above the online count.
         b.file("devices/system/cpu/kernel_max", *b"255\n");
+        // No CPUs are isolated or fully-nohz in this synthetic topology.
+        b.file("devices/system/cpu/isolated", *b"\n");
+        b.file("devices/system/cpu/nohz_full", *b"(null)\n");
         for i in 0..ncpu {
             let dir = format!("devices/system/cpu/cpu{i}");
-            let online_path = format!("{dir}/online");
-            b.dir(dir);
-            b.file(online_path, *b"1\n");
+            b.dir(dir.clone());
+            b.file(format!("{dir}/online"), *b"1\n");
+
+            // Plausible cpufreq scaling attributes.
+            let cpufreq = format!("{dir}/cpufreq");
+            b.dir(cpufreq.clone());
+            b.file(format!("{cpufreq}/scaling_cur_freq"), *b"2000000\n");
+            b.file(format!("{cpufreq}/cpuinfo_max_freq"), *b"3000000\n");
+
+            // A single L1 data cache entry, enough for tools that just check
+            // the directory exists and has plausible-looking attributes.
+            let cache = format!("{dir}/cache");
+            b.dir(cache.clone());
+            let index0 = format!("{cache}/index0");
+            b.dir(index0.clone());
+            b.file(format!("{index0}/level"), *b"1\n");
+            b.file(format!("{index0}/size"), *b"32K\n");
+            b.file(format!("{index0}/type"), *b"Data\n");
         }
 
         // ---- devices/system/node (single-node NUMA topology) ----
@@ -175,9 +200,35 @@ impl SysFs {
         b.dir("class/net");
         b.dir("class/tty");
         b.dir("class/mem");
+        b.dir("class/block");
+
+        // ---- class/net/lo (the loopback interface) ----
+        b.dir("class/net/lo");
+        b.file("class/net/lo/address", *b"00:00:00:00:00:00\n");
+        b.file("class/net/lo/mtu", *b"65536\n");
+        // IFF_UP | IFF_LOOPBACK | IFF_RUNNING, the flags a `lo` interface
+        // reports once brought up.
+        b.file("class/net/lo/flags", *b"0x9\n");
+        b.file("class/net/lo/operstate", *b"unknown\n");
+        // ARPHRD_LOOPBACK.
+        b.file("class/net/lo/type", *b"772\n");
+        b.file("class/net/lo/carrier", *b"1\n");
+        b.dir("class/net/lo/statistics");
+        b.file("class/net/lo/statistics/rx_bytes", *b"0\n");
+        b.file("class/net/lo/statistics/tx_bytes", *b"0\n");
+        b.file("class/net/lo/statistics/rx_packets", *b"0\n");
+        b.file("class/net/lo/statistics/tx_packets", *b"0\n");
 
         // ---- fs/cgroup (minimal presence) ----
         b.dir("fs/cgroup");
+        b.file(
+            "fs/cgroup/cgroup.controllers",
+            *b"cpuset cpu io memory hugetlb pids rdma misc\n",
+        );
+        b.file("fs/cgroup/cgroup.procs", *b"");
+
+        // ---- power/ (present but minimal: no real suspend support) ----
+        b.file("power/state", *b"freeze mem disk\n");
 
         b.build()
     }
@@ -279,7 +330,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "block", "bus", "class", "devices", "firmware", "fs", "kernel", "module",
+                "block", "bus", "class", "devices", "firmware", "fs", "kernel", "module", "power",
             ]
         );
         // Every top-level entry is a directory.
@@ -338,19 +389,32 @@ mod tests {
         names.sort();
         let mut expected: Vec<String> = (0..ncpu).map(|i| format!("cpu{i}")).collect();
         expected.extend(
-            ["kernel_max", "online", "possible", "present"]
-                .iter()
-                .map(|s| (*s).to_string()),
+            [
+                "isolated",
+                "kernel_max",
+                "nohz_full",
+                "online",
+                "possible",
+                "present",
+            ]
+            .iter()
+            .map(|s| (*s).to_string()),
         );
         expected.sort();
         assert_eq!(names, expected);
 
-        // Every per-cpu dir has an "online" file reporting "1".
+        // Every per-cpu dir has an "online" file reporting "1", plus a
+        // cpufreq/ and cache/index0/ subtree.
         for i in 0..ncpu {
             let path = format!("devices/system/cpu/cpu{i}/online");
             let mut buf = [0u8; 4];
             let n = fs.read_at(&path, 0, &mut buf).unwrap();
             assert_eq!(&buf[..n], b"1\n");
+
+            let freq_path = format!("devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq");
+            assert!(fs.stat(&freq_path).is_some());
+            let cache_path = format!("devices/system/cpu/cpu{i}/cache/index0/type");
+            assert!(fs.stat(&cache_path).is_some());
         }
     }
 
@@ -421,5 +485,120 @@ mod tests {
     #[test]
     fn read_only_by_default() {
         assert!(SysFs::new().read_only());
+    }
+
+    #[test]
+    fn class_net_lo_present_with_mtu_and_statistics() {
+        let mut fs = SysFs::new();
+        let mut buf = [0u8; 32];
+
+        let n = fs.read_at("class/net/lo/mtu", 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"65536\n");
+
+        assert!(fs.stat("class/net/lo/statistics/rx_bytes").is_some());
+        let n = fs
+            .read_at("class/net/lo/statistics/rx_bytes", 0, &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n], b"0\n");
+
+        let n = fs.read_at("class/net/lo/address", 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"00:00:00:00:00:00\n");
+        let n = fs.read_at("class/net/lo/operstate", 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"unknown\n");
+        let n = fs.read_at("class/net/lo/type", 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"772\n");
+    }
+
+    #[test]
+    fn ls_sys_class_net_lists_lo() {
+        let mut fs = SysFs::new();
+        let names: Vec<_> = fs
+            .readdir("class/net")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["lo"]);
+        assert_eq!(fs.stat("class/net/lo").unwrap().kind, NodeKind::Dir);
+    }
+
+    #[test]
+    fn class_block_and_top_level_block_present() {
+        let mut fs = SysFs::new();
+        for path in ["class/block", "block"] {
+            assert_eq!(fs.stat(path).unwrap().kind, NodeKind::Dir, "{path}");
+        }
+    }
+
+    #[test]
+    fn cpu0_cpufreq_and_cache_present() {
+        let mut fs = SysFs::new();
+        let mut buf = [0u8; 32];
+        let n = fs
+            .read_at("devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", 0, &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n], b"2000000\n");
+        let n = fs
+            .read_at("devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", 0, &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n], b"3000000\n");
+
+        assert_eq!(
+            fs.stat("devices/system/cpu/cpu0/cache/index0").unwrap().kind,
+            NodeKind::Dir
+        );
+        let n = fs
+            .read_at("devices/system/cpu/cpu0/cache/index0/level", 0, &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n], b"1\n");
+        let n = fs
+            .read_at("devices/system/cpu/cpu0/cache/index0/size", 0, &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n], b"32K\n");
+    }
+
+    #[test]
+    fn cpu_kernel_max_isolated_and_nohz_full_present() {
+        let mut fs = SysFs::new();
+        let mut buf = [0u8; 32];
+        let n = fs
+            .read_at("devices/system/cpu/kernel_max", 0, &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n], b"255\n");
+        let n = fs
+            .read_at("devices/system/cpu/isolated", 0, &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n], b"\n");
+        let n = fs
+            .read_at("devices/system/cpu/nohz_full", 0, &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..n], b"(null)\n");
+    }
+
+    #[test]
+    fn kernel_security_and_module_dirs_present() {
+        let mut fs = SysFs::new();
+        for path in ["kernel/security", "module", "firmware"] {
+            assert_eq!(fs.stat(path).unwrap().kind, NodeKind::Dir, "{path}");
+        }
+        let mut buf = [0u8; 16];
+        let n = fs.read_at("kernel/profiling", 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"0\n");
+    }
+
+    #[test]
+    fn power_and_cgroup_present() {
+        let mut fs = SysFs::new();
+        assert_eq!(fs.stat("power").unwrap().kind, NodeKind::Dir);
+        let mut buf = [0u8; 32];
+        let n = fs.read_at("power/state", 0, &mut buf).unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("mem"));
+
+        assert!(fs.stat("fs/cgroup/cgroup.controllers").is_some());
+        assert!(fs.stat("fs/cgroup/cgroup.procs").is_some());
+        let n = fs
+            .read_at("fs/cgroup/cgroup.controllers", 0, &mut buf)
+            .unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("memory"));
     }
 }
