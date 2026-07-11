@@ -557,6 +557,30 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- load/store exclusive & acquire/release (LDXR/STXR/LDAR/STLR) ----
+        if (instr >> 24) & 0x3f == 0b00_1000 {
+            let size = (instr >> 30) & 3;
+            let o2 = (instr >> 23) & 1; // 0 = exclusive, 1 = ordered (LDAR/STLR)
+            let l = (instr >> 22) & 1; // 1 = load
+            let o1 = (instr >> 21) & 1; // 1 = pair (LDXP/STXP)
+            if o1 == 1 {
+                return Step::Illegal; // exclusive pair: Phase 10
+            }
+            let rs = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rt = reg_field(instr, 0);
+            let addr = self.read_sp(rn);
+            if l == 1 {
+                return self.ldst(addr, size, 0b01, rt, mem);
+            }
+            let step = self.ldst(addr, size, 0b00, rt, mem);
+            if matches!(step, Step::Next) && o2 == 0 {
+                // Store-exclusive always succeeds on our single core: status = 0.
+                self.write_x(rs, 0);
+            }
+            return step;
+        }
+
         // ---- load/store pair: LDP/STP (signed offset / pre / post index) ----
         if (instr >> 27) & 0x7 == 0b101 && (instr >> 26) & 1 == 0 {
             let opc = (instr >> 30) & 3;
@@ -1146,6 +1170,22 @@ mod tests {
         c.exec(0x3900_0020, &mut m); // strb w0,[x1]
         c.exec(0x3880_0022, &mut m); // ldrsb x2,[x1]
         assert_eq!(c.x[2] as i64, -128, "signed byte load sign-extends");
+    }
+
+    #[test]
+    fn exclusive_store_load_roundtrip() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        c.x[1] = base + 0x40;
+        c.x[3] = 0x42;
+        // stxr w2,x3,[x1] — succeeds on our single core (status 0)
+        assert!(matches!(c.exec(0xC802_7C23, &mut m), Step::Next));
+        assert_eq!(c.x[2], 0, "store-exclusive reports success");
+        // ldxr x0,[x1]
+        assert!(matches!(c.exec(0xC85F_7C20, &mut m), Step::Next));
+        assert_eq!(c.x[0], 0x42);
     }
 
     #[test]
