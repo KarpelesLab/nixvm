@@ -11,11 +11,27 @@ use std::path::PathBuf;
 use nixvm::abi::Arch;
 use nixvm::fs::{DevFs, MountTable, Overlay, Passthrough, ProcFs, SysFs, TmpFs};
 use nixvm::kernel::Kernel;
-use nixvm::loader::{ProcessSpec, load_static};
+use nixvm::loader::{ProcessSpec, interp_path, load_dynamic, load_static};
 use nixvm::vcpu::Backend;
 use nixvm::vcpu::GuestMemory;
 use nixvm::vcpu::interp::InterpBackend;
 use nixvm::vcpu::mem::PAGE_SIZE;
+
+/// Read an entire file out of the mount table (for the dynamic linker lookup).
+fn read_mount_file(mounts: &mut MountTable, path: &str) -> Option<Vec<u8>> {
+    let size = mounts.stat(path)?.size as usize;
+    let mut buf = vec![0u8; size];
+    let mut off = 0;
+    while off < size {
+        match mounts.read_at(path, off as u64, &mut buf[off..]) {
+            Ok(0) => break,
+            Ok(n) => off += n,
+            Err(_) => return None,
+        }
+    }
+    buf.truncate(off);
+    Some(buf)
+}
 
 const GUEST_BASE: u64 = 0x1_0000;
 const MEM_BYTES: u64 = 512 * 1024 * 1024;
@@ -46,9 +62,38 @@ fn main() {
         "PWD=/work".to_string(),
     ];
 
+    // Build the mount table first so the loader can read the dynamic linker
+    // (PT_INTERP → ld-musl) out of the guest root.
+    let mut mounts = MountTable::new();
+    // NIXVM_ROOT points `/` at a host Alpine rootfs (read-only lower) with a
+    // tmpfs upper (copy-on-write) — the real multi-instance layout.
+    if let Ok(root) = std::env::var("NIXVM_ROOT") {
+        let lower = Box::new(Passthrough::read_only(root));
+        mounts.mount("/", Box::new(Overlay::new(lower, Box::new(TmpFs::new()))));
+    } else {
+        mounts.mount("/", Box::new(TmpFs::new()));
+    }
+    mounts.mount("/tmp", Box::new(TmpFs::new()));
+    mounts.mount("/dev", Box::new(DevFs::new()));
+    mounts.mount("/proc", Box::new(ProcFs::new()));
+    mounts.mount("/sys", Box::new(SysFs::new()));
+    if let Ok(cwd) = std::env::current_dir() {
+        mounts.mount("/work", Box::new(Passthrough::new(cwd)));
+    }
+
     let mut mem = GuestMemory::new(GUEST_BASE, MEM_BYTES);
     let spec = ProcessSpec { argv, envp };
-    let img = match load_static(&mut mem, &elf, &spec) {
+    let loaded = if let Some(interp) = interp_path(&elf) {
+        eprintln!("run-elf: dynamic executable, interpreter {interp}");
+        let Some(interp_elf) = read_mount_file(&mut mounts, &interp) else {
+            eprintln!("run-elf: interpreter {interp} not found in the root");
+            std::process::exit(1);
+        };
+        load_dynamic(&mut mem, &elf, &interp_elf, &spec)
+    } else {
+        load_static(&mut mem, &elf, &spec)
+    };
+    let img = match loaded {
         Ok(i) => i,
         Err(e) => {
             eprintln!("run-elf: load failed: {e}");
@@ -64,28 +109,6 @@ fn main() {
 
     let backend = InterpBackend::new(Arch::Aarch64).unwrap();
     let vcpu = backend.new_vcpu(img.entry, img.stack_pointer).unwrap();
-
-    let mut mounts = MountTable::new();
-    // NIXVM_ROOT points `/` at a host Alpine rootfs (read-only lower) with a
-    // tmpfs upper (copy-on-write) — the real multi-instance layout.
-    if let Ok(root) = std::env::var("NIXVM_ROOT") {
-        let lower = Box::new(Passthrough::read_only(root));
-        mounts.mount("/", Box::new(Overlay::new(lower, Box::new(TmpFs::new()))));
-        // Make this (static) binary available at /bin/busybox so the shell can
-        // `execve` applets: Alpine's /bin/ls, /bin/head, … symlink to it, and
-        // the root's own busybox is dynamic (no loader yet).
-        let _ = mounts.create("/bin/busybox", 0o755);
-        let _ = mounts.write_at("/bin/busybox", 0, &elf);
-    } else {
-        mounts.mount("/", Box::new(TmpFs::new()));
-    }
-    mounts.mount("/tmp", Box::new(TmpFs::new()));
-    mounts.mount("/dev", Box::new(DevFs::new()));
-    mounts.mount("/proc", Box::new(ProcFs::new()));
-    mounts.mount("/sys", Box::new(SysFs::new()));
-    if let Ok(cwd) = std::env::current_dir() {
-        mounts.mount("/work", Box::new(Passthrough::new(cwd)));
-    }
 
     let mut kernel = Kernel::new(Arch::Aarch64, mounts);
     // NIXVM_CPUS=N runs guest compute on N host worker threads (SMP); default 1.
