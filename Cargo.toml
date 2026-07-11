@@ -15,6 +15,12 @@ repository = "https://github.com/KarpelesLab/nixvm"
 authors = ["Mark Karpeles <magicaltux@gmail.com>"]
 description = "A portable VM-style sandbox that runs a real Linux userland by emulating Linux syscalls directly (no guest kernel, no device emulation)."
 
+# `cdylib` is what `wasm-pack`/wasm-bindgen needs to emit a loadable .wasm for
+# the browser demo (src/wasm.rs); `rlib` keeps normal `cargo build`/`cargo test`
+# and the `nixvm` bin working exactly as before.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 # The binary. Kept out of a default library build via `required-features` so the
 # embeddable library never has to pull CLI deps.
 [[bin]]
@@ -35,6 +41,10 @@ interp = []
 # read-only guest root. Off by default so the core stays dependency-free and
 # wasm-buildable; only mounting a real image needs it.
 fstool = ["dep:fstool"]
+# Browser demo entry point (src/wasm.rs): exposes `run_elf` via wasm-bindgen so
+# a page can load a static ELF and run it on the software interpreter. Only
+# meaningful on wasm32 targets; pulls in wasm-bindgen + console_error_panic_hook.
+wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
 
 [dependencies]
 # The core builds fully offline with no third-party deps. `fstool` is the first
@@ -44,6 +54,12 @@ fstool = ["dep:fstool"]
 fstool = { version = "0.4.18", optional = true, default-features = false, features = [
     "gzip",
 ] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Only pulled in on wasm32, and only linked when the `wasm` feature is on
+# (both deps are `optional = true` so the `wasm` feature can gate them).
+wasm-bindgen = { version = "0.2", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
