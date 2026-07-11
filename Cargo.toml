@@ -45,6 +45,10 @@ fstool = ["dep:fstool"]
 # a page can load a static ELF and run it on the software interpreter. Only
 # meaningful on wasm32 targets; pulls in wasm-bindgen + console_error_panic_hook.
 wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
+# HTTP(S) fetching of guest root images (src/image.rs). Off by default so the
+# core stays dependency-free and wasm-buildable; sha256 verification is
+# hand-rolled in image.rs so it needs no extra dep either way.
+fetch = ["dep:ureq"]
 
 [dependencies]
 # The core builds fully offline with no third-party deps. `fstool` is the first
@@ -54,6 +58,9 @@ wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
 fstool = { version = "0.4.18", optional = true, default-features = false, features = [
     "gzip",
 ] }
+# Blocking HTTP(S) client for downloading guest root images, gated behind the
+# `fetch` feature (see src/image.rs). Not linked into the default build.
+ureq = { version = "2", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Only pulled in on wasm32, and only linked when the `wasm` feature is on
