@@ -1,0 +1,75 @@
+name: CI
+
+# Builds, lints, and tests the `nixvm` crate: the default feature set, the
+# `fstool` feature (real on-disk filesystem images), and a guard build of the
+# library for wasm32 (mirrors how .github/workflows/pages.yml builds the
+# browser demo, but without the wasm-pack packaging step).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same branch/PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (pinned to rust-version = 1.89)
+        uses: dtolnay/rust-toolchain@1.89
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (default features)
+        run: cargo build --verbose
+
+      - name: Build (fstool feature)
+        run: cargo build --features fstool --verbose
+
+      - name: Clippy (default features, deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (fstool feature, deny warnings)
+        run: cargo clippy --all-targets --features fstool -- -D warnings
+
+      - name: Test (default features)
+        run: cargo test --verbose
+
+      - name: Test (fstool feature)
+        run: cargo test --features fstool --verbose
+
+  wasm:
+    name: wasm32 library build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (pinned to rust-version = 1.89)
+        uses: dtolnay/rust-toolchain@1.89
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build lib for wasm32 (`wasm` feature, no default features)
+        # `--lib` restricts this to the library target, mirroring how
+        # pages.yml's `wasm-pack build ... -- --lib` skips src/bin/nixvm.rs
+        # (needs the `cli` feature) and src/bin/run-elf.rs (cfg(unix)), neither
+        # of which builds for wasm32-unknown-unknown.
+        run: cargo build --lib --target wasm32-unknown-unknown --features wasm --no-default-features
