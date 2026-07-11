@@ -88,6 +88,11 @@ fn main() {
     }
 
     let mut kernel = Kernel::new(Arch::Aarch64, mounts);
+    // NIXVM_CPUS=N runs guest compute on N host worker threads (SMP); default 1.
+    if let Some(n) = std::env::var("NIXVM_CPUS").ok().and_then(|s| s.parse().ok()) {
+        eprintln!("run-elf: ncpus={n}");
+        kernel.set_ncpus(n);
+    }
     kernel.set_cwd("/work");
     kernel.set_heap(img.program_break, mid);
     kernel.set_mmap_area(img.stack_bottom, mid);

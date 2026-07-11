@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use crate::abi::Arch;
 use crate::abi::arch::{self, Sysno};
@@ -115,11 +116,26 @@ enum RunState {
     Zombie(i32),
 }
 
+/// The result of servicing one guest exit, telling the scheduler what to do
+/// with the task's vcpu next.
+enum Serviced {
+    /// Syscall done; write this value into the vcpu's result register, resume.
+    SetRet(i64),
+    /// Resume compute without touching the result register (interrupt / execve
+    /// replaced the image).
+    Resume,
+    /// The syscall would block; leave the guest PC on the `svc` and retry later.
+    Blocked,
+    /// The task became a zombie (exit, fault, or halt).
+    Ended,
+}
+
 /// A guest task (process or thread): its vcpu and per-task state. Its address
 /// space lives in [`Kernel::spaces`] at `info.mm`, shared with any sibling
-/// threads created via `CLONE_VM`.
+/// threads created via `CLONE_VM`. `vcpu` is `None` while the task is in
+/// flight on an SMP worker thread (its compute running off the main thread).
 struct Process {
-    vcpu: Box<dyn Vcpu>,
+    vcpu: Option<Box<dyn Vcpu>>,
     info: ProcInfo,
 }
 
@@ -158,10 +174,16 @@ pub struct Kernel {
     /// All tasks; the running one is `take`n out during its slice, so its
     /// slot is temporarily `None` (making `fork`/`wait4` on the table clean).
     procs: Vec<Option<Process>>,
-    /// Address-space table indexed by `ProcInfo::mm`. The running task's space
-    /// is `take`n out for the duration of its slice (only one task runs at a
-    /// time under the cooperative scheduler, so no aliasing), then restored.
-    spaces: Vec<Option<GuestMemory>>,
+    /// Address-space table indexed by `ProcInfo::mm`, each behind its own lock
+    /// so a task's guest memory can be handed to an SMP worker thread while the
+    /// main thread keeps servicing other tasks' syscalls. Threads that share
+    /// memory (`CLONE_VM`) share one `Arc`; the per-space `Mutex` serializes
+    /// access between a worker running compute and the main thread servicing a
+    /// syscall against the same address space.
+    spaces: Vec<Arc<Mutex<GuestMemory>>>,
+    /// Number of virtual CPUs: how many host worker threads run guest compute
+    /// in parallel. `1` uses the single-threaded cooperative scheduler.
+    ncpus: usize,
     next_pid: i32,
     /// Set by a handler when the syscall would block (re-trap it later).
     block: bool,
@@ -202,6 +224,7 @@ impl Kernel {
             cur: ProcInfo::default(),
             procs: Vec::new(),
             spaces: Vec::new(),
+            ncpus: 1,
             next_pid: 2,
             block: false,
             exec_ok: false,
@@ -240,6 +263,15 @@ impl Kernel {
         self.cur.cwd = path::normalize(&dir.into());
     }
 
+    /// Set the number of virtual CPUs (host worker threads that run guest
+    /// compute in parallel). `0` is treated as `1`. With more than one CPU the
+    /// SMP scheduler runs; guest compute for independent tasks proceeds on
+    /// separate host threads while syscalls are serviced serially on the main
+    /// thread (a big-kernel-lock model that maps cleanly onto KVM/HVF later).
+    pub fn set_ncpus(&mut self, n: usize) {
+        self.ncpus = n.max(1);
+    }
+
     /// Run the machine: `vcpu`/`mem` become the initial process (pid 1), then
     /// the scheduler drives all processes until pid 1 exits. Returns pid 1's
     /// exit code.
@@ -250,13 +282,20 @@ impl Kernel {
         info.tgid = 1;
         info.mm = self.spaces.len();
         info.run = RunState::Running;
-        self.spaces.push(Some(mem));
-        self.procs.push(Some(Process { vcpu, info }));
-        self.schedule()
+        self.spaces.push(Arc::new(Mutex::new(mem)));
+        self.procs.push(Some(Process {
+            vcpu: Some(vcpu),
+            info,
+        }));
+        if self.ncpus > 1 {
+            self.schedule_smp()
+        } else {
+            self.schedule_serial()
+        }
     }
 
-    /// Cooperative round-robin scheduler.
-    fn schedule(&mut self) -> Result<i32, VcpuError> {
+    /// Cooperative single-CPU round-robin scheduler.
+    fn schedule_serial(&mut self) -> Result<i32, VcpuError> {
         loop {
             if let Some(code) = self.pid1_code() {
                 return Ok(code);
@@ -272,13 +311,14 @@ impl Kernel {
                 }
                 let mut proc = self.procs[i].take().unwrap();
                 let mm = proc.info.mm;
-                let mut space = self.spaces[mm]
-                    .take()
-                    .expect("running task's address space must be present");
+                let mut vcpu = proc.vcpu.take().expect("runnable task has a vcpu");
+                let space_arc = Arc::clone(&self.spaces[mm]);
+                let mut guard = space_arc.lock().unwrap();
                 std::mem::swap(&mut self.cur, &mut proc.info);
-                let made = self.run_slice(&mut proc.vcpu, &mut space)?;
+                let made = self.run_slice(&mut vcpu, &mut guard)?;
                 std::mem::swap(&mut self.cur, &mut proc.info);
-                self.spaces[mm] = Some(space);
+                drop(guard);
+                proc.vcpu = Some(vcpu);
                 self.procs[i] = Some(proc);
                 progressed |= made;
             }
@@ -317,51 +357,217 @@ impl Kernel {
     ) -> Result<bool, VcpuError> {
         let mut progressed = false;
         loop {
-            match vcpu.run(mem)? {
-                Exit::Syscall => {
-                    let raw = vcpu.syscall_nr();
-                    let sys = arch::decode(self.arch, raw);
-                    let args = vcpu.syscall_args();
-                    self.block = false;
-                    self.exec_ok = false;
-                    let ret = self.dispatch(sys, raw, &args, vcpu.as_mut(), mem);
-                    self.deliver_pending_signals();
-                    if let RunState::Zombie(_) = self.cur.run {
-                        return Ok(true);
-                    }
-                    if self.block {
-                        return Ok(progressed);
-                    }
-                    if self.exec_ok {
-                        progressed = true;
-                        continue; // resume the new image at its entry
-                    }
+            let exit = vcpu.run(mem)?;
+            match self.service(exit, vcpu.as_mut(), mem) {
+                Serviced::SetRet(ret) => {
                     vcpu.set_syscall_ret(ret as u64);
                     progressed = true;
                 }
-                Exit::Interrupted => {}
-                Exit::MemFault { addr, write } => {
-                    eprintln!(
-                        "[fault] pid {} memory fault at {addr:#x} (write={write})",
-                        self.cur.pid
-                    );
-                    self.cur.run = RunState::Zombie(139);
-                    return Ok(true);
-                }
-                Exit::IllegalInstruction { pc } => {
-                    eprintln!(
-                        "[fault] pid {} illegal instruction at {pc:#x}",
-                        self.cur.pid
-                    );
-                    self.cur.run = RunState::Zombie(132);
-                    return Ok(true);
-                }
-                Exit::Halt => {
-                    self.cur.run = RunState::Zombie(0);
-                    return Ok(true);
-                }
+                Serviced::Resume => progressed = true,
+                Serviced::Blocked => return Ok(progressed),
+                Serviced::Ended => return Ok(true),
             }
         }
+    }
+
+    /// Service one guest exit against the current task (`self.cur`): dispatch a
+    /// syscall, or turn a fault/halt into a zombie. Shared by the serial and
+    /// SMP schedulers. Does NOT touch the vcpu's result register — the caller
+    /// applies [`Serviced::SetRet`] — so the same logic works whether the vcpu
+    /// lives on the main thread or is round-tripping through a worker.
+    fn service(&mut self, exit: Exit, vcpu: &mut dyn Vcpu, mem: &mut GuestMemory) -> Serviced {
+        match exit {
+            Exit::Syscall => {
+                let raw = vcpu.syscall_nr();
+                let sys = arch::decode(self.arch, raw);
+                let args = vcpu.syscall_args();
+                self.block = false;
+                self.exec_ok = false;
+                let ret = self.dispatch(sys, raw, &args, vcpu, mem);
+                self.deliver_pending_signals();
+                if let RunState::Zombie(_) = self.cur.run {
+                    Serviced::Ended
+                } else if self.block {
+                    Serviced::Blocked
+                } else if self.exec_ok {
+                    Serviced::Resume // resume the new image at its entry
+                } else {
+                    Serviced::SetRet(ret)
+                }
+            }
+            Exit::Interrupted => Serviced::Resume,
+            Exit::MemFault { addr, write } => {
+                eprintln!(
+                    "[fault] pid {} memory fault at {addr:#x} (write={write})",
+                    self.cur.pid
+                );
+                self.cur.run = RunState::Zombie(139);
+                Serviced::Ended
+            }
+            Exit::IllegalInstruction { pc } => {
+                eprintln!("[fault] pid {} illegal instruction at {pc:#x}", self.cur.pid);
+                self.cur.run = RunState::Zombie(132);
+                Serviced::Ended
+            }
+            Exit::Halt => {
+                self.cur.run = RunState::Zombie(0);
+                Serviced::Ended
+            }
+        }
+    }
+
+    /// SMP scheduler: a pool of `ncpus` host worker threads run guest compute
+    /// (`vcpu.run`) in parallel, while this main thread services every syscall
+    /// serially. Only the `Box<dyn Vcpu>` and the task's `Arc<Mutex<GuestMemory>>`
+    /// cross a thread boundary; the `Kernel` (mounts, pipes, process table)
+    /// stays here and needs no locking — scheduling and syscall servicing are
+    /// single-threaded, so the whole design is race-free by construction. This
+    /// is the big-kernel-lock model a KVM/HVF backend will slot into: vCPUs run
+    /// in parallel, exits are serviced on one thread.
+    #[allow(clippy::too_many_lines)] // the worker pool + service loop reads best as one unit
+    fn schedule_smp(&mut self) -> Result<i32, VcpuError> {
+        // Work handed to a worker: run this vcpu on this address space until it
+        // next exits. `Stop` drains the pool at shutdown.
+        enum Work {
+            Run(usize, Box<dyn Vcpu>, Arc<Mutex<GuestMemory>>),
+            Stop,
+        }
+        type Done = (usize, Box<dyn Vcpu>, Result<Exit, VcpuError>);
+
+        let queue: Arc<(Mutex<VecDeque<Work>>, Condvar)> =
+            Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        let (done_tx, done_rx) = mpsc::channel::<Done>();
+        let mut workers = Vec::with_capacity(self.ncpus);
+        for _ in 0..self.ncpus {
+            let q = Arc::clone(&queue);
+            let out = done_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                loop {
+                    let work = {
+                        let (lock, cv) = &*q;
+                        let mut g = lock.lock().unwrap();
+                        loop {
+                            if let Some(w) = g.pop_front() {
+                                break w;
+                            }
+                            g = cv.wait(g).unwrap();
+                        }
+                    };
+                    match work {
+                        Work::Stop => break,
+                        Work::Run(id, mut vcpu, space) => {
+                            let exit = {
+                                let mut mem = space.lock().unwrap();
+                                vcpu.run(&mut mem)
+                            };
+                            if out.send((id, vcpu, exit)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        drop(done_tx);
+
+        let push = |w: Work| {
+            let (lock, cv) = &*queue;
+            lock.lock().unwrap().push_back(w);
+            cv.notify_one();
+        };
+
+        // A task that blocked records the progress epoch at which it did; it is
+        // not re-dispatched until the epoch advances (some other task made real
+        // progress that might satisfy its wait) — avoiding a busy spin.
+        let mut blocked_at: BTreeMap<usize, u64> = BTreeMap::new();
+        let mut epoch: u64 = 0;
+        let mut inflight = 0usize;
+        let outcome = loop {
+            if let Some(code) = self.pid1_code() {
+                break Ok(code);
+            }
+            // Fill idle workers with runnable tasks.
+            while inflight < self.ncpus {
+                let Some(i) = self.pick_smp_runnable(&blocked_at, epoch) else {
+                    break;
+                };
+                let mm = self.procs[i].as_ref().unwrap().info.mm;
+                let space = Arc::clone(&self.spaces[mm]);
+                let vcpu = self.procs[i].as_mut().unwrap().vcpu.take().unwrap();
+                push(Work::Run(i, vcpu, space));
+                inflight += 1;
+            }
+            if inflight == 0 {
+                // Nothing runnable and nothing in flight: either everyone is
+                // blocked (deadlock) or done.
+                break if self.any_running() {
+                    Err(VcpuError::Backend("deadlock: every task is blocked".into()))
+                } else {
+                    Ok(self.pid1_code().unwrap_or(0))
+                };
+            }
+            let (i, vcpu, exit_res) = done_rx.recv().expect("workers outlive the scheduler");
+            inflight -= 1;
+            let exit = match exit_res {
+                Ok(e) => e,
+                Err(e) => break Err(e),
+            };
+            let mm = self.procs[i].as_ref().unwrap().info.mm;
+            let space = Arc::clone(&self.spaces[mm]);
+            let mut vcpu = vcpu;
+            let flow = {
+                let mut proc = self.procs[i].take().unwrap();
+                std::mem::swap(&mut self.cur, &mut proc.info);
+                let flow = {
+                    let mut mem = space.lock().unwrap();
+                    self.service(exit, vcpu.as_mut(), &mut mem)
+                };
+                std::mem::swap(&mut self.cur, &mut proc.info);
+                self.procs[i] = Some(proc);
+                flow
+            };
+            match flow {
+                Serviced::SetRet(ret) => {
+                    vcpu.set_syscall_ret(ret as u64);
+                    self.procs[i].as_mut().unwrap().vcpu = Some(vcpu);
+                    epoch += 1; // real progress: wake blocked waiters to retry
+                }
+                Serviced::Resume => {
+                    self.procs[i].as_mut().unwrap().vcpu = Some(vcpu);
+                    epoch += 1;
+                }
+                Serviced::Blocked => {
+                    self.procs[i].as_mut().unwrap().vcpu = Some(vcpu);
+                    blocked_at.insert(i, epoch);
+                }
+                Serviced::Ended => {
+                    // Task became a zombie; keep the (now-idle) vcpu slot empty.
+                    self.procs[i].as_mut().unwrap().vcpu = Some(vcpu);
+                    epoch += 1;
+                }
+            }
+        };
+
+        for _ in 0..self.ncpus {
+            push(Work::Stop);
+        }
+        for h in workers {
+            let _ = h.join();
+        }
+        outcome
+    }
+
+    /// Pick a runnable task for an SMP worker: `Running`, holding its vcpu (not
+    /// already in flight), and not parked at the current progress epoch.
+    fn pick_smp_runnable(&self, blocked_at: &BTreeMap<usize, u64>, epoch: u64) -> Option<usize> {
+        (0..self.procs.len()).find(|&i| {
+            let Some(Some(p)) = self.procs.get(i) else {
+                return false;
+            };
+            p.info.run == RunState::Running
+                && p.vcpu.is_some()
+                && blocked_at.get(&i).copied() != Some(epoch)
+        })
     }
 
     /// The syscall table. Returns the value the guest sees in its result
@@ -663,7 +869,7 @@ impl Kernel {
         }
 
         if let Some(cm) = child_mem.take() {
-            self.spaces.push(Some(cm));
+            self.spaces.push(Arc::new(Mutex::new(cm)));
         }
 
         let mut child_vcpu = vcpu.fork();
@@ -675,7 +881,7 @@ impl Kernel {
         }
         child_vcpu.set_syscall_ret(0); // child returns 0 and advances past the svc
         self.procs.push(Some(Process {
-            vcpu: child_vcpu,
+            vcpu: Some(child_vcpu),
             info,
         }));
         i64::from(pid)
@@ -1574,6 +1780,112 @@ mod tests {
         fn reset(&mut self, _e: u64, _s: u64) {}
     }
 
+    /// A vcpu that replays a fixed script of syscall numbers (one per `run`),
+    /// then halts. Used to drive the scheduler (incl. the SMP path) without a
+    /// real interpreter. A `fork` clone carries the remaining script, so a
+    /// scripted `clone` syscall produces a child that finishes the rest.
+    #[derive(Clone)]
+    struct ScriptVcpu {
+        ops: VecDeque<u64>,
+        cur_nr: u64,
+    }
+    impl ScriptVcpu {
+        fn boxed(ops: impl IntoIterator<Item = u64>) -> Box<dyn Vcpu> {
+            Box::new(Self {
+                ops: ops.into_iter().collect(),
+                cur_nr: 0,
+            })
+        }
+    }
+    impl Vcpu for ScriptVcpu {
+        fn run(&mut self, _m: &mut GuestMemory) -> Result<Exit, VcpuError> {
+            match self.ops.pop_front() {
+                Some(nr) => {
+                    self.cur_nr = nr;
+                    Ok(Exit::Syscall)
+                }
+                None => Ok(Exit::Halt),
+            }
+        }
+        fn syscall_nr(&self) -> u64 {
+            self.cur_nr
+        }
+        fn syscall_args(&self) -> [u64; 6] {
+            [0; 6]
+        }
+        fn set_syscall_ret(&mut self, _v: u64) {}
+        fn reg(&self, _i: usize) -> u64 {
+            0
+        }
+        fn set_reg(&mut self, _i: usize, _v: u64) {}
+        fn pc(&self) -> u64 {
+            0
+        }
+        fn set_pc(&mut self, _v: u64) {}
+        fn sp(&self) -> u64 {
+            0
+        }
+        fn set_sp(&mut self, _v: u64) {}
+        fn set_tls(&mut self, _v: u64) {}
+        fn fork(&self) -> Box<dyn Vcpu> {
+            Box::new(self.clone())
+        }
+        fn reset(&mut self, _e: u64, _s: u64) {}
+    }
+
+    fn kernel_only() -> Kernel {
+        let mut mounts = MountTable::new();
+        mounts.mount("/", Box::new(TmpFs::new()));
+        Kernel::new(Arch::Aarch64, mounts)
+    }
+
+    // aarch64 syscall numbers used by the scripted SMP tests.
+    const NR_GETPID: u64 = 172;
+    const NR_CLONE: u64 = 220;
+
+    #[test]
+    fn smp_single_task_completes() {
+        let mut k = kernel_only();
+        k.set_ncpus(4);
+        let mem = GuestMemory::new(0x1_0000, 16 * PAGE);
+        // Three getpids then an implicit halt.
+        let code = k
+            .run(ScriptVcpu::boxed([NR_GETPID, NR_GETPID, NR_GETPID]), mem)
+            .unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn smp_fork_runs_child_on_the_pool() {
+        let mut k = kernel_only();
+        k.set_ncpus(4);
+        let mem = GuestMemory::new(0x1_0000, 16 * PAGE);
+        // pid 1: clone (fork) once, then two getpids, then halt. The child is
+        // forked with the remaining script ([getpid, getpid]) and finishes it
+        // on another worker thread.
+        let code = k
+            .run(ScriptVcpu::boxed([NR_CLONE, NR_GETPID, NR_GETPID]), mem)
+            .unwrap();
+        assert_eq!(code, 0, "pid 1 exits cleanly");
+        assert!(
+            k.procs.iter().flatten().any(|p| p.info.pid == 2),
+            "the forked child exists in the process table"
+        );
+    }
+
+    #[test]
+    fn smp_and_serial_agree() {
+        let program = [NR_CLONE, NR_GETPID, NR_CLONE, NR_GETPID, NR_GETPID];
+        let run_with = |ncpus: usize| {
+            let mut k = kernel_only();
+            k.set_ncpus(ncpus);
+            let mem = GuestMemory::new(0x1_0000, 16 * PAGE);
+            k.run(ScriptVcpu::boxed(program), mem).unwrap()
+        };
+        // The same program yields the same pid-1 exit code on 1 and 8 CPUs.
+        assert_eq!(run_with(1), run_with(8));
+    }
+
     const PAGE: u64 = 4096;
     const AT_CWD: u64 = (-100i64) as u64;
 
@@ -1835,7 +2147,7 @@ mod tests {
         };
         info.run = RunState::Running;
         Process {
-            vcpu: Box::new(DummyVcpu),
+            vcpu: Some(Box::new(DummyVcpu)),
             info,
         }
     }
@@ -1882,7 +2194,8 @@ mod tests {
     fn fork_gets_its_own_address_space() {
         let (mut k, mut mem, mut v) = setup();
         // Put the parent's space in the table (as run() would).
-        k.spaces.push(Some(GuestMemory::new(0x1_0000, PAGE)));
+        k.spaces
+            .push(Arc::new(Mutex::new(GuestMemory::new(0x1_0000, PAGE))));
         k.cur.mm = 0;
         let before = k.spaces.len();
         // flags = SIGCHLD only (a plain fork), no CLONE_VM.

@@ -22,7 +22,7 @@ pub mod mem;
 pub use mem::{GuestMemory, MemError, Prot};
 
 /// Why [`Vcpu::run`] returned control to the kernel.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
     /// The guest executed a syscall instruction (`svc #0` / `syscall`). Read the
     /// number/args via the `syscall_*` accessors, service it, write the result
