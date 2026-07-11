@@ -29,6 +29,12 @@ pub enum Fd {
     /// 1, selecting which side of a connected pair (and thus which direction is
     /// read vs. written). Unconnected/listening sockets always use `end == 0`.
     Socket { sock: usize, end: usize },
+    /// An `eventfd2` counter: index into the kernel's eventfd table.
+    Eventfd(usize),
+    /// A `timerfd_create` timer: index into the kernel's timerfd table.
+    Timerfd(usize),
+    /// An `epoll_create1` instance: index into the kernel's epoll table.
+    Epoll(usize),
 }
 
 /// Maps small integer descriptors to [`Fd`]s, allocating the lowest free number.
