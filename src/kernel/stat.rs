@@ -8,6 +8,7 @@ use crate::fs::{Attrs, NodeKind};
 
 const S_IFCHR: u32 = 0o020_000;
 const S_IFIFO: u32 = 0o010_000;
+const S_IFSOCK: u32 = 0o140_000;
 
 /// The 128-byte `struct stat` for `attrs`.
 pub fn encode_stat(attrs: &Attrs) -> [u8; 128] {
@@ -76,6 +77,20 @@ pub fn fifo_attrs() -> Attrs {
         kind: NodeKind::Fifo,
         size: 0,
         mode: S_IFIFO | 0o600,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+        inode: 0,
+        nlink: 1,
+    }
+}
+
+/// Attributes for a socket endpoint (`fstat` on a socket fd).
+pub fn socket_attrs() -> Attrs {
+    Attrs {
+        kind: NodeKind::Socket,
+        size: 0,
+        mode: S_IFSOCK | 0o777,
         uid: 0,
         gid: 0,
         mtime: 0,
