@@ -27,6 +27,7 @@ pub mod mount;
 pub mod overlay;
 #[cfg(unix)]
 pub mod passthrough;
+pub mod sysfs;
 pub mod tmpfs;
 
 #[cfg(feature = "fstool")]
@@ -36,6 +37,7 @@ pub use mount::MountTable;
 pub use overlay::Overlay;
 #[cfg(unix)]
 pub use passthrough::Passthrough;
+pub use sysfs::SysFs;
 pub use tmpfs::TmpFs;
 
 /// The kind of a filesystem node.
