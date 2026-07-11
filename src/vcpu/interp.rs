@@ -85,6 +85,8 @@ struct Aarch64Interp {
     flags: Flags,
     /// SIMD/FP registers v0..v31 (128-bit; D/S/H/B views are the low bits).
     v: [u128; 32],
+    /// Debug: print stores to this guest address (from `NIXVM_WATCH`).
+    watch: Option<u64>,
 }
 
 impl Aarch64Interp {
@@ -96,6 +98,9 @@ impl Aarch64Interp {
             tpidr: 0,
             flags: Flags::default(),
             v: [0; 32],
+            watch: std::env::var("NIXVM_WATCH")
+                .ok()
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
         }
     }
 
@@ -116,6 +121,7 @@ impl Aarch64Interp {
             }
             self.v[rt] = u128::from_le_bytes(buf); // sub-128 loads zero-extend
         } else {
+            self.note_store(addr, self.v[rt], nbytes);
             let bytes = self.v[rt].to_le_bytes();
             if mem.write(addr, &bytes[..nbytes]).is_err() {
                 return Step::Fault { addr, write: true };
@@ -170,13 +176,28 @@ impl Aarch64Interp {
         }
     }
 
+    /// Debug: report a store overlapping the `NIXVM_WATCH` address.
+    fn note_store(&self, addr: u64, value: u128, nbytes: usize) {
+        if let Some(w) = self.watch
+            && w >= addr
+            && w < addr + nbytes as u64
+        {
+            eprintln!(
+                "[watch] pc={:#x} store {value:#x} ({nbytes}B) -> {addr:#x}",
+                self.pc
+            );
+        }
+    }
+
     /// Perform a single load or store of `1 << size` bytes at `addr`. `opc`
     /// selects: 00 store, 01 load (zero-extend), 10 load (sign-extend to 64),
     /// 11 load (sign-extend to 32).
     fn ldst(&mut self, addr: u64, size: u32, opc: u32, rt: usize, mem: &mut GuestMemory) -> Step {
         let nbytes = 1usize << size;
         if opc == 0b00 {
-            let val = self.read_x(rt).to_le_bytes();
+            let value = self.read_x(rt);
+            self.note_store(addr, u128::from(value), nbytes);
+            let val = value.to_le_bytes();
             if mem.write(addr, &val[..nbytes]).is_err() {
                 return Step::Fault { addr, write: true };
             }
@@ -390,6 +411,24 @@ impl Aarch64Interp {
             } else {
                 self.write_sp(rd, r);
             }
+            return Step::Next;
+        }
+
+        // ---- EXTR (extract from a register pair; ROR is an alias) ----
+        if (instr >> 23) & 0xff == 0b00100111 {
+            let sf = (instr >> 31) & 1;
+            let rm = reg_field(instr, 16);
+            let imms = (instr >> 10) & 0x3f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let (n, m) = (self.read_x(rn), self.read_x(rm));
+            let r = if sf == 1 {
+                if imms == 0 { m } else { (n << (64 - imms)) | (m >> imms) }
+            } else {
+                let (n, m) = (n & 0xffff_ffff, m & 0xffff_ffff);
+                if imms == 0 { m } else { (n << (32 - imms)) | (m >> imms) }
+            };
+            self.write_x(rd, mask_sf(r, sf));
             return Step::Next;
         }
 
@@ -680,7 +719,9 @@ impl Aarch64Interp {
         }
 
         // ---- SIMD/FP load/store pair: LDP/STP q/d/s ----
-        if (instr >> 27) & 0x7 == 0b101 && (instr >> 26) & 1 == 1 {
+        // bit25 == 0 distinguishes real pairs from SIMD modified-immediate
+        // (MOVI/MVNI), which also has bits[29:27]==101 with V==1.
+        if (instr >> 27) & 0x7 == 0b101 && (instr >> 26) & 1 == 1 && (instr >> 25) & 1 == 0 {
             let opc = (instr >> 30) & 3;
             if opc == 3 {
                 return Step::Illegal;
@@ -708,6 +749,7 @@ impl Aarch64Interp {
                     }
                     self.v[r] = u128::from_le_bytes(buf);
                 } else {
+                    self.note_store(a, self.v[r], nbytes);
                     let bytes = self.v[r].to_le_bytes();
                     if mem.write(a, &bytes[..nbytes]).is_err() {
                         return Step::Fault { addr: a, write: true };
@@ -745,7 +787,7 @@ impl Aarch64Interp {
         }
 
         // ---- load/store pair: LDP/STP (signed offset / pre / post index) ----
-        if (instr >> 27) & 0x7 == 0b101 && (instr >> 26) & 1 == 0 {
+        if (instr >> 27) & 0x7 == 0b101 && (instr >> 26) & 1 == 0 && (instr >> 25) & 1 == 0 {
             let opc = (instr >> 30) & 3;
             let is64 = match opc {
                 0b00 => false,
@@ -775,6 +817,7 @@ impl Aarch64Interp {
                     }
                     self.write_x(r, u64::from_le_bytes(buf));
                 } else {
+                    self.note_store(a, u128::from(self.read_x(r)), nbytes);
                     let val = self.read_x(r).to_le_bytes();
                     if mem.write(a, &val[..nbytes]).is_err() {
                         return Step::Fault { addr: a, write: true };
@@ -1283,6 +1326,16 @@ mod tests {
     /// A scratch memory for instructions that don't touch it.
     fn scratch() -> GuestMemory {
         GuestMemory::new(0x1_0000, PAGE_SIZE)
+    }
+
+    #[test]
+    fn simd_modified_immediate_movi_mvni() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.exec(0x4F00_0400, &mut m); // movi v0.4s, #0
+        assert_eq!(c.v[0], 0);
+        c.v[3] = 0xdead; // must not be treated as an LDP/STP pair
+        c.exec(0x2F00_0403, &mut m); // mvni v3.2s, #0  -> low 64 bits all ones
+        assert_eq!(c.v[3], 0xFFFF_FFFF_FFFF_FFFF);
     }
 
     #[test]
