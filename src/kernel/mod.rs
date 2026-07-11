@@ -13,7 +13,7 @@
 //! Phase 3 (files/stat/tty), Phase 6 (clone/futex/signals), Phase 8 (sockets).
 
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 use crate::abi::Arch;
 use crate::abi::arch::{self, Sysno};
@@ -54,8 +54,9 @@ pub struct Kernel {
     mmap_floor: u64,
     /// `getrandom` PRNG state (xorshift; seeded lazily from the host clock).
     rng_state: u64,
-    /// Sinks for guest fd 1 and 2. Configurable so callers (and tests) can
-    /// capture or redirect guest output.
+    /// Source for guest fd 0 and sinks for fd 1/2. Configurable so callers (and
+    /// tests) can feed input and capture or redirect guest output.
+    stdin: Box<dyn Read + Send>,
     stdout: Box<dyn Write + Send>,
     stderr: Box<dyn Write + Send>,
     /// Set by `exit`/`exit_group`; ends the run loop.
@@ -89,6 +90,7 @@ impl Kernel {
             mmap_cursor: 0,
             mmap_floor: 0,
             rng_state: 0,
+            stdin: Box::new(std::io::stdin()),
             stdout: Box::new(std::io::stdout()),
             stderr: Box::new(std::io::stderr()),
             exit_code: None,
@@ -104,6 +106,11 @@ impl Kernel {
     /// Redirect the sink backing guest fd 2 (`stderr`).
     pub fn set_stderr(&mut self, w: Box<dyn Write + Send>) {
         self.stderr = w;
+    }
+
+    /// Redirect the source backing guest fd 0 (`stdin`).
+    pub fn set_stdin(&mut self, r: Box<dyn Read + Send>) {
+        self.stdin = r;
     }
 
     /// Set the heap window: `start` is the initial program break (page-aligned,
@@ -292,11 +299,22 @@ impl Kernel {
         len as i64
     }
 
-    /// `read(fd, buf, count)` — stdin (currently EOF) and open files.
+    /// `read(fd, buf, count)` — stdin and open files.
     fn sys_read(&mut self, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+        if matches!(self.fds.get(fd as i32), Some(Fd::Stdin)) {
+            let mut tmp = vec![0u8; count as usize];
+            return match self.stdin.read(&mut tmp) {
+                Ok(n) => {
+                    if mem.write(buf, &tmp[..n]).is_err() {
+                        return err(Errno::EFAULT);
+                    }
+                    n as i64
+                }
+                Err(_) => err(Errno::EIO),
+            };
+        }
         let (path, offset) = match self.fds.get(fd as i32) {
             Some(Fd::File { path, offset }) => (path.clone(), *offset),
-            Some(Fd::Stdin) => return 0, // no console input yet
             _ => return err(Errno::EBADF),
         };
         let mut tmp = vec![0u8; count as usize];
@@ -753,6 +771,15 @@ mod tests {
         // writev(1, iov, 2)
         assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Writev, [1, iov, 2, 0, 0, 0]), 7);
         assert_eq!(&*cap.lock().unwrap(), b"foobar!");
+    }
+
+    #[test]
+    fn read_from_stdin() {
+        let (mut k, mut mem, mut v) = setup();
+        k.set_stdin(Box::new(std::io::Cursor::new(b"piped".to_vec())));
+        let buf = 0x1_0000;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [0, buf, 5, 0, 0, 0]), 5);
+        assert_eq!(mem.read_vec(buf, 5).unwrap(), b"piped");
     }
 
     #[test]
