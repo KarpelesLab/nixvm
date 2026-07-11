@@ -73,9 +73,3 @@ jobs:
       # bins, matching how pages.yml builds the deployable artifact.
       - name: Build wasm demo library
         run: cargo build --lib --target wasm32-unknown-unknown --features wasm --no-default-features
-
-      # Diagnostic (non-failing): does fstool build for wasm32? Informs whether
-      # the demo can mount a real squashfs image (read-only lower) in-browser.
-      - name: (diagnostic) fstool on wasm32
-        continue-on-error: true
-        run: cargo build --lib --target wasm32-unknown-unknown --no-default-features --features fstool
