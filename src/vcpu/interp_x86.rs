@@ -36,8 +36,24 @@
 //! immediate forms, `SHLD`/`SHRD`, `BSWAP`, and the SSE shuffle/unpack/
 //! shift group `PSHUFD`/`PSHUFLW`/`PSHUFHW`/`PSHUFB`/`SHUFPS`/`SHUFPD`/
 //! `UNPCKLPS`/`UNPCKHPS`/`PUNPCKL*`/`PUNPCKH*`/`MOVLHPS`/`MOVHLPS`/
-//! `PSLLDQ`/`PSRLDQ`/`PSLLD`/`PSRLD`/`PSLLQ`/`PSRLQ`. Anything else surfaces
-//! as [`Exit::IllegalInstruction`].
+//! `PSLLDQ`/`PSRLDQ`/`PSLLD`/`PSRLD`/`PSLLQ`/`PSRLQ`.
+//!
+//! Also a subset of the x87 FPU (the `D8-DF` ESC opcodes, needed since
+//! musl/glibc use x87 for `long double` and some `printf`/`strtod` float
+//! paths on x86-64 even though SSE2 is the default for `double`/`float`):
+//! an 8-deep register stack (`FLD`/`FST`/`FSTP` for `m32`/`m64`/`m80` and
+//! `ST(i)`, `FILD`/`FIST`/`FISTP` for `m16`/`m32`/`m64` integers, `FXCH`,
+//! the constant loads `FLD1`/`FLDZ`/`FLDPI`/`FLDL2E`/`FLDL2T`/`FLDLG2`/
+//! `FLDLN2`), arithmetic (`FADD`/`FADDP`/`FIADD`, `FSUB`/`FSUBP`/`FSUBR`/
+//! `FSUBRP`, `FMUL`/`FMULP`/`FIMUL`, `FDIV`/`FDIVP`/`FDIVR`/`FDIVRP`,
+//! `FABS`/`FCHS`/`FSQRT`/`FRNDINT`), compares (`FCOM`/`FCOMP`/`FCOMPP`/
+//! `FUCOM`/`FUCOMP`/`FUCOMPP`/`FTST`, and `FCOMI`/`FCOMIP`/`FUCOMI`/
+//! `FUCOMIP`, which set `EFLAGS` directly), and control (`FLDCW`/`FNSTCW`/
+//! `FNSTSW`/`FNCLEX`/`FNINIT`/`FWAIT`/`FFREE`/`FINCSTP`/`FDECSTP`). Each
+//! 80-bit `long double` register is modeled as an `f64` rather than true
+//! extended precision — an accepted approximation for a software scaffold
+//! (see [`f80_to_f64`]). Anything else surfaces as
+//! [`Exit::IllegalInstruction`].
 
 use crate::abi::Arch;
 
@@ -138,6 +154,12 @@ impl Rex {
 }
 
 /// A decoded ModRM byte (plus any SIB/displacement that followed it).
+///
+/// `Copy` because the x87 dispatch (`fpu_d8`..`fpu_df`) matches on `.kind`
+/// and then, in the memory-operand arm, re-resolves it via [`resolve`] —
+/// cheaper to copy the two `usize`/[`RmKind`] fields than to thread a
+/// reference through.
+#[derive(Clone, Copy)]
 struct ModRm {
     /// The `reg` field, extended by `REX.R`.
     reg: usize,
@@ -239,6 +261,218 @@ enum BitTestOp {
     Bts,
     Btr,
     Btc,
+}
+
+/// The x87 `D8-DF` ESC-opcode arithmetic/compare group, selected by the
+/// ModRM `reg` field (`/0../7`) for both the memory forms (`FADD`/`FIADD`
+/// m32/m64/m16/m32-int, ...) and `D8`'s `ST(0),ST(i)` register form — all
+/// five opcode families (`D8`, `DA`, `DC` memory, `DE` memory) number their
+/// eight sub-operations identically. `DC`/`DE`'s *register* forms (dest is
+/// `ST(i)`, not `ST(0)`) instead use [`Self::from_reg_reversed`].
+#[derive(Clone, Copy)]
+enum FpuOp {
+    Add,
+    Mul,
+    Com,
+    Comp,
+    Sub,
+    SubR,
+    Div,
+    DivR,
+}
+
+impl FpuOp {
+    /// The straightforward `/0../7 -> Add/Mul/Com/Comp/Sub/SubR/Div/DivR`
+    /// mapping used by `D8` (memory and `ST(0),ST(i)` register form), and
+    /// the memory forms of `DA`/`DC`/`DE`.
+    fn from_reg(reg: u8) -> Self {
+        match reg & 7 {
+            0 => Self::Add,
+            1 => Self::Mul,
+            2 => Self::Com,
+            3 => Self::Comp,
+            4 => Self::Sub,
+            5 => Self::SubR,
+            6 => Self::Div,
+            _ => Self::DivR,
+        }
+    }
+
+    /// `DC`/`DE`'s register form writes `ST(i)` (not `ST(0)`) and reads
+    /// `ST(0)` as the other operand, so the non-commutative pair `SUB`/
+    /// `SUBR` (and `DIV`/`DIVR`) trade places relative to [`Self::from_reg`]
+    /// — e.g. `DC E0+i` disassembles as `FSUBR ST(i), ST(0)`, not `FSUB`.
+    /// `Com`/`Comp` (`/2`/`/3`) have no defined register-destination form in
+    /// this range.
+    fn from_reg_reversed(reg: u8) -> Option<Self> {
+        Some(match reg & 7 {
+            0 => Self::Add,
+            1 => Self::Mul,
+            4 => Self::SubR,
+            5 => Self::Sub,
+            6 => Self::DivR,
+            7 => Self::Div,
+            _ => return None,
+        })
+    }
+}
+
+/// Apply an arithmetic [`FpuOp`] (`Com`/`Comp` never reach here — callers
+/// special-case compares before calling this) to `dst OP src`; the `R`
+/// ("reversed") variants swap the operand order (`FSUBR`/`FDIVR` compute
+/// `src - dst`/`src / dst`).
+fn fpu_binop(op: FpuOp, dst: f64, src: f64) -> f64 {
+    match op {
+        FpuOp::Add => dst + src,
+        FpuOp::Mul => dst * src,
+        FpuOp::Sub => dst - src,
+        FpuOp::SubR => src - dst,
+        FpuOp::Div => dst / src,
+        FpuOp::DivR => src / dst,
+        FpuOp::Com | FpuOp::Comp => dst, // unreachable in practice; see doc comment above
+    }
+}
+
+/// The memory operand width for the x87 arithmetic group's non-register
+/// (`mod != 3`) forms: `D8` uses `F32`, `DC` uses `F64`, `DA` uses `I32`
+/// (`FIADD`/... m32int), `DE` uses `I16` (m16int).
+#[derive(Clone, Copy)]
+enum MemWidth {
+    F32,
+    F64,
+    I16,
+    I32,
+}
+
+/// Decode an x87 80-bit extended-precision value (`m80fp`: 64-bit
+/// significand with an explicit integer bit, then a 16-bit sign+exponent) to
+/// the nearest `f64`. This interpreter models the x87 register stack with
+/// `f64` throughout rather than true 80-bit precision — an accepted
+/// approximation (see [`X86Interp::st`]) — so this conversion, and its
+/// [`f64_to_f80_bytes`] inverse, are the only places 80-bit precision is
+/// even nominally in play, and both narrow through `f64` immediately.
+#[allow(clippy::cast_precision_loss)] // mantissa/2^63 is exactly the extended-precision significand formula
+fn f80_to_f64(mantissa: u64, exp: u16, sign: bool) -> f64 {
+    let value = if exp == 0 && mantissa == 0 {
+        0.0
+    } else if exp == 0x7fff {
+        if mantissa == (1u64 << 63) { f64::INFINITY } else { f64::NAN }
+    } else {
+        let m = mantissa as f64 / (1u64 << 63) as f64;
+        m * 2f64.powi(i32::from(exp) - 16383)
+    };
+    if sign { -value } else { value }
+}
+
+/// Encode an `f64` as the 10-byte x87 extended-precision (`m80fp`) format —
+/// see [`f80_to_f64`]. Finite normal and subnormal `f64` values, `0`, `±inf`
+/// and `NaN` are all handled exactly (mapping through the nearest `f64`, per
+/// the same accepted approximation).
+fn f64_to_f80_bytes(v: f64) -> [u8; 10] {
+    let bits = v.to_bits();
+    let sign = bits >> 63;
+    let biased_exp = (bits >> 52) & 0x7ff;
+    let frac = bits & 0x000f_ffff_ffff_ffff;
+    let (mantissa, exp): (u64, u64) = if biased_exp == 0x7ff {
+        if frac == 0 { (1u64 << 63, 0x7fff) } else { (0xC000_0000_0000_0000, 0x7fff) }
+    } else if biased_exp == 0 {
+        if frac == 0 {
+            (0, 0)
+        } else {
+            // Subnormal f64: normalize by shifting the fraction so its
+            // leading set bit lands at bit 63 (the extended format's
+            // explicit integer bit), adjusting the exponent to match.
+            let shift = frac.leading_zeros();
+            let mantissa = frac << shift;
+            let unbiased = -1011i64 - i64::from(shift);
+            (mantissa, (unbiased + 16383) as u64)
+        }
+    } else {
+        let mantissa = (1u64 << 63) | (frac << 11);
+        let unbiased = biased_exp as i64 - 1023;
+        (mantissa, (unbiased + 16383) as u64)
+    };
+    let mut out = [0u8; 10];
+    out[0..8].copy_from_slice(&mantissa.to_le_bytes());
+    let exp16 = (exp as u16) | ((sign as u16) << 15);
+    out[8..10].copy_from_slice(&exp16.to_le_bytes());
+    out
+}
+
+// ---- x87 memory operand read/write. Free functions (not `X86Interp`
+// methods, unlike the GPR/XMM `read_operand`/`xmm_read128` family) since
+// none of them touch FPU register-file state — only the ModRM/opcode
+// dispatch in `fpu_d8`..`fpu_df` needs `self`. ----
+
+fn fpu_read_f32(mem: &GuestMemory, addr: u64) -> Result<f64, Step> {
+    let mut b = [0u8; 4];
+    mem.read(addr, &mut b)
+        .map_err(|_| Step::Fault { addr, write: false })?;
+    Ok(f64::from(f32::from_le_bytes(b)))
+}
+
+#[allow(clippy::cast_possible_truncation)] // FST/FSTP m32fp is exactly this narrowing
+fn fpu_write_f32(mem: &mut GuestMemory, addr: u64, v: f64) -> Result<(), Step> {
+    let bytes = (v as f32).to_le_bytes();
+    mem.write(addr, &bytes)
+        .map_err(|_| Step::Fault { addr, write: true })
+}
+
+fn fpu_read_f64(mem: &GuestMemory, addr: u64) -> Result<f64, Step> {
+    let mut b = [0u8; 8];
+    mem.read(addr, &mut b)
+        .map_err(|_| Step::Fault { addr, write: false })?;
+    Ok(f64::from_le_bytes(b))
+}
+
+fn fpu_write_f64(mem: &mut GuestMemory, addr: u64, v: f64) -> Result<(), Step> {
+    mem.write(addr, &v.to_le_bytes())
+        .map_err(|_| Step::Fault { addr, write: true })
+}
+
+fn fpu_read_f80(mem: &GuestMemory, addr: u64) -> Result<f64, Step> {
+    let mut b = [0u8; 10];
+    mem.read(addr, &mut b)
+        .map_err(|_| Step::Fault { addr, write: false })?;
+    let mantissa = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let se = u16::from_le_bytes(b[8..10].try_into().unwrap());
+    Ok(f80_to_f64(mantissa, se & 0x7fff, se & 0x8000 != 0))
+}
+
+fn fpu_write_f80(mem: &mut GuestMemory, addr: u64, v: f64) -> Result<(), Step> {
+    mem.write(addr, &f64_to_f80_bytes(v))
+        .map_err(|_| Step::Fault { addr, write: true })
+}
+
+/// `FILD`/`FIADD`/`FICOM`/... source: a `width`-bit two's-complement
+/// integer in memory, sign-extended.
+fn fpu_read_int(mem: &GuestMemory, addr: u64, width: u32) -> Result<i64, Step> {
+    let n = (width / 8) as usize;
+    let mut b = [0u8; 8];
+    mem.read(addr, &mut b[..n])
+        .map_err(|_| Step::Fault { addr, write: false })?;
+    Ok(sign_extend_w(u64::from_le_bytes(b), width))
+}
+
+/// `FIST`/`FISTP` destination: truncate `val` (already rounded per
+/// [`X86Interp::round_per_cw`] by the caller) to `width` bits.
+fn fpu_write_int(mem: &mut GuestMemory, addr: u64, val: i64, width: u32) -> Result<(), Step> {
+    let n = (width / 8) as usize;
+    let bytes = (val as u64).to_le_bytes();
+    mem.write(addr, &bytes[..n])
+        .map_err(|_| Step::Fault { addr, write: true })
+}
+
+/// The `D8`/`DA`/`DC`/`DE` memory-form arithmetic source, at the width `w`
+/// dictates ([`MemWidth`]).
+#[allow(clippy::cast_precision_loss)] // FILD's int->f64 load is exactly this
+fn fpu_read_src(mem: &GuestMemory, addr: u64, w: MemWidth) -> Result<f64, Step> {
+    match w {
+        MemWidth::F32 => fpu_read_f32(mem, addr),
+        MemWidth::F64 => fpu_read_f64(mem, addr),
+        MemWidth::I16 => fpu_read_int(mem, addr, 16).map(|v| v as f64),
+        MemWidth::I32 => fpu_read_int(mem, addr, 32).map(|v| v as f64),
+    }
 }
 
 /// Apply `f` lane-wise (`f64`) to the low `lanes` 8-byte lanes of `dst`/`src`,
@@ -493,6 +727,7 @@ macro_rules! fetch {
 
 /// A user-mode x86-64 interpreter.
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)] // df + the x87 C0-C3 condition codes are each independently meaningful flags, not a state machine
 struct X86Interp {
     /// rax..r15, in the standard ModRM/REX numbering.
     gpr: [u64; 16],
@@ -506,6 +741,30 @@ struct X86Interp {
     df: bool,
     /// FS.base, set by `arch_prctl(ARCH_SET_FS, ...)` (thread pointer).
     fs_base: u64,
+    /// The x87 register stack, `ST(0)..ST(7)`, physically indexed (i.e. not
+    /// yet rotated by `fpu_top`) — see [`X86Interp::st_get`]. Real x87
+    /// registers are 80-bit extended precision; this interpreter models
+    /// each as an `f64` instead (an accepted approximation for a software
+    /// scaffold — see [`f80_to_f64`]), so values round-tripped through the
+    /// register stack lose precision beyond `f64`'s ~15-17 significant
+    /// digits relative to true 80-bit `long double`.
+    st: [f64; 8],
+    /// The status word's `TOP` field: `ST(i)` physically lives at
+    /// `st[(fpu_top + i) & 7]`. `FLD`-family pushes decrement it (then
+    /// write the new `ST(0)`); pops increment it.
+    fpu_top: u8,
+    /// Status-word condition codes `C0`/`C1`/`C2`/`C3`, set by compares
+    /// (`FCOM`/`FUCOM`/`FTST`/...) and read back by `FNSTSW`.
+    fpu_c0: bool,
+    fpu_c1: bool,
+    fpu_c2: bool,
+    fpu_c3: bool,
+    /// The control word (`FLDCW`/`FNSTCW`): only the rounding-control field
+    /// (bits 10-11) is consulted, by [`X86Interp::round_per_cw`] (`FIST`/
+    /// `FISTP`/`FRNDINT`); the precision-control and exception-mask fields
+    /// are stored and read back verbatim but otherwise unused, since this
+    /// interpreter doesn't model FPU exceptions at all.
+    fpu_cw: u16,
 }
 
 impl X86Interp {
@@ -519,6 +778,13 @@ impl X86Interp {
             flags: Flags::default(),
             df: false,
             fs_base: 0,
+            st: [0.0; 8],
+            fpu_top: 0,
+            fpu_c0: false,
+            fpu_c1: false,
+            fpu_c2: false,
+            fpu_c3: false,
+            fpu_cw: 0x037F, // the real x87's power-on/FNINIT default control word
         }
     }
 
@@ -2387,6 +2653,566 @@ impl X86Interp {
         self.next(pc2)
     }
 
+    // ---- x87 FPU (the `D8-DF` ESC opcodes). Register-relative addressing:
+    // `ST(i)` lives at `st[(fpu_top + i) & 7]`; `fpu_push` decrements
+    // `fpu_top` then writes the new `ST(0)`, `fpu_pop` reads `ST(0)` then
+    // increments `fpu_top`. See [`X86Interp::st`] for the `f64`-models-
+    // 80-bit-`long-double` approximation this is all built on. ----
+
+    fn st_idx(&self, i: u8) -> usize {
+        ((self.fpu_top.wrapping_add(i)) & 7) as usize
+    }
+
+    fn st_get(&self, i: u8) -> f64 {
+        self.st[self.st_idx(i)]
+    }
+
+    fn st_set(&mut self, i: u8, v: f64) {
+        let idx = self.st_idx(i);
+        self.st[idx] = v;
+    }
+
+    fn fpu_push(&mut self, v: f64) {
+        self.fpu_top = self.fpu_top.wrapping_sub(1) & 7;
+        self.st[self.fpu_top as usize] = v;
+    }
+
+    /// Pop and return the old `ST(0)`.
+    fn fpu_pop(&mut self) -> f64 {
+        let v = self.st[self.fpu_top as usize];
+        self.fpu_top = (self.fpu_top + 1) & 7;
+        v
+    }
+
+    /// `FNINIT`: the power-on-reset FPU state (used both by the `FNINIT`
+    /// opcode and by [`Vcpu::reset`]).
+    fn fpu_init(&mut self) {
+        self.st = [0.0; 8];
+        self.fpu_top = 0;
+        self.fpu_c0 = false;
+        self.fpu_c1 = false;
+        self.fpu_c2 = false;
+        self.fpu_c3 = false;
+        self.fpu_cw = 0x037F;
+    }
+
+    /// The compare core shared by `FCOM`/`FCOMP`/`FCOMPP`/`FUCOM`/`FUCOMP`/
+    /// `FUCOMPP`/`FTST`/`FICOM`/`FICOMP`: an unordered (either operand
+    /// `NaN`) compare sets `C0`/`C2`/`C3` all `true` (mirroring the SSE
+    /// `UCOMISx`/`COMISx` unordered predicate — see
+    /// [`X86Interp::sse_comis`]); otherwise exactly one of less-than/equal/
+    /// greater-than holds, with `C2` clear. `C1` is always cleared (this
+    /// interpreter never raises the stack-fault/inexact conditions real
+    /// hardware would report there).
+    fn fpu_compare(&mut self, a: f64, b: f64) {
+        let unordered = a.is_nan() || b.is_nan();
+        let (lt, gt) = (a < b, a > b);
+        self.fpu_c0 = unordered || lt;
+        self.fpu_c2 = unordered;
+        self.fpu_c3 = unordered || (!lt && !gt); // equal, without a direct `==` (see sse_comis)
+        self.fpu_c1 = false;
+    }
+
+    /// `FCOMI`/`FUCOMI`/`FCOMIP`/`FUCOMIP`: compare `ST(0)` against `ST(i)`
+    /// and write the result directly into `ZF`/`PF`/`CF` (`OF`/`SF` always
+    /// cleared) instead of `C0`/`C2`/`C3` — the same unordered predicate as
+    /// [`X86Interp::fpu_compare`], just routed to `EFLAGS`. This
+    /// interpreter doesn't distinguish the signaling (`FCOMI`) and quiet
+    /// (`FUCOMI`) `#IA` exception behavior (it doesn't model FP exceptions
+    /// at all), so both share this one implementation; `pop` is set for the
+    /// `...IP` forms.
+    fn fpu_comi(&mut self, i: u8, pop: bool) {
+        let a = self.st_get(0);
+        let b = self.st_get(i);
+        let unordered = a.is_nan() || b.is_nan();
+        let (lt, gt) = (a < b, a > b);
+        self.flags = Flags {
+            cf: unordered || lt,
+            zf: unordered || (!lt && !gt), // equal, without a direct `==` (see sse_comis)
+            pf: unordered,
+            of: false,
+            sf: false,
+        };
+        if pop {
+            self.fpu_pop();
+        }
+    }
+
+    /// `FIST`/`FISTP`/`FRNDINT`'s rounding mode, per the control word's `RC`
+    /// field (bits 10-11) — the default control word (`0x037F`) selects
+    /// round-to-nearest-even.
+    fn round_per_cw(&self, v: f64) -> f64 {
+        match (self.fpu_cw >> 10) & 3 {
+            1 => v.floor(),
+            2 => v.ceil(),
+            3 => v.trunc(),
+            _ => v.round_ties_even(),
+        }
+    }
+
+    /// The status word `FNSTSW`/`FSTSW` report: `TOP` (bits 11-13) and
+    /// `C0`/`C1`/`C2`/`C3` (bits 8/9/10/14); the busy, exception-summary and
+    /// exception-flag bits are always `0` (never modeled).
+    fn fpu_sw(&self) -> u16 {
+        let mut sw = (u16::from(self.fpu_top) & 7) << 11;
+        if self.fpu_c0 {
+            sw |= 1 << 8;
+        }
+        if self.fpu_c1 {
+            sw |= 1 << 9;
+        }
+        if self.fpu_c2 {
+            sw |= 1 << 10;
+        }
+        if self.fpu_c3 {
+            sw |= 1 << 14;
+        }
+        sw
+    }
+
+    /// Shared body of `D8`'s register form and every arithmetic group's
+    /// `dst == ST(0)` case: apply `op` (arithmetic) or compare (`Com`/
+    /// `Comp`, the latter also popping) against `src`.
+    fn fpu_arith_st0(&mut self, op: FpuOp, src: f64) {
+        match op {
+            FpuOp::Com => self.fpu_compare(self.st_get(0), src),
+            FpuOp::Comp => {
+                self.fpu_compare(self.st_get(0), src);
+                self.fpu_pop();
+            }
+            _ => {
+                let dst = self.st_get(0);
+                self.st_set(0, fpu_binop(op, dst, src));
+            }
+        }
+    }
+
+    /// The `mod != 3` (memory) form shared by `D8`/`DA`/`DC`/`DE`: `ST(0) op=
+    /// src`, where `src` is loaded from memory at width `w` and `reg`
+    /// selects the operation via [`FpuOp::from_reg`].
+    fn fpu_arith_mem(&mut self, mem: &mut GuestMemory, reg: usize, kind: RmKind, pc2: u64, w: MemWidth) -> Step {
+        let op = FpuOp::from_reg((reg & 7) as u8);
+        let addr = match resolve(kind, pc2) {
+            Operand::Mem(a) => a,
+            Operand::Reg(_) | Operand::Reg8Hi(_) => return Step::Illegal, // mod!=3 always resolves to memory
+        };
+        let src = fetch!(fpu_read_src(mem, addr, w));
+        self.fpu_arith_st0(op, src);
+        self.next(pc2)
+    }
+
+    /// `D8`: memory form is `ST(0) op= m32fp`; register form is `ST(0) op=
+    /// ST(i)`, using the same `/0../7` operation numbering ([`FpuOp::from_reg`]).
+    fn fpu_d8(&mut self, mem: &mut GuestMemory, modrm: ModRm, pc2: u64) -> Step {
+        match modrm.kind {
+            RmKind::Reg(r) => {
+                let op = FpuOp::from_reg((modrm.reg & 7) as u8);
+                let src = self.st_get((r & 7) as u8);
+                self.fpu_arith_st0(op, src);
+                self.next(pc2)
+            }
+            _ => self.fpu_arith_mem(mem, modrm.reg, modrm.kind, pc2, MemWidth::F32),
+        }
+    }
+
+    /// `D9`: `FLD`/`FST`/`FSTP m32fp`, `FLDCW`/`FNSTCW`, `FLD ST(i)`,
+    /// `FXCH`, `FNOP`, `FCHS`/`FABS`/`FTST`, the constant loads
+    /// (`FLD1`/`FLDZ`/...), `FDECSTP`/`FINCSTP`, `FSQRT`, `FRNDINT`.
+    #[allow(clippy::too_many_lines)] // one flat opcode dispatch, same style as exec_0f_sse
+    #[allow(clippy::single_match_else)] // the register-vs-memory ModRM split is the real structure, not a single-pattern match
+    fn fpu_d9(&mut self, mem: &mut GuestMemory, modrm: ModRm, pc2: u64) -> Step {
+        match modrm.kind {
+            RmKind::Reg(r) => {
+                let reg = modrm.reg & 7;
+                let rm = (r & 7) as u8;
+                match reg {
+                    0 => {
+                        // FLD ST(i): push a copy of ST(i).
+                        let v = self.st_get(rm);
+                        self.fpu_push(v);
+                        self.next(pc2)
+                    }
+                    1 => {
+                        // FXCH ST(i): swap ST(0) and ST(i).
+                        let a = self.st_get(0);
+                        let b = self.st_get(rm);
+                        self.st_set(0, b);
+                        self.st_set(rm, a);
+                        self.next(pc2)
+                    }
+                    2 if rm == 0 => self.next(pc2), // FNOP
+                    4 => match rm {
+                        0 => {
+                            self.st_set(0, -self.st_get(0)); // FCHS
+                            self.next(pc2)
+                        }
+                        1 => {
+                            self.st_set(0, self.st_get(0).abs()); // FABS
+                            self.next(pc2)
+                        }
+                        4 => {
+                            self.fpu_compare(self.st_get(0), 0.0); // FTST
+                            self.next(pc2)
+                        }
+                        _ => Step::Illegal, // FXAM (D9 E5): not in our documented subset
+                    },
+                    5 => {
+                        let Some(c) = (match rm {
+                            0 => Some(1.0),                       // FLD1
+                            1 => Some(std::f64::consts::LOG2_10), // FLDL2T
+                            2 => Some(std::f64::consts::LOG2_E),  // FLDL2E
+                            3 => Some(std::f64::consts::PI),      // FLDPI
+                            4 => Some(std::f64::consts::LOG10_2), // FLDLG2
+                            5 => Some(std::f64::consts::LN_2),    // FLDLN2
+                            6 => Some(0.0),                       // FLDZ
+                            _ => None,
+                        }) else {
+                            return Step::Illegal;
+                        };
+                        self.fpu_push(c);
+                        self.next(pc2)
+                    }
+                    6 => match rm {
+                        6 => {
+                            self.fpu_top = self.fpu_top.wrapping_sub(1) & 7; // FDECSTP
+                            self.next(pc2)
+                        }
+                        7 => {
+                            self.fpu_top = (self.fpu_top + 1) & 7; // FINCSTP
+                            self.next(pc2)
+                        }
+                        // F2XM1/FYL2X/FPTAN/FPATAN/FXTRACT/FPREM1: not in our documented subset
+                        _ => Step::Illegal,
+                    },
+                    7 => match rm {
+                        2 => {
+                            self.st_set(0, self.st_get(0).sqrt()); // FSQRT
+                            self.next(pc2)
+                        }
+                        4 => {
+                            let v = self.round_per_cw(self.st_get(0)); // FRNDINT
+                            self.st_set(0, v);
+                            self.next(pc2)
+                        }
+                        // FPREM/FYL2XP1/FSINCOS/FSCALE/FSIN/FCOS: not in our documented subset
+                        _ => Step::Illegal,
+                    },
+                    _ => Step::Illegal, // D9 /1, /3 register forms: not in our documented subset
+                }
+            }
+            _ => {
+                let addr = match resolve(modrm.kind, pc2) {
+                    Operand::Mem(a) => a,
+                    Operand::Reg(_) | Operand::Reg8Hi(_) => return Step::Illegal,
+                };
+                match modrm.reg & 7 {
+                    0 => {
+                        let v = fetch!(fpu_read_f32(mem, addr)); // FLD m32fp
+                        self.fpu_push(v);
+                        self.next(pc2)
+                    }
+                    2 => {
+                        let v = self.st_get(0); // FST m32fp
+                        fetch!(fpu_write_f32(mem, addr, v));
+                        self.next(pc2)
+                    }
+                    3 => {
+                        let v = self.st_get(0); // FSTP m32fp
+                        fetch!(fpu_write_f32(mem, addr, v));
+                        self.fpu_pop();
+                        self.next(pc2)
+                    }
+                    5 => {
+                        // FLDCW m2byte
+                        let mut b = [0u8; 2];
+                        fetch!(mem.read(addr, &mut b).map_err(|_| Step::Fault { addr, write: false }));
+                        self.fpu_cw = u16::from_le_bytes(b);
+                        self.next(pc2)
+                    }
+                    7 => {
+                        // FNSTCW m2byte
+                        let bytes = self.fpu_cw.to_le_bytes();
+                        fetch!(mem.write(addr, &bytes).map_err(|_| Step::Fault { addr, write: true }));
+                        self.next(pc2)
+                    }
+                    // /1, FLDENV (/4), FNSTENV (/6): not in our documented subset
+                    _ => Step::Illegal,
+                }
+            }
+        }
+    }
+
+    /// `DA`: memory form is `ST(0) op= m32int` (`FIADD`/.../`FIDIVR`);
+    /// the only register form we implement is `FUCOMPP` (`DA E9`).
+    fn fpu_da(&mut self, mem: &mut GuestMemory, modrm: ModRm, pc2: u64) -> Step {
+        match modrm.kind {
+            RmKind::Reg(r) => {
+                if (modrm.reg & 7) == 5 && (r & 7) == 1 {
+                    self.fpu_compare(self.st_get(0), self.st_get(1)); // FUCOMPP
+                    self.fpu_pop();
+                    self.fpu_pop();
+                    self.next(pc2)
+                } else {
+                    Step::Illegal // FCMOVcc: not in our documented subset
+                }
+            }
+            _ => self.fpu_arith_mem(mem, modrm.reg, modrm.kind, pc2, MemWidth::I32),
+        }
+    }
+
+    /// `DB`: `FILD`/`FIST`/`FISTP m32int`, `FLD`/`FSTP m80fp`, `FNCLEX`,
+    /// `FNINIT`, `FUCOMI`/`FCOMI`.
+    #[allow(clippy::single_match_else)] // the register-vs-memory ModRM split is the real structure, not a single-pattern match
+    #[allow(clippy::cast_precision_loss)] // FILD's int->f64 load is exactly this
+    fn fpu_db(&mut self, mem: &mut GuestMemory, modrm: ModRm, pc2: u64) -> Step {
+        match modrm.kind {
+            RmKind::Reg(r) => {
+                let rm = (r & 7) as u8;
+                match modrm.reg & 7 {
+                    4 => match rm {
+                        2 => self.next(pc2), // FNCLEX: no exception state is modeled, so a no-op
+                        3 => {
+                            self.fpu_init(); // FNINIT
+                            self.next(pc2)
+                        }
+                        // FNENI/FNDISI/FNSETPM (obsolete 287 opcodes): not in our documented subset
+                        _ => Step::Illegal,
+                    },
+                    5 | 6 => {
+                        self.fpu_comi(rm, false); // FUCOMI (/5) / FCOMI (/6)
+                        self.next(pc2)
+                    }
+                    _ => Step::Illegal, // FCMOVNcc: not in our documented subset
+                }
+            }
+            _ => {
+                let addr = match resolve(modrm.kind, pc2) {
+                    Operand::Mem(a) => a,
+                    Operand::Reg(_) | Operand::Reg8Hi(_) => return Step::Illegal,
+                };
+                match modrm.reg & 7 {
+                    0 => {
+                        let v = fetch!(fpu_read_int(mem, addr, 32)); // FILD m32int
+                        self.fpu_push(v as f64);
+                        self.next(pc2)
+                    }
+                    2 => {
+                        let v = self.round_per_cw(self.st_get(0)); // FIST m32int
+                        fetch!(fpu_write_int(mem, addr, v as i64, 32));
+                        self.next(pc2)
+                    }
+                    3 => {
+                        let v = self.round_per_cw(self.st_get(0)); // FISTP m32int
+                        fetch!(fpu_write_int(mem, addr, v as i64, 32));
+                        self.fpu_pop();
+                        self.next(pc2)
+                    }
+                    5 => {
+                        let v = fetch!(fpu_read_f80(mem, addr)); // FLD m80fp
+                        self.fpu_push(v);
+                        self.next(pc2)
+                    }
+                    7 => {
+                        let v = self.st_get(0); // FSTP m80fp
+                        fetch!(fpu_write_f80(mem, addr, v));
+                        self.fpu_pop();
+                        self.next(pc2)
+                    }
+                    // /1 FISTTP (SSE3), /4, /6: not in our documented subset
+                    _ => Step::Illegal,
+                }
+            }
+        }
+    }
+
+    /// `DC`: memory form is `ST(0) op= m64fp`; register form is `ST(i) op=
+    /// ST(0)` with `SUB`/`SUBR` and `DIV`/`DIVR` swapped relative to `D8`
+    /// (see [`FpuOp::from_reg_reversed`]).
+    fn fpu_dc(&mut self, mem: &mut GuestMemory, modrm: ModRm, pc2: u64) -> Step {
+        match modrm.kind {
+            RmKind::Reg(r) => {
+                let Some(op) = FpuOp::from_reg_reversed((modrm.reg & 7) as u8) else { return Step::Illegal };
+                let i = (r & 7) as u8;
+                let dst = self.st_get(i);
+                let src = self.st_get(0);
+                self.st_set(i, fpu_binop(op, dst, src));
+                self.next(pc2)
+            }
+            _ => self.fpu_arith_mem(mem, modrm.reg, modrm.kind, pc2, MemWidth::F64),
+        }
+    }
+
+    /// `DD`: `FLD`/`FST`/`FSTP m64fp`, `FNSTSW m2byte`, `FFREE`,
+    /// register `FST`/`FSTP ST(i)`, `FUCOM`/`FUCOMP`.
+    #[allow(clippy::single_match_else)] // the register-vs-memory ModRM split is the real structure, not a single-pattern match
+    fn fpu_dd(&mut self, mem: &mut GuestMemory, modrm: ModRm, pc2: u64) -> Step {
+        match modrm.kind {
+            RmKind::Reg(r) => {
+                let i = (r & 7) as u8;
+                match modrm.reg & 7 {
+                    0 => self.next(pc2), // FFREE ST(i): no tag word is modeled, so a no-op
+                    2 => {
+                        let v = self.st_get(0); // FST ST(i)
+                        self.st_set(i, v);
+                        self.next(pc2)
+                    }
+                    3 => {
+                        let v = self.st_get(0); // FSTP ST(i)
+                        self.st_set(i, v);
+                        self.fpu_pop();
+                        self.next(pc2)
+                    }
+                    4 => {
+                        self.fpu_compare(self.st_get(0), self.st_get(i)); // FUCOM ST(i)
+                        self.next(pc2)
+                    }
+                    5 => {
+                        self.fpu_compare(self.st_get(0), self.st_get(i)); // FUCOMP ST(i)
+                        self.fpu_pop();
+                        self.next(pc2)
+                    }
+                    _ => Step::Illegal,
+                }
+            }
+            _ => {
+                let addr = match resolve(modrm.kind, pc2) {
+                    Operand::Mem(a) => a,
+                    Operand::Reg(_) | Operand::Reg8Hi(_) => return Step::Illegal,
+                };
+                match modrm.reg & 7 {
+                    0 => {
+                        let v = fetch!(fpu_read_f64(mem, addr)); // FLD m64fp
+                        self.fpu_push(v);
+                        self.next(pc2)
+                    }
+                    2 => {
+                        let v = self.st_get(0); // FST m64fp
+                        fetch!(fpu_write_f64(mem, addr, v));
+                        self.next(pc2)
+                    }
+                    3 => {
+                        let v = self.st_get(0); // FSTP m64fp
+                        fetch!(fpu_write_f64(mem, addr, v));
+                        self.fpu_pop();
+                        self.next(pc2)
+                    }
+                    7 => {
+                        let sw = self.fpu_sw(); // FNSTSW m2byte
+                        fetch!(mem.write(addr, &sw.to_le_bytes()).map_err(|_| Step::Fault { addr, write: true }));
+                        self.next(pc2)
+                    }
+                    // /1 FISTTP (SSE3), FRSTOR (/4), FNSAVE (/6): not in our documented subset
+                    _ => Step::Illegal,
+                }
+            }
+        }
+    }
+
+    /// `DE`: memory form is `ST(0) op= m16int`; register form is `ST(i) op=
+    /// ST(0)` then pop (the `P` mnemonics: `FADDP`/`FSUBRP`/...), using the
+    /// same reversed numbering as `DC`; `DE D9` is the fixed opcode
+    /// `FCOMPP`.
+    fn fpu_de(&mut self, mem: &mut GuestMemory, modrm: ModRm, pc2: u64) -> Step {
+        match modrm.kind {
+            RmKind::Reg(r) => {
+                let reg = modrm.reg & 7;
+                let rm = (r & 7) as u8;
+                if reg == 3 && rm == 1 {
+                    self.fpu_compare(self.st_get(0), self.st_get(1)); // FCOMPP
+                    self.fpu_pop();
+                    self.fpu_pop();
+                    return self.next(pc2);
+                }
+                let Some(op) = FpuOp::from_reg_reversed(reg as u8) else { return Step::Illegal };
+                let dst = self.st_get(rm);
+                let src = self.st_get(0);
+                self.st_set(rm, fpu_binop(op, dst, src));
+                self.fpu_pop();
+                self.next(pc2)
+            }
+            _ => self.fpu_arith_mem(mem, modrm.reg, modrm.kind, pc2, MemWidth::I16),
+        }
+    }
+
+    /// `DF`: `FILD`/`FIST`/`FISTP m16int`, `FILD m64int`, `FISTP m64int`,
+    /// `FNSTSW AX` (`DF E0`), `FUCOMIP`/`FCOMIP`.
+    #[allow(clippy::single_match_else)] // the register-vs-memory ModRM split is the real structure, not a single-pattern match
+    #[allow(clippy::cast_precision_loss)] // FILD's int->f64 load is exactly this
+    fn fpu_df(&mut self, mem: &mut GuestMemory, modrm: ModRm, pc2: u64) -> Step {
+        match modrm.kind {
+            RmKind::Reg(r) => {
+                let reg = modrm.reg & 7;
+                let rm = (r & 7) as u8;
+                match reg {
+                    4 if rm == 0 => {
+                        let sw = u64::from(self.fpu_sw()); // FNSTSW AX
+                        fetch!(self.write_operand(mem, Operand::Reg(RAX), sw, 16));
+                        self.next(pc2)
+                    }
+                    5 | 6 => {
+                        self.fpu_comi(rm, true); // FUCOMIP (/5) / FCOMIP (/6)
+                        self.next(pc2)
+                    }
+                    _ => Step::Illegal, // other DF register forms: not in our documented subset
+                }
+            }
+            _ => {
+                let addr = match resolve(modrm.kind, pc2) {
+                    Operand::Mem(a) => a,
+                    Operand::Reg(_) | Operand::Reg8Hi(_) => return Step::Illegal,
+                };
+                match modrm.reg & 7 {
+                    0 => {
+                        let v = fetch!(fpu_read_int(mem, addr, 16)); // FILD m16int
+                        self.fpu_push(v as f64);
+                        self.next(pc2)
+                    }
+                    2 => {
+                        let v = self.round_per_cw(self.st_get(0)); // FIST m16int
+                        fetch!(fpu_write_int(mem, addr, v as i64, 16));
+                        self.next(pc2)
+                    }
+                    3 => {
+                        let v = self.round_per_cw(self.st_get(0)); // FISTP m16int
+                        fetch!(fpu_write_int(mem, addr, v as i64, 16));
+                        self.fpu_pop();
+                        self.next(pc2)
+                    }
+                    5 => {
+                        let v = fetch!(fpu_read_int(mem, addr, 64)); // FILD m64int
+                        self.fpu_push(v as f64);
+                        self.next(pc2)
+                    }
+                    7 => {
+                        let v = self.round_per_cw(self.st_get(0)); // FISTP m64int
+                        fetch!(fpu_write_int(mem, addr, v as i64, 64));
+                        self.fpu_pop();
+                        self.next(pc2)
+                    }
+                    // FBLD/FBSTP (packed BCD, /4 and /6): not in our documented subset
+                    _ => Step::Illegal,
+                }
+            }
+        }
+    }
+
+    /// Dispatch on the `D8-DF` ESC opcode byte after decoding its ModRM
+    /// (shared by all eight, since the memory-vs-`ST(i)`-vs-fixed-opcode
+    /// split always happens at the ModRM `mod`/`reg`/`rm` fields).
+    fn exec_x87(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, esc: u8) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        match esc {
+            0xD8 => self.fpu_d8(mem, modrm, pc2),
+            0xD9 => self.fpu_d9(mem, modrm, pc2),
+            0xDA => self.fpu_da(mem, modrm, pc2),
+            0xDB => self.fpu_db(mem, modrm, pc2),
+            0xDC => self.fpu_dc(mem, modrm, pc2),
+            0xDD => self.fpu_dd(mem, modrm, pc2),
+            0xDE => self.fpu_de(mem, modrm, pc2),
+            _ => self.fpu_df(mem, modrm, pc2), // 0xDF
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn exec(&mut self, mem: &mut GuestMemory) -> Step {
         // Legacy prefixes (operand-size `0x66`, `REP`/`REPE` `0xF3`, `REPNE`
@@ -2629,7 +3455,10 @@ impl X86Interp {
                     self.next(pc2)
                 }
             }
-            0x90 => self.next(pc), // NOP (also XCHG eax,eax, a no-op either way)
+            // NOP (also XCHG eax,eax, a no-op either way) / FWAIT/WAIT (no
+            // pending FPU exceptions are ever modeled, so also a no-op).
+            0x90 | 0x9B => self.next(pc),
+            0xD8..=0xDF => self.exec_x87(mem, pc, rex, opcode),
             0x0F => self.exec_0f(mem, pc, rex, has_rex, width, opsize16, rep),
             _ => Step::Illegal,
         }
@@ -2711,6 +3540,7 @@ impl Vcpu for X86Interp {
         self.flags = Flags::default();
         self.df = false;
         self.fs_base = 0;
+        self.fpu_init();
     }
 }
 
@@ -3979,5 +4809,160 @@ mod tests {
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
             "bytes shifted up by 2, top 2 bytes dropped"
         );
+    }
+
+    // ---- x87 FPU ----
+
+    #[test]
+    fn fld_fadd_fstp_m64_roundtrip() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let (a, b, c) = (0x1_2000u64, 0x1_2008u64, 0x1_2010u64);
+        m.write_init(a, &2.5f64.to_le_bytes()).unwrap();
+        m.write_init(b, &4.0f64.to_le_bytes()).unwrap();
+        cpu.gpr[RBX] = a;
+        cpu.gpr[RCX] = b;
+        cpu.gpr[RDX] = c;
+        // fld qword [rbx]  (DD /0, modrm=00 000 011)
+        // fadd qword [rcx] (DC /0, modrm=00 000 001)
+        // fstp qword [rdx] (DD /3, modrm=00 011 010)
+        m.write_init(CODE, &[0xDD, 0x03, 0xDC, 0x01, 0xDD, 0x1A]).unwrap();
+        cpu.exec(&mut m); // fld
+        cpu.exec(&mut m); // fadd
+        cpu.exec(&mut m); // fstp
+        assert_eq!(m.read_u64(c).unwrap(), 6.5f64.to_bits());
+        assert_eq!(cpu.fpu_top, 0, "FLD's push and FSTP's pop must cancel out");
+    }
+
+    #[test]
+    fn fmulp_multiplies_and_pops() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let (p1, p2) = (0x1_2000u64, 0x1_2008u64);
+        m.write_init(p1, &2.0f64.to_le_bytes()).unwrap();
+        m.write_init(p2, &3.0f64.to_le_bytes()).unwrap();
+        cpu.gpr[RBX] = p1;
+        cpu.gpr[RCX] = p2;
+        // fld qword [rbx] ; fld qword [rcx] ; fmulp st(1), st(0)  (DE C9)
+        m.write_init(CODE, &[0xDD, 0x03, 0xDD, 0x01, 0xDE, 0xC9]).unwrap();
+        cpu.exec(&mut m);
+        cpu.exec(&mut m);
+        cpu.exec(&mut m);
+        assert_eq!(cpu.st_get(0), 6.0);
+        assert_eq!(cpu.fpu_top, 7, "FMULP pops one value off the stack");
+    }
+
+    #[test]
+    fn fild_fsqrt_int_to_float() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let p = 0x1_2000u64;
+        m.write_init(p, &16i32.to_le_bytes()).unwrap();
+        cpu.gpr[RBX] = p;
+        // fild dword [rbx]  (DB /0, modrm=00 000 011) ; fsqrt  (D9 FA)
+        m.write_init(CODE, &[0xDB, 0x03, 0xD9, 0xFA]).unwrap();
+        cpu.exec(&mut m); // fild
+        cpu.exec(&mut m); // fsqrt
+        assert_eq!(cpu.st_get(0), 4.0);
+    }
+
+    #[test]
+    fn fld1_fldz_constants() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        // fld1 (D9 E8) ; fldz (D9 EE)
+        m.write_init(CODE, &[0xD9, 0xE8, 0xD9, 0xEE]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.st_get(0), 1.0);
+        cpu.exec(&mut m);
+        assert_eq!(cpu.st_get(0), 0.0, "FLDZ pushes 0.0 as the new ST(0)");
+        assert_eq!(cpu.st_get(1), 1.0, "FLD1's value is still ST(1)");
+    }
+
+    #[test]
+    fn fcomi_sets_eflags_for_less_greater_equal() {
+        let mut m = mem();
+        let (p_one, p_two) = (0x1_2000u64, 0x1_2008u64);
+        m.write_init(p_one, &1.0f64.to_le_bytes()).unwrap();
+        m.write_init(p_two, &2.0f64.to_le_bytes()).unwrap();
+        // fld qword [rbx] (-> ST(1) once the second fld runs)
+        // fld qword [rcx] (-> ST(0))
+        // fcomi st(0), st(1)  (DB F1)
+        let code = [0xDD, 0x03, 0xDD, 0x01, 0xDB, 0xF1];
+
+        // ST(0) = 1.0, ST(1) = 2.0: ST(0) < ST(1) sets CF, clears ZF.
+        let mut less = X86Interp::new(CODE, STACK);
+        less.gpr[RBX] = p_two;
+        less.gpr[RCX] = p_one;
+        m.write_init(CODE, &code).unwrap();
+        less.exec(&mut m);
+        less.exec(&mut m);
+        less.exec(&mut m);
+        assert!(less.flags.cf, "ST(0)=1.0 < ST(1)=2.0 sets CF");
+        assert!(!less.flags.zf);
+
+        // ST(0) = 2.0, ST(1) = 1.0: ST(0) > ST(1) clears both CF and ZF.
+        let mut greater = X86Interp::new(CODE, STACK);
+        greater.gpr[RBX] = p_one;
+        greater.gpr[RCX] = p_two;
+        m.write_init(CODE, &code).unwrap();
+        greater.exec(&mut m);
+        greater.exec(&mut m);
+        greater.exec(&mut m);
+        assert!(!greater.flags.cf, "ST(0)=2.0 > ST(1)=1.0 clears CF");
+        assert!(!greater.flags.zf);
+
+        // ST(0) = ST(1) = 1.0: equal operands clear CF and set ZF.
+        let mut equal = X86Interp::new(CODE, STACK);
+        equal.gpr[RBX] = p_one;
+        equal.gpr[RCX] = p_one;
+        m.write_init(CODE, &code).unwrap();
+        equal.exec(&mut m);
+        equal.exec(&mut m);
+        equal.exec(&mut m);
+        assert!(!equal.flags.cf);
+        assert!(equal.flags.zf, "equal operands set ZF");
+    }
+
+    #[test]
+    fn fistp_rounds_per_control_word_truncate_mode() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let (cw_addr, val_addr, out_addr) = (0x1_2000u64, 0x1_2008u64, 0x1_2010u64);
+        m.write_init(cw_addr, &0x0F7Fu16.to_le_bytes()).unwrap(); // default 0x037F with RC=11 (truncate)
+        m.write_init(val_addr, &3.75f64.to_le_bytes()).unwrap();
+        cpu.gpr[RBX] = cw_addr;
+        cpu.gpr[RCX] = val_addr;
+        cpu.gpr[RDX] = out_addr;
+        // fldcw [rbx]        (D9 /5, modrm=00 101 011)
+        // fld qword [rcx]    (DD /0, modrm=00 000 001)
+        // fistp dword [rdx]  (DB /3, modrm=00 011 010)
+        m.write_init(CODE, &[0xD9, 0x2B, 0xDD, 0x01, 0xDB, 0x1A]).unwrap();
+        cpu.exec(&mut m); // fldcw
+        cpu.exec(&mut m); // fld
+        cpu.exec(&mut m); // fistp
+        assert_eq!(
+            m.read_u32(out_addr).unwrap() as i32,
+            3,
+            "round-toward-zero (FLDCW RC=11) truncates 3.75 to 3"
+        );
+    }
+
+    #[test]
+    fn fxch_swaps_st0_and_st1() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let (p1, p2) = (0x1_2000u64, 0x1_2008u64);
+        m.write_init(p1, &1.0f64.to_le_bytes()).unwrap();
+        m.write_init(p2, &2.0f64.to_le_bytes()).unwrap();
+        cpu.gpr[RBX] = p1;
+        cpu.gpr[RCX] = p2;
+        // fld qword [rbx] ; fld qword [rcx] ; fxch st(1)  (D9 C9)
+        m.write_init(CODE, &[0xDD, 0x03, 0xDD, 0x01, 0xD9, 0xC9]).unwrap();
+        cpu.exec(&mut m); // ST(0) = 1.0
+        cpu.exec(&mut m); // ST(0) = 2.0, ST(1) = 1.0
+        cpu.exec(&mut m); // fxch
+        assert_eq!(cpu.st_get(0), 1.0);
+        assert_eq!(cpu.st_get(1), 2.0);
     }
 }
