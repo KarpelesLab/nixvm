@@ -37,6 +37,7 @@ pub mod kernel;
 pub mod loader;
 pub mod sandbox;
 pub mod vcpu;
+pub mod vm;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 

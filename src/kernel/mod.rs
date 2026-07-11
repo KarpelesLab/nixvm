@@ -116,6 +116,16 @@ enum RunState {
     Zombie(i32),
 }
 
+/// Outcome of a [`Kernel::pump`] step in interactive mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pumped {
+    /// pid 1 exited with this code; the machine is done.
+    Exited(i32),
+    /// Every runnable task is parked waiting for input; feed stdin and pump
+    /// again to resume (e.g. the shell is blocked on a `read` of its terminal).
+    Blocked,
+}
+
 /// The result of servicing one guest exit, telling the scheduler what to do
 /// with the task's vcpu next.
 enum Serviced {
@@ -148,6 +158,7 @@ struct Pipe {
 }
 
 /// The kernel: global state plus the process table and scheduler.
+#[allow(clippy::struct_excessive_bools)] // independent one-shot flags, not a state enum
 pub struct Kernel {
     arch: Arch,
     mounts: MountTable,
@@ -162,6 +173,14 @@ pub struct Kernel {
     stdin: Box<dyn Read + Send>,
     stdout: Box<dyn Write + Send>,
     stderr: Box<dyn Write + Send>,
+    /// Interactive mode (the browser terminal): guest reads of fd 0 draw from
+    /// `stdin_buf` and *block* (re-trap) when it is empty rather than hitting
+    /// the host `stdin`, so the embedder can pump input in between runs.
+    interactive: bool,
+    /// Buffered terminal input for interactive mode (see [`Kernel::feed_stdin`]).
+    stdin_buf: VecDeque<u8>,
+    /// Whether interactive stdin has been closed (EOF / Ctrl-D).
+    stdin_closed: bool,
     rng_state: u64,
     trace: bool,
     /// The process file-creation mask (`umask`); global for our single session.
@@ -225,6 +244,9 @@ impl Kernel {
             procs: Vec::new(),
             spaces: Vec::new(),
             ncpus: 1,
+            interactive: false,
+            stdin_buf: VecDeque::new(),
+            stdin_closed: false,
             next_pid: 2,
             block: false,
             exec_ok: false,
@@ -300,35 +322,97 @@ impl Kernel {
             if let Some(code) = self.pid1_code() {
                 return Ok(code);
             }
-            let mut progressed = false;
-            for i in 0..self.procs.len() {
-                let runnable = matches!(
-                    self.procs.get(i),
-                    Some(Some(p)) if p.info.run == RunState::Running
-                );
-                if !runnable {
-                    continue;
-                }
-                let mut proc = self.procs[i].take().unwrap();
-                let mm = proc.info.mm;
-                let mut vcpu = proc.vcpu.take().expect("runnable task has a vcpu");
-                let space_arc = Arc::clone(&self.spaces[mm]);
-                let mut guard = space_arc.lock().unwrap();
-                std::mem::swap(&mut self.cur, &mut proc.info);
-                let made = self.run_slice(&mut vcpu, &mut guard)?;
-                std::mem::swap(&mut self.cur, &mut proc.info);
-                drop(guard);
-                proc.vcpu = Some(vcpu);
-                self.procs[i] = Some(proc);
-                progressed |= made;
-            }
-            if !progressed {
+            if !self.serial_sweep()? {
                 if self.any_running() {
                     return Err(VcpuError::Backend(
                         "deadlock: every process is blocked".into(),
                     ));
                 }
                 return Ok(self.pid1_code().unwrap_or(0));
+            }
+        }
+    }
+
+    /// One pass over the process table on the current thread: run each runnable
+    /// task's slice. Returns whether any task made progress. Shared by the
+    /// blocking scheduler and the interactive [`Kernel::pump`] loop.
+    fn serial_sweep(&mut self) -> Result<bool, VcpuError> {
+        let mut progressed = false;
+        for i in 0..self.procs.len() {
+            let runnable = matches!(
+                self.procs.get(i),
+                Some(Some(p)) if p.info.run == RunState::Running
+            );
+            if !runnable {
+                continue;
+            }
+            let mut proc = self.procs[i].take().unwrap();
+            let mm = proc.info.mm;
+            let mut vcpu = proc.vcpu.take().expect("runnable task has a vcpu");
+            let space_arc = Arc::clone(&self.spaces[mm]);
+            let mut guard = space_arc.lock().unwrap();
+            std::mem::swap(&mut self.cur, &mut proc.info);
+            let made = self.run_slice(&mut vcpu, &mut guard)?;
+            std::mem::swap(&mut self.cur, &mut proc.info);
+            drop(guard);
+            proc.vcpu = Some(vcpu);
+            self.procs[i] = Some(proc);
+            progressed |= made;
+        }
+        Ok(progressed)
+    }
+
+    // ---- interactive driver (the browser terminal) -----------------------
+
+    /// Enable interactive mode: guest reads of fd 0 draw from the buffer fed via
+    /// [`Kernel::feed_stdin`] and block when empty, instead of the host stdin.
+    pub fn set_interactive(&mut self, yes: bool) {
+        self.interactive = yes;
+    }
+
+    /// Append bytes to the interactive terminal-input buffer (keystrokes).
+    pub fn feed_stdin(&mut self, bytes: &[u8]) {
+        self.stdin_buf.extend(bytes.iter().copied());
+    }
+
+    /// Signal end-of-input on the interactive stdin (Ctrl-D).
+    pub fn close_stdin(&mut self) {
+        self.stdin_closed = true;
+    }
+
+    /// Seed the initial process (pid 1) without running it, for the incremental
+    /// [`Kernel::pump`] driver. Use instead of [`Kernel::run`] when the embedder
+    /// wants to interleave guest execution with feeding input (e.g. a terminal).
+    pub fn boot(&mut self, vcpu: Box<dyn Vcpu>, mem: GuestMemory) {
+        let mut info = std::mem::take(&mut self.cur);
+        info.pid = 1;
+        info.ppid = 0;
+        info.tgid = 1;
+        info.mm = self.spaces.len();
+        info.run = RunState::Running;
+        self.spaces.push(Arc::new(Mutex::new(mem)));
+        self.procs.push(Some(Process {
+            vcpu: Some(vcpu),
+            info,
+        }));
+    }
+
+    /// Drive the (single-CPU) machine until pid 1 exits or every task is parked
+    /// waiting for input. Call after [`Kernel::boot`], re-calling after each
+    /// [`Kernel::feed_stdin`] to resume. Unlike [`Kernel::run`], a full sweep
+    /// with no progress is reported as [`Pumped::Blocked`] (needs input), not a
+    /// deadlock error.
+    pub fn pump(&mut self) -> Result<Pumped, VcpuError> {
+        loop {
+            if let Some(code) = self.pid1_code() {
+                return Ok(Pumped::Exited(code));
+            }
+            if !self.serial_sweep()? {
+                return Ok(if self.any_running() {
+                    Pumped::Blocked
+                } else {
+                    Pumped::Exited(self.pid1_code().unwrap_or(0))
+                });
             }
         }
     }
@@ -1130,6 +1214,23 @@ impl Kernel {
     /// `read(fd, buf, count)` — stdin, files, and pipes.
     fn sys_read(&mut self, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
         match self.cur.fds.get(fd as i32).cloned() {
+            Some(Fd::Stdin) if self.interactive => {
+                // Draw from the buffered terminal input; block (re-trap) when it
+                // is empty and not yet closed, so the embedder can pump more.
+                if self.stdin_buf.is_empty() {
+                    if self.stdin_closed {
+                        return 0; // EOF
+                    }
+                    self.block = true;
+                    return 0;
+                }
+                let n = (count as usize).min(self.stdin_buf.len());
+                let chunk: Vec<u8> = self.stdin_buf.drain(..n).collect();
+                if mem.write(buf, &chunk).is_err() {
+                    return err(Errno::EFAULT);
+                }
+                n as i64
+            }
             Some(Fd::Stdin) => {
                 let mut tmp = vec![0u8; count as usize];
                 match self.stdin.read(&mut tmp) {
@@ -1898,8 +1999,99 @@ mod tests {
     }
 
     // aarch64 syscall numbers used by the scripted SMP tests.
+    const NR_READ: u64 = 63;
     const NR_GETPID: u64 = 172;
     const NR_CLONE: u64 = 220;
+
+    /// A vcpu that keeps issuing `read(0, buf, 16)` until it gets a result
+    /// (data or EOF), then halts. Models the re-trap of a blocking read: while
+    /// the kernel parks the read (no `set_syscall_ret`), `run` re-issues the
+    /// same syscall; once a result arrives it halts. Used to drive the
+    /// interactive `pump` loop.
+    #[derive(Clone)]
+    struct ReadVcpu {
+        buf: u64,
+        done: bool,
+    }
+    impl Vcpu for ReadVcpu {
+        fn run(&mut self, _m: &mut GuestMemory) -> Result<Exit, VcpuError> {
+            if self.done {
+                Ok(Exit::Halt)
+            } else {
+                Ok(Exit::Syscall)
+            }
+        }
+        fn syscall_nr(&self) -> u64 {
+            NR_READ
+        }
+        fn syscall_args(&self) -> [u64; 6] {
+            [0, self.buf, 16, 0, 0, 0]
+        }
+        fn set_syscall_ret(&mut self, _v: u64) {
+            self.done = true; // got a result (data or EOF): stop.
+        }
+        fn reg(&self, _i: usize) -> u64 {
+            0
+        }
+        fn set_reg(&mut self, _i: usize, _v: u64) {}
+        fn pc(&self) -> u64 {
+            0
+        }
+        fn set_pc(&mut self, _v: u64) {}
+        fn sp(&self) -> u64 {
+            0
+        }
+        fn set_sp(&mut self, _v: u64) {}
+        fn set_tls(&mut self, _v: u64) {}
+        fn fork(&self) -> Box<dyn Vcpu> {
+            Box::new(self.clone())
+        }
+        fn reset(&mut self, _e: u64, _s: u64) {}
+    }
+
+    #[test]
+    fn interactive_stdin_blocks_then_delivers_then_eof() {
+        let (mut k, mut mem, mut v) = setup();
+        k.set_interactive(true);
+        let buf = 0x1_0000u64; // mapped by setup()
+
+        // Empty buffer, not closed: the read parks (blocks).
+        k.block = false;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]), 0);
+        assert!(k.block, "read of empty interactive stdin blocks");
+
+        // Feed input: the read now delivers it.
+        k.feed_stdin(b"hi\n");
+        k.block = false;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]), 3);
+        assert_eq!(&mem.read_vec(buf, 3).unwrap(), b"hi\n");
+        assert!(!k.block);
+
+        // Closed + empty: EOF (0), no block.
+        k.close_stdin();
+        k.block = false;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]), 0);
+        assert!(!k.block, "EOF does not block");
+    }
+
+    #[test]
+    fn pump_blocks_on_empty_stdin_then_runs_to_exit_on_input() {
+        let mut mounts = MountTable::new();
+        mounts.mount("/", Box::new(TmpFs::new()));
+        let mut k = Kernel::new(Arch::Aarch64, mounts);
+        k.set_interactive(true);
+        let mut mem = GuestMemory::new(0x1_0000, 16 * PAGE);
+        mem.map(0x1_0000, PAGE, Prot::rw()).unwrap();
+
+        k.boot(Box::new(ReadVcpu { buf: 0x1_0000, done: false }), mem);
+
+        // Nothing to read yet: pump parks waiting for input.
+        assert_eq!(k.pump().unwrap(), Pumped::Blocked);
+
+        // Feed a line: the read completes and the task halts (exit 0).
+        k.feed_stdin(b"go\n");
+        assert_eq!(k.pump().unwrap(), Pumped::Exited(0));
+    }
 
     #[test]
     fn smp_single_task_completes() {

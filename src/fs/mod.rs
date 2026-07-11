@@ -29,6 +29,7 @@ pub mod overlay;
 pub mod passthrough;
 pub mod procfs;
 pub mod sysfs;
+pub mod tar;
 pub mod tmpfs;
 
 pub use devfs::DevFs;
