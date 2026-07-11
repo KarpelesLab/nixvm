@@ -145,10 +145,54 @@ pub fn extract_into(mounts: &mut MountTable, tar: &[u8]) -> usize {
     created
 }
 
+/// Decompress a gzip stream (e.g. a `.tar.gz` root image) with `compcol`,
+/// refusing to produce more than `max_output` bytes of plaintext (a
+/// decompression-bomb guard). Lets an embedder unpack a `.tar.gz` in-process —
+/// the browser demo uses this instead of the browser's `DecompressionStream`.
+///
+/// # Errors
+/// Returns a message on malformed gzip data or if the output would exceed
+/// `max_output`.
+#[cfg(feature = "targz")]
+pub fn gunzip(gz: &[u8], max_output: u64) -> Result<Vec<u8>, String> {
+    compcol::vec::decompress_to_vec_capped::<compcol::gzip::Gzip>(gz, max_output)
+        .map_err(|e| format!("gzip decompression failed: {e:?}"))
+}
+
+/// Decompress a `.tar.gz` and unpack it into `mounts` (rooted at `/`), capping
+/// the decompressed size at `max_output`. Returns the number of entries created.
+///
+/// # Errors
+/// Returns a message if the gzip stream is malformed or exceeds `max_output`.
+#[cfg(feature = "targz")]
+pub fn extract_targz_into(
+    mounts: &mut MountTable,
+    targz: &[u8],
+    max_output: u64,
+) -> Result<usize, String> {
+    let tar = gunzip(targz, max_output)?;
+    Ok(extract_into(mounts, &tar))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fs::TmpFs;
+
+    #[cfg(feature = "targz")]
+    #[test]
+    fn gunzip_decompresses_a_gzip_stream() {
+        // `printf 'hello nixvm from compcol' | gzip -n`
+        let gz: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xcb, 0x48, 0xcd, 0xc9,
+            0xc9, 0x57, 0xc8, 0xcb, 0xac, 0x28, 0xcb, 0x55, 0x48, 0x2b, 0xca, 0xcf, 0x55, 0x48,
+            0xce, 0xcf, 0x2d, 0x48, 0xce, 0xcf, 0x01, 0x00, 0x84, 0x0a, 0xf1, 0xef, 0x18, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(gunzip(gz, 1 << 20).unwrap(), b"hello nixvm from compcol");
+        // The bomb guard trips when the cap is below the real output size.
+        assert!(gunzip(gz, 4).is_err());
+    }
 
     /// Build one 512-byte ustar header + padded data for an entry.
     fn entry(name: &str, typeflag: u8, link: &str, data: &[u8]) -> Vec<u8> {

@@ -509,6 +509,7 @@ dependencies = [
 name = "nixvm"
 version = "0.0.0"
 dependencies = [
+ "compcol",
  "console_error_panic_hook",
  "fstool",
  "ureq",

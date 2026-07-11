@@ -72,6 +72,9 @@ mod browser {
     /// Guest RAM ceiling for the browser demo: kept small since it backs a
     /// `Vec<u8>` in the wasm linear memory, not a real mmap.
     const MEM_BYTES: u64 = 256 * 1024 * 1024;
+    /// Decompression-bomb guard for the `.tar.gz` root image (a minirootfs is
+    /// well under this uncompressed).
+    const MAX_ROOTFS_BYTES: u64 = 512 * 1024 * 1024;
 
     /// A [`std::io::Write`] sink that appends into a shared, lock-guarded byte
     /// buffer. Used in place of the host's real stdout/stderr to capture guest
@@ -221,18 +224,21 @@ mod browser {
 
     #[wasm_bindgen]
     impl Terminal {
-        /// Boot `argv[0]` from `rootfs_tar` (an uncompressed tar) in interactive
-        /// mode. Throws if the image lacks `argv[0]` or its dynamic linker.
+        /// Boot `argv[0]` from `rootfs_targz` (a `.tar.gz` root image) in
+        /// interactive mode. The gzip is decompressed in-process via `compcol`
+        /// (no browser `DecompressionStream` needed). Throws if the archive is
+        /// malformed or lacks `argv[0]` / its dynamic linker.
         #[wasm_bindgen(constructor)]
-        pub fn new(rootfs_tar: &[u8], argv: Vec<String>) -> Result<Terminal, JsError> {
+        pub fn new(rootfs_targz: &[u8], argv: Vec<String>) -> Result<Terminal, JsError> {
             console_error_panic_hook::set_once();
             let argv = if argv.is_empty() {
                 vec!["/bin/busybox".to_string(), "sh".to_string()]
             } else {
                 argv
             };
-            let vm =
-                crate::vm::Vm::boot(rootfs_tar, argv, MEM_BYTES).map_err(|e| JsError::new(&e))?;
+            let tar = crate::fs::tar::gunzip(rootfs_targz, MAX_ROOTFS_BYTES)
+                .map_err(|e| JsError::new(&e))?;
+            let vm = crate::vm::Vm::boot(&tar, argv, MEM_BYTES).map_err(|e| JsError::new(&e))?;
             Ok(Self { vm })
         }
 

@@ -70,3 +70,31 @@ fn boots_alpine_and_runs_shell_commands() {
     let _ = drain(&mut vm);
     assert!(vm.exit_code().is_some(), "shell should exit on `exit`");
 }
+
+/// Same, but from the *compressed* `.tar.gz`, decompressed in-process via
+/// `compcol` (the path the browser demo takes). Gated on the `targz` feature
+/// and `NIXVM_ALPINE_TARGZ` pointing at the `.tar.gz`.
+#[cfg(feature = "targz")]
+#[test]
+fn boots_alpine_from_targz_via_compcol() {
+    let Ok(gz_path) = std::env::var("NIXVM_ALPINE_TARGZ") else {
+        eprintln!("NIXVM_ALPINE_TARGZ not set; skipping compcol .tar.gz boot test");
+        return;
+    };
+    let gz = std::fs::read(&gz_path).expect("read Alpine .tar.gz");
+    let tar = nixvm::fs::tar::gunzip(&gz, 512 * 1024 * 1024).expect("compcol gunzip");
+
+    let mut vm = Vm::boot(
+        &tar,
+        vec!["/bin/busybox".to_string(), "sh".to_string()],
+        256 * 1024 * 1024,
+    )
+    .expect("boot from compcol-decompressed rootfs");
+    let _ = drain(&mut vm);
+    vm.write_stdin(b"echo compcol-decompressed-ok\n");
+    let out = drain(&mut vm);
+    assert!(
+        out.contains("compcol-decompressed-ok"),
+        "shell runs from the compcol-decompressed rootfs, got: {out:?}"
+    );
+}

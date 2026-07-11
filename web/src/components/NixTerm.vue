@@ -9,7 +9,8 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 // nixvm browser terminal.
 //
 // Boots a real Alpine Linux minirootfs (fetched same-origin as
-// `rootfs.tar.gz`, gzip-decompressed in-browser) into the nixvm wasm
+// `rootfs.tar.gz` and handed to the wasm as-is — nixvm gunzips it itself via
+// the `compcol` crate) into the nixvm wasm
 // sandbox's `Terminal` class (from `../../pkg/nixvm.js`, assembled next to
 // this app's build output by `.github/workflows/pages.yml` — see
 // `web/README.md` for how to get it locally) and drives an interactive
@@ -163,14 +164,11 @@ async function handleInput(data) {
   }
 }
 
-async function fetchRootfsTar() {
+async function fetchRootfsTarGz() {
   if (cachedTar) return cachedTar;
-  if (!("DecompressionStream" in globalThis)) {
-    throw new Error(
-      "This browser has no DecompressionStream support. Use a recent " +
-        "Chrome, Edge, Firefox, or Safari to run this demo.",
-    );
-  }
+  // Fetch the compressed image as-is; nixvm's wasm decompresses the gzip
+  // itself (via the `compcol` crate), so there's no DecompressionStream
+  // dependency and it works in any wasm-capable browser.
   status.value = "downloading";
   await tick();
   const url = siteUrl("rootfs.tar.gz");
@@ -178,10 +176,7 @@ async function fetchRootfsTar() {
   if (!res.ok) {
     throw new Error(`failed to fetch ${url}: ${res.status} ${res.statusText}`);
   }
-  status.value = "decompressing";
-  await tick();
-  const decompressed = res.body.pipeThrough(new DecompressionStream("gzip"));
-  const buf = await new Response(decompressed).arrayBuffer();
+  const buf = await res.arrayBuffer();
   cachedTar = new Uint8Array(buf);
   return cachedTar;
 }
@@ -204,13 +199,14 @@ async function loadWasmModule() {
 
 async function boot() {
   try {
-    const tar = await fetchRootfsTar();
+    const targz = await fetchRootfsTarGz();
     const mod = await loadWasmModule();
     status.value = "booting";
     lineBuffer = "";
     atLineStart = true;
     await tick();
-    guestTerm = new mod.Terminal(tar, ["/bin/busybox", "sh"]);
+    // The wasm Terminal takes the raw .tar.gz and gunzips it in-process.
+    guestTerm = new mod.Terminal(targz, ["/bin/busybox", "sh"]);
     const out = guestTerm.pump();
     writeBanner("nixvm — Alpine Linux, running entirely in your browser.");
     writeBanner('Type commands and press Enter. Try: uname -a; ls /; cat /etc/os-release');

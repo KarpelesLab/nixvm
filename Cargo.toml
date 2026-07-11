@@ -41,10 +41,16 @@ interp = []
 # read-only guest root. Off by default so the core stays dependency-free and
 # wasm-buildable; only mounting a real image needs it.
 fstool = ["dep:fstool"]
-# Browser demo entry point (src/wasm.rs): exposes `run_elf` via wasm-bindgen so
-# a page can load a static ELF and run it on the software interpreter. Only
-# meaningful on wasm32 targets; pulls in wasm-bindgen + console_error_panic_hook.
-wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
+# In-process gzip decompression of a `.tar.gz` root image, via the `compcol`
+# compression collection (the same one `fstool` uses). Lets the browser demo
+# decompress the Alpine minirootfs itself instead of relying on the browser's
+# `DecompressionStream` — so it works in any wasm-capable browser and keeps the
+# decompression path in Rust. Pure computation; builds for wasm32.
+targz = ["dep:compcol"]
+# Browser demo entry point (src/wasm.rs): exposes an interactive `Terminal` and
+# `run_elf` via wasm-bindgen. Pulls in wasm-bindgen + console_error_panic_hook,
+# and `targz` so it can unpack a `.tar.gz` root image in-process.
+wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "targz"]
 # HTTP(S) fetching of guest root images (src/image.rs). Off by default so the
 # core stays dependency-free and wasm-buildable; sha256 verification is
 # hand-rolled in image.rs so it needs no extra dep either way.
@@ -61,6 +67,12 @@ fstool = { version = "0.4.18", optional = true, default-features = false, featur
 # Blocking HTTP(S) client for downloading guest root images, gated behind the
 # `fetch` feature (see src/image.rs). Not linked into the default build.
 ureq = { version = "2", optional = true }
+# Compression collection (gzip decoder), gated behind `targz`. `std` + `gzip`
+# only — a pure-Rust inflate that builds for wasm32. Same crate `fstool` uses.
+compcol = { version = "0.6", optional = true, default-features = false, features = [
+    "std",
+    "gzip",
+] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Only pulled in on wasm32, and only linked when the `wasm` feature is on
