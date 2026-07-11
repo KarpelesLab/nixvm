@@ -46,6 +46,10 @@ pub fn decode(nr: u64) -> Sysno {
         32 => Sysno::Dup,
         33 => Sysno::Dup2,
         292 => Sysno::Dup3,
+        56 => Sysno::Clone,
+        59 => Sysno::Execve,
+        61 => Sysno::Wait4,
+        273 => Sysno::SetRobustList,
         other => Sysno::Unknown(other),
     }
 }

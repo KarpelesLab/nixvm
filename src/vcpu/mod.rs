@@ -105,6 +105,15 @@ pub trait Vcpu: Send {
 
     /// Thread pointer (arm64 `TPIDR_EL0` / x86-64 `FS.base`), set by TLS syscalls.
     fn set_tls(&mut self, value: u64);
+
+    /// Duplicate this vcpu's full register state (for `fork`/`clone`). The copy
+    /// resumes at the same point; the kernel then sets the child's syscall
+    /// return value and advances its PC.
+    fn fork(&self) -> Box<dyn Vcpu>;
+
+    /// Reset every register for `execve`: clear general/SIMD registers, flags,
+    /// and TLS, then set the entry PC and initial SP for the new image.
+    fn reset(&mut self, entry: u64, sp: u64);
 }
 
 /// Constructs [`Vcpu`]s that share one guest address space.

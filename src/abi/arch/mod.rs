@@ -53,6 +53,10 @@ pub enum Sysno {
     Dup,
     Dup2,
     Dup3,
+    Clone,
+    Execve,
+    Wait4,
+    SetRobustList,
     /// A raw guest number with no mapping yet — handled as ENOSYS but logged.
     Unknown(u64),
 }

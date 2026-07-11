@@ -63,7 +63,7 @@ fn main() {
     let mid = page_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
 
     let backend = InterpBackend::new(Arch::Aarch64).unwrap();
-    let mut vcpu = backend.new_vcpu(img.entry, img.stack_pointer).unwrap();
+    let vcpu = backend.new_vcpu(img.entry, img.stack_pointer).unwrap();
 
     let mut mounts = MountTable::new();
     // NIXVM_ROOT points `/` at a host Alpine rootfs (read-only lower) with a
@@ -71,6 +71,11 @@ fn main() {
     if let Ok(root) = std::env::var("NIXVM_ROOT") {
         let lower = Box::new(Passthrough::read_only(root));
         mounts.mount("/", Box::new(Overlay::new(lower, Box::new(TmpFs::new()))));
+        // Make this (static) binary available at /bin/busybox so the shell can
+        // `execve` applets: Alpine's /bin/ls, /bin/head, … symlink to it, and
+        // the root's own busybox is dynamic (no loader yet).
+        let _ = mounts.create("/bin/busybox", 0o755);
+        let _ = mounts.write_at("/bin/busybox", 0, &elf);
     } else {
         mounts.mount("/", Box::new(TmpFs::new()));
     }
@@ -84,7 +89,7 @@ fn main() {
     kernel.set_heap(img.program_break, mid);
     kernel.set_mmap_area(img.stack_bottom, mid);
 
-    let result = kernel.run(vcpu.as_mut(), &mut mem);
+    let result = kernel.run(vcpu, mem);
     eprintln!("\nrun-elf: result = {result:?}");
     let unsupported = kernel.unsupported();
     if unsupported.is_empty() {

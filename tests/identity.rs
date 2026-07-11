@@ -25,9 +25,9 @@ fn run(program: &[u32], rw_page: Option<u64>) -> i32 {
     mem.write_init(base, &bytes).unwrap();
 
     let backend = InterpBackend::new(Arch::Aarch64).unwrap();
-    let mut vcpu = backend.new_vcpu(base, base + 250 * PAGE_SIZE).unwrap();
+    let vcpu = backend.new_vcpu(base, base + 250 * PAGE_SIZE).unwrap();
     let mut kernel = Kernel::new(Arch::Aarch64, MountTable::new());
-    let code = kernel.run(vcpu.as_mut(), &mut mem).unwrap();
+    let code = kernel.run(vcpu, mem).unwrap();
     assert!(kernel.unsupported().is_empty(), "{:?}", kernel.unsupported());
     code
 }

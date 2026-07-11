@@ -46,12 +46,12 @@ fn brk_grows_heap_and_memory_is_usable() {
     mem.write_init(base, &bytes).unwrap();
 
     let backend = InterpBackend::new(Arch::Aarch64).unwrap();
-    let mut vcpu = backend.new_vcpu(base, base + 250 * PAGE_SIZE).unwrap();
+    let vcpu = backend.new_vcpu(base, base + 250 * PAGE_SIZE).unwrap();
 
     let mut kernel = Kernel::new(Arch::Aarch64, MountTable::new());
     kernel.set_heap(heap_start, heap_limit);
 
-    let code = kernel.run(vcpu.as_mut(), &mut mem).unwrap();
+    let code = kernel.run(vcpu, mem).unwrap();
     assert_eq!(code, 42, "value written to the brk-grown heap round-trips");
     assert!(kernel.unsupported().is_empty(), "{:?}", kernel.unsupported());
 }

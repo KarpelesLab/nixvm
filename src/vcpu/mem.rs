@@ -54,6 +54,7 @@ pub enum MemError {
 }
 
 /// The guest address space shared by every vcpu of one guest process.
+#[derive(Clone)]
 pub struct GuestMemory {
     base: u64,
     size: u64,

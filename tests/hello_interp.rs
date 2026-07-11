@@ -71,13 +71,13 @@ fn hello_world_runs_and_exits() {
     mem.write_init(data, b"hi\n").unwrap();
 
     let backend = InterpBackend::new(Arch::Aarch64).unwrap();
-    let mut vcpu = backend.new_vcpu(code, stack).unwrap();
+    let vcpu = backend.new_vcpu(code, stack).unwrap();
 
     let captured = Arc::new(Mutex::new(Vec::new()));
     let mut kernel = Kernel::new(Arch::Aarch64, MountTable::new());
     kernel.set_stdout(Box::new(SharedBuf(captured.clone())));
 
-    let exit_code = kernel.run(vcpu.as_mut(), &mut mem).unwrap();
+    let exit_code = kernel.run(vcpu, mem).unwrap();
 
     assert_eq!(exit_code, 0, "guest should exit with status 0");
     assert_eq!(&*captured.lock().unwrap(), b"hi\n", "guest should print hi");

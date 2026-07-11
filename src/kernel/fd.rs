@@ -22,7 +22,7 @@ pub enum Fd {
 }
 
 /// Maps small integer descriptors to [`Fd`]s, allocating the lowest free number.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FdTable {
     map: BTreeMap<i32, Fd>,
 }
@@ -65,6 +65,17 @@ impl FdTable {
 
     pub fn close(&mut self, fd: i32) -> Option<Fd> {
         self.map.remove(&fd)
+    }
+
+    /// Iterate over the open descriptors (used to adjust pipe refcounts on
+    /// `fork` and `exit`).
+    pub fn values(&self) -> impl Iterator<Item = &Fd> {
+        self.map.values()
+    }
+
+    /// Remove every descriptor, returning them (used on process exit).
+    pub fn drain(&mut self) -> Vec<Fd> {
+        std::mem::take(&mut self.map).into_values().collect()
     }
 }
 

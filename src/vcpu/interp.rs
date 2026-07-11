@@ -76,6 +76,7 @@ struct Flags {
 }
 
 /// A user-mode aarch64 interpreter.
+#[derive(Clone)]
 struct Aarch64Interp {
     /// x0..x30. x31 is the zero register (reads 0) or SP depending on encoding.
     x: [u64; 31],
@@ -1056,6 +1057,19 @@ impl Vcpu for Aarch64Interp {
     }
     fn set_tls(&mut self, value: u64) {
         self.tpidr = value;
+    }
+
+    fn fork(&self) -> Box<dyn Vcpu> {
+        Box::new(self.clone())
+    }
+
+    fn reset(&mut self, entry: u64, sp: u64) {
+        self.x = [0; 31];
+        self.v = [0; 32];
+        self.sp = sp;
+        self.pc = entry;
+        self.tpidr = 0;
+        self.flags = Flags::default();
     }
 }
 

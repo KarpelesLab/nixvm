@@ -95,13 +95,13 @@ fn static_elf_prints_and_exits() {
     let img = load_static(&mut mem, &elf, &spec).unwrap();
 
     let backend = InterpBackend::new(Arch::Aarch64).unwrap();
-    let mut vcpu = backend.new_vcpu(img.entry, img.stack_pointer).unwrap();
+    let vcpu = backend.new_vcpu(img.entry, img.stack_pointer).unwrap();
 
     let captured = Arc::new(Mutex::new(Vec::new()));
     let mut kernel = Kernel::new(Arch::Aarch64, MountTable::new());
     kernel.set_stdout(Box::new(SharedBuf(captured.clone())));
 
-    let code = kernel.run(vcpu.as_mut(), &mut mem).unwrap();
+    let code = kernel.run(vcpu, mem).unwrap();
 
     assert_eq!(code, 0);
     assert_eq!(&*captured.lock().unwrap(), b"hi\n");

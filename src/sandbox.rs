@@ -190,15 +190,15 @@ impl Sandbox {
         let mounts = self.build_mounts();
 
         // 3. Guest address space + ELF load (Phase 2).
-        let mut mem = GuestMemory::new(GUEST_BASE, self.config.mem_bytes);
+        let mem = GuestMemory::new(GUEST_BASE, self.config.mem_bytes);
 
         // 4. Pick a backend and (Phase 1) create the first vcpu.
         let backend = vcpu::select(self.config.arch)?;
-        let mut vcpu = backend.new_vcpu(/*entry=*/ 0, /*stack=*/ 0)?;
+        let vcpu = backend.new_vcpu(/*entry=*/ 0, /*stack=*/ 0)?;
 
         // 5. Run/serve loop.
         let mut kernel = Kernel::new(self.config.arch, mounts);
-        let code = kernel.run(vcpu.as_mut(), &mut mem)?;
+        let code = kernel.run(vcpu, mem)?;
         Ok(code)
     }
 
@@ -230,13 +230,13 @@ impl Sandbox {
             page_align_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
 
         let backend = self.backend()?;
-        let mut vcpu = backend.new_vcpu(img.entry, img.stack_pointer)?;
+        let vcpu = backend.new_vcpu(img.entry, img.stack_pointer)?;
 
         let mut kernel = Kernel::new(arch, self.build_mounts());
         kernel.set_cwd("/work");
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
-        Ok(kernel.run(vcpu.as_mut(), &mut mem)?)
+        Ok(kernel.run(vcpu, mem)?)
     }
 
     /// Select the execution backend per config: the interpreter when forced,
