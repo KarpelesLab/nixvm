@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use nixvm::abi::Arch;
-use nixvm::fs::{MountTable, Overlay, Passthrough, TmpFs};
+use nixvm::fs::{DevFs, MountTable, Overlay, Passthrough, TmpFs};
 use nixvm::kernel::Kernel;
 use nixvm::loader::{ProcessSpec, load_static};
 use nixvm::vcpu::GuestMemory;
@@ -80,6 +80,7 @@ fn main() {
         mounts.mount("/", Box::new(TmpFs::new()));
     }
     mounts.mount("/tmp", Box::new(TmpFs::new()));
+    mounts.mount("/dev", Box::new(DevFs::new()));
     if let Ok(cwd) = std::env::current_dir() {
         mounts.mount("/work", Box::new(Passthrough::new(cwd)));
     }

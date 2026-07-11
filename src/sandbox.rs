@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use crate::Error;
 use crate::abi::Arch;
-use crate::fs::{MountTable, TmpFs};
+use crate::fs::{DevFs, MountTable, TmpFs};
 #[cfg(unix)]
 use crate::fs::Passthrough;
 use crate::image::{ImageRef, ImageStore};
@@ -260,6 +260,7 @@ impl Sandbox {
         let mut mounts = MountTable::new();
         mounts.mount("/", Box::new(TmpFs::new()));
         mounts.mount("/tmp", Box::new(TmpFs::new()));
+        mounts.mount("/dev", Box::new(DevFs::new()));
 
         #[cfg(unix)]
         {
