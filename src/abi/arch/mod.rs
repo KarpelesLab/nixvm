@@ -49,6 +49,10 @@ pub enum Sysno {
     RtSigprocmask,
     Futex,
     Fcntl,
+    Pipe2,
+    Dup,
+    Dup2,
+    Dup3,
     /// A raw guest number with no mapping yet — handled as ENOSYS but logged.
     Unknown(u64),
 }

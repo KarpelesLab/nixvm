@@ -12,7 +12,7 @@
 //! Handlers are stubs in the scaffold; they come online across ROADMAP phases:
 //! Phase 3 (files/stat/tty), Phase 6 (clone/futex/signals), Phase 8 (sockets).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 
 use crate::abi::Arch;
@@ -66,6 +66,16 @@ pub struct Kernel {
     unsupported: BTreeMap<u64, u64>,
     /// Print each syscall to stderr (set by the `NIXVM_TRACE` env var).
     trace: bool,
+    /// Anonymous pipe buffers; `Fd::PipeRead`/`Fd::PipeWrite` index into this.
+    pipes: Vec<Pipe>,
+}
+
+/// An in-kernel pipe: a byte buffer with reference counts for the open ends.
+#[derive(Debug, Default)]
+struct Pipe {
+    buf: VecDeque<u8>,
+    readers: usize,
+    writers: usize,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -98,6 +108,7 @@ impl Kernel {
             exit_code: None,
             unsupported: BTreeMap::new(),
             trace: std::env::var_os("NIXVM_TRACE").is_some(),
+            pipes: Vec::new(),
         }
     }
 
@@ -204,6 +215,9 @@ impl Kernel {
             Sysno::Ioctl => err(Errno::ENOTTY),
             Sysno::Fcntl => self.sys_fcntl(args[0], args[1]),
             Sysno::Futex => sys_futex(args, mem),
+            Sysno::Pipe2 => self.sys_pipe2(args[0], mem),
+            Sysno::Dup => self.sys_dup(args[0]),
+            Sysno::Dup2 | Sysno::Dup3 => self.sys_dup2(args[0], args[1]),
             Sysno::ExitGroup | Sysno::Exit => {
                 self.exit_code = Some(args[0] as i32);
                 0
@@ -243,11 +257,8 @@ impl Kernel {
                 Ok(()) => count as i64,
                 Err(_) => err(Errno::EIO),
             },
-            _ => {
-                let Some(Fd::File { path, offset }) = self.fds.get(fd as i32).cloned() else {
-                    return err(Errno::EBADF);
-                };
-                match self.mounts.write_at(&path, offset, &data) {
+            _ => match self.fds.get(fd as i32).cloned() {
+                Some(Fd::File { path, offset }) => match self.mounts.write_at(&path, offset, &data) {
                     Ok(n) => {
                         if let Some(Fd::File { offset, .. }) = self.fds.get_mut(fd as i32) {
                             *offset += n as u64;
@@ -255,9 +266,34 @@ impl Kernel {
                         n as i64
                     }
                     Err(e) => io_errno(&e),
-                }
-            }
+                },
+                Some(Fd::PipeWrite(i)) => self.write_pipe(i, &data),
+                _ => err(Errno::EBADF),
+            },
         }
+    }
+
+    /// Read from the read end of pipe `i`. An empty pipe reads as EOF for now;
+    /// real blocking on an open writer arrives with the scheduler (Phase 6).
+    fn read_pipe(&mut self, i: usize, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+        let n = count.min(self.pipes[i].buf.len() as u64) as usize;
+        if n == 0 {
+            return 0;
+        }
+        let data: Vec<u8> = self.pipes[i].buf.drain(..n).collect();
+        if mem.write(buf, &data).is_err() {
+            return err(Errno::EFAULT);
+        }
+        n as i64
+    }
+
+    /// Write to the write end of pipe `i` (`EPIPE` if all readers are gone).
+    fn write_pipe(&mut self, i: usize, data: &[u8]) -> i64 {
+        if self.pipes[i].readers == 0 {
+            return err(Errno::EPIPE);
+        }
+        self.pipes[i].buf.extend(data.iter().copied());
+        data.len() as i64
     }
 
     /// `writev(fd, iov, iovcnt)` — gather `struct iovec { base; len }` entries.
@@ -336,6 +372,9 @@ impl Kernel {
                 Err(_) => err(Errno::EIO),
             };
         }
+        if let Some(&Fd::PipeRead(i)) = self.fds.get(fd as i32) {
+            return self.read_pipe(i, buf, count, mem);
+        }
         let (path, offset) = match self.fds.get(fd as i32) {
             Some(Fd::File { path, offset }) => (path.clone(), *offset),
             _ => return err(Errno::EBADF),
@@ -391,8 +430,72 @@ impl Kernel {
     /// `close(fd)`.
     fn sys_close(&mut self, fd: i32) -> i64 {
         match self.fds.close(fd) {
-            Some(_) => 0,
+            Some(f) => {
+                self.bump_pipe(&f, false);
+                0
+            }
             None => err(Errno::EBADF),
+        }
+    }
+
+    /// `pipe2(fds, flags)` — create an anonymous pipe; write the read/write fd
+    /// pair to `fds[0]`/`fds[1]`.
+    fn sys_pipe2(&mut self, fds_ptr: u64, mem: &mut GuestMemory) -> i64 {
+        let idx = self.pipes.len();
+        self.pipes.push(Pipe {
+            buf: VecDeque::new(),
+            readers: 1,
+            writers: 1,
+        });
+        let rfd = self.fds.alloc(Fd::PipeRead(idx));
+        let wfd = self.fds.alloc(Fd::PipeWrite(idx));
+        let mut b = [0u8; 8];
+        b[0..4].copy_from_slice(&rfd.to_le_bytes());
+        b[4..8].copy_from_slice(&wfd.to_le_bytes());
+        if mem.write(fds_ptr, &b).is_err() {
+            return err(Errno::EFAULT);
+        }
+        0
+    }
+
+    /// `dup(oldfd)` — duplicate onto the lowest free descriptor.
+    fn sys_dup(&mut self, oldfd: u64) -> i64 {
+        let Some(fd) = self.fds.get(oldfd as i32).cloned() else {
+            return err(Errno::EBADF);
+        };
+        self.bump_pipe(&fd, true);
+        i64::from(self.fds.alloc(fd))
+    }
+
+    /// `dup2`/`dup3(oldfd, newfd)` — duplicate onto a specific descriptor.
+    fn sys_dup2(&mut self, oldfd: u64, newfd: u64) -> i64 {
+        let Some(fd) = self.fds.get(oldfd as i32).cloned() else {
+            return err(Errno::EBADF);
+        };
+        if oldfd == newfd {
+            return newfd as i64;
+        }
+        if let Some(old) = self.fds.close(newfd as i32) {
+            self.bump_pipe(&old, false);
+        }
+        self.bump_pipe(&fd, true);
+        self.fds.insert(newfd as i32, fd);
+        newfd as i64
+    }
+
+    /// Adjust the reader/writer refcount of the pipe a fd refers to (if any).
+    fn bump_pipe(&mut self, fd: &Fd, inc: bool) {
+        let delta = |n: &mut usize| {
+            if inc {
+                *n += 1;
+            } else {
+                *n = n.saturating_sub(1);
+            }
+        };
+        match fd {
+            Fd::PipeRead(i) => delta(&mut self.pipes[*i].readers),
+            Fd::PipeWrite(i) => delta(&mut self.pipes[*i].writers),
+            _ => {}
         }
     }
 
@@ -430,6 +533,7 @@ impl Kernel {
                 }
             }
             Some(Fd::Stdin | Fd::Stdout | Fd::Stderr) => stat::char_device_attrs(),
+            Some(Fd::PipeRead(_) | Fd::PipeWrite(_)) => stat::fifo_attrs(),
             None => return err(Errno::EBADF),
         };
         write_stat_or_fault(mem, statbuf, &attrs)
@@ -816,6 +920,32 @@ mod tests {
         // writev(1, iov, 2)
         assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Writev, [1, iov, 2, 0, 0, 0]), 7);
         assert_eq!(&*cap.lock().unwrap(), b"foobar!");
+    }
+
+    #[test]
+    fn pipe_write_read_and_dup() {
+        let (mut k, mut mem, mut v) = setup();
+        // pipe2(fds, 0): fds[0]=read, fds[1]=write
+        let fds = 0x1_0000;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]), 0);
+        let rfd = u64::from(mem.read_u32(fds).unwrap());
+        let wfd = u64::from(mem.read_u32(fds + 4).unwrap());
+        assert!(rfd >= 3 && wfd >= 3 && rfd != wfd);
+
+        // write "pipe!" to the write end
+        let msg = 0x1_1000;
+        mem.write_init(msg, b"pipe!").unwrap();
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [wfd, msg, 5, 0, 0, 0]), 5);
+
+        // dup the read end, then read through the duplicate
+        let dfd = call(&mut k, &mut mem, &mut v, Sysno::Dup, [rfd, 0, 0, 0, 0, 0]);
+        assert!(dfd >= 3);
+        let buf = 0x1_2000;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [dfd as u64, buf, 5, 0, 0, 0]), 5);
+        assert_eq!(mem.read_vec(buf, 5).unwrap(), b"pipe!");
+
+        // now the pipe is drained -> reads 0 (EOF-for-now)
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [rfd, buf, 5, 0, 0, 0]), 0);
     }
 
     #[test]

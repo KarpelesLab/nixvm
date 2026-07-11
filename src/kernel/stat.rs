@@ -7,6 +7,7 @@
 use crate::fs::{Attrs, NodeKind};
 
 const S_IFCHR: u32 = 0o020_000;
+const S_IFIFO: u32 = 0o010_000;
 
 /// The 128-byte `struct stat` for `attrs`.
 pub fn encode_stat(attrs: &Attrs) -> [u8; 128] {
@@ -38,6 +39,20 @@ pub fn char_device_attrs() -> Attrs {
         kind: NodeKind::CharDevice,
         size: 0,
         mode: S_IFCHR | 0o620,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+        inode: 0,
+        nlink: 1,
+    }
+}
+
+/// Attributes for a pipe end (`fstat` on a pipe fd).
+pub fn fifo_attrs() -> Attrs {
+    Attrs {
+        kind: NodeKind::Fifo,
+        size: 0,
+        mode: S_IFIFO | 0o600,
         uid: 0,
         gid: 0,
         mtime: 0,

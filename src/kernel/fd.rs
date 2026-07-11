@@ -15,6 +15,10 @@ pub enum Fd {
     File { path: String, offset: u64 },
     /// An open directory being walked by `getdents64`.
     Dir { path: String, pos: usize },
+    /// Read end of pipe `index` in the kernel's pipe table.
+    PipeRead(usize),
+    /// Write end of pipe `index` in the kernel's pipe table.
+    PipeWrite(usize),
 }
 
 /// Maps small integer descriptors to [`Fd`]s, allocating the lowest free number.
@@ -42,6 +46,12 @@ impl FdTable {
         }
         self.map.insert(n, fd);
         n
+    }
+
+    /// Place `fd` at a specific descriptor number, replacing any existing entry
+    /// (which is returned). Used by `dup2`/`dup3`.
+    pub fn insert(&mut self, n: i32, fd: Fd) -> Option<Fd> {
+        self.map.insert(n, fd)
     }
 
     #[must_use]
