@@ -19,7 +19,7 @@ use crate::abi::Arch;
 use crate::abi::arch::{self, Sysno};
 use crate::abi::errno::Errno;
 use crate::fs::{Attrs, MountTable, NodeKind};
-use crate::loader::{ProcessSpec, load_static};
+use crate::loader::{ProcessSpec, interp_path, load_dynamic, load_static};
 use crate::vcpu::mem::{PAGE_SIZE, Prot};
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 
@@ -887,8 +887,10 @@ impl Kernel {
         i64::from(pid)
     }
 
-    /// `execve(path, argv, envp)` — replace the process image with a new static
-    /// ELF read from the mount table (following symlinks).
+    /// `execve(path, argv, envp)` — replace the process image with a new ELF
+    /// read from the mount table (following symlinks). Static and static-PIE
+    /// images load directly; a dynamic executable's `PT_INTERP` linker is read
+    /// from the same root and loaded alongside it.
     fn sys_execve(
         &mut self,
         path_ptr: u64,
@@ -912,7 +914,15 @@ impl Kernel {
         let (base, size) = (mem.base(), mem.size());
         let mut new_mem = GuestMemory::new(base, size);
         let spec = ProcessSpec { argv, envp };
-        let Ok(img) = load_static(&mut new_mem, &elf, &spec) else {
+        let loaded = if let Some(interp) = interp_path(&elf) {
+            let Some(interp_elf) = self.read_file(&interp) else {
+                return err(Errno::ENOENT); // interpreter missing
+            };
+            load_dynamic(&mut new_mem, &elf, &interp_elf, &spec)
+        } else {
+            load_static(&mut new_mem, &elf, &spec)
+        };
+        let Ok(img) = loaded else {
             return err(Errno::ENOEXEC);
         };
         *mem = new_mem;

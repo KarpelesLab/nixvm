@@ -22,7 +22,7 @@ use crate::fs::Passthrough;
 use crate::fs::{DevFs, MountFs, MountTable, Overlay, ProcFs, SysFs, TmpFs};
 use crate::image::{ImageRef, ImageStore};
 use crate::kernel::Kernel;
-use crate::loader::{ProcessSpec, load_static};
+use crate::loader::{ProcessSpec, interp_path, load_dynamic, load_static};
 use crate::vcpu::interp::InterpBackend;
 use crate::vcpu::mem::PAGE_SIZE;
 use crate::vcpu::{self, Backend, GuestMemory};
@@ -296,11 +296,19 @@ impl Sandbox {
             argv,
             envp: self.env(),
         };
-        let img = load_static(&mut mem, &elf, &spec).map_err(|_| {
-            Error::Config(format!(
-                "{path}: not a runnable static ELF (dynamic linking is not yet supported)"
-            ))
-        })?;
+        // Dynamic executables name their linker in PT_INTERP; load it alongside.
+        let img = if let Some(interp) = interp_path(&elf) {
+            let interp_elf = read_mount_file(&mut mounts, &interp).ok_or_else(|| {
+                Error::Config(format!(
+                    "{path}: dynamic linker `{interp}` not found in the guest root"
+                ))
+            })?;
+            load_dynamic(&mut mem, &elf, &interp_elf, &spec)
+                .map_err(|e| Error::Config(format!("{path}: dynamic load failed: {e}")))?
+        } else {
+            load_static(&mut mem, &elf, &spec)
+                .map_err(|e| Error::Config(format!("{path}: load failed: {e}")))?
+        };
         let mid = page_align_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
 
         let backend = self.backend()?;
@@ -554,51 +562,72 @@ fn page_align_down(v: u64) -> u64 {
 mod tests {
     use super::*;
 
-    /// A minimal static aarch64 ELF whose entry is `exit(code)`:
-    /// `movz x0,#code ; movz x8,#93 ; svc #0`. One PT_LOAD maps the whole file
-    /// (headers included) at the guest base; the entry points at the code.
-    fn build_exit_elf(code: u16) -> Vec<u8> {
-        const BASE: u64 = 0x1_0000;
+    /// `movz x0,#code ; movz x8,#93 ; svc #0` — the guest `exit(code)`.
+    fn exit_words(code: u16) -> Vec<u8> {
         let words: [u32; 3] = [
-            0xD280_0000 | (u32::from(code) << 5), // movz x0, #code
-            0xD280_0BA8,                          // movz x8, #93 (exit)
-            0xD400_0001,                          // svc #0
+            0xD280_0000 | (u32::from(code) << 5),
+            0xD280_0BA8,
+            0xD400_0001,
         ];
-        let mut code_bytes = Vec::new();
+        let mut b = Vec::new();
         for w in words {
-            code_bytes.extend_from_slice(&w.to_le_bytes());
+            b.extend_from_slice(&w.to_le_bytes());
         }
-        let (ehsize, phsize) = (64u64, 56u64);
-        let code_off = ehsize + phsize;
-        let file_len = code_off + code_bytes.len() as u64;
-        let entry = BASE + code_off;
+        b
+    }
 
-        let mut e = Vec::new();
-        e.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]);
-        e.extend_from_slice(&[0u8; 8]);
-        e.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
-        e.extend_from_slice(&183u16.to_le_bytes()); // e_machine = AArch64
-        e.extend_from_slice(&1u32.to_le_bytes()); // e_version
-        e.extend_from_slice(&entry.to_le_bytes()); // e_entry
-        e.extend_from_slice(&ehsize.to_le_bytes()); // e_phoff
-        e.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
-        e.extend_from_slice(&0u32.to_le_bytes()); // e_flags
-        e.extend_from_slice(&(ehsize as u16).to_le_bytes()); // e_ehsize
-        e.extend_from_slice(&(phsize as u16).to_le_bytes()); // e_phentsize
-        e.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
-        e.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
-        e.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
-        e.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
-        e.extend_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
-        e.extend_from_slice(&5u32.to_le_bytes()); // p_flags = R+X
-        e.extend_from_slice(&0u64.to_le_bytes()); // p_offset
-        e.extend_from_slice(&BASE.to_le_bytes()); // p_vaddr
-        e.extend_from_slice(&BASE.to_le_bytes()); // p_paddr
-        e.extend_from_slice(&file_len.to_le_bytes()); // p_filesz
-        e.extend_from_slice(&file_len.to_le_bytes()); // p_memsz
-        e.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
-        e.extend_from_slice(&code_bytes);
+    /// A minimal aarch64 ELF: an optional `PT_INTERP` header plus one `PT_LOAD`
+    /// mapping the whole file (headers included). `e_type` is ET_EXEC (2) or
+    /// ET_DYN (3, a PIE with `p_vaddr = 0` that the loader biases). Entry points
+    /// at the code, which follows the (optional) interpreter path string.
+    fn build_elf(e_type: u16, vaddr: u64, interp: Option<&str>, code: &[u8]) -> Vec<u8> {
+        let (ehsize, phsize) = (64usize, 56usize);
+        let nph = if interp.is_some() { 2 } else { 1 };
+        let mut interp_bytes = interp.map(|s| s.as_bytes().to_vec()).unwrap_or_default();
+        if interp.is_some() {
+            interp_bytes.push(0);
+        }
+        let interp_off = ehsize + nph * phsize;
+        let code_off = (interp_off + interp_bytes.len()) as u64;
+        let file_len = code_off + code.len() as u64;
+        let entry = vaddr + code_off;
+
+        let mut e = vec![0u8; interp_off];
+        e[0..8].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]);
+        e[16..18].copy_from_slice(&e_type.to_le_bytes());
+        e[18..20].copy_from_slice(&183u16.to_le_bytes()); // AArch64
+        e[20..24].copy_from_slice(&1u32.to_le_bytes());
+        e[24..32].copy_from_slice(&entry.to_le_bytes());
+        e[32..40].copy_from_slice(&(ehsize as u64).to_le_bytes()); // e_phoff
+        e[52..54].copy_from_slice(&(ehsize as u16).to_le_bytes());
+        e[54..56].copy_from_slice(&(phsize as u16).to_le_bytes());
+        e[56..58].copy_from_slice(&(nph as u16).to_le_bytes());
+
+        let mut p = ehsize;
+        if let Some(_s) = interp {
+            e[p..p + 4].copy_from_slice(&3u32.to_le_bytes()); // PT_INTERP
+            e[p + 4..p + 8].copy_from_slice(&4u32.to_le_bytes()); // PF_R
+            e[p + 8..p + 16].copy_from_slice(&(interp_off as u64).to_le_bytes());
+            e[p + 32..p + 40].copy_from_slice(&(interp_bytes.len() as u64).to_le_bytes());
+            e[p + 40..p + 48].copy_from_slice(&(interp_bytes.len() as u64).to_le_bytes());
+            p += phsize;
+        }
+        e[p..p + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        e[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes()); // R+X
+        e[p + 16..p + 24].copy_from_slice(&vaddr.to_le_bytes()); // p_vaddr
+        e[p + 24..p + 32].copy_from_slice(&vaddr.to_le_bytes()); // p_paddr
+        e[p + 32..p + 40].copy_from_slice(&file_len.to_le_bytes());
+        e[p + 40..p + 48].copy_from_slice(&file_len.to_le_bytes());
+        e[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+
+        e.extend_from_slice(&interp_bytes);
+        e.extend_from_slice(code);
         e
+    }
+
+    /// A static ET_EXEC `exit(code)` at the fixed guest base.
+    fn build_exit_elf(code: u16) -> Vec<u8> {
+        build_elf(2, 0x1_0000, None, &exit_words(code))
     }
 
     #[cfg(unix)]
@@ -623,6 +652,53 @@ mod tests {
             .unwrap();
         std::fs::remove_dir_all(&dir).ok();
         assert_eq!(code, 42, "PID 1 read from the root and run to its exit code");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boots_a_dynamic_pid1_via_its_interpreter() {
+        let dir = temp_root("dyn");
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        // PID 1 /init is a dynamic ET_DYN naming interpreter /lib/ld; its own
+        // code never runs (control goes to the interpreter's entry).
+        std::fs::write(
+            dir.join("init"),
+            build_elf(3, 0, Some("/lib/ld"), &exit_words(0)),
+        )
+        .unwrap();
+        // The "interpreter" is a PIE that just exits 55 — standing in for the
+        // real ld-musl, which would instead relocate and jump to the exe.
+        std::fs::write(dir.join("lib/ld"), build_elf(3, 0, None, &exit_words(55))).unwrap();
+
+        let code = Sandbox::builder()
+            .arch(Arch::Aarch64)
+            .prefer_interp(true)
+            .root_dir(&dir)
+            .command(["/init"])
+            .run()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(code, 55, "control transferred to the interpreter's entry");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dynamic_pid1_missing_interpreter_is_a_clear_error() {
+        let dir = temp_root("dyn-noint");
+        std::fs::write(
+            dir.join("init"),
+            build_elf(3, 0, Some("/lib/ld"), &exit_words(0)),
+        )
+        .unwrap();
+        let err = Sandbox::builder()
+            .arch(Arch::Aarch64)
+            .prefer_interp(true)
+            .root_dir(&dir)
+            .command(["/init"])
+            .run()
+            .unwrap_err();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(matches!(err, Error::Config(m) if m.contains("dynamic linker")));
     }
 
     #[cfg(unix)]

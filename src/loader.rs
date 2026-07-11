@@ -34,6 +34,8 @@ const ET_DYN: u16 = 3;
 
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
+/// Program header naming the dynamic linker (`ld-musl`) for a dynamic executable.
+const PT_INTERP: u32 = 3;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -212,10 +214,47 @@ pub fn load_static(
         0
     };
 
-    // Collect every program header up front: PT_LOAD segments get mapped,
-    // PT_DYNAMIC (if present) drives the relocation pass below, and the full
-    // list is needed to translate the dynamic table's link-time vaddrs back
-    // to file offsets.
+    let mapped = map_image(mem, elf, &ehdr, bias)?;
+
+    if ehdr.e_type == ET_DYN {
+        apply_relative_relocations(mem, elf, &mapped.phdrs, bias, ehdr.machine)?;
+    }
+
+    let entry = ehdr
+        .entry
+        .checked_add(bias)
+        .ok_or(LoadError::Malformed("entry + bias overflow"))?;
+
+    // No separate interpreter: AT_BASE is 0.
+    let stack_pointer = build_stack(mem, spec, &ehdr, entry, mapped.phdr_vaddr, 0)?;
+
+    Ok(LoadedImage {
+        entry,
+        stack_pointer,
+        program_break: mapped.program_break,
+        stack_bottom: (mem.base() + mem.size()) - STACK_SIZE,
+    })
+}
+
+/// The result of mapping one ELF image's `PT_LOAD` segments.
+struct MappedImage {
+    /// All program headers (needed for the relocation pass).
+    phdrs: Vec<Phdr>,
+    /// End of the highest segment, page-aligned (the program break / next base).
+    program_break: u64,
+    /// Biased vaddr of the program headers, for `AT_PHDR`.
+    phdr_vaddr: Option<u64>,
+}
+
+/// Parse the program headers and map every `PT_LOAD` segment at `bias`. Shared
+/// by the static loader and the dynamic loader (which maps the executable and
+/// the interpreter at different biases).
+fn map_image(
+    mem: &mut GuestMemory,
+    elf: &[u8],
+    ehdr: &Ehdr,
+    bias: u64,
+) -> Result<MappedImage, LoadError> {
     let mut phdrs = Vec::with_capacity(ehdr.phnum as usize);
     for i in 0..ehdr.phnum {
         let off = ehdr.phoff as usize + i as usize * PHDR_LEN;
@@ -252,8 +291,6 @@ pub fn load_static(
 
         program_break = program_break.max(round_up(vaddr + ph.memsz, PAGE_SIZE));
 
-        // If this segment contains the program headers, record their (biased)
-        // vaddr for AT_PHDR.
         if ph.offset <= ehdr.phoff && ehdr.phoff < ph.offset + ph.filesz {
             phdr_vaddr = Some(vaddr + (ehdr.phoff - ph.offset));
         }
@@ -263,21 +300,86 @@ pub fn load_static(
         return Err(LoadError::Malformed("no loadable segments"));
     }
 
-    if ehdr.e_type == ET_DYN {
-        apply_relative_relocations(mem, elf, &phdrs, bias, ehdr.machine)?;
-    }
+    Ok(MappedImage {
+        phdrs,
+        program_break,
+        phdr_vaddr,
+    })
+}
 
-    let entry = ehdr
+/// The dynamic-linker path (`PT_INTERP`) named by a dynamic executable, if any.
+/// The caller reads that file and hands its bytes to [`load_dynamic`].
+#[must_use]
+pub fn interp_path(elf: &[u8]) -> Option<String> {
+    let ehdr = Ehdr::parse(elf).ok()?;
+    for i in 0..ehdr.phnum {
+        let off = ehdr.phoff as usize + i as usize * PHDR_LEN;
+        let ph = Phdr::parse(elf, off).ok()?;
+        if ph.p_type == PT_INTERP {
+            let start = ph.offset as usize;
+            let end = start + ph.filesz as usize;
+            let bytes = elf.get(start..end)?;
+            let path = bytes.split(|&b| b == 0).next()?;
+            return Some(String::from_utf8_lossy(path).into_owned());
+        }
+    }
+    None
+}
+
+/// Load a dynamically-linked executable and its interpreter (`ld-musl`).
+///
+/// Maps the executable at its bias and the interpreter at a separate base
+/// above it, applies each image's `R_*_RELATIVE` fixups, and starts execution
+/// at the *interpreter's* entry with the auxv describing the executable
+/// (`AT_ENTRY`/`AT_PHDR`/`AT_PHNUM`) and the interpreter's load base
+/// (`AT_BASE`). The interpreter then maps and relocates the executable's shared
+/// libraries at runtime (via file-backed `mmap`) and jumps to `AT_ENTRY`.
+pub fn load_dynamic(
+    mem: &mut GuestMemory,
+    exe: &[u8],
+    interp: &[u8],
+    spec: &ProcessSpec,
+) -> Result<LoadedImage, LoadError> {
+    let exe_hdr = Ehdr::parse(exe)?;
+    let exe_bias = if exe_hdr.e_type == ET_DYN {
+        mem.base()
+    } else {
+        0
+    };
+    let exe_map = map_image(mem, exe, &exe_hdr, exe_bias)?;
+    if exe_hdr.e_type == ET_DYN {
+        apply_relative_relocations(mem, exe, &exe_map.phdrs, exe_bias, exe_hdr.machine)?;
+    }
+    let exe_entry = exe_hdr
         .entry
-        .checked_add(bias)
+        .checked_add(exe_bias)
         .ok_or(LoadError::Malformed("entry + bias overflow"))?;
 
-    let stack_pointer = build_stack(mem, spec, &ehdr, entry, phdr_vaddr)?;
+    // Load the interpreter above the executable image, page-group aligned so it
+    // never overlaps the executable's segments.
+    let interp_hdr = Ehdr::parse(interp)?;
+    let interp_base = if interp_hdr.e_type == ET_DYN {
+        round_up(exe_map.program_break, 0x1_0000)
+    } else {
+        0
+    };
+    let interp_map = map_image(mem, interp, &interp_hdr, interp_base)?;
+    if interp_hdr.e_type == ET_DYN {
+        apply_relative_relocations(mem, interp, &interp_map.phdrs, interp_base, interp_hdr.machine)?;
+    }
+    let interp_entry = interp_hdr
+        .entry
+        .checked_add(interp_base)
+        .ok_or(LoadError::Malformed("interp entry + bias overflow"))?;
+
+    // The stack/auxv describe the *executable* (AT_ENTRY/AT_PHDR/AT_PHNUM), but
+    // AT_BASE is the interpreter's load base and control starts at its entry.
+    let stack_pointer = build_stack(mem, spec, &exe_hdr, exe_entry, exe_map.phdr_vaddr, interp_base)?;
 
     Ok(LoadedImage {
-        entry,
+        entry: interp_entry,
         stack_pointer,
-        program_break,
+        program_break: interp_map.program_break.max(exe_map.program_break),
         stack_bottom: (mem.base() + mem.size()) - STACK_SIZE,
     })
 }
@@ -559,6 +661,7 @@ fn build_stack(
     ehdr: &Ehdr,
     entry: u64,
     phdr_vaddr: Option<u64>,
+    interp_base: u64,
 ) -> Result<u64, LoadError> {
     let top = mem.base() + mem.size();
     let stack_bottom = top - STACK_SIZE;
@@ -596,10 +699,9 @@ fn build_stack(
         (AT_PHENT, PHDR_LEN as u64),
         (AT_PHNUM, u64::from(ehdr.phnum)),
         (AT_PAGESZ, PAGE_SIZE),
-        // No separate interpreter is ever loaded (static executables only,
-        // including static PIEs relocated in-place by this loader), so
-        // AT_BASE is always 0.
-        (AT_BASE, 0),
+        // The dynamic linker's load base (0 when there is no interpreter, i.e.
+        // static executables and static PIEs relocated in-place by this loader).
+        (AT_BASE, interp_base),
         (AT_FLAGS, 0),
         (AT_ENTRY, entry),
         (AT_UID, 0),
@@ -724,6 +826,72 @@ mod tests {
             argv: vec!["prog".into(), "arg1".into()],
             envp: vec!["PATH=/bin".into()],
         }
+    }
+
+    /// A dynamic executable: `PT_INTERP` (naming the linker) + one RWX `PT_LOAD`
+    /// covering the whole file. Layout: `[Ehdr][Phdr×2][interp\0][code]`.
+    fn dyn_elf(machine: u16, e_type: u16, interp: &str, vaddr: u64, code: &[u8]) -> Vec<u8> {
+        let interp_off = EHDR_LEN + 2 * PHDR_LEN;
+        let mut interp_bytes = interp.as_bytes().to_vec();
+        interp_bytes.push(0);
+        let code_off = (interp_off + interp_bytes.len()) as u64;
+        let total = code_off + code.len() as u64;
+        let mut f = vec![0u8; total as usize];
+        f[0..4].copy_from_slice(&ELF_MAGIC);
+        f[4] = ELFCLASS64;
+        f[5] = ELFDATA2LSB;
+        f[6] = 1;
+        f[16..18].copy_from_slice(&e_type.to_le_bytes());
+        f[18..20].copy_from_slice(&machine.to_le_bytes());
+        f[20..24].copy_from_slice(&1u32.to_le_bytes());
+        f[24..32].copy_from_slice(&(vaddr + code_off).to_le_bytes()); // e_entry
+        f[32..40].copy_from_slice(&(EHDR_LEN as u64).to_le_bytes()); // e_phoff
+        f[52..54].copy_from_slice(&(EHDR_LEN as u16).to_le_bytes());
+        f[54..56].copy_from_slice(&(PHDR_LEN as u16).to_le_bytes());
+        f[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
+
+        let p0 = EHDR_LEN;
+        f[p0..p0 + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
+        f[p0 + 4..p0 + 8].copy_from_slice(&PF_R.to_le_bytes());
+        f[p0 + 8..p0 + 16].copy_from_slice(&(interp_off as u64).to_le_bytes()); // p_offset
+        f[p0 + 32..p0 + 40].copy_from_slice(&(interp_bytes.len() as u64).to_le_bytes()); // p_filesz
+
+        let p1 = EHDR_LEN + PHDR_LEN;
+        f[p1..p1 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        f[p1 + 4..p1 + 8].copy_from_slice(&(PF_R | PF_W | PF_X).to_le_bytes());
+        f[p1 + 16..p1 + 24].copy_from_slice(&vaddr.to_le_bytes()); // p_vaddr
+        f[p1 + 24..p1 + 32].copy_from_slice(&vaddr.to_le_bytes()); // p_paddr
+        f[p1 + 32..p1 + 40].copy_from_slice(&total.to_le_bytes()); // p_filesz
+        f[p1 + 40..p1 + 48].copy_from_slice(&total.to_le_bytes()); // p_memsz
+        f[p1 + 48..p1 + 56].copy_from_slice(&PAGE_SIZE.to_le_bytes());
+
+        f[interp_off..interp_off + interp_bytes.len()].copy_from_slice(&interp_bytes);
+        f[code_off as usize..].copy_from_slice(code);
+        f
+    }
+
+    #[test]
+    fn interp_path_reads_pt_interp() {
+        let exe = dyn_elf(EM_AARCH64, ET_DYN, "/lib/ld-musl-aarch64.so.1", 0, &[0xD4, 0, 0, 1]);
+        assert_eq!(interp_path(&exe).as_deref(), Some("/lib/ld-musl-aarch64.so.1"));
+        // A plain static ELF has no interpreter.
+        let stat = tiny_elf(EM_AARCH64, 0x1_0000, &[0xD4, 0, 0, 1]);
+        assert_eq!(interp_path(&stat), None);
+    }
+
+    #[test]
+    fn load_dynamic_maps_both_and_starts_at_the_interpreter() {
+        let mut mem = GuestMemory::new(0x1_0000, 256 * PAGE_SIZE);
+        // Executable: dynamic, its own code never runs (control goes to interp).
+        let exe = dyn_elf(EM_AARCH64, ET_DYN, "/lib/ld", 0, &[0xD4, 0, 0, 1]);
+        // Interpreter: a static ELF at a high, non-overlapping vaddr.
+        let interp = tiny_elf(EM_AARCH64, 0x8_0000, &[0xD4, 0, 0, 1]);
+        let img = load_dynamic(&mut mem, &exe, &interp, &spec()).unwrap();
+        // Entry is the interpreter's entry (its vaddr + header size), not the exe's.
+        assert_eq!(img.entry, 0x8_0000 + (EHDR_LEN + PHDR_LEN) as u64);
+        // Both images are mapped: the exe at the guest base, the interp at 0x80000.
+        assert!(mem.read_u32(mem.base()).is_ok(), "exe mapped at base");
+        assert!(mem.read_u32(0x8_0000).is_ok(), "interp mapped");
     }
 
     /// Build a minimal static-PIE ELF64 (`ET_DYN`, no `PT_INTERP`): a single
