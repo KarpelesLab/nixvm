@@ -1,9 +1,10 @@
 name: Deploy browser demo to GitHub Pages
 
-# Builds src/wasm.rs (the `wasm` feature) to WebAssembly with wasm-pack and
-# publishes web/ + the wasm-pack `pkg/` output as a GitHub Pages site: a
-# try-before-install demo where visitors pick a static ELF and watch it run
-# on nixvm's software interpreter, entirely client-side.
+# Builds src/wasm.rs (the `wasm` feature) to WebAssembly with wasm-pack,
+# builds the Vue + xterm.js frontend in web/ with Vite, assembles them
+# together with a bundled Alpine minirootfs, and publishes the result as a
+# GitHub Pages site: a real Alpine Linux userland, booted and driven through
+# an interactive shell, entirely client-side.
 
 on:
   push:
@@ -43,28 +44,52 @@ jobs:
         with:
           version: "latest"
 
-      - name: Build the wasm demo (src/wasm.rs, `wasm` feature)
+      - name: Build the wasm sandbox (src/wasm.rs, `wasm` feature)
         # wasm-pack already builds only the library target (`cargo build --lib`)
         # internally, so it never touches src/bin/run-elf.rs (a native dev
         # harness gated on `cfg(unix)`). Passing an extra `-- --lib` is a
         # duplicate arg that wasm-pack rejects.
         run: wasm-pack build --target web --no-default-features --features wasm
 
-      - name: Assemble the Pages site
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build the frontend (Vite)
+        working-directory: web
+        run: npm run build
+
+      - name: Fetch the Alpine minirootfs
+        # Resolve the current v3.20 aarch64 minirootfs filename from the
+        # release manifest rather than hardcoding a version, so this keeps
+        # working as Alpine ships point releases.
         run: |
-          set -eu
-          rm -rf site
-          mkdir -p site
-          cp -r web/. site/
-          mkdir -p site/pkg
-          cp pkg/nixvm.js pkg/nixvm_bg.wasm site/pkg/
-          [ -f pkg/nixvm.d.ts ] && cp pkg/nixvm.d.ts site/pkg/ || true
-          [ -f pkg/nixvm_bg.wasm.d.ts ] && cp pkg/nixvm_bg.wasm.d.ts site/pkg/ || true
+          set -euo pipefail
+          VER=$(curl -sSL https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/latest-releases.yaml | grep -m1 -oE 'alpine-minirootfs-[0-9.]+-aarch64.tar.gz')
+          echo "Resolved Alpine minirootfs: $VER"
+          curl -sSL -o web/dist/rootfs.tar.gz "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/$VER"
+
+      - name: Copy the wasm-pack output into the built site
+        # web/dist/index.html's `import('./pkg/nixvm.js')` (see
+        # web/src/components/NixTerm.vue) expects pkg/ to sit next to it.
+        run: |
+          set -euo pipefail
+          mkdir -p web/dist/pkg
+          cp pkg/nixvm.js pkg/nixvm_bg.wasm web/dist/pkg/
+          [ -f pkg/nixvm.d.ts ] && cp pkg/nixvm.d.ts web/dist/pkg/ || true
+          [ -f pkg/nixvm_bg.wasm.d.ts ] && cp pkg/nixvm_bg.wasm.d.ts web/dist/pkg/ || true
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: site
+          path: web/dist
 
   deploy:
     needs: build

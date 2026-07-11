@@ -1,0 +1,7 @@
+node_modules/
+dist/
+
+# Local-dev-only copies of build artifacts that CI assembles separately
+# (see README.md) — never committed.
+public/pkg/
+public/rootfs.tar.gz
