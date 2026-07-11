@@ -97,8 +97,7 @@ fn main() {
 fn basename(p: &str) -> String {
     PathBuf::from(p)
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.to_string())
+        .map_or_else(|| p.to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 fn page_down(v: u64) -> u64 {

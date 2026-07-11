@@ -83,6 +83,8 @@ struct Aarch64Interp {
     pc: u64,
     tpidr: u64,
     flags: Flags,
+    /// SIMD/FP registers v0..v31 (128-bit; D/S/H/B views are the low bits).
+    v: [u128; 32],
 }
 
 impl Aarch64Interp {
@@ -93,7 +95,33 @@ impl Aarch64Interp {
             pc: entry,
             tpidr: 0,
             flags: Flags::default(),
+            v: [0; 32],
         }
+    }
+
+    /// Load or store `1 << scale` bytes of SIMD register `rt` at `addr`.
+    fn ldst_vec(
+        &mut self,
+        addr: u64,
+        scale: u32,
+        is_load: bool,
+        rt: usize,
+        mem: &mut GuestMemory,
+    ) -> Step {
+        let nbytes = 1usize << scale; // 1..=16
+        if is_load {
+            let mut buf = [0u8; 16];
+            if mem.read(addr, &mut buf[..nbytes]).is_err() {
+                return Step::Fault { addr, write: false };
+            }
+            self.v[rt] = u128::from_le_bytes(buf); // sub-128 loads zero-extend
+        } else {
+            let bytes = self.v[rt].to_le_bytes();
+            if mem.write(addr, &bytes[..nbytes]).is_err() {
+                return Step::Fault { addr, write: true };
+            }
+        }
+        Step::Next
     }
 
     /// Read a register with zero-register semantics (index 31 → 0).
@@ -513,27 +541,70 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
-        // ---- 3-source multiply: MADD/MSUB (MUL/MNEG are aliases) ----
-        if (instr >> 24) & 0x1f == 0b1_1011 && (instr >> 21) & 0x7 == 0 {
+        // ---- 3-source: MADD/MSUB, S/UMADDL, S/UMSUBL, S/UMULH ----
+        if (instr >> 24) & 0x1f == 0b1_1011 {
             let sf = (instr >> 31) & 1;
+            let op31 = (instr >> 21) & 0x7;
             let o0 = (instr >> 15) & 1;
             let rm = reg_field(instr, 16);
             let ra = reg_field(instr, 10);
             let rn = reg_field(instr, 5);
             let rd = reg_field(instr, 0);
-            let prod = self.read_x(rn).wrapping_mul(self.read_x(rm));
-            let acc = self.read_x(ra);
-            let r = if o0 == 0 {
-                acc.wrapping_add(prod)
-            } else {
-                acc.wrapping_sub(prod)
+            let (n, m, a) = (self.read_x(rn), self.read_x(rm), self.read_x(ra));
+            let r = match op31 {
+                0b000 => {
+                    // MADD/MSUB
+                    let prod = n.wrapping_mul(m);
+                    let r = if o0 == 0 { a.wrapping_add(prod) } else { a.wrapping_sub(prod) };
+                    mask_sf(r, sf)
+                }
+                0b001 => {
+                    // SMADDL/SMSUBL: 64 += sext(Wn) * sext(Wm)
+                    let prod = i64::from(n as i32).wrapping_mul(i64::from(m as i32)) as u64;
+                    if o0 == 0 { a.wrapping_add(prod) } else { a.wrapping_sub(prod) }
+                }
+                0b101 => {
+                    // UMADDL/UMSUBL: 64 += zext(Wn) * zext(Wm)
+                    let prod = u64::from(n as u32).wrapping_mul(u64::from(m as u32));
+                    if o0 == 0 { a.wrapping_add(prod) } else { a.wrapping_sub(prod) }
+                }
+                0b010 => ((i128::from(n as i64).wrapping_mul(i128::from(m as i64))) >> 64) as u64, // SMULH
+                0b110 => ((u128::from(n).wrapping_mul(u128::from(m))) >> 64) as u64,                // UMULH
+                _ => return Step::Illegal,
+            };
+            self.write_x(rd, r);
+            return Step::Next;
+        }
+
+        // ---- 1-source: RBIT/REV16/REV32/REV/CLZ/CLS ----
+        if (instr >> 21) & 0x3ff == 0b10_1101_0110 {
+            let sf = (instr >> 31) & 1;
+            let opcode = (instr >> 10) & 0x3f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let width = if sf == 1 { 64u32 } else { 32 };
+            let x = if sf == 1 { self.read_x(rn) } else { self.read_x(rn) & 0xffff_ffff };
+            let r = match opcode {
+                0b000000 => rbit(x, width),
+                0b000001 => rev16(x, width),
+                0b000010 => {
+                    if sf == 1 { rev32(x) } else { u64::from((x as u32).swap_bytes()) }
+                }
+                0b000011 => x.swap_bytes(), // REV (64-bit)
+                0b000100 => u64::from(if sf == 1 {
+                    x.leading_zeros()
+                } else {
+                    (x as u32).leading_zeros()
+                }),
+                0b000101 => u64::from(cls(x, width)),
+                _ => return Step::Illegal,
             };
             self.write_x(rd, mask_sf(r, sf));
             return Step::Next;
         }
 
         // ---- 2-source: UDIV/SDIV and variable shifts LSLV/LSRV/ASRV/RORV ----
-        if (instr >> 21) & 0xff == 0b1101_0110 {
+        if (instr >> 21) & 0x3ff == 0b00_1101_0110 {
             let sf = (instr >> 31) & 1;
             let opcode = (instr >> 10) & 0x3f;
             let rm = reg_field(instr, 16);
@@ -553,6 +624,31 @@ impl Aarch64Interp {
                 _ => return Step::Illegal,
             };
             self.write_x(rd, mask_sf(r, sf));
+            return Step::Next;
+        }
+
+        // ---- conditional compare: CCMP/CCMN (immediate or register) ----
+        if (instr >> 21) & 0xff == 0b1101_0010 {
+            let sf = (instr >> 31) & 1;
+            let op = (instr >> 30) & 1; // 1 = CCMP (subtract), 0 = CCMN (add)
+            let cond = (instr >> 12) & 0xf;
+            let rn = reg_field(instr, 5);
+            let nzcv = instr & 0xf;
+            let operand = if (instr >> 11) & 1 == 1 {
+                u64::from((instr >> 16) & 0x1f) // immediate
+            } else {
+                self.read_x(reg_field(instr, 16)) // register
+            };
+            if self.cond_holds(cond) {
+                self.addsub_flags(self.read_x(rn), operand, op == 1, sf == 1);
+            } else {
+                self.flags = Flags {
+                    n: nzcv & 8 != 0,
+                    z: nzcv & 4 != 0,
+                    c: nzcv & 2 != 0,
+                    v: nzcv & 1 != 0,
+                };
+            }
             return Step::Next;
         }
 
@@ -580,6 +676,47 @@ impl Aarch64Interp {
                 }
             };
             self.write_x(rd, mask_sf(r, sf));
+            return Step::Next;
+        }
+
+        // ---- SIMD/FP load/store pair: LDP/STP q/d/s ----
+        if (instr >> 27) & 0x7 == 0b101 && (instr >> 26) & 1 == 1 {
+            let opc = (instr >> 30) & 3;
+            if opc == 3 {
+                return Step::Illegal;
+            }
+            let nbytes = 4usize << opc; // S=4, D=8, Q=16
+            let class = (instr >> 23) & 3; // 1 post, 2 offset, 3 pre
+            let is_load = (instr >> 22) & 1 == 1;
+            let imm7 = sign_extend(u64::from((instr >> 15) & 0x7f), 7);
+            let rt2 = reg_field(instr, 10);
+            let rn = reg_field(instr, 5);
+            let rt = reg_field(instr, 0);
+            let offset = imm7 * nbytes as i64;
+            let base = self.read_sp(rn);
+            let addr = if class == 1 {
+                base
+            } else {
+                (base as i64).wrapping_add(offset) as u64
+            };
+            for (i, r) in [rt, rt2].into_iter().enumerate() {
+                let a = addr.wrapping_add((i * nbytes) as u64);
+                if is_load {
+                    let mut buf = [0u8; 16];
+                    if mem.read(a, &mut buf[..nbytes]).is_err() {
+                        return Step::Fault { addr: a, write: false };
+                    }
+                    self.v[r] = u128::from_le_bytes(buf);
+                } else {
+                    let bytes = self.v[r].to_le_bytes();
+                    if mem.write(a, &bytes[..nbytes]).is_err() {
+                        return Step::Fault { addr: a, write: true };
+                    }
+                }
+            }
+            if class == 1 || class == 3 {
+                self.write_sp(rn, (base as i64).wrapping_add(offset) as u64);
+            }
             return Step::Next;
         }
 
@@ -708,6 +845,75 @@ impl Aarch64Interp {
             return self.ldst(addr, size, opc, rt, mem);
         }
 
+        // ---- SIMD/FP load/store register, unsigned immediate offset ----
+        if (instr >> 27) & 0x7 == 0b111 && (instr >> 24) & 0x3 == 0b01 && (instr >> 26) & 1 == 1 {
+            let size = (instr >> 30) & 3;
+            let opc = (instr >> 22) & 3;
+            let scale = if opc & 2 != 0 { 4 } else { size }; // opc<1> set => 128-bit
+            let imm12 = u64::from((instr >> 10) & 0xfff);
+            let rn = reg_field(instr, 5);
+            let rt = reg_field(instr, 0);
+            let addr = self.read_sp(rn).wrapping_add(imm12 << scale);
+            return self.ldst_vec(addr, scale, opc & 1 == 1, rt, mem);
+        }
+
+        // ---- SIMD/FP load/store register, immediate pre/post/unscaled ----
+        if (instr >> 27) & 0x7 == 0b111
+            && (instr >> 24) & 0x3 == 0b00
+            && (instr >> 26) & 1 == 1
+            && (instr >> 21) & 1 == 0
+        {
+            let size = (instr >> 30) & 3;
+            let opc = (instr >> 22) & 3;
+            let scale = if opc & 2 != 0 { 4 } else { size };
+            let imm9 = sign_extend(u64::from((instr >> 12) & 0x1ff), 9);
+            let idx = (instr >> 10) & 3;
+            let rn = reg_field(instr, 5);
+            let rt = reg_field(instr, 0);
+            let base = self.read_sp(rn);
+            let addr = if idx == 0b01 {
+                base
+            } else {
+                (base as i64).wrapping_add(imm9) as u64
+            };
+            let step = self.ldst_vec(addr, scale, opc & 1 == 1, rt, mem);
+            if matches!(step, Step::Next) && (idx == 0b01 || idx == 0b11) {
+                self.write_sp(rn, (base as i64).wrapping_add(imm9) as u64);
+            }
+            return step;
+        }
+
+        // ---- DUP Vd.T, Rn (replicate a GP register across lanes) ----
+        if (instr >> 21) & 0x1ff == 0b0_0111_0000 && (instr >> 10) & 0x3f == 0b00_0011 {
+            let q = (instr >> 30) & 1;
+            let imm5 = (instr >> 16) & 0x1f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize = elem_bits(imm5);
+            let elem = u128::from(self.read_x(rn)) & ones_u128(esize);
+            let width = if q == 1 { 128 } else { 64 };
+            let mut val = 0u128;
+            let mut shift = 0;
+            while shift < width {
+                val |= elem << shift;
+                shift += esize;
+            }
+            self.v[rd] = val;
+            return Step::Next;
+        }
+
+        // ---- UMOV Rd, Vn.Ts[index] (extract a lane to a GP register) ----
+        if (instr >> 21) & 0x1ff == 0b0_0111_0000 && (instr >> 10) & 0x3f == 0b00_1111 {
+            let imm5 = (instr >> 16) & 0x1f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize = elem_bits(imm5);
+            let index = imm5 >> (esize / 8).trailing_zeros().wrapping_add(1);
+            let elem = (self.v[rn] >> (u128::from(index) * u128::from(esize))) & ones_u128(esize);
+            self.write_x(rd, elem as u64);
+            return Step::Next;
+        }
+
         // ---- TBZ / TBNZ (test bit and branch) ----
         if (instr >> 25) & 0x3f == 0b01_1011 {
             let op = (instr >> 24) & 1;
@@ -822,6 +1028,48 @@ fn shift_reg(v: u64, shift_type: u32, amount: u32, sf: bool) -> u64 {
     if sf { r } else { r & 0xffff_ffff }
 }
 
+/// Reverse the low `width` bits of `v`.
+fn rbit(v: u64, width: u32) -> u64 {
+    if width == 64 {
+        v.reverse_bits()
+    } else {
+        u64::from((v as u32).reverse_bits())
+    }
+}
+
+/// Reverse the byte order within each 16-bit halfword across `width` bits.
+fn rev16(v: u64, width: u32) -> u64 {
+    let mut r = 0u64;
+    let mut i = 0;
+    while i < width {
+        let h = ((v >> i) & 0xffff) as u16;
+        r |= u64::from(h.swap_bytes()) << i;
+        i += 16;
+    }
+    r
+}
+
+/// Reverse the byte order within each 32-bit word (64-bit REV32).
+fn rev32(v: u64) -> u64 {
+    u64::from((v as u32).swap_bytes()) | (u64::from(((v >> 32) as u32).swap_bytes()) << 32)
+}
+
+/// Count leading sign bits minus one (CLS) over the low `width` bits.
+fn cls(v: u64, width: u32) -> u32 {
+    let sign = (v >> (width - 1)) & 1;
+    let mut count = 0;
+    let mut i = width - 1;
+    while i > 0 {
+        i -= 1;
+        if (v >> i) & 1 == sign {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
 /// Unsigned divide with aarch64 semantics (division by zero yields 0).
 fn udiv(a: u64, b: u64, sf: bool) -> u64 {
     if sf {
@@ -861,6 +1109,24 @@ fn extend_reg(val: u64, option: u32, shift: u32) -> u64 {
 /// `n` low bits set.
 fn ones(n: u32) -> u64 {
     if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+}
+
+/// `n` low bits set, as a `u128`.
+fn ones_u128(n: u32) -> u128 {
+    if n >= 128 { u128::MAX } else { (1u128 << n) - 1 }
+}
+
+/// SIMD element size in bits from a `Q`/`DUP`/`UMOV` `imm5` field.
+fn elem_bits(imm5: u32) -> u32 {
+    if imm5 & 1 != 0 {
+        8
+    } else if imm5 & 2 != 0 {
+        16
+    } else if imm5 & 4 != 0 {
+        32
+    } else {
+        64
+    }
 }
 
 /// Rotate the low `size` bits of `v` right by `r`.

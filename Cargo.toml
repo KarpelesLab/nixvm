@@ -67,6 +67,8 @@ cast_sign_loss = "allow"
 cast_possible_wrap = "allow"
 # Instruction decode legitimately tests fixed opcode fields as `x & mask == n`.
 verbose_bit_mask = "allow"
+# Binary opcode literals (0b000101 …) read best without digit separators.
+unreadable_literal = "allow"
 
 [profile.release]
 lto = "thin"
