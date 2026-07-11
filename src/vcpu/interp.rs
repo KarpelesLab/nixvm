@@ -29,7 +29,16 @@
 //! `FNMADD`/`FNMSUB`, `FABS`/`FNEG`/`FSQRT`/`FRINT*`/`FCVT` including half
 //! precision, `FMAX`/`FMIN`/`FMAXNM`/`FMINNM`/`FNMUL`, `FCMP`/`FCCMP`/
 //! `FCSEL`, `SCVTF`/`UCVTF`/`FCVTZS`/`FCVTZU`, `FMOV` in its GPR/immediate/
-//! vector forms). Anything else surfaces as [`Exit::IllegalInstruction`].
+//! vector forms), NEON permute (`TBL`/`TBX`, `EXT`, `ZIP1`/`ZIP2`/`UZP1`/
+//! `UZP2`/`TRN1`/`TRN2`, vector `REV64`/`REV32`/`REV16`), widening/narrowing
+//! (`XTN`/`XTN2`, `SQXTN`/`UQXTN`/`SQXTUN` and their `2` forms, `SSHLL`/
+//! `USHLL`, `UADDW`/`SADDW`, `ADDHN`), saturating integer arithmetic
+//! (`SQADD`/`UQADD`/`SQSUB`/`UQSUB`, `SQSHL`/`UQSHL`/`SQRSHL`/`UQRSHL`,
+//! `SUQADD`/`USQADD`), pairwise (`ADDP`/`UMAXP`/`UMINP`/`SMAXP`/`SMINP`/
+//! `FADDP`/`FMAXP`, vector and scalar), across-lanes (`SMAXV`/`SMINV`/
+//! `UMAXV`/`UMINV` alongside `ADDV`/`UADDLV`), and scalar `CRC32B`/`H`/`W`/
+//! `X` + `CRC32CB`/`H`/`W`/`X`. Anything else surfaces as
+//! [`Exit::IllegalInstruction`].
 
 use crate::abi::Arch;
 
@@ -924,7 +933,14 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
-        // ---- 2-source: UDIV/SDIV and variable shifts LSLV/LSRV/ASRV/RORV ----
+        // ---- 2-source: UDIV/SDIV, variable shifts LSLV/LSRV/ASRV/RORV, and
+        // CRC32B/H/W/X + CRC32CB/H/W/X (scalar CRC) ----
+        // CRC32/CRC32C share this exact 10-bit outer class with UDIV/SDIV/the
+        // shifts (opcode 0b01_0000..=0b01_0111, vs their 0b00_0010..=
+        // 0b00_1011), so they're handled as more `opcode` cases here rather
+        // than a separate arm — a separate arm placed *after* this one would
+        // never be reached, since this arm's catch-all already claims every
+        // instruction matching the outer mask.
         if (instr >> 21) & 0x3ff == 0b00_1101_0110 {
             let sf = (instr >> 31) & 1;
             let opcode = (instr >> 10) & 0x3f;
@@ -942,6 +958,23 @@ impl Aarch64Interp {
                 0b00_1001 => shift_reg(a, 1, amount, sf == 1),
                 0b00_1010 => shift_reg(a, 2, amount, sf == 1),
                 0b00_1011 => shift_reg(a, 3, amount, sf == 1),
+                0b01_0000..=0b01_0111 => {
+                    // CRC32<B/H/W/X> (bit12=0) / CRC32C<B/H/W/X> (bit12=1);
+                    // the low 2 bits of opcode select B/H/W/X (0/1/2/3).
+                    let sz = opcode & 3;
+                    if (sz == 3) != (sf == 1) {
+                        return Step::Illegal; // the X form requires sf=1
+                    }
+                    let is_c = (opcode >> 2) & 1 == 1;
+                    let nbytes = 1usize << sz;
+                    let val = b & ones((nbytes * 8) as u32);
+                    let poly = if is_c { 0x82F6_3B78u32 } else { 0xEDB8_8320u32 };
+                    let mut crc = a as u32;
+                    for i in 0..nbytes {
+                        crc = crc32_step(crc, (val >> (i * 8)) as u8, poly);
+                    }
+                    u64::from(crc)
+                }
                 _ => return Step::Illegal,
             };
             self.write_x(rd, mask_sf(r, sf));
@@ -1497,6 +1530,120 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- TBL/TBX Vd.Ta, {Vn..Vn+len}, Vm.Ta (table vector lookup) ----
+        // `0 Q 0 01110 000 Rm 0 len op 00 Rn Rd`; len (1-4) selects how many
+        // consecutive 16B table registers (Vn, Vn+1, ... mod 32) participate;
+        // op selects TBL (out-of-range index -> 0) vs TBX (out-of-range index
+        // leaves the destination lane unchanged). Distinct opcode-field bit10
+        // (0 here, 1 throughout the DUP/INS/UMOV/SMOV family above) keeps
+        // this from ever shadowing — or being shadowed by — those arms.
+        if (instr >> 24) & 0x1f == 0b0_1110
+            && (instr >> 29) & 1 == 0
+            && (instr >> 21) & 0x7 == 0
+            && (instr >> 15) & 1 == 0
+            && (instr >> 10) & 0x3 == 0
+        {
+            let q = (instr >> 30) & 1;
+            let len = ((instr >> 13) & 3) + 1; // number of 16B table registers
+            let is_tbx = (instr >> 12) & 1 == 1;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let table_bytes = (len as usize) * 16;
+            let idx_bytes = self.v[rm].to_le_bytes();
+            let nbytes = if q == 1 { 16usize } else { 8 };
+            let mut out = self.v[rd].to_le_bytes();
+            for i in 0..nbytes {
+                let idx = idx_bytes[i] as usize;
+                if idx < table_bytes {
+                    let reg = (rn + idx / 16) & 0x1f;
+                    out[i] = self.v[reg].to_le_bytes()[idx % 16];
+                } else if !is_tbx {
+                    out[i] = 0;
+                } // TBX: out-of-range leaves the destination byte unchanged.
+            }
+            for b in out.iter_mut().skip(nbytes) {
+                *b = 0;
+            }
+            self.v[rd] = u128::from_le_bytes(out);
+            return Step::Next;
+        }
+
+        // ---- EXT Vd.T, Vn.T, Vm.T, #imm4 (extract from a register pair) ----
+        if (instr >> 24) & 0x3f == 0b10_1110
+            && (instr >> 22) & 3 == 0
+            && (instr >> 21) & 1 == 0
+            && (instr >> 15) & 1 == 0
+            && (instr >> 10) & 1 == 0
+        {
+            let q = (instr >> 30) & 1;
+            let imm4 = (instr >> 11) & 0xf;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let size = if q == 1 { 16usize } else { 8 };
+            let mut concat = [0u8; 32];
+            concat[..16].copy_from_slice(&self.v[rn].to_le_bytes());
+            concat[16..].copy_from_slice(&self.v[rm].to_le_bytes());
+            let off = imm4 as usize;
+            let mut out = [0u8; 16];
+            out[..size].copy_from_slice(&concat[off..off + size]);
+            self.v[rd] = u128::from_le_bytes(out);
+            return Step::Next;
+        }
+
+        // ---- ZIP1/ZIP2/UZP1/UZP2/TRN1/TRN2 (vector permute) ----
+        if (instr >> 24) & 0x1f == 0b0_1110
+            && (instr >> 29) & 1 == 0
+            && (instr >> 21) & 1 == 0
+            && (instr >> 15) & 1 == 0
+            && (instr >> 11) & 1 == 1
+            && (instr >> 10) & 1 == 0
+        {
+            let q = (instr >> 30) & 1;
+            let size = (instr >> 22) & 3;
+            let opcode = (instr >> 12) & 0x7;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize = 8u32 << size;
+            let width = if q == 1 { 128 } else { 64 };
+            let lanes = width / esize;
+            let half = lanes / 2;
+            let mask = ones_u128(esize);
+            let lane = |v: u128, i: u32| (v >> (i * esize)) & mask;
+            let second = opcode & 0b100 != 0; // "2" (vs "1") variant
+            let mut result = 0u128;
+            match opcode & 0b011 {
+                0b11 => {
+                    // ZIP1/ZIP2: interleave one half of Vn with the same half of Vm.
+                    let base = if second { half } else { 0 };
+                    for i in 0..half {
+                        result |= lane(self.v[rn], base + i) << (2 * i * esize);
+                        result |= lane(self.v[rm], base + i) << ((2 * i + 1) * esize);
+                    }
+                }
+                0b01 => {
+                    // UZP1/UZP2: gather every-other element (even/odd) from Vn then Vm.
+                    let start = u32::from(second);
+                    for i in 0..half {
+                        result |= lane(self.v[rn], 2 * i + start) << (i * esize);
+                        result |= lane(self.v[rm], 2 * i + start) << ((half + i) * esize);
+                    }
+                }
+                _ => {
+                    // TRN1/TRN2: interleave even/odd elements from Vn and Vm.
+                    let start = u32::from(second);
+                    for i in 0..half {
+                        result |= lane(self.v[rn], 2 * i + start) << (2 * i * esize);
+                        result |= lane(self.v[rm], 2 * i + start) << ((2 * i + 1) * esize);
+                    }
+                }
+            }
+            self.v[rd] = result & (if q == 1 { u128::MAX } else { ones_u128(64) });
+            return Step::Next;
+        }
+
         // ---- FMOV between GP and SIMD/FP registers (bit-exact, no convert) ----
         if (instr >> 24) & 0x7f == 0b0011110 && (instr >> 21) & 1 == 1 && (instr >> 10) & 0x3f == 0
         {
@@ -1894,6 +2041,133 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- SIMD three-same pairwise (integer): ADDP/SMAXP/SMINP/UMAXP/
+        // UMINP (vector) ----
+        // Shares its outer bits with the general integer three-same arm below
+        // but these opcodes (0b10111/0b10100/0b10101) aren't in that arm's op
+        // table, so — per this file's ordering discipline — this
+        // specific-opcode arm must come first, or the general arm's
+        // catch-all would swallow these as Illegal.
+        if (instr >> 24) & 0x9f == 0b0_0001110
+            && (instr >> 21) & 1 == 1
+            && (instr >> 10) & 1 == 1
+            && matches!((instr >> 11) & 0x1f, 0b10111 | 0b10100 | 0b10101)
+        {
+            let q = (instr >> 30) & 1;
+            let uns = (instr >> 29) & 1;
+            let size = (instr >> 22) & 3;
+            let opcode = (instr >> 11) & 0x1f;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            if opcode == 0b10111 && uns == 1 {
+                return Step::Illegal; // no unsigned ADDP
+            }
+            let esize = 8u32 << size;
+            let lanes = (if q == 1 { 128 } else { 64 }) / esize;
+            let mask = ones_u128(esize);
+            let lane = |v: u128, i: u32| (v >> (i * esize)) & mask;
+            // concat[j] = Vn[j] for j < lanes, else Vm[j - lanes] — pairwise
+            // ops act on adjacent elements of Vn:Vm concatenated together.
+            let concat = |v0: u128, v1: u128, j: u32| {
+                if j < lanes { lane(v0, j) } else { lane(v1, j - lanes) }
+            };
+            let mut result = 0u128;
+            for i in 0..lanes {
+                let (lhs, rhs) = (
+                    concat(self.v[rn], self.v[rm], 2 * i),
+                    concat(self.v[rn], self.v[rm], 2 * i + 1),
+                );
+                let pair = match (opcode, uns) {
+                    (0b10111, _) => lhs.wrapping_add(rhs) & mask, // ADDP
+                    (0b10100, 0) => {
+                        // SMAXP
+                        if sign_extend(lhs as u64, esize) >= sign_extend(rhs as u64, esize) {
+                            lhs
+                        } else {
+                            rhs
+                        }
+                    }
+                    (0b10100, _) => {
+                        if lhs >= rhs { lhs } else { rhs } // UMAXP
+                    }
+                    (0b10101, 0) => {
+                        // SMINP
+                        if sign_extend(lhs as u64, esize) <= sign_extend(rhs as u64, esize) {
+                            lhs
+                        } else {
+                            rhs
+                        }
+                    }
+                    _ => {
+                        if lhs <= rhs { lhs } else { rhs } // UMINP
+                    }
+                };
+                result |= pair << (i * esize);
+            }
+            self.v[rd] = result;
+            return Step::Next;
+        }
+
+        // ---- FADDP/FMAXP (vector, pairwise floating-point) ----
+        // Same outer bits as the FP three-same arm above, but the (U=1, a=0,
+        // opcode=0b11010/0b11110) combination isn't in that arm's `matches!`
+        // list, so — per the ordering discipline — this must be checked
+        // before the general integer three-same arm's catch-all below.
+        if (instr >> 24) & 0x9f == 0b0_0001110
+            && (instr >> 21) & 1 == 1
+            && (instr >> 10) & 1 == 1
+            && (instr >> 29) & 1 == 1
+            && (instr >> 23) & 1 == 0
+            && matches!((instr >> 11) & 0x1f, 0b11010 | 0b11110)
+        {
+            let q = (instr >> 30) & 1;
+            let dbl = (instr >> 22) & 1;
+            let is_max = (instr >> 11) & 0x1f == 0b11110;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            if dbl == 1 && q == 0 {
+                return Step::Illegal;
+            }
+            self.v[rd] = if dbl == 0 {
+                let lanes = if q == 1 { 4 } else { 2 };
+                let lane =
+                    |v: u128, i: u32| f32::from_bits(((v >> (i * 32)) & 0xffff_ffff) as u32);
+                let concat = |v0: u128, v1: u128, j: u32| {
+                    if j < lanes { lane(v0, j) } else { lane(v1, j - lanes) }
+                };
+                let mut result = 0u128;
+                for i in 0..lanes {
+                    let (a, b) = (
+                        concat(self.v[rn], self.v[rm], 2 * i),
+                        concat(self.v[rn], self.v[rm], 2 * i + 1),
+                    );
+                    let r = if is_max { fmax32(a, b) } else { a + b };
+                    result |= u128::from(r.to_bits()) << (i * 32);
+                }
+                result
+            } else {
+                let lane = |v: u128, i: u32| {
+                    f64::from_bits(((v >> (i * 64)) & u128::from(u64::MAX)) as u64)
+                };
+                let concat = |v0: u128, v1: u128, j: u32| {
+                    if j < 2 { lane(v0, j) } else { lane(v1, j - 2) }
+                };
+                let mut result = 0u128;
+                for i in 0..2u32 {
+                    let (a, b) = (
+                        concat(self.v[rn], self.v[rm], 2 * i),
+                        concat(self.v[rn], self.v[rm], 2 * i + 1),
+                    );
+                    let r = if is_max { fmax64(a, b) } else { a + b };
+                    result |= u128::from(r.to_bits()) << (i * 64);
+                }
+                result
+            };
+            return Step::Next;
+        }
+
         // ---- SIMD three-same (integer): ADD/SUB/compares/SSHL/USHL (vector) ----
         if (instr >> 24) & 0x9f == 0b0_0001110 && (instr >> 21) & 1 == 1 && (instr >> 10) & 1 == 1 {
             let q = (instr >> 30) & 1;
@@ -1904,7 +2178,8 @@ impl Aarch64Interp {
             let rn = reg_field(instr, 5);
             let rd = reg_field(instr, 0);
             // 0=ADD 1=SUB 2=CMEQ 3=CMGT 4=CMGE 5=CMHI 6=CMHS 7=SSHL 8=USHL 9=MUL
-            // 10=MLA 11=MLS 12=SMAX 13=SMIN 14=UMAX 15=UMIN.
+            // 10=MLA 11=MLS 12=SMAX 13=SMIN 14=UMAX 15=UMIN 16=SQADD 17=UQADD
+            // 18=SQSUB 19=UQSUB 20=SQSHL 21=UQSHL 22=SQRSHL 23=UQRSHL.
             let op = match (u, opcode) {
                 (0, 0b10000) => 0u8,
                 (1, 0b10000) => 1,
@@ -1922,6 +2197,14 @@ impl Aarch64Interp {
                 (0, 0b01101) => 13,
                 (1, 0b01100) => 14,
                 (1, 0b01101) => 15,
+                (0, 0b00001) => 16,
+                (1, 0b00001) => 17,
+                (0, 0b00101) => 18,
+                (1, 0b00101) => 19,
+                (0, 0b01001) => 20,
+                (1, 0b01001) => 21,
+                (0, 0b01011) => 22,
+                (1, 0b01011) => 23,
                 _ => return Step::Illegal,
             };
             let esize = 8u32 << size;
@@ -2010,13 +2293,29 @@ impl Aarch64Interp {
                             y
                         } // UMAX
                     }
-                    _ => {
+                    15 => {
                         if x < y {
                             x
                         } else {
                             y
-                        } // UMIN (op == 15)
+                        } // UMIN
                     }
+                    16 => signed_sat(
+                        i128::from(sign_extend(x as u64, esize))
+                            + i128::from(sign_extend(y as u64, esize)),
+                        esize,
+                    ), // SQADD
+                    17 => unsigned_sat(x as i128 + y as i128, esize), // UQADD
+                    18 => signed_sat(
+                        i128::from(sign_extend(x as u64, esize))
+                            - i128::from(sign_extend(y as u64, esize)),
+                        esize,
+                    ), // SQSUB
+                    19 => unsigned_sat(x as i128 - y as i128, esize), // UQSUB
+                    20 => sat_shl(x, sign_extend(y as u64 & 0xff, 8), esize, true, false), // SQSHL
+                    21 => sat_shl(x, sign_extend(y as u64 & 0xff, 8), esize, false, false), // UQSHL
+                    22 => sat_shl(x, sign_extend(y as u64 & 0xff, 8), esize, true, true), // SQRSHL
+                    _ => sat_shl(x, sign_extend(y as u64 & 0xff, 8), esize, false, true), // UQRSHL (23)
                 };
                 result |= lane << sh;
             }
@@ -2037,6 +2336,131 @@ impl Aarch64Interp {
             let rd = reg_field(instr, 0);
             let mask = if q == 1 { u128::MAX } else { ones_u128(64) };
             self.v[rd] = !self.v[rn] & mask;
+            return Step::Next;
+        }
+
+        // ---- REV64/REV32/REV16 (vector): reverse element order within a
+        // 64-/32-/16-bit container ----
+        // Same outer two-reg-misc class as NOT/MVN above and ABS/NEG/FABS
+        // below but a disjoint opcode (0b00000/0b00001 vs their 0b00101/
+        // 0b01011/0b01111/0b11111); still, per this file's ordering
+        // discipline, checked before the looser ABS/NEG/FABS arm so its
+        // catch-all can't swallow these first.
+        if (instr >> 24) & 0x1f == 0b0_1110
+            && (instr >> 17) & 0x1f == 0b1_0000
+            && (instr >> 10) & 3 == 0b10
+            && (instr >> 12) & 0x1f <= 1
+        {
+            let u = (instr >> 29) & 1;
+            let size = (instr >> 22) & 3;
+            let opcode = (instr >> 12) & 0x1f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let container = match (u, opcode) {
+                (0, 0b00000) => 64u32, // REV64
+                (1, 0b00000) => 32,    // REV32
+                (0, 0b00001) => 16,    // REV16
+                _ => return Step::Illegal,
+            };
+            let esize = 8u32 << size;
+            if esize >= container {
+                return Step::Illegal;
+            }
+            let q = (instr >> 30) & 1;
+            let width = if q == 1 { 128 } else { 64 };
+            let per = container / esize; // elements per container
+            let mask = ones_u128(esize);
+            let mut result = 0u128;
+            let mut i = 0u32;
+            while i < width / esize {
+                let c = i / per; // which container
+                let within = i % per;
+                let src = c * per + (per - 1 - within);
+                let lane = (self.v[rn] >> (src * esize)) & mask;
+                result |= lane << (i * esize);
+                i += 1;
+            }
+            self.v[rd] = result;
+            return Step::Next;
+        }
+
+        // ---- XTN/XTN2, SQXTN/SQXTN2, UQXTN/UQXTN2, SQXTUN/SQXTUN2 (narrow) ----
+        if (instr >> 24) & 0x1f == 0b0_1110
+            && (instr >> 17) & 0x1f == 0b1_0000
+            && (instr >> 10) & 3 == 0b10
+            && matches!((instr >> 12) & 0x1f, 0b10010 | 0b10100)
+        {
+            let q = (instr >> 30) & 1;
+            let u = (instr >> 29) & 1;
+            let size = (instr >> 22) & 3;
+            let opcode = (instr >> 12) & 0x1f;
+            if size == 3 {
+                return Step::Illegal;
+            }
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize = 8u32 << size; // destination (narrow) element size
+            let lanes = 64 / esize;
+            let mask = ones_u128(esize);
+            let src_mask = ones_u128(esize * 2);
+            let mut narrow = 0u128;
+            for i in 0..lanes {
+                let wide = (self.v[rn] >> (i * esize * 2)) & src_mask;
+                let lane = match (u, opcode) {
+                    (0, 0b10010) => wide & mask, // XTN/XTN2: plain truncate
+                    (0, 0b10100) => signed_sat(
+                        i128::from(sign_extend(wide as u64, esize * 2)),
+                        esize,
+                    ), // SQXTN/SQXTN2
+                    (1, 0b10100) => unsigned_sat(wide as i128, esize), // UQXTN/UQXTN2
+                    _ => unsigned_sat(
+                        i128::from(sign_extend(wide as u64, esize * 2)),
+                        esize,
+                    ), // SQXTUN/SQXTUN2 (1, 0b10010)
+                };
+                narrow |= lane << (i * esize);
+            }
+            self.v[rd] = if q == 1 {
+                (self.v[rd] & ones_u128(64)) | (narrow << 64)
+            } else {
+                narrow
+            };
+            return Step::Next;
+        }
+
+        // ---- SUQADD/USQADD (vector): saturating accumulate of the other
+        // signedness into the existing Vd ----
+        if (instr >> 24) & 0x1f == 0b0_1110
+            && (instr >> 17) & 0x1f == 0b1_0000
+            && (instr >> 10) & 3 == 0b10
+            && (instr >> 12) & 0x1f == 0b0_0011
+        {
+            let q = (instr >> 30) & 1;
+            let u = (instr >> 29) & 1;
+            let size = (instr >> 22) & 3;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize = 8u32 << size;
+            let width = if q == 1 { 128 } else { 64 };
+            let lanes = width / esize;
+            let mask = ones_u128(esize);
+            let mut result = 0u128;
+            for i in 0..lanes {
+                let sh = i * esize;
+                let vd = (self.v[rd] >> sh) & mask;
+                let vn = (self.v[rn] >> sh) & mask;
+                let lane = if u == 0 {
+                    // SUQADD: signed accumulator + unsigned addend, signed-saturate.
+                    let sum = i128::from(sign_extend(vd as u64, esize)) + vn as i128;
+                    signed_sat(sum, esize)
+                } else {
+                    // USQADD: unsigned accumulator + signed addend, unsigned-saturate.
+                    let sum = vd as i128 + i128::from(sign_extend(vn as u64, esize));
+                    unsigned_sat(sum, esize)
+                };
+                result |= lane << sh;
+            }
+            self.v[rd] = result;
             return Step::Next;
         }
 
@@ -2158,6 +2582,79 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- UADDW/UADDW2/SADDW/SADDW2 (vector wide add: Vn is already
+        // wide, Vm is narrow and gets widened first) ----
+        if (instr >> 24) & 0x1f == 0b0_1110
+            && (instr >> 21) & 1 == 1
+            && (instr >> 12) & 0xf == 0b0001
+            && (instr >> 10) & 3 == 0b00
+        {
+            let q = (instr >> 30) & 1;
+            let unsigned = (instr >> 29) & 1 == 1;
+            let size = (instr >> 22) & 3;
+            if size == 3 {
+                return Step::Illegal;
+            }
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize = 8u32 << size;
+            let mask = ones_u128(esize);
+            // Q selects which half of the narrow Vm supplies the addend
+            // (UADDW/SADDW use the low half, the "2" forms the high half).
+            let src_shift = if q == 1 { 64 } else { 0 };
+            let lanes = 64 / esize;
+            let wide_mask = ones_u128(2 * esize);
+            let mut result = 0u128;
+            for i in 0..lanes {
+                let sh = i * 2 * esize;
+                let xn = (self.v[rn] >> sh) & wide_mask;
+                let xm = (self.v[rm] >> (src_shift + i * esize)) & mask;
+                let wm = if unsigned {
+                    xm
+                } else {
+                    (sign_extend(xm as u64, esize) as u128) & wide_mask
+                };
+                result |= (xn.wrapping_add(wm) & wide_mask) << sh;
+            }
+            self.v[rd] = result;
+            return Step::Next;
+        }
+
+        // ---- ADDHN/ADDHN2 (vector add, high narrow) ----
+        if (instr >> 24) & 0x1f == 0b0_1110
+            && (instr >> 29) & 1 == 0
+            && (instr >> 21) & 1 == 1
+            && (instr >> 12) & 0xf == 0b0100
+            && (instr >> 10) & 3 == 0b00
+        {
+            let q = (instr >> 30) & 1;
+            let size = (instr >> 22) & 3;
+            if size == 3 {
+                return Step::Illegal;
+            }
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize = 8u32 << size; // destination (narrow) element size
+            let src_mask = ones_u128(esize * 2);
+            let lanes = 64 / esize;
+            let mut narrow = 0u128;
+            for i in 0..lanes {
+                let sh = i * esize * 2;
+                let xn = (self.v[rn] >> sh) & src_mask;
+                let xm = (self.v[rm] >> sh) & src_mask;
+                let sum = xn.wrapping_add(xm) & src_mask;
+                narrow |= (sum >> esize) << (i * esize);
+            }
+            self.v[rd] = if q == 1 {
+                (self.v[rd] & ones_u128(64)) | (narrow << 64)
+            } else {
+                narrow
+            };
+            return Step::Next;
+        }
+
         // ---- ADDV / UADDLV (across-lanes reduction) ----
         if (instr >> 24) & 0x1f == 0b0_1110
             && (instr >> 17) & 0x1f == 0b1_1000
@@ -2192,6 +2689,63 @@ impl Aarch64Interp {
                         sum = sum.wrapping_add((self.v[rn] >> (i * esize)) & mask);
                     }
                     self.v[rd] = sum & ones_u128(esize * 2);
+                }
+                (0 | 1, 0b0_1010 | 0b1_1010) => {
+                    // SMAXV/UMAXV/SMINV/UMINV: extremum across all lanes.
+                    let is_min = opcode == 0b1_1010;
+                    let lane_at = |i: u32| (self.v[rn] >> (i * esize)) & mask;
+                    let mut acc = lane_at(0);
+                    for i in 1..lanes {
+                        let v = lane_at(i);
+                        let better = if u == 0 {
+                            let (sv, sacc) = (sign_extend(v as u64, esize), sign_extend(acc as u64, esize));
+                            if is_min { sv < sacc } else { sv > sacc }
+                        } else if is_min {
+                            v < acc
+                        } else {
+                            v > acc
+                        };
+                        if better {
+                            acc = v;
+                        }
+                    }
+                    self.v[rd] = acc;
+                }
+                _ => return Step::Illegal,
+            }
+            return Step::Next;
+        }
+
+        // ---- ADDP (scalar, D-form) / FADDP (scalar, S/D-form): pairwise-add
+        // the two lanes of a single source register into a scalar result ----
+        if (instr >> 24) & 0x1f == 0b1_1110
+            && (instr >> 30) & 1 == 1
+            && (instr >> 17) & 0x1f == 0b1_1000
+            && (instr >> 10) & 3 == 0b10
+        {
+            let u = (instr >> 29) & 1;
+            let sz = (instr >> 22) & 1;
+            let opcode = (instr >> 12) & 0x1f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            match (u, opcode) {
+                (0, 0b1_1011) => {
+                    // ADDP d, Vn.2D
+                    let lo = self.v[rn] as u64;
+                    let hi = (self.v[rn] >> 64) as u64;
+                    self.v[rd] = u128::from(lo.wrapping_add(hi));
+                }
+                (1, 0b0_1101) => {
+                    // FADDP (scalar): S (sz=0) or D (sz=1).
+                    if sz == 0 {
+                        let a = f32::from_bits(self.v[rn] as u32);
+                        let b = f32::from_bits((self.v[rn] >> 32) as u32);
+                        self.set_fp32(rd, a + b);
+                    } else {
+                        let a = f64::from_bits(self.v[rn] as u64);
+                        let b = f64::from_bits((self.v[rn] >> 64) as u64);
+                        self.set_fp64(rd, a + b);
+                    }
                 }
                 _ => return Step::Illegal,
             }
@@ -2610,6 +3164,84 @@ fn simd_shl(x: u128, amt: i64, esize: u32, signed: bool) -> u128 {
             (x >> sh) & mask
         }
     }
+}
+
+/// Clamp `v` to the signed range representable in `esize` bits (1..=64),
+/// returning the clamped value as its `esize`-bit two's-complement bit
+/// pattern. Shared by the saturating NEON integer arithmetic (SQADD/SQSUB/
+/// SQSHL/SQRSHL/SUQADD) and the SQXTN/SQXTUN narrowing family.
+fn signed_sat(v: i128, esize: u32) -> u128 {
+    let max = (1i128 << (esize - 1)) - 1;
+    let min = -(1i128 << (esize - 1));
+    (v.clamp(min, max) as u128) & ones_u128(esize)
+}
+
+/// Clamp `v` to the unsigned range representable in `esize` bits (1..=64),
+/// i.e. `[0, 2^esize - 1]` (negative inputs saturate to 0). Shared by
+/// UQADD/UQSUB/UQSHL/UQRSHL/USQADD and the UQXTN/SQXTUN narrowing family.
+fn unsigned_sat(v: i128, esize: u32) -> u128 {
+    let max = (1i128 << esize) - 1;
+    v.clamp(0, max) as u128
+}
+
+/// ARM `SQSHL`/`UQSHL`/`SQRSHL`/`UQRSHL` per-lane saturating shift: `x` is an
+/// `esize`-bit lane, `amt` is a signed shift amount (positive = left,
+/// negative = right, matching the `SSHL`/`USHL` convention above). Left
+/// shifts saturate at the `esize`-bit signed/unsigned bound; right shifts
+/// never saturate but, when `rounding`, add a half-ULP before shifting
+/// (verified against native `sqrshl`/`uqrshl` execution on aarch64 hardware).
+fn sat_shl(x: u128, amt: i64, esize: u32, signed: bool, rounding: bool) -> u128 {
+    if amt >= 0 {
+        let sh = amt.min(i64::from(esize)) as u32;
+        if signed {
+            let se = i128::from(sign_extend(x as u64, esize));
+            signed_sat(se << sh, esize)
+        } else {
+            // `x < 2^esize` and `sh <= esize <= 64`, so `x << sh` fits in a
+            // `u128` (< 2^128) without overflow — unlike the signed path,
+            // this deliberately stays in `u128` rather than widening to
+            // `i128`, which (being one bit narrower) could wrap here.
+            let shifted = x << sh;
+            let max = ones_u128(esize);
+            if shifted > max { max } else { shifted }
+        }
+    } else {
+        let sh = (-amt) as u32; // 1..=128
+        if signed {
+            let se = i128::from(sign_extend(x as u64, esize));
+            let r = if sh >= 127 {
+                if se < 0 { -1 } else { 0 }
+            } else if rounding {
+                (se + (1i128 << (sh - 1))) >> sh
+            } else {
+                se >> sh
+            };
+            (r as u128) & ones_u128(esize)
+        } else {
+            let r = if sh >= 128 {
+                0
+            } else if rounding {
+                (x + (1u128 << (sh - 1))) >> sh
+            } else {
+                x >> sh
+            };
+            r & ones_u128(esize)
+        }
+    }
+}
+
+/// One byte of the reflected CRC32/CRC32C update used by the `CRC32*`
+/// instructions: XOR the byte in, then run 8 rounds of the reflected LFSR
+/// with `poly` (`0xEDB8_8320` for CRC32, `0x82F6_3B78` for CRC32C — the
+/// bit-reflected forms of the architectural 0x04C11DB7/0x1EDC6F41
+/// polynomials). Verified against native `crc32b`/`crc32cb` execution and the
+/// standard `"123456789"` CRC-32/CRC-32C check vectors.
+fn crc32_step(crc: u32, byte: u8, poly: u32) -> u32 {
+    let mut crc = crc ^ u32::from(byte);
+    for _ in 0..8 {
+        crc = if crc & 1 != 0 { (crc >> 1) ^ poly } else { crc >> 1 };
+    }
+    crc
 }
 
 /// `n` low bits set, as a `u128`.
@@ -3888,6 +4520,247 @@ mod tests {
         c.exec(0xD53B_4400, &mut m); // mrs x0, fpcr
         assert_eq!(c.x[0], 0, "FPCR reads 0");
         c.exec(0xD51B_4400, &mut m); // msr fpcr, x0  (ignored, no panic)
+    }
+
+    // The expected values in the NEON/CRC tests below were cross-checked
+    // against native execution of the same instructions on aarch64 hardware
+    // (Apple Silicon, via inline asm), not just hand-derived from the ARM
+    // ARM pseudocode — see the interp NEON-widening task notes.
+
+    #[test]
+    fn tbl_tbx_and_ext() {
+        let (mut c, mut m) = (cpu(), scratch());
+        // tbl v0.8b, {v1.16b}, v2.8b: 1-register table lookup; indices past
+        // the 16-byte table (16, 255, ...) read as 0, and the 8B form zeroes
+        // the upper 64 bits of Vd.
+        c.v[1] = u128::from_le_bytes([
+            100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+        ]);
+        c.v[2] = u128::from_le_bytes([0, 5, 15, 16, 255, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        c.exec(0x0E02_0020, &mut m);
+        assert_eq!(
+            c.v[0].to_le_bytes(),
+            [100, 105, 115, 0, 0, 103, 100, 100, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+
+        // tbx v0.8b, {v1.16b}, v2.8b: same indices, but out-of-range leaves
+        // the destination byte unchanged instead of zeroing it.
+        c.v[0] = u128::from_le_bytes([9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0]);
+        c.exec(0x0E02_1020, &mut m);
+        assert_eq!(
+            c.v[0].to_le_bytes(),
+            [100, 105, 115, 9, 9, 103, 100, 100, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+
+        // ext v0.16b, v1.16b, v2.16b, #4: 16 bytes of Vn:Vm starting at 4.
+        c.v[1] = u128::from_le_bytes([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        c.v[2] = u128::from_le_bytes([
+            16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        ]);
+        c.exec(0x6E02_2020, &mut m);
+        assert_eq!(
+            c.v[0].to_le_bytes(),
+            [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        );
+    }
+
+    #[test]
+    fn zip_uzp_trn_permute() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = quad_u32(0x10, 0x11, 0x12, 0x13);
+        c.v[2] = quad_u32(0x20, 0x21, 0x22, 0x23);
+        c.exec(0x4E82_3820, &mut m); // zip1 v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(0x10, 0x20, 0x11, 0x21));
+        c.exec(0x4E82_7820, &mut m); // zip2 v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(0x12, 0x22, 0x13, 0x23));
+        c.exec(0x4E82_1820, &mut m); // uzp1 v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(0x10, 0x12, 0x20, 0x22));
+        c.exec(0x4E82_5820, &mut m); // uzp2 v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(0x11, 0x13, 0x21, 0x23));
+        c.exec(0x4E82_2820, &mut m); // trn1 v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(0x10, 0x20, 0x12, 0x22));
+        c.exec(0x4E82_6820, &mut m); // trn2 v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(0x11, 0x21, 0x13, 0x23));
+    }
+
+    #[test]
+    fn rev64_rev32_rev16_vector() {
+        let (mut c, mut m) = (cpu(), scratch());
+        let bytes: [u8; 16] = core::array::from_fn(|i| i as u8);
+        c.v[1] = u128::from_le_bytes(bytes);
+        c.exec(0x4EA0_0820, &mut m); // rev64 v0.4s, v1.4s
+        assert_eq!(
+            c.v[0].to_le_bytes(),
+            [4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11]
+        );
+        c.exec(0x6E60_0820, &mut m); // rev32 v0.8h, v1.8h
+        assert_eq!(
+            c.v[0].to_le_bytes(),
+            [2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13]
+        );
+        c.exec(0x4E20_1820, &mut m); // rev16 v0.16b, v1.16b
+        assert_eq!(
+            c.v[0].to_le_bytes(),
+            [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14]
+        );
+    }
+
+    #[test]
+    fn xtn_sqxtn_uqxtn_sqxtun_narrow() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = quad_u32(0x0001_FFFF, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF);
+        c.exec(0x0E61_2820, &mut m); // xtn v0.4h, v1.4s: plain truncation.
+        assert_eq!(c.v[0], quad_u16(0xFFFF, 0xFFFF, 0x0000, 0xFFFF));
+        c.exec(0x0E61_4820, &mut m); // sqxtn v0.4h, v1.4s: signed-saturate.
+        assert_eq!(c.v[0], quad_u16(0x7FFF, 0x7FFF, 0x8000, 0xFFFF));
+        c.exec(0x2E61_4820, &mut m); // uqxtn v0.4h, v1.4s: unsigned-saturate.
+        assert_eq!(c.v[0], quad_u16(0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF));
+        c.exec(0x2E61_2820, &mut m); // sqxtun v0.4h, v1.4s: signed->unsigned saturate.
+        assert_eq!(c.v[0], quad_u16(0xFFFF, 0xFFFF, 0x0000, 0x0000));
+    }
+
+    #[test]
+    fn addhn_uaddw_saddw_wide() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = quad_u32(0xFFFF_FFFF, 0x0001_0000, 0x8000_0000, 1);
+        c.v[2] = quad_u32(1, 0x0000_FFFF, 0x8000_0000, 1);
+        c.exec(0x0E62_4020, &mut m); // addhn v0.4h, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u16(0, 1, 0, 0));
+
+        c.v[1] = quad_u32(1, 2, 3, 4);
+        c.v[2] = quad_u16(0xFFFF, 1, 2, 3);
+        c.exec(0x2E62_1020, &mut m); // uaddw v0.4s, v1.4s, v2.4h
+        assert_eq!(c.v[0], quad_u32(0x1_0000, 3, 5, 7));
+        c.exec(0x0E62_1020, &mut m); // saddw v0.4s, v1.4s, v2.4h
+        assert_eq!(c.v[0], quad_u32(0, 3, 5, 7));
+    }
+
+    #[test]
+    fn sqadd_uqadd_sqsub_uqsub_saturate() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = quad_u32(0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF, 5);
+        c.v[2] = quad_u32(1, 0xFFFF_FFFF, 1, 3);
+        c.exec(0x4EA2_0C20, &mut m); // sqadd v0.4s, v1.4s, v2.4s
+        assert_eq!(
+            c.v[0],
+            quad_u32(0x7FFF_FFFF, 0x8000_0000, 0, 8),
+            "SQADD clamps at INT32_MAX/INT32_MIN instead of wrapping"
+        );
+        c.exec(0x6EA2_0C20, &mut m); // uqadd v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(0x8000_0000, 0xFFFF_FFFF, 0xFFFF_FFFF, 8));
+        c.exec(0x4EA2_2C20, &mut m); // sqsub v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(0x7FFF_FFFE, 0x8000_0001, 0xFFFF_FFFE, 2));
+        c.exec(0x6EA2_2C20, &mut m); // uqsub v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(0x7FFF_FFFE, 0, 0xFFFF_FFFE, 2));
+    }
+
+    #[test]
+    fn sqshl_uqshl_sqrshl_uqrshl_register() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = quad_u32(1, 0x4000_0000, 0xFFFF_FFFF, 0x8000_0000);
+        // Shift amounts (low signed byte of each Vm lane): 4, 2, -1, -4.
+        c.v[2] = quad_u32(4, 2, 0xFFFF_FFFF, 0xFFFF_FFFC);
+        c.exec(0x4EA2_4C20, &mut m); // sqshl v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(0x10, 0x7FFF_FFFF, 0xFFFF_FFFF, 0xF800_0000));
+        c.exec(0x6EA2_4C20, &mut m); // uqshl v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(0x10, 0xFFFF_FFFF, 0x7FFF_FFFF, 0x0800_0000));
+        c.exec(0x4EA2_5C20, &mut m); // sqrshl v0.4s, v1.4s, v2.4s (rounding right shift)
+        assert_eq!(c.v[0], quad_u32(0x10, 0x7FFF_FFFF, 0, 0xF800_0000));
+        c.exec(0x6EA2_5C20, &mut m); // uqrshl v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(0x10, 0xFFFF_FFFF, 0x8000_0000, 0x0800_0000));
+    }
+
+    #[test]
+    fn suqadd_usqadd_saturating_accumulate() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[0] = quad_u32(5, (-5i32) as u32, 0x7FFF_FFFF, (-2_000_000_000i32) as u32);
+        c.v[1] = quad_u32(10, 3, 10, 0xFFFF_FFFF);
+        c.exec(0x4EA0_3820, &mut m); // suqadd v0.4s, v1.4s (signed acc + unsigned addend)
+        assert_eq!(
+            c.v[0],
+            quad_u32(15, (-2i32) as u32, 0x7FFF_FFFF, 0x7FFF_FFFF)
+        );
+
+        c.v[0] = quad_u32(5, 3, 0xFFFF_FFF0, 0);
+        c.v[1] = quad_u32(10, (-5i32) as u32, 10, (-1i32) as u32);
+        c.exec(0x6EA0_3820, &mut m); // usqadd v0.4s, v1.4s (unsigned acc + signed addend)
+        assert_eq!(c.v[0], quad_u32(15, 0, 0xFFFF_FFFA, 0));
+    }
+
+    #[test]
+    fn addp_smaxp_sminp_umaxp_uminp_pairwise() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = quad_u32(1, 2, 3, 4);
+        c.v[2] = quad_u32(10, 20, 30, 40);
+        c.exec(0x4EA2_BC20, &mut m); // addp v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(3, 7, 30, 70));
+        c.exec(0x4EA2_A420, &mut m); // smaxp v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(2, 4, 20, 40));
+        c.exec(0x4EA2_AC20, &mut m); // sminp v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(1, 3, 10, 30));
+        c.exec(0x6EA2_A420, &mut m); // umaxp v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(2, 4, 20, 40));
+        c.exec(0x6EA2_AC20, &mut m); // uminp v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_u32(1, 3, 10, 30));
+
+        // addp d0, v1.2d (scalar pairwise: the two 64-bit halves of one register)
+        c.v[1] = (200u128 << 64) | 0x64;
+        c.exec(0x5EF1_B820, &mut m);
+        assert_eq!(c.v[0], 300);
+    }
+
+    #[test]
+    fn faddp_fmaxp_vector_and_scalar() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = quad_f32(1.0, 2.0, 3.0, 4.0);
+        c.v[2] = quad_f32(10.0, 20.0, 30.0, 40.0);
+        c.exec(0x6E22_D420, &mut m); // faddp v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_f32(3.0, 7.0, 30.0, 70.0));
+        c.exec(0x6E22_F420, &mut m); // fmaxp v0.4s, v1.4s, v2.4s
+        assert_eq!(c.v[0], quad_f32(2.0, 4.0, 20.0, 40.0));
+
+        // faddp s0, v1.2s (scalar pairwise)
+        c.v[1] = quad_f32(3.5, 4.5, 0.0, 0.0);
+        c.exec(0x7E30_D820, &mut m);
+        assert_eq!(f32::from_bits(c.v[0] as u32), 8.0);
+    }
+
+    #[test]
+    fn smaxv_sminv_umaxv_uminv_across_lanes() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = quad_u32((-5i32) as u32, 10, (-20i32) as u32, 3);
+        c.exec(0x4EB0_A820, &mut m); // smaxv s0, v1.4s
+        assert_eq!(c.v[0] as u32, 10);
+        c.exec(0x4EB1_A820, &mut m); // sminv s0, v1.4s
+        assert_eq!(c.v[0] as u32 as i32, -20);
+        c.exec(0x6EB0_A820, &mut m); // umaxv s0, v1.4s (unsigned: -5's bit pattern is huge)
+        assert_eq!(c.v[0] as u32, (-5i32) as u32);
+        c.exec(0x6EB1_A820, &mut m); // uminv s0, v1.4s
+        assert_eq!(c.v[0] as u32, 3);
+    }
+
+    #[test]
+    fn crc32x_and_crc32cx_known_vectors() {
+        let (mut c, mut m) = (cpu(), scratch());
+        // CRC32X/CRC32CX over the 8-byte ASCII chunk "01234567", seeded with
+        // 0xFFFFFFFF — cross-checked against native `crc32x`/`crc32cx`
+        // execution on real aarch64 hardware.
+        c.x[1] = 0xFFFF_FFFF;
+        c.x[2] = 0x3736_3534_3332_3130;
+        c.exec(0x9AC2_4C20, &mut m); // crc32x w0, w1, x2
+        assert_eq!(c.x[0] as u32, 0xd27f_c50a);
+        c.exec(0x9AC2_5C20, &mut m); // crc32cx w0, w1, x2
+        assert_eq!(c.x[0] as u32, 0x53dd_dcdf);
+
+        // Byte-at-a-time CRC32B of "123456789" (seeded 0xFFFFFFFF, then
+        // bit-complemented) must match the standard CRC-32 check value.
+        c.x[1] = 0xFFFF_FFFF;
+        for &byte in b"123456789" {
+            c.x[2] = u64::from(byte);
+            c.exec(0x1AC2_4020, &mut m); // crc32b w0, w1, w2
+            c.x[1] = c.x[0];
+        }
+        assert_eq!(!(c.x[1] as u32), 0xcbf4_3926);
     }
 
     #[test]
