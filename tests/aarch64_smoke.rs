@@ -187,7 +187,11 @@ fn write_and_exit() {
     let mut code = Vec::new();
     code.extend(mov_imm32(0, 1)); // x0 = 1 (fd = stdout)
     let x1 = mov_imm32(1, u32::try_from(msg_addr).unwrap());
-    assert_eq!(x1.len(), 2, "msg_addr's high half must be nonzero for this vaddr");
+    assert_eq!(
+        x1.len(),
+        2,
+        "msg_addr's high half must be nonzero for this vaddr"
+    );
     code.extend(x1);
     code.extend(mov_imm32(2, 3)); // x2 = 3 (len)
     code.extend(mov_imm32(8, 64)); // x8 = __NR_write
@@ -195,7 +199,11 @@ fn write_and_exit() {
     code.extend(mov_imm32(0, 0)); // x0 = 0 (exit status)
     code.extend(mov_imm32(8, 93)); // x8 = __NR_exit
     code.push(svc0());
-    assert_eq!(code.len() as u64, CODE_WORDS, "CODE_WORDS must match the assembled program");
+    assert_eq!(
+        code.len() as u64,
+        CODE_WORDS,
+        "CODE_WORDS must match the assembled program"
+    );
 
     let mut body = words_to_bytes(&code);
     body.extend_from_slice(b"ok\n");
@@ -203,7 +211,11 @@ fn write_and_exit() {
     let (code, out, kernel) = run_program(vaddr, &body);
     assert_eq!(code, 0);
     assert_eq!(&out, b"ok\n");
-    assert!(kernel.unsupported().is_empty(), "{:?}", kernel.unsupported());
+    assert!(
+        kernel.unsupported().is_empty(),
+        "{:?}",
+        kernel.unsupported()
+    );
 }
 
 // ---- 2. arithmetic -> exit code ---------------------------------------------
@@ -224,7 +236,11 @@ fn arithmetic_into_exit_code() {
 
     assert_eq!(code, 42, "7*6 should exit with status 42");
     assert!(out.is_empty());
-    assert!(kernel.unsupported().is_empty(), "{:?}", kernel.unsupported());
+    assert!(
+        kernel.unsupported().is_empty(),
+        "{:?}",
+        kernel.unsupported()
+    );
 }
 
 // ---- 3. getpid / gettid ------------------------------------------------------
@@ -251,7 +267,11 @@ fn getpid_and_gettid_reflect_pid_one() {
         "getpid() (tgid=1) + gettid() (pid=1) should exit with status 2"
     );
     assert!(out.is_empty());
-    assert!(kernel.unsupported().is_empty(), "{:?}", kernel.unsupported());
+    assert!(
+        kernel.unsupported().is_empty(),
+        "{:?}",
+        kernel.unsupported()
+    );
 }
 
 // ---- 4. write from a computed buffer (loads/stores through guest memory) ---
@@ -266,7 +286,11 @@ fn write_from_computed_buffer() {
 
     let mut code = Vec::new();
     let x1 = mov_imm32(1, u32::try_from(buf_addr).unwrap());
-    assert_eq!(x1.len(), 2, "buf_addr's high half must be nonzero for this vaddr");
+    assert_eq!(
+        x1.len(),
+        2,
+        "buf_addr's high half must be nonzero for this vaddr"
+    );
     code.extend(x1);
     code.push(movz(2, 0x6f)); // x2 = 'o'
     code.push(strb(2, 1, 0)); // [x1+0] = 'o'
@@ -281,15 +305,26 @@ fn write_from_computed_buffer() {
     code.extend(mov_imm32(0, 0)); // x0 = 0 (exit status)
     code.extend(mov_imm32(8, 93)); // x8 = __NR_exit
     code.push(svc0());
-    assert_eq!(code.len() as u64, CODE_WORDS, "CODE_WORDS must match the assembled program");
+    assert_eq!(
+        code.len() as u64,
+        CODE_WORDS,
+        "CODE_WORDS must match the assembled program"
+    );
 
     let mut body = words_to_bytes(&code);
     body.extend_from_slice(&[0, 0, 0]); // scratch buffer, filled by STRB at runtime
 
     let (code, out, kernel) = run_program(vaddr, &body);
     assert_eq!(code, 0);
-    assert_eq!(&out, b"ok\n", "bytes stored via STRB should round-trip through write()");
-    assert!(kernel.unsupported().is_empty(), "{:?}", kernel.unsupported());
+    assert_eq!(
+        &out, b"ok\n",
+        "bytes stored via STRB should round-trip through write()"
+    );
+    assert!(
+        kernel.unsupported().is_empty(),
+        "{:?}",
+        kernel.unsupported()
+    );
 }
 
 // ---- 5. brk + write (memory syscalls) ---------------------------------------
@@ -319,7 +354,11 @@ fn brk_then_write() {
     code.extend(mov_imm32(0, 0));
     code.extend(mov_imm32(8, 93)); // __NR_exit
     code.push(svc0());
-    assert_eq!(code.len() as u64, CODE_WORDS, "CODE_WORDS must match the assembled program");
+    assert_eq!(
+        code.len() as u64,
+        CODE_WORDS,
+        "CODE_WORDS must match the assembled program"
+    );
 
     let body = words_to_bytes(&code);
     let elf = build_elf(vaddr, &body);
@@ -330,7 +369,10 @@ fn brk_then_write() {
         envp: vec![],
     };
     let img = load_static(&mut mem, &elf, &spec).unwrap();
-    assert_eq!(img.program_break, program_break, "predicted program_break must match the loader's");
+    assert_eq!(
+        img.program_break, program_break,
+        "predicted program_break must match the loader's"
+    );
 
     let backend = InterpBackend::new(Arch::Aarch64).unwrap();
     let vcpu = backend.new_vcpu(img.entry, img.stack_pointer).unwrap();
@@ -350,5 +392,9 @@ fn brk_then_write() {
         b"B",
         "byte stored into the brk-grown page should round-trip through write()"
     );
-    assert!(kernel.unsupported().is_empty(), "{:?}", kernel.unsupported());
+    assert!(
+        kernel.unsupported().is_empty(),
+        "{:?}",
+        kernel.unsupported()
+    );
 }

@@ -405,7 +405,10 @@ impl Kernel {
                 Serviced::Ended
             }
             Exit::IllegalInstruction { pc } => {
-                eprintln!("[fault] pid {} illegal instruction at {pc:#x}", self.cur.pid);
+                eprintln!(
+                    "[fault] pid {} illegal instruction at {pc:#x}",
+                    self.cur.pid
+                );
                 self.cur.run = RunState::Zombie(132);
                 Serviced::Ended
             }
@@ -1055,11 +1058,10 @@ impl Kernel {
                     Ok(_) => {
                         // Park only if some other task could wake us; otherwise a
                         // lone waiter would deadlock, so fake a wake.
-                        let others = self
-                            .procs
-                            .iter()
-                            .flatten()
-                            .any(|p| p.info.pid != self.cur.pid && p.info.run == RunState::Running);
+                        let others =
+                            self.procs.iter().flatten().any(|p| {
+                                p.info.pid != self.cur.pid && p.info.run == RunState::Running
+                            });
                         if !others {
                             return 0;
                         }
@@ -1379,9 +1381,14 @@ impl Kernel {
                 }
             }
             // eventfd/timerfd/epoll are anonymous-inode char-device-like fds.
-            Some(Fd::Stdin | Fd::Stdout | Fd::Stderr | Fd::Eventfd(_) | Fd::Timerfd(_) | Fd::Epoll(_)) => {
-                stat::char_device_attrs()
-            }
+            Some(
+                Fd::Stdin
+                | Fd::Stdout
+                | Fd::Stderr
+                | Fd::Eventfd(_)
+                | Fd::Timerfd(_)
+                | Fd::Epoll(_),
+            ) => stat::char_device_attrs(),
             Some(Fd::PipeRead(_) | Fd::PipeWrite(_)) => stat::fifo_attrs(),
             Some(Fd::Socket { .. }) => stat::socket_attrs(),
             None => return err(Errno::EBADF),
@@ -1608,7 +1615,10 @@ impl Kernel {
             let mut data = vec![0u8; len as usize];
             let mut got = 0usize;
             while got < data.len() {
-                match self.mounts.read_at(&path, offset + got as u64, &mut data[got..]) {
+                match self
+                    .mounts
+                    .read_at(&path, offset + got as u64, &mut data[got..])
+                {
                     Ok(n) if n > 0 => got += n,
                     _ => break, // EOF or read error: leave the rest zero-filled
                 }
@@ -2233,7 +2243,8 @@ mod tests {
         assert_eq!(child.info.tgid, k.cur.tgid, "thread shares the tgid");
         assert_eq!(child.info.mm, k.cur.mm, "thread shares the address space");
         assert_eq!(
-            spaces_before, k.spaces.len(),
+            spaces_before,
+            k.spaces.len(),
             "CLONE_VM does not allocate a new address space"
         );
     }
@@ -2247,7 +2258,13 @@ mod tests {
         k.cur.mm = 0;
         let before = k.spaces.len();
         // flags = SIGCHLD only (a plain fork), no CLONE_VM.
-        let child = call(&mut k, &mut mem, &mut v, Sysno::Clone, [0x11, 0, 0, 0, 0, 0]);
+        let child = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [0x11, 0, 0, 0, 0, 0],
+        );
         assert_eq!(child, 2);
         let c = k.procs.iter().flatten().find(|p| p.info.pid == 2).unwrap();
         assert!(!c.info.is_thread);
@@ -2264,7 +2281,13 @@ mod tests {
         k.procs.push(Some(make_proc(3, 1, 0, true)));
         k.procs.push(Some(make_proc(4, 4, 1, false)));
 
-        call(&mut k, &mut mem, &mut v, Sysno::ExitGroup, [42, 0, 0, 0, 0, 0]);
+        call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::ExitGroup,
+            [42, 0, 0, 0, 0, 0],
+        );
 
         assert!(matches!(k.cur.run, RunState::Zombie(42)), "leader exits");
         let state = |pid| {
@@ -2274,8 +2297,16 @@ mod tests {
                 .find(|p| p.info.pid == pid)
                 .map(|p| p.info.run)
         };
-        assert_eq!(state(2), Some(RunState::Zombie(42)), "sibling thread killed");
-        assert_eq!(state(3), Some(RunState::Zombie(42)), "sibling thread killed");
+        assert_eq!(
+            state(2),
+            Some(RunState::Zombie(42)),
+            "sibling thread killed"
+        );
+        assert_eq!(
+            state(3),
+            Some(RunState::Zombie(42)),
+            "sibling thread killed"
+        );
         assert_eq!(
             state(4),
             Some(RunState::Running),
@@ -2371,7 +2402,13 @@ mod tests {
         );
         assert_eq!(fd, 3);
         assert_eq!(
-            call(&mut k, &mut mem, &mut v, Sysno::Write, [fd as u64, content, 4, 0, 0, 0]),
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [fd as u64, content, 4, 0, 0, 0]
+            ),
             4
         );
 
@@ -2405,7 +2442,13 @@ mod tests {
             Sysno::Openat,
             [AT_CWD, path, 0o102, 0o644, 0, 0],
         );
-        call(&mut k, &mut mem, &mut v, Sysno::Write, [fd as u64, content, 2, 0, 0, 0]);
+        call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Write,
+            [fd as u64, content, 2, 0, 0, 0],
+        );
         let addr = 0x1_3000u64;
         call(
             &mut k,
@@ -2425,12 +2468,24 @@ mod tests {
         let (mut k, mut mem, mut v) = setup();
         // No such fd -> EBADF.
         assert_eq!(
-            call(&mut k, &mut mem, &mut v, Sysno::Mmap, [0x1_5000, 4, 1, MAP_FIXED, 99, 0]),
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Mmap,
+                [0x1_5000, 4, 1, MAP_FIXED, 99, 0]
+            ),
             -i64::from(Errno::EBADF.0)
         );
         // fd 1 is stdout, not a file -> EACCES.
         assert_eq!(
-            call(&mut k, &mut mem, &mut v, Sysno::Mmap, [0x1_5000, 4, 1, MAP_FIXED, 1, 0]),
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Mmap,
+                [0x1_5000, 4, 1, MAP_FIXED, 1, 0]
+            ),
             -i64::from(Errno::EACCES.0)
         );
     }
@@ -2600,7 +2655,13 @@ mod tests {
         // Install handler 0xdead for SIGINT (2).
         mem.write_init(act, &0xdeadu64.to_le_bytes()).unwrap();
         assert_eq!(
-            call(&mut k, &mut mem, &mut v, Sysno::RtSigaction, [2, act, 0, 8, 0, 0]),
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::RtSigaction,
+                [2, act, 0, 8, 0, 0]
+            ),
             0
         );
         assert_eq!(k.cur.handlers[2], 0xdead);
@@ -2628,11 +2689,23 @@ mod tests {
         mem.write_init(act, &1u64.to_le_bytes()).unwrap();
         // SIGKILL (9) and SIGSTOP (19) dispositions cannot change.
         assert_eq!(
-            call(&mut k, &mut mem, &mut v, Sysno::RtSigaction, [9, act, 0, 8, 0, 0]),
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::RtSigaction,
+                [9, act, 0, 8, 0, 0]
+            ),
             -22
         );
         assert_eq!(
-            call(&mut k, &mut mem, &mut v, Sysno::RtSigaction, [19, act, 0, 8, 0, 0]),
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::RtSigaction,
+                [19, act, 0, 8, 0, 0]
+            ),
             -22
         );
     }
@@ -2646,7 +2719,13 @@ mod tests {
 
         // SIG_SETMASK (2) replaces the mask.
         assert_eq!(
-            call(&mut k, &mut mem, &mut v, Sysno::RtSigprocmask, [2, set, 0, 8, 0, 0]),
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::RtSigprocmask,
+                [2, set, 0, 8, 0, 0]
+            ),
             0
         );
         assert_eq!(k.cur.blocked, 0b1010);

@@ -164,7 +164,9 @@ impl DevFs {
 
     /// Look up a plain subdirectory name, returning its inode.
     fn dir_lookup(name: &str) -> Option<u64> {
-        DIRS.iter().find(|(n, _)| *n == name).map(|(_, inode)| *inode)
+        DIRS.iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, inode)| *inode)
     }
 
     /// Look up a symlink name, returning its `(inode, target)`.
@@ -668,7 +670,9 @@ mod tests {
         // Open succeeds (stat above), but read/write are stubs.
         let mut buf = [0u8; 8];
         assert_eq!(
-            fs.read_at("net/tun", 0, &mut buf).unwrap_err().raw_os_error(),
+            fs.read_at("net/tun", 0, &mut buf)
+                .unwrap_err()
+                .raw_os_error(),
             Some(11) // EAGAIN
         );
         assert_eq!(fs.write_at("net/tun", 0, b"packet").unwrap(), 0);

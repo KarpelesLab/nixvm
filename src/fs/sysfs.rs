@@ -77,7 +77,12 @@ impl Builder {
 
     fn dir(&mut self, path: impl Into<String>) {
         self.next_inode += 1;
-        self.map.insert(path.into(), Node::Dir { inode: self.next_inode });
+        self.map.insert(
+            path.into(),
+            Node::Dir {
+                inode: self.next_inode,
+            },
+        );
     }
 
     fn file(&mut self, path: impl Into<String>, data: impl Into<Vec<u8>>) {
@@ -325,7 +330,12 @@ mod tests {
     #[test]
     fn readdir_root_lists_top_level_dirs() {
         let mut fs = SysFs::new();
-        let mut names: Vec<_> = fs.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        let mut names: Vec<_> = fs
+            .readdir("")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         names.sort();
         assert_eq!(
             names,
@@ -334,7 +344,12 @@ mod tests {
             ]
         );
         // Every top-level entry is a directory.
-        assert!(fs.readdir("").unwrap().iter().all(|e| e.kind == NodeKind::Dir));
+        assert!(
+            fs.readdir("")
+                .unwrap()
+                .iter()
+                .all(|e| e.kind == NodeKind::Dir)
+        );
     }
 
     #[test]
@@ -446,7 +461,14 @@ mod tests {
     #[test]
     fn class_and_block_and_cgroup_present() {
         let mut fs = SysFs::new();
-        for path in ["class", "class/net", "class/tty", "class/mem", "block", "fs/cgroup"] {
+        for path in [
+            "class",
+            "class/net",
+            "class/tty",
+            "class/mem",
+            "block",
+            "fs/cgroup",
+        ] {
             assert_eq!(fs.stat(path).unwrap().kind, NodeKind::Dir, "{path}");
         }
     }
@@ -535,16 +557,26 @@ mod tests {
         let mut fs = SysFs::new();
         let mut buf = [0u8; 32];
         let n = fs
-            .read_at("devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", 0, &mut buf)
+            .read_at(
+                "devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
+                0,
+                &mut buf,
+            )
             .unwrap();
         assert_eq!(&buf[..n], b"2000000\n");
         let n = fs
-            .read_at("devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", 0, &mut buf)
+            .read_at(
+                "devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq",
+                0,
+                &mut buf,
+            )
             .unwrap();
         assert_eq!(&buf[..n], b"3000000\n");
 
         assert_eq!(
-            fs.stat("devices/system/cpu/cpu0/cache/index0").unwrap().kind,
+            fs.stat("devices/system/cpu/cpu0/cache/index0")
+                .unwrap()
+                .kind,
             NodeKind::Dir
         );
         let n = fs

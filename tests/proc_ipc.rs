@@ -265,15 +265,26 @@ fn fork_propagates_child_exit_code() {
     let code_words = build(0).len() as u64;
     let wstatus_addr = u32::try_from(vaddr + BODY_OFF + code_words * 4).unwrap();
     let instrs = build(wstatus_addr);
-    assert_eq!(instrs.len() as u64, code_words, "two-pass build must be length-stable");
+    assert_eq!(
+        instrs.len() as u64,
+        code_words,
+        "two-pass build must be length-stable"
+    );
 
     let mut body = words_to_bytes(&instrs);
     body.extend_from_slice(&[0, 0, 0, 0]); // wstatus scratch word, filled by wait4
 
     let (exit_code, out, kernel) = run_program(vaddr, &body);
-    assert_eq!(exit_code, CHILD_EXIT_CODE as i32, "parent's exit code must be the child's, via wait4");
+    assert_eq!(
+        exit_code, CHILD_EXIT_CODE as i32,
+        "parent's exit code must be the child's, via wait4"
+    );
     assert!(out.is_empty());
-    assert!(kernel.unsupported().is_empty(), "{:?}", kernel.unsupported());
+    assert!(
+        kernel.unsupported().is_empty(),
+        "{:?}",
+        kernel.unsupported()
+    );
 }
 
 // ---- 2. pipe IPC -------------------------------------------------------------
@@ -341,8 +352,15 @@ fn pipe_write_read_roundtrips_to_stdout() {
 
     let (exit_code, out, kernel) = run_program(vaddr, &body);
     assert_eq!(exit_code, 0);
-    assert_eq!(&out, MSG, "bytes written into the pipe should read back unchanged and echo to stdout");
-    assert!(kernel.unsupported().is_empty(), "{:?}", kernel.unsupported());
+    assert_eq!(
+        &out, MSG,
+        "bytes written into the pipe should read back unchanged and echo to stdout"
+    );
+    assert!(
+        kernel.unsupported().is_empty(),
+        "{:?}",
+        kernel.unsupported()
+    );
 }
 
 // ---- 3. fork + pipe -----------------------------------------------------------
@@ -429,8 +447,15 @@ fn fork_pipe_parent_reads_child_writes_and_exits() {
 
     let (exit_code, out, kernel) = run_program(vaddr, &body);
     assert_eq!(exit_code, 0);
-    assert_eq!(&out, MSG, "the parent should read exactly what the child wrote into the pipe");
-    assert!(kernel.unsupported().is_empty(), "{:?}", kernel.unsupported());
+    assert_eq!(
+        &out, MSG,
+        "the parent should read exactly what the child wrote into the pipe"
+    );
+    assert!(
+        kernel.unsupported().is_empty(),
+        "{:?}",
+        kernel.unsupported()
+    );
 }
 
 // ---- 4. mmap anonymous --------------------------------------------------------
@@ -486,7 +511,14 @@ fn mmap_anonymous_store_load_roundtrip() {
 
     let exit_code = kernel.run(vcpu, mem).unwrap();
 
-    assert_eq!(exit_code, VALUE as i32, "byte stored into the mmap'd page should round-trip through a load");
+    assert_eq!(
+        exit_code, VALUE as i32,
+        "byte stored into the mmap'd page should round-trip through a load"
+    );
     assert!(captured.lock().unwrap().is_empty());
-    assert!(kernel.unsupported().is_empty(), "{:?}", kernel.unsupported());
+    assert!(
+        kernel.unsupported().is_empty(),
+        "{:?}",
+        kernel.unsupported()
+    );
 }

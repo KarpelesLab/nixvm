@@ -310,7 +310,11 @@ mod browser {
 
         let stdout = String::from_utf8_lossy(&stdout_buf.lock().unwrap()).into_owned();
         let stderr = String::from_utf8_lossy(&stderr_buf.lock().unwrap()).into_owned();
-        let unsupported = kernel.unsupported().iter().map(|(&nr, &c)| (nr, c)).collect();
+        let unsupported = kernel
+            .unsupported()
+            .iter()
+            .map(|(&nr, &c)| (nr, c))
+            .collect();
 
         let (exit_code, error) = match result {
             Ok(code) => (Some(code), None),

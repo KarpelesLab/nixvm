@@ -208,11 +208,7 @@ pub fn load_static(
     // biased addresses in the same place an `ET_EXEC` image with `p_vaddr`
     // starting at 0 would land, regardless of how large the caller's region
     // is. `ET_EXEC` images keep their existing, unbiased behavior.
-    let bias: u64 = if ehdr.e_type == ET_DYN {
-        mem.base()
-    } else {
-        0
-    };
+    let bias: u64 = if ehdr.e_type == ET_DYN { mem.base() } else { 0 };
 
     let mapped = map_image(mem, elf, &ehdr, bias)?;
 
@@ -365,7 +361,13 @@ pub fn load_dynamic(
     };
     let interp_map = map_image(mem, interp, &interp_hdr, interp_base)?;
     if interp_hdr.e_type == ET_DYN {
-        apply_relative_relocations(mem, interp, &interp_map.phdrs, interp_base, interp_hdr.machine)?;
+        apply_relative_relocations(
+            mem,
+            interp,
+            &interp_map.phdrs,
+            interp_base,
+            interp_hdr.machine,
+        )?;
     }
     let interp_entry = interp_hdr
         .entry
@@ -374,7 +376,14 @@ pub fn load_dynamic(
 
     // The stack/auxv describe the *executable* (AT_ENTRY/AT_PHDR/AT_PHNUM), but
     // AT_BASE is the interpreter's load base and control starts at its entry.
-    let stack_pointer = build_stack(mem, spec, &exe_hdr, exe_entry, exe_map.phdr_vaddr, interp_base)?;
+    let stack_pointer = build_stack(
+        mem,
+        spec,
+        &exe_hdr,
+        exe_entry,
+        exe_map.phdr_vaddr,
+        interp_base,
+    )?;
 
     Ok(LoadedImage {
         entry: interp_entry,
@@ -462,8 +471,9 @@ fn apply_relative_relocations(
         if entsz as usize != RELA_LEN {
             return Err(LoadError::Malformed("unexpected DT_RELAENT"));
         }
-        let file_off = vaddr_to_file_offset(phdrs, rela_vaddr)
-            .ok_or(LoadError::Malformed("DT_RELA not backed by a PT_LOAD segment"))?;
+        let file_off = vaddr_to_file_offset(phdrs, rela_vaddr).ok_or(LoadError::Malformed(
+            "DT_RELA not backed by a PT_LOAD segment",
+        ))?;
         let count = relasz as usize / RELA_LEN;
         for i in 0..count {
             let e = (file_off as usize)
@@ -496,8 +506,9 @@ fn apply_relative_relocations(
         if entsz as usize != REL_LEN {
             return Err(LoadError::Malformed("unexpected DT_RELENT"));
         }
-        let file_off = vaddr_to_file_offset(phdrs, rel_vaddr)
-            .ok_or(LoadError::Malformed("DT_REL not backed by a PT_LOAD segment"))?;
+        let file_off = vaddr_to_file_offset(phdrs, rel_vaddr).ok_or(LoadError::Malformed(
+            "DT_REL not backed by a PT_LOAD segment",
+        ))?;
         let count = relsz as usize / REL_LEN;
         for i in 0..count {
             let e = (file_off as usize)
@@ -872,8 +883,17 @@ mod tests {
 
     #[test]
     fn interp_path_reads_pt_interp() {
-        let exe = dyn_elf(EM_AARCH64, ET_DYN, "/lib/ld-musl-aarch64.so.1", 0, &[0xD4, 0, 0, 1]);
-        assert_eq!(interp_path(&exe).as_deref(), Some("/lib/ld-musl-aarch64.so.1"));
+        let exe = dyn_elf(
+            EM_AARCH64,
+            ET_DYN,
+            "/lib/ld-musl-aarch64.so.1",
+            0,
+            &[0xD4, 0, 0, 1],
+        );
+        assert_eq!(
+            interp_path(&exe).as_deref(),
+            Some("/lib/ld-musl-aarch64.so.1")
+        );
         // A plain static ELF has no interpreter.
         let stat = tiny_elf(EM_AARCH64, 0x1_0000, &[0xD4, 0, 0, 1]);
         assert_eq!(interp_path(&stat), None);
@@ -1156,7 +1176,11 @@ mod tests {
             a += 16;
         }
         assert_eq!(found_entry, Some(img.entry));
-        assert_eq!(found_base, Some(0), "no separate interpreter for a static PIE");
+        assert_eq!(
+            found_base,
+            Some(0),
+            "no separate interpreter for a static PIE"
+        );
     }
 
     #[test]

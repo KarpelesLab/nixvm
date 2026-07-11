@@ -129,9 +129,14 @@ impl MountFs for TmpFs {
         let node = self.nodes.get(rel)?;
         let (kind, mode, size, mtime) = match node {
             Node::Dir { .. } => (NodeKind::Dir, S_IFDIR | 0o755, 0, 0),
-            Node::File { data, mode, mtime, .. } => {
-                (NodeKind::File, S_IFREG | (mode & 0o777), data.len() as u64, *mtime)
-            }
+            Node::File {
+                data, mode, mtime, ..
+            } => (
+                NodeKind::File,
+                S_IFREG | (mode & 0o777),
+                data.len() as u64,
+                *mtime,
+            ),
             Node::Symlink { target, .. } => {
                 (NodeKind::Symlink, S_IFLNK | 0o777, target.len() as u64, 0)
             }

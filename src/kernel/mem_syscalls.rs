@@ -104,7 +104,13 @@ impl Kernel {
     /// is honored by zeroing the mapped pages so the guest sees fresh zero pages;
     /// every other advice is ignored.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_madvise(&mut self, addr: u64, len: u64, advice: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_madvise(
+        &mut self,
+        addr: u64,
+        len: u64,
+        advice: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         if advice == MADV_DONTNEED && len != 0 {
             let mut p = page_down(addr);
             let end = page_up(addr + len);
@@ -121,7 +127,13 @@ impl Kernel {
     /// `mincore(addr, len, vec)` — report residency. Everything mapped here is
     /// resident, so write `1` for each page spanned by `[addr, addr + len)`.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_mincore(&mut self, addr: u64, len: u64, vec: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_mincore(
+        &mut self,
+        addr: u64,
+        len: u64,
+        vec: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         if len == 0 {
             return 0;
         }

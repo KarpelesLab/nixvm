@@ -377,7 +377,6 @@ impl Sandbox {
         env
     }
 
-
     /// Load and run a statically-linked ELF64 image, returning its exit code.
     ///
     /// This is the full pipeline — loader → backend → kernel run/serve loop —
@@ -482,7 +481,9 @@ impl Sandbox {
             RootSource::Squashfs(path) => open_squashfs(path),
             RootSource::Image(image) => {
                 let store = ImageStore::default_location();
-                let path = store.ensure(image).map_err(|e| Error::Config(e.to_string()))?;
+                let path = store
+                    .ensure(image)
+                    .map_err(|e| Error::Config(e.to_string()))?;
                 open_squashfs(&path)
             }
         }
@@ -651,7 +652,10 @@ mod tests {
             .run()
             .unwrap();
         std::fs::remove_dir_all(&dir).ok();
-        assert_eq!(code, 42, "PID 1 read from the root and run to its exit code");
+        assert_eq!(
+            code, 42,
+            "PID 1 read from the root and run to its exit code"
+        );
     }
 
     #[cfg(unix)]
@@ -740,7 +744,10 @@ mod tests {
         let sb = Sandbox::builder().build();
         let mut mounts = sb.build_mounts().unwrap();
         preconfigure(&mut mounts);
-        assert!(mounts.stat("/etc/hostname").is_some(), "/etc/hostname seeded");
+        assert!(
+            mounts.stat("/etc/hostname").is_some(),
+            "/etc/hostname seeded"
+        );
         let (path, argv) = sb.pid1_program(&mut mounts);
         assert_eq!(path, "/bin/sh", "nude mode defaults PID 1 to the shell");
         assert_eq!(argv, vec!["/bin/sh".to_string()]);

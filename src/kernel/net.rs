@@ -314,7 +314,11 @@ impl InetAddr {
 
     /// `127.0.0.0/8` (v4) or `::1` (v6).
     fn is_loopback(&self) -> bool {
-        if self.v6 { self.ip == loopback_ip(true) } else { self.ip[0] == 127 }
+        if self.v6 {
+            self.ip == loopback_ip(true)
+        } else {
+            self.ip[0] == 127
+        }
     }
 
     /// This is a self-contained VM loopback: only the wildcard or loopback
@@ -367,12 +371,13 @@ impl Net {
                 return false;
             }
             match &s.kind {
-                Kind::Idle { bound: Some(Addr::Inet(b)) } if proto == "tcp" => {
-                    route_key("tcp", *b) == key
-                }
-                Kind::Listener { addr: Some(Addr::Inet(b)), .. } if proto == "tcp" => {
-                    route_key("tcp", *b) == key
-                }
+                Kind::Idle {
+                    bound: Some(Addr::Inet(b)),
+                } if proto == "tcp" => route_key("tcp", *b) == key,
+                Kind::Listener {
+                    addr: Some(Addr::Inet(b)),
+                    ..
+                } if proto == "tcp" => route_key("tcp", *b) == key,
                 Kind::Dgram(d) if proto == "udp" => {
                     d.local.is_some_and(|b| route_key("udp", b) == key)
                 }
@@ -385,7 +390,11 @@ impl Net {
     /// ephemeral range, trimmed for a small in-VM table).
     fn ephemeral_port(&self, proto: &str, v6: bool) -> u16 {
         for port in 32_768u32..=60_999 {
-            let a = InetAddr { v6, port: port as u16, ip: [0; 16] };
+            let a = InetAddr {
+                v6,
+                port: port as u16,
+                ip: [0; 16],
+            };
             if !self.addr_in_use(proto, a, usize::MAX) {
                 return port as u16;
             }
@@ -396,7 +405,11 @@ impl Net {
     /// A fresh client-side local address: loopback of `v6`'s family, with a
     /// freshly allocated ephemeral TCP port.
     fn fresh_local(&self, v6: bool) -> InetAddr {
-        InetAddr { v6, port: self.ephemeral_port("tcp", v6), ip: loopback_ip(v6) }
+        InetAddr {
+            v6,
+            port: self.ephemeral_port("tcp", v6),
+            ip: loopback_ip(v6),
+        }
     }
 }
 
@@ -421,7 +434,11 @@ impl Kernel {
         }
         let v6 = self.net.socks[sock].domain == AF_INET6;
         let port = self.net.ephemeral_port("udp", v6);
-        let local = InetAddr { v6, port, ip: loopback_ip(v6) };
+        let local = InetAddr {
+            v6,
+            port,
+            ip: loopback_ip(v6),
+        };
         if let Kind::Dgram(d) = &mut self.net.socks[sock].kind {
             d.local = Some(local);
         }
@@ -441,9 +458,17 @@ impl Kernel {
                 return err(Errno::EPROTONOSUPPORT);
             }
             let nonblock = sotype & SOCK_NONBLOCK != 0;
-            let kind = Kind::Netlink(Netlink { sotype: base_type, ..Netlink::default() });
+            let kind = Kind::Netlink(Netlink {
+                sotype: base_type,
+                ..Netlink::default()
+            });
             let idx = self.net.socks.len();
-            self.net.socks.push(Sock { domain, kind, nonblock, opts: SockOpts::default() });
+            self.net.socks.push(Sock {
+                domain,
+                kind,
+                nonblock,
+                opts: SockOpts::default(),
+            });
             return i64::from(self.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 }));
         }
         if domain != AF_UNIX && domain != AF_INET && domain != AF_INET6 {
@@ -460,7 +485,12 @@ impl Kernel {
             Kind::Idle { bound: None }
         };
         let idx = self.net.socks.len();
-        self.net.socks.push(Sock { domain, kind, nonblock, opts: SockOpts::default() });
+        self.net.socks.push(Sock {
+            domain,
+            kind,
+            nonblock,
+            opts: SockOpts::default(),
+        });
         i64::from(self.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 }))
     }
 
@@ -543,7 +573,9 @@ impl Kernel {
                 };
                 if a.port == 0 {
                     a.port = self.net.ephemeral_port(proto, a.v6);
-                } else if !self.net.socks[sock].opts.reuseaddr && self.net.addr_in_use(proto, a, sock) {
+                } else if !self.net.socks[sock].opts.reuseaddr
+                    && self.net.addr_in_use(proto, a, sock)
+                {
                     return err(Errno::EINVAL); // real errno: EADDRINUSE
                 }
                 match &mut self.net.socks[sock].kind {
@@ -575,14 +607,21 @@ impl Kernel {
         if bound.is_none() && domain != AF_UNIX {
             let v6 = domain == AF_INET6;
             let port = self.net.ephemeral_port("tcp", v6);
-            bound = Some(Addr::Inet(InetAddr { v6, port, ip: [0; 16] }));
+            bound = Some(Addr::Inet(InetAddr {
+                v6,
+                port,
+                ip: [0; 16],
+            }));
         }
         let key = match &bound {
             Some(Addr::Unix(p)) => Some(p.clone()),
             Some(Addr::Inet(a)) => Some(route_key("tcp", *a)),
             None => None,
         };
-        self.net.socks[sock].kind = Kind::Listener { addr: bound, backlog: VecDeque::new() };
+        self.net.socks[sock].kind = Kind::Listener {
+            addr: bound,
+            backlog: VecDeque::new(),
+        };
         if let Some(k) = key {
             self.net.listeners.insert(k, sock);
         }
@@ -657,7 +696,11 @@ impl Kernel {
             let v6 = domain == AF_INET6;
             let mut peer_addr = match listener_addr {
                 Some(Addr::Inet(a)) => a,
-                _ => InetAddr { v6, port: 0, ip: loopback_ip(v6) },
+                _ => InetAddr {
+                    v6,
+                    port: 0,
+                    ip: loopback_ip(v6),
+                },
             };
             if peer_addr.is_any() {
                 // Report the concrete loopback even if the server bound ANY.
@@ -708,10 +751,7 @@ impl Kernel {
         if let Kind::Pair(p) = &mut self.net.socks[pidx].kind {
             p.nonblock[1] = flags & SOCK_NONBLOCK != 0;
         }
-        i64::from(self.cur.fds.alloc(Fd::Socket {
-            sock: pidx,
-            end: 1,
-        }))
+        i64::from(self.cur.fds.alloc(Fd::Socket { sock: pidx, end: 1 }))
     }
 
     /// `bind(fd, addr, addrlen)` for an `AF_NETLINK` socket: parse a
@@ -733,7 +773,11 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         let requested = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
-        let pid = if requested == 0 { sock as u32 + 1 } else { requested };
+        let pid = if requested == 0 {
+            sock as u32 + 1
+        } else {
+            requested
+        };
         let Kind::Netlink(nl) = &mut self.net.socks[sock].kind else {
             return err(Errno::EINVAL);
         };
@@ -783,7 +827,13 @@ impl Kernel {
         };
         let domain = self.net.socks[sock].domain;
         match &self.net.socks[sock].kind {
-            Kind::Pair(p) => write_sockaddr(mem, addr, addrlen, domain, p.addrs[1 - end].map(Addr::Inet).as_ref()),
+            Kind::Pair(p) => write_sockaddr(
+                mem,
+                addr,
+                addrlen,
+                domain,
+                p.addrs[1 - end].map(Addr::Inet).as_ref(),
+            ),
             Kind::Dgram(d) if d.peer.is_some() => {
                 write_sockaddr(mem, addr, addrlen, domain, d.peer.map(Addr::Inet).as_ref())
             }
@@ -942,7 +992,11 @@ impl Kernel {
         }
         if level == SOL_SOCKET && (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO) {
             let opts = &self.net.socks[sock].opts;
-            let b = if optname == SO_RCVTIMEO { opts.rcvtimeo } else { opts.sndtimeo };
+            let b = if optname == SO_RCVTIMEO {
+                opts.rcvtimeo
+            } else {
+                opts.sndtimeo
+            };
             return write_optval(mem, optval, optlen_ptr, &b);
         }
         let value: u32 = if level == SOL_SOCKET {
@@ -963,12 +1017,14 @@ impl Kernel {
                 SO_BROADCAST => u32::from(self.net.socks[sock].opts.broadcast),
                 SO_RCVBUF => self.net.socks[sock].opts.rcvbuf,
                 SO_SNDBUF => self.net.socks[sock].opts.sndbuf,
-                SO_ACCEPTCONN => u32::from(matches!(self.net.socks[sock].kind, Kind::Listener { .. })),
+                SO_ACCEPTCONN => {
+                    u32::from(matches!(self.net.socks[sock].kind, Kind::Listener { .. }))
+                }
                 SO_DOMAIN => u32::from(self.net.socks[sock].domain),
                 SO_PROTOCOL => match (&self.net.socks[sock].kind, self.net.socks[sock].domain) {
-                    (Kind::Dgram(_), _) => 17,     // IPPROTO_UDP
+                    (Kind::Dgram(_), _) => 17,                      // IPPROTO_UDP
                     (_, d) if d == AF_UNIX || d == AF_NETLINK => 0, // NETLINK_ROUTE == 0
-                    _ => 6,                        // IPPROTO_TCP
+                    _ => 6,                                         // IPPROTO_TCP
                 },
                 _ => 0,
             }
@@ -1102,7 +1158,11 @@ impl Kernel {
         if mem.write(buf, &data[..n]).is_err() {
             return err(Errno::EFAULT);
         }
-        if flags & MSG_TRUNC != 0 { data.len() as i64 } else { n as i64 }
+        if flags & MSG_TRUNC != 0 {
+            data.len() as i64
+        } else {
+            n as i64
+        }
     }
 
     /// Pop (or, for `MSG_PEEK`, peek at) datagram socket `sock`'s next queued
@@ -1227,8 +1287,11 @@ impl Kernel {
         if shut_rd {
             return 0;
         }
-        let short =
-            flags & MSG_WAITALL != 0 && !nonblock && avail > 0 && avail < count as usize && peer_open;
+        let short = flags & MSG_WAITALL != 0
+            && !nonblock
+            && avail > 0
+            && avail < count as usize
+            && peer_open;
         if avail == 0 || short {
             if peer_open {
                 if nonblock {
@@ -1334,11 +1397,22 @@ impl Kernel {
                 ]
             } else if nlmsg_type == RTM_GETROUTE {
                 // No routes beyond the implicit loopback one: just end the dump.
-                vec![encode_nlmsg(NLMSG_DONE, 0, nlmsg_seq, pid, &0i32.to_le_bytes())]
+                vec![encode_nlmsg(
+                    NLMSG_DONE,
+                    0,
+                    nlmsg_seq,
+                    pid,
+                    &0i32.to_le_bytes(),
+                )]
             } else if want_ack {
                 vec![encode_nlmsgerr(0, &orig_hdr, nlmsg_seq, pid)]
             } else {
-                vec![encode_nlmsgerr(-Errno::EOPNOTSUPP.0, &orig_hdr, nlmsg_seq, pid)]
+                vec![encode_nlmsgerr(
+                    -Errno::EOPNOTSUPP.0,
+                    &orig_hdr,
+                    nlmsg_seq,
+                    pid,
+                )]
             };
             if let Kind::Netlink(nl) = &mut self.net.socks[sock].kind {
                 nl.queue.extend(replies);
@@ -1371,17 +1445,25 @@ fn read_sockaddr(mem: &GuestMemory, ptr: u64, addrlen: u64) -> Option<Addr> {
             let path = &bytes[2..];
             if path.first() == Some(&0) {
                 let len = (addrlen as usize).saturating_sub(2).min(path.len());
-                Some(Addr::Unix(String::from_utf8_lossy(&path[..len]).into_owned()))
+                Some(Addr::Unix(
+                    String::from_utf8_lossy(&path[..len]).into_owned(),
+                ))
             } else {
                 let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
-                Some(Addr::Unix(String::from_utf8_lossy(&path[..end]).into_owned()))
+                Some(Addr::Unix(
+                    String::from_utf8_lossy(&path[..end]).into_owned(),
+                ))
             }
         }
         AF_INET if bytes.len() >= 8 => {
             let port = u16::from_be_bytes([bytes[2], bytes[3]]);
             let mut ip = [0u8; 16];
             ip[0..4].copy_from_slice(&bytes[4..8]);
-            Some(Addr::Inet(InetAddr { v6: false, port, ip }))
+            Some(Addr::Inet(InetAddr {
+                v6: false,
+                port,
+                ip,
+            }))
         }
         AF_INET6 if bytes.len() >= 24 => {
             let port = u16::from_be_bytes([bytes[2], bytes[3]]);
@@ -1434,8 +1516,16 @@ fn write_sockaddr(
         }
         Some(Addr::Inet(a)) => encode_inet_sockaddr(*a),
         None => match domain {
-            AF_INET => encode_inet_sockaddr(InetAddr { v6: false, port: 0, ip: [0; 16] }),
-            AF_INET6 => encode_inet_sockaddr(InetAddr { v6: true, port: 0, ip: [0; 16] }),
+            AF_INET => encode_inet_sockaddr(InetAddr {
+                v6: false,
+                port: 0,
+                ip: [0; 16],
+            }),
+            AF_INET6 => encode_inet_sockaddr(InetAddr {
+                v6: true,
+                port: 0,
+                ip: [0; 16],
+            }),
             _ => domain.to_le_bytes().to_vec(),
         },
     };
@@ -1623,7 +1713,13 @@ mod tests {
         (kernel, mem, DummyVcpu)
     }
 
-    fn call(k: &mut Kernel, mem: &mut GuestMemory, v: &mut DummyVcpu, s: Sysno, a: [u64; 6]) -> i64 {
+    fn call(
+        k: &mut Kernel,
+        mem: &mut GuestMemory,
+        v: &mut DummyVcpu,
+        s: Sysno,
+        a: [u64; 6],
+    ) -> i64 {
         k.dispatch(s, 0, &a, v, mem)
     }
 
@@ -1655,7 +1751,16 @@ mod tests {
     fn socketpair_roundtrip() {
         let (mut k, mut mem, mut v) = setup();
         let sv = 0x1_0000;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, sv, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Socketpair,
+                [1, 1, 0, sv, 0, 0]
+            ),
+            0
+        );
         let a = u64::from(mem.read_u32(sv).unwrap());
         let b = u64::from(mem.read_u32(sv + 4).unwrap());
         assert!(a >= 3 && b >= 3 && a != b);
@@ -1663,12 +1768,21 @@ mod tests {
         let msg = 0x1_1000;
         let out = 0x1_2000;
         mem.write_init(msg, b"hi").unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [a, msg, 2, 0, 0, 0]), 2);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [b, out, 2, 0, 0, 0]), 2);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Write, [a, msg, 2, 0, 0, 0]),
+            2
+        );
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Read, [b, out, 2, 0, 0, 0]),
+            2
+        );
         assert_eq!(mem.read_vec(out, 2).unwrap(), b"hi");
 
         // The other direction is empty with the peer still open -> blocks.
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [a, out, 2, 0, 0, 0]), 0);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Read, [a, out, 2, 0, 0, 0]),
+            0
+        );
         assert!(k.block);
     }
 
@@ -1681,12 +1795,45 @@ mod tests {
         let alen = 5u64;
 
         let srv = call(&mut k, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Bind, [srv, addr, alen, 0, 0, 0]), 0);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Listen, [srv, 8, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Bind,
+                [srv, addr, alen, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Listen,
+                [srv, 8, 0, 0, 0, 0]
+            ),
+            0
+        );
 
         let cli = call(&mut k, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Connect, [cli, addr, alen, 0, 0, 0]), 0);
-        let acc = call(&mut k, &mut mem, &mut v, Sysno::Accept4, [srv, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Connect,
+                [cli, addr, alen, 0, 0, 0]
+            ),
+            0
+        );
+        let acc = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Accept4,
+            [srv, 0, 0, 0, 0, 0],
+        );
         assert!(acc >= 3, "accept returned a fd");
         let acc = acc as u64;
 
@@ -1694,13 +1841,49 @@ mod tests {
         let out = 0x1_3000;
         // client -> server
         mem.write_init(msg, b"ping").unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [cli, msg, 4, 0, 0, 0]), 4);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [acc, out, 4, 0, 0, 0]), 4);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [cli, msg, 4, 0, 0, 0]
+            ),
+            4
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Read,
+                [acc, out, 4, 0, 0, 0]
+            ),
+            4
+        );
         assert_eq!(mem.read_vec(out, 4).unwrap(), b"ping");
         // server -> client
         mem.write_init(msg, b"pong").unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [acc, msg, 4, 0, 0, 0]), 4);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [cli, out, 4, 0, 0, 0]), 4);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [acc, msg, 4, 0, 0, 0]
+            ),
+            4
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Read,
+                [cli, out, 4, 0, 0, 0]
+            ),
+            4
+        );
         assert_eq!(mem.read_vec(out, 4).unwrap(), b"pong");
     }
 
@@ -1711,7 +1894,13 @@ mod tests {
         mem.write_init(addr, &1u16.to_le_bytes()).unwrap();
         mem.write_init(addr + 2, b"/nope\0").unwrap();
         let cli = call(&mut k, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
-        let ret = call(&mut k, &mut mem, &mut v, Sysno::Connect, [cli, addr, 8, 0, 0, 0]);
+        let ret = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Connect,
+            [cli, addr, 8, 0, 0, 0],
+        );
         assert_eq!(ret, -i64::from(Errno::ECONNREFUSED.0));
     }
 
@@ -1719,14 +1908,38 @@ mod tests {
     fn write_to_socket_with_closed_peer_is_epipe() {
         let (mut k, mut mem, mut v) = setup();
         let sv = 0x1_0000;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, sv, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Socketpair,
+                [1, 1, 0, sv, 0, 0]
+            ),
+            0
+        );
         let end0 = u64::from(mem.read_u32(sv).unwrap());
         let end1 = u64::from(mem.read_u32(sv + 4).unwrap());
 
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Close, [end1, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Close,
+                [end1, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
         let msg = 0x1_1000;
         mem.write_init(msg, b"x").unwrap();
-        let ret = call(&mut k, &mut mem, &mut v, Sysno::Write, [end0, msg, 1, 0, 0, 0]);
+        let ret = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Write,
+            [end0, msg, 1, 0, 0, 0],
+        );
         assert_eq!(ret, -i64::from(Errno::EPIPE.0));
     }
 
@@ -1734,10 +1947,19 @@ mod tests {
     fn fstat_reports_socket_type() {
         let (mut k, mut mem, mut v) = setup();
         let sv = 0x1_0000;
-        call(&mut k, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, sv, 0, 0]);
+        call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Socketpair,
+            [1, 1, 0, sv, 0, 0],
+        );
         let a = u64::from(mem.read_u32(sv).unwrap());
         let st = 0x1_2000;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Fstat, [a, st, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Fstat, [a, st, 0, 0, 0, 0]),
+            0
+        );
         let mode = mem.read_u32(st + 16).unwrap();
         assert_eq!(mode & 0o170_000, 0o140_000, "S_IFSOCK");
     }
@@ -1750,24 +1972,93 @@ mod tests {
         let alen = 16u64;
 
         let srv = call(&mut k, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Bind, [srv, addr, alen, 0, 0, 0]), 0);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Listen, [srv, 8, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Bind,
+                [srv, addr, alen, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Listen,
+                [srv, 8, 0, 0, 0, 0]
+            ),
+            0
+        );
 
         let cli = call(&mut k, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Connect, [cli, addr, alen, 0, 0, 0]), 0);
-        let acc = call(&mut k, &mut mem, &mut v, Sysno::Accept4, [srv, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Connect,
+                [cli, addr, alen, 0, 0, 0]
+            ),
+            0
+        );
+        let acc = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Accept4,
+            [srv, 0, 0, 0, 0, 0],
+        );
         assert!(acc >= 3, "accept returned a fd");
         let acc = acc as u64;
 
         let msg = 0x1_1200;
         let out = 0x1_1300;
         mem.write_init(msg, b"ping").unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [cli, msg, 4, 0, 0, 0]), 4);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [acc, out, 4, 0, 0, 0]), 4);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [cli, msg, 4, 0, 0, 0]
+            ),
+            4
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Read,
+                [acc, out, 4, 0, 0, 0]
+            ),
+            4
+        );
         assert_eq!(mem.read_vec(out, 4).unwrap(), b"ping");
         mem.write_init(msg, b"pong").unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [acc, msg, 4, 0, 0, 0]), 4);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [cli, out, 4, 0, 0, 0]), 4);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [acc, msg, 4, 0, 0, 0]
+            ),
+            4
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Read,
+                [cli, out, 4, 0, 0, 0]
+            ),
+            4
+        );
         assert_eq!(mem.read_vec(out, 4).unwrap(), b"pong");
 
         // getpeername on the client reports the server's bound port; getsockname
@@ -1775,12 +2066,30 @@ mod tests {
         let peer = 0x1_1400;
         let peerlen = 0x1_1500;
         mem.write_init(peerlen, &16u32.to_le_bytes()).unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getpeername, [cli, peer, peerlen, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Getpeername,
+                [cli, peer, peerlen, 0, 0, 0]
+            ),
+            0
+        );
         assert_eq!(read_port(&mem, peer), 9000);
         assert_eq!(mem.read_vec(peer, 8).unwrap()[4..8], [127, 0, 0, 1]);
 
         mem.write_init(peerlen, &16u32.to_le_bytes()).unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getsockname, [acc, peer, peerlen, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Getsockname,
+                [acc, peer, peerlen, 0, 0, 0]
+            ),
+            0
+        );
         assert_eq!(read_port(&mem, peer), 9000);
     }
 
@@ -1794,20 +2103,71 @@ mod tests {
         let alen = 28u64;
 
         let srv = call(&mut k, &mut mem, &mut v, Sysno::Socket, [10, 1, 0, 0, 0, 0]) as u64;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Bind, [srv, addr, alen, 0, 0, 0]), 0);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Listen, [srv, 8, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Bind,
+                [srv, addr, alen, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Listen,
+                [srv, 8, 0, 0, 0, 0]
+            ),
+            0
+        );
 
         let cli = call(&mut k, &mut mem, &mut v, Sysno::Socket, [10, 1, 0, 0, 0, 0]) as u64;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Connect, [cli, addr, alen, 0, 0, 0]), 0);
-        let acc = call(&mut k, &mut mem, &mut v, Sysno::Accept4, [srv, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Connect,
+                [cli, addr, alen, 0, 0, 0]
+            ),
+            0
+        );
+        let acc = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Accept4,
+            [srv, 0, 0, 0, 0, 0],
+        );
         assert!(acc >= 3, "accept returned a fd");
         let acc = acc as u64;
 
         let msg = 0x1_1200;
         let out = 0x1_1300;
         mem.write_init(msg, b"v6ok").unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [cli, msg, 4, 0, 0, 0]), 4);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [acc, out, 4, 0, 0, 0]), 4);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [cli, msg, 4, 0, 0, 0]
+            ),
+            4
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Read,
+                [acc, out, 4, 0, 0, 0]
+            ),
+            4
+        );
         assert_eq!(mem.read_vec(out, 4).unwrap(), b"v6ok");
     }
 
@@ -1817,12 +2177,30 @@ mod tests {
         let addr = 0x1_1000;
         write_sockaddr_in(&mut mem, addr, [127, 0, 0, 1], 0); // port 0: auto-assign
         let s = call(&mut k, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Bind, [s, addr, 16, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Bind,
+                [s, addr, 16, 0, 0, 0]
+            ),
+            0
+        );
 
         let name = 0x1_1200;
         let namelen = 0x1_1300;
         mem.write_init(namelen, &16u32.to_le_bytes()).unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getsockname, [s, name, namelen, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Getsockname,
+                [s, name, namelen, 0, 0, 0]
+            ),
+            0
+        );
         assert!(read_port(&mem, name) >= 32_768);
     }
 
@@ -1836,16 +2214,58 @@ mod tests {
 
         let a = call(&mut k, &mut mem, &mut v, Sysno::Socket, [2, 2, 0, 0, 0, 0]) as u64;
         let b = call(&mut k, &mut mem, &mut v, Sysno::Socket, [2, 2, 0, 0, 0, 0]) as u64;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Bind, [a, a_addr, 16, 0, 0, 0]), 0);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Bind, [b, b_addr, 16, 0, 0, 0]), 0);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Connect, [a, b_addr, 16, 0, 0, 0]), 0);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Connect, [b, a_addr, 16, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Bind,
+                [a, a_addr, 16, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Bind,
+                [b, b_addr, 16, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Connect,
+                [a, b_addr, 16, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Connect,
+                [b, a_addr, 16, 0, 0, 0]
+            ),
+            0
+        );
 
         let msg = 0x1_1200;
         let out = 0x1_1300;
         mem.write_init(msg, b"hi").unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [a, msg, 2, 0, 0, 0]), 2);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [b, out, 2, 0, 0, 0]), 2);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Write, [a, msg, 2, 0, 0, 0]),
+            2
+        );
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Read, [b, out, 2, 0, 0, 0]),
+            2
+        );
         assert_eq!(mem.read_vec(out, 2).unwrap(), b"hi");
     }
 
@@ -1892,7 +2312,10 @@ mod tests {
         // Setting SO_REUSEADDR=1 on b lets the rebind through.
         let optval = 0x1_1600;
         mem.write_init(optval, &1u32.to_le_bytes()).unwrap();
-        assert_eq!(k.sys_setsockopt(b, SOL_SOCKET, SO_REUSEADDR, optval, 4, &mem), 0);
+        assert_eq!(
+            k.sys_setsockopt(b, SOL_SOCKET, SO_REUSEADDR, optval, 4, &mem),
+            0
+        );
         assert_eq!(k.sys_bind(b, addr, 16, &mem), 0);
     }
 
@@ -1901,10 +2324,40 @@ mod tests {
         let (mut k, mut mem, mut v) = setup();
         let addr = 0x1_1000;
         write_sockaddr_in(&mut mem, addr, [127, 0, 0, 1], 9600);
-        let srv = call(&mut k, &mut mem, &mut v, Sysno::Socket, [2, 1 | SOCK_NONBLOCK, 0, 0, 0, 0]) as u64;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Bind, [srv, addr, 16, 0, 0, 0]), 0);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Listen, [srv, 8, 0, 0, 0, 0]), 0);
-        let ret = call(&mut k, &mut mem, &mut v, Sysno::Accept4, [srv, 0, 0, 0, 0, 0]);
+        let srv = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Socket,
+            [2, 1 | SOCK_NONBLOCK, 0, 0, 0, 0],
+        ) as u64;
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Bind,
+                [srv, addr, 16, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Listen,
+                [srv, 8, 0, 0, 0, 0]
+            ),
+            0
+        );
+        let ret = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Accept4,
+            [srv, 0, 0, 0, 0, 0],
+        );
         assert_eq!(ret, -i64::from(Errno::EAGAIN.0));
         assert!(!k.block);
     }
@@ -1916,18 +2369,30 @@ mod tests {
 
         let optval = 0x1_1000;
         mem.write_init(optval, &65_536u32.to_le_bytes()).unwrap();
-        assert_eq!(k.sys_setsockopt(s, SOL_SOCKET, SO_RCVBUF, optval, 4, &mem), 0);
+        assert_eq!(
+            k.sys_setsockopt(s, SOL_SOCKET, SO_RCVBUF, optval, 4, &mem),
+            0
+        );
         mem.write_init(optval, &1u32.to_le_bytes()).unwrap();
-        assert_eq!(k.sys_setsockopt(s, SOL_SOCKET, SO_REUSEADDR, optval, 4, &mem), 0);
+        assert_eq!(
+            k.sys_setsockopt(s, SOL_SOCKET, SO_REUSEADDR, optval, 4, &mem),
+            0
+        );
 
         let out = 0x1_1100;
         let outlen = 0x1_1200;
         mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
-        assert_eq!(k.sys_getsockopt(s, SOL_SOCKET, SO_RCVBUF, out, outlen, &mut mem), 0);
+        assert_eq!(
+            k.sys_getsockopt(s, SOL_SOCKET, SO_RCVBUF, out, outlen, &mut mem),
+            0
+        );
         assert_eq!(mem.read_u32(out).unwrap(), 65_536);
 
         mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
-        assert_eq!(k.sys_getsockopt(s, SOL_SOCKET, SO_REUSEADDR, out, outlen, &mut mem), 0);
+        assert_eq!(
+            k.sys_getsockopt(s, SOL_SOCKET, SO_REUSEADDR, out, outlen, &mut mem),
+            0
+        );
         assert_eq!(mem.read_u32(out).unwrap(), 1);
     }
 
@@ -1937,18 +2402,42 @@ mod tests {
         let addr = 0x1_1000;
         write_sockaddr_in(&mut mem, addr, [127, 0, 0, 1], 9800);
         let srv = call(&mut k, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Bind, [srv, addr, 16, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Bind,
+                [srv, addr, 16, 0, 0, 0]
+            ),
+            0
+        );
 
         let out = 0x1_1100;
         let outlen = 0x1_1200;
         mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
-        assert_eq!(k.sys_getsockopt(srv, SOL_SOCKET, SO_ACCEPTCONN, out, outlen, &mut mem), 0);
+        assert_eq!(
+            k.sys_getsockopt(srv, SOL_SOCKET, SO_ACCEPTCONN, out, outlen, &mut mem),
+            0
+        );
         assert_eq!(mem.read_u32(out).unwrap(), 0, "not listening yet");
 
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Listen, [srv, 8, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Listen,
+                [srv, 8, 0, 0, 0, 0]
+            ),
+            0
+        );
 
         mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
-        assert_eq!(k.sys_getsockopt(srv, SOL_SOCKET, SO_ACCEPTCONN, out, outlen, &mut mem), 0);
+        assert_eq!(
+            k.sys_getsockopt(srv, SOL_SOCKET, SO_ACCEPTCONN, out, outlen, &mut mem),
+            0
+        );
         assert_eq!(mem.read_u32(out).unwrap(), 1, "listening");
     }
 
@@ -1956,13 +2445,25 @@ mod tests {
     fn msg_peek_returns_same_bytes_twice() {
         let (mut k, mut mem, mut v) = setup();
         let sv = 0x1_0000;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, sv, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Socketpair,
+                [1, 1, 0, sv, 0, 0]
+            ),
+            0
+        );
         let a = u64::from(mem.read_u32(sv).unwrap());
         let b = u64::from(mem.read_u32(sv + 4).unwrap());
 
         let msg = 0x1_1000;
         mem.write_init(msg, b"peekme").unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [a, msg, 6, 0, 0, 0]), 6);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Write, [a, msg, 6, 0, 0, 0]),
+            6
+        );
 
         let out = 0x1_2000;
         // Two MSG_PEEK reads in a row see the same bytes: nothing is consumed.
@@ -1972,10 +2473,16 @@ mod tests {
         assert_eq!(mem.read_vec(out, 6).unwrap(), b"peekme");
 
         // A real (non-peek) read now drains it...
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [b, out, 6, 0, 0, 0]), 6);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Read, [b, out, 6, 0, 0, 0]),
+            6
+        );
         assert_eq!(mem.read_vec(out, 6).unwrap(), b"peekme");
         // ...so a further read blocks (the peer end is still open).
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [b, out, 6, 0, 0, 0]), 0);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Read, [b, out, 6, 0, 0, 0]),
+            0
+        );
         assert!(k.block);
     }
 
@@ -1989,20 +2496,71 @@ mod tests {
         let alen = 2 + 6;
 
         let srv = call(&mut k, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Bind, [srv, addr, alen, 0, 0, 0]), 0);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Listen, [srv, 8, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Bind,
+                [srv, addr, alen, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Listen,
+                [srv, 8, 0, 0, 0, 0]
+            ),
+            0
+        );
 
         let cli = call(&mut k, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Connect, [cli, addr, alen, 0, 0, 0]), 0);
-        let acc = call(&mut k, &mut mem, &mut v, Sysno::Accept4, [srv, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Connect,
+                [cli, addr, alen, 0, 0, 0]
+            ),
+            0
+        );
+        let acc = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Accept4,
+            [srv, 0, 0, 0, 0, 0],
+        );
         assert!(acc >= 3, "accept returned a fd");
         let acc = acc as u64;
 
         let msg = 0x1_2000;
         let out = 0x1_3000;
         mem.write_init(msg, b"hi").unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [cli, msg, 2, 0, 0, 0]), 2);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [acc, out, 2, 0, 0, 0]), 2);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [cli, msg, 2, 0, 0, 0]
+            ),
+            2
+        );
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Read,
+                [acc, out, 2, 0, 0, 0]
+            ),
+            2
+        );
         assert_eq!(mem.read_vec(out, 2).unwrap(), b"hi");
     }
 
@@ -2011,16 +2569,37 @@ mod tests {
         const SHUT_WR: u64 = 1;
         let (mut k, mut mem, mut v) = setup();
         let sv = 0x1_0000;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, sv, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Socketpair,
+                [1, 1, 0, sv, 0, 0]
+            ),
+            0
+        );
         let a = u64::from(mem.read_u32(sv).unwrap());
         let b = u64::from(mem.read_u32(sv + 4).unwrap());
 
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Shutdown, [a, SHUT_WR, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Shutdown,
+                [a, SHUT_WR, 0, 0, 0, 0]
+            ),
+            0
+        );
 
         // b's read sees immediate EOF (0), not a block, even though a's fd is
         // still open (only its write side was shut down).
         let out = 0x1_1000;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [b, out, 4, 0, 0, 0]), 0);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Read, [b, out, 4, 0, 0, 0]),
+            0
+        );
         assert!(!k.block);
 
         // a itself can no longer write.
@@ -2037,7 +2616,13 @@ mod tests {
         let peer = 0x1_1000;
         let peerlen = 0x1_1100;
         mem.write_init(peerlen, &16u32.to_le_bytes()).unwrap();
-        let ret = call(&mut k, &mut mem, &mut v, Sysno::Getpeername, [s, peer, peerlen, 0, 0, 0]);
+        let ret = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Getpeername,
+            [s, peer, peerlen, 0, 0, 0],
+        );
         assert_eq!(ret, -i64::from(Errno::ENOTCONN.0));
     }
 
@@ -2103,16 +2688,38 @@ mod tests {
             &mut mem,
             &mut v,
             Sysno::Socket,
-            [u64::from(AF_NETLINK), SOCK_RAW | SOCK_NONBLOCK, NETLINK_ROUTE, 0, 0, 0],
+            [
+                u64::from(AF_NETLINK),
+                SOCK_RAW | SOCK_NONBLOCK,
+                NETLINK_ROUTE,
+                0,
+                0,
+                0,
+            ],
         ) as u64;
         assert!(fd >= 3);
 
         let req = 0x1_1000;
         write_nlmsghdr(&mut mem, req, RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 42);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [fd, req, 16, 0, 0, 0]), 16);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [fd, req, 16, 0, 0, 0]
+            ),
+            16
+        );
 
         let out = 0x1_2000;
-        let n = call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, out, 2048, 0, 0, 0]);
+        let n = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Read,
+            [fd, out, 2048, 0, 0, 0],
+        );
         assert!(n > 0, "expected a reply");
         let buf = mem.read_vec(out, n as usize).unwrap();
         let msgs = parse_nlmsgs(&buf);
@@ -2137,15 +2744,37 @@ mod tests {
             &mut mem,
             &mut v,
             Sysno::Socket,
-            [u64::from(AF_NETLINK), SOCK_RAW | SOCK_NONBLOCK, NETLINK_ROUTE, 0, 0, 0],
+            [
+                u64::from(AF_NETLINK),
+                SOCK_RAW | SOCK_NONBLOCK,
+                NETLINK_ROUTE,
+                0,
+                0,
+                0,
+            ],
         ) as u64;
 
         let req = 0x1_1000;
         write_nlmsghdr(&mut mem, req, RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 7);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Sendto, [fd, req, 16, 0, 0, 0]), 16);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Sendto,
+                [fd, req, 16, 0, 0, 0]
+            ),
+            16
+        );
 
         let out = 0x1_2000;
-        let n = call(&mut k, &mut mem, &mut v, Sysno::Recvfrom, [fd, out, 2048, 0, 0, 0]);
+        let n = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Recvfrom,
+            [fd, out, 2048, 0, 0, 0],
+        );
         assert!(n > 0, "expected a reply");
         let buf = mem.read_vec(out, n as usize).unwrap();
         let msgs = parse_nlmsgs(&buf);
@@ -2167,15 +2796,37 @@ mod tests {
             &mut mem,
             &mut v,
             Sysno::Socket,
-            [u64::from(AF_NETLINK), SOCK_RAW | SOCK_NONBLOCK, NETLINK_ROUTE, 0, 0, 0],
+            [
+                u64::from(AF_NETLINK),
+                SOCK_RAW | SOCK_NONBLOCK,
+                NETLINK_ROUTE,
+                0,
+                0,
+                0,
+            ],
         ) as u64;
 
         let req = 0x1_1000;
         write_nlmsghdr(&mut mem, req, 0xffff, NLM_F_REQUEST, 99);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [fd, req, 16, 0, 0, 0]), 16);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [fd, req, 16, 0, 0, 0]
+            ),
+            16
+        );
 
         let out = 0x1_2000;
-        let n = call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, out, 2048, 0, 0, 0]);
+        let n = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Read,
+            [fd, out, 2048, 0, 0, 0],
+        );
         assert!(n > 0);
         let buf = mem.read_vec(out, n as usize).unwrap();
         let msgs = parse_nlmsgs(&buf);
@@ -2195,7 +2846,14 @@ mod tests {
             &mut mem,
             &mut v,
             Sysno::Socket,
-            [u64::from(AF_NETLINK), SOCK_RAW | SOCK_NONBLOCK, NETLINK_ROUTE, 0, 0, 0],
+            [
+                u64::from(AF_NETLINK),
+                SOCK_RAW | SOCK_NONBLOCK,
+                NETLINK_ROUTE,
+                0,
+                0,
+                0,
+            ],
         ) as u64;
 
         let addr = 0x1_1000;
@@ -2203,12 +2861,30 @@ mod tests {
         b[0..2].copy_from_slice(&AF_NETLINK.to_le_bytes());
         b[4..8].copy_from_slice(&4242u32.to_le_bytes());
         mem.write_init(addr, &b).unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Bind, [fd, addr, 12, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Bind,
+                [fd, addr, 12, 0, 0, 0]
+            ),
+            0
+        );
 
         let name = 0x1_2000;
         let namelen = 0x1_2100;
         mem.write_init(namelen, &12u32.to_le_bytes()).unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getsockname, [fd, name, namelen, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Getsockname,
+                [fd, name, namelen, 0, 0, 0]
+            ),
+            0
+        );
         let b = mem.read_vec(name, 8).unwrap();
         assert_eq!(u16::from_le_bytes([b[0], b[1]]), AF_NETLINK);
         assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), 4242);
@@ -2222,10 +2898,23 @@ mod tests {
             &mut mem,
             &mut v,
             Sysno::Socket,
-            [u64::from(AF_NETLINK), SOCK_RAW | SOCK_NONBLOCK, NETLINK_ROUTE, 0, 0, 0],
+            [
+                u64::from(AF_NETLINK),
+                SOCK_RAW | SOCK_NONBLOCK,
+                NETLINK_ROUTE,
+                0,
+                0,
+                0,
+            ],
         ) as u64;
         let out = 0x1_1000;
-        let ret = call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, out, 64, 0, 0, 0]);
+        let ret = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Read,
+            [fd, out, 64, 0, 0, 0],
+        );
         assert_eq!(ret, -i64::from(Errno::EAGAIN.0));
         assert!(!k.block);
     }

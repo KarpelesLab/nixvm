@@ -190,16 +190,14 @@ impl ImageStore {
             }
         }
 
-        let source = resolve_source(image)
-            .ok_or_else(|| ImageError::NotCached(Box::new(image.clone())))?;
+        let source =
+            resolve_source(image).ok_or_else(|| ImageError::NotCached(Box::new(image.clone())))?;
 
         std::fs::create_dir_all(&self.root).map_err(ImageError::Io)?;
 
-        let tmp_path = self.root.join(format!(
-            ".{}.{}.tmp",
-            image.file_name(),
-            std::process::id()
-        ));
+        let tmp_path = self
+            .root
+            .join(format!(".{}.{}.tmp", image.file_name(), std::process::id()));
         let _cleanup = TempGuard(&tmp_path);
 
         let digest = match source {
@@ -479,7 +477,7 @@ impl Sha256 {
 
 #[cfg(test)]
 mod tests {
-    use super::{sha256_bytes, ImageError, ImageRef, ImageStore};
+    use super::{ImageError, ImageRef, ImageStore, sha256_bytes};
     use crate::abi::Arch;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -568,7 +566,9 @@ mod tests {
             .with_source(format!("file://{}", src.0.display()))
             .with_sha256(digest);
 
-        let path = store.ensure(&image).expect("digest matches, ensure succeeds");
+        let path = store
+            .ensure(&image)
+            .expect("digest matches, ensure succeeds");
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).expect("read"), contents);
     }
@@ -584,7 +584,9 @@ mod tests {
             .with_source(src.0.to_str().expect("utf8 temp path"))
             .with_sha256(wrong_digest);
 
-        let err = store.ensure(&image).expect_err("digest mismatch must error");
+        let err = store
+            .ensure(&image)
+            .expect_err("digest mismatch must error");
         assert!(
             matches!(err, ImageError::DigestMismatch { .. }),
             "expected DigestMismatch, got {err:?}"
@@ -603,7 +605,9 @@ mod tests {
         let image = ImageRef::default_for(Arch::Aarch64)
             .with_source("http://example.invalid/does-not-matter.sqfs");
 
-        let err = store.ensure(&image).expect_err("no fetch feature must error");
+        let err = store
+            .ensure(&image)
+            .expect_err("no fetch feature must error");
         assert!(
             matches!(err, ImageError::Fetch(_)),
             "expected Fetch error, got {err:?}"

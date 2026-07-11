@@ -394,7 +394,13 @@ impl Aarch64Interp {
     /// Write the low `nbytes` bytes of `val` to `addr`, going through
     /// `note_store` (watch logging + exclusive-monitor clear) like every
     /// other store path. Shared by the LSE atomic helpers below.
-    fn mem_write_sized(&mut self, mem: &mut GuestMemory, addr: u64, nbytes: usize, val: u64) -> bool {
+    fn mem_write_sized(
+        &mut self,
+        mem: &mut GuestMemory,
+        addr: u64,
+        nbytes: usize,
+        val: u64,
+    ) -> bool {
         self.note_store(addr, u128::from(val), nbytes);
         mem.write(addr, &val.to_le_bytes()[..nbytes]).is_ok()
     }
@@ -474,7 +480,14 @@ impl Aarch64Interp {
 
     /// SWP/SWPA/SWPL/SWPAL (+ SWPB/SWPH): atomic swap — store `rs` to
     /// `addr`, return the original `nbytes`-wide value there in `rt`.
-    fn swp(&mut self, addr: u64, nbytes: usize, rs: usize, rt: usize, mem: &mut GuestMemory) -> Step {
+    fn swp(
+        &mut self,
+        addr: u64,
+        nbytes: usize,
+        rs: usize,
+        rt: usize,
+        mem: &mut GuestMemory,
+    ) -> Step {
         let Some(old) = mem_read_sized(mem, addr, nbytes) else {
             return Step::Fault { addr, write: false };
         };
@@ -510,9 +523,9 @@ impl Aarch64Interp {
         let s = self.read_x(rs) & mask;
         let new = match op {
             0b000 => old.wrapping_add(s) & mask, // ADD
-            0b001 => old & !s & mask,             // CLR: old AND NOT rs
-            0b010 => (old ^ s) & mask,            // EOR
-            0b011 => (old | s) & mask,            // SET: old OR rs
+            0b001 => old & !s & mask,            // CLR: old AND NOT rs
+            0b010 => (old ^ s) & mask,           // EOR
+            0b011 => (old | s) & mask,           // SET: old OR rs
             0b100 => {
                 // SMAX
                 if sign_extend(old, bits) >= sign_extend(s, bits) {
@@ -645,7 +658,10 @@ impl Aarch64Interp {
                     // DC_ZVA_BLOCK_BYTES bytes (see that const).
                     let addr = self.read_x(rt) & !(DC_ZVA_BLOCK_BYTES - 1);
                     self.note_store(addr, 0u128, DC_ZVA_BLOCK_BYTES as usize);
-                    if mem.write(addr, &[0u8; DC_ZVA_BLOCK_BYTES as usize]).is_err() {
+                    if mem
+                        .write(addr, &[0u8; DC_ZVA_BLOCK_BYTES as usize])
+                        .is_err()
+                    {
                         Step::Fault { addr, write: true }
                     } else {
                         Step::Next
@@ -706,7 +722,7 @@ impl Aarch64Interp {
                 0b000 => sha1_quad_round(self.v[rd], e, self.v[rm], Sha1Op::Choose), // SHA1C
                 0b001 => sha1_quad_round(self.v[rd], e, self.v[rm], Sha1Op::Parity), // SHA1P
                 0b010 => sha1_quad_round(self.v[rd], e, self.v[rm], Sha1Op::Majority), // SHA1M
-                0b011 => sha1_su0(self.v[rd], self.v[rn], self.v[rm]),              // SHA1SU0
+                0b011 => sha1_su0(self.v[rd], self.v[rn], self.v[rm]),               // SHA1SU0
                 // SHA256H2 is called with the pre-round `abcd`/`efgh` swapped
                 // into `Vn`/`Vd` (matching the real usage pattern of saving
                 // `abcd` before `SHA256H` overwrites it), so it re-derives
@@ -1162,7 +1178,11 @@ impl Aarch64Interp {
             let rn = reg_field(instr, 5);
             let rd = reg_field(instr, 0);
             let a = self.read_x(rn);
-            let b = if op == 1 { !self.read_x(rm) } else { self.read_x(rm) };
+            let b = if op == 1 {
+                !self.read_x(rm)
+            } else {
+                self.read_x(rm)
+            };
             let carry = u128::from(self.flags.c);
             let r = if sf == 1 {
                 let sum = u128::from(a) + u128::from(b) + carry;
@@ -1349,10 +1369,7 @@ impl Aarch64Interp {
         // function (verified against the exclusive/CAS class above and the
         // load/store-pair and register-offset classes elsewhere), so this
         // arm's position relative to them doesn't matter.
-        if (instr >> 24) & 0x3f == 0b11_1000
-            && (instr >> 21) & 1 == 1
-            && (instr >> 10) & 3 == 0
-        {
+        if (instr >> 24) & 0x3f == 0b11_1000 && (instr >> 21) & 1 == 1 && (instr >> 10) & 3 == 0 {
             let size = (instr >> 30) & 3;
             let nbytes = 1usize << size;
             let rs = reg_field(instr, 16);
@@ -1704,7 +1721,11 @@ impl Aarch64Interp {
             let index = imm5 >> (esize / 8).trailing_zeros().wrapping_add(1);
             let elem = (self.v[rn] >> (u128::from(index) * u128::from(esize))) & ones_u128(esize);
             let se = sign_extend(elem as u64, esize);
-            let result = if q == 1 { se as u64 } else { u64::from(se as u32) };
+            let result = if q == 1 {
+                se as u64
+            } else {
+                u64::from(se as u32)
+            };
             self.write_x(rd, result);
             return Step::Next;
         }
@@ -2019,10 +2040,10 @@ impl Aarch64Interp {
                 0 => {
                     let (n, m, a) = (self.fp32(rn), self.fp32(rm), self.fp32(ra));
                     let r = match (o1, o0) {
-                        (0, 0) => n.mul_add(m, a),      // FMADD:  a + n*m
-                        (0, 1) => (-n).mul_add(m, a),    // FMSUB:  a - n*m
-                        (1, 0) => (-n).mul_add(m, -a),   // FNMADD: -a - n*m
-                        _ => n.mul_add(m, -a),           // FNMSUB: n*m - a
+                        (0, 0) => n.mul_add(m, a),     // FMADD:  a + n*m
+                        (0, 1) => (-n).mul_add(m, a),  // FMSUB:  a - n*m
+                        (1, 0) => (-n).mul_add(m, -a), // FNMADD: -a - n*m
+                        _ => n.mul_add(m, -a),         // FNMSUB: n*m - a
                     };
                     self.set_fp32(rd, r);
                 }
@@ -2145,14 +2166,14 @@ impl Aarch64Interp {
             let rd = reg_field(instr, 0);
             let (vn, vm, vd) = (self.v[rn], self.v[rm], self.v[rd]);
             let out = match (u, size) {
-                (0, 0b00) => vn & vm,                 // AND
-                (0, 0b01) => vn & !vm,                // BIC
-                (0, 0b10) => vn | vm,                 // ORR (MOV when Rn==Rm)
-                (0, 0b11) => vn | !vm,                // ORN
-                (1, 0b00) => vn ^ vm,                 // EOR
-                (1, 0b01) => (vd & vn) | (!vd & vm),  // BSL
-                (1, 0b10) => (vm & vn) | (!vm & vd),  // BIT
-                _ => (!vm & vn) | (vm & vd),          // BIF (1,0b11)
+                (0, 0b00) => vn & vm,                // AND
+                (0, 0b01) => vn & !vm,               // BIC
+                (0, 0b10) => vn | vm,                // ORR (MOV when Rn==Rm)
+                (0, 0b11) => vn | !vm,               // ORN
+                (1, 0b00) => vn ^ vm,                // EOR
+                (1, 0b01) => (vd & vn) | (!vd & vm), // BSL
+                (1, 0b10) => (vm & vn) | (!vm & vd), // BIT
+                _ => (!vm & vn) | (vm & vd),         // BIF (1,0b11)
             };
             let mask = if q == 1 { u128::MAX } else { ones_u128(64) };
             self.v[rd] = out & mask;
@@ -2267,9 +2288,9 @@ impl Aarch64Interp {
             if dbl == 0 {
                 let (a, b) = (self.fp32(rn), self.fp32(rm));
                 let r = match (uns, asub, opcode) {
-                    (1, 1, 0b11010) => (a - b).abs(),      // FABD
-                    (0, 0, 0b11111) => 2.0 - a * b,        // FRECPS
-                    _ => (3.0 - a * b) / 2.0,               // (0,1,0b11111) FRSQRTS
+                    (1, 1, 0b11010) => (a - b).abs(), // FABD
+                    (0, 0, 0b11111) => 2.0 - a * b,   // FRECPS
+                    _ => (3.0 - a * b) / 2.0,         // (0,1,0b11111) FRSQRTS
                 };
                 self.set_fp32(rd, r);
             } else {
@@ -2313,7 +2334,11 @@ impl Aarch64Interp {
             // concat[j] = Vn[j] for j < lanes, else Vm[j - lanes] — pairwise
             // ops act on adjacent elements of Vn:Vm concatenated together.
             let concat = |v0: u128, v1: u128, j: u32| {
-                if j < lanes { lane(v0, j) } else { lane(v1, j - lanes) }
+                if j < lanes {
+                    lane(v0, j)
+                } else {
+                    lane(v1, j - lanes)
+                }
             };
             let mut result = 0u128;
             for i in 0..lanes {
@@ -2375,10 +2400,13 @@ impl Aarch64Interp {
             }
             self.v[rd] = if dbl == 0 {
                 let lanes = if q == 1 { 4 } else { 2 };
-                let lane =
-                    |v: u128, i: u32| f32::from_bits(((v >> (i * 32)) & 0xffff_ffff) as u32);
+                let lane = |v: u128, i: u32| f32::from_bits(((v >> (i * 32)) & 0xffff_ffff) as u32);
                 let concat = |v0: u128, v1: u128, j: u32| {
-                    if j < lanes { lane(v0, j) } else { lane(v1, j - lanes) }
+                    if j < lanes {
+                        lane(v0, j)
+                    } else {
+                        lane(v1, j - lanes)
+                    }
                 };
                 let mut result = 0u128;
                 for i in 0..lanes {
@@ -2530,18 +2558,10 @@ impl Aarch64Interp {
                         }
                     }
                     14 => {
-                        if x > y {
-                            x
-                        } else {
-                            y
-                        } // UMAX
+                        if x > y { x } else { y } // UMAX
                     }
                     15 => {
-                        if x < y {
-                            x
-                        } else {
-                            y
-                        } // UMIN
+                        if x < y { x } else { y } // UMIN
                     }
                     16 => signed_sat(
                         i128::from(sign_extend(x as u64, esize))
@@ -2651,15 +2671,11 @@ impl Aarch64Interp {
                 let wide = (self.v[rn] >> (i * esize * 2)) & src_mask;
                 let lane = match (u, opcode) {
                     (0, 0b10010) => wide & mask, // XTN/XTN2: plain truncate
-                    (0, 0b10100) => signed_sat(
-                        i128::from(sign_extend(wide as u64, esize * 2)),
-                        esize,
-                    ), // SQXTN/SQXTN2
+                    (0, 0b10100) => {
+                        signed_sat(i128::from(sign_extend(wide as u64, esize * 2)), esize)
+                    } // SQXTN/SQXTN2
                     (1, 0b10100) => unsigned_sat(wide as i128, esize), // UQXTN/UQXTN2
-                    _ => unsigned_sat(
-                        i128::from(sign_extend(wide as u64, esize * 2)),
-                        esize,
-                    ), // SQXTUN/SQXTUN2 (1, 0b10010)
+                    _ => unsigned_sat(i128::from(sign_extend(wide as u64, esize * 2)), esize), // SQXTUN/SQXTUN2 (1, 0b10010)
                 };
                 narrow |= lane << (i * esize);
             }
@@ -2862,9 +2878,8 @@ impl Aarch64Interp {
                         let mut result = 0u128;
                         for i in 0..2u32 {
                             let sh = i * 64;
-                            let val = f64::from_bits(
-                                ((self.v[rn] >> sh) & u128::from(u64::MAX)) as u64,
-                            );
+                            let val =
+                                f64::from_bits(((self.v[rn] >> sh) & u128::from(u64::MAX)) as u64);
                             let res = match (uns, opcode) {
                                 (0, 0b01111) => val.abs(),
                                 (1, 0b01111) => -val,
@@ -3038,9 +3053,9 @@ impl Aarch64Interp {
             for i in 1..4 {
                 let v = lane(i);
                 acc = match (is_nm, is_min) {
-                    (true, true) => acc.min(v),   // FMINNMV
-                    (true, false) => acc.max(v),  // FMAXNMV
-                    (false, true) => fmin32(acc, v), // FMINV
+                    (true, true) => acc.min(v),       // FMINNMV
+                    (true, false) => acc.max(v),      // FMAXNMV
+                    (false, true) => fmin32(acc, v),  // FMINV
                     (false, false) => fmax32(acc, v), // FMAXV
                 };
             }
@@ -3091,7 +3106,8 @@ impl Aarch64Interp {
                     for i in 1..lanes {
                         let v = lane_at(i);
                         let better = if u == 0 {
-                            let (sv, sacc) = (sign_extend(v as u64, esize), sign_extend(acc as u64, esize));
+                            let (sv, sacc) =
+                                (sign_extend(v as u64, esize), sign_extend(acc as u64, esize));
                             if is_min { sv < sacc } else { sv > sacc }
                         } else if is_min {
                             v < acc
@@ -3300,7 +3316,7 @@ impl Aarch64Interp {
                         let nv = f32::from_bits(((self.v[rn] >> sh) & mask) as u32);
                         let acc = f32::from_bits(((self.v[rd] >> sh) & mask) as u32);
                         let r = match (opcode, u) {
-                            (0b0001, 0) => nv.mul_add(mv, acc),   // FMLA
+                            (0b0001, 0) => nv.mul_add(mv, acc),    // FMLA
                             (0b0101, 0) => (-nv).mul_add(mv, acc), // FMLS
                             (0b1001, 0) => nv * mv,                // FMUL
                             (0b1001, 1) => fmulx32(nv, mv),        // FMULX
@@ -3348,7 +3364,7 @@ impl Aarch64Interp {
                         let n_elem = (self.v[rn] >> sh) & mask;
                         let prod = n_elem.wrapping_mul(m_elem) & mask;
                         let lane = match (opcode, u) {
-                            (0b1000, 0) => prod, // MUL
+                            (0b1000, 0) => prod,                                                  // MUL
                             (0b0000, 1) => ((self.v[rd] >> sh) & mask).wrapping_add(prod) & mask, // MLA
                             _ => ((self.v[rd] >> sh) & mask).wrapping_sub(prod) & mask, // MLS
                         };
@@ -3842,7 +3858,11 @@ fn sat_shl(x: u128, amt: i64, esize: u32, signed: bool, rounding: bool) -> u128 
 fn crc32_step(crc: u32, byte: u8, poly: u32) -> u32 {
     let mut crc = crc ^ u32::from(byte);
     for _ in 0..8 {
-        crc = if crc & 1 != 0 { (crc >> 1) ^ poly } else { crc >> 1 };
+        crc = if crc & 1 != 0 {
+            (crc >> 1) ^ poly
+        } else {
+            crc >> 1
+        };
     }
     crc
 }
@@ -4101,7 +4121,11 @@ fn f32_to_f16(v: f32) -> u16 {
     let frac = bits & 0x007f_ffff;
     if exp == 0xff {
         // Infinity, or NaN (force a nonzero mantissa so it stays a NaN).
-        let payload = if frac != 0 { (frac >> 13) as u16 | 0x200 } else { 0 };
+        let payload = if frac != 0 {
+            (frac >> 13) as u16 | 0x200
+        } else {
+            0
+        };
         return sign | 0x7c00 | payload;
     }
     let hexp = exp - 127 + 15;
@@ -4312,7 +4336,12 @@ fn aes_inv_mix_column(a: [u8; 4]) -> [u8; 4] {
 /// vector's least-significant 32 bits, matching this file's `LD1`/`ldst_vec`
 /// convention elsewhere).
 fn u32_lanes(v: u128) -> [u32; 4] {
-    [v as u32, (v >> 32) as u32, (v >> 64) as u32, (v >> 96) as u32]
+    [
+        v as u32,
+        (v >> 32) as u32,
+        (v >> 64) as u32,
+        (v >> 96) as u32,
+    ]
 }
 
 /// Read 32-bit lane `i` (0..=3) of `v`.
@@ -4322,7 +4351,10 @@ fn lane32(v: u128, i: u32) -> u32 {
 
 /// Pack 4 32-bit lanes (lane 0 first) into a 128-bit vector.
 fn pack_u32_lanes(l: [u32; 4]) -> u128 {
-    u128::from(l[0]) | (u128::from(l[1]) << 32) | (u128::from(l[2]) << 64) | (u128::from(l[3]) << 96)
+    u128::from(l[0])
+        | (u128::from(l[1]) << 32)
+        | (u128::from(l[2]) << 64)
+        | (u128::from(l[3]) << 96)
 }
 
 /// Which SHA-1 nonlinear round function `SHA1C`/`SHA1P`/`SHA1M` runs.
@@ -4376,7 +4408,12 @@ fn sha1_su0(vd: u128, vn: u128, vm: u128) -> u128 {
     let d = u32_lanes(vd);
     let n = u32_lanes(vn);
     let m = u32_lanes(vm);
-    pack_u32_lanes([d[0] ^ d[2] ^ m[0], d[1] ^ d[3] ^ m[1], d[2] ^ n[0] ^ m[2], d[3] ^ n[1] ^ m[3]])
+    pack_u32_lanes([
+        d[0] ^ d[2] ^ m[0],
+        d[1] ^ d[3] ^ m[1],
+        d[2] ^ n[0] ^ m[2],
+        d[3] ^ n[1] ^ m[3],
+    ])
 }
 
 /// `SHA1SU1`: finishes the recurrence `SHA1SU0` started, folding in the
@@ -4863,7 +4900,10 @@ mod tests {
         c.x[3] = 0x99;
         // stxr w2,x3,[x1] — monitor was cleared by the plain store above.
         assert!(matches!(c.exec(0xC802_7C23, &mut m), Step::Next));
-        assert_eq!(c.x[2], 1, "STXR reports failure once the monitor is cleared");
+        assert_eq!(
+            c.x[2], 1,
+            "STXR reports failure once the monitor is cleared"
+        );
         let mut buf = [0u8; 8];
         m.read(addr, &mut buf).unwrap();
         assert_eq!(
@@ -4888,10 +4928,17 @@ mod tests {
         c.x[1] = 0xdead_beef;
         c.x[2] = 0x2222_2222;
         assert!(matches!(c.exec(0x88a1_7c02, &mut m), Step::Next));
-        assert_eq!(c.x[1], 0x1111_1111, "CAS returns the original value even on mismatch");
+        assert_eq!(
+            c.x[1], 0x1111_1111,
+            "CAS returns the original value even on mismatch"
+        );
         let mut buf = [0u8; 4];
         m.read(addr, &mut buf).unwrap();
-        assert_eq!(u32::from_le_bytes(buf), 0x1111_1111, "no swap on a failed compare");
+        assert_eq!(
+            u32::from_le_bytes(buf),
+            0x1111_1111,
+            "no swap on a failed compare"
+        );
 
         // cas w1,w2,[x0] with a matching compare value: swap happens.
         c.x[1] = 0x1111_1111;
@@ -4899,7 +4946,11 @@ mod tests {
         assert!(matches!(c.exec(0x88a1_7c02, &mut m), Step::Next));
         assert_eq!(c.x[1], 0x1111_1111, "CAS still returns the pre-swap value");
         m.read(addr, &mut buf).unwrap();
-        assert_eq!(u32::from_le_bytes(buf), 0x2222_2222, "swap happens on a matching compare");
+        assert_eq!(
+            u32::from_le_bytes(buf),
+            0x2222_2222,
+            "swap happens on a matching compare"
+        );
     }
 
     #[test]
@@ -4917,7 +4968,11 @@ mod tests {
         assert_eq!(c.x[2], 0x1234_5678, "SWP returns the original value");
         let mut buf = [0u8; 4];
         m.read(addr, &mut buf).unwrap();
-        assert_eq!(u32::from_le_bytes(buf), 0xAAAA_BBBB, "SWP stores the new value");
+        assert_eq!(
+            u32::from_le_bytes(buf),
+            0xAAAA_BBBB,
+            "SWP stores the new value"
+        );
     }
 
     #[test]
@@ -4936,21 +4991,33 @@ mod tests {
         assert!(matches!(c.exec(0xb821_0002, &mut m), Step::Next));
         assert_eq!(c.x[2], 0x0f, "LDADD returns the original value");
         m.read(addr, &mut buf).unwrap();
-        assert_eq!(u32::from_le_bytes(buf), 0x1f, "LDADD writes old+rs back to memory");
+        assert_eq!(
+            u32::from_le_bytes(buf),
+            0x1f,
+            "LDADD writes old+rs back to memory"
+        );
 
         // ldset w1,w2,[x0]: w2 = old; mem = old | w1.
         c.x[1] = 0xf0;
         assert!(matches!(c.exec(0xb821_3002, &mut m), Step::Next));
         assert_eq!(c.x[2], 0x1f, "LDSET returns the original value");
         m.read(addr, &mut buf).unwrap();
-        assert_eq!(u32::from_le_bytes(buf), 0xff, "LDSET writes old|rs back to memory");
+        assert_eq!(
+            u32::from_le_bytes(buf),
+            0xff,
+            "LDSET writes old|rs back to memory"
+        );
 
         // ldclr w1,w2,[x0]: w2 = old; mem = old & !w1.
         c.x[1] = 0x0f;
         assert!(matches!(c.exec(0xb821_1002, &mut m), Step::Next));
         assert_eq!(c.x[2], 0xff, "LDCLR returns the original value");
         m.read(addr, &mut buf).unwrap();
-        assert_eq!(u32::from_le_bytes(buf), 0xf0, "LDCLR writes old&!rs back to memory");
+        assert_eq!(
+            u32::from_le_bytes(buf),
+            0xf0,
+            "LDCLR writes old&!rs back to memory"
+        );
     }
 
     #[test]
@@ -5505,7 +5572,11 @@ mod tests {
         c.exec(0x0E62_0020, &mut m); // saddl v0.4s, v1.4h, v2.4h
         assert_eq!(c.v[0], quad_u32(11, 22, 33, 0), "signed: -1 + 1 == 0");
         c.exec(0x2E62_0020, &mut m); // uaddl v0.4s, v1.4h, v2.4h
-        assert_eq!(c.v[0], quad_u32(11, 22, 33, 0x1_0000), "unsigned: 0xFFFF + 1");
+        assert_eq!(
+            c.v[0],
+            quad_u32(11, 22, 33, 0x1_0000),
+            "unsigned: 0xFFFF + 1"
+        );
     }
 
     #[test]
@@ -5656,13 +5727,22 @@ mod tests {
         // Shift amounts (low signed byte of each Vm lane): 4, 2, -1, -4.
         c.v[2] = quad_u32(4, 2, 0xFFFF_FFFF, 0xFFFF_FFFC);
         c.exec(0x4EA2_4C20, &mut m); // sqshl v0.4s, v1.4s, v2.4s
-        assert_eq!(c.v[0], quad_u32(0x10, 0x7FFF_FFFF, 0xFFFF_FFFF, 0xF800_0000));
+        assert_eq!(
+            c.v[0],
+            quad_u32(0x10, 0x7FFF_FFFF, 0xFFFF_FFFF, 0xF800_0000)
+        );
         c.exec(0x6EA2_4C20, &mut m); // uqshl v0.4s, v1.4s, v2.4s
-        assert_eq!(c.v[0], quad_u32(0x10, 0xFFFF_FFFF, 0x7FFF_FFFF, 0x0800_0000));
+        assert_eq!(
+            c.v[0],
+            quad_u32(0x10, 0xFFFF_FFFF, 0x7FFF_FFFF, 0x0800_0000)
+        );
         c.exec(0x4EA2_5C20, &mut m); // sqrshl v0.4s, v1.4s, v2.4s (rounding right shift)
         assert_eq!(c.v[0], quad_u32(0x10, 0x7FFF_FFFF, 0, 0xF800_0000));
         c.exec(0x6EA2_5C20, &mut m); // uqrshl v0.4s, v1.4s, v2.4s
-        assert_eq!(c.v[0], quad_u32(0x10, 0xFFFF_FFFF, 0x8000_0000, 0x0800_0000));
+        assert_eq!(
+            c.v[0],
+            quad_u32(0x10, 0xFFFF_FFFF, 0x8000_0000, 0x0800_0000)
+        );
     }
 
     #[test]
@@ -5816,7 +5896,10 @@ mod tests {
         c.v[1] = u128::from(x.to_bits());
         c.exec(0x5EA1_D820, &mut m);
         let estimate = f32::from_bits(c.v[0] as u32);
-        assert_eq!(estimate, 0.25, "this interpreter's FRECPE is the exact reciprocal");
+        assert_eq!(
+            estimate, 0.25,
+            "this interpreter's FRECPE is the exact reciprocal"
+        );
 
         // One Newton-Raphson refinement step: y1 = y0 * frecps(x, y0), which
         // should already have converged to 1/x given an exact-reciprocal
@@ -5898,7 +5981,10 @@ mod tests {
         let pc_before = c.pc;
         assert!(matches!(c.exec(0xF980_0000, &mut m), Step::Next));
         assert_eq!(c.x[0], 0xDEAD_0000, "PRFM must not touch any register");
-        assert_eq!(c.pc, pc_before, "exec() itself doesn't advance pc; run() does");
+        assert_eq!(
+            c.pc, pc_before,
+            "exec() itself doesn't advance pc; run() does"
+        );
 
         // prfm pldl1keep, [x0, x1] (register-offset form) and the unscaled
         // immediate form must equally be no-ops, not faults.
@@ -5953,7 +6039,9 @@ mod tests {
             "before the block"
         );
         assert!(
-            buf[aligned_off..aligned_off + block].iter().all(|&b| b == 0),
+            buf[aligned_off..aligned_off + block]
+                .iter()
+                .all(|&b| b == 0),
             "the DC ZVA block itself"
         );
         assert!(

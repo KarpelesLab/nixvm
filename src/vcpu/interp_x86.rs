@@ -123,7 +123,10 @@ enum Step {
     Syscall,
     Illegal,
     /// A load/store/fetch touched bad guest memory.
-    Fault { addr: u64, write: bool },
+    Fault {
+        addr: u64,
+        write: bool,
+    },
 }
 
 /// EFLAGS bits this interpreter tracks: CF/ZF/SF/OF/PF.
@@ -361,7 +364,11 @@ fn f80_to_f64(mantissa: u64, exp: u16, sign: bool) -> f64 {
     let value = if exp == 0 && mantissa == 0 {
         0.0
     } else if exp == 0x7fff {
-        if mantissa == (1u64 << 63) { f64::INFINITY } else { f64::NAN }
+        if mantissa == (1u64 << 63) {
+            f64::INFINITY
+        } else {
+            f64::NAN
+        }
     } else {
         let m = mantissa as f64 / (1u64 << 63) as f64;
         m * 2f64.powi(i32::from(exp) - 16383)
@@ -379,7 +386,11 @@ fn f64_to_f80_bytes(v: f64) -> [u8; 10] {
     let biased_exp = (bits >> 52) & 0x7ff;
     let frac = bits & 0x000f_ffff_ffff_ffff;
     let (mantissa, exp): (u64, u64) = if biased_exp == 0x7ff {
-        if frac == 0 { (1u64 << 63, 0x7fff) } else { (0xC000_0000_0000_0000, 0x7fff) }
+        if frac == 0 {
+            (1u64 << 63, 0x7fff)
+        } else {
+            (0xC000_0000_0000_0000, 0x7fff)
+        }
     } else if biased_exp == 0 {
         if frac == 0 {
             (0, 0)
@@ -657,8 +668,10 @@ const fn sign_extend_w(v: u64, width: u32) -> i64 {
 
 fn fetch_u8(mem: &GuestMemory, pc: u64) -> Result<(u8, u64), Step> {
     let mut b = [0u8; 1];
-    mem.read(pc, &mut b)
-        .map_err(|_| Step::Fault { addr: pc, write: false })?;
+    mem.read(pc, &mut b).map_err(|_| Step::Fault {
+        addr: pc,
+        write: false,
+    })?;
     Ok((b[0], pc + 1))
 }
 
@@ -669,8 +682,10 @@ fn fetch_i8(mem: &GuestMemory, pc: u64) -> Result<(i8, u64), Step> {
 
 fn fetch_u16(mem: &GuestMemory, pc: u64) -> Result<(u16, u64), Step> {
     let mut b = [0u8; 2];
-    mem.read(pc, &mut b)
-        .map_err(|_| Step::Fault { addr: pc, write: false })?;
+    mem.read(pc, &mut b).map_err(|_| Step::Fault {
+        addr: pc,
+        write: false,
+    })?;
     Ok((u16::from_le_bytes(b), pc + 2))
 }
 
@@ -681,8 +696,10 @@ fn fetch_i16(mem: &GuestMemory, pc: u64) -> Result<(i16, u64), Step> {
 
 fn fetch_u32(mem: &GuestMemory, pc: u64) -> Result<(u32, u64), Step> {
     let mut b = [0u8; 4];
-    mem.read(pc, &mut b)
-        .map_err(|_| Step::Fault { addr: pc, write: false })?;
+    mem.read(pc, &mut b).map_err(|_| Step::Fault {
+        addr: pc,
+        write: false,
+    })?;
     Ok((u32::from_le_bytes(b), pc + 4))
 }
 
@@ -693,8 +710,10 @@ fn fetch_i32(mem: &GuestMemory, pc: u64) -> Result<(i32, u64), Step> {
 
 fn fetch_u64(mem: &GuestMemory, pc: u64) -> Result<(u64, u64), Step> {
     let mut b = [0u8; 8];
-    mem.read(pc, &mut b)
-        .map_err(|_| Step::Fault { addr: pc, write: false })?;
+    mem.read(pc, &mut b).map_err(|_| Step::Fault {
+        addr: pc,
+        write: false,
+    })?;
     Ok((u64::from_le_bytes(b), pc + 8))
 }
 
@@ -813,8 +832,10 @@ impl X86Interp {
 
     fn push(&mut self, mem: &mut GuestMemory, val: u64) -> Result<(), Step> {
         let sp = self.gpr[RSP].wrapping_sub(8);
-        mem.write(sp, &val.to_le_bytes())
-            .map_err(|_| Step::Fault { addr: sp, write: true })?;
+        mem.write(sp, &val.to_le_bytes()).map_err(|_| Step::Fault {
+            addr: sp,
+            write: true,
+        })?;
         self.gpr[RSP] = sp;
         Ok(())
     }
@@ -822,8 +843,10 @@ impl X86Interp {
     fn pop(&mut self, mem: &GuestMemory) -> Result<u64, Step> {
         let sp = self.gpr[RSP];
         let mut b = [0u8; 8];
-        mem.read(sp, &mut b)
-            .map_err(|_| Step::Fault { addr: sp, write: false })?;
+        mem.read(sp, &mut b).map_err(|_| Step::Fault {
+            addr: sp,
+            write: false,
+        })?;
         self.gpr[RSP] = sp.wrapping_add(8);
         Ok(u64::from_le_bytes(b))
     }
@@ -839,7 +862,13 @@ impl X86Interp {
 
         if md == 0b11 {
             let rm = usize::from(rm_field) | (usize::from(rex.b) << 3);
-            return Ok((ModRm { reg, kind: RmKind::Reg(rm) }, pc));
+            return Ok((
+                ModRm {
+                    reg,
+                    kind: RmKind::Reg(rm),
+                },
+                pc,
+            ));
         }
 
         if rm_field == 0b100 {
@@ -874,15 +903,26 @@ impl X86Interp {
             };
             let base_val = base.map_or(0, |b| self.gpr[b]);
             let index_val = index.map_or(0, |i| self.gpr[i]);
-            let addr =
-                (base_val.wrapping_add(index_val.wrapping_mul(scale)) as i64).wrapping_add(disp)
-                    as u64;
-            return Ok((ModRm { reg, kind: RmKind::Mem(addr) }, pc));
+            let addr = (base_val.wrapping_add(index_val.wrapping_mul(scale)) as i64)
+                .wrapping_add(disp) as u64;
+            return Ok((
+                ModRm {
+                    reg,
+                    kind: RmKind::Mem(addr),
+                },
+                pc,
+            ));
         }
 
         if rm_field == 0b101 && md == 0b00 {
             let (disp, pc) = fetch_i32(mem, pc)?;
-            return Ok((ModRm { reg, kind: RmKind::MemRip(i64::from(disp)) }, pc));
+            return Ok((
+                ModRm {
+                    reg,
+                    kind: RmKind::MemRip(i64::from(disp)),
+                },
+                pc,
+            ));
         }
 
         let base = usize::from(rm_field) | (usize::from(rex.b) << 3);
@@ -898,7 +938,13 @@ impl X86Interp {
             _ => (0i64, pc),
         };
         let addr = (self.gpr[base] as i64).wrapping_add(disp) as u64;
-        Ok((ModRm { reg, kind: RmKind::Mem(addr) }, pc))
+        Ok((
+            ModRm {
+                reg,
+                kind: RmKind::Mem(addr),
+            },
+            pc,
+        ))
     }
 
     fn read_operand(&self, mem: &GuestMemory, op: Operand, width: u32) -> Result<u64, Step> {
@@ -908,8 +954,10 @@ impl X86Interp {
             Operand::Mem(a) => {
                 let n = (width / 8) as usize;
                 let mut b = [0u8; 8];
-                mem.read(a, &mut b[..n])
-                    .map_err(|_| Step::Fault { addr: a, write: false })?;
+                mem.read(a, &mut b[..n]).map_err(|_| Step::Fault {
+                    addr: a,
+                    write: false,
+                })?;
                 Ok(u64::from_le_bytes(b))
             }
         }
@@ -943,8 +991,10 @@ impl X86Interp {
             Operand::Mem(a) => {
                 let n = (width / 8) as usize;
                 let bytes = val.to_le_bytes();
-                mem.write(a, &bytes[..n])
-                    .map_err(|_| Step::Fault { addr: a, write: true })
+                mem.write(a, &bytes[..n]).map_err(|_| Step::Fault {
+                    addr: a,
+                    write: true,
+                })
             }
         }
     }
@@ -963,8 +1013,10 @@ impl X86Interp {
             Operand::Mem(a) => {
                 let n = (width / 8) as usize;
                 let mut b = [0u8; 8];
-                mem.read(a, &mut b[..n])
-                    .map_err(|_| Step::Fault { addr: a, write: false })?;
+                mem.read(a, &mut b[..n]).map_err(|_| Step::Fault {
+                    addr: a,
+                    write: false,
+                })?;
                 Ok(u64::from_le_bytes(b))
             }
             Operand::Reg8Hi(_) => unreachable!("SSE decode never yields an 8-bit-high operand"),
@@ -977,8 +1029,10 @@ impl X86Interp {
             Operand::Reg(r) => Ok(self.xmm[r]),
             Operand::Mem(a) => {
                 let mut b = [0u8; 16];
-                mem.read(a, &mut b)
-                    .map_err(|_| Step::Fault { addr: a, write: false })?;
+                mem.read(a, &mut b).map_err(|_| Step::Fault {
+                    addr: a,
+                    write: false,
+                })?;
                 Ok(u128::from_le_bytes(b))
             }
             Operand::Reg8Hi(_) => unreachable!("SSE decode never yields an 8-bit-high operand"),
@@ -992,9 +1046,10 @@ impl X86Interp {
                 self.xmm[r] = val;
                 Ok(())
             }
-            Operand::Mem(a) => mem
-                .write(a, &val.to_le_bytes())
-                .map_err(|_| Step::Fault { addr: a, write: true }),
+            Operand::Mem(a) => mem.write(a, &val.to_le_bytes()).map_err(|_| Step::Fault {
+                addr: a,
+                write: true,
+            }),
             Operand::Reg8Hi(_) => unreachable!("SSE decode never yields an 8-bit-high operand"),
         }
     }
@@ -1215,7 +1270,14 @@ impl X86Interp {
     }
 
     /// `op reg, r/m` (`Gv,Ev` encoding: destination is the reg operand).
-    fn alu_gv_rm(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, width: u32, op: AluOp) -> Step {
+    fn alu_gv_rm(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        width: u32,
+        op: AluOp,
+    ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let rm_op = resolve(modrm.kind, pc2);
         let b = fetch!(self.read_operand(mem, rm_op, width));
@@ -1312,10 +1374,20 @@ impl X86Interp {
     }
 
     /// `XCHG r/m, reg` (`0x86`/`0x87`) — swap the two operands' contents.
-    fn xchg(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, has_rex: bool, width: u32) -> Step {
+    fn xchg(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        has_rex: bool,
+        width: u32,
+    ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let (rm_op, reg_op) = if width == 8 {
-            (resolve8(modrm.kind, pc2, has_rex), reg8_operand(modrm.reg, has_rex))
+            (
+                resolve8(modrm.kind, pc2, has_rex),
+                reg8_operand(modrm.reg, has_rex),
+            )
         } else {
             (resolve(modrm.kind, pc2), Operand::Reg(modrm.reg))
         };
@@ -1330,7 +1402,14 @@ impl X86Interp {
     /// `NEG r/m` (/3), `MUL r/m` (/4), `IMUL r/m` (/5, one-operand form),
     /// `DIV r/m` (/6) and `IDIV r/m` (/7). `0xF6` selects an 8-bit r/m;
     /// `0xF7` uses `width`.
-    fn group3(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, has_rex: bool, width: u32) -> Step {
+    fn group3(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        has_rex: bool,
+        width: u32,
+    ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let rm_op_at = |end_pc| {
             if width == 8 {
@@ -1542,7 +1621,14 @@ impl X86Interp {
 
     /// `IMUL r, r/m, imm` (`0x69` imm32/imm16, `0x6B` imm8): `reg` = `r/m` *
     /// sign-extended immediate.
-    fn imul_imm(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, width: u32, imm8: bool) -> Step {
+    fn imul_imm(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        width: u32,
+        imm8: bool,
+    ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let (imm, pc3): (i64, u64) = if imm8 {
             let (v, p) = fetch!(fetch_i8(mem, pc2));
@@ -1602,21 +1688,45 @@ impl X86Interp {
     /// bit. `BSF`/`BSR` leave `reg` unmodified when the source is zero
     /// (architecturally undefined; this matches common hardware behavior);
     /// `TZCNT`/`LZCNT` instead define the result as `width` and set `CF`.
-    fn bit_scan(&mut self, mem: &GuestMemory, pc: u64, rex: Rex, width: u32, rep: u8, reverse: bool) -> Step {
+    fn bit_scan(
+        &mut self,
+        mem: &GuestMemory,
+        pc: u64,
+        rex: Rex,
+        width: u32,
+        rep: u8,
+        reverse: bool,
+    ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let rm_op = resolve(modrm.kind, pc2);
         let src = fetch!(self.read_operand(mem, rm_op, width));
         let count_form = rep == 1; // F3-prefixed: TZCNT/LZCNT instead of BSF/BSR
         if src == 0 {
-            self.flags = Flags { zf: true, cf: count_form, sf: false, of: false, pf: false };
+            self.flags = Flags {
+                zf: true,
+                cf: count_form,
+                sf: false,
+                of: false,
+                pf: false,
+            };
             if count_form {
                 self.gpr[modrm.reg] = mask_w(u64::from(width), width);
             }
         } else {
             let lz_in_width = src.leading_zeros() - (64 - width);
-            let result = if reverse { width - 1 - lz_in_width } else { src.trailing_zeros() };
+            let result = if reverse {
+                width - 1 - lz_in_width
+            } else {
+                src.trailing_zeros()
+            };
             self.gpr[modrm.reg] = mask_w(u64::from(result), width);
-            self.flags = Flags { zf: count_form && result == 0, cf: false, sf: false, of: false, pf: false };
+            self.flags = Flags {
+                zf: count_form && result == 0,
+                cf: false,
+                sf: false,
+                of: false,
+                pf: false,
+            };
         }
         self.next(pc2)
     }
@@ -1629,7 +1739,13 @@ impl X86Interp {
         let src = fetch!(self.read_operand(mem, rm_op, width));
         let count = src.count_ones();
         self.gpr[modrm.reg] = u64::from(count);
-        self.flags = Flags { zf: count == 0, cf: false, sf: false, of: false, pf: false };
+        self.flags = Flags {
+            zf: count == 0,
+            cf: false,
+            sf: false,
+            of: false,
+            pf: false,
+        };
         self.next(pc2)
     }
 
@@ -1663,7 +1779,14 @@ impl X86Interp {
 
     /// `BT`/`BTS`/`BTR`/`BTC Ev, Gv` (`0F A3/AB/B3/BB`): the bit index comes
     /// from a GPR.
-    fn bt_ev_gv(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, width: u32, op: BitTestOp) -> Step {
+    fn bt_ev_gv(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        width: u32,
+        op: BitTestOp,
+    ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let rm_op = resolve(modrm.kind, pc2);
         let bit_idx = self.gpr[modrm.reg];
@@ -1758,10 +1881,20 @@ impl X86Interp {
     /// `XADD Eb,Gb` / `Ev,Gv` (`0F C0`/`C1`): `reg` gets the *old* value of
     /// the destination, and the destination becomes `dest + reg` — flags are
     /// set exactly as for `ADD dest, reg`.
-    fn xadd(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, has_rex: bool, width: u32) -> Step {
+    fn xadd(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        has_rex: bool,
+        width: u32,
+    ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let (rm_op, reg_op) = if width == 8 {
-            (resolve8(modrm.kind, pc2, has_rex), reg8_operand(modrm.reg, has_rex))
+            (
+                resolve8(modrm.kind, pc2, has_rex),
+                reg8_operand(modrm.reg, has_rex),
+            )
         } else {
             (resolve(modrm.kind, pc2), Operand::Reg(modrm.reg))
         };
@@ -1776,10 +1909,20 @@ impl X86Interp {
     /// `CMPXCHG Eb,Gb` / `Ev,Gv` (`0F B0`/`B1`): compare `AL`/`rAX` against
     /// the destination (setting flags like `CMP`); on a match, `ZF=1` and
     /// `dest <- reg`, otherwise `ZF=0` and `AL`/`rAX <- dest`.
-    fn cmpxchg(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, has_rex: bool, width: u32) -> Step {
+    fn cmpxchg(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        has_rex: bool,
+        width: u32,
+    ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let (rm_op, reg_op) = if width == 8 {
-            (resolve8(modrm.kind, pc2, has_rex), reg8_operand(modrm.reg, has_rex))
+            (
+                resolve8(modrm.kind, pc2, has_rex),
+                reg8_operand(modrm.reg, has_rex),
+            )
         } else {
             (resolve(modrm.kind, pc2), Operand::Reg(modrm.reg))
         };
@@ -1845,8 +1988,16 @@ impl X86Interp {
     /// host RNG in this scaffold) and writes the result to the destination,
     /// always reporting success (`CF=1`); `OF`/`SF`/`ZF`/`PF` are cleared,
     /// matching the real instructions' defined behavior.
-    fn rdrand_or_seed(&mut self, mem: &mut GuestMemory, modrm: ModRm, pc2: u64, width: u32) -> Step {
-        let RmKind::Reg(r) = modrm.kind else { return Step::Illegal };
+    fn rdrand_or_seed(
+        &mut self,
+        mem: &mut GuestMemory,
+        modrm: ModRm,
+        pc2: u64,
+        width: u32,
+    ) -> Step {
+        let RmKind::Reg(r) = modrm.kind else {
+            return Step::Illegal;
+        };
         // A splitmix64-style step: cheap, deterministic, and good enough to
         // not look like "always the same value" across successive calls.
         self.prng = self.prng.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -1855,7 +2006,13 @@ impl X86Interp {
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^= z >> 31;
         fetch!(self.write_operand(mem, Operand::Reg(r), mask_w(z, width), width));
-        self.flags = Flags { cf: true, zf: false, sf: false, of: false, pf: false };
+        self.flags = Flags {
+            cf: true,
+            zf: false,
+            sf: false,
+            of: false,
+            pf: false,
+        };
         self.next(pc2)
     }
 
@@ -1977,12 +2134,17 @@ impl X86Interp {
         let mut count: u64 = if rep == 0 { 1 } else { self.gpr[RCX] };
         while count > 0 {
             let mut b = [0u8; 8];
-            fetch!(mem
-                .read(self.gpr[RSI], &mut b[..n])
-                .map_err(|_| Step::Fault { addr: self.gpr[RSI], write: false }));
-            fetch!(mem
-                .write(self.gpr[RDI], &b[..n])
-                .map_err(|_| Step::Fault { addr: self.gpr[RDI], write: true }));
+            fetch!(
+                mem.read(self.gpr[RSI], &mut b[..n])
+                    .map_err(|_| Step::Fault {
+                        addr: self.gpr[RSI],
+                        write: false
+                    })
+            );
+            fetch!(mem.write(self.gpr[RDI], &b[..n]).map_err(|_| Step::Fault {
+                addr: self.gpr[RDI],
+                write: true
+            }));
             self.gpr[RSI] = self.advance_ptr(self.gpr[RSI], step);
             self.gpr[RDI] = self.advance_ptr(self.gpr[RDI], step);
             count -= 1;
@@ -2002,9 +2164,13 @@ impl X86Interp {
         let mut count: u64 = if rep == 0 { 1 } else { self.gpr[RCX] };
         while count > 0 {
             let bytes = val.to_le_bytes();
-            fetch!(mem
-                .write(self.gpr[RDI], &bytes[..n])
-                .map_err(|_| Step::Fault { addr: self.gpr[RDI], write: true }));
+            fetch!(
+                mem.write(self.gpr[RDI], &bytes[..n])
+                    .map_err(|_| Step::Fault {
+                        addr: self.gpr[RDI],
+                        write: true
+                    })
+            );
             self.gpr[RDI] = self.advance_ptr(self.gpr[RDI], step);
             count -= 1;
             if rep != 0 {
@@ -2022,9 +2188,13 @@ impl X86Interp {
         let mut count: u64 = if rep == 0 { 1 } else { self.gpr[RCX] };
         while count > 0 {
             let mut b = [0u8; 8];
-            fetch!(mem
-                .read(self.gpr[RSI], &mut b[..n])
-                .map_err(|_| Step::Fault { addr: self.gpr[RSI], write: false }));
+            fetch!(
+                mem.read(self.gpr[RSI], &mut b[..n])
+                    .map_err(|_| Step::Fault {
+                        addr: self.gpr[RSI],
+                        write: false
+                    })
+            );
             let v = u64::from_le_bytes(b);
             fetch!(self.write_operand(mem, Operand::Reg(RAX), v, width));
             self.gpr[RSI] = self.advance_ptr(self.gpr[RSI], step);
@@ -2046,9 +2216,13 @@ impl X86Interp {
         let mut count: u64 = if rep == 0 { 1 } else { self.gpr[RCX] };
         while count > 0 {
             let mut b = [0u8; 8];
-            fetch!(mem
-                .read(self.gpr[RDI], &mut b[..n])
-                .map_err(|_| Step::Fault { addr: self.gpr[RDI], write: false }));
+            fetch!(
+                mem.read(self.gpr[RDI], &mut b[..n])
+                    .map_err(|_| Step::Fault {
+                        addr: self.gpr[RDI],
+                        write: false
+                    })
+            );
             self.sub_flags(a, mask_w(u64::from_le_bytes(b), width), width);
             self.gpr[RDI] = self.advance_ptr(self.gpr[RDI], step);
             count -= 1;
@@ -2071,12 +2245,20 @@ impl X86Interp {
         let mut count: u64 = if rep == 0 { 1 } else { self.gpr[RCX] };
         while count > 0 {
             let (mut bs, mut bd) = ([0u8; 8], [0u8; 8]);
-            fetch!(mem
-                .read(self.gpr[RSI], &mut bs[..n])
-                .map_err(|_| Step::Fault { addr: self.gpr[RSI], write: false }));
-            fetch!(mem
-                .read(self.gpr[RDI], &mut bd[..n])
-                .map_err(|_| Step::Fault { addr: self.gpr[RDI], write: false }));
+            fetch!(
+                mem.read(self.gpr[RSI], &mut bs[..n])
+                    .map_err(|_| Step::Fault {
+                        addr: self.gpr[RSI],
+                        write: false
+                    })
+            );
+            fetch!(
+                mem.read(self.gpr[RDI], &mut bd[..n])
+                    .map_err(|_| Step::Fault {
+                        addr: self.gpr[RDI],
+                        write: false
+                    })
+            );
             let (vs, vd) = (u64::from_le_bytes(bs), u64::from_le_bytes(bd));
             self.sub_flags(mask_w(vs, width), mask_w(vd, width), width);
             self.gpr[RSI] = self.advance_ptr(self.gpr[RSI], step);
@@ -2094,7 +2276,11 @@ impl X86Interp {
 
     /// Advance a string-op pointer by `step` bytes, per `DF`.
     fn advance_ptr(&self, ptr: u64, step: u64) -> u64 {
-        if self.df { ptr.wrapping_sub(step) } else { ptr.wrapping_add(step) }
+        if self.df {
+            ptr.wrapping_sub(step)
+        } else {
+            ptr.wrapping_add(step)
+        }
     }
 
     /// Should a `REPE`/`REPNE`-prefixed `SCAS`/`CMPS` loop keep going after
@@ -2185,7 +2371,11 @@ impl X86Interp {
                     resolve(modrm.kind, pc2)
                 };
                 let raw = fetch!(self.read_operand(mem, rm_op, src_width));
-                let val = if signed { sign_extend_w(raw, src_width) as u64 } else { raw };
+                let val = if signed {
+                    sign_extend_w(raw, src_width) as u64
+                } else {
+                    raw
+                };
                 self.gpr[modrm.reg] = mask_w(val, width);
                 self.next(pc2)
             }
@@ -2302,13 +2492,13 @@ impl X86Interp {
             0x60 => self.sse_unpck(mem, pc, rex, 1, false), // PUNPCKLBW
             0x61 => self.sse_unpck(mem, pc, rex, 2, false), // PUNPCKLWD
             0x62 => self.sse_unpck(mem, pc, rex, 4, false), // PUNPCKLDQ
-            0x64 => self.sse_pcmpgt(mem, pc, rex, 1), // PCMPGTB
-            0x66 => self.sse_pcmpgt(mem, pc, rex, 4), // PCMPGTD
-            0x68 => self.sse_unpck(mem, pc, rex, 1, true), // PUNPCKHBW
-            0x69 => self.sse_unpck(mem, pc, rex, 2, true), // PUNPCKHWD
-            0x6A => self.sse_unpck(mem, pc, rex, 4, true), // PUNPCKHDQ
+            0x64 => self.sse_pcmpgt(mem, pc, rex, 1),       // PCMPGTB
+            0x66 => self.sse_pcmpgt(mem, pc, rex, 4),       // PCMPGTD
+            0x68 => self.sse_unpck(mem, pc, rex, 1, true),  // PUNPCKHBW
+            0x69 => self.sse_unpck(mem, pc, rex, 2, true),  // PUNPCKHWD
+            0x6A => self.sse_unpck(mem, pc, rex, 4, true),  // PUNPCKHDQ
             0x6C => self.sse_unpck(mem, pc, rex, 8, false), // PUNPCKLQDQ
-            0x6D => self.sse_unpck(mem, pc, rex, 8, true), // PUNPCKHQDQ
+            0x6D => self.sse_unpck(mem, pc, rex, 8, true),  // PUNPCKHQDQ
             0x6E => self.sse_movd_load(mem, pc, rex, gw),
             0x7E if rep == 1 => self.sse_movq_xmm_load(mem, pc, rex),
             0x7E => self.sse_movd_store(mem, pc, rex, gw),
@@ -2384,13 +2574,17 @@ impl X86Interp {
             (Some(w), true) => match rm_op {
                 Operand::Reg(r) => {
                     let src = self.xmm[modrm.reg];
-                    self.xmm[r] = (self.xmm[r] & !u128::from(mask_w(u64::MAX, w))) | u128::from(mask_w(src as u64, w));
+                    self.xmm[r] = (self.xmm[r] & !u128::from(mask_w(u64::MAX, w)))
+                        | u128::from(mask_w(src as u64, w));
                 }
                 Operand::Mem(a) => {
                     let src = mask_w(self.xmm[modrm.reg] as u64, w);
                     let n = (w / 8) as usize;
                     let bytes = src.to_le_bytes();
-                    fetch!(mem.write(a, &bytes[..n]).map_err(|_| Step::Fault { addr: a, write: true }));
+                    fetch!(mem.write(a, &bytes[..n]).map_err(|_| Step::Fault {
+                        addr: a,
+                        write: true
+                    }));
                 }
                 Operand::Reg8Hi(_) => unreachable!("SSE decode never yields an 8-bit-high operand"),
             },
@@ -2458,7 +2652,10 @@ impl X86Interp {
         match rm_op {
             Operand::Reg(r) => self.xmm[r] = u128::from(lo),
             Operand::Mem(a) => {
-                fetch!(mem.write(a, &lo.to_le_bytes()).map_err(|_| Step::Fault { addr: a, write: true }));
+                fetch!(mem.write(a, &lo.to_le_bytes()).map_err(|_| Step::Fault {
+                    addr: a,
+                    write: true
+                }));
             }
             Operand::Reg8Hi(_) => unreachable!("SSE decode never yields an 8-bit-high operand"),
         }
@@ -2521,13 +2718,25 @@ impl X86Interp {
         let result: i64 = if rep == 2 {
             let bits = fetch!(self.xmm_read_lo(mem, rm_op, 64));
             let f = f64::from_bits(bits);
-            if round { f.round_ties_even() as i64 } else { f.trunc() as i64 }
+            if round {
+                f.round_ties_even() as i64
+            } else {
+                f.trunc() as i64
+            }
         } else {
             let bits = fetch!(self.xmm_read_lo(mem, rm_op, 32));
             let f = f32::from_bits(bits as u32);
-            if round { f.round_ties_even() as i64 } else { f.trunc() as i64 }
+            if round {
+                f.round_ties_even() as i64
+            } else {
+                f.trunc() as i64
+            }
         };
-        self.gpr[modrm.reg] = if gw == 64 { result as u64 } else { mask_w(result as u64, 32) };
+        self.gpr[modrm.reg] = if gw == 64 {
+            result as u64
+        } else {
+            mask_w(result as u64, 32)
+        };
         self.next(pc2)
     }
 
@@ -2694,7 +2903,11 @@ impl X86Interp {
         let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
         let mut out = [0u8; 16];
         for i in 0..16 {
-            out[i] = if add { d[i].wrapping_add(s[i]) } else { d[i].wrapping_sub(s[i]) };
+            out[i] = if add {
+                d[i].wrapping_add(s[i])
+            } else {
+                d[i].wrapping_sub(s[i])
+            };
         }
         self.xmm[modrm.reg] = u128::from_le_bytes(out);
         self.next(pc2)
@@ -2725,7 +2938,9 @@ impl X86Interp {
     fn sse_movhlps(&mut self, mem: &GuestMemory, pc: u64, rex: Rex) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let rm_op = resolve(modrm.kind, pc2);
-        let Operand::Reg(r) = rm_op else { return Step::Illegal };
+        let Operand::Reg(r) = rm_op else {
+            return Step::Illegal;
+        };
         let src_hi = self.xmm[r] >> 64;
         self.xmm[modrm.reg] = (self.xmm[modrm.reg] & !u128::from(u64::MAX)) | src_hi;
         self.next(pc2)
@@ -2737,7 +2952,9 @@ impl X86Interp {
     fn sse_movlhps(&mut self, mem: &GuestMemory, pc: u64, rex: Rex) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let rm_op = resolve(modrm.kind, pc2);
-        let Operand::Reg(r) = rm_op else { return Step::Illegal };
+        let Operand::Reg(r) = rm_op else {
+            return Step::Illegal;
+        };
         let src_lo = self.xmm[r] & u128::from(u64::MAX);
         self.xmm[modrm.reg] = (self.xmm[modrm.reg] & u128::from(u64::MAX)) | (src_lo << 64);
         self.next(pc2)
@@ -2746,7 +2963,14 @@ impl X86Interp {
     /// `UNPCKLPS`/`UNPCKHPS`/`UNPCKLPD`/`UNPCKHPD` (`0F 14/15`, `66 0F
     /// 14/15`) and `PUNPCKL*`/`PUNPCKH*` (`66 0F 60/61/62/68/69/6A/6C/6D`):
     /// see [`unpck`].
-    fn sse_unpck(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, lane_bytes: usize, high: bool) -> Step {
+    fn sse_unpck(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        lane_bytes: usize,
+        high: bool,
+    ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let rm_op = resolve(modrm.kind, pc2);
         let src = fetch!(self.xmm_read128(mem, rm_op));
@@ -2760,7 +2984,14 @@ impl X86Interp {
     /// (`PSHUFHW`/`PSHUFLW`, only the high/low four) into `dst` per the
     /// two-bit lane selectors packed into `imm8`; `PSHUFHW`/`PSHUFLW` pass
     /// their untouched half through unchanged.
-    fn sse_pshuf(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, rep: u8, opsize16: bool) -> Step {
+    fn sse_pshuf(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        rep: u8,
+        opsize16: bool,
+    ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let (imm, pc3) = fetch!(fetch_u8(mem, pc2));
         let rm_op = resolve(modrm.kind, pc3);
@@ -2830,7 +3061,13 @@ impl X86Interp {
     /// (zero-filling); the others shift each `lane_bytes`-wide lane
     /// independently by *bits* (see [`pack_shift_right`]/
     /// [`pack_shift_left`]).
-    fn sse_shift_imm_group(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, lane_bytes: u32) -> Step {
+    fn sse_shift_imm_group(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        lane_bytes: u32,
+    ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let (imm, pc3) = fetch!(fetch_u8(mem, pc2));
         let rm_op = resolve(modrm.kind, pc3);
@@ -2874,7 +3111,11 @@ impl X86Interp {
         let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
         let mut out = [0u8; 16];
         for i in 0..16 {
-            out[i] = if d[i] & 0x80 != 0 { 0 } else { s[usize::from(d[i] & 0x0f)] };
+            out[i] = if d[i] & 0x80 != 0 {
+                0
+            } else {
+                s[usize::from(d[i] & 0x0f)]
+            };
         }
         self.xmm[modrm.reg] = u128::from_le_bytes(out);
         self.next(pc2)
@@ -2884,7 +3125,14 @@ impl X86Interp {
     /// `lane_bytes`-wide lane add/subtract — a 32-/64-bit-lane
     /// generalization of [`Self::sse_paddsubb`]'s byte lanes.
     #[allow(clippy::many_single_char_names)] // dst/src/lane_bytes/add is the natural naming here
-    fn sse_paddsub(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, lane_bytes: usize, add: bool) -> Step {
+    fn sse_paddsub(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        lane_bytes: usize,
+        add: bool,
+    ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let rm_op = resolve(modrm.kind, pc2);
         let src = fetch!(self.xmm_read128(mem, rm_op));
@@ -2894,7 +3142,11 @@ impl X86Interp {
         for lane in (0..16).step_by(lane_bytes) {
             let a = u64_from_le(&d[lane..lane + lane_bytes]);
             let b = u64_from_le(&s[lane..lane + lane_bytes]);
-            let r = if add { a.wrapping_add(b) } else { a.wrapping_sub(b) };
+            let r = if add {
+                a.wrapping_add(b)
+            } else {
+                a.wrapping_sub(b)
+            };
             out[lane..lane + lane_bytes].copy_from_slice(&r.to_le_bytes()[..lane_bytes]);
         }
         self.xmm[modrm.reg] = u128::from_le_bytes(out);
@@ -2910,7 +3162,11 @@ impl X86Interp {
         let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
         let mut out = [0u8; 16];
         for i in 0..16 {
-            out[i] = if is_min { d[i].min(s[i]) } else { d[i].max(s[i]) };
+            out[i] = if is_min {
+                d[i].min(s[i])
+            } else {
+                d[i].max(s[i])
+            };
         }
         self.xmm[modrm.reg] = u128::from_le_bytes(out);
         self.next(pc2)
@@ -2927,8 +3183,14 @@ impl X86Interp {
         let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
         let mut out = [0u8; 16];
         for lane in (0..16).step_by(lane_bytes) {
-            let a = sign_extend_w(u64_from_le(&d[lane..lane + lane_bytes]), lane_bytes as u32 * 8);
-            let b = sign_extend_w(u64_from_le(&s[lane..lane + lane_bytes]), lane_bytes as u32 * 8);
+            let a = sign_extend_w(
+                u64_from_le(&d[lane..lane + lane_bytes]),
+                lane_bytes as u32 * 8,
+            );
+            let b = sign_extend_w(
+                u64_from_le(&s[lane..lane + lane_bytes]),
+                lane_bytes as u32 * 8,
+            );
             let fill = if a > b { 0xffu8 } else { 0u8 };
             out[lane..lane + lane_bytes].fill(fill);
         }
@@ -3073,7 +3335,14 @@ impl X86Interp {
     /// The `mod != 3` (memory) form shared by `D8`/`DA`/`DC`/`DE`: `ST(0) op=
     /// src`, where `src` is loaded from memory at width `w` and `reg`
     /// selects the operation via [`FpuOp::from_reg`].
-    fn fpu_arith_mem(&mut self, mem: &mut GuestMemory, reg: usize, kind: RmKind, pc2: u64, w: MemWidth) -> Step {
+    fn fpu_arith_mem(
+        &mut self,
+        mem: &mut GuestMemory,
+        reg: usize,
+        kind: RmKind,
+        pc2: u64,
+        w: MemWidth,
+    ) -> Step {
         let op = FpuOp::from_reg((reg & 7) as u8);
         let addr = match resolve(kind, pc2) {
             Operand::Mem(a) => a,
@@ -3208,14 +3477,20 @@ impl X86Interp {
                     5 => {
                         // FLDCW m2byte
                         let mut b = [0u8; 2];
-                        fetch!(mem.read(addr, &mut b).map_err(|_| Step::Fault { addr, write: false }));
+                        fetch!(
+                            mem.read(addr, &mut b)
+                                .map_err(|_| Step::Fault { addr, write: false })
+                        );
                         self.fpu_cw = u16::from_le_bytes(b);
                         self.next(pc2)
                     }
                     7 => {
                         // FNSTCW m2byte
                         let bytes = self.fpu_cw.to_le_bytes();
-                        fetch!(mem.write(addr, &bytes).map_err(|_| Step::Fault { addr, write: true }));
+                        fetch!(
+                            mem.write(addr, &bytes)
+                                .map_err(|_| Step::Fault { addr, write: true })
+                        );
                         self.next(pc2)
                     }
                     // /1, FLDENV (/4), FNSTENV (/6): not in our documented subset
@@ -3314,7 +3589,9 @@ impl X86Interp {
     fn fpu_dc(&mut self, mem: &mut GuestMemory, modrm: ModRm, pc2: u64) -> Step {
         match modrm.kind {
             RmKind::Reg(r) => {
-                let Some(op) = FpuOp::from_reg_reversed((modrm.reg & 7) as u8) else { return Step::Illegal };
+                let Some(op) = FpuOp::from_reg_reversed((modrm.reg & 7) as u8) else {
+                    return Step::Illegal;
+                };
                 let i = (r & 7) as u8;
                 let dst = self.st_get(i);
                 let src = self.st_get(0);
@@ -3381,7 +3658,10 @@ impl X86Interp {
                     }
                     7 => {
                         let sw = self.fpu_sw(); // FNSTSW m2byte
-                        fetch!(mem.write(addr, &sw.to_le_bytes()).map_err(|_| Step::Fault { addr, write: true }));
+                        fetch!(
+                            mem.write(addr, &sw.to_le_bytes())
+                                .map_err(|_| Step::Fault { addr, write: true })
+                        );
                         self.next(pc2)
                     }
                     // /1 FISTTP (SSE3), FRSTOR (/4), FNSAVE (/6): not in our documented subset
@@ -3406,7 +3686,9 @@ impl X86Interp {
                     self.fpu_pop();
                     return self.next(pc2);
                 }
-                let Some(op) = FpuOp::from_reg_reversed(reg as u8) else { return Step::Illegal };
+                let Some(op) = FpuOp::from_reg_reversed(reg as u8) else {
+                    return Step::Illegal;
+                };
                 let dst = self.st_get(rm);
                 let src = self.st_get(0);
                 self.st_set(rm, fpu_binop(op, dst, src));
@@ -3601,7 +3883,11 @@ impl X86Interp {
                 let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
                 let rm_op = resolve(modrm.kind, pc2);
                 let raw = fetch!(self.read_operand(mem, rm_op, 32));
-                let val = if width == 64 { sign_extend_w(raw, 32) as u64 } else { raw };
+                let val = if width == 64 {
+                    sign_extend_w(raw, 32) as u64
+                } else {
+                    raw
+                };
                 self.gpr[modrm.reg] = mask_w(val, width);
                 self.next(pc2)
             }
@@ -3637,14 +3923,27 @@ impl X86Interp {
                 // CWD / CDQ / CQO: sign-extend AX/EAX/RAX's sign bit into
                 // DX/EDX/RDX.
                 match width {
-                    64 => self.gpr[RDX] = if sign_bit(self.gpr[RAX], 64) { u64::MAX } else { 0 },
+                    64 => {
+                        self.gpr[RDX] = if sign_bit(self.gpr[RAX], 64) {
+                            u64::MAX
+                        } else {
+                            0
+                        }
+                    }
                     16 => {
-                        let d = if sign_bit(self.gpr[RAX] & 0xffff, 16) { 0xffffu64 } else { 0 };
+                        let d = if sign_bit(self.gpr[RAX] & 0xffff, 16) {
+                            0xffffu64
+                        } else {
+                            0
+                        };
                         self.gpr[RDX] = (self.gpr[RDX] & !0xffffu64) | d;
                     }
                     _ => {
-                        self.gpr[RDX] =
-                            if sign_bit(self.gpr[RAX] & 0xffff_ffff, 32) { 0xffff_ffff } else { 0 };
+                        self.gpr[RDX] = if sign_bit(self.gpr[RAX] & 0xffff_ffff, 32) {
+                            0xffff_ffff
+                        } else {
+                            0
+                        };
                     }
                 }
                 self.next(pc)
@@ -4299,7 +4598,11 @@ mod tests {
         cpu.exec(&mut m); // mov al, 0x12
         assert_eq!(cpu.gpr[RAX] & 0xff, 0x12);
         cpu.exec(&mut m); // mov ah, 0x34
-        assert_eq!((cpu.gpr[RAX] >> 8) & 0xff, 0x34, "AH is the high byte of RAX");
+        assert_eq!(
+            (cpu.gpr[RAX] >> 8) & 0xff,
+            0x34,
+            "AH is the high byte of RAX"
+        );
         cpu.exec(&mut m); // mov cl, al
         assert_eq!(cpu.gpr[RCX] & 0xff, 0x12);
         cpu.exec(&mut m); // mov bl, ah
@@ -4438,7 +4741,10 @@ mod tests {
         cpu.exec(&mut m);
         assert!(!cpu.flags.zf);
         cpu.exec(&mut m);
-        assert_eq!(cpu.gpr[RDX], 0x1234, "CMOVcc must not write when the condition is false");
+        assert_eq!(
+            cpu.gpr[RDX], 0x1234,
+            "CMOVcc must not write when the condition is false"
+        );
     }
 
     #[test]
@@ -4482,7 +4788,11 @@ mod tests {
         // mul cl  (F6 /4, modrm=11 100 001)
         m.write_init(CODE, &[0xF6, 0xE1]).unwrap();
         cpu.exec(&mut m);
-        assert_eq!(cpu.gpr[RAX] & 0xffff, 60, "AX = AL * CL for an 8-bit operand");
+        assert_eq!(
+            cpu.gpr[RAX] & 0xffff,
+            60,
+            "AX = AL * CL for an 8-bit operand"
+        );
 
         cpu.gpr[RCX] = 0;
         // div cl  (F6 /6, modrm=11 110 001): divide by zero
@@ -4536,7 +4846,10 @@ mod tests {
         m.write_init(CODE, &[0x98]).unwrap();
         cpu.rip = CODE;
         cpu.exec(&mut m);
-        assert_eq!(cpu.gpr[RAX], 0, "AX=0 sign-extends to EAX=0, clearing the upper 32 bits");
+        assert_eq!(
+            cpu.gpr[RAX], 0,
+            "AX=0 sign-extends to EAX=0, clearing the upper 32 bits"
+        );
 
         cpu.gpr[RAX] = 0xffff_ffff_ffff_8000;
         // cdqe (REX.W 98): rax = sign_extend(eax)
@@ -4586,7 +4899,11 @@ mod tests {
         m.write_init(CODE, &[0xFF, 0xD0]).unwrap();
         cpu.exec(&mut m);
         assert_eq!(cpu.rip, CODE + 0x100);
-        assert_eq!(m.read_u64(STACK - 8).unwrap(), CODE + 2, "return address pushed");
+        assert_eq!(
+            m.read_u64(STACK - 8).unwrap(),
+            CODE + 2,
+            "return address pushed"
+        );
 
         cpu.gpr[RBX] = CODE + 0x200;
         // jmp rbx  (FF /4, modrm=11 100 011)
@@ -4606,7 +4923,8 @@ mod tests {
         let mut m = mem();
         let mut cpu = X86Interp::new(CODE, STACK);
         cpu.gpr[RBP] = STACK - 0x40;
-        m.write_init(STACK - 0x40, &0x1122_3344u64.to_le_bytes()).unwrap();
+        m.write_init(STACK - 0x40, &0x1122_3344u64.to_le_bytes())
+            .unwrap();
         // leave (C9)
         m.write_init(CODE, &[0xC9]).unwrap();
         cpu.exec(&mut m);
@@ -4650,7 +4968,10 @@ mod tests {
         vendor.extend_from_slice(&(cpu.gpr[RBX] as u32).to_le_bytes());
         vendor.extend_from_slice(&(cpu.gpr[RDX] as u32).to_le_bytes());
         vendor.extend_from_slice(&(cpu.gpr[RCX] as u32).to_le_bytes());
-        assert_eq!(vendor, b"GenuineIntel", "EBX/EDX/ECX spell the vendor string");
+        assert_eq!(
+            vendor, b"GenuineIntel",
+            "EBX/EDX/ECX spell the vendor string"
+        );
     }
 
     #[test]
@@ -4660,8 +4981,16 @@ mod tests {
         cpu.gpr[RAX] = 1;
         m.write_init(CODE, &[0x0F, 0xA2]).unwrap();
         cpu.exec(&mut m);
-        assert_ne!(cpu.gpr[RDX] as u32 & (1 << 26), 0, "SSE2 feature bit (EDX bit 26) is set");
-        assert_ne!(cpu.gpr[RDX] as u32 & (1 << 0), 0, "FPU feature bit (EDX bit 0) is set");
+        assert_ne!(
+            cpu.gpr[RDX] as u32 & (1 << 26),
+            0,
+            "SSE2 feature bit (EDX bit 26) is set"
+        );
+        assert_ne!(
+            cpu.gpr[RDX] as u32 & (1 << 0),
+            0,
+            "FPU feature bit (EDX bit 0) is set"
+        );
     }
 
     #[test]
@@ -4675,7 +5004,10 @@ mod tests {
         cpu.rip = CODE;
         cpu.exec(&mut m);
         let second = (cpu.gpr[RDX] << 32) | (cpu.gpr[RAX] & 0xffff_ffff);
-        assert!(second > first, "RDTSC must return a monotonically increasing counter");
+        assert!(
+            second > first,
+            "RDTSC must return a monotonically increasing counter"
+        );
     }
 
     #[test]
@@ -4707,8 +5039,16 @@ mod tests {
         cpu.rip = CODE;
         cpu.exec(&mut m);
         assert!(!cpu.flags.zf, "a mismatch clears ZF");
-        assert_eq!(cpu.gpr[RAX] & 0xffff_ffff, 42, "accumulator <- dest on a mismatch");
-        assert_eq!(cpu.gpr[RBX] & 0xffff_ffff, 42, "a mismatch leaves dest untouched");
+        assert_eq!(
+            cpu.gpr[RAX] & 0xffff_ffff,
+            42,
+            "accumulator <- dest on a mismatch"
+        );
+        assert_eq!(
+            cpu.gpr[RBX] & 0xffff_ffff,
+            42,
+            "a mismatch leaves dest untouched"
+        );
     }
 
     #[test]
@@ -4720,7 +5060,11 @@ mod tests {
         // xadd eax, ecx  (0F C1 /r, modrm=11 001 000: reg=ecx, rm=eax)
         m.write_init(CODE, &[0x0F, 0xC1, 0xC8]).unwrap();
         cpu.exec(&mut m);
-        assert_eq!(cpu.gpr[RCX] & 0xffff_ffff, 10, "reg gets the old dest value");
+        assert_eq!(
+            cpu.gpr[RCX] & 0xffff_ffff,
+            10,
+            "reg gets the old dest value"
+        );
         assert_eq!(cpu.gpr[RAX] & 0xffff_ffff, 15, "dest becomes dest + src");
     }
 
@@ -4735,7 +5079,11 @@ mod tests {
         // lock add [rbx], ecx  (F0 01 /r, modrm=00 001 011: reg=ecx, rm=[rbx])
         m.write_init(CODE, &[0xF0, 0x01, 0x0B]).unwrap();
         cpu.exec(&mut m);
-        assert_eq!(m.read_u32(addr).unwrap(), 15, "LOCK ADD still performs the add on memory");
+        assert_eq!(
+            m.read_u32(addr).unwrap(),
+            15,
+            "LOCK ADD still performs the add on memory"
+        );
         assert!(!cpu.flags.zf);
     }
 
@@ -4866,7 +5214,11 @@ mod tests {
         m.write_init(CODE, &[0xF2, 0x0F, 0x10, 0x00]).unwrap();
         cpu.exec(&mut m);
         assert_eq!(cpu.xmm[0] as u64, 3.0f64.to_bits(), "MOVSD load from [rax]");
-        assert_eq!(cpu.xmm[0] >> 64, 0, "MOVSD mem-load zeroes the upper 64 bits");
+        assert_eq!(
+            cpu.xmm[0] >> 64,
+            0,
+            "MOVSD mem-load zeroes the upper 64 bits"
+        );
 
         // movsd xmm1, [rbx]  (F2 0F 10 /r, modrm=00 001 011)
         m.write_init(CODE, &[0xF2, 0x0F, 0x10, 0x0B]).unwrap();
@@ -4880,7 +5232,11 @@ mod tests {
         m.write_init(CODE, &[0xF2, 0x0F, 0x10, 0xD9]).unwrap();
         cpu.rip = CODE;
         cpu.exec(&mut m);
-        assert_eq!(cpu.xmm[3] >> 64, 0xdead_beef, "reg-reg MOVSD preserves dest's upper bits");
+        assert_eq!(
+            cpu.xmm[3] >> 64,
+            0xdead_beef,
+            "reg-reg MOVSD preserves dest's upper bits"
+        );
         assert_eq!(cpu.xmm[3] as u64, 4.0f64.to_bits());
 
         // addsd xmm0, xmm1  (F2 0F 58 /r, modrm=11 000 001) -> 3.0 + 4.0 = 7.0
@@ -4928,7 +5284,10 @@ mod tests {
         m.write_init(CODE, &[0xF2, 0x0F, 0x2C, 0xC8]).unwrap();
         cpu.rip = CODE;
         cpu.exec(&mut m);
-        assert_eq!(cpu.gpr[RCX] as u32 as i32, -42, "CVTTSD2SI truncates back to the original int");
+        assert_eq!(
+            cpu.gpr[RCX] as u32 as i32, -42,
+            "CVTTSD2SI truncates back to the original int"
+        );
     }
 
     #[test]
@@ -4969,7 +5328,10 @@ mod tests {
         m.write_init(CODE, &[0x66, 0x0F, 0x2E, 0xC1]).unwrap();
         cpu.rip = CODE;
         cpu.exec(&mut m);
-        assert!(cpu.flags.cf && cpu.flags.zf && cpu.flags.pf, "an unordered compare sets CF/ZF/PF");
+        assert!(
+            cpu.flags.cf && cpu.flags.zf && cpu.flags.pf,
+            "an unordered compare sets CF/ZF/PF"
+        );
         assert!(!cpu.flags.of && !cpu.flags.sf, "OF/SF are always cleared");
     }
 
@@ -5035,7 +5397,10 @@ mod tests {
         cpu.rip = CODE;
         cpu.exec(&mut m);
         assert!(cpu.flags.zf, "BSF of a zero source sets ZF");
-        assert_eq!(cpu.gpr[RBX], 0x1234, "BSF must not modify the destination when the source is zero");
+        assert_eq!(
+            cpu.gpr[RBX], 0x1234,
+            "BSF must not modify the destination when the source is zero"
+        );
     }
 
     #[test]
@@ -5139,10 +5504,22 @@ mod tests {
         m.write_init(CODE, &[0x66, 0x0F, 0x70, 0xC1, 0x1B]).unwrap();
         cpu.exec(&mut m);
         let out = cpu.xmm[0].to_le_bytes();
-        assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 0x4444_4444);
-        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 0x3333_3333);
-        assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 0x2222_2222);
-        assert_eq!(u32::from_le_bytes(out[12..16].try_into().unwrap()), 0x1111_1111);
+        assert_eq!(
+            u32::from_le_bytes(out[0..4].try_into().unwrap()),
+            0x4444_4444
+        );
+        assert_eq!(
+            u32::from_le_bytes(out[4..8].try_into().unwrap()),
+            0x3333_3333
+        );
+        assert_eq!(
+            u32::from_le_bytes(out[8..12].try_into().unwrap()),
+            0x2222_2222
+        );
+        assert_eq!(
+            u32::from_le_bytes(out[12..16].try_into().unwrap()),
+            0x1111_1111
+        );
     }
 
     #[test]
@@ -5157,7 +5534,12 @@ mod tests {
         m.write_init(CODE, &[0x66, 0x0F, 0x60, 0xC1]).unwrap();
         cpu.exec(&mut m);
         let out = cpu.xmm[0].to_le_bytes();
-        assert_eq!(out, [1, 101, 2, 102, 3, 103, 4, 104, 5, 105, 6, 106, 7, 107, 8, 108]);
+        assert_eq!(
+            out,
+            [
+                1, 101, 2, 102, 3, 103, 4, 104, 5, 105, 6, 106, 7, 107, 8, 108
+            ]
+        );
     }
 
     #[test]
@@ -5179,10 +5561,26 @@ mod tests {
         m.write_init(CODE, &[0x0F, 0xC6, 0xC1, imm]).unwrap();
         cpu.exec(&mut m);
         let out = cpu.xmm[0].to_le_bytes();
-        assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 30, "lane0 <- dst[2]");
-        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 40, "lane1 <- dst[3]");
-        assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 50, "lane2 <- src[0]");
-        assert_eq!(u32::from_le_bytes(out[12..16].try_into().unwrap()), 60, "lane3 <- src[1]");
+        assert_eq!(
+            u32::from_le_bytes(out[0..4].try_into().unwrap()),
+            30,
+            "lane0 <- dst[2]"
+        );
+        assert_eq!(
+            u32::from_le_bytes(out[4..8].try_into().unwrap()),
+            40,
+            "lane1 <- dst[3]"
+        );
+        assert_eq!(
+            u32::from_le_bytes(out[8..12].try_into().unwrap()),
+            50,
+            "lane2 <- src[0]"
+        );
+        assert_eq!(
+            u32::from_le_bytes(out[12..16].try_into().unwrap()),
+            60,
+            "lane3 <- src[1]"
+        );
     }
 
     #[test]
@@ -5217,7 +5615,8 @@ mod tests {
         // fld qword [rbx]  (DD /0, modrm=00 000 011)
         // fadd qword [rcx] (DC /0, modrm=00 000 001)
         // fstp qword [rdx] (DD /3, modrm=00 011 010)
-        m.write_init(CODE, &[0xDD, 0x03, 0xDC, 0x01, 0xDD, 0x1A]).unwrap();
+        m.write_init(CODE, &[0xDD, 0x03, 0xDC, 0x01, 0xDD, 0x1A])
+            .unwrap();
         cpu.exec(&mut m); // fld
         cpu.exec(&mut m); // fadd
         cpu.exec(&mut m); // fstp
@@ -5235,7 +5634,8 @@ mod tests {
         cpu.gpr[RBX] = p1;
         cpu.gpr[RCX] = p2;
         // fld qword [rbx] ; fld qword [rcx] ; fmulp st(1), st(0)  (DE C9)
-        m.write_init(CODE, &[0xDD, 0x03, 0xDD, 0x01, 0xDE, 0xC9]).unwrap();
+        m.write_init(CODE, &[0xDD, 0x03, 0xDD, 0x01, 0xDE, 0xC9])
+            .unwrap();
         cpu.exec(&mut m);
         cpu.exec(&mut m);
         cpu.exec(&mut m);
@@ -5328,7 +5728,8 @@ mod tests {
         // fldcw [rbx]        (D9 /5, modrm=00 101 011)
         // fld qword [rcx]    (DD /0, modrm=00 000 001)
         // fistp dword [rdx]  (DB /3, modrm=00 011 010)
-        m.write_init(CODE, &[0xD9, 0x2B, 0xDD, 0x01, 0xDB, 0x1A]).unwrap();
+        m.write_init(CODE, &[0xD9, 0x2B, 0xDD, 0x01, 0xDB, 0x1A])
+            .unwrap();
         cpu.exec(&mut m); // fldcw
         cpu.exec(&mut m); // fld
         cpu.exec(&mut m); // fistp
@@ -5349,7 +5750,8 @@ mod tests {
         cpu.gpr[RBX] = p1;
         cpu.gpr[RCX] = p2;
         // fld qword [rbx] ; fld qword [rcx] ; fxch st(1)  (D9 C9)
-        m.write_init(CODE, &[0xDD, 0x03, 0xDD, 0x01, 0xD9, 0xC9]).unwrap();
+        m.write_init(CODE, &[0xDD, 0x03, 0xDD, 0x01, 0xD9, 0xC9])
+            .unwrap();
         cpu.exec(&mut m); // ST(0) = 1.0
         cpu.exec(&mut m); // ST(0) = 2.0, ST(1) = 1.0
         cpu.exec(&mut m); // fxch

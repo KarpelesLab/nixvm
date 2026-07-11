@@ -820,19 +820,37 @@ mod tests {
     #[test]
     fn eventfd_write_then_read_counter() {
         let (mut k, mut mem, mut v) = setup();
-        let fd = call(&mut k, &mut mem, &mut v, Sysno::Eventfd2, [0, 0, 0, 0, 0, 0]);
+        let fd = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Eventfd2,
+            [0, 0, 0, 0, 0, 0],
+        );
         assert!(fd >= 3);
         let fd = fd as u64;
 
         let buf = 0x1_0000;
         mem.write_init(buf, &3u64.to_le_bytes()).unwrap();
         assert_eq!(
-            call(&mut k, &mut mem, &mut v, Sysno::Write, [fd, buf, 8, 0, 0, 0]),
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [fd, buf, 8, 0, 0, 0]
+            ),
             8
         );
         mem.write_init(buf, &4u64.to_le_bytes()).unwrap();
         assert_eq!(
-            call(&mut k, &mut mem, &mut v, Sysno::Write, [fd, buf, 8, 0, 0, 0]),
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [fd, buf, 8, 0, 0, 0]
+            ),
             8
         );
 
@@ -882,12 +900,19 @@ mod tests {
 
         let msg = 0x1_1000;
         mem.write_init(msg, b"hi").unwrap();
-        call(&mut k, &mut mem, &mut v, Sysno::Write, [wfd, msg, 2, 0, 0, 0]);
+        call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Write,
+            [wfd, msg, 2, 0, 0, 0],
+        );
 
         // A zero-timeout poll on the read end: no data yet on an *empty*
         // pipe would report 0; here data is buffered so it must report ready.
         let pollfds = 0x1_2000;
-        mem.write_init(pollfds, &(rfd as u32).to_le_bytes()).unwrap();
+        mem.write_init(pollfds, &(rfd as u32).to_le_bytes())
+            .unwrap();
         mem.write_init(pollfds + 4, &1u16.to_le_bytes()).unwrap(); // POLLIN
         mem.write_init(pollfds + 6, &0u16.to_le_bytes()).unwrap();
 
@@ -910,7 +935,8 @@ mod tests {
         let rfd = u64::from(mem.read_u32(fds).unwrap());
 
         let pollfds = 0x1_2000;
-        mem.write_init(pollfds, &(rfd as u32).to_le_bytes()).unwrap();
+        mem.write_init(pollfds, &(rfd as u32).to_le_bytes())
+            .unwrap();
         mem.write_init(pollfds + 4, &1u16.to_le_bytes()).unwrap();
 
         let n = call(
@@ -934,15 +960,28 @@ mod tests {
 
         let msg = 0x1_1000;
         mem.write_init(msg, b"yo").unwrap();
-        call(&mut k, &mut mem, &mut v, Sysno::Write, [wfd, msg, 2, 0, 0, 0]);
+        call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Write,
+            [wfd, msg, 2, 0, 0, 0],
+        );
 
-        let epfd = call(&mut k, &mut mem, &mut v, Sysno::EpollCreate1, [0, 0, 0, 0, 0, 0]);
+        let epfd = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::EpollCreate1,
+            [0, 0, 0, 0, 0, 0],
+        );
         assert!(epfd >= 3);
         let epfd = epfd as u64;
 
         let ev = 0x1_2000;
         mem.write_init(ev, &1u32.to_le_bytes()).unwrap(); // EPOLLIN
-        mem.write_init(ev + 8, &0x1234_5678u64.to_le_bytes()).unwrap(); // data (aarch64 offset)
+        mem.write_init(ev + 8, &0x1234_5678u64.to_le_bytes())
+            .unwrap(); // data (aarch64 offset)
         assert_eq!(
             call(
                 &mut k,

@@ -28,7 +28,10 @@ pub enum Fd {
     /// An endpoint of socket `sock` in the kernel's socket table. `end` is 0 or
     /// 1, selecting which side of a connected pair (and thus which direction is
     /// read vs. written). Unconnected/listening sockets always use `end == 0`.
-    Socket { sock: usize, end: usize },
+    Socket {
+        sock: usize,
+        end: usize,
+    },
     /// An `eventfd2` counter: index into the kernel's eventfd table.
     Eventfd(usize),
     /// A `timerfd_create` timer: index into the kernel's timerfd table.

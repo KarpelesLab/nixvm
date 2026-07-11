@@ -1,75 +1,75 @@
 name: CI
 
-# Builds, lints, and tests the `nixvm` crate: the default feature set, the
-# `fstool` feature (real on-disk filesystem images), and a guard build of the
-# library for wasm32 (mirrors how .github/workflows/pages.yml builds the
-# browser demo, but without the wasm-pack packaging step).
-
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 
 permissions:
   contents: read
 
-# Cancel superseded runs on the same branch/PR.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    name: build / clippy / test
-    runs-on: ubuntu-latest
+    name: Test & lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Install Rust (pinned to rust-version = 1.89)
-        uses: dtolnay/rust-toolchain@1.89
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: rustfmt, clippy
 
-      - name: Cache cargo
+      - name: Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
 
-      - name: Build (default features)
-        run: cargo build --verbose
+      - name: Format
+        if: runner.os == 'Linux' # formatting is platform-independent
+        run: cargo fmt --all --check
 
-      - name: Build (fstool feature)
-        run: cargo build --features fstool --verbose
-
-      - name: Clippy (default features, deny warnings)
+      # `--all-features` is intentionally NOT used: `wasm` pulls in wasm-bindgen
+      # (only builds for wasm32) and `hvf`/`kvm` are target-gated backends. The
+      # feature sets below are the ones that build on a normal host.
+      - name: Clippy (default features, warnings denied)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Clippy (fstool feature, deny warnings)
+      - name: Clippy (fstool, warnings denied)
         run: cargo clippy --all-targets --features fstool -- -D warnings
 
       - name: Test (default features)
-        run: cargo test --verbose
+        run: cargo test
 
-      - name: Test (fstool feature)
-        run: cargo test --features fstool --verbose
+      - name: Test (fstool)
+        run: cargo test --features fstool
 
   wasm:
-    name: wasm32 library build
+    name: wasm build guard
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Install Rust (pinned to rust-version = 1.89)
-        uses: dtolnay/rust-toolchain@1.89
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Cache cargo
+      - name: Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build lib for wasm32 (`wasm` feature, no default features)
-        # `--lib` restricts this to the library target, mirroring how
-        # pages.yml's `wasm-pack build ... -- --lib` skips src/bin/nixvm.rs
-        # (needs the `cli` feature) and src/bin/run-elf.rs (cfg(unix)), neither
-        # of which builds for wasm32-unknown-unknown.
+      # Guards the browser demo build (src/wasm.rs). `--lib` skips the cfg(unix)
+      # bins, matching how pages.yml builds the deployable artifact.
+      - name: Build wasm demo library
         run: cargo build --lib --target wasm32-unknown-unknown --features wasm --no-default-features

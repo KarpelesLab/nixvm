@@ -192,9 +192,9 @@ impl FsToolMount {
             return to_io(err);
         };
         match (want, a.kind == EntryKind::Dir, a.kind == EntryKind::Symlink) {
-            (WantKind::Dir, true, _) | (WantKind::NotDir, false, _) | (WantKind::Symlink, _, true) => {
-                to_io(err)
-            }
+            (WantKind::Dir, true, _)
+            | (WantKind::NotDir, false, _)
+            | (WantKind::Symlink, _, true) => to_io(err),
             (WantKind::Dir, false, _) => enotdir(),
             (WantKind::NotDir, true, _) => eisdir(),
             (WantKind::Symlink, _, false) => einval(),
@@ -487,14 +487,8 @@ mod tests {
             fs.read_at("nope", 0, &mut buf).unwrap_err().raw_os_error(),
             Some(2)
         );
-        assert_eq!(
-            fs.readdir("nope").unwrap_err().raw_os_error(),
-            Some(2)
-        );
-        assert_eq!(
-            fs.readlink("nope").unwrap_err().raw_os_error(),
-            Some(2)
-        );
+        assert_eq!(fs.readdir("nope").unwrap_err().raw_os_error(), Some(2));
+        assert_eq!(fs.readlink("nope").unwrap_err().raw_os_error(), Some(2));
     }
 
     #[test]

@@ -252,7 +252,11 @@ fn smp_scheduling_matches_serial_fork_sum() {
     let code_words = build_code(0).len() as u64;
     let wstatus_addr = u32::try_from(vaddr + BODY_OFF + code_words * 4).unwrap();
     let instrs = build_code(wstatus_addr);
-    assert_eq!(instrs.len() as u64, code_words, "two-pass build must be length-stable");
+    assert_eq!(
+        instrs.len() as u64,
+        code_words,
+        "two-pass build must be length-stable"
+    );
 
     let mut body = words_to_bytes(&instrs);
     body.extend_from_slice(&[0u8; 4]); // wstatus scratch word, filled by wait4
@@ -263,7 +267,11 @@ fn smp_scheduling_matches_serial_fork_sum() {
         let (serial_code, serial_out, serial_kernel) = run_program(vaddr, &body, 1);
         assert_eq!(serial_code, EXPECTED_EXIT, "serial (ncpus=1) run {iter}");
         assert!(serial_out.is_empty());
-        assert!(serial_kernel.unsupported().is_empty(), "{:?}", serial_kernel.unsupported());
+        assert!(
+            serial_kernel.unsupported().is_empty(),
+            "{:?}",
+            serial_kernel.unsupported()
+        );
 
         let (smp_code, smp_out, smp_kernel) = run_program(vaddr, &body, 4);
         assert_eq!(
@@ -271,6 +279,10 @@ fn smp_scheduling_matches_serial_fork_sum() {
             "SMP (ncpus=4) run {iter} must agree with the serial scheduler"
         );
         assert!(smp_out.is_empty());
-        assert!(smp_kernel.unsupported().is_empty(), "{:?}", smp_kernel.unsupported());
+        assert!(
+            smp_kernel.unsupported().is_empty(),
+            "{:?}",
+            smp_kernel.unsupported()
+        );
     }
 }

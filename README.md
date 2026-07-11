@@ -1,5 +1,10 @@
 # nixvm
 
+[![CI](https://github.com/KarpelesLab/nixvm/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/nixvm/actions/workflows/ci.yml)
+[![Deploy demo](https://github.com/KarpelesLab/nixvm/actions/workflows/pages.yml/badge.svg)](https://github.com/KarpelesLab/nixvm/actions/workflows/pages.yml)
+[![Browser demo](https://img.shields.io/badge/demo-live-brightgreen.svg)](https://karpeleslab.github.io/nixvm/)
+[![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](LICENSE)
+
 **A portable, VM-style sandbox that runs a real Linux userland by emulating
 Linux syscalls directly — not by emulating hardware.**
 

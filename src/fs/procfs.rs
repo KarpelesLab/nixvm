@@ -294,8 +294,7 @@ const POOLSIZE: &str = "4096\n";
 
 // ---- /proc/net/* ----
 
-const NET_TCP_HEADER: &str =
-    "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+const NET_TCP_HEADER: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
 
 const NET_TCP6_HEADER: &str = "  sl  \
 local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
@@ -312,7 +311,8 @@ const NET_DEV: &str = "Inter-|   Receive                                        
  face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
     lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n";
 
-const NET_ROUTE: &str = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n";
+const NET_ROUTE: &str =
+    "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n";
 
 const NET_SNMP: &str = "Ip: Forwarding DefaultTTL InReceives InHdrErrors InAddrErrors ForwDatagrams InUnknownProtos InDiscards InDelivers OutRequests OutDiscards OutNoRoutes ReasmTimeout ReasmReqds ReasmOKs ReasmFails FragOKs FragFails FragCreates\n\
 Ip: 1 64 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
@@ -559,7 +559,9 @@ impl ProcFs {
             if rel == pid_s {
                 return "self".to_string();
             }
-            if let Some(rest) = rel.strip_prefix(pid_s.as_str()).and_then(|r| r.strip_prefix('/'))
+            if let Some(rest) = rel
+                .strip_prefix(pid_s.as_str())
+                .and_then(|r| r.strip_prefix('/'))
             {
                 return format!("self/{rest}");
             }
@@ -1067,9 +1069,17 @@ impl MountFs for ProcFs {
         let (kind, mode, size) = if is_dir(rel) {
             (NodeKind::Dir, S_IFDIR | 0o555, 0)
         } else if rel == "self/exe" {
-            (NodeKind::Symlink, S_IFLNK | 0o777, self.data.exe.len() as u64)
+            (
+                NodeKind::Symlink,
+                S_IFLNK | 0o777,
+                self.data.exe.len() as u64,
+            )
         } else if rel == "self/cwd" {
-            (NodeKind::Symlink, S_IFLNK | 0o777, self.data.cwd.len() as u64)
+            (
+                NodeKind::Symlink,
+                S_IFLNK | 0o777,
+                self.data.cwd.len() as u64,
+            )
         } else if rel == "self/root" {
             (NodeKind::Symlink, S_IFLNK | 0o777, ROOT_TARGET.len() as u64)
         } else {
@@ -1261,7 +1271,12 @@ mod tests {
     #[test]
     fn root_readdir_lists_files_and_dirs() {
         let mut fs = ProcFs::new();
-        let names: Vec<String> = fs.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        let names: Vec<String> = fs
+            .readdir("")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         assert!(names.contains(&"cpuinfo".to_string()));
         assert!(names.contains(&"self".to_string()));
         assert!(names.contains(&"sys".to_string()));
@@ -1365,7 +1380,12 @@ mod tests {
         assert_eq!(read_all(&mut fs, "42/cmdline"), b"prog\0--flag\0");
         assert_eq!(fs.readlink("42/exe").unwrap(), "/usr/bin/prog");
         assert_eq!(fs.stat("42").unwrap().kind, NodeKind::Dir);
-        let names: Vec<String> = fs.readdir("42").unwrap().into_iter().map(|e| e.name).collect();
+        let names: Vec<String> = fs
+            .readdir("42")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         assert!(names.contains(&"fd".to_string()));
     }
 
@@ -1486,11 +1506,26 @@ mod tests {
             .into_iter()
             .map(|e| e.name)
             .collect();
-        for want in ["tcp", "tcp6", "udp", "udp6", "unix", "dev", "route", "snmp", "protocols"] {
+        for want in [
+            "tcp",
+            "tcp6",
+            "udp",
+            "udp6",
+            "unix",
+            "dev",
+            "route",
+            "snmp",
+            "protocols",
+        ] {
             assert!(names.contains(&want.to_string()), "missing {want}");
         }
         // Root readdir lists the new `net` directory.
-        let root_names: Vec<String> = fs.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        let root_names: Vec<String> = fs
+            .readdir("")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         assert!(root_names.contains(&"net".to_string()));
     }
 
@@ -1588,8 +1623,16 @@ mod tests {
     #[test]
     fn top_level_misc_files_present() {
         let mut fs = ProcFs::new();
-        assert!(String::from_utf8(read_all(&mut fs, "diskstats")).unwrap().contains("vda"));
-        assert!(String::from_utf8(read_all(&mut fs, "partitions")).unwrap().contains("#blocks"));
+        assert!(
+            String::from_utf8(read_all(&mut fs, "diskstats"))
+                .unwrap()
+                .contains("vda")
+        );
+        assert!(
+            String::from_utf8(read_all(&mut fs, "partitions"))
+                .unwrap()
+                .contains("#blocks")
+        );
         assert!(
             String::from_utf8(read_all(&mut fs, "swaps"))
                 .unwrap()
@@ -1745,7 +1788,12 @@ mod tests {
         assert!(random_names.contains(&"uuid".to_string()));
         assert!(random_names.contains(&"boot_id".to_string()));
 
-        let root_names: Vec<String> = fs.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        let root_names: Vec<String> = fs
+            .readdir("")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         assert!(root_names.contains(&"kallsyms".to_string()));
         assert!(root_names.contains(&"vmstat".to_string()));
     }

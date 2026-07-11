@@ -99,7 +99,11 @@ fn static_x86_64_elf_prints_and_exits() {
     body.extend_from_slice(&[0x31, 0xFF]); // xor edi, edi
     body.extend_from_slice(&[0xB8, 0x3C, 0x00, 0x00, 0x00]); // mov eax, 60
     body.extend_from_slice(&[0x0F, 0x05]); // syscall
-    assert_eq!(body.len() as u64, PROG_LEN, "PROG_LEN must match the assembled program");
+    assert_eq!(
+        body.len() as u64,
+        PROG_LEN,
+        "PROG_LEN must match the assembled program"
+    );
     body.extend_from_slice(b"ok\n");
 
     let elf = build_elf(vaddr, &body);

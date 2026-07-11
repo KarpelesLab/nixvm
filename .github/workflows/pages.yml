@@ -7,7 +7,7 @@ name: Deploy browser demo to GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - "src/**"
       - "web/**"
