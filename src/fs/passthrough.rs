@@ -9,6 +9,12 @@
 //!
 //! Host-only; not built for wasm.
 //!
+//! This module is the one deliberate exception to the project's "`unsafe`
+//! lives only in `vcpu::hvf`" rule: safe, TOCTOU-free confinement genuinely
+//! requires the dirfd-relative `*at(2)` syscalls, which `std` does not expose,
+//! so they are declared by hand below (see the security note). The `unsafe` is
+//! confined to those thin FFI shims.
+//!
 //! # Security: confined, symlink/TOCTOU-safe path resolution
 //!
 //! A passthrough must never become an escape hatch out of the shared host
