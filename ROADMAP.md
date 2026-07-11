@@ -201,10 +201,17 @@ splits into three layers:
   |CLONE_THREAD)` shares these; `fork` copies them (COW `GuestMemory`).
 - **Kernel-global:** the mount table and the scheduler.
 
-The **scheduler** (`kernel::sched`) replaces the single-vcpu `Kernel::run` loop:
-round-robin (or step-budget preemptive) across ready tasks, `Exit::Interrupted`
-as the yield point, futex/`wait4` as block/wake edges — mirroring univdreams'
-per-thread `Cpu` loop.
+The **scheduler** (`kernel::sched`) replaces the single-vcpu `Kernel::run` loop.
+The model mirrors a real SMP kernel: spin up **one host thread per vcpu, sized to
+the physical CPU count** — each host thread *is* a CPU. The scheduler hands a
+runnable task to a free vcpu-thread, which owns and runs it until it blocks
+(futex/`wait4`), yields (`Exit::Interrupted` / step-budget), or exits; then the
+thread picks up the next runnable task. This is exactly how the hardware
+backends must work — an HVF/KVM vcpu *is* a host thread running guest code — so
+the same scheduler drives the interpreter and the hardware backends uniformly;
+only the "run this task's registers until the next exit" primitive differs per
+backend. Guest threads/processes migrate across vcpu-threads like tasks across
+CPUs, rather than pinning one host thread per guest thread.
 
 - **New:** scheduler (`kernel::sched`), `Task`/`Process` split, per-task cwd,
   per-thread vcpu ownership, COW fork of `GuestMemory`.
