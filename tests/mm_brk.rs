@@ -4,10 +4,10 @@
 use nixvm::abi::Arch;
 use nixvm::fs::MountTable;
 use nixvm::kernel::Kernel;
-use nixvm::vcpu::mem::{PAGE_SIZE, Prot};
 use nixvm::vcpu::Backend;
-use nixvm::vcpu::interp::InterpBackend;
 use nixvm::vcpu::GuestMemory;
+use nixvm::vcpu::interp::InterpBackend;
+use nixvm::vcpu::mem::{PAGE_SIZE, Prot};
 
 #[test]
 fn brk_grows_heap_and_memory_is_usable() {
@@ -53,5 +53,9 @@ fn brk_grows_heap_and_memory_is_usable() {
 
     let code = kernel.run(vcpu, mem).unwrap();
     assert_eq!(code, 42, "value written to the brk-grown heap round-trips");
-    assert!(kernel.unsupported().is_empty(), "{:?}", kernel.unsupported());
+    assert!(
+        kernel.unsupported().is_empty(),
+        "{:?}",
+        kernel.unsupported()
+    );
 }

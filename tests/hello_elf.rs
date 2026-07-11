@@ -10,9 +10,9 @@ use nixvm::fs::MountTable;
 use nixvm::kernel::Kernel;
 use nixvm::loader::{ProcessSpec, load_static};
 use nixvm::vcpu::Backend;
+use nixvm::vcpu::GuestMemory;
 use nixvm::vcpu::interp::InterpBackend;
 use nixvm::vcpu::mem::PAGE_SIZE;
-use nixvm::vcpu::GuestMemory;
 
 const EHDR_LEN: usize = 64;
 const PHDR_LEN: usize = 56;

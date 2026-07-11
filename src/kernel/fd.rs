@@ -12,9 +12,15 @@ pub enum Fd {
     Stdout,
     Stderr,
     /// An open path in the [`crate::fs::MountTable`], with the current offset.
-    File { path: String, offset: u64 },
+    File {
+        path: String,
+        offset: u64,
+    },
     /// An open directory being walked by `getdents64`.
-    Dir { path: String, pos: usize },
+    Dir {
+        path: String,
+        pos: usize,
+    },
     /// Read end of pipe `index` in the kernel's pipe table.
     PipeRead(usize),
     /// Write end of pipe `index` in the kernel's pipe table.

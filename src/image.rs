@@ -33,7 +33,12 @@ impl ImageRef {
     /// Cache-relative filename, e.g. `alpine-3.20-aarch64.sqfs`.
     #[must_use]
     pub fn file_name(&self) -> String {
-        format!("{}-{}-{}.sqfs", self.distro, self.version, self.arch.as_str())
+        format!(
+            "{}-{}-{}.sqfs",
+            self.distro,
+            self.version,
+            self.arch.as_str()
+        )
     }
 }
 

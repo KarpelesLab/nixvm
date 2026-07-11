@@ -17,9 +17,9 @@ use std::path::PathBuf;
 
 use crate::Error;
 use crate::abi::Arch;
-use crate::fs::{DevFs, MountTable, TmpFs};
 #[cfg(unix)]
 use crate::fs::Passthrough;
+use crate::fs::{DevFs, MountTable, TmpFs};
 use crate::image::{ImageRef, ImageStore};
 use crate::kernel::Kernel;
 use crate::loader::{ProcessSpec, load_static};
@@ -226,8 +226,7 @@ impl Sandbox {
         // Lay out heap and mmap in the gap between the image and the stack: the
         // heap grows up from the program break, mmap grows down from the stack,
         // meeting at a midpoint so the two arenas can't collide.
-        let mid =
-            page_align_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
+        let mid = page_align_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
 
         let backend = self.backend()?;
         let vcpu = backend.new_vcpu(img.entry, img.stack_pointer)?;
@@ -264,7 +263,10 @@ impl Sandbox {
 
         #[cfg(unix)]
         {
-            mounts.mount("/work", Box::new(Passthrough::new(self.config.work_dir.clone())));
+            mounts.mount(
+                "/work",
+                Box::new(Passthrough::new(self.config.work_dir.clone())),
+            );
             for b in &self.config.binds {
                 let pt = if b.read_only {
                     Passthrough::read_only(b.host.clone())

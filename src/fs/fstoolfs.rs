@@ -186,7 +186,11 @@ impl MountFs for FsToolMount {
             return Err(erofs());
         }
         self.fs
-            .create_dir(&mut *self.dev, Path::new(&abs(rel)), FileMeta::with_mode(mode as u16))
+            .create_dir(
+                &mut *self.dev,
+                Path::new(&abs(rel)),
+                FileMeta::with_mode(mode as u16),
+            )
             .map_err(to_io)
     }
 
@@ -194,7 +198,9 @@ impl MountFs for FsToolMount {
         if self.read_only {
             return Err(erofs());
         }
-        self.fs.remove(&mut *self.dev, Path::new(&abs(rel))).map_err(to_io)
+        self.fs
+            .remove(&mut *self.dev, Path::new(&abs(rel)))
+            .map_err(to_io)
     }
 
     fn rmdir(&mut self, rel: &str) -> io::Result<()> {
@@ -205,7 +211,9 @@ impl MountFs for FsToolMount {
         if self.read_only {
             return Err(erofs());
         }
-        self.fs.truncate(&mut *self.dev, Path::new(&abs(rel)), len).map_err(to_io)
+        self.fs
+            .truncate(&mut *self.dev, Path::new(&abs(rel)), len)
+            .map_err(to_io)
     }
 
     fn readlink(&mut self, rel: &str) -> io::Result<String> {
@@ -256,7 +264,12 @@ mod tests {
         assert_eq!(fs.stat("hello").unwrap().size, 7);
 
         fs.mkdir("d", 0o755).unwrap();
-        let names: Vec<_> = fs.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        let names: Vec<_> = fs
+            .readdir("")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         assert!(names.contains(&"hello".to_string()) && names.contains(&"d".to_string()));
     }
 }

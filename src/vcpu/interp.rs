@@ -62,7 +62,10 @@ enum Step {
     Syscall,
     Illegal,
     /// A load/store touched bad guest memory.
-    Fault { addr: u64, write: bool },
+    Fault {
+        addr: u64,
+        write: bool,
+    },
 }
 
 /// NZCV condition flags. (Four is the architectural count, not a smell.)
@@ -210,8 +213,8 @@ impl Aarch64Interp {
         }
         let raw = u64::from_le_bytes(buf);
         let val = match opc {
-            0b01 => raw, // zero-extend
-            0b10 => sign_extend(raw, (nbytes * 8) as u32) as u64, // sign-extend to 64
+            0b01 => raw,                                                     // zero-extend
+            0b10 => sign_extend(raw, (nbytes * 8) as u32) as u64,            // sign-extend to 64
             _ => sign_extend(raw, (nbytes * 8) as u32) as u64 & 0xffff_ffff, // to 32
         };
         self.write_x(rt, val);
@@ -256,13 +259,13 @@ impl Aarch64Interp {
             0b0101 => !f.n,
             0b0110 => f.v,
             0b0111 => !f.v,
-            0b1000 => f.c && !f.z,       // HI
-            0b1001 => !f.c || f.z,       // LS  (not HI)
-            0b1010 => f.n == f.v,        // GE
-            0b1011 => f.n != f.v,        // LT
+            0b1000 => f.c && !f.z,          // HI
+            0b1001 => !f.c || f.z,          // LS  (not HI)
+            0b1010 => f.n == f.v,           // GE
+            0b1011 => f.n != f.v,           // LT
             0b1100 => !f.z && (f.n == f.v), // GT
             0b1101 => f.z || (f.n != f.v),  // LE  (not GT)
-            _ => true, // AL / NV
+            _ => true,                      // AL / NV
         }
     }
 
@@ -424,10 +427,18 @@ impl Aarch64Interp {
             let rd = reg_field(instr, 0);
             let (n, m) = (self.read_x(rn), self.read_x(rm));
             let r = if sf == 1 {
-                if imms == 0 { m } else { (n << (64 - imms)) | (m >> imms) }
+                if imms == 0 {
+                    m
+                } else {
+                    (n << (64 - imms)) | (m >> imms)
+                }
             } else {
                 let (n, m) = (n & 0xffff_ffff, m & 0xffff_ffff);
-                if imms == 0 { m } else { (n << (32 - imms)) | (m >> imms) }
+                if imms == 0 {
+                    m
+                } else {
+                    (n << (32 - imms)) | (m >> imms)
+                }
             };
             self.write_x(rd, mask_sf(r, sf));
             return Step::Next;
@@ -455,7 +466,11 @@ impl Aarch64Interp {
                 0b10 => (rotated, 0u64), // UBFM
                 0b00 => {
                     // SBFM: sign-fill from bit `imms`.
-                    let top = if (src >> imms) & 1 == 1 { ones(width) } else { 0 };
+                    let top = if (src >> imms) & 1 == 1 {
+                        ones(width)
+                    } else {
+                        0
+                    };
                     (rotated, top)
                 }
                 0b01 => {
@@ -595,21 +610,33 @@ impl Aarch64Interp {
                 0b000 => {
                     // MADD/MSUB
                     let prod = n.wrapping_mul(m);
-                    let r = if o0 == 0 { a.wrapping_add(prod) } else { a.wrapping_sub(prod) };
+                    let r = if o0 == 0 {
+                        a.wrapping_add(prod)
+                    } else {
+                        a.wrapping_sub(prod)
+                    };
                     mask_sf(r, sf)
                 }
                 0b001 => {
                     // SMADDL/SMSUBL: 64 += sext(Wn) * sext(Wm)
                     let prod = i64::from(n as i32).wrapping_mul(i64::from(m as i32)) as u64;
-                    if o0 == 0 { a.wrapping_add(prod) } else { a.wrapping_sub(prod) }
+                    if o0 == 0 {
+                        a.wrapping_add(prod)
+                    } else {
+                        a.wrapping_sub(prod)
+                    }
                 }
                 0b101 => {
                     // UMADDL/UMSUBL: 64 += zext(Wn) * zext(Wm)
                     let prod = u64::from(n as u32).wrapping_mul(u64::from(m as u32));
-                    if o0 == 0 { a.wrapping_add(prod) } else { a.wrapping_sub(prod) }
+                    if o0 == 0 {
+                        a.wrapping_add(prod)
+                    } else {
+                        a.wrapping_sub(prod)
+                    }
                 }
                 0b010 => ((i128::from(n as i64).wrapping_mul(i128::from(m as i64))) >> 64) as u64, // SMULH
-                0b110 => ((u128::from(n).wrapping_mul(u128::from(m))) >> 64) as u64,                // UMULH
+                0b110 => ((u128::from(n).wrapping_mul(u128::from(m))) >> 64) as u64, // UMULH
                 _ => return Step::Illegal,
             };
             self.write_x(rd, r);
@@ -623,12 +650,20 @@ impl Aarch64Interp {
             let rn = reg_field(instr, 5);
             let rd = reg_field(instr, 0);
             let width = if sf == 1 { 64u32 } else { 32 };
-            let x = if sf == 1 { self.read_x(rn) } else { self.read_x(rn) & 0xffff_ffff };
+            let x = if sf == 1 {
+                self.read_x(rn)
+            } else {
+                self.read_x(rn) & 0xffff_ffff
+            };
             let r = match opcode {
                 0b000000 => rbit(x, width),
                 0b000001 => rev16(x, width),
                 0b000010 => {
-                    if sf == 1 { rev32(x) } else { u64::from((x as u32).swap_bytes()) }
+                    if sf == 1 {
+                        rev32(x)
+                    } else {
+                        u64::from((x as u32).swap_bytes())
+                    }
                 }
                 0b000011 => x.swap_bytes(), // REV (64-bit)
                 0b000100 => u64::from(if sf == 1 {
@@ -746,14 +781,20 @@ impl Aarch64Interp {
                 if is_load {
                     let mut buf = [0u8; 16];
                     if mem.read(a, &mut buf[..nbytes]).is_err() {
-                        return Step::Fault { addr: a, write: false };
+                        return Step::Fault {
+                            addr: a,
+                            write: false,
+                        };
                     }
                     self.v[r] = u128::from_le_bytes(buf);
                 } else {
                     self.note_store(a, self.v[r], nbytes);
                     let bytes = self.v[r].to_le_bytes();
                     if mem.write(a, &bytes[..nbytes]).is_err() {
-                        return Step::Fault { addr: a, write: true };
+                        return Step::Fault {
+                            addr: a,
+                            write: true,
+                        };
                     }
                 }
             }
@@ -814,14 +855,20 @@ impl Aarch64Interp {
                 if is_load {
                     let mut buf = [0u8; 8];
                     if mem.read(a, &mut buf[..nbytes]).is_err() {
-                        return Step::Fault { addr: a, write: false };
+                        return Step::Fault {
+                            addr: a,
+                            write: false,
+                        };
                     }
                     self.write_x(r, u64::from_le_bytes(buf));
                 } else {
                     self.note_store(a, u128::from(self.read_x(r)), nbytes);
                     let val = self.read_x(r).to_le_bytes();
                     if mem.write(a, &val[..nbytes]).is_err() {
-                        return Step::Fault { addr: a, write: true };
+                        return Step::Fault {
+                            addr: a,
+                            write: true,
+                        };
                     }
                 }
             }
@@ -949,7 +996,11 @@ impl Aarch64Interp {
             } else {
                 // ORR / BIC immediate: modify the existing register.
                 let m = to_q(imm64);
-                if op == 0 { self.v[rd] | m } else { self.v[rd] & !m }
+                if op == 0 {
+                    self.v[rd] | m
+                } else {
+                    self.v[rd] & !m
+                }
             };
             return Step::Next;
         }
@@ -1000,7 +1051,8 @@ impl Aarch64Interp {
         }
 
         // ---- FMOV between GP and SIMD/FP registers (bit-exact, no convert) ----
-        if (instr >> 24) & 0x7f == 0b0011110 && (instr >> 21) & 1 == 1 && (instr >> 10) & 0x3f == 0 {
+        if (instr >> 24) & 0x7f == 0b0011110 && (instr >> 21) & 1 == 1 && (instr >> 10) & 0x3f == 0
+        {
             let ftype = (instr >> 22) & 3; // 00 = S (32-bit), 01 = D (64-bit)
             let rmode = (instr >> 19) & 3;
             let opcode = (instr >> 16) & 7;
@@ -1119,7 +1171,9 @@ impl Vcpu for Aarch64Interp {
         self.x[8]
     }
     fn syscall_args(&self) -> [u64; 6] {
-        [self.x[0], self.x[1], self.x[2], self.x[3], self.x[4], self.x[5]]
+        [
+            self.x[0], self.x[1], self.x[2], self.x[3], self.x[4], self.x[5],
+        ]
     }
     fn set_syscall_ret(&mut self, value: u64) {
         self.x[0] = value;
@@ -1263,7 +1317,11 @@ fn sdiv(a: u64, b: u64, sf: bool) -> u64 {
         if b == 0 { 0 } else { a.wrapping_div(b) as u64 }
     } else {
         let (a, b) = (a as i32, b as i32);
-        if b == 0 { 0 } else { u64::from(a.wrapping_div(b) as u32) }
+        if b == 0 {
+            0
+        } else {
+            u64::from(a.wrapping_div(b) as u32)
+        }
     }
 }
 
@@ -1352,7 +1410,11 @@ fn vfp_expand_imm64(imm8: u32) -> u64 {
 
 /// `n` low bits set, as a `u128`.
 fn ones_u128(n: u32) -> u128 {
-    if n >= 128 { u128::MAX } else { (1u128 << n) - 1 }
+    if n >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << n) - 1
+    }
 }
 
 /// SIMD element size in bits from a `Q`/`DUP`/`UMOV` `imm5` field.
@@ -1684,7 +1746,8 @@ mod tests {
         let base = 0x1_0000u64;
         let mut mem = GuestMemory::new(base, 8 * PAGE_SIZE);
         mem.map(base, PAGE_SIZE, Prot::rx()).unwrap();
-        mem.map(base + 4 * PAGE_SIZE, PAGE_SIZE, Prot::rw()).unwrap();
+        mem.map(base + 4 * PAGE_SIZE, PAGE_SIZE, Prot::rw())
+            .unwrap();
         let sp = base + 5 * PAGE_SIZE;
 
         let program: [u32; 7] = [

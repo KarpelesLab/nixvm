@@ -288,7 +288,7 @@ fn build_stack(
     let nwords = 1                       // argc
         + spec.argv.len() + 1            // argv + NULL
         + spec.envp.len() + 1            // envp + NULL
-        + auxv.len() * 2;                // auxv pairs (incl. AT_NULL)
+        + auxv.len() * 2; // auxv pairs (incl. AT_NULL)
     let vec_bytes = nwords as u64 * 8;
     let sp = (random_addr - vec_bytes) & !0xf;
 

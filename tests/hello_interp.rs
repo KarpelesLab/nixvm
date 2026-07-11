@@ -12,9 +12,9 @@ use nixvm::abi::Arch;
 use nixvm::fs::MountTable;
 use nixvm::kernel::Kernel;
 use nixvm::vcpu::Backend;
+use nixvm::vcpu::GuestMemory;
 use nixvm::vcpu::interp::InterpBackend;
 use nixvm::vcpu::mem::{PAGE_SIZE, Prot};
-use nixvm::vcpu::GuestMemory;
 
 /// A `Write` sink that appends into a shared buffer the test can inspect.
 #[derive(Clone)]
@@ -82,5 +82,9 @@ fn hello_world_runs_and_exits() {
     assert_eq!(exit_code, 0, "guest should exit with status 0");
     assert_eq!(&*captured.lock().unwrap(), b"hi\n", "guest should print hi");
     // Nothing should have hit the unsupported ledger.
-    assert!(kernel.unsupported().is_empty(), "unexpected: {:?}", kernel.unsupported());
+    assert!(
+        kernel.unsupported().is_empty(),
+        "unexpected: {:?}",
+        kernel.unsupported()
+    );
 }

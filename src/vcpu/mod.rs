@@ -44,7 +44,10 @@ pub enum Exit {
 #[derive(Debug)]
 pub enum VcpuError {
     /// No backend supports this host/guest combination.
-    Unsupported { host: &'static str, guest: Arch },
+    Unsupported {
+        host: &'static str,
+        guest: Arch,
+    },
     /// The hypervisor rejected an operation.
     Backend(String),
     Mem(MemError),
@@ -54,7 +57,11 @@ impl core::fmt::Display for VcpuError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Unsupported { host, guest } => {
-                write!(f, "no vcpu backend for host {host} + guest {}", guest.as_str())
+                write!(
+                    f,
+                    "no vcpu backend for host {host} + guest {}",
+                    guest.as_str()
+                )
             }
             Self::Backend(m) => write!(f, "vcpu backend error: {m}"),
             Self::Mem(e) => write!(f, "guest memory error: {e:?}"),
