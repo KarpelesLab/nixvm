@@ -7,6 +7,7 @@ use super::Sysno;
 
 /// Map a raw x86-64 syscall number to the normalized [`Sysno`].
 #[must_use]
+#[allow(clippy::too_many_lines)] // one arm per syscall number; a flat table is clearest.
 pub fn decode(nr: u64) -> Sysno {
     match nr {
         0 => Sysno::Read,
@@ -101,6 +102,30 @@ pub fn decode(nr: u64) -> Sysno {
         53 => Sysno::Socketpair,
         54 => Sysno::Setsockopt,
         55 => Sysno::Getsockopt,
+        24 => Sysno::SchedYield,
+        204 => Sysno::SchedGetaffinity,
+        203 => Sysno::SchedSetaffinity,
+        145 => Sysno::SchedGetscheduler,
+        144 => Sysno::SchedSetscheduler,
+        143 => Sysno::SchedGetparam,
+        146 => Sysno::SchedGetPriorityMax,
+        147 => Sysno::SchedGetPriorityMin,
+        98 => Sysno::Getrusage,
+        99 => Sysno::Sysinfo,
+        302 => Sysno::Prlimit64,
+        97 => Sysno::Getrlimit,
+        160 => Sysno::Setrlimit,
+        100 => Sysno::Times,
+        140 => Sysno::Getpriority,
+        141 => Sysno::Setpriority,
+        309 => Sysno::Getcpu,
+        157 => Sysno::Prctl,
+        135 => Sysno::Personality,
+        170 => Sysno::Sethostname,
+        171 => Sysno::Setdomainname,
+        125 => Sysno::Capget,
+        126 => Sysno::Capset,
+        324 => Sysno::Membarrier,
         other => Sysno::Unknown(other),
     }
 }
