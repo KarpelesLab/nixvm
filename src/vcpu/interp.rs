@@ -124,6 +124,32 @@ impl Aarch64Interp {
         Step::Branched
     }
 
+    /// Perform a single load or store of `1 << size` bytes at `addr`. `opc`
+    /// selects: 00 store, 01 load (zero-extend), 10 load (sign-extend to 64),
+    /// 11 load (sign-extend to 32).
+    fn ldst(&mut self, addr: u64, size: u32, opc: u32, rt: usize, mem: &mut GuestMemory) -> Step {
+        let nbytes = 1usize << size;
+        if opc == 0b00 {
+            let val = self.read_x(rt).to_le_bytes();
+            if mem.write(addr, &val[..nbytes]).is_err() {
+                return Step::Fault { addr, write: true };
+            }
+            return Step::Next;
+        }
+        let mut buf = [0u8; 8];
+        if mem.read(addr, &mut buf[..nbytes]).is_err() {
+            return Step::Fault { addr, write: false };
+        }
+        let raw = u64::from_le_bytes(buf);
+        let val = match opc {
+            0b01 => raw, // zero-extend
+            0b10 => sign_extend(raw, (nbytes * 8) as u32) as u64, // sign-extend to 64
+            _ => sign_extend(raw, (nbytes * 8) as u32) as u64 & 0xffff_ffff, // to 32
+        };
+        self.write_x(rt, val);
+        Step::Next
+    }
+
     /// Compute `a - b` (if `sub`) or `a + b`, setting NZCV. Returns the result.
     fn addsub_flags(&mut self, a: u64, b: u64, sub: bool, sf: bool) -> u64 {
         let (operand, carry_in) = if sub { (!b, 1u128) } else { (b, 0u128) };
@@ -551,24 +577,65 @@ impl Aarch64Interp {
             let rn = reg_field(instr, 5);
             let rt = reg_field(instr, 0);
             let addr = self.read_sp(rn).wrapping_add(imm12 << size);
-            let nbytes = 1usize << size;
-            match opc {
-                0b00 => {
-                    // STR
-                    let val = self.read_x(rt).to_le_bytes();
-                    if mem.write(addr, &val[..nbytes]).is_err() {
-                        return Step::Fault { addr, write: true };
-                    }
-                }
-                0b01 => {
-                    // LDR (zero-extended)
-                    let mut buf = [0u8; 8];
-                    if mem.read(addr, &mut buf[..nbytes]).is_err() {
-                        return Step::Fault { addr, write: false };
-                    }
-                    self.write_x(rt, u64::from_le_bytes(buf));
-                }
-                _ => return Step::Illegal, // signed loads: Phase 10
+            return self.ldst(addr, size, opc, rt, mem);
+        }
+
+        // ---- load/store register, immediate pre/post-index and unscaled ----
+        if (instr >> 27) & 0x7 == 0b111
+            && (instr >> 24) & 0x3 == 0b00
+            && (instr >> 26) & 1 == 0
+            && (instr >> 21) & 1 == 0
+        {
+            let size = (instr >> 30) & 3;
+            let opc = (instr >> 22) & 3;
+            let imm9 = sign_extend(u64::from((instr >> 12) & 0x1ff), 9);
+            let idx = (instr >> 10) & 3; // 00 unscaled, 01 post, 11 pre
+            let rn = reg_field(instr, 5);
+            let rt = reg_field(instr, 0);
+            let base = self.read_sp(rn);
+            let addr = if idx == 0b01 {
+                base
+            } else {
+                (base as i64).wrapping_add(imm9) as u64
+            };
+            let step = self.ldst(addr, size, opc, rt, mem);
+            if matches!(step, Step::Next) && (idx == 0b01 || idx == 0b11) {
+                self.write_sp(rn, (base as i64).wrapping_add(imm9) as u64);
+            }
+            return step;
+        }
+
+        // ---- load/store register, register offset ----
+        if (instr >> 27) & 0x7 == 0b111
+            && (instr >> 24) & 0x3 == 0b00
+            && (instr >> 26) & 1 == 0
+            && (instr >> 21) & 1 == 1
+            && (instr >> 10) & 3 == 0b10
+        {
+            let size = (instr >> 30) & 3;
+            let opc = (instr >> 22) & 3;
+            let rm = reg_field(instr, 16);
+            let option = (instr >> 13) & 7;
+            let s = (instr >> 12) & 1;
+            let rn = reg_field(instr, 5);
+            let rt = reg_field(instr, 0);
+            let shift = if s == 1 { size } else { 0 };
+            let addr = self
+                .read_sp(rn)
+                .wrapping_add(extend_reg(self.read_x(rm), option, shift));
+            return self.ldst(addr, size, opc, rt, mem);
+        }
+
+        // ---- TBZ / TBNZ (test bit and branch) ----
+        if (instr >> 25) & 0x3f == 0b01_1011 {
+            let op = (instr >> 24) & 1;
+            let bitpos = (((instr >> 31) & 1) << 5) | ((instr >> 19) & 0x1f);
+            let rt = reg_field(instr, 0);
+            let bit = (self.read_x(rt) >> bitpos) & 1;
+            let take = if op == 0 { bit == 0 } else { bit == 1 };
+            if take {
+                let off = sign_extend(u64::from((instr >> 5) & 0x3fff), 14) << 2;
+                return self.branch(off);
             }
             return Step::Next;
         }
@@ -689,6 +756,17 @@ fn sdiv(a: u64, b: u64, sf: bool) -> u64 {
         let (a, b) = (a as i32, b as i32);
         if b == 0 { 0 } else { u64::from(a.wrapping_div(b) as u32) }
     }
+}
+
+/// Extend a register value per the load/store register-offset `option` field,
+/// then shift left by `shift`.
+fn extend_reg(val: u64, option: u32, shift: u32) -> u64 {
+    let extended = match option {
+        0b010 => val & 0xffff_ffff,                         // UXTW
+        0b110 => sign_extend(val & 0xffff_ffff, 32) as u64, // SXTW
+        _ => val,                                           // UXTX/SXTX (LSL) and others
+    };
+    extended << shift
 }
 
 /// `n` low bits set.
@@ -996,6 +1074,55 @@ mod tests {
         assert_eq!(c.x[0], 0x1234, "x0 restored from stack");
         assert_eq!(c.x[1], 0x5678, "x1 restored from stack");
         assert_eq!(c.sp, sp, "sp restored to its original value");
+    }
+
+    #[test]
+    fn indexed_and_register_offset_load_store() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+
+        // str x0,[x1,#-8]!  (pre-index, writes back x1)
+        c.x[1] = base + 0x100;
+        c.x[0] = 0xAABB_CCDD;
+        assert!(matches!(c.exec(0xF81F_8C20, &mut m), Step::Next));
+        assert_eq!(c.x[1], base + 0xF8, "pre-index writeback");
+
+        // ldur x2,[x1]  (unscaled offset 0)
+        assert!(matches!(c.exec(0xF840_0022, &mut m), Step::Next));
+        assert_eq!(c.x[2], 0xAABB_CCDD);
+
+        // ldr x3,[x5,x6]  (register offset)
+        c.x[5] = base;
+        c.x[6] = 0xF8;
+        assert!(matches!(c.exec(0xF866_68A3, &mut m), Step::Next));
+        assert_eq!(c.x[3], 0xAABB_CCDD);
+    }
+
+    #[test]
+    fn ldrsb_sign_extends() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        c.x[1] = base + 0x200;
+        c.x[0] = 0x80;
+        c.exec(0x3900_0020, &mut m); // strb w0,[x1]
+        c.exec(0x3880_0022, &mut m); // ldrsb x2,[x1]
+        assert_eq!(c.x[2] as i64, -128, "signed byte load sign-extends");
+    }
+
+    #[test]
+    fn tbz_tests_a_bit() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.pc = 0x1000;
+        c.x[0] = 0; // bit 3 clear -> TBZ taken
+        assert!(matches!(c.exec(0x3618_0040, &mut m), Step::Branched));
+        assert_eq!(c.pc, 0x1008);
+        c.pc = 0x1000;
+        c.x[0] = 8; // bit 3 set -> TBZ not taken
+        assert!(matches!(c.exec(0x3618_0040, &mut m), Step::Next));
     }
 
     #[test]
