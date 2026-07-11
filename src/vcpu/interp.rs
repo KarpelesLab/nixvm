@@ -45,8 +45,18 @@
 //! Newton-Raphson refinement steps (`FRECPE`/`FRSQRTE`/`FRECPS`/`FRSQRTS`
 //! scalar and vector, `URECPE`/`URSQRTE` vector), scalar/vector FP
 //! compare-to-zero (`FCMEQ`/`FCMGT`/`FCMGE`/`FCMLT`/`FCMLE`) and `FABD`, and
-//! `PRFM` (decoded as a no-op in all its addressing forms). Anything else
-//! surfaces as [`Exit::IllegalInstruction`].
+//! `PRFM` (decoded as a no-op in all its addressing forms). System-register
+//! access (`MRS`/`MSR` for `TPIDR_EL0`/`TPIDRRO_EL0`, `FPCR`/`FPSR`, the
+//! `MIDR_EL1`/`CTR_EL0`/`DCZID_EL0`/`ID_AA64ISAR0_EL1`/`ID_AA64PFR0_EL1`
+//! ID/feature registers, and a free-running `CNTVCT_EL0`/`CNTVCTSS_EL0`/
+//! `CNTFRQ_EL0`), barriers and hints (`DMB`/`DSB`/`ISB`/`SB`/`ESB`/…, all
+//! no-ops), cache maintenance (`DC ZVA` — which really zeroes guest memory
+//! — plus `DC CVAC`/`CVAU`/`CIVAC`/`IVAC` and `IC IALLU`/`IALLUIS`/`IVAU` as
+//! no-ops), and the Armv8 Cryptographic Extension (`AESE`/`AESD`/`AESMC`/
+//! `AESIMC` and `SHA1C`/`P`/`M`/`H`/`SU0`/`SU1`, `SHA256H`/`H2`/`SU0`/`SU1`)
+//! round out what musl startup, `getauxval`-driven feature dispatch, and
+//! hashing/crypto code need. Anything else surfaces as
+//! [`Exit::IllegalInstruction`].
 
 use crate::abi::Arch;
 
@@ -121,6 +131,17 @@ struct Aarch64Interp {
     sp: u64,
     pc: u64,
     tpidr: u64,
+    /// Backing state for the `CNTVCT_EL0`/`CNTVCTSS_EL0` virtual counter:
+    /// incremented on every read (see `read_sysreg`) so a guest spin loop
+    /// waiting for the counter to advance terminates, even though this
+    /// interpreter has no wall-clock timer to drive a real one.
+    cntvct: u64,
+    /// Modeled `FPCR`/`FPSR`. This interpreter doesn't consult the rounding
+    /// mode or raise FP exception bits, but `MRS`/`MSR` round-trip through
+    /// these so save/restore code (e.g. a signal handler prologue) and
+    /// feature-probing code that reads them back see consistent state.
+    fpcr: u64,
+    fpsr: u64,
     flags: Flags,
     /// SIMD/FP registers v0..v31 (128-bit; D/S/H/B views are the low bits).
     v: [u128; 32],
@@ -146,6 +167,9 @@ impl Aarch64Interp {
             sp: stack,
             pc: entry,
             tpidr: 0,
+            cntvct: 0,
+            fpcr: 0,
+            fpsr: 0,
             flags: Flags::default(),
             v: [0; 32],
             watch: std::env::var("NIXVM_WATCH")
@@ -209,21 +233,56 @@ impl Aarch64Interp {
         Step::Branched
     }
 
-    /// Read a system register named by the `MRS` encoding. Only `TPIDR_EL0`
-    /// (the user thread pointer) is backed; everything else reads as 0.
-    fn read_sysreg(&self, instr: u32) -> u64 {
-        if (instr >> 5) & 0x7fff == TPIDR_EL0 {
-            self.tpidr
-        } else {
-            0
+    /// Read a system register named by the `MRS` encoding. Backs the
+    /// registers musl startup, `getauxval`-driven feature dispatch, and
+    /// hashing/crypto code actually probe from EL0: the user thread
+    /// pointers, `FPCR`/`FPSR`, the cache-geometry/DCZID registers backing
+    /// `DC ZVA`, a free-running virtual counter, and a handful of ID/feature
+    /// registers advertising exactly what this interpreter implements.
+    /// Everything else reads as 0 — a legal reading for any system register
+    /// this interpreter doesn't model (equivalent to an EL1 that never wrote
+    /// it), rather than an illegal-instruction trap.
+    // `TPIDRRO_EL0`/`MPIDR_EL1`/`REVIDR_EL1` read the same as the wildcard
+    // (0) — kept as explicit, named arms anyway (rather than folded into
+    // `_`) because they're specific registers real startup/feature-dispatch
+    // code names, not "whatever this interpreter didn't get around to".
+    #[allow(clippy::match_same_arms)]
+    fn read_sysreg(&mut self, instr: u32) -> u64 {
+        match (instr >> 5) & 0x7fff {
+            TPIDR_EL0 => self.tpidr,
+            TPIDRRO_EL0 => 0,
+            FPCR => self.fpcr,
+            FPSR => self.fpsr,
+            MIDR_EL1 => MIDR_EL1_VAL,
+            MPIDR_EL1 => 0,
+            REVIDR_EL1 => 0,
+            CTR_EL0 => CTR_EL0_VAL,
+            DCZID_EL0 => DCZID_EL0_VAL,
+            CNTFRQ_EL0 => CNTFRQ_EL0_VAL,
+            CNTVCT_EL0 | CNTVCTSS_EL0 => {
+                // Advance on every read so `while (cntvct == cntvct) {}`-style
+                // spins (and real "did time pass" checks) always terminate.
+                self.cntvct = self.cntvct.wrapping_add(1);
+                self.cntvct
+            }
+            ID_AA64ISAR0_EL1 => ID_AA64ISAR0_EL1_VAL,
+            ID_AA64PFR0_EL1 => ID_AA64PFR0_EL1_VAL,
+            _ => 0,
         }
     }
 
-    /// Write a system register named by the `MSR` encoding. Only `TPIDR_EL0` is
-    /// backed; writes to other registers are ignored.
+    /// Write a system register named by the `MSR` encoding. Only
+    /// `TPIDR_EL0`/`FPCR`/`FPSR` are backed by state; writes to the
+    /// read-only ID/counter/cache registers `read_sysreg` models above are
+    /// architecturally UNDEFINED from EL0 on real hardware, but harmless to
+    /// silently accept here, and everything else this interpreter doesn't
+    /// model is likewise a no-op.
     fn write_sysreg(&mut self, instr: u32, value: u64) {
-        if (instr >> 5) & 0x7fff == TPIDR_EL0 {
-            self.tpidr = value;
+        match (instr >> 5) & 0x7fff {
+            TPIDR_EL0 => self.tpidr = value,
+            FPCR => self.fpcr = value,
+            FPSR => self.fpsr = value,
+            _ => {}
         }
     }
 
@@ -561,6 +620,105 @@ impl Aarch64Interp {
             self.write_sysreg(instr, self.read_x(rt));
             return Step::Next;
         }
+
+        // ---- SYS (register): cache maintenance — DC ZVA/CVAC/CVAU/CIVAC/
+        // IVAC, IC IALLU/IALLUIS/IVAU ----
+        // Shares the System-instructions base encoding with MRS (0xD53) and
+        // MSR (0xD51) above, but with op0==1 (a named sysreg needs op0 in
+        // {2,3}) and L==0: bits[31:19] == 0x1AA1, objdump-verified against
+        // `clang -target aarch64-linux-gnu` (e.g. `dc zva, x0` assembles to
+        // 0xd50b7420). That's disjoint from those two exact-match checks
+        // above and from the hint/barrier no-op arm below (which fixes
+        // CRn in {2,3}; every DC/IC op here fixes CRn==7), so this can't
+        // shadow, or be shadowed by, any of them. AT/TLBI and anything else
+        // in this instruction class we don't implement falls through to
+        // `Illegal`, matching a real EL0 trap.
+        if (instr >> 19) & 0x1fff == 0x1AA1 {
+            let key = (instr >> 5) & 0x3fff; // op1:CRn:CRm:op2
+            let rt = reg_field(instr, 0);
+            return match key {
+                SYS_DC_ZVA => {
+                    // DC ZVA must really zero guest memory — memset/bzero
+                    // fast paths (and musl's) rely on it, not just PC
+                    // advancing. The address is block-aligned per the
+                    // architecture; DCZID_EL0_VAL says the block is
+                    // DC_ZVA_BLOCK_BYTES bytes (see that const).
+                    let addr = self.read_x(rt) & !(DC_ZVA_BLOCK_BYTES - 1);
+                    self.note_store(addr, 0u128, DC_ZVA_BLOCK_BYTES as usize);
+                    if mem.write(addr, &[0u8; DC_ZVA_BLOCK_BYTES as usize]).is_err() {
+                        Step::Fault { addr, write: true }
+                    } else {
+                        Step::Next
+                    }
+                }
+                SYS_DC_CVAC | SYS_DC_CVAU | SYS_DC_CIVAC | SYS_DC_IVAC | SYS_IC_IALLU
+                | SYS_IC_IALLUIS | SYS_IC_IVAU => Step::Next,
+                _ => Step::Illegal,
+            };
+        }
+
+        // ---- Cryptographic AES / SHA (2-register): AESE/AESD/AESMC/
+        // AESIMC, SHA1H/SHA1SU1/SHA256SU0 ----
+        // Fixed bits verified against `clang -target aarch64-linux-gnu` +
+        // `llvm-objdump` (e.g. `aese v0.16b,v1.16b` -> 0x4e284820), and the
+        // transforms themselves against native execution of the real ARMv8
+        // Crypto Extension instructions (this host's Apple Silicon CPU
+        // implements FEAT_AES/FEAT_SHA1/FEAT_SHA256) — see the test module.
+        // bit28 (U) selects AES (0) vs SHA-1/256 (1); bits[16:12] select the
+        // specific op. bits[31:24] == 0x4E/0x5E don't appear as a fixed
+        // pattern in any earlier arm, and every SIMD class below that shares
+        // a *partial* top-byte mask with this one requires bit10==1, while
+        // this class always has bit10==0 — so this can't shadow, or be
+        // shadowed by, anything else in this function.
+        if instr & 0xEFFE_0C00 == 0x4E28_0800 {
+            let u = (instr >> 28) & 1;
+            let opcode = (instr >> 12) & 0x1f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            self.v[rd] = match (u, opcode) {
+                (0, 0b00100) => aes_round(self.v[rd], self.v[rn], true), // AESE
+                (0, 0b00101) => aes_round(self.v[rd], self.v[rn], false), // AESD
+                (0, 0b00110) => aes_mix_columns(self.v[rn], true),       // AESMC
+                (0, 0b00111) => aes_mix_columns(self.v[rn], false),      // AESIMC
+                // SHA1H: Sd = ROL(Sn, 30), scalar (zero-extends to 128 bits).
+                (1, 0b00000) => u128::from((self.v[rn] as u32).rotate_left(30)),
+                (1, 0b00001) => sha1_su1(self.v[rd], self.v[rn]), // SHA1SU1
+                (1, 0b00010) => sha256_su0(self.v[rd], self.v[rn]), // SHA256SU0
+                _ => return Step::Illegal,
+            };
+            return Step::Next;
+        }
+
+        // ---- Cryptographic SHA (3-register): SHA1C/P/M/SU0, SHA256H/H2/
+        // SU1 ----
+        // Same verification approach as the 2-register crypto class above
+        // (e.g. `sha256h q0,q1,v2.4s` -> 0x5e024020); disjoint from it (and
+        // everything else) the same way: bit21==0 here (vs ==1 above), and
+        // bit10==0 always, again distinct from every SIMD class requiring
+        // bit10==1.
+        if instr & 0xFFE0_0C00 == 0x5E00_0000 {
+            let opcode = (instr >> 12) & 7;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let e = self.v[rn] as u32;
+            self.v[rd] = match opcode {
+                0b000 => sha1_quad_round(self.v[rd], e, self.v[rm], Sha1Op::Choose), // SHA1C
+                0b001 => sha1_quad_round(self.v[rd], e, self.v[rm], Sha1Op::Parity), // SHA1P
+                0b010 => sha1_quad_round(self.v[rd], e, self.v[rm], Sha1Op::Majority), // SHA1M
+                0b011 => sha1_su0(self.v[rd], self.v[rn], self.v[rm]),              // SHA1SU0
+                // SHA256H2 is called with the pre-round `abcd`/`efgh` swapped
+                // into `Vn`/`Vd` (matching the real usage pattern of saving
+                // `abcd` before `SHA256H` overwrites it), so it re-derives
+                // the same round `SHA256H` computed and keeps the other half.
+                0b100 => sha256_hash(self.v[rd], self.v[rn], self.v[rm], false), // SHA256H
+                0b101 => sha256_hash(self.v[rn], self.v[rd], self.v[rm], true),  // SHA256H2
+                0b110 => sha256_su1(self.v[rd], self.v[rn], self.v[rm]),         // SHA256SU1
+                _ => return Step::Illegal,
+            };
+            return Step::Next;
+        }
+
         if instr & 0xFFFF_FC1F == 0xD65F_0000 {
             self.pc = self.read_x(reg_field(instr, 5)); // ret
             return Step::Branched;
@@ -3320,13 +3478,72 @@ impl Vcpu for Aarch64Interp {
         self.sp = sp;
         self.pc = entry;
         self.tpidr = 0;
+        self.fpcr = 0;
+        self.fpsr = 0;
         self.flags = Flags::default();
         self.excl_monitor = true;
     }
 }
 
-/// Encoded `op0<0>:op1:CRn:CRm:op2` field (bits 19:5) for `TPIDR_EL0`.
+/// Encoded `op0<0>:op1:CRn:CRm:op2` field (bits 19:5) used by `MRS`/`MSR` to
+/// name a system register — see `Aarch64Interp::read_sysreg`/`write_sysreg`.
+/// Every value below was cross-checked by assembling the named register with
+/// `clang -target aarch64-linux-gnu` and disassembling with `llvm-objdump`
+/// (e.g. `mrs x0, tpidr_el0` -> `0xd53bd040`, giving `(0xd53bd040 >> 5) &
+/// 0x7fff == 0x5e82`).
 const TPIDR_EL0: u32 = 0x5E82;
+const TPIDRRO_EL0: u32 = 0x5E83;
+const FPCR: u32 = 0x5A20;
+const FPSR: u32 = 0x5A21;
+const MIDR_EL1: u32 = 0x4000;
+const MPIDR_EL1: u32 = 0x4005;
+const REVIDR_EL1: u32 = 0x4006;
+const CTR_EL0: u32 = 0x5801;
+const DCZID_EL0: u32 = 0x5807;
+const CNTFRQ_EL0: u32 = 0x5F00;
+const CNTVCT_EL0: u32 = 0x5F02;
+const CNTVCTSS_EL0: u32 = 0x5F06;
+const ID_AA64ISAR0_EL1: u32 = 0x4030;
+const ID_AA64PFR0_EL1: u32 = 0x4020;
+
+/// Plausible `MIDR_EL1` value (ARM-implementer, architecture=0xf meaning "see
+/// `ID_AA64*`", an arbitrary but real-looking Cortex-ish part/revision).
+/// Nothing in this interpreter's target userland (musl, openssl) branches on
+/// the exact value, just that reading it doesn't trap.
+const MIDR_EL1_VAL: u64 = 0x410F_D0C0;
+/// `CTR_EL0`: 64-byte I-cache and D-cache lines, unified L1, `IDC`/`DIC` set
+/// (matches `DCZID_EL0_VAL`'s 64-byte `DC ZVA` block below).
+const CTR_EL0_VAL: u64 = 0x8444_c004;
+/// `DCZID_EL0`: `BS` (bits 3:0) = 4 -> `DC ZVA` zeroes `4 << 4` =
+/// [`DC_ZVA_BLOCK_BYTES`] bytes; `DZP` (bit 4) = 0, i.e. `DC ZVA` is not
+/// disabled.
+const DCZID_EL0_VAL: u64 = 0x4;
+/// `DC ZVA`'s zeroed block size in bytes. Must stay in sync with
+/// `DCZID_EL0_VAL`'s `BS` field above (`4 << 4 == 64`).
+const DC_ZVA_BLOCK_BYTES: u64 = 64;
+const CNTFRQ_EL0_VAL: u64 = 1_000_000_000;
+/// `ID_AA64ISAR0_EL1`: advertise exactly the optional features this
+/// interpreter implements — `AES` (=1: AES, no `PMULL`), `SHA1` (=1),
+/// `SHA2` (=1: SHA-256 only, no SHA-512), `CRC32` (=1), `Atomic` (=2: full
+/// LSE including `CASP`) — all other fields (`RDM`, `SM3/4`, `DP`, …) stay 0.
+const ID_AA64ISAR0_EL1_VAL: u64 = 0x0021_1110;
+/// `ID_AA64PFR0_EL1`: `EL0`/`EL1` = 1 (AArch64-only, no AArch32), `FP`/
+/// `AdvSIMD` = 0 (implemented, no FP16), everything else (`EL2`, `EL3`,
+/// `GIC`, `RAS`, `SVE`, …) unimplemented (0xf or 0, per field).
+const ID_AA64PFR0_EL1_VAL: u64 = 0x0000_0011;
+
+/// Encoded `op1:CRn:CRm:op2` field (bits 18:5) for the cache-maintenance
+/// `SYS` instructions below — same objdump-verification method as the MRS/
+/// MSR codes above (e.g. `dc zva, x0` -> `0xd50b7420`, `(0xd50b7420 >> 5) &
+/// 0x3fff == 0x1ba1`).
+const SYS_DC_ZVA: u32 = 0x1BA1;
+const SYS_DC_CVAC: u32 = 0x1BD1;
+const SYS_DC_CVAU: u32 = 0x1BD9;
+const SYS_DC_CIVAC: u32 = 0x1BF1;
+const SYS_DC_IVAC: u32 = 0x03B1;
+const SYS_IC_IALLU: u32 = 0x03A8;
+const SYS_IC_IALLUIS: u32 = 0x0388;
+const SYS_IC_IVAU: u32 = 0x1BA9;
 
 /// Extract a 5-bit register field starting at bit `lsb`.
 fn reg_field(instr: u32, lsb: u32) -> usize {
@@ -3926,6 +4143,341 @@ fn f32_to_f16(v: f32) -> u16 {
 const fn sign_extend(v: u64, bits: u32) -> i64 {
     let shift = 64 - bits;
     ((v << shift) as i64) >> shift
+}
+
+// ---- Cryptographic Extension: AES ----
+//
+// All of this is the plain FIPS-197 algorithm: `AES_SBOX` is generated (in
+// the test module, `aes_sbox_matches_generated_table`) from the GF(2^8)
+// multiplicative inverse plus the standard affine transform rather than
+// typed in from memory, and every transform below was checked against
+// native execution of the real `AESE`/`AESD`/`AESMC`/`AESIMC` instructions
+// on this host's Apple Silicon CPU (which implements FEAT_AES) — see the
+// test module. That check also confirmed the 16-byte vector maps to the
+// FIPS-197 state array exactly as `bytes[r + 4c]` (byte 0 = the vector's
+// least-significant byte), so no ARM-specific re-layout is needed here.
+
+/// Forward AES S-box (`SubBytes`).
+const AES_SBOX: [u8; 256] = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+];
+
+/// Inverse AES S-box (`InvSubBytes`): `AES_INV_SBOX[AES_SBOX[b]] == b`.
+const AES_INV_SBOX: [u8; 256] = [
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+    0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+    0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+    0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+    0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+    0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+    0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+    0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+    0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+    0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+    0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
+];
+
+/// `AESE`/`AESD`: XOR `vd`/`vn` as a 16-byte state, then apply `ShiftRows`
+/// (or its inverse) and `SubBytes` (or its inverse). The ARM ARM's
+/// pseudocode order is actually `ShiftRows` then `SubBytes` (`InvShiftRows`
+/// then `InvSubBytes` for `AESD`), but the two commute — `SubBytes` acts on
+/// each byte independently of its position, and `ShiftRows` only permutes
+/// positions — so applying them in the other order here gives the same
+/// result.
+fn aes_round(vd: u128, vn: u128, encrypt: bool) -> u128 {
+    let state = (vd ^ vn).to_le_bytes();
+    let shifted = if encrypt {
+        aes_shift_rows(state)
+    } else {
+        aes_inv_shift_rows(state)
+    };
+    let sbox = if encrypt { &AES_SBOX } else { &AES_INV_SBOX };
+    u128::from_le_bytes(shifted.map(|b| sbox[b as usize]))
+}
+
+/// `AESMC`/`AESIMC`: `MixColumns` (or its inverse) over `vn` alone — unlike
+/// `AESE`/`AESD`, `Vd`'s prior value isn't read, only overwritten.
+fn aes_mix_columns(vn: u128, forward: bool) -> u128 {
+    let state = vn.to_le_bytes();
+    let mut out = [0u8; 16];
+    for (out_col, in_col) in out.chunks_exact_mut(4).zip(state.chunks_exact(4)) {
+        let a = [in_col[0], in_col[1], in_col[2], in_col[3]];
+        let r = if forward {
+            aes_mix_column(a)
+        } else {
+            aes_inv_mix_column(a)
+        };
+        out_col.copy_from_slice(&r);
+    }
+    u128::from_le_bytes(out)
+}
+
+/// FIPS-197 `ShiftRows`: state byte `r + 4c` (row `r`, column `c`) moves to
+/// `r + 4*((c+r) mod 4)` — row `r` is cyclically shifted left by `r`.
+fn aes_shift_rows(state: [u8; 16]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for r in 0..4usize {
+        for c in 0..4usize {
+            out[r + 4 * c] = state[r + 4 * ((c + r) % 4)];
+        }
+    }
+    out
+}
+
+/// `InvShiftRows`, the inverse permutation of [`aes_shift_rows`].
+fn aes_inv_shift_rows(state: [u8; 16]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for r in 0..4usize {
+        for c in 0..4usize {
+            out[r + 4 * ((c + r) % 4)] = state[r + 4 * c];
+        }
+    }
+    out
+}
+
+/// GF(2^8) multiplication modulo the AES reduction polynomial
+/// `x^8 + x^4 + x^3 + x + 1` (`0x11B`).
+fn gf_mul(mut a: u8, mut b: u8) -> u8 {
+    let mut p = 0u8;
+    for _ in 0..8 {
+        if b & 1 != 0 {
+            p ^= a;
+        }
+        let hi = a & 0x80;
+        a <<= 1;
+        if hi != 0 {
+            a ^= 0x1b;
+        }
+        b >>= 1;
+    }
+    p
+}
+
+/// FIPS-197 `MixColumns` on one 4-byte state column.
+fn aes_mix_column(a: [u8; 4]) -> [u8; 4] {
+    [
+        gf_mul(2, a[0]) ^ gf_mul(3, a[1]) ^ a[2] ^ a[3],
+        a[0] ^ gf_mul(2, a[1]) ^ gf_mul(3, a[2]) ^ a[3],
+        a[0] ^ a[1] ^ gf_mul(2, a[2]) ^ gf_mul(3, a[3]),
+        gf_mul(3, a[0]) ^ a[1] ^ a[2] ^ gf_mul(2, a[3]),
+    ]
+}
+
+/// `InvMixColumns` on one 4-byte state column.
+fn aes_inv_mix_column(a: [u8; 4]) -> [u8; 4] {
+    [
+        gf_mul(14, a[0]) ^ gf_mul(11, a[1]) ^ gf_mul(13, a[2]) ^ gf_mul(9, a[3]),
+        gf_mul(9, a[0]) ^ gf_mul(14, a[1]) ^ gf_mul(11, a[2]) ^ gf_mul(13, a[3]),
+        gf_mul(13, a[0]) ^ gf_mul(9, a[1]) ^ gf_mul(14, a[2]) ^ gf_mul(11, a[3]),
+        gf_mul(11, a[0]) ^ gf_mul(13, a[1]) ^ gf_mul(9, a[2]) ^ gf_mul(14, a[3]),
+    ]
+}
+
+// ---- Cryptographic Extension: SHA-1 / SHA-256 ----
+//
+// These implement the standard FIPS 180-4 round functions and message
+// schedule recurrence; the ARM-specific part is how each instruction packs
+// 4 (SHA-1) or 8 (SHA-256) 32-bit working variables into one or two 128-bit
+// vector registers and how many rounds/schedule words it advances per call.
+// That packing isn't published in an easily-citable form, so it was derived
+// empirically: probe the real `SHA1C`/`SHA1P`/`SHA1M`/`SHA1SU0`/`SHA1SU1`/
+// `SHA256H`/`SHA256H2`/`SHA256SU0`/`SHA256SU1` instructions on this host's
+// Apple Silicon CPU (which implements FEAT_SHA1/FEAT_SHA256) with
+// distinguishable (non-repeating-nibble) inputs, then solve for the linear/
+// round-function structure that reproduces the outputs — see the test
+// module, which re-checks this against a full SHA-1 and SHA-256 block
+// compression compared to a `sha1sum`/`sha256sum`-equivalent digest.
+
+/// Unpack a 128-bit vector into 4 little-endian 32-bit lanes (lane 0 = the
+/// vector's least-significant 32 bits, matching this file's `LD1`/`ldst_vec`
+/// convention elsewhere).
+fn u32_lanes(v: u128) -> [u32; 4] {
+    [v as u32, (v >> 32) as u32, (v >> 64) as u32, (v >> 96) as u32]
+}
+
+/// Read 32-bit lane `i` (0..=3) of `v`.
+fn lane32(v: u128, i: u32) -> u32 {
+    (v >> (i * 32)) as u32
+}
+
+/// Pack 4 32-bit lanes (lane 0 first) into a 128-bit vector.
+fn pack_u32_lanes(l: [u32; 4]) -> u128 {
+    u128::from(l[0]) | (u128::from(l[1]) << 32) | (u128::from(l[2]) << 64) | (u128::from(l[3]) << 96)
+}
+
+/// Which SHA-1 nonlinear round function `SHA1C`/`SHA1P`/`SHA1M` runs.
+#[derive(Clone, Copy)]
+enum Sha1Op {
+    /// `SHA1C`: `Ch(b,c,d)` — rounds 0..19.
+    Choose,
+    /// `SHA1P`: `Parity(b,c,d)` — rounds 20..39 and 60..79.
+    Parity,
+    /// `SHA1M`: `Maj(b,c,d)` — rounds 40..59.
+    Majority,
+}
+
+fn sha1_f(op: Sha1Op, b: u32, c: u32, d: u32) -> u32 {
+    match op {
+        Sha1Op::Choose => (b & c) ^ (!b & d),
+        Sha1Op::Parity => b ^ c ^ d,
+        Sha1Op::Majority => (b & c) ^ (b & d) ^ (c & d),
+    }
+}
+
+/// `SHA1C`/`SHA1P`/`SHA1M`: four rounds of the SHA-1 compression function,
+/// folding scalar `e` and vector `abcd` (lanes 0..3 = `a,b,c,d`) against the
+/// four pre-added `W[t]+K[t]` words in `wk` (lane 0 consumed first). Returns
+/// the updated `{a,b,c,d}` packed the same way `abcd` was.
+#[allow(clippy::many_single_char_names)]
+fn sha1_quad_round(abcd: u128, mut e: u32, wk: u128, op: Sha1Op) -> u128 {
+    let [mut a, mut b, mut c, mut d] = u32_lanes(abcd);
+    for i in 0..4u32 {
+        let w = lane32(wk, i);
+        let t = a
+            .rotate_left(5)
+            .wrapping_add(sha1_f(op, b, c, d))
+            .wrapping_add(e)
+            .wrapping_add(w);
+        e = d;
+        d = c;
+        c = b.rotate_left(30);
+        b = a;
+        a = t;
+    }
+    pack_u32_lanes([a, b, c, d])
+}
+
+/// `SHA1SU0`: the XOR half of the SHA-1 message-schedule recurrence
+/// `W[t] = ROL(W[t-3] ^ W[t-8] ^ W[t-14] ^ W[t-16], 1)` — computes
+/// `W[t-16..t-13] ^ W[t-14..t-11] ^ W[t-8..t-5]`, missing the `W[t-3]` term
+/// that `SHA1SU1` adds before rotating. `vd` = `W[t-16..t-13]`, `vn` =
+/// `W[t-12..t-9]`, `vm` = `W[t-8..t-5]`.
+fn sha1_su0(vd: u128, vn: u128, vm: u128) -> u128 {
+    let d = u32_lanes(vd);
+    let n = u32_lanes(vn);
+    let m = u32_lanes(vm);
+    pack_u32_lanes([d[0] ^ d[2] ^ m[0], d[1] ^ d[3] ^ m[1], d[2] ^ n[0] ^ m[2], d[3] ^ n[1] ^ m[3]])
+}
+
+/// `SHA1SU1`: finishes the recurrence `SHA1SU0` started, folding in the
+/// `W[t-3]` term and rotating. `vd` = `SHA1SU0`'s output, `vn` =
+/// `W[t-4..t-1]`. Lane 3 needs `W[t]` for its `W[t-3]` term — that's lane 0
+/// of this very call's result, computed first.
+fn sha1_su1(vd: u128, vn: u128) -> u128 {
+    let d = u32_lanes(vd);
+    let n = u32_lanes(vn);
+    let w0 = (d[0] ^ n[1]).rotate_left(1);
+    let w1 = (d[1] ^ n[2]).rotate_left(1);
+    let w2 = (d[2] ^ n[3]).rotate_left(1);
+    let w3 = (d[3] ^ w0).rotate_left(1);
+    pack_u32_lanes([w0, w1, w2, w3])
+}
+
+fn sha256_ch(e: u32, f: u32, g: u32) -> u32 {
+    (e & f) ^ (!e & g)
+}
+fn sha256_maj(a: u32, b: u32, c: u32) -> u32 {
+    (a & b) ^ (a & c) ^ (b & c)
+}
+fn sha256_bsig0(a: u32) -> u32 {
+    a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22)
+}
+fn sha256_bsig1(e: u32) -> u32 {
+    e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25)
+}
+fn sha256_ssig0(x: u32) -> u32 {
+    x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3)
+}
+fn sha256_ssig1(x: u32) -> u32 {
+    x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10)
+}
+
+/// `SHA256H`/`SHA256H2`: four rounds of the SHA-256 compression function
+/// over working variables `{a,b,c,d}` (`abcd`, lanes 0..3) and `{e,f,g,h}`
+/// (`efgh`), consuming the four pre-added `W[t]+K[t]` words in `wk` (lane 0
+/// first). `SHA256H` wants the updated `{a,b,c,d}`; `SHA256H2` is called
+/// with the *original* (pre-round) `abcd`/`efgh` and wants the updated
+/// `{e,f,g,h}` from that same round — hence `want_efgh` picks which half of
+/// one shared computation to return, rather than this being two unrelated
+/// functions.
+#[allow(clippy::many_single_char_names)]
+fn sha256_hash(abcd: u128, efgh: u128, wk: u128, want_efgh: bool) -> u128 {
+    let [mut a, mut b, mut c, mut d] = u32_lanes(abcd);
+    let [mut e, mut f, mut g, mut h] = u32_lanes(efgh);
+    for i in 0..4u32 {
+        let w = lane32(wk, i);
+        let t1 = h
+            .wrapping_add(sha256_bsig1(e))
+            .wrapping_add(sha256_ch(e, f, g))
+            .wrapping_add(w);
+        let t2 = sha256_bsig0(a).wrapping_add(sha256_maj(a, b, c));
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    if want_efgh {
+        pack_u32_lanes([e, f, g, h])
+    } else {
+        pack_u32_lanes([a, b, c, d])
+    }
+}
+
+/// `SHA256SU0`: the `ssig0` half of the SHA-256 message-schedule recurrence
+/// `W[t] = ssig1(W[t-2]) + W[t-7] + ssig0(W[t-15]) + W[t-16]` — computes
+/// `W[t-16..t-13] + ssig0(W[t-15..t-12])`. `vd` = `W[t-16..t-13]`, `vn` =
+/// `W[t-12..t-9]` (only lane 0, `W[t-12]`, is used — as `W[t-15]` for the
+/// fourth output word).
+fn sha256_su0(vd: u128, vn: u128) -> u128 {
+    let d = u32_lanes(vd);
+    let n = u32_lanes(vn);
+    pack_u32_lanes([
+        d[0].wrapping_add(sha256_ssig0(d[1])),
+        d[1].wrapping_add(sha256_ssig0(d[2])),
+        d[2].wrapping_add(sha256_ssig0(d[3])),
+        d[3].wrapping_add(sha256_ssig0(n[0])),
+    ])
+}
+
+/// `SHA256SU1`: finishes the recurrence `SHA256SU0` started, adding the
+/// `ssig1(W[t-2])` and `W[t-7]` terms. `vd` = `SHA256SU0`'s output, `vn` =
+/// `W[t-8..t-5]`, `vm` = `W[t-4..t-1]`. Words 2 and 3 need `W[t-2]` for a `t`
+/// only one or two words in the future — that's this call's own lane 0 or 1,
+/// computed first, since those source words don't exist as an earlier
+/// instruction's output yet.
+fn sha256_su1(vd: u128, vn: u128, vm: u128) -> u128 {
+    let d = u32_lanes(vd);
+    let n = u32_lanes(vn);
+    let m = u32_lanes(vm);
+    let w0 = d[0].wrapping_add(sha256_ssig1(m[2])).wrapping_add(n[1]);
+    let w1 = d[1].wrapping_add(sha256_ssig1(m[3])).wrapping_add(n[2]);
+    let w2 = d[2].wrapping_add(sha256_ssig1(w0)).wrapping_add(n[3]);
+    let w3 = d[3].wrapping_add(sha256_ssig1(w1)).wrapping_add(m[0]);
+    pack_u32_lanes([w0, w1, w2, w3])
 }
 
 #[cfg(test)]
@@ -5352,5 +5904,251 @@ mod tests {
         // immediate form must equally be no-ops, not faults.
         c.x[1] = 8;
         assert!(matches!(c.exec(0xF8A1_6800, &mut m), Step::Next));
+    }
+
+    #[test]
+    fn mrs_ctr_el0_returns_constant() {
+        let (mut c, mut m) = (cpu(), scratch());
+        // mrs x0, ctr_el0
+        assert!(matches!(c.exec(0xD53B_0020, &mut m), Step::Next));
+        assert_eq!(c.x[0], CTR_EL0_VAL);
+    }
+
+    #[test]
+    fn mrs_cntvct_el0_increases_across_reads() {
+        let (mut c, mut m) = (cpu(), scratch());
+        // mrs x0, cntvct_el0 (twice)
+        assert!(matches!(c.exec(0xD53B_E040, &mut m), Step::Next));
+        let first = c.x[0];
+        assert!(matches!(c.exec(0xD53B_E040, &mut m), Step::Next));
+        let second = c.x[0];
+        assert!(
+            second > first,
+            "a spin on CNTVCT_EL0 must observe it advance"
+        );
+    }
+
+    #[test]
+    fn dc_zva_zeroes_a_64_byte_block() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        // Fill a region spanning the target block (and its neighbours) with
+        // a recognizable non-zero pattern first.
+        let region = base + 0x100;
+        m.write(region, &[0xAAu8; 256]).unwrap();
+        let mut c = cpu();
+        // DC ZVA's address isn't block-aligned; the real block touched must
+        // still be exactly the DCZID_EL0_VAL-sized, block-aligned one.
+        let unaligned_off = 0x72usize;
+        c.x[0] = region + unaligned_off as u64;
+        // dc zva, x0
+        assert!(matches!(c.exec(0xD50B_7420, &mut m), Step::Next));
+        let mut buf = [0u8; 256];
+        m.read(region, &mut buf).unwrap();
+        let block = DC_ZVA_BLOCK_BYTES as usize;
+        let aligned_off = unaligned_off & !(block - 1);
+        assert!(
+            buf[..aligned_off].iter().all(|&b| b == 0xAA),
+            "before the block"
+        );
+        assert!(
+            buf[aligned_off..aligned_off + block].iter().all(|&b| b == 0),
+            "the DC ZVA block itself"
+        );
+        assert!(
+            buf[aligned_off + block..].iter().all(|&b| b == 0xAA),
+            "after the block"
+        );
+    }
+
+    #[test]
+    fn dmb_isb_decode_as_noops() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.pc = 0x1000;
+        // dmb sy — exec() itself never advances pc (run() does), so a
+        // Step::Next with pc unchanged is exactly "this was a no-op".
+        assert!(matches!(c.exec(0xD503_3FBF, &mut m), Step::Next));
+        assert_eq!(c.pc, 0x1000);
+        // isb (sy)
+        assert!(matches!(c.exec(0xD503_3FDF, &mut m), Step::Next));
+        assert_eq!(c.pc, 0x1000);
+    }
+
+    /// `AESE v0.16b, v1.16b` with `Vd=0`, `Vn = 00 01 02 .. 0f` (byte `i` ==
+    /// `i`). Expected result captured from native execution of the real
+    /// `AESE` instruction on this host's Apple Silicon CPU (`FEAT_AES`) —
+    /// see the module-level comment above `AES_SBOX`.
+    #[test]
+    fn aese_matches_hardware_vector() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[0] = 0; // Vd
+        c.v[1] = 0x0f0e_0d0c_0b0a_0908_0706_0504_0302_0100; // Vn = 00..0f
+        // aese v0.16b, v1.16b
+        assert!(matches!(c.exec(0x4E28_4820, &mut m), Step::Next));
+        assert_eq!(c.v[0], 0x2b6f_7cfe_c577_d730_7bab_01f2_7667_6b63);
+    }
+
+    /// AES S-box generated from the GF(2^8) multiplicative inverse plus the
+    /// standard affine transform, independently of the hardcoded
+    /// `AES_SBOX`/`AES_INV_SBOX` tables — catches a transcription error in
+    /// either table that a self-consistency check alone couldn't.
+    #[test]
+    fn aes_sbox_matches_generated_table() {
+        fn gf_mul(mut a: u8, mut b: u8) -> u8 {
+            let mut p = 0u8;
+            for _ in 0..8 {
+                if b & 1 != 0 {
+                    p ^= a;
+                }
+                let hi = a & 0x80;
+                a <<= 1;
+                if hi != 0 {
+                    a ^= 0x1b;
+                }
+                b >>= 1;
+            }
+            p
+        }
+        let mut inv = [0u8; 256];
+        for a in 1..=255u16 {
+            for b in 1..=255u16 {
+                if gf_mul(a as u8, b as u8) == 1 {
+                    inv[a as usize] = b as u8;
+                    break;
+                }
+            }
+        }
+        let rol = |x: u8, n: u32| x.rotate_left(n);
+        for i in 0..256usize {
+            let b = inv[i];
+            let generated = b ^ rol(b, 1) ^ rol(b, 2) ^ rol(b, 3) ^ rol(b, 4) ^ 0x63;
+            assert_eq!(AES_SBOX[i], generated, "AES_SBOX[{i:#04x}]");
+            assert_eq!(AES_INV_SBOX[generated as usize], i as u8, "AES_INV_SBOX");
+        }
+    }
+
+    /// `SHA256H q0, q1, v2.4s` with distinguishable (non-repeating-nibble)
+    /// inputs. Expected result captured from native execution of the real
+    /// `SHA256H` instruction on this host's Apple Silicon CPU
+    /// (`FEAT_SHA256`) — see the module-level comment above `sha1_f`.
+    #[test]
+    fn sha256h_matches_hardware_vector() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[0] = 0xfeed_face_0def_aced_8bad_f00d_dead_beef; // Qd = abcd
+        c.v[1] = 0xba5e_ba11_5ca1_ab1e_1337_c0de_cafe_babe; // Qn = efgh
+        c.v[2] = 0xc0ff_ee11_ba1d_2323_0fac_ade1_000f_f1ce; // Vm.4S = W+K
+        // sha256h q0, q1, v2.4s
+        assert!(matches!(c.exec(0x5E02_4020, &mut m), Step::Next));
+        assert_eq!(c.v[0], 0xea32_0a6e_642e_88ee_9b73_03d0_dd3d_d598);
+    }
+
+    /// A full SHA-256 block compression, built only from `SHA256SU0`/
+    /// `SHA256SU1` (message schedule) and `SHA256H`/`SHA256H2` (compression
+    /// rounds) plus `ADD`/`INS` for the surrounding bookkeeping a real
+    /// SHA-256 implementation does in registers, checked against the
+    /// well-known `SHA-256("abc")` digest. This is the strongest available
+    /// check that the ARM-specific packing derived empirically for these
+    /// four instructions (see the module-level comment above `sha1_f`) is
+    /// actually self-consistent end to end, not just matching one captured
+    /// vector.
+    #[test]
+    fn sha256_block_compression_matches_known_digest() {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        const H0: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        // SHA-256("abc"), from the FIPS 180-4 example / any `sha256sum`.
+        const EXPECT: [u32; 8] = [
+            0xba7816bf, 0x8f01cfea, 0x414140de, 0x5dae2223, 0xb00361a3, 0x96177a9c, 0xb410ff61,
+            0xf20015ad,
+        ];
+
+        // SHA-256("abc"), padded to one 64-byte block.
+        let mut block = [0u8; 64];
+        block[0..3].copy_from_slice(b"abc");
+        block[3] = 0x80;
+        block[63] = 0x18; // bit length 24, big-endian in the last byte
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes(block[4 * i..4 * i + 4].try_into().unwrap());
+        }
+        // Message schedule extension via SHA256SU0 + SHA256SU1, 4 words at a
+        // time: W[16..19] needs W[0..15], SU0(W[i-16..i-13], W[i-12..i-9])
+        // then SU1(<su0 result>, W[i-8..i-5], W[i-4..i-1]).
+        let (mut c, mut m) = (cpu(), scratch());
+        for i in (16..64).step_by(4) {
+            let wd = pack4(&w, i - 16);
+            let wn = pack4(&w, i - 12);
+            let wm8 = pack4(&w, i - 8);
+            let wm4 = pack4(&w, i - 4);
+            c.v[0] = wd; // Vd = W[i-16..i-13]
+            c.v[1] = wn;
+            // sha256su0 v0.4s, v1.4s
+            assert!(matches!(c.exec(0x5E28_2820, &mut m), Step::Next));
+            c.v[2] = wm8;
+            c.v[3] = wm4;
+            // sha256su1 v0.4s, v2.4s, v3.4s
+            assert!(matches!(c.exec(0x5E03_6040, &mut m), Step::Next));
+            for (j, word) in u32_lanes(c.v[0]).into_iter().enumerate() {
+                w[i + j] = word;
+            }
+        }
+
+        let abcd0 = pack_u32_lanes([H0[0], H0[1], H0[2], H0[3]]);
+        let efgh0 = pack_u32_lanes([H0[4], H0[5], H0[6], H0[7]]);
+        c.v[10] = abcd0; // ABCD_SAVED
+        c.v[11] = efgh0; // EFGH_SAVED
+        c.v[0] = abcd0;
+        c.v[1] = efgh0;
+        for i in (0..64).step_by(4) {
+            let wk = pack_u32_lanes([
+                w[i].wrapping_add(K[i]),
+                w[i + 1].wrapping_add(K[i + 1]),
+                w[i + 2].wrapping_add(K[i + 2]),
+                w[i + 3].wrapping_add(K[i + 3]),
+            ]);
+            c.v[2] = wk;
+            c.v[10] = c.v[0]; // save pre-round ABCD for SHA256H2
+            // sha256h q0, q1, v2.4s
+            assert!(matches!(c.exec(0x5E02_4020, &mut m), Step::Next));
+            // sha256h2 q1, q10, v2.4s
+            assert!(matches!(c.exec(0x5E02_5141, &mut m), Step::Next));
+        }
+        let final_a = u32_lanes(c.v[0]);
+        let final_e = u32_lanes(c.v[1]);
+        let digest = [
+            H0[0].wrapping_add(final_a[0]),
+            H0[1].wrapping_add(final_a[1]),
+            H0[2].wrapping_add(final_a[2]),
+            H0[3].wrapping_add(final_a[3]),
+            H0[4].wrapping_add(final_e[0]),
+            H0[5].wrapping_add(final_e[1]),
+            H0[6].wrapping_add(final_e[2]),
+            H0[7].wrapping_add(final_e[3]),
+        ];
+        assert_eq!(digest, EXPECT);
+    }
+
+    /// Pack `w[i..i+4]` into a `V.4S` register value, lane 0 = `w[i]` — the
+    /// words are already plain `u32` values (`sha256_block_compression_
+    /// matches_known_digest` converts the input bytes with
+    /// `u32::from_be_bytes`, since SHA message words are big-endian), so
+    /// packing them into lanes is just `pack_u32_lanes`, no further
+    /// byte-order fixup needed.
+    fn pack4(w: &[u32; 64], i: usize) -> u128 {
+        pack_u32_lanes([w[i], w[i + 1], w[i + 2], w[i + 3]])
     }
 }
