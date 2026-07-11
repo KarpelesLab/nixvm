@@ -20,6 +20,29 @@ host CPU or a software interpreter. When a guest process executes a
 written in Rust — services the syscall.** Files, memory, processes, threads,
 signals, and networking are all implemented in userspace, under our control.
 
+## Try it in your browser
+
+**▶ [karpeleslab.github.io/nixvm](https://karpeleslab.github.io/nixvm/)**
+
+Because the whole thing — the CPU interpreter *and* the syscall kernel — is
+portable Rust with no OS dependencies, it compiles to WebAssembly and runs
+entirely in the page. There's no server: the ELF you give it is executed
+locally, in a sandbox, inside your browser's sandbox.
+
+- **Drag in (or pick) a static Linux ELF** — aarch64 or x86-64; the arch is
+  detected from the ELF header and the matching interpreter runs it.
+- **Bundled samples** let you see output with zero setup.
+- You get the program's **stdout/stderr, its exit code, and the ledger of any
+  syscalls it hit that nixvm doesn't implement yet** — the same
+  `unsupported()` view you'd get from the native `run-elf` harness.
+
+It's a try-before-you-install demo, so it's deliberately minimal: a
+statically-linked ELF runner (dynamic linking and a full Alpine shell run on
+the native build, not the wasm demo yet). CI rebuilds and redeploys it to
+GitHub Pages on every push to `main` (see
+[`.github/workflows/pages.yml`](.github/workflows/pages.yml)); the page is
+`web/index.html` and the wasm entry point is `src/wasm.rs`.
+
 ## Status
 
 Early but functional on the software-interpreter path: a real Rust syscall
@@ -44,7 +67,7 @@ plan and what's next.
 | **Filesystem** | `tmpfs` (rw in-memory), `overlay` (COW upper/lower), `passthrough` (host dir, **symlink/TOCTOU-safe** — see below), `devfs`, `procfs`, `sysfs`; a real on-disk squashfs/ext reader (`fstoolfs`, via the optional `fstool` crate) exists but isn't wired into the default mount table yet |
 | **Networking** | in-VM AF_UNIX + AF_INET/AF_INET6 loopback (TCP stream + UDP datagram); no real host/internet networking yet |
 | **I/O multiplexing** | `poll`/`ppoll`/`select`/`pselect6`, `epoll_create1`/`ctl`/`wait`/`pwait2`, `eventfd2`, `timerfd_*` |
-| **Browser demo (wasm)** | working: `wasm32-unknown-unknown` + interpreter, built and deployed to GitHub Pages by CI on every push to `main` |
+| **Browser demo (wasm)** | working — [**live demo**](https://karpeleslab.github.io/nixvm/): `wasm32-unknown-unknown` + interpreter, built and deployed to GitHub Pages by CI on every push to `main` ([details](#try-it-in-your-browser)) |
 
 The syscall dispatch table in `src/kernel/mod.rs` covers process/thread
 lifecycle, fd/file I/O, `mmap`/`brk`/`mprotect`/`mremap`, signals, networking,
