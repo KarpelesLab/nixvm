@@ -31,11 +31,19 @@ hvf = []    # Hypervisor.framework, macOS/arm64  (Phase 1)
 kvm = []    # KVM, Linux                          (Phase 10)
 # Software CPU interpreter — the no-acceleration fallback (Phase 10).
 interp = []
+# Real on-disk filesystem images (ext2/3/4) via our `fstool` crate, for the
+# read-only guest root. Off by default so the core stays dependency-free and
+# wasm-buildable; only mounting a real image needs it.
+fstool = ["dep:fstool"]
 
 [dependencies]
-# None yet — the scaffold builds fully offline. Per-phase additions arrive gated
-# by the features above (object, a squashfs reader, kvm-ioctls, sha2, a fetch
-# stack, …).
+# The core builds fully offline with no third-party deps. `fstool` is the first
+# optional dependency, gated behind its feature; per-phase additions arrive
+# gated by the features above (object, kvm-ioctls, sha2, a fetch stack, …).
+# `gzip` lets us repack an Alpine .tar.gz minirootfs into an ext4 root image.
+fstool = { version = "0.4.18", optional = true, default-features = false, features = [
+    "gzip",
+] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

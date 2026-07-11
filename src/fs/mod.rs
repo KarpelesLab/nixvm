@@ -20,10 +20,14 @@
 
 use std::io;
 
+#[cfg(feature = "fstool")]
+pub mod fstoolfs;
 pub mod mount;
 pub mod overlay;
 pub mod tmpfs;
 
+#[cfg(feature = "fstool")]
+pub use fstoolfs::FsToolMount;
 pub use mount::MountTable;
 pub use overlay::Overlay;
 pub use tmpfs::TmpFs;
@@ -67,7 +71,7 @@ pub struct DirEntry {
 /// Only `stat`, `read_at`, and `readdir` are required; every mutating method
 /// defaults to `EROFS`, so a read-only backend (like squashfs) implements the
 /// three required methods and nothing else.
-pub trait MountFs: std::fmt::Debug + Send {
+pub trait MountFs: std::fmt::Debug {
     // ---- required (read side) ----
     fn stat(&mut self, rel: &str) -> Option<Attrs>;
     fn read_at(&mut self, rel: &str, off: u64, buf: &mut [u8]) -> io::Result<usize>;
