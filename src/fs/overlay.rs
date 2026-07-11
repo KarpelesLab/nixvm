@@ -70,6 +70,9 @@ impl Overlay {
     }
 
     /// Materialize `rel` into the upper layer if it lives only in the lower.
+    /// For a directory, this recurses into every non-whited-out lower child
+    /// so that renaming (or otherwise moving) a lower-only directory brings
+    /// its whole subtree along rather than an empty shell.
     fn copy_up(&mut self, rel: &str) -> io::Result<()> {
         if self.upper.stat(rel).is_some() {
             return Ok(());
@@ -79,7 +82,17 @@ impl Overlay {
         };
         self.ensure_dir_in_upper(parent_of(rel));
         match attrs.kind {
-            NodeKind::Dir => self.ensure_dir_in_upper(rel),
+            NodeKind::Dir => {
+                self.ensure_dir_in_upper(rel);
+                if let Ok(entries) = self.lower.readdir(rel) {
+                    for e in entries {
+                        let child = join(rel, &e.name);
+                        if !self.is_whited(&child) {
+                            self.copy_up(&child)?;
+                        }
+                    }
+                }
+            }
             NodeKind::Symlink => {
                 if let Ok(target) = self.lower.readlink(rel) {
                     self.upper.symlink(&target, rel)?;
@@ -112,6 +125,21 @@ fn join(dir: &str, name: &str) -> String {
 
 fn enoent() -> io::Error {
     io::Error::from_raw_os_error(2)
+}
+fn eexist() -> io::Error {
+    io::Error::from_raw_os_error(17)
+}
+fn enotdir() -> io::Error {
+    io::Error::from_raw_os_error(20)
+}
+fn eisdir() -> io::Error {
+    io::Error::from_raw_os_error(21)
+}
+fn einval() -> io::Error {
+    io::Error::from_raw_os_error(22)
+}
+fn enotempty() -> io::Error {
+    io::Error::from_raw_os_error(39)
 }
 
 impl MountFs for Overlay {
@@ -163,20 +191,28 @@ impl MountFs for Overlay {
     }
 
     fn create(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        if self.stat(rel).is_some() {
+            return Err(eexist());
+        }
         self.whiteouts.remove(rel);
         self.ensure_dir_in_upper(parent_of(rel));
         self.upper.create(rel, mode)
     }
 
     fn mkdir(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        if self.stat(rel).is_some() {
+            return Err(eexist());
+        }
         self.whiteouts.remove(rel);
         self.ensure_dir_in_upper(parent_of(rel));
         self.upper.mkdir(rel, mode)
     }
 
     fn unlink(&mut self, rel: &str) -> io::Result<()> {
-        if self.stat(rel).is_none() {
-            return Err(enoent());
+        match self.stat(rel) {
+            None => return Err(enoent()),
+            Some(a) if a.kind == NodeKind::Dir => return Err(eisdir()),
+            Some(_) => {}
         }
         let _ = self.upper.unlink(rel);
         self.whiteouts.insert(rel.to_string());
@@ -186,11 +222,11 @@ impl MountFs for Overlay {
     fn rmdir(&mut self, rel: &str) -> io::Result<()> {
         match self.stat(rel) {
             Some(a) if a.kind == NodeKind::Dir => {}
-            Some(_) => return Err(io::Error::from_raw_os_error(20)), // ENOTDIR
+            Some(_) => return Err(enotdir()),
             None => return Err(enoent()),
         }
         if !self.readdir(rel)?.is_empty() {
-            return Err(io::Error::from_raw_os_error(39)); // ENOTEMPTY
+            return Err(enotempty());
         }
         let _ = self.upper.rmdir(rel);
         self.whiteouts.insert(rel.to_string());
@@ -203,6 +239,9 @@ impl MountFs for Overlay {
     }
 
     fn symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {
+        if self.stat(linkpath).is_some() {
+            return Err(eexist());
+        }
         self.whiteouts.remove(linkpath);
         self.ensure_dir_in_upper(parent_of(linkpath));
         self.upper.symlink(target, linkpath)
@@ -220,9 +259,49 @@ impl MountFs for Overlay {
     }
 
     fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
-        if self.stat(from).is_none() {
-            return Err(enoent());
+        if from == to {
+            return if self.stat(from).is_some() {
+                Ok(())
+            } else {
+                Err(enoent())
+            };
         }
+        let Some(from_attrs) = self.stat(from) else {
+            return Err(enoent());
+        };
+        let from_is_dir = from_attrs.kind == NodeKind::Dir;
+        // Refuse to move a directory into itself or one of its own
+        // descendants.
+        if from_is_dir && (to == from || to.starts_with(&format!("{from}/"))) {
+            return Err(einval());
+        }
+        if let Some(to_attrs) = self.stat(to) {
+            let to_is_dir = to_attrs.kind == NodeKind::Dir;
+            match (from_is_dir, to_is_dir) {
+                // Directory onto directory: only if the destination is empty
+                // in the merged view.
+                (true, true) => {
+                    if !self.readdir(to)?.is_empty() {
+                        return Err(enotempty());
+                    }
+                }
+                (true, false) => return Err(enotdir()),
+                (false, true) => return Err(eisdir()),
+                (false, false) => {}
+            }
+            // Clear the destination from the upper layer (if present there);
+            // any lower counterpart is superseded once `to` reappears in the
+            // upper below.
+            if to_is_dir {
+                let _ = self.upper.rmdir(to);
+            } else {
+                let _ = self.upper.unlink(to);
+            }
+        }
+
+        // Copy the whole `from` subtree into the upper layer first (a no-op
+        // for anything already upper-resident), then rename within the
+        // upper — the lower layer is never mutated.
         self.copy_up(from)?;
         self.ensure_dir_in_upper(parent_of(to));
         self.whiteouts.remove(to);
@@ -313,5 +392,103 @@ mod tests {
         let mut buf = [0u8; 1];
         o.read_at("d/x", 0, &mut buf).unwrap();
         assert_eq!(&buf, b"z");
+    }
+
+    #[test]
+    fn unlink_lower_file_removes_it_from_readdir_and_stat() {
+        let mut o = overlay();
+        o.unlink("f").unwrap();
+        assert!(o.stat("f").is_none());
+        assert_eq!(
+            o.read_at("f", 0, &mut [0u8; 3]).unwrap_err().raw_os_error(),
+            Some(2) // ENOENT
+        );
+        let names: Vec<_> = o.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        assert!(!names.contains(&"f".to_string()));
+    }
+
+    #[test]
+    fn recreating_after_unlink_clears_the_whiteout() {
+        let mut o = overlay();
+        o.unlink("f").unwrap();
+        assert!(o.stat("f").is_none());
+        o.create("f", 0o644).unwrap();
+        o.write_at("f", 0, b"new").unwrap();
+        assert!(o.stat("f").is_some());
+        let mut buf = [0u8; 3];
+        o.read_at("f", 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"new");
+        let names: Vec<_> = o.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&"f".to_string()));
+    }
+
+    #[test]
+    fn readdir_dedups_name_present_in_both_layers() {
+        let mut o = overlay();
+        // After a write, "f" is copied up: it now exists in both upper and
+        // lower under the same name.
+        o.write_at("f", 0, b"UP!").unwrap();
+        let names: Vec<_> = o.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        assert_eq!(names.iter().filter(|n| n.as_str() == "f").count(), 1);
+    }
+
+    #[test]
+    fn recreating_dir_after_rmdir_does_not_leak_lower_children() {
+        let mut o = overlay();
+        // "d" (lower) contains only "d/x"; empty it out, then rmdir it.
+        o.unlink("d/x").unwrap();
+        o.rmdir("d").unwrap();
+        assert!(o.stat("d").is_none());
+
+        // Recreate "d" fresh and populate it differently.
+        o.mkdir("d", 0o755).unwrap();
+        o.create("d/y", 0o644).unwrap();
+
+        let names: Vec<_> = o
+            .readdir("d")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["y".to_string()]);
+        assert!(o.stat("d/x").is_none(), "stale lower child must not leak");
+    }
+
+    #[test]
+    fn mkdir_and_create_reject_existing_lower_entries() {
+        let mut o = overlay();
+        assert_eq!(o.mkdir("d", 0o755).unwrap_err().raw_os_error(), Some(17)); // EEXIST
+        assert_eq!(o.create("f", 0o644).unwrap_err().raw_os_error(), Some(17)); // EEXIST
+    }
+
+    #[test]
+    fn rename_copies_up_lower_file_then_moves_it() {
+        let mut lower_check = seeded_lower();
+        let mut o = overlay();
+        o.rename("f", "g").unwrap();
+        assert!(o.stat("f").is_none());
+        let mut buf = [0u8; 3];
+        o.read_at("g", 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"low");
+        // The lower layer was never touched.
+        let mut lb = [0u8; 3];
+        lower_check.read_at("f", 0, &mut lb).unwrap();
+        assert_eq!(&lb, b"low");
+    }
+
+    #[test]
+    fn rename_lower_only_dir_brings_its_subtree() {
+        let mut o = overlay();
+        o.rename("d", "e").unwrap();
+        assert!(o.stat("d").is_none());
+        let mut buf = [0u8; 1];
+        o.read_at("e/x", 0, &mut buf).unwrap();
+        let names: Vec<_> = o
+            .readdir("e")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["x".to_string()]);
     }
 }
