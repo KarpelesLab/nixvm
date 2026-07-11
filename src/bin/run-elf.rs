@@ -12,10 +12,10 @@ use nixvm::abi::Arch;
 use nixvm::fs::{DevFs, MountTable, Overlay, Passthrough, TmpFs};
 use nixvm::kernel::Kernel;
 use nixvm::loader::{ProcessSpec, load_static};
+use nixvm::vcpu::Backend;
 use nixvm::vcpu::GuestMemory;
 use nixvm::vcpu::interp::InterpBackend;
 use nixvm::vcpu::mem::PAGE_SIZE;
-use nixvm::vcpu::Backend;
 
 const GUEST_BASE: u64 = 0x1_0000;
 const MEM_BYTES: u64 = 512 * 1024 * 1024;

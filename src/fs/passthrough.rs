@@ -143,7 +143,9 @@ impl MountFs for Passthrough {
 
     fn write_at(&mut self, rel: &str, off: u64, buf: &[u8]) -> io::Result<usize> {
         self.deny_if_ro()?;
-        let mut f = fs::OpenOptions::new().write(true).open(self.host_path(rel)?)?;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .open(self.host_path(rel)?)?;
         f.seek(SeekFrom::Start(off))?;
         f.write(buf)
     }
@@ -230,7 +232,12 @@ mod tests {
         assert_eq!(fs::read(tmp.0.join("f.txt")).unwrap(), b"host data");
 
         pt.mkdir("sub", 0o755).unwrap();
-        let names: Vec<_> = pt.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        let names: Vec<_> = pt
+            .readdir("")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         assert!(names.contains(&"f.txt".to_string()) && names.contains(&"sub".to_string()));
         assert_eq!(pt.stat("f.txt").unwrap().size, 9);
     }

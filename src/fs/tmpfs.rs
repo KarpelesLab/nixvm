@@ -17,9 +17,18 @@ const S_IFLNK: u32 = 0o120_000;
 
 #[derive(Debug)]
 enum Node {
-    Dir { inode: u64 },
-    File { inode: u64, data: Vec<u8>, mode: u32 },
-    Symlink { inode: u64, target: String },
+    Dir {
+        inode: u64,
+    },
+    File {
+        inode: u64,
+        data: Vec<u8>,
+        mode: u32,
+    },
+    Symlink {
+        inode: u64,
+        target: String,
+    },
 }
 
 impl Node {
@@ -222,7 +231,11 @@ impl MountFs for TmpFs {
             Some(_) => return Err(enotdir()),
             None => return Err(enoent()),
         }
-        if self.nodes.keys().any(|k| Self::parent_of(k) == rel && !k.is_empty()) {
+        if self
+            .nodes
+            .keys()
+            .any(|k| Self::parent_of(k) == rel && !k.is_empty())
+        {
             return Err(io::Error::from_raw_os_error(39)); // ENOTEMPTY
         }
         self.nodes.remove(rel);
@@ -312,11 +325,21 @@ mod tests {
         fs.create("d/b", 0o644).unwrap();
         fs.create("top", 0o644).unwrap();
 
-        let mut names: Vec<_> = fs.readdir("d").unwrap().into_iter().map(|e| e.name).collect();
+        let mut names: Vec<_> = fs
+            .readdir("d")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         names.sort();
         assert_eq!(names, vec!["a", "b"]);
 
-        let root: Vec<_> = fs.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        let root: Vec<_> = fs
+            .readdir("")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         assert!(root.contains(&"d".to_string()) && root.contains(&"top".to_string()));
     }
 

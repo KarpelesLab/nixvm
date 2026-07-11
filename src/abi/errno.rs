@@ -61,4 +61,5 @@ errnos! {
     ENOSYS = 38,
     ENOTEMPTY = 39,
     ELOOP = 40,
+    ENODATA = 61,
 }

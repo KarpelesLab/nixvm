@@ -20,18 +20,18 @@
 
 use std::io;
 
+pub mod devfs;
 #[cfg(feature = "fstool")]
 pub mod fstoolfs;
-pub mod devfs;
 pub mod mount;
 pub mod overlay;
 #[cfg(unix)]
 pub mod passthrough;
 pub mod tmpfs;
 
+pub use devfs::DevFs;
 #[cfg(feature = "fstool")]
 pub use fstoolfs::FsToolMount;
-pub use devfs::DevFs;
 pub use mount::MountTable;
 pub use overlay::Overlay;
 #[cfg(unix)]

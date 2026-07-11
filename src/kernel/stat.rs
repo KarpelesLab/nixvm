@@ -12,8 +12,10 @@ const S_IFIFO: u32 = 0o010_000;
 /// The 128-byte `struct stat` for `attrs`.
 pub fn encode_stat(attrs: &Attrs) -> [u8; 128] {
     let mut b = [0u8; 128];
-    let put64 = |b: &mut [u8; 128], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
-    let put32 = |b: &mut [u8; 128], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put64 =
+        |b: &mut [u8; 128], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    let put32 =
+        |b: &mut [u8; 128], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
 
     put64(&mut b, 0, 1); // st_dev
     put64(&mut b, 8, attrs.inode); // st_ino
@@ -30,6 +32,27 @@ pub fn encode_stat(attrs: &Attrs) -> [u8; 128] {
     put64(&mut b, 72, t); // st_atime
     put64(&mut b, 88, t); // st_mtime
     put64(&mut b, 104, t); // st_ctime
+    b
+}
+
+/// The 120-byte `struct statfs` (arm64 / x86-64 layout). Reports a large,
+/// mostly-empty in-memory filesystem with 4 KiB blocks.
+pub fn encode_statfs() -> [u8; 120] {
+    let mut b = [0u8; 120];
+    let put64 =
+        |b: &mut [u8; 120], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+
+    put64(&mut b, 0, 0x0102_1994); // f_type (TMPFS_MAGIC)
+    put64(&mut b, 8, 4096); // f_bsize
+    put64(&mut b, 16, 1 << 20); // f_blocks
+    put64(&mut b, 24, 1 << 19); // f_bfree
+    put64(&mut b, 32, 1 << 19); // f_bavail
+    put64(&mut b, 40, 1 << 16); // f_files
+    put64(&mut b, 48, 1 << 15); // f_ffree
+    // 56: f_fsid[2] left zero
+    put64(&mut b, 64, 255); // f_namelen
+    put64(&mut b, 72, 4096); // f_frsize
+    // 80: f_flags, 88..120: f_spare[4] left zero
     b
 }
 

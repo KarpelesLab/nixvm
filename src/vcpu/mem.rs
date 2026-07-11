@@ -288,8 +288,14 @@ mod tests {
     #[test]
     fn out_of_bounds_faults() {
         let m = mem();
-        assert!(matches!(m.read_u32(0x9_0000), Err(MemError::OutOfBounds(_))));
-        assert!(matches!(m.read_u32(0x0_0000), Err(MemError::OutOfBounds(_))));
+        assert!(matches!(
+            m.read_u32(0x9_0000),
+            Err(MemError::OutOfBounds(_))
+        ));
+        assert!(matches!(
+            m.read_u32(0x0_0000),
+            Err(MemError::OutOfBounds(_))
+        ));
     }
 
     #[test]

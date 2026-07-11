@@ -23,6 +23,7 @@ use crate::vcpu::mem::{PAGE_SIZE, Prot};
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 
 mod fd;
+mod fs_ext;
 mod path;
 mod stat;
 
@@ -96,6 +97,8 @@ pub struct Kernel {
     stderr: Box<dyn Write + Send>,
     rng_state: u64,
     trace: bool,
+    /// The process file-creation mask (`umask`); global for our single session.
+    umask: u32,
     unsupported: BTreeMap<u64, u64>,
     /// The running process's per-process state (swapped in for the slice).
     cur: ProcInfo,
@@ -132,6 +135,7 @@ impl Kernel {
             stderr: Box::new(std::io::stderr()),
             rng_state: 0,
             trace: std::env::var_os("NIXVM_TRACE").is_some(),
+            umask: 0o022,
             unsupported: BTreeMap::new(),
             cur: ProcInfo::default(),
             procs: Vec::new(),
@@ -273,7 +277,10 @@ impl Kernel {
                     return Ok(true);
                 }
                 Exit::IllegalInstruction { pc } => {
-                    eprintln!("[fault] pid {} illegal instruction at {pc:#x}", self.cur.pid);
+                    eprintln!(
+                        "[fault] pid {} illegal instruction at {pc:#x}",
+                        self.cur.pid
+                    );
                     self.cur.run = RunState::Zombie(132);
                     return Ok(true);
                 }
@@ -321,6 +328,24 @@ impl Kernel {
             Sysno::Getdents64 => self.sys_getdents64(args[0], args[1], args[2], mem),
             Sysno::Getcwd => self.sys_getcwd(args[0], args[1], mem),
             Sysno::Chdir => self.sys_chdir(args[0], mem),
+            Sysno::Statfs => self.sys_statfs(args[0], args[1], mem),
+            Sysno::Fstatfs => self.sys_fstatfs(args[0], args[1], mem),
+            Sysno::Readlinkat => {
+                self.sys_readlinkat(args[0] as i64, args[1], args[2], args[3], mem)
+            }
+            Sysno::Symlinkat => self.sys_symlinkat(args[0], args[1] as i64, args[2], mem),
+            Sysno::Mkdirat => self.sys_mkdirat(args[0] as i64, args[1], args[2], mem),
+            Sysno::Unlinkat => self.sys_unlinkat(args[0] as i64, args[1], args[2], mem),
+            Sysno::Renameat | Sysno::Renameat2 => {
+                self.sys_renameat(args[0] as i64, args[1], args[2] as i64, args[3], mem)
+            }
+            Sysno::Faccessat | Sysno::Faccessat2 => {
+                self.sys_faccessat(args[0] as i64, args[1], mem)
+            }
+            Sysno::Access => self.sys_faccessat(AT_FDCWD, args[0], mem),
+            Sysno::Umask => self.sys_umask(args[0]),
+            // No extended attributes: report "no such attribute".
+            Sysno::Getxattr | Sysno::Lgetxattr | Sysno::Fgetxattr => err(Errno::ENODATA),
             Sysno::Writev => self.sys_writev(args[0], args[1], args[2], mem),
             Sysno::Getrandom => self.sys_getrandom(args[0], args[1], mem),
             Sysno::Ioctl => err(Errno::ENOTTY),
@@ -337,14 +362,20 @@ impl Kernel {
             // set_tid_address also returns the tid.
             Sysno::Getpid | Sysno::Gettid | Sysno::SetTidAddress => i64::from(self.cur.pid),
             Sysno::Getppid => i64::from(self.cur.ppid),
-            // signal setup / robust list / uid all succeed as root.
+            // Succeed as root / no-op: uid queries, signal setup, robust list,
+            // and permission/ownership/timestamp changes we don't model yet.
             Sysno::Getuid
             | Sysno::Geteuid
             | Sysno::Getgid
             | Sysno::Getegid
             | Sysno::RtSigaction
             | Sysno::RtSigprocmask
-            | Sysno::SetRobustList => 0,
+            | Sysno::SetRobustList
+            | Sysno::Fchmodat
+            | Sysno::Fchmod
+            | Sysno::Fchownat
+            | Sysno::Fchown
+            | Sysno::Utimensat => 0,
             _ => {
                 *self.unsupported.entry(raw).or_default() += 1;
                 err(Errno::ENOSYS)
@@ -654,7 +685,10 @@ impl Kernel {
         let fd = if attrs.kind == NodeKind::Dir {
             self.cur.fds.alloc(Fd::Dir { path: abs, pos: 0 })
         } else {
-            self.cur.fds.alloc(Fd::File { path: abs, offset: 0 })
+            self.cur.fds.alloc(Fd::File {
+                path: abs,
+                offset: 0,
+            })
         };
         i64::from(fd)
     }
@@ -803,8 +837,10 @@ impl Kernel {
             Ok(e) => e,
             Err(e) => return io_errno(&e),
         };
-        let mut all: Vec<(String, NodeKind, u64)> =
-            vec![(".".into(), NodeKind::Dir, 1), ("..".into(), NodeKind::Dir, 1)];
+        let mut all: Vec<(String, NodeKind, u64)> = vec![
+            (".".into(), NodeKind::Dir, 1),
+            ("..".into(), NodeKind::Dir, 1),
+        ];
         all.extend(entries.into_iter().map(|e| (e.name, e.kind, e.inode)));
 
         let (bytes, consumed) = stat::encode_dirents(&all, pos, count as usize);
@@ -1184,7 +1220,13 @@ mod tests {
         (kernel, mem, DummyVcpu)
     }
 
-    fn call(k: &mut Kernel, mem: &mut GuestMemory, v: &mut DummyVcpu, s: Sysno, a: [u64; 6]) -> i64 {
+    fn call(
+        k: &mut Kernel,
+        mem: &mut GuestMemory,
+        v: &mut DummyVcpu,
+        s: Sysno,
+        a: [u64; 6],
+    ) -> i64 {
         k.dispatch(s, 0, &a, v, mem)
     }
 
@@ -1197,20 +1239,53 @@ mod tests {
         mem.write_init(path, b"/f\0").unwrap();
         mem.write_init(msg, b"Hi").unwrap();
 
-        let fd = call(&mut k, &mut mem, &mut v, Sysno::Openat, [AT_CWD, path, 0o102, 0o644, 0, 0]);
+        let fd = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Openat,
+            [AT_CWD, path, 0o102, 0o644, 0, 0],
+        );
         assert_eq!(fd, 3);
         let fd = fd as u64;
 
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [fd, msg, 2, 0, 0, 0]), 2);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, buf, 2, 0, 0, 0]), 2);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [fd, msg, 2, 0, 0, 0]
+            ),
+            2
+        );
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, buf, 2, 0, 0, 0]),
+            2
+        );
         assert_eq!(mem.read_vec(buf, 2).unwrap(), b"Hi");
 
         let stbuf = 0x1_3000;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Fstat, [fd, stbuf, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Fstat,
+                [fd, stbuf, 0, 0, 0, 0]
+            ),
+            0
+        );
         assert_eq!(mem.read_u64(stbuf + 48).unwrap(), 2);
 
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Close, [fd, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Close, [fd, 0, 0, 0, 0, 0]),
+            0
+        );
     }
 
     #[test]
@@ -1240,7 +1315,16 @@ mod tests {
         mem.write_init(iov + 16, &d1.to_le_bytes()).unwrap();
         mem.write_init(iov + 24, &4u64.to_le_bytes()).unwrap();
 
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Writev, [1, iov, 2, 0, 0, 0]), 7);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Writev,
+                [1, iov, 2, 0, 0, 0]
+            ),
+            7
+        );
         assert_eq!(&*cap.lock().unwrap(), b"foobar!");
     }
 
@@ -1248,23 +1332,53 @@ mod tests {
     fn pipe_write_read_and_dup() {
         let (mut k, mut mem, mut v) = setup();
         let fds = 0x1_0000;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]),
+            0
+        );
         let rfd = u64::from(mem.read_u32(fds).unwrap());
         let wfd = u64::from(mem.read_u32(fds + 4).unwrap());
         assert!(rfd >= 3 && wfd >= 3 && rfd != wfd);
 
         let msg = 0x1_1000;
         mem.write_init(msg, b"pipe!").unwrap();
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [wfd, msg, 5, 0, 0, 0]), 5);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [wfd, msg, 5, 0, 0, 0]
+            ),
+            5
+        );
 
         let dfd = call(&mut k, &mut mem, &mut v, Sysno::Dup, [rfd, 0, 0, 0, 0, 0]);
         assert!(dfd >= 3);
         let buf = 0x1_2000;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [dfd as u64, buf, 5, 0, 0, 0]), 5);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Read,
+                [dfd as u64, buf, 5, 0, 0, 0]
+            ),
+            5
+        );
         assert_eq!(mem.read_vec(buf, 5).unwrap(), b"pipe!");
 
         // drained + writer still open -> blocks (returns 0 with the block flag)
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [rfd, buf, 5, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Read,
+                [rfd, buf, 5, 0, 0, 0]
+            ),
+            0
+        );
         assert!(k.block);
     }
 
@@ -1273,7 +1387,10 @@ mod tests {
         let (mut k, mut mem, mut v) = setup();
         k.set_stdin(Box::new(std::io::Cursor::new(b"piped".to_vec())));
         let buf = 0x1_0000;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [0, buf, 5, 0, 0, 0]), 5);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Read, [0, buf, 5, 0, 0, 0]),
+            5
+        );
         assert_eq!(mem.read_vec(buf, 5).unwrap(), b"piped");
     }
 
@@ -1281,7 +1398,16 @@ mod tests {
     fn getrandom_fills_buffer() {
         let (mut k, mut mem, mut v) = setup();
         let buf = 0x1_0000;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getrandom, [buf, 16, 0, 0, 0, 0]), 16);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Getrandom,
+                [buf, 16, 0, 0, 0, 0]
+            ),
+            16
+        );
         assert!(mem.read_vec(buf, 16).unwrap().iter().any(|&b| b != 0));
     }
 
@@ -1289,22 +1415,42 @@ mod tests {
     fn clone_makes_a_child_and_wait4_reaps_it() {
         let (mut k, mut mem, mut v) = setup();
         // clone(flags=0, stack=0, ...) -> child pid
-        let child = call(&mut k, &mut mem, &mut v, Sysno::Clone, [0x11, 0, 0, 0, 0, 0]);
+        let child = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [0x11, 0, 0, 0, 0, 0],
+        );
         assert_eq!(child, 2, "first child is pid 2");
         assert_eq!(k.procs.len(), 1, "child pushed to the process table");
 
         // no zombie yet -> wait4 blocks
         let ws = 0x1_0000;
-        call(&mut k, &mut mem, &mut v, Sysno::Wait4, [child as u64, ws, 0, 0, 0, 0]);
+        call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Wait4,
+            [child as u64, ws, 0, 0, 0, 0],
+        );
         assert!(k.block, "wait4 blocks while the child is alive");
 
         // make the child a zombie (exit code 7), then wait4 reaps it.
-        if let Some(Some(p)) = k.procs.iter_mut().find(|s| {
-            s.as_ref().is_some_and(|p| p.info.pid == 2)
-        }) {
+        if let Some(Some(p)) = k
+            .procs
+            .iter_mut()
+            .find(|s| s.as_ref().is_some_and(|p| p.info.pid == 2))
+        {
             p.info.run = RunState::Zombie(7);
         }
-        let reaped = call(&mut k, &mut mem, &mut v, Sysno::Wait4, [child as u64, ws, 0, 0, 0, 0]);
+        let reaped = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Wait4,
+            [child as u64, ws, 0, 0, 0, 0],
+        );
         assert_eq!(reaped, 2);
         // WIFEXITED status: (code & 0xff) << 8
         assert_eq!(mem.read_u32(ws).unwrap(), 7 << 8);
@@ -1330,10 +1476,25 @@ mod tests {
 
         let path = 0x1_0000;
         mem.write_init(path, b"/work/probe\0").unwrap();
-        let fd = call(&mut k, &mut mem, &mut v, Sysno::Openat, [AT_CWD, path, 0, 0, 0, 0]);
+        let fd = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Openat,
+            [AT_CWD, path, 0, 0, 0, 0],
+        );
         assert!(fd >= 3, "open through hole failed: {fd}");
         let buf = 0x1_1000;
-        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [fd as u64, buf, 1, 0, 0, 0]), 1);
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Read,
+                [fd as u64, buf, 1, 0, 0, 0]
+            ),
+            1
+        );
         assert_eq!(mem.read_vec(buf, 1).unwrap(), b"Z");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1344,17 +1505,41 @@ mod tests {
         let (mut k, mut mem, mut v) = setup();
         let path = 0x1_0000;
         mem.write_init(path, b"/a\0").unwrap();
-        call(&mut k, &mut mem, &mut v, Sysno::Openat, [AT_CWD, path, 0o102, 0o644, 0, 0]);
+        call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Openat,
+            [AT_CWD, path, 0o102, 0o644, 0, 0],
+        );
 
         let root = 0x1_1000;
         mem.write_init(root, b"/\0").unwrap();
-        let dirfd = call(&mut k, &mut mem, &mut v, Sysno::Openat, [AT_CWD, root, 0, 0, 0, 0]);
+        let dirfd = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Openat,
+            [AT_CWD, root, 0, 0, 0, 0],
+        );
         let buf = 0x1_2000;
-        let n = call(&mut k, &mut mem, &mut v, Sysno::Getdents64, [dirfd as u64, buf, PAGE, 0, 0, 0]);
+        let n = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Getdents64,
+            [dirfd as u64, buf, PAGE, 0, 0, 0],
+        );
         assert!(n > 0);
 
         let cbuf = 0x1_3000;
-        let len = call(&mut k, &mut mem, &mut v, Sysno::Getcwd, [cbuf, 64, 0, 0, 0, 0]);
+        let len = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Getcwd,
+            [cbuf, 64, 0, 0, 0, 0],
+        );
         assert_eq!(len, 2);
         assert_eq!(mem.read_vec(cbuf, 1).unwrap(), b"/");
     }

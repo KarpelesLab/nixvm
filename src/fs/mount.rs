@@ -110,6 +110,12 @@ impl MountTable {
         fs.readlink(&rel)
     }
 
+    /// Create a symlink at `abs_link` pointing at `target` (stored verbatim).
+    pub fn symlink(&mut self, target: &str, abs_link: &str) -> io::Result<()> {
+        let (fs, rel) = self.resolve(abs_link).ok_or_else(enoent)?;
+        fs.symlink(target, &rel)
+    }
+
     /// Rename within a single backend. Cross-mount renames return `EXDEV`.
     pub fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
         let from_idx = self.best_mount(from).ok_or_else(enoent)?;

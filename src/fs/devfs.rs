@@ -225,18 +225,24 @@ mod tests {
     #[test]
     fn readdir_lists_all_nodes() {
         let mut fs = DevFs::new();
-        let mut names: Vec<_> = fs.readdir("").unwrap().into_iter().map(|e| e.name).collect();
+        let mut names: Vec<_> = fs
+            .readdir("")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
         names.sort();
         assert_eq!(
             names,
             vec!["full", "null", "random", "tty", "urandom", "zero"]
         );
         // Every entry is a character device.
-        assert!(fs
-            .readdir("")
-            .unwrap()
-            .iter()
-            .all(|e| e.kind == NodeKind::CharDevice));
+        assert!(
+            fs.readdir("")
+                .unwrap()
+                .iter()
+                .all(|e| e.kind == NodeKind::CharDevice)
+        );
     }
 
     #[test]
@@ -248,7 +254,10 @@ mod tests {
         assert_eq!(a.size, 0);
         assert_eq!(a.nlink, 1);
         // Distinct inodes per device.
-        assert_ne!(fs.stat("null").unwrap().inode, fs.stat("zero").unwrap().inode);
+        assert_ne!(
+            fs.stat("null").unwrap().inode,
+            fs.stat("zero").unwrap().inode
+        );
         // The root is a directory.
         assert_eq!(fs.stat("").unwrap().kind, NodeKind::Dir);
     }
@@ -258,8 +267,14 @@ mod tests {
         let mut fs = DevFs::new();
         assert!(fs.stat("nope").is_none());
         let mut buf = [0u8; 4];
-        assert_eq!(fs.read_at("nope", 0, &mut buf).unwrap_err().raw_os_error(), Some(2));
-        assert_eq!(fs.write_at("nope", 0, b"x").unwrap_err().raw_os_error(), Some(2));
+        assert_eq!(
+            fs.read_at("nope", 0, &mut buf).unwrap_err().raw_os_error(),
+            Some(2)
+        );
+        assert_eq!(
+            fs.write_at("nope", 0, b"x").unwrap_err().raw_os_error(),
+            Some(2)
+        );
     }
 
     #[test]
