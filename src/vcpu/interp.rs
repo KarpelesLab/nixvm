@@ -15,8 +15,12 @@
 //! `CSINV`/`CSNEG`), bit manipulation (`REV`/`REV16`/`REV32`/`RBIT`/`CLZ`/
 //! `CLS`), compares, conditional/unconditional branches, `BL`/`BLR`/`RET`,
 //! load/store (unsigned immediate, unscaled/pre/post-index, register offset,
-//! pair including `LDPSW`, and exclusive/acquire-release treated as
-//! non-atomic single-core operations), and a growing slice of NEON/SIMD
+//! pair including `LDPSW`, and exclusive/acquire-release backed by a
+//! best-effort local monitor), ARMv8.1 LSE atomics (`CAS`/`CASP` and their
+//! `A`/`L`/`AL` forms, `SWP`, and the `LD<op>`/`ST<op>` atomic memory ops:
+//! `ADD`/`CLR`/`EOR`/`SET`/`SMAX`/`SMIN`/`UMAX`/`UMIN`, implemented as plain
+//! read-modify-write since a per-address-space lock in the SMP layer
+//! serializes guest memory access), and a growing slice of NEON/SIMD
 //! (`DUP`/`INS`/`UMOV`/`SMOV`, `LD1`/`ST1`, vector `ADD`/`SUB`/`MUL`/`MLA`/
 //! `MLS`/`ABS`/`NEG`/`SMAX`/`SMIN`/`UMAX`/`UMIN`/compares/`SSHL`/`USHL`/
 //! `SHL`/`SSHR`/`USHR`/`NOT`/`SADDL`/`UADDL`, `ADDV`/`UADDLV`, and vector
@@ -105,6 +109,17 @@ struct Aarch64Interp {
     v: [u128; 32],
     /// Debug: print stores to this guest address (from `NIXVM_WATCH`).
     watch: Option<u64>,
+    /// Local exclusive monitor for LDXR/LDAXR + STXR/STLXR: opened by a
+    /// load-exclusive, checked (and consumed) by the matching
+    /// store-exclusive, and cleared by any intervening store (see
+    /// `note_store`). Best-effort single-flag model — real hardware tracks a
+    /// monitored address range, but this interpreter is single-threaded per
+    /// slice and memory access is already serialized by the SMP layer, so a
+    /// flag is enough to give musl-style lock code the pass/fail behavior it
+    /// expects. Starts `true` so a lone STXR (no preceding LDXR) still
+    /// succeeds, matching the exclusive-always-succeeds behavior this
+    /// interpreter had before LSE support landed.
+    excl_monitor: bool,
 }
 
 impl Aarch64Interp {
@@ -119,6 +134,7 @@ impl Aarch64Interp {
             watch: std::env::var("NIXVM_WATCH")
                 .ok()
                 .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
+            excl_monitor: true,
         }
     }
 
@@ -253,8 +269,13 @@ impl Aarch64Interp {
         };
     }
 
-    /// Debug: report a store overlapping the `NIXVM_WATCH` address.
-    fn note_store(&self, addr: u64, value: u128, nbytes: usize) {
+    /// Debug: report a store overlapping the `NIXVM_WATCH` address. Also
+    /// clears the local exclusive monitor (`excl_monitor`) — every store in
+    /// this interpreter funnels through here or through
+    /// `mem_write_sized`/`ldst`/`ldst_vec` (which call this), so this is the
+    /// one place that needs to know "a store just happened".
+    fn note_store(&mut self, addr: u64, value: u128, nbytes: usize) {
+        self.excl_monitor = false;
         if let Some(w) = self.watch
             && w >= addr
             && w < addr + nbytes as u64
@@ -291,6 +312,158 @@ impl Aarch64Interp {
             _ => sign_extend(raw, (nbytes * 8) as u32) as u64 & 0xffff_ffff, // to 32
         };
         self.write_x(rt, val);
+        Step::Next
+    }
+
+    /// Write the low `nbytes` bytes of `val` to `addr`, going through
+    /// `note_store` (watch logging + exclusive-monitor clear) like every
+    /// other store path. Shared by the LSE atomic helpers below.
+    fn mem_write_sized(&mut self, mem: &mut GuestMemory, addr: u64, nbytes: usize, val: u64) -> bool {
+        self.note_store(addr, u128::from(val), nbytes);
+        mem.write(addr, &val.to_le_bytes()[..nbytes]).is_ok()
+    }
+
+    /// CAS/CASA/CASL/CASAL (and the CASB/CASH byte/halfword forms): compare
+    /// `rs` against the `nbytes`-wide value at `addr` and, on a match, swap
+    /// in `rt`. Always returns the *original* memory value in `rs`,
+    /// regardless of whether the swap happened — that's the real CAS
+    /// contract, not a simplification. Implemented as a plain
+    /// read-modify-write: this interpreter is single-threaded per vcpu slice
+    /// and the SMP layer serializes memory access across vcpus, so no host
+    /// atomics are needed to be atomic from the guest's perspective.
+    fn cas_single(
+        &mut self,
+        addr: u64,
+        nbytes: usize,
+        rs: usize,
+        rt: usize,
+        mem: &mut GuestMemory,
+    ) -> Step {
+        let Some(old) = mem_read_sized(mem, addr, nbytes) else {
+            return Step::Fault { addr, write: false };
+        };
+        if old == self.read_x(rs) & ones((nbytes * 8) as u32) {
+            let new = self.read_x(rt);
+            if !self.mem_write_sized(mem, addr, nbytes, new) {
+                return Step::Fault { addr, write: true };
+            }
+        }
+        self.write_x(rs, old);
+        Step::Next
+    }
+
+    /// CASP/CASPA/CASPL/CASPAL: compare-and-swap a register pair. Compares
+    /// `rs`/`rs+1` against the two `nbytes`-wide values at `addr`/
+    /// `addr+nbytes`; on a full-pair match, swaps in `rt`/`rt+1`. Like
+    /// `cas_single`, the original pair is always written back to `rs`/`rs+1`.
+    fn cas_pair(
+        &mut self,
+        addr: u64,
+        nbytes: usize,
+        rs: usize,
+        rt: usize,
+        mem: &mut GuestMemory,
+    ) -> Step {
+        // Real encodings require Rs/Rt even and < 31; mask defensively so a
+        // malformed instruction word can't index out of the register file.
+        let rs2 = (rs + 1) & 0x1f;
+        let rt2 = (rt + 1) & 0x1f;
+        let addr2 = addr.wrapping_add(nbytes as u64);
+        let Some(old0) = mem_read_sized(mem, addr, nbytes) else {
+            return Step::Fault { addr, write: false };
+        };
+        let Some(old1) = mem_read_sized(mem, addr2, nbytes) else {
+            return Step::Fault {
+                addr: addr2,
+                write: false,
+            };
+        };
+        let mask = ones((nbytes * 8) as u32);
+        if old0 == self.read_x(rs) & mask && old1 == self.read_x(rs2) & mask {
+            let (new0, new1) = (self.read_x(rt), self.read_x(rt2));
+            if !self.mem_write_sized(mem, addr, nbytes, new0) {
+                return Step::Fault { addr, write: true };
+            }
+            if !self.mem_write_sized(mem, addr2, nbytes, new1) {
+                return Step::Fault {
+                    addr: addr2,
+                    write: true,
+                };
+            }
+        }
+        self.write_x(rs, old0);
+        self.write_x(rs2, old1);
+        Step::Next
+    }
+
+    /// SWP/SWPA/SWPL/SWPAL (+ SWPB/SWPH): atomic swap — store `rs` to
+    /// `addr`, return the original `nbytes`-wide value there in `rt`.
+    fn swp(&mut self, addr: u64, nbytes: usize, rs: usize, rt: usize, mem: &mut GuestMemory) -> Step {
+        let Some(old) = mem_read_sized(mem, addr, nbytes) else {
+            return Step::Fault { addr, write: false };
+        };
+        let new = self.read_x(rs);
+        if !self.mem_write_sized(mem, addr, nbytes, new) {
+            return Step::Fault { addr, write: true };
+        }
+        self.write_x(rt, old);
+        Step::Next
+    }
+
+    /// LD<op>/LD<op>A/LD<op>L/LD<op>AL and their ST<op> aliases (same
+    /// encoding with `rt == 31`): atomic read-modify-write. Returns the
+    /// *original* `nbytes`-wide value in `rt` (silently discarded for the
+    /// ST<op> aliases via `write_x`'s usual zero-register semantics) and
+    /// writes `old <op> rs` back to memory. `op` is the 3-bit LSE opcode:
+    /// 000 ADD, 001 CLR (AND NOT), 010 EOR, 011 SET (OR), 100 SMAX,
+    /// 101 SMIN, 110 UMAX, 111 UMIN.
+    fn ld_op(
+        &mut self,
+        addr: u64,
+        nbytes: usize,
+        rs: usize,
+        rt: usize,
+        op: u32,
+        mem: &mut GuestMemory,
+    ) -> Step {
+        let Some(old) = mem_read_sized(mem, addr, nbytes) else {
+            return Step::Fault { addr, write: false };
+        };
+        let bits = (nbytes * 8) as u32;
+        let mask = ones(bits);
+        let s = self.read_x(rs) & mask;
+        let new = match op {
+            0b000 => old.wrapping_add(s) & mask, // ADD
+            0b001 => old & !s & mask,             // CLR: old AND NOT rs
+            0b010 => (old ^ s) & mask,            // EOR
+            0b011 => (old | s) & mask,            // SET: old OR rs
+            0b100 => {
+                // SMAX
+                if sign_extend(old, bits) >= sign_extend(s, bits) {
+                    old
+                } else {
+                    s
+                }
+            }
+            0b101 => {
+                // SMIN
+                if sign_extend(old, bits) <= sign_extend(s, bits) {
+                    old
+                } else {
+                    s
+                }
+            }
+            0b110 => {
+                if old >= s { old } else { s } // UMAX
+            }
+            _ => {
+                if old <= s { old } else { s } // UMIN (op == 0b111)
+            }
+        };
+        if !self.mem_write_sized(mem, addr, nbytes, new) {
+            return Step::Fault { addr, write: true };
+        }
+        self.write_x(rt, old);
         Step::Next
     }
 
@@ -940,28 +1113,97 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- CAS/CASP: LSE compare-and-swap (single and register-pair) ----
+        // Shares its outer (instr>>24)&0x3f == 0b00_1000 bits with the
+        // exclusive-class block below, so — per this file's ordering
+        // discipline — the more specific mask (fixed opc/b11:10 = 0b1_1111,
+        // and o1 == 1) must be, and is, checked first.
+        if (instr >> 24) & 0x3f == 0b00_1000
+            && (instr >> 21) & 1 == 1
+            && (instr >> 10) & 0x1f == 0b1_1111
+        {
+            let rs = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rt = reg_field(instr, 0);
+            let addr = self.read_sp(rn);
+            if (instr >> 23) & 1 == 1 {
+                // CAS/CASA/CASL/CASAL/CASB/CASH: size selects B/H/W/X.
+                let size = (instr >> 30) & 3;
+                return self.cas_single(addr, 1usize << size, rs, rt, mem);
+            }
+            // CASP/CASPA/CASPL/CASPAL: bit30 selects a 32- or 64-bit pair
+            // (bit31 is not part of `size` here, unlike every other class).
+            let nbytes = if (instr >> 30) & 1 == 1 { 8 } else { 4 };
+            return self.cas_pair(addr, nbytes, rs, rt, mem);
+        }
+
+        // ---- LSE atomic memory operations: SWP and LD<op>/ST<op> ----
+        // (ADD/CLR/EOR/SET/SMAX/SMIN/UMAX/UMIN, each with +A/+L/+AL
+        // acquire/release forms; ST<op> is the same encoding with Rt == 31).
+        // Outer bits (111000) are disjoint from every other class in this
+        // function (verified against the exclusive/CAS class above and the
+        // load/store-pair and register-offset classes elsewhere), so this
+        // arm's position relative to them doesn't matter.
+        if (instr >> 24) & 0x3f == 0b11_1000
+            && (instr >> 21) & 1 == 1
+            && (instr >> 10) & 3 == 0
+        {
+            let size = (instr >> 30) & 3;
+            let nbytes = 1usize << size;
+            let rs = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rt = reg_field(instr, 0);
+            let addr = self.read_sp(rn);
+            let o3 = (instr >> 15) & 1; // 1 = SWP, 0 = LD<op>/ST<op>
+            let opc = (instr >> 12) & 7;
+            if o3 == 1 {
+                return if opc == 0 {
+                    self.swp(addr, nbytes, rs, rt, mem)
+                } else {
+                    Step::Illegal // reserved
+                };
+            }
+            return self.ld_op(addr, nbytes, rs, rt, opc, mem);
+        }
+
         // ---- load/store exclusive & acquire/release (LDXR/STXR/LDAR/STLR) ----
         if (instr >> 24) & 0x3f == 0b00_1000 {
             let size = (instr >> 30) & 3;
             let o2 = (instr >> 23) & 1; // 0 = exclusive, 1 = ordered (LDAR/STLR)
             let l = (instr >> 22) & 1; // 1 = load
-            let o1 = (instr >> 21) & 1; // 1 = pair (LDXP/STXP)
+            let o1 = (instr >> 21) & 1; // 1 = pair: LDXP/STXP, or CAS/CASP above
             if o1 == 1 {
-                return Step::Illegal; // exclusive pair: Phase 10
+                return Step::Illegal; // LDXP/STXP: Phase 10 (CAS/CASP handled above)
             }
             let rs = reg_field(instr, 16);
             let rn = reg_field(instr, 5);
             let rt = reg_field(instr, 0);
             let addr = self.read_sp(rn);
             if l == 1 {
-                return self.ldst(addr, size, 0b01, rt, mem);
+                let step = self.ldst(addr, size, 0b01, rt, mem);
+                if o2 == 0 && matches!(step, Step::Next) {
+                    // LDXR/LDAXR opens the local exclusive monitor.
+                    self.excl_monitor = true;
+                }
+                return step;
             }
-            let step = self.ldst(addr, size, 0b00, rt, mem);
-            if matches!(step, Step::Next) && o2 == 0 {
-                // Store-exclusive always succeeds on our single core: status = 0.
-                self.write_x(rs, 0);
+            if o2 == 0 {
+                // STXR/STLXR: only stores — and only succeeds — while the
+                // monitor opened by a prior LDXR/LDAXR is still set; any
+                // intervening store clears it (see `note_store`).
+                if !self.excl_monitor {
+                    self.write_x(rs, 1); // status = 1: exclusive access failed
+                    return Step::Next;
+                }
+                let step = self.ldst(addr, size, 0b00, rt, mem);
+                self.excl_monitor = false; // consumed by this attempt either way
+                if matches!(step, Step::Next) {
+                    self.write_x(rs, 0); // status = 0: success
+                }
+                return step;
             }
-            return step;
+            // STLR: plain ordered store, no exclusive-monitor status register.
+            return self.ldst(addr, size, 0b00, rt, mem);
         }
 
         // ---- load/store pair: LDP/STP (signed offset / pre / post index) ----
@@ -2139,6 +2381,7 @@ impl Vcpu for Aarch64Interp {
         self.pc = entry;
         self.tpidr = 0;
         self.flags = Flags::default();
+        self.excl_monitor = true;
     }
 }
 
@@ -2266,6 +2509,17 @@ fn extend_reg(val: u64, option: u32, shift: u32) -> u64 {
 /// `n` low bits set.
 fn ones(n: u32) -> u64 {
     if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+}
+
+/// Read `nbytes` (1, 2, 4, or 8) little-endian bytes from `addr`,
+/// zero-extended to 64 bits. `None` on a memory fault. A plain integer read
+/// (no register write-back), unlike `Aarch64Interp::ldst` — shared by the LSE
+/// atomic (CAS/CASP/SWP/LD<op>) helpers, which all need the raw old value
+/// before deciding what (if anything) to write back.
+fn mem_read_sized(mem: &mut GuestMemory, addr: u64, nbytes: usize) -> Option<u64> {
+    let mut buf = [0u8; 8];
+    mem.read(addr, &mut buf[..nbytes]).ok()?;
+    Some(u64::from_le_bytes(buf))
 }
 
 /// ARM `AdvSIMDExpandImm`: build the 64-bit lane value for a SIMD modified
@@ -2941,6 +3195,152 @@ mod tests {
         // ldxr x0,[x1]
         assert!(matches!(c.exec(0xC85F_7C20, &mut m), Step::Next));
         assert_eq!(c.x[0], 0x42);
+    }
+
+    #[test]
+    fn ldxr_stxr_sequence_reports_success() {
+        // The real usage order (LDXR opens the monitor, then STXR consumes
+        // it), unlike `exclusive_store_load_roundtrip` above which only
+        // exercises the always-succeeds default.
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        let addr = base + 0x40;
+        m.write(addr, &0x42u64.to_le_bytes()).unwrap();
+        c.x[1] = addr;
+        // ldxr x0,[x1]
+        assert!(matches!(c.exec(0xC85F_7C20, &mut m), Step::Next));
+        assert_eq!(c.x[0], 0x42);
+        c.x[3] = 0x99;
+        // stxr w2,x3,[x1] — monitor is open, so this succeeds (status 0).
+        assert!(matches!(c.exec(0xC802_7C23, &mut m), Step::Next));
+        assert_eq!(c.x[2], 0, "STXR reports success while the monitor is open");
+        let mut buf = [0u8; 8];
+        m.read(addr, &mut buf).unwrap();
+        assert_eq!(u64::from_le_bytes(buf), 0x99, "STXR's store took effect");
+    }
+
+    #[test]
+    fn intervening_store_clears_exclusive_monitor() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        let addr = base + 0x40;
+        m.write(addr, &0x42u64.to_le_bytes()).unwrap();
+        c.x[1] = addr;
+        assert!(matches!(c.exec(0xC85F_7C20, &mut m), Step::Next)); // ldxr x0,[x1]
+        c.x[4] = 0x1234;
+        assert!(matches!(c.exec(0xB900_0024, &mut m), Step::Next)); // str w4,[x1] (unrelated store)
+        c.x[3] = 0x99;
+        // stxr w2,x3,[x1] — monitor was cleared by the plain store above.
+        assert!(matches!(c.exec(0xC802_7C23, &mut m), Step::Next));
+        assert_eq!(c.x[2], 1, "STXR reports failure once the monitor is cleared");
+        let mut buf = [0u8; 8];
+        m.read(addr, &mut buf).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(buf) & 0xffff_ffff,
+            0x1234,
+            "failed STXR must not have written memory"
+        );
+    }
+
+    #[test]
+    fn cas_success_and_failure_paths() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        let addr = base + 0x300;
+        m.write(addr, &0x1111_1111u32.to_le_bytes()).unwrap();
+        c.x[0] = addr;
+
+        // cas w1,w2,[x0] with a mismatching compare value: no swap, but the
+        // original memory value is still returned in w1.
+        c.x[1] = 0xdead_beef;
+        c.x[2] = 0x2222_2222;
+        assert!(matches!(c.exec(0x88a1_7c02, &mut m), Step::Next));
+        assert_eq!(c.x[1], 0x1111_1111, "CAS returns the original value even on mismatch");
+        let mut buf = [0u8; 4];
+        m.read(addr, &mut buf).unwrap();
+        assert_eq!(u32::from_le_bytes(buf), 0x1111_1111, "no swap on a failed compare");
+
+        // cas w1,w2,[x0] with a matching compare value: swap happens.
+        c.x[1] = 0x1111_1111;
+        c.x[2] = 0x2222_2222;
+        assert!(matches!(c.exec(0x88a1_7c02, &mut m), Step::Next));
+        assert_eq!(c.x[1], 0x1111_1111, "CAS still returns the pre-swap value");
+        m.read(addr, &mut buf).unwrap();
+        assert_eq!(u32::from_le_bytes(buf), 0x2222_2222, "swap happens on a matching compare");
+    }
+
+    #[test]
+    fn swp_round_trip() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        let addr = base + 0x300;
+        m.write(addr, &0x1234_5678u32.to_le_bytes()).unwrap();
+        c.x[0] = addr;
+        c.x[1] = 0xAAAA_BBBB; // new value (Ws)
+        // swp w1,w2,[x0]
+        assert!(matches!(c.exec(0xb821_8002, &mut m), Step::Next));
+        assert_eq!(c.x[2], 0x1234_5678, "SWP returns the original value");
+        let mut buf = [0u8; 4];
+        m.read(addr, &mut buf).unwrap();
+        assert_eq!(u32::from_le_bytes(buf), 0xAAAA_BBBB, "SWP stores the new value");
+    }
+
+    #[test]
+    fn ldadd_ldset_ldclr_return_old_value_and_update_memory() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        let addr = base + 0x300;
+        m.write(addr, &0x0000_000fu32.to_le_bytes()).unwrap();
+        c.x[0] = addr;
+        let mut buf = [0u8; 4];
+
+        // ldadd w1,w2,[x0]: w2 = old; mem = old + w1.
+        c.x[1] = 0x10;
+        assert!(matches!(c.exec(0xb821_0002, &mut m), Step::Next));
+        assert_eq!(c.x[2], 0x0f, "LDADD returns the original value");
+        m.read(addr, &mut buf).unwrap();
+        assert_eq!(u32::from_le_bytes(buf), 0x1f, "LDADD writes old+rs back to memory");
+
+        // ldset w1,w2,[x0]: w2 = old; mem = old | w1.
+        c.x[1] = 0xf0;
+        assert!(matches!(c.exec(0xb821_3002, &mut m), Step::Next));
+        assert_eq!(c.x[2], 0x1f, "LDSET returns the original value");
+        m.read(addr, &mut buf).unwrap();
+        assert_eq!(u32::from_le_bytes(buf), 0xff, "LDSET writes old|rs back to memory");
+
+        // ldclr w1,w2,[x0]: w2 = old; mem = old & !w1.
+        c.x[1] = 0x0f;
+        assert!(matches!(c.exec(0xb821_1002, &mut m), Step::Next));
+        assert_eq!(c.x[2], 0xff, "LDCLR returns the original value");
+        m.read(addr, &mut buf).unwrap();
+        assert_eq!(u32::from_le_bytes(buf), 0xf0, "LDCLR writes old&!rs back to memory");
+    }
+
+    #[test]
+    fn stadd_updates_memory_without_register_writeback() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        let addr = base + 0x300;
+        m.write(addr, &0x5u32.to_le_bytes()).unwrap();
+        c.x[0] = addr;
+        c.x[1] = 0x3;
+        // stadd w1,[x0] — same encoding as LDADD with Rt == 31 (no result).
+        assert!(matches!(c.exec(0xb821_001f, &mut m), Step::Next));
+        let mut buf = [0u8; 4];
+        m.read(addr, &mut buf).unwrap();
+        assert_eq!(u32::from_le_bytes(buf), 0x8, "STADD still updates memory");
     }
 
     #[test]
