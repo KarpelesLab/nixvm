@@ -1542,20 +1542,39 @@ impl Kernel {
         self.cur.brk as i64
     }
 
-    /// `mmap(addr, len, prot, flags, fd, off)` — anonymous mappings only.
+    /// `mmap(addr, len, prot, flags, fd, off)`.
+    ///
+    /// Anonymous mappings carve from the downward-growing arena (or land at a
+    /// `MAP_FIXED` address). File-backed mappings additionally copy the file's
+    /// bytes from `off` into the fresh, zero-filled region — the mechanism the
+    /// dynamic linker uses to map `ld-musl` and the shared libraries. We give
+    /// every file mapping private (copy) semantics: `MAP_SHARED` writes are not
+    /// flushed back to the backing file (documented limitation), which is
+    /// correct for the read-only/executable maps loaders create.
     fn sys_mmap(&mut self, a: &[u64; 6], mem: &mut GuestMemory) -> i64 {
         const MAP_FIXED: u64 = 0x10;
         const MAP_ANONYMOUS: u64 = 0x20;
 
         let (addr, len, prot, flags) = (a[0], a[1], a[2], a[3]);
+        let (fd, offset) = (a[4], a[5]);
         if len == 0 {
             return err(Errno::EINVAL);
         }
-        if flags & MAP_ANONYMOUS == 0 {
-            return err(Errno::ENOSYS);
-        }
         let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
         let prot = Prot((prot as u8) & 0x7);
+
+        // For a file-backed mapping, resolve the backing path up front so a bad
+        // fd fails before we disturb the address space.
+        let file_src = if flags & MAP_ANONYMOUS == 0 {
+            match self.cur.fds.get(fd as i32) {
+                Some(Fd::File { path, .. }) => Some(path.clone()),
+                Some(_) => return err(Errno::EACCES), // mmap of pipe/socket/dir
+                None => return err(Errno::EBADF),
+            }
+        } else {
+            None
+        };
+
         let base = if flags & MAP_FIXED != 0 && addr != 0 {
             addr - addr % PAGE_SIZE
         } else {
@@ -1570,6 +1589,25 @@ impl Kernel {
         };
         if mem.map(base, len, prot).is_err() {
             return err(Errno::ENOMEM);
+        }
+
+        if let Some(path) = file_src {
+            // Fill the mapping from the file: a zero-initialized page-sized
+            // buffer, with the file's bytes (from `offset`, up to EOF) copied
+            // over the front; the tail past EOF stays zero, as mmap requires.
+            let mut data = vec![0u8; len as usize];
+            let mut got = 0usize;
+            while got < data.len() {
+                match self.mounts.read_at(&path, offset + got as u64, &mut data[got..]) {
+                    Ok(n) if n > 0 => got += n,
+                    _ => break, // EOF or read error: leave the rest zero-filled
+                }
+            }
+            // write_init bypasses page protection, so a read/exec-only mapping
+            // (the common code-segment case) is still populated correctly.
+            if mem.write_init(base, &data).is_err() {
+                return err(Errno::ENOMEM);
+            }
         }
         base as i64
     }
@@ -2301,6 +2339,90 @@ mod tests {
         assert_eq!(r, 0);
         assert!(k.block, "caller parks awaiting a wake");
         assert_eq!(k.cur.futex_wait, Some((0, uaddr)));
+    }
+
+    #[test]
+    fn mmap_file_backed_copies_file_contents() {
+        const MAP_FIXED: u64 = 0x10;
+        const PROT_READ: u64 = 0x1;
+        let (mut k, mut mem, mut v) = setup();
+        let path = 0x1_0000;
+        let content = 0x1_1000;
+        mem.write_init(path, b"/lib\0").unwrap();
+        mem.write_init(content, &[0x11, 0x22, 0x33, 0x44]).unwrap();
+
+        // Create /lib and write four bytes to it.
+        let fd = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Openat,
+            [AT_CWD, path, 0o102, 0o644, 0, 0],
+        );
+        assert_eq!(fd, 3);
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Write, [fd as u64, content, 4, 0, 0, 0]),
+            4
+        );
+
+        // Map it read-only at a fixed address; the file bytes appear there.
+        let addr = 0x1_5000u64;
+        let ret = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Mmap,
+            [addr, 4, PROT_READ, MAP_FIXED, fd as u64, 0],
+        );
+        assert_eq!(ret, addr as i64);
+        assert_eq!(mem.read_u32(addr).unwrap(), 0x4433_2211);
+    }
+
+    #[test]
+    fn mmap_file_backed_zero_fills_past_eof() {
+        const MAP_FIXED: u64 = 0x10;
+        let (mut k, mut mem, mut v) = setup();
+        let path = 0x1_0000;
+        let content = 0x1_1000;
+        mem.write_init(path, b"/x\0").unwrap();
+        mem.write_init(content, &[0xAB, 0xCD]).unwrap();
+        // Pre-dirty the target page so we can prove the tail is zeroed.
+        mem.write(0x1_3000, &[0xFF; 8]).unwrap();
+        let fd = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Openat,
+            [AT_CWD, path, 0o102, 0o644, 0, 0],
+        );
+        call(&mut k, &mut mem, &mut v, Sysno::Write, [fd as u64, content, 2, 0, 0, 0]);
+        let addr = 0x1_3000u64;
+        call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Mmap,
+            [addr, 8, 0x1, MAP_FIXED, fd as u64, 0],
+        );
+        // First two bytes from the file, the rest zero-filled (not the old 0xFF).
+        assert_eq!(mem.read_u32(addr).unwrap(), 0x0000_CDAB);
+        assert_eq!(mem.read_u32(addr + 4).unwrap(), 0);
+    }
+
+    #[test]
+    fn mmap_bad_and_nonfile_fd_rejected() {
+        const MAP_FIXED: u64 = 0x10;
+        let (mut k, mut mem, mut v) = setup();
+        // No such fd -> EBADF.
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Mmap, [0x1_5000, 4, 1, MAP_FIXED, 99, 0]),
+            -i64::from(Errno::EBADF.0)
+        );
+        // fd 1 is stdout, not a file -> EACCES.
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Mmap, [0x1_5000, 4, 1, MAP_FIXED, 1, 0]),
+            -i64::from(Errno::EACCES.0)
+        );
     }
 
     #[cfg(unix)]
