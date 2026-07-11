@@ -26,6 +26,14 @@ use crate::vcpu::GuestMemory;
 
 use super::{Fd, Kernel, err};
 
+impl Errno {
+    /// Not (yet) in [`crate::abi::errno::Errno`]'s generic subset — only this
+    /// module needs it so far (`getpeername`/`shutdown` on an unconnected
+    /// socket). A second `impl Errno` block is legal: inherent impls may
+    /// split across modules within the same crate.
+    const ENOTCONN: Errno = Errno(107);
+}
+
 const AF_UNIX: u16 = 1;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
@@ -34,12 +42,39 @@ const SOCK_DGRAM: u64 = 2;
 const SOCK_NONBLOCK: u64 = 0o4000;
 
 const SOL_SOCKET: u64 = 1;
+const IPPROTO_IP: u64 = 0;
+const IPPROTO_TCP: u64 = 6;
+const IPPROTO_IPV6: u64 = 41;
+
+// `SOL_SOCKET` option names (asm-generic/socket.h).
 const SO_REUSEADDR: u64 = 2;
 const SO_TYPE: u64 = 3;
-// SO_ERROR (4) is handled by the wildcard arm below: always 0, since there is
-// no pending-error model to report.
+const SO_ERROR: u64 = 4;
+const SO_BROADCAST: u64 = 6;
 const SO_SNDBUF: u64 = 7;
 const SO_RCVBUF: u64 = 8;
+const SO_KEEPALIVE: u64 = 9;
+const SO_LINGER: u64 = 13;
+const SO_REUSEPORT: u64 = 15;
+const SO_RCVTIMEO: u64 = 20;
+const SO_SNDTIMEO: u64 = 21;
+const SO_ACCEPTCONN: u64 = 30;
+const SO_PROTOCOL: u64 = 38;
+const SO_DOMAIN: u64 = 39;
+
+// Protocol-level option names.
+const IP_TOS: u64 = 1;
+const TCP_NODELAY: u64 = 1;
+const IPV6_V6ONLY: u64 = 26;
+
+// `sendto`/`recvfrom` `flags` bits this module honors (linux/socket.h).
+const MSG_PEEK: u64 = 0x02;
+const MSG_TRUNC: u64 = 0x20;
+const MSG_DONTWAIT: u64 = 0x40;
+const MSG_WAITALL: u64 = 0x100;
+// MSG_NOSIGNAL (0x4000) is a documented no-op: this virtual transport never
+// raises SIGPIPE on a peer-closed write in the first place (it returns
+// `EPIPE`), so there is nothing to suppress.
 
 /// The kernel's socket table plus the AF_UNIX/AF_INET(6) address registries.
 #[derive(Debug, Default)]
@@ -59,9 +94,67 @@ struct Sock {
     /// `SOCK_NONBLOCK` at creation time (there is no `fcntl(F_SETFL)` wiring
     /// into this module, so this is fixed at `socket()`/`accept4()`).
     nonblock: bool,
-    /// `SO_REUSEADDR`, set via `setsockopt`; relaxes the `bind` `EADDRINUSE`
-    /// check for `AF_INET`/`AF_INET6`.
+    /// `setsockopt`-controlled knobs, `SO_ERROR`, and buffer-size hints.
+    opts: SockOpts,
+}
+
+/// The mutable `setsockopt`-controlled state of a socket, plus `SO_ERROR`.
+/// Only `reuseaddr` has an observable effect on this virtual loopback (it
+/// relaxes `bind`'s `EADDRINUSE` check); the rest are stored and echoed back
+/// by `getsockopt` for compatibility with guest code that sets/reads them,
+/// since there is no real transport here to actually tune. The many
+/// independent `bool` flags genuinely are independent `setsockopt` knobs
+/// (not encodable as a smaller state machine), hence the blanket allow.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug)]
+struct SockOpts {
     reuseaddr: bool,
+    reuseport: bool,
+    keepalive: bool,
+    broadcast: bool,
+    /// `TCP_NODELAY` — stored only; every write is already delivered
+    /// immediately, so Nagle's algorithm was never modeled to begin with.
+    nodelay: bool,
+    /// `IPV6_V6ONLY` — stored only; this module never models a dual-stack
+    /// socket (an `AF_INET6` bind/connect always requires a v6 peer/local
+    /// address), so there is no dual-stack behavior to gate.
+    v6only: bool,
+    linger_on: bool,
+    linger_secs: i32,
+    /// Raw `struct timeval` bytes (`tv_sec`, `tv_usec`), stored and echoed
+    /// back verbatim; nothing in this module actually times out.
+    rcvtimeo: [u8; 16],
+    sndtimeo: [u8; 16],
+    rcvbuf: u32,
+    sndbuf: u32,
+    tos: u32,
+    /// `SO_ERROR`: read-and-cleared by `getsockopt`. Nothing in this
+    /// synchronous virtual transport currently produces an asynchronous
+    /// pending error, so this is always `0` today; the storage/clear
+    /// machinery is here so `getsockopt(SO_ERROR)` behaves correctly if a
+    /// future path (e.g. a failed background connect) ever sets it.
+    error: i32,
+}
+
+impl Default for SockOpts {
+    fn default() -> Self {
+        Self {
+            reuseaddr: false,
+            reuseport: false,
+            keepalive: false,
+            broadcast: false,
+            nodelay: false,
+            v6only: false,
+            linger_on: false,
+            linger_secs: 0,
+            rcvtimeo: [0; 16],
+            sndtimeo: [0; 16],
+            rcvbuf: 212_992,
+            sndbuf: 212_992,
+            tos: 0,
+            error: 0,
+        }
+    }
 }
 
 /// The lifecycle state of a socket slot.
@@ -84,16 +177,21 @@ enum Kind {
 }
 
 /// A connected socket: `to[e]` holds bytes destined for end `e` (so end `e`
-/// reads `to[e]` and writes `to[1 - e]`). `refs[e]` counts open fds on end `e`;
-/// `shut[e]` records a write-side `shutdown` from end `e`; `nonblock[e]`
-/// mirrors the `O_NONBLOCK`/`SOCK_NONBLOCK` of the fd currently on end `e`.
-/// `addrs[e]` is end `e`'s local `AF_INET`/`AF_INET6` address (so its peer
-/// address is `addrs[1 - e]`); `None` for AF_UNIX pairs.
+/// reads `to[e]` and writes `to[1 - e]`). `refs[e]` counts open fds on end `e`.
+/// `shut_wr[e]`/`shut_rd[e]` record a `shutdown(SHUT_WR)`/`shutdown(SHUT_RD)`
+/// from end `e`: a shut write side makes further writes from `e` fail with
+/// `EPIPE` and makes the peer's reads see EOF once `to[1-e]` drains; a shut
+/// read side makes further reads from `e` return EOF (`0`) immediately,
+/// regardless of what's still queued. `nonblock[e]` mirrors the
+/// `O_NONBLOCK`/`SOCK_NONBLOCK` of the fd currently on end `e`. `addrs[e]` is
+/// end `e`'s local `AF_INET`/`AF_INET6` address (so its peer address is
+/// `addrs[1 - e]`); `None` for AF_UNIX pairs.
 #[derive(Debug)]
 struct Pair {
     to: [VecDeque<u8>; 2],
     refs: [usize; 2],
-    shut: [bool; 2],
+    shut_wr: [bool; 2],
+    shut_rd: [bool; 2],
     nonblock: [bool; 2],
     addrs: [Option<InetAddr>; 2],
 }
@@ -104,7 +202,8 @@ impl Pair {
         Self {
             to: [VecDeque::new(), VecDeque::new()],
             refs: [1, 1],
-            shut: [false, false],
+            shut_wr: [false, false],
+            shut_rd: [false, false],
             nonblock: [false, false],
             addrs: [None, None],
         }
@@ -277,7 +376,7 @@ impl Kernel {
             Kind::Idle { bound: None }
         };
         let idx = self.net.socks.len();
-        self.net.socks.push(Sock { domain, kind, nonblock, reuseaddr: false });
+        self.net.socks.push(Sock { domain, kind, nonblock, opts: SockOpts::default() });
         i64::from(self.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 }))
     }
 
@@ -305,7 +404,7 @@ impl Kernel {
             domain: AF_UNIX,
             kind: Kind::Pair(pair),
             nonblock,
-            reuseaddr: false,
+            opts: SockOpts::default(),
         });
         let fd0 = self.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
         let fd1 = self.cur.fds.alloc(Fd::Socket { sock: idx, end: 1 });
@@ -357,7 +456,7 @@ impl Kernel {
                 };
                 if a.port == 0 {
                     a.port = self.net.ephemeral_port(proto, a.v6);
-                } else if !self.net.socks[sock].reuseaddr && self.net.addr_in_use(proto, a, sock) {
+                } else if !self.net.socks[sock].opts.reuseaddr && self.net.addr_in_use(proto, a, sock) {
                     return err(Errno::EINVAL); // real errno: EADDRINUSE
                 }
                 match &mut self.net.socks[sock].kind {
@@ -566,30 +665,47 @@ impl Kernel {
             Kind::Dgram(d) if d.peer.is_some() => {
                 write_sockaddr(mem, addr, addrlen, domain, d.peer.map(Addr::Inet).as_ref())
             }
-            _ => err(Errno::EINVAL), // real errno: ENOTCONN
+            _ => err(Errno::ENOTCONN),
         }
     }
 
-    /// `shutdown(fd, how)` — mark this end's write side closed so the peer sees
-    /// EOF once it drains.
-    pub(super) fn sys_shutdown(&mut self, fd: u64, _how: u64) -> i64 {
+    /// `shutdown(fd, how)` — `SHUT_RD` (0) marks this end's read side closed
+    /// (further reads return EOF immediately, regardless of what's still
+    /// queued); `SHUT_WR` (1) marks the write side closed (further writes
+    /// return `EPIPE`, and the peer sees EOF on read once it drains what's
+    /// already queued); `SHUT_RDWR` (2) does both.
+    pub(super) fn sys_shutdown(&mut self, fd: u64, how: u64) -> i64 {
+        const SHUT_RD: u64 = 0;
+        const SHUT_WR: u64 = 1;
+        const SHUT_RDWR: u64 = 2;
         let Some((sock, end)) = self.sock_of(fd) else {
             return err(Errno::ENOTSOCK);
         };
         match &mut self.net.socks[sock].kind {
             Kind::Pair(p) => {
-                p.shut[end] = true;
+                match how {
+                    SHUT_RD => p.shut_rd[end] = true,
+                    SHUT_WR => p.shut_wr[end] = true,
+                    SHUT_RDWR => {
+                        p.shut_rd[end] = true;
+                        p.shut_wr[end] = true;
+                    }
+                    _ => return err(Errno::EINVAL),
+                }
                 0
             }
-            _ => err(Errno::EINVAL), // real errno: ENOTCONN
+            _ => err(Errno::ENOTCONN),
         }
     }
 
-    /// `setsockopt(fd, level, optname, optval, optlen)` — currently only
-    /// `SOL_SOCKET`/`SO_REUSEADDR` has an observable effect (it relaxes the
-    /// `bind` `EADDRINUSE` check); everything else (`TCP_NODELAY`, buffer
-    /// size hints, …) is accepted and silently ignored, since this is a
-    /// virtual loopback with no real transport to tune.
+    /// `setsockopt(fd, level, optname, optval, optlen)`. `SOL_SOCKET`
+    /// `SO_REUSEADDR` has an observable effect (it relaxes the `bind`
+    /// `EADDRINUSE` check); the rest of the options listed below are stored
+    /// and echoed back by `getsockopt`, since this is a virtual loopback with
+    /// no real transport to actually tune. Any option this module doesn't
+    /// recognize is accepted and silently ignored (returns `0`) rather than
+    /// erroring, matching how a real stack treats a great many `setsockopt`
+    /// calls guest code makes speculatively.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_setsockopt(
         &mut self,
@@ -603,20 +719,84 @@ impl Kernel {
         let Some((sock, _)) = self.sock_of(fd) else {
             return err(Errno::ENOTSOCK);
         };
-        if level == SOL_SOCKET
-            && optname == SO_REUSEADDR
+        let opts = &mut self.net.socks[sock].opts;
+        if level == SOL_SOCKET {
+            match optname {
+                SO_REUSEADDR if optlen >= 4 => {
+                    if let Ok(v) = mem.read_u32(optval) {
+                        opts.reuseaddr = v != 0;
+                    }
+                }
+                SO_REUSEPORT if optlen >= 4 => {
+                    if let Ok(v) = mem.read_u32(optval) {
+                        opts.reuseport = v != 0;
+                    }
+                }
+                SO_KEEPALIVE if optlen >= 4 => {
+                    if let Ok(v) = mem.read_u32(optval) {
+                        opts.keepalive = v != 0;
+                    }
+                }
+                SO_BROADCAST if optlen >= 4 => {
+                    if let Ok(v) = mem.read_u32(optval) {
+                        opts.broadcast = v != 0;
+                    }
+                }
+                SO_RCVBUF if optlen >= 4 => {
+                    if let Ok(v) = mem.read_u32(optval) {
+                        opts.rcvbuf = v;
+                    }
+                }
+                SO_SNDBUF if optlen >= 4 => {
+                    if let Ok(v) = mem.read_u32(optval) {
+                        opts.sndbuf = v;
+                    }
+                }
+                SO_LINGER if optlen >= 8 => {
+                    if let Ok(b) = mem.read_vec(optval, 8) {
+                        opts.linger_on = i32::from_le_bytes([b[0], b[1], b[2], b[3]]) != 0;
+                        opts.linger_secs = i32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                    }
+                }
+                SO_RCVTIMEO if optlen >= 16 => {
+                    if let Ok(b) = mem.read_vec(optval, 16) {
+                        opts.rcvtimeo.copy_from_slice(&b);
+                    }
+                }
+                SO_SNDTIMEO if optlen >= 16 => {
+                    if let Ok(b) = mem.read_vec(optval, 16) {
+                        opts.sndtimeo.copy_from_slice(&b);
+                    }
+                }
+                // SO_TYPE/SO_ERROR/SO_ACCEPTCONN/SO_DOMAIN/SO_PROTOCOL are
+                // read-only in real Linux; anything else is unrecognized.
+                // Either way: accept-and-ignore.
+                _ => {}
+            }
+        } else if level == IPPROTO_TCP && optname == TCP_NODELAY && optlen >= 4 {
+            if let Ok(v) = mem.read_u32(optval) {
+                opts.nodelay = v != 0;
+            }
+        } else if level == IPPROTO_IPV6 && optname == IPV6_V6ONLY && optlen >= 4 {
+            if let Ok(v) = mem.read_u32(optval) {
+                opts.v6only = v != 0;
+            }
+        } else if level == IPPROTO_IP
+            && optname == IP_TOS
             && optlen >= 4
             && let Ok(v) = mem.read_u32(optval)
         {
-            self.net.socks[sock].reuseaddr = v != 0;
+            opts.tos = v;
         }
+        // Unknown level/optname combos: accept-and-ignore.
         0
     }
 
-    /// `getsockopt(fd, level, optname, optval, optlen)` — sane canned values
-    /// for `SO_TYPE`/`SO_ERROR`/`SO_REUSEADDR`/`SO_RCVBUF`/`SO_SNDBUF`; `0` for
+    /// `getsockopt(fd, level, optname, optval, optlen)` — sane canned/stored
+    /// values for the options `setsockopt` above understands, plus
+    /// `SO_TYPE`/`SO_ERROR`/`SO_ACCEPTCONN`/`SO_DOMAIN`/`SO_PROTOCOL`; `0` for
     /// anything else.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) fn sys_getsockopt(
         &mut self,
         fd: u64,
@@ -629,33 +809,65 @@ impl Kernel {
         let Some((sock, _)) = self.sock_of(fd) else {
             return err(Errno::ENOTSOCK);
         };
+        // SO_LINGER and the timeval-shaped options are wider than the u32
+        // fast path below, so they're handled (and returned) up front.
+        if level == SOL_SOCKET && optname == SO_LINGER {
+            let opts = &self.net.socks[sock].opts;
+            let mut b = [0u8; 8];
+            b[0..4].copy_from_slice(&i32::from(opts.linger_on).to_le_bytes());
+            b[4..8].copy_from_slice(&opts.linger_secs.to_le_bytes());
+            return write_optval(mem, optval, optlen_ptr, &b);
+        }
+        if level == SOL_SOCKET && (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO) {
+            let opts = &self.net.socks[sock].opts;
+            let b = if optname == SO_RCVTIMEO { opts.rcvtimeo } else { opts.sndtimeo };
+            return write_optval(mem, optval, optlen_ptr, &b);
+        }
         let value: u32 = if level == SOL_SOCKET {
             match optname {
                 SO_TYPE => match self.net.socks[sock].kind {
                     Kind::Dgram(_) => SOCK_DGRAM as u32,
                     _ => SOCK_STREAM as u32,
                 },
-                SO_REUSEADDR => u32::from(self.net.socks[sock].reuseaddr),
-                SO_RCVBUF | SO_SNDBUF => 212_992,
-                _ => 0, // includes SO_ERROR
+                SO_ERROR => {
+                    let e = self.net.socks[sock].opts.error;
+                    self.net.socks[sock].opts.error = 0; // read-and-cleared
+                    e as u32
+                }
+                SO_REUSEADDR => u32::from(self.net.socks[sock].opts.reuseaddr),
+                SO_REUSEPORT => u32::from(self.net.socks[sock].opts.reuseport),
+                SO_KEEPALIVE => u32::from(self.net.socks[sock].opts.keepalive),
+                SO_BROADCAST => u32::from(self.net.socks[sock].opts.broadcast),
+                SO_RCVBUF => self.net.socks[sock].opts.rcvbuf,
+                SO_SNDBUF => self.net.socks[sock].opts.sndbuf,
+                SO_ACCEPTCONN => u32::from(matches!(self.net.socks[sock].kind, Kind::Listener { .. })),
+                SO_DOMAIN => u32::from(self.net.socks[sock].domain),
+                SO_PROTOCOL => match (&self.net.socks[sock].kind, self.net.socks[sock].domain) {
+                    (Kind::Dgram(_), _) => 17,     // IPPROTO_UDP
+                    (_, d) if d == AF_UNIX => 0,
+                    _ => 6,                        // IPPROTO_TCP
+                },
+                _ => 0,
             }
+        } else if level == IPPROTO_TCP && optname == TCP_NODELAY {
+            u32::from(self.net.socks[sock].opts.nodelay)
+        } else if level == IPPROTO_IPV6 && optname == IPV6_V6ONLY {
+            u32::from(self.net.socks[sock].opts.v6only)
+        } else if level == IPPROTO_IP && optname == IP_TOS {
+            self.net.socks[sock].opts.tos
         } else {
             0
         };
-        if optval != 0 {
-            let _ = mem.write(optval, &value.to_le_bytes());
-        }
-        if optlen_ptr != 0 {
-            let _ = mem.write(optlen_ptr, &4u32.to_le_bytes());
-        }
-        0
+        write_optval(mem, optval, optlen_ptr, &value.to_le_bytes())
     }
 
     /// `sendto(fd, buf, len, flags, dest_addr, addrlen)` — for a datagram
     /// socket with an explicit destination, deliver straight into that port's
     /// inbound queue (fire-and-forget, like real UDP: no error if nothing is
     /// bound there); otherwise (no destination, or a stream socket) this is
-    /// just `write`.
+    /// just `write`. `flags` (`MSG_DONTWAIT`/`MSG_NOSIGNAL`/…) has nothing to
+    /// observably change here: a send into these in-memory queues never
+    /// blocks and never raises `SIGPIPE` in the first place.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_sendto(
         &mut self,
@@ -699,15 +911,20 @@ impl Kernel {
     }
 
     /// `recvfrom(fd, buf, len, flags, src_addr, addrlen)` — for a datagram
-    /// socket, pop the next queued datagram and report its source address;
-    /// for a stream socket this is `read` plus (best-effort) the peer address.
+    /// socket, pop (or, with `MSG_PEEK`, peek at) the next queued datagram and
+    /// report its source address; for a stream socket this is a flag-aware
+    /// `read` plus (best-effort) the peer address. `MSG_DONTWAIT` forces
+    /// non-blocking for this call only; `MSG_TRUNC` (datagram only) makes the
+    /// return value the full datagram length even if the caller's buffer was
+    /// smaller (the copy itself is always truncated to `len`, matching real
+    /// `recv` — this flag only changes what the *return value* reports).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_recvfrom(
         &mut self,
         fd: u64,
         buf: u64,
         len: u64,
-        _flags: u64,
+        flags: u64,
         src_addr: u64,
         src_addrlen: u64,
         mem: &mut GuestMemory,
@@ -716,7 +933,7 @@ impl Kernel {
             return err(Errno::ENOTSOCK);
         };
         if !matches!(self.net.socks[sock].kind, Kind::Dgram(_)) {
-            let n = self.read_socket(sock, end, buf, len, mem);
+            let n = self.recv_stream(sock, end, buf, len, mem, flags);
             if n > 0 {
                 let domain = self.net.socks[sock].domain;
                 let peer = match &self.net.socks[sock].kind {
@@ -727,12 +944,8 @@ impl Kernel {
             }
             return n;
         }
-        let nonblock = self.net.socks[sock].nonblock;
-        let popped = match &mut self.net.socks[sock].kind {
-            Kind::Dgram(d) => d.queue.pop_front(),
-            _ => unreachable!("checked above"),
-        };
-        let Some((from, data)) = popped else {
+        let nonblock = self.net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
+        let Some((from, data)) = self.recv_dgram_msg(sock, flags) else {
             if nonblock {
                 return err(Errno::EAGAIN);
             }
@@ -745,7 +958,19 @@ impl Kernel {
         if mem.write(buf, &data[..n]).is_err() {
             return err(Errno::EFAULT);
         }
-        n as i64
+        if flags & MSG_TRUNC != 0 { data.len() as i64 } else { n as i64 }
+    }
+
+    /// Pop (or, for `MSG_PEEK`, peek at) datagram socket `sock`'s next queued
+    /// inbound `(source, payload)`. A pure query: the caller decides the
+    /// block/`EAGAIN` behavior when this returns `None` (an empty queue).
+    fn recv_dgram_msg(&mut self, sock: usize, flags: u64) -> Option<(InetAddr, Vec<u8>)> {
+        let peek = flags & MSG_PEEK != 0;
+        match &mut self.net.socks[sock].kind {
+            Kind::Dgram(d) if peek => d.queue.front().cloned(),
+            Kind::Dgram(d) => d.queue.pop_front(),
+            _ => unreachable!("checked by caller"),
+        }
     }
 
     /// Read from socket `sock`'s inbound queue for `end`. For a stream pair:
@@ -753,7 +978,9 @@ impl Kernel {
     /// empty with the peer closed -> EOF (0). For a datagram socket: pop the
     /// next queued datagram's payload (no address; that's `recvfrom`'s job),
     /// blocking/`EAGAIN`-ing the same way while the queue is empty (UDP sockets
-    /// never see EOF). Mirrors `read_pipe`.
+    /// never see EOF). Mirrors `read_pipe`. This is the plain `read()` path
+    /// (no `MSG_*` flags); `recvfrom`/`recv` go through [`Self::recv_stream`]
+    /// and [`Self::recv_dgram_msg`] instead, which are flag-aware.
     pub(super) fn read_socket(
         &mut self,
         sock: usize,
@@ -764,11 +991,7 @@ impl Kernel {
     ) -> i64 {
         if matches!(self.net.socks[sock].kind, Kind::Dgram(_)) {
             let nonblock = self.net.socks[sock].nonblock;
-            let popped = match &mut self.net.socks[sock].kind {
-                Kind::Dgram(d) => d.queue.pop_front(),
-                _ => unreachable!("checked above"),
-            };
-            let Some((_, data)) = popped else {
+            let Some((_, data)) = self.recv_dgram_msg(sock, 0) else {
                 if nonblock {
                     return err(Errno::EAGAIN);
                 }
@@ -781,15 +1004,42 @@ impl Kernel {
             }
             return n as i64;
         }
-        let (empty, peer_open, nonblock) = match &self.net.socks[sock].kind {
+        self.recv_stream(sock, end, buf, count, mem, 0)
+    }
+
+    /// Shared stream-socket receive path for plain `read()` (`flags == 0`)
+    /// and `recvfrom()`/`recv()`. An immediate EOF (`0`) if this end's read
+    /// side was `shutdown(SHUT_RD)`; otherwise the peer's queued bytes,
+    /// honoring `MSG_PEEK` (leave the bytes queued instead of draining them),
+    /// `MSG_DONTWAIT` (force non-blocking for this call only), and a
+    /// best-effort `MSG_WAITALL` (don't return a short read while more is
+    /// expected and the peer is still writable — ignored when non-blocking,
+    /// matching real Linux). Mirrors `read_pipe`'s blocking convention:
+    /// empty + peer open -> block (or `EAGAIN`); empty + peer closed -> EOF.
+    fn recv_stream(
+        &mut self,
+        sock: usize,
+        end: usize,
+        buf: u64,
+        count: u64,
+        mem: &mut GuestMemory,
+        flags: u64,
+    ) -> i64 {
+        let (shut_rd, avail, peer_open, nonblock) = match &self.net.socks[sock].kind {
             Kind::Pair(p) => (
-                p.to[end].is_empty(),
-                p.refs[1 - end] > 0 && !p.shut[1 - end],
-                p.nonblock[end],
+                p.shut_rd[end],
+                p.to[end].len(),
+                p.refs[1 - end] > 0 && !p.shut_wr[1 - end],
+                p.nonblock[end] || flags & MSG_DONTWAIT != 0,
             ),
             _ => return err(Errno::EINVAL),
         };
-        if empty {
+        if shut_rd {
+            return 0;
+        }
+        let short =
+            flags & MSG_WAITALL != 0 && !nonblock && avail > 0 && avail < count as usize && peer_open;
+        if avail == 0 || short {
             if peer_open {
                 if nonblock {
                     return err(Errno::EAGAIN);
@@ -798,10 +1048,15 @@ impl Kernel {
             }
             return 0;
         }
+        let peek = flags & MSG_PEEK != 0;
         let data: Vec<u8> = match &mut self.net.socks[sock].kind {
             Kind::Pair(p) => {
-                let n = count.min(p.to[end].len() as u64) as usize;
-                p.to[end].drain(..n).collect()
+                let n = (count as usize).min(p.to[end].len());
+                if peek {
+                    p.to[end].iter().take(n).copied().collect()
+                } else {
+                    p.to[end].drain(..n).collect()
+                }
             }
             _ => return err(Errno::EINVAL),
         };
@@ -812,9 +1067,9 @@ impl Kernel {
     }
 
     /// Append to socket `sock`'s outbound queue for `end`. For a stream pair,
-    /// `EPIPE` if the peer end is fully closed. For a datagram socket, this is
-    /// `send` (i.e. requires a `connect`-ed peer — `EPIPE` stands in for the
-    /// real `ENOTCONN`, unavailable in this crate's errno set) and delivers
+    /// `EPIPE` if this end's write side was `shutdown(SHUT_WR)` or the peer
+    /// end is fully closed. For a datagram socket, this is `send` (i.e.
+    /// requires a `connect`-ed peer, else `ENOTCONN`) and delivers
     /// fire-and-forget, like real UDP: no error if nothing is bound at the
     /// peer's port. Mirrors `write_pipe`.
     pub(super) fn write_socket(&mut self, sock: usize, end: usize, data: &[u8]) -> i64 {
@@ -824,7 +1079,7 @@ impl Kernel {
                 _ => unreachable!("checked above"),
             };
             let Some(peer) = peer else {
-                return err(Errno::EPIPE); // real errno: ENOTCONN
+                return err(Errno::ENOTCONN);
             };
             let src = self.ensure_dgram_bound(sock);
             let key = route_key("udp", peer);
@@ -837,7 +1092,7 @@ impl Kernel {
         }
         match &mut self.net.socks[sock].kind {
             Kind::Pair(p) => {
-                if p.refs[1 - end] == 0 {
+                if p.shut_wr[end] || p.refs[1 - end] == 0 {
                     return err(Errno::EPIPE);
                 }
                 p.to[1 - end].extend(data.iter().copied());
@@ -850,8 +1105,15 @@ impl Kernel {
 
 /// Decode a `sockaddr` into an [`Addr`]: the `sun_path` for AF_UNIX, or the
 /// port/address for AF_INET (`struct sockaddr_in`) / AF_INET6
-/// (`struct sockaddr_in6`). Abstract (leading-NUL) AF_UNIX names are treated
-/// as their raw path.
+/// (`struct sockaddr_in6`). A `sun_path` whose first byte is NUL is Linux's
+/// "abstract namespace": the name is every byte after that leading NUL up to
+/// `addrlen` (embedded NULs allowed, no terminator — unlike a filesystem
+/// path). The decoded [`Addr::Unix`] keeps that leading NUL character in its
+/// `String`, which doubles as the `bind`/`listen`/`connect` lookup key in
+/// [`Net::listeners`]: since a filesystem-path bind can never start with a
+/// NUL byte, abstract and path names can never collide, and two guest
+/// processes can rendezvous on an abstract name exactly like a path one — no
+/// separate table needed.
 fn read_sockaddr(mem: &GuestMemory, ptr: u64, addrlen: u64) -> Option<Addr> {
     if addrlen < 2 {
         return None;
@@ -861,8 +1123,13 @@ fn read_sockaddr(mem: &GuestMemory, ptr: u64, addrlen: u64) -> Option<Addr> {
     match family {
         AF_UNIX => {
             let path = &bytes[2..];
-            let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
-            Some(Addr::Unix(String::from_utf8_lossy(&path[..end]).into_owned()))
+            if path.first() == Some(&0) {
+                let len = (addrlen as usize).saturating_sub(2).min(path.len());
+                Some(Addr::Unix(String::from_utf8_lossy(&path[..len]).into_owned()))
+            } else {
+                let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
+                Some(Addr::Unix(String::from_utf8_lossy(&path[..end]).into_owned()))
+            }
         }
         AF_INET if bytes.len() >= 8 => {
             let port = u16::from_be_bytes([bytes[2], bytes[3]]);
@@ -932,6 +1199,19 @@ fn write_sockaddr(
         let _ = mem.write(addr, &buf[..n]);
     }
     let _ = mem.write(addrlen_ptr, &(buf.len() as u32).to_le_bytes());
+    0
+}
+
+/// Write a `getsockopt` result: `value` to `optval` (best-effort) and its
+/// length to the `socklen_t` at `optlen_ptr`. A no-op for a null pointer.
+/// Always returns success (`0`).
+fn write_optval(mem: &mut GuestMemory, optval: u64, optlen_ptr: u64, value: &[u8]) -> i64 {
+    if optval != 0 {
+        let _ = mem.write(optval, value);
+    }
+    if optlen_ptr != 0 {
+        let _ = mem.write(optlen_ptr, &(value.len() as u32).to_le_bytes());
+    }
     0
 }
 
@@ -1273,5 +1553,137 @@ mod tests {
         let ret = call(&mut k, &mut mem, &mut v, Sysno::Accept4, [srv, 0, 0, 0, 0, 0]);
         assert_eq!(ret, -i64::from(Errno::EAGAIN.0));
         assert!(!k.block);
+    }
+
+    #[test]
+    fn setsockopt_getsockopt_rcvbuf_and_reuseaddr_roundtrip() {
+        let (mut k, mut mem, _v) = setup();
+        let s = k.sys_socket(2, 1, 0) as u64; // AF_INET, SOCK_STREAM
+
+        let optval = 0x1_1000;
+        mem.write_init(optval, &65_536u32.to_le_bytes()).unwrap();
+        assert_eq!(k.sys_setsockopt(s, SOL_SOCKET, SO_RCVBUF, optval, 4, &mem), 0);
+        mem.write_init(optval, &1u32.to_le_bytes()).unwrap();
+        assert_eq!(k.sys_setsockopt(s, SOL_SOCKET, SO_REUSEADDR, optval, 4, &mem), 0);
+
+        let out = 0x1_1100;
+        let outlen = 0x1_1200;
+        mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
+        assert_eq!(k.sys_getsockopt(s, SOL_SOCKET, SO_RCVBUF, out, outlen, &mut mem), 0);
+        assert_eq!(mem.read_u32(out).unwrap(), 65_536);
+
+        mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
+        assert_eq!(k.sys_getsockopt(s, SOL_SOCKET, SO_REUSEADDR, out, outlen, &mut mem), 0);
+        assert_eq!(mem.read_u32(out).unwrap(), 1);
+    }
+
+    #[test]
+    fn so_acceptconn_is_one_after_listen() {
+        let (mut k, mut mem, mut v) = setup();
+        let addr = 0x1_1000;
+        write_sockaddr_in(&mut mem, addr, [127, 0, 0, 1], 9800);
+        let srv = call(&mut k, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Bind, [srv, addr, 16, 0, 0, 0]), 0);
+
+        let out = 0x1_1100;
+        let outlen = 0x1_1200;
+        mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
+        assert_eq!(k.sys_getsockopt(srv, SOL_SOCKET, SO_ACCEPTCONN, out, outlen, &mut mem), 0);
+        assert_eq!(mem.read_u32(out).unwrap(), 0, "not listening yet");
+
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Listen, [srv, 8, 0, 0, 0, 0]), 0);
+
+        mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
+        assert_eq!(k.sys_getsockopt(srv, SOL_SOCKET, SO_ACCEPTCONN, out, outlen, &mut mem), 0);
+        assert_eq!(mem.read_u32(out).unwrap(), 1, "listening");
+    }
+
+    #[test]
+    fn msg_peek_returns_same_bytes_twice() {
+        let (mut k, mut mem, mut v) = setup();
+        let sv = 0x1_0000;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, sv, 0, 0]), 0);
+        let a = u64::from(mem.read_u32(sv).unwrap());
+        let b = u64::from(mem.read_u32(sv + 4).unwrap());
+
+        let msg = 0x1_1000;
+        mem.write_init(msg, b"peekme").unwrap();
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [a, msg, 6, 0, 0, 0]), 6);
+
+        let out = 0x1_2000;
+        // Two MSG_PEEK reads in a row see the same bytes: nothing is consumed.
+        assert_eq!(k.sys_recvfrom(b, out, 6, MSG_PEEK, 0, 0, &mut mem), 6);
+        assert_eq!(mem.read_vec(out, 6).unwrap(), b"peekme");
+        assert_eq!(k.sys_recvfrom(b, out, 6, MSG_PEEK, 0, 0, &mut mem), 6);
+        assert_eq!(mem.read_vec(out, 6).unwrap(), b"peekme");
+
+        // A real (non-peek) read now drains it...
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [b, out, 6, 0, 0, 0]), 6);
+        assert_eq!(mem.read_vec(out, 6).unwrap(), b"peekme");
+        // ...so a further read blocks (the peer end is still open).
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [b, out, 6, 0, 0, 0]), 0);
+        assert!(k.block);
+    }
+
+    #[test]
+    fn af_unix_abstract_namespace_bind_connect_exchange() {
+        let (mut k, mut mem, mut v) = setup();
+        let addr = 0x1_1000;
+        mem.write_init(addr, &1u16.to_le_bytes()).unwrap(); // AF_UNIX
+        // sun_path = "\0nixvm": a leading NUL marks an abstract-namespace name.
+        mem.write_init(addr + 2, b"\0nixvm").unwrap();
+        let alen = 2 + 6;
+
+        let srv = call(&mut k, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Bind, [srv, addr, alen, 0, 0, 0]), 0);
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Listen, [srv, 8, 0, 0, 0, 0]), 0);
+
+        let cli = call(&mut k, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Connect, [cli, addr, alen, 0, 0, 0]), 0);
+        let acc = call(&mut k, &mut mem, &mut v, Sysno::Accept4, [srv, 0, 0, 0, 0, 0]);
+        assert!(acc >= 3, "accept returned a fd");
+        let acc = acc as u64;
+
+        let msg = 0x1_2000;
+        let out = 0x1_3000;
+        mem.write_init(msg, b"hi").unwrap();
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [cli, msg, 2, 0, 0, 0]), 2);
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [acc, out, 2, 0, 0, 0]), 2);
+        assert_eq!(mem.read_vec(out, 2).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn shutdown_wr_then_peer_read_sees_eof() {
+        const SHUT_WR: u64 = 1;
+        let (mut k, mut mem, mut v) = setup();
+        let sv = 0x1_0000;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, sv, 0, 0]), 0);
+        let a = u64::from(mem.read_u32(sv).unwrap());
+        let b = u64::from(mem.read_u32(sv + 4).unwrap());
+
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Shutdown, [a, SHUT_WR, 0, 0, 0, 0]), 0);
+
+        // b's read sees immediate EOF (0), not a block, even though a's fd is
+        // still open (only its write side was shut down).
+        let out = 0x1_1000;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [b, out, 4, 0, 0, 0]), 0);
+        assert!(!k.block);
+
+        // a itself can no longer write.
+        let msg = 0x1_2000;
+        mem.write_init(msg, b"x").unwrap();
+        let ret = call(&mut k, &mut mem, &mut v, Sysno::Write, [a, msg, 1, 0, 0, 0]);
+        assert_eq!(ret, -i64::from(Errno::EPIPE.0));
+    }
+
+    #[test]
+    fn getpeername_on_unconnected_returns_enotconn() {
+        let (mut k, mut mem, mut v) = setup();
+        let s = call(&mut k, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
+        let peer = 0x1_1000;
+        let peerlen = 0x1_1100;
+        mem.write_init(peerlen, &16u32.to_le_bytes()).unwrap();
+        let ret = call(&mut k, &mut mem, &mut v, Sysno::Getpeername, [s, peer, peerlen, 0, 0, 0]);
+        assert_eq!(ret, -i64::from(Errno::ENOTCONN.0));
     }
 }
