@@ -7,6 +7,11 @@
 //! real hardware; the tree is entirely static and read-only, so every mutating
 //! method falls through to the `EROFS` default.
 //!
+//! The CPU topology (`devices/system/cpu/cpu0`, `cpu1`, …) is sized from
+//! [`std::thread::available_parallelism`] at first access, so it matches the
+//! host's reported core count (the guest's "nproc"). Everything else is a
+//! fixed, plausible placeholder.
+//!
 //! The tree is a `BTreeMap` keyed by mount-relative path (`""` is the `/sys`
 //! root, then `"kernel"`, `"kernel/ostype"`, …); this keeps `readdir`
 //! (children of a directory) a simple parent-path scan, mirroring `tmpfs`.
@@ -26,7 +31,7 @@ const S_IFREG: u32 = 0o100_000;
 #[derive(Debug)]
 enum Node {
     Dir { inode: u64 },
-    File { inode: u64, data: &'static [u8] },
+    File { inode: u64, data: Vec<u8> },
 }
 
 impl Node {
@@ -34,6 +39,58 @@ impl Node {
         match self {
             Node::Dir { inode } | Node::File { inode, .. } => *inode,
         }
+    }
+}
+
+/// Number of logical CPUs to report, mirroring what the guest's `nproc` would
+/// see. Falls back to `1` if the host declines to say.
+fn nproc() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+/// Render a CPU index set the way `sysfs` bitmap-list files do: `"0\n"` for a
+/// single CPU, `"0-N\n"` for a contiguous range starting at 0.
+fn cpu_range(ncpu: usize) -> String {
+    if ncpu <= 1 {
+        "0\n".to_string()
+    } else {
+        format!("0-{}\n", ncpu - 1)
+    }
+}
+
+/// Incrementally builds the static tree, handing out distinct small inodes in
+/// insertion order.
+struct Builder {
+    map: BTreeMap<String, Node>,
+    next_inode: u64,
+}
+
+impl Builder {
+    fn new() -> Self {
+        Self {
+            map: BTreeMap::new(),
+            next_inode: 0,
+        }
+    }
+
+    fn dir(&mut self, path: impl Into<String>) {
+        self.next_inode += 1;
+        self.map.insert(path.into(), Node::Dir { inode: self.next_inode });
+    }
+
+    fn file(&mut self, path: impl Into<String>, data: impl Into<Vec<u8>>) {
+        self.next_inode += 1;
+        self.map.insert(
+            path.into(),
+            Node::File {
+                inode: self.next_inode,
+                data: data.into(),
+            },
+        );
+    }
+
+    fn build(self) -> BTreeMap<String, Node> {
+        self.map
     }
 }
 
@@ -55,41 +112,74 @@ impl SysFs {
 
     /// The shared static tree, built once on first access. Directories carry
     /// distinct small inodes; files carry their fixed contents.
-    fn tree() -> &'static BTreeMap<&'static str, Node> {
-        static TREE: OnceLock<BTreeMap<&'static str, Node>> = OnceLock::new();
-        TREE.get_or_init(|| {
-            let mut t = BTreeMap::new();
-            // Directories: (path, inode). Root ("") reserves inode 1.
-            let dirs: &[(&str, u64)] = &[
-                ("", 1),
-                ("kernel", 2),
-                ("devices", 3),
-                ("devices/system", 4),
-                ("devices/system/cpu", 5),
-                ("class", 6),
-                ("fs", 7),
-                ("block", 8),
-                ("bus", 9),
-                ("module", 10),
-                ("firmware", 11),
-            ];
-            for &(path, inode) in dirs {
-                t.insert(path, Node::Dir { inode });
-            }
-            // Files: (path, inode, contents).
-            let files: &[(&str, u64, &[u8])] = &[
-                ("kernel/ostype", 12, b"Linux\n"),
-                ("kernel/osrelease", 13, b"6.1.0-nixvm\n"),
-                ("kernel/hostname", 14, b"nixvm\n"),
-                ("devices/system/cpu/online", 15, b"0\n"),
-                ("devices/system/cpu/possible", 16, b"0\n"),
-                ("devices/system/cpu/present", 17, b"0\n"),
-            ];
-            for &(path, inode, data) in files {
-                t.insert(path, Node::File { inode, data });
-            }
-            t
-        })
+    fn tree() -> &'static BTreeMap<String, Node> {
+        static TREE: OnceLock<BTreeMap<String, Node>> = OnceLock::new();
+        TREE.get_or_init(Self::build_tree)
+    }
+
+    fn build_tree() -> BTreeMap<String, Node> {
+        let ncpu = nproc();
+        let online = cpu_range(ncpu);
+        let mut b = Builder::new();
+
+        // ---- top level ----
+        b.dir("");
+        b.dir("kernel");
+        b.dir("devices");
+        b.dir("class");
+        b.dir("fs");
+        b.dir("block");
+        b.dir("bus");
+        b.dir("module");
+        b.dir("firmware");
+
+        // ---- kernel/ ----
+        b.file("kernel/ostype", *b"Linux\n");
+        b.file("kernel/osrelease", *b"6.1.0-nixvm\n");
+        b.file("kernel/hostname", *b"nixvm\n");
+        b.dir("kernel/mm");
+        b.dir("kernel/mm/transparent_hugepage");
+        b.file(
+            "kernel/mm/transparent_hugepage/enabled",
+            *b"always [madvise] never\n",
+        );
+
+        // ---- devices/system/cpu ----
+        b.dir("devices/system");
+        b.dir("devices/system/cpu");
+        b.file("devices/system/cpu/online", online.clone());
+        b.file("devices/system/cpu/possible", online.clone());
+        b.file("devices/system/cpu/present", online.clone());
+        // The compile-time max CPU index the (synthetic) kernel was built
+        // for; real kernels report a value well above the online count.
+        b.file("devices/system/cpu/kernel_max", *b"255\n");
+        for i in 0..ncpu {
+            let dir = format!("devices/system/cpu/cpu{i}");
+            let online_path = format!("{dir}/online");
+            b.dir(dir);
+            b.file(online_path, *b"1\n");
+        }
+
+        // ---- devices/system/node (single-node NUMA topology) ----
+        b.dir("devices/system/node");
+        b.dir("devices/system/node/node0");
+        b.file("devices/system/node/node0/cpulist", online);
+        b.file(
+            "devices/system/node/node0/meminfo",
+            *b"Node 0 MemTotal:        2048000 kB\n\
+               Node 0 MemFree:         1024000 kB\n\
+               Node 0 MemUsed:         1024000 kB\n",
+        );
+
+        // ---- class/ (sparse — just enough dirs to exist and be listable) ----
+        b.dir("class/net");
+        b.dir("class/tty");
+        b.dir("class/mem");
+
+        // ---- fs/cgroup (minimal presence) ----
+        b.dir("fs/cgroup");
+
+        b.build()
     }
 
     /// The mount-relative parent path of `rel` (`""` for a top-level entry).
@@ -159,7 +249,7 @@ impl MountFs for SysFs {
             None => return Err(enoent()),
         }
         let mut out = Vec::new();
-        for (&path, node) in tree {
+        for (path, node) in tree {
             if path.is_empty() || Self::parent_of(path) != rel {
                 continue;
             }
@@ -223,14 +313,88 @@ mod tests {
     }
 
     #[test]
-    fn nested_cpu_files_present() {
+    fn cpu_online_matches_nproc() {
         let mut fs = SysFs::new();
+        let ncpu = nproc();
+        let mut buf = [0u8; 64];
         for name in ["online", "possible", "present"] {
             let path = format!("devices/system/cpu/{name}");
-            let mut buf = [0u8; 8];
             let n = fs.read_at(&path, 0, &mut buf).unwrap();
-            assert_eq!(&buf[..n], b"0\n");
+            let text = std::str::from_utf8(&buf[..n]).unwrap();
+            assert_eq!(text, cpu_range(ncpu));
         }
+    }
+
+    #[test]
+    fn per_cpu_dirs_match_nproc() {
+        let mut fs = SysFs::new();
+        let ncpu = nproc();
+        let mut names: Vec<_> = fs
+            .readdir("devices/system/cpu")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        let mut expected: Vec<String> = (0..ncpu).map(|i| format!("cpu{i}")).collect();
+        expected.extend(
+            ["kernel_max", "online", "possible", "present"]
+                .iter()
+                .map(|s| (*s).to_string()),
+        );
+        expected.sort();
+        assert_eq!(names, expected);
+
+        // Every per-cpu dir has an "online" file reporting "1".
+        for i in 0..ncpu {
+            let path = format!("devices/system/cpu/cpu{i}/online");
+            let mut buf = [0u8; 4];
+            let n = fs.read_at(&path, 0, &mut buf).unwrap();
+            assert_eq!(&buf[..n], b"1\n");
+        }
+    }
+
+    #[test]
+    fn ls_sys_devices_system_cpu_lists_expected_entries() {
+        let mut fs = SysFs::new();
+        let names: Vec<_> = fs
+            .readdir("devices/system")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"cpu".to_string()));
+        assert!(names.contains(&"node".to_string()));
+    }
+
+    #[test]
+    fn node0_present_with_meminfo_and_cpulist() {
+        let mut fs = SysFs::new();
+        let a = fs.stat("devices/system/node/node0").unwrap();
+        assert_eq!(a.kind, NodeKind::Dir);
+        let mut buf = [0u8; 256];
+        let n = fs
+            .read_at("devices/system/node/node0/meminfo", 0, &mut buf)
+            .unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("Node 0 MemTotal"));
+    }
+
+    #[test]
+    fn class_and_block_and_cgroup_present() {
+        let mut fs = SysFs::new();
+        for path in ["class", "class/net", "class/tty", "class/mem", "block", "fs/cgroup"] {
+            assert_eq!(fs.stat(path).unwrap().kind, NodeKind::Dir, "{path}");
+        }
+    }
+
+    #[test]
+    fn transparent_hugepage_enabled_present() {
+        let mut fs = SysFs::new();
+        let mut buf = [0u8; 64];
+        let n = fs
+            .read_at("kernel/mm/transparent_hugepage/enabled", 0, &mut buf)
+            .unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("madvise"));
     }
 
     #[test]

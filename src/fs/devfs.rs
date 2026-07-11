@@ -1,14 +1,19 @@
 //! Synthesized `/dev` filesystem.
 //!
 //! Provides the handful of pseudo-device nodes a POSIX userland expects
-//! (`null`, `zero`, `full`, `random`, `urandom`, `tty`) without any real
-//! hardware behind them. Every node is a character device (`S_IFCHR`); the
-//! backend is otherwise stateless apart from a small PRNG used to feed
-//! `/dev/random` and `/dev/urandom`.
+//! (`null`, `zero`, `full`, `random`, `urandom`, `tty`, `console`, `ptmx`,
+//! `kmsg`) without any real hardware behind them. Every device node is a
+//! character device (`S_IFCHR`); the backend is otherwise stateless apart
+//! from a small PRNG used to feed `/dev/random` and `/dev/urandom`.
+//!
+//! Also provides the standard `/dev/fd`, `/dev/std{in,out,err}` symlinks (into
+//! `/proc/self/fd`) and the `/dev/pts`, `/dev/shm` directories (present and
+//! listable, though empty — nothing allocates entries under them yet).
 //!
 //! The set of nodes is fixed, so there is no path map: `stat`/`read_at`/
 //! `write_at` dispatch on the mount-relative name directly. The root (`""`) is
-//! the `/dev` directory itself and `readdir("")` enumerates the device names.
+//! the `/dev` directory itself and `readdir("")` enumerates the device names,
+//! directories, and symlinks.
 
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +24,8 @@ use super::{Attrs, DirEntry, MountFs, NodeKind};
 const S_IFCHR: u32 = 0o020_000;
 /// Unix mode type bit for a directory.
 const S_IFDIR: u32 = 0o040_000;
+/// Unix mode type bit for a symbolic link.
+const S_IFLNK: u32 = 0o120_000;
 /// Mode reported for every device node: char device, `rw` for everyone.
 const CHR_MODE: u32 = S_IFCHR | 0o666;
 
@@ -42,6 +49,21 @@ const DEVICES: &[(&str, u64, u64, u64)] = &[
     ("random", 5, 1, 8),
     ("urandom", 6, 1, 9),
     ("tty", 7, 5, 0),
+    ("console", 8, 5, 1),
+    ("ptmx", 9, 5, 2),
+    ("kmsg", 10, 1, 11),
+];
+
+/// Plain subdirectories under `/dev`: `(name, inode)`. Present and listable,
+/// but always empty — nothing allocates pty or shm-segment entries yet.
+const DIRS: &[(&str, u64)] = &[("pts", 11), ("shm", 12)];
+
+/// Fixed symlinks under `/dev`: `(name, inode, target)`.
+const SYMLINKS: &[(&str, u64, &str)] = &[
+    ("fd", 13, "/proc/self/fd"),
+    ("stdin", 14, "/proc/self/fd/0"),
+    ("stdout", 15, "/proc/self/fd/1"),
+    ("stderr", 16, "/proc/self/fd/2"),
 ];
 
 /// The synthesized `/dev` backend.
@@ -70,6 +92,19 @@ impl DevFs {
             .iter()
             .find(|(n, ..)| *n == name)
             .map(|(_, inode, major, minor)| (*inode, makedev(*major, *minor)))
+    }
+
+    /// Look up a plain subdirectory name, returning its inode.
+    fn dir_lookup(name: &str) -> Option<u64> {
+        DIRS.iter().find(|(n, _)| *n == name).map(|(_, inode)| *inode)
+    }
+
+    /// Look up a symlink name, returning its `(inode, target)`.
+    fn symlink_lookup(name: &str) -> Option<(u64, &'static str)> {
+        SYMLINKS
+            .iter()
+            .find(|(n, ..)| *n == name)
+            .map(|(_, inode, target)| (*inode, *target))
     }
 
     /// Char-device attributes for a device with the given inode and device
@@ -121,6 +156,15 @@ fn enoent() -> io::Error {
 fn enospc() -> io::Error {
     io::Error::from_raw_os_error(28) // ENOSPC
 }
+fn eisdir() -> io::Error {
+    io::Error::from_raw_os_error(21) // EISDIR
+}
+fn enotdir() -> io::Error {
+    io::Error::from_raw_os_error(20) // ENOTDIR
+}
+fn einval() -> io::Error {
+    io::Error::from_raw_os_error(22) // EINVAL
+}
 
 impl MountFs for DevFs {
     fn read_only(&self) -> bool {
@@ -142,12 +186,38 @@ impl MountFs for DevFs {
                 rdev: 0,
             });
         }
-        Self::lookup(rel).map(Self::dev_attrs)
+        if let Some(attrs) = Self::lookup(rel).map(Self::dev_attrs) {
+            return Some(attrs);
+        }
+        if let Some(inode) = Self::dir_lookup(rel) {
+            return Some(Attrs {
+                kind: NodeKind::Dir,
+                size: 0,
+                mode: S_IFDIR | 0o755,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+                inode,
+                nlink: 1,
+                rdev: 0,
+            });
+        }
+        Self::symlink_lookup(rel).map(|(inode, target)| Attrs {
+            kind: NodeKind::Symlink,
+            size: target.len() as u64,
+            mode: S_IFLNK | 0o777,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            inode,
+            nlink: 1,
+            rdev: 0,
+        })
     }
 
     fn read_at(&mut self, rel: &str, _off: u64, buf: &mut [u8]) -> io::Result<usize> {
         match rel {
-            "null" | "tty" => Ok(0), // always EOF
+            "null" | "tty" | "console" | "kmsg" | "ptmx" => Ok(0), // always EOF
             "zero" | "full" => {
                 buf.fill(0);
                 Ok(buf.len())
@@ -156,33 +226,66 @@ impl MountFs for DevFs {
                 self.fill_random(buf);
                 Ok(buf.len())
             }
+            _ if Self::dir_lookup(rel).is_some() => Err(eisdir()),
+            _ if Self::symlink_lookup(rel).is_some() => Err(einval()),
             _ => Err(enoent()),
         }
     }
 
     fn readdir(&mut self, rel: &str) -> io::Result<Vec<DirEntry>> {
-        if !rel.is_empty() {
-            // Device nodes are not directories.
-            return Err(io::Error::from_raw_os_error(20)); // ENOTDIR
+        match rel {
+            "" => {
+                let mut out: Vec<DirEntry> = DEVICES
+                    .iter()
+                    .map(|(name, inode, ..)| DirEntry {
+                        name: (*name).to_string(),
+                        kind: NodeKind::CharDevice,
+                        inode: *inode,
+                    })
+                    .collect();
+                out.extend(DIRS.iter().map(|(name, inode)| DirEntry {
+                    name: (*name).to_string(),
+                    kind: NodeKind::Dir,
+                    inode: *inode,
+                }));
+                out.extend(SYMLINKS.iter().map(|(name, inode, _)| DirEntry {
+                    name: (*name).to_string(),
+                    kind: NodeKind::Symlink,
+                    inode: *inode,
+                }));
+                Ok(out)
+            }
+            // `pts` and `shm` exist and are listable, but nothing populates
+            // entries under them yet.
+            "pts" | "shm" => Ok(Vec::new()),
+            _ if Self::lookup(rel).is_some() || Self::symlink_lookup(rel).is_some() => {
+                Err(enotdir())
+            }
+            _ => Err(enoent()),
         }
-        Ok(DEVICES
-            .iter()
-            .map(|(name, inode, ..)| DirEntry {
-                name: (*name).to_string(),
-                kind: NodeKind::CharDevice,
-                inode: *inode,
-            })
-            .collect())
     }
 
     fn write_at(&mut self, rel: &str, _off: u64, buf: &[u8]) -> io::Result<usize> {
         match rel {
             // Discard writes, reporting the whole buffer consumed.
-            "null" | "zero" | "random" | "urandom" | "tty" => Ok(buf.len()),
+            "null" | "zero" | "random" | "urandom" | "tty" | "console" | "kmsg" | "ptmx" => {
+                Ok(buf.len())
+            }
             // `/dev/full` is always out of space.
             "full" => Err(enospc()),
+            _ if Self::dir_lookup(rel).is_some() => Err(eisdir()),
             _ => Err(enoent()),
         }
+    }
+
+    fn readlink(&mut self, rel: &str) -> io::Result<String> {
+        if let Some((_, target)) = Self::symlink_lookup(rel) {
+            return Ok(target.to_string());
+        }
+        if rel.is_empty() || Self::lookup(rel).is_some() || Self::dir_lookup(rel).is_some() {
+            return Err(einval()); // exists, but is not a symlink
+        }
+        Err(enoent())
     }
 }
 
@@ -245,13 +348,17 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            vec!["full", "null", "random", "tty", "urandom", "zero"]
+            vec![
+                "console", "fd", "full", "kmsg", "null", "ptmx", "pts", "random", "shm",
+                "stderr", "stdin", "stdout", "tty", "urandom", "zero",
+            ]
         );
-        // Every entry is a character device.
+        // Every char-device entry is reported as such.
         assert!(
             fs.readdir("")
                 .unwrap()
                 .iter()
+                .filter(|e| DEVICES.iter().any(|(n, ..)| *n == e.name))
                 .all(|e| e.kind == NodeKind::CharDevice)
         );
     }
@@ -307,5 +414,53 @@ mod tests {
     #[test]
     fn not_read_only() {
         assert!(!DevFs::new().read_only());
+    }
+
+    #[test]
+    fn console_ptmx_kmsg_have_canonical_numbers_and_behave_like_devices() {
+        let mut fs = DevFs::new();
+        assert_eq!(fs.stat("console").unwrap().rdev, makedev(5, 1));
+        assert_eq!(fs.stat("ptmx").unwrap().rdev, makedev(5, 2));
+        assert_eq!(fs.stat("kmsg").unwrap().rdev, makedev(1, 11));
+        for name in ["console", "ptmx", "kmsg"] {
+            let a = fs.stat(name).unwrap();
+            assert_eq!(a.kind, NodeKind::CharDevice);
+            assert_eq!(a.mode, S_IFCHR | 0o666);
+            // Always EOF on read, writes are swallowed.
+            let mut buf = [0u8; 4];
+            assert_eq!(fs.read_at(name, 0, &mut buf).unwrap(), 0);
+            assert_eq!(fs.write_at(name, 0, b"x").unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn symlinks_resolve_to_proc_self_fd() {
+        let mut fs = DevFs::new();
+        assert_eq!(fs.readlink("fd").unwrap(), "/proc/self/fd");
+        assert_eq!(fs.readlink("stdin").unwrap(), "/proc/self/fd/0");
+        assert_eq!(fs.readlink("stdout").unwrap(), "/proc/self/fd/1");
+        assert_eq!(fs.readlink("stderr").unwrap(), "/proc/self/fd/2");
+        for name in ["fd", "stdin", "stdout", "stderr"] {
+            let a = fs.stat(name).unwrap();
+            assert_eq!(a.kind, NodeKind::Symlink);
+            assert_eq!(a.mode, S_IFLNK | 0o777);
+        }
+    }
+
+    #[test]
+    fn pts_and_shm_dirs_present_and_listable() {
+        let mut fs = DevFs::new();
+        for name in ["pts", "shm"] {
+            assert_eq!(fs.stat(name).unwrap().kind, NodeKind::Dir);
+            assert_eq!(fs.readdir(name).unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    fn readlink_on_non_symlink_is_einval() {
+        let mut fs = DevFs::new();
+        assert_eq!(fs.readlink("null").unwrap_err().raw_os_error(), Some(22));
+        assert_eq!(fs.readlink("pts").unwrap_err().raw_os_error(), Some(22));
+        assert_eq!(fs.readlink("").unwrap_err().raw_os_error(), Some(22));
     }
 }
