@@ -268,6 +268,82 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- logical immediate: AND/ORR/EOR/ANDS (bitmask immediate) ----
+        if (instr >> 23) & 0x3f == 0b1_00100 {
+            let sf = (instr >> 31) & 1;
+            let opc = (instr >> 29) & 3;
+            let n = (instr >> 22) & 1;
+            let immr = (instr >> 16) & 0x3f;
+            let imms = (instr >> 10) & 0x3f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let width = if sf == 1 { 64 } else { 32 };
+            if sf == 0 && n == 1 {
+                return Step::Illegal;
+            }
+            let Some((imm, _)) = decode_bit_masks(n, imms, immr, width) else {
+                return Step::Illegal;
+            };
+            let a = self.read_x(rn);
+            let r = mask_sf(
+                match opc {
+                    0b00 | 0b11 => a & imm, // AND / ANDS
+                    0b01 => a | imm,        // ORR
+                    _ => a ^ imm,           // EOR (0b10)
+                },
+                sf,
+            );
+            if opc == 0b11 {
+                self.flags = Flags {
+                    n: (r >> if sf == 1 { 63 } else { 31 }) & 1 == 1,
+                    z: r == 0,
+                    c: false,
+                    v: false,
+                };
+                self.write_x(rd, r);
+            } else {
+                self.write_sp(rd, r);
+            }
+            return Step::Next;
+        }
+
+        // ---- bitfield: SBFM/BFM/UBFM (LSL/LSR/ASR/xtend/xbfx aliases) ----
+        if (instr >> 23) & 0x3f == 0b1_00110 {
+            let sf = (instr >> 31) & 1;
+            let opc = (instr >> 29) & 3;
+            let n = (instr >> 22) & 1;
+            let immr = (instr >> 16) & 0x3f;
+            let imms = (instr >> 10) & 0x3f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let width = if sf == 1 { 64u32 } else { 32 };
+            if (sf == 1) != (n == 1) {
+                return Step::Illegal; // N must match sf
+            }
+            let Some((wmask, tmask)) = decode_bit_masks(n, imms, immr, width) else {
+                return Step::Illegal;
+            };
+            let src = self.read_x(rn);
+            let rotated = ror_val(src, immr, width) & wmask;
+            let (bot, top) = match opc {
+                0b10 => (rotated, 0u64), // UBFM
+                0b00 => {
+                    // SBFM: sign-fill from bit `imms`.
+                    let top = if (src >> imms) & 1 == 1 { ones(width) } else { 0 };
+                    (rotated, top)
+                }
+                0b01 => {
+                    // BFM: merge with the destination register.
+                    let dst = self.read_x(rd);
+                    ((dst & !wmask) | rotated, dst)
+                }
+                _ => return Step::Illegal,
+            };
+            let result = mask_sf((top & !tmask) | (bot & tmask), sf);
+            self.write_x(rd, result);
+            return Step::Next;
+        }
+
         // ---- add/subtract immediate (incl. ADDS/SUBS/CMP/CMN) ----
         if (instr >> 23) & 0x3f == 0b1_00010 {
             let sf = (instr >> 31) & 1;
@@ -615,6 +691,58 @@ fn sdiv(a: u64, b: u64, sf: bool) -> u64 {
     }
 }
 
+/// `n` low bits set.
+fn ones(n: u32) -> u64 {
+    if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+}
+
+/// Rotate the low `size` bits of `v` right by `r`.
+fn ror_val(v: u64, r: u32, size: u32) -> u64 {
+    if size == 0 {
+        return v;
+    }
+    let r = r % size;
+    let v = v & ones(size);
+    if r == 0 {
+        return v;
+    }
+    ((v >> r) | (v << (size - r))) & ones(size)
+}
+
+/// Replicate an `esize`-bit `pattern` across `width` bits.
+fn replicate(pattern: u64, esize: u32, width: u32) -> u64 {
+    let pat = pattern & ones(esize);
+    let mut result = 0u64;
+    let mut i = 0u32;
+    while i < width {
+        result |= pat << i;
+        i += esize;
+    }
+    result & ones(width)
+}
+
+/// ARM `DecodeBitMasks`: turn `(N, imms, immr)` into the `(wmask, tmask)` pair
+/// used by the logical-immediate and bitfield instructions. Returns `None` for
+/// reserved encodings.
+fn decode_bit_masks(n: u32, imms: u32, immr: u32, width: u32) -> Option<(u64, u64)> {
+    let x = (n << 6) | ((!imms) & 0x3f);
+    if x == 0 {
+        return None;
+    }
+    let len = x.ilog2();
+    if len < 1 {
+        return None;
+    }
+    let levels = (1u32 << len) - 1;
+    let s = imms & levels;
+    let r = immr & levels;
+    let diff = s.wrapping_sub(r) & levels;
+    let esize = 1u32 << len;
+    let wmask = replicate(ror_val(ones(s + 1), r, esize), esize, width);
+    let tmask = replicate(ones(diff + 1), esize, width);
+    Some((wmask, tmask))
+}
+
 /// Sign-extend the low `bits` of `v` to a full `i64`.
 const fn sign_extend(v: u64, bits: u32) -> i64 {
     let shift = 64 - bits;
@@ -670,6 +798,35 @@ mod tests {
         assert!(c.flags.z, "6 == 6 sets Z");
         assert!(c.cond_holds(0b0000), "EQ holds");
         assert!(!c.cond_holds(0b0001), "NE does not hold");
+    }
+
+    #[test]
+    fn bitfield_shifts_and_extends() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = 0x1234;
+        c.exec(0xD37C_EC20, &mut m); // lsl x0,x1,#4
+        assert_eq!(c.x[0], 0x1234 << 4);
+        c.exec(0xD344_FC20, &mut m); // lsr x0,x1,#4
+        assert_eq!(c.x[0], 0x1234 >> 4);
+
+        c.x[1] = (-16i64) as u64;
+        c.exec(0x9344_FC20, &mut m); // asr x0,x1,#4
+        assert_eq!(c.x[0] as i64, -1);
+
+        c.x[1] = 0x1234_5678_9abc_def0;
+        c.exec(0x5300_1C20, &mut m); // uxtb w0,w1  -> 0xf0
+        assert_eq!(c.x[0], 0xf0);
+        c.x[1] = 0x80; // high bit of the byte set
+        c.exec(0x9340_1C20, &mut m); // sxtb x0,x1  -> sign-extended
+        assert_eq!(c.x[0] as i64, -128);
+    }
+
+    #[test]
+    fn logical_immediate() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = 0x1_2345;
+        c.exec(0x9240_1C20, &mut m); // and x0,x1,#0xff
+        assert_eq!(c.x[0], 0x45);
     }
 
     #[test]
