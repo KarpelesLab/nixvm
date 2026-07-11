@@ -985,6 +985,98 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- INS Vd.Ts[index], Rn (insert a GP register into a lane) ----
+        if (instr >> 21) & 0x1ff == 0b0_0111_0000 && (instr >> 10) & 0x3f == 0b00_0111 {
+            let imm5 = (instr >> 16) & 0x1f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize = elem_bits(imm5);
+            let index = imm5 >> (esize / 8).trailing_zeros().wrapping_add(1);
+            let shift = u128::from(index) * u128::from(esize);
+            let mask = ones_u128(esize) << shift;
+            let val = (u128::from(self.read_x(rn)) & ones_u128(esize)) << shift;
+            self.v[rd] = (self.v[rd] & !mask) | val;
+            return Step::Next;
+        }
+
+        // ---- FMOV between GP and SIMD/FP registers (bit-exact, no convert) ----
+        if (instr >> 24) & 0x7f == 0b0011110 && (instr >> 21) & 1 == 1 && (instr >> 10) & 0x3f == 0 {
+            let ftype = (instr >> 22) & 3; // 00 = S (32-bit), 01 = D (64-bit)
+            let rmode = (instr >> 19) & 3;
+            let opcode = (instr >> 16) & 7;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            match (rmode, opcode) {
+                (0, 0b111) => {
+                    // GP -> FP: Vd = Rn (32 or 64 bits), upper bits cleared.
+                    let val = self.read_x(rn);
+                    self.v[rd] = if ftype == 0 {
+                        u128::from(val & 0xffff_ffff)
+                    } else {
+                        u128::from(val)
+                    };
+                }
+                (0, 0b110) => {
+                    // FP -> GP: Rd = Vn low 32/64 bits.
+                    let val = if ftype == 0 {
+                        (self.v[rn] as u64) & 0xffff_ffff
+                    } else {
+                        self.v[rn] as u64
+                    };
+                    self.write_x(rd, val);
+                }
+                (1, 0b111) => {
+                    // GP -> Vd.D[1] (insert into the high 64 bits).
+                    let val = u128::from(self.read_x(rn));
+                    self.v[rd] = (self.v[rd] & u128::from(u64::MAX)) | (val << 64);
+                }
+                (1, 0b110) => self.write_x(rd, (self.v[rn] >> 64) as u64), // Vn.D[1] -> GP
+                _ => return Step::Illegal, // FCVT*/SCVTF/etc: not implemented
+            }
+            return Step::Next;
+        }
+
+        // ---- SSHLL/USHLL (vector shift-left-long, widening) ----
+        if (instr >> 23) & 0x3f == 0b0_11110 && (instr >> 10) & 0x3f == 0b10_1001 {
+            let q = (instr >> 30) & 1;
+            let unsigned = (instr >> 29) & 1 == 1;
+            let immh = (instr >> 19) & 0xf;
+            let immb = (instr >> 16) & 7;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize = if immh & 0b1000 != 0 {
+                return Step::Illegal;
+            } else if immh & 0b0100 != 0 {
+                32
+            } else if immh & 0b0010 != 0 {
+                16
+            } else if immh & 0b0001 != 0 {
+                8
+            } else {
+                return Step::Illegal;
+            };
+            let shift = ((immh << 3) | immb) - esize;
+            let src = if q == 0 {
+                self.v[rn] as u64
+            } else {
+                (self.v[rn] >> 64) as u64
+            };
+            let lanes = 64 / esize;
+            let mut result = 0u128;
+            for i in 0..lanes {
+                let e = (src >> (i * esize)) & ones(esize);
+                let ext = if unsigned {
+                    u128::from(e)
+                } else {
+                    (sign_extend(e, esize) as u128) & ones_u128(2 * esize)
+                };
+                let widened = (ext << shift) & ones_u128(2 * esize);
+                result |= widened << (i * 2 * esize);
+            }
+            self.v[rd] = result;
+            return Step::Next;
+        }
+
         // ---- TBZ / TBNZ (test bit and branch) ----
         if (instr >> 25) & 0x3f == 0b01_1011 {
             let op = (instr >> 24) & 1;
@@ -1340,6 +1432,26 @@ mod tests {
     /// A scratch memory for instructions that don't touch it.
     fn scratch() -> GuestMemory {
         GuestMemory::new(0x1_0000, PAGE_SIZE)
+    }
+
+    #[test]
+    fn fmov_ins_sshll() {
+        let (mut c, mut m) = (cpu(), scratch());
+        // fmov s0, w1  (GP -> FP low 32); fmov w3, s0 (back)
+        c.x[1] = 0x1234_5678;
+        c.exec(0x1E27_0020, &mut m);
+        assert_eq!(c.v[0], 0x1234_5678);
+        c.exec(0x1E26_0003, &mut m);
+        assert_eq!(c.x[3], 0x1234_5678);
+        // mov v0.s[1], w2  (insert GP into element 1)
+        c.v[0] = 0;
+        c.x[2] = 0xAABB;
+        c.exec(0x4E0C_1C40, &mut m);
+        assert_eq!(c.v[0], 0xAABB_u128 << 32);
+        // sshll v0.2d, v0.2s, #0  ([-1, 2] -> [-1, 2] widened & sign-extended)
+        c.v[0] = (2u128 << 32) | 0xFFFF_FFFF;
+        c.exec(0x0F20_A400, &mut m);
+        assert_eq!(c.v[0], (2u128 << 64) | u128::from(u64::MAX));
     }
 
     #[test]
