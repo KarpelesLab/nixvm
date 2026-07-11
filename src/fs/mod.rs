@@ -27,6 +27,7 @@ pub mod mount;
 pub mod overlay;
 #[cfg(unix)]
 pub mod passthrough;
+pub mod procfs;
 pub mod sysfs;
 pub mod tmpfs;
 
@@ -37,6 +38,7 @@ pub use mount::MountTable;
 pub use overlay::Overlay;
 #[cfg(unix)]
 pub use passthrough::Passthrough;
+pub use procfs::ProcFs;
 pub use sysfs::SysFs;
 pub use tmpfs::TmpFs;
 
