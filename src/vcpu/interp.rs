@@ -753,6 +753,47 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- add/subtract with carry: ADC/SBC (+ flag-setting S forms) ----
+        if (instr >> 21) & 0xff == 0b1101_0000 {
+            let sf = (instr >> 31) & 1;
+            let op = (instr >> 30) & 1; // 0 = ADC, 1 = SBC
+            let s = (instr >> 29) & 1;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let a = self.read_x(rn);
+            let b = if op == 1 { !self.read_x(rm) } else { self.read_x(rm) };
+            let carry = u128::from(self.flags.c);
+            let r = if sf == 1 {
+                let sum = u128::from(a) + u128::from(b) + carry;
+                let r = sum as u64;
+                if s == 1 {
+                    self.flags = Flags {
+                        n: (r >> 63) & 1 == 1,
+                        z: r == 0,
+                        c: (sum >> 64) & 1 == 1,
+                        v: (((a ^ r) & (b ^ r)) >> 63) & 1 == 1,
+                    };
+                }
+                r
+            } else {
+                let (a32, b32) = (a as u32, b as u32);
+                let sum = u64::from(a32) + u64::from(b32) + carry as u64;
+                let r = sum as u32;
+                if s == 1 {
+                    self.flags = Flags {
+                        n: (r >> 31) & 1 == 1,
+                        z: r == 0,
+                        c: (sum >> 32) & 1 == 1,
+                        v: (((a32 ^ r) & (b32 ^ r)) >> 31) & 1 == 1,
+                    };
+                }
+                u64::from(r)
+            };
+            self.write_x(rd, r);
+            return Step::Next;
+        }
+
         // ---- conditional compare: CCMP/CCMN (immediate or register) ----
         if (instr >> 21) & 0xff == 0b1101_0010 {
             let sf = (instr >> 31) & 1;
@@ -1354,6 +1395,34 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- SIMD three-same logical: AND/BIC/ORR(MOV)/ORN/EOR/BSL/BIT/BIF ----
+        // Checked before the integer three-same arm (which uses a looser mask).
+        if (instr >> 24) & 0x1f == 0b0_1110
+            && (instr >> 21) & 1 == 1
+            && (instr >> 10) & 0x3f == 0b000111
+        {
+            let q = (instr >> 30) & 1;
+            let u = (instr >> 29) & 1;
+            let size = (instr >> 22) & 3;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let (a, b, d) = (self.v[rn], self.v[rm], self.v[rd]);
+            let r = match (u, size) {
+                (0, 0b00) => a & b,              // AND
+                (0, 0b01) => a & !b,             // BIC
+                (0, 0b10) => a | b,              // ORR (MOV when Rn==Rm)
+                (0, 0b11) => a | !b,             // ORN
+                (1, 0b00) => a ^ b,              // EOR
+                (1, 0b01) => (d & a) | (!d & b), // BSL
+                (1, 0b10) => (b & a) | (!b & d), // BIT
+                _ => (!b & a) | (b & d),         // BIF (1,0b11)
+            };
+            let mask = if q == 1 { u128::MAX } else { ones_u128(64) };
+            self.v[rd] = r & mask;
+            return Step::Next;
+        }
+
         // ---- SIMD three-same (integer): ADD/SUB (vector) and CMEQ (register) ----
         if (instr >> 24) & 0x9f == 0b0_0001110 && (instr >> 21) & 1 == 1 && (instr >> 10) & 1 == 1 {
             let q = (instr >> 30) & 1;
@@ -1431,6 +1500,61 @@ impl Aarch64Interp {
                 };
                 let widened = (ext << shift) & ones_u128(2 * esize);
                 result |= widened << (i * 2 * esize);
+            }
+            self.v[rd] = result;
+            return Step::Next;
+        }
+
+        // ---- SIMD shift by immediate: SHL / SSHR / USHR (scalar + vector) ----
+        if ((instr >> 23) & 0x3f == 0b0_11110 || (instr >> 23) & 0x3f == 0b1_11110)
+            && (instr >> 10) & 1 == 1
+        {
+            let scalar = (instr >> 23) & 0x3f == 0b1_11110;
+            let q = (instr >> 30) & 1;
+            let u = (instr >> 29) & 1;
+            let immh = (instr >> 19) & 0xf;
+            let immb = (instr >> 16) & 7;
+            let opcode = (instr >> 11) & 0x1f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize: u32 = if immh & 0b1000 != 0 {
+                64
+            } else if immh & 0b0100 != 0 {
+                32
+            } else if immh & 0b0010 != 0 {
+                16
+            } else if immh & 0b0001 != 0 {
+                8
+            } else {
+                return Step::Illegal;
+            };
+            let immhb = (immh << 3) | immb;
+            let lanes_bits = if scalar {
+                esize
+            } else if q == 1 {
+                128
+            } else {
+                64
+            };
+            let mut result = 0u128;
+            let mut i = 0;
+            while i < lanes_bits / esize {
+                let e = ((self.v[rn] >> (i * esize)) & ones_u128(esize)) as u64;
+                let lane = match opcode {
+                    0b01010 => e << (immhb - esize), // SHL
+                    0b00000 => {
+                        // SSHR (u==0) / USHR (u==1)
+                        let sh = (2 * esize - immhb).min(63);
+                        if u == 1 {
+                            e >> sh
+                        } else {
+                            (sign_extend(e, esize) >> sh) as u64
+                        }
+                    }
+                    _ => return Step::Illegal,
+                };
+                result |= u128::from(lane & ones(esize)) << (i * esize);
+                i += 1;
             }
             self.v[rd] = result;
             return Step::Next;
@@ -2225,6 +2349,30 @@ mod tests {
         c.pc = 0x1000;
         c.x[0] = 8; // bit 3 set -> TBZ not taken
         assert!(matches!(c.exec(0x3618_0040, &mut m), Step::Next));
+    }
+
+    #[test]
+    fn adc_sbc_use_carry() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[0] = 10;
+        c.x[1] = 3;
+        c.flags.c = true;
+        c.exec(0x9A01_0002, &mut m); // adc x2,x0,x1 -> 10+3+1
+        assert_eq!(c.x[2], 14);
+        c.flags.c = false;
+        c.exec(0xDA01_0002, &mut m); // sbc x2,x0,x1 -> 10-3-1
+        assert_eq!(c.x[2], 6);
+    }
+
+    #[test]
+    fn shl_scalar_and_vector_mov() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = 0xff;
+        c.exec(0x5F74_5421, &mut m); // shl d1,d1,#52
+        assert_eq!(c.v[1], 0xff << 52);
+        c.v[0] = 0x1234_5678_9abc_def0;
+        c.exec(0x4EA0_1C02, &mut m); // mov v2.16b, v0.16b (orr)
+        assert_eq!(c.v[2], c.v[0]);
     }
 
     #[test]
