@@ -35,10 +35,18 @@
 //! `USHLL`, `UADDW`/`SADDW`, `ADDHN`), saturating integer arithmetic
 //! (`SQADD`/`UQADD`/`SQSUB`/`UQSUB`, `SQSHL`/`UQSHL`/`SQRSHL`/`UQRSHL`,
 //! `SUQADD`/`USQADD`), pairwise (`ADDP`/`UMAXP`/`UMINP`/`SMAXP`/`SMINP`/
-//! `FADDP`/`FMAXP`, vector and scalar), across-lanes (`SMAXV`/`SMINV`/
-//! `UMAXV`/`UMINV` alongside `ADDV`/`UADDLV`), and scalar `CRC32B`/`H`/`W`/
-//! `X` + `CRC32CB`/`H`/`W`/`X`. Anything else surfaces as
-//! [`Exit::IllegalInstruction`].
+//! `FADDP`/`FMAXP`, vector and scalar — including `LDNP`/`STNP`, which reuse
+//! the `LDP`/`STP` decode paths since they share an addressing mode),
+//! across-lanes (`SMAXV`/`SMINV`/`UMAXV`/`UMINV` alongside `ADDV`/`UADDLV`,
+//! plus float `FMAXNMV`/`FMINNMV`/`FMAXV`/`FMINV`), scalar `CRC32B`/`H`/`W`/
+//! `X` + `CRC32CB`/`H`/`W`/`X`, by-element FP/int multiply (`FMUL`/`FMLA`/
+//! `FMLS`/`FMULX`, `MUL`/`MLA`/`MLS`, `SMULL`/`UMULL`/`SQDMULL`, scalar and
+//! vector as applicable), reciprocal/rsqrt estimates and their
+//! Newton-Raphson refinement steps (`FRECPE`/`FRSQRTE`/`FRECPS`/`FRSQRTS`
+//! scalar and vector, `URECPE`/`URSQRTE` vector), scalar/vector FP
+//! compare-to-zero (`FCMEQ`/`FCMGT`/`FCMGE`/`FCMLT`/`FCMLE`) and `FABD`, and
+//! `PRFM` (decoded as a no-op in all its addressing forms). Anything else
+//! surfaces as [`Exit::IllegalInstruction`].
 
 use crate::abi::Arch;
 
@@ -525,6 +533,12 @@ impl Aarch64Interp {
     }
 
     #[allow(clippy::too_many_lines)]
+    // The by-element-multiply arm binds `q`/`u`/`l`/`m`/`h` together in one
+    // scope — these are the ARM ARM's own one-letter names for those
+    // instruction-encoding fields (Q, U, L, M, H), and spelling them out
+    // would make that arm harder, not easier, to cross-check against the
+    // manual.
+    #[allow(clippy::many_single_char_names)]
     fn exec(&mut self, instr: u32, mem: &mut GuestMemory) -> Step {
         // ---- exact-match control flow ----
         if instr & 0xFFE0_001F == 0xD400_0001 {
@@ -1298,6 +1312,27 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- PRFM (immediate unsigned offset / unscaled / register offset): prefetch, no-op ----
+        // Shares its outer format bits with the three general GP load/store
+        // classes immediately below (unsigned immediate, unscaled/pre/
+        // post-index, and register offset) — within each of those, `opc`
+        // (bits[23:22]) is a full 2-bit field, and `opc == 0b10` with
+        // `size == 0b11` (64-bit) is exactly the encoding space PRFM claims
+        // (their generic `opc` only ever uses 00/01 for size 0b11: STR/LDR).
+        // Checked first, per this file's ordering discipline, so those
+        // classes' `ldst` dispatch doesn't misdecode a prefetch hint's
+        // "Rt" (really a prefetch-operation selector, not a register) as a
+        // real load destination — which could needlessly fault on memory a
+        // prefetch is allowed to ignore.
+        if (instr >> 27) & 0x7 == 0b111
+            && (instr >> 26) & 1 == 0
+            && (instr >> 30) & 3 == 0b11
+            && (instr >> 22) & 3 == 0b10
+            && matches!((instr >> 24) & 0x3, 0b00 | 0b01)
+        {
+            return Step::Next;
+        }
+
         // ---- load/store register, unsigned immediate offset ----
         if (instr >> 27) & 0x7 == 0b111 && (instr >> 24) & 0x3 == 0b01 && (instr >> 26) & 1 == 0 {
             let size = (instr >> 30) & 3;
@@ -1967,7 +2002,7 @@ impl Aarch64Interp {
         }
 
         // ---- SIMD three-same (floating-point): FADD/FSUB/FMUL/FDIV/FMLA/FMLS/
-        // FCMEQ/FCMGE/FCMGT (2S/4S/2D) ----
+        // FABD/FRECPS/FRSQRTS/FCMEQ/FCMGE/FCMGT (2S/4S/2D) ----
         // Shares its outer bit pattern with the integer three-same class below,
         // but is disambiguated (and thus must be checked first) by the exact
         // (U, a, opcode) combination baked into the match guard, so it never
@@ -1977,8 +2012,9 @@ impl Aarch64Interp {
             && (instr >> 10) & 1 == 1
             && matches!(
                 ((instr >> 29) & 1, (instr >> 23) & 1, (instr >> 11) & 0x1f),
-                (0, 0 | 1, 0b11010 | 0b11001) // FADD/FSUB, FMLA/FMLS
+                (0, 0 | 1, 0b11010 | 0b11001 | 0b11111) // FADD/FSUB/FRECPS/FRSQRTS, FMLA/FMLS
                     | (1, 0, 0b11011 | 0b11111) // FMUL / FDIV
+                    | (1, 1, 0b11010) // FABD
                     | (0, 0, 0b11100) // FCMEQ
                     | (1, 0 | 1, 0b11100) // FCMGE / FCMGT
             )
@@ -2009,6 +2045,9 @@ impl Aarch64Interp {
                         (1, 0, 0b11111) => (lhs / rhs).to_bits(),
                         (0, 0, 0b11001) => lhs.mul_add(rhs, acc()).to_bits(),
                         (0, 1, 0b11001) => (-lhs).mul_add(rhs, acc()).to_bits(),
+                        (1, 1, 0b11010) => (lhs - rhs).abs().to_bits(), // FABD
+                        (0, 0, 0b11111) => (2.0 - lhs * rhs).to_bits(), // FRECPS
+                        (0, 1, 0b11111) => ((3.0 - lhs * rhs) / 2.0).to_bits(), // FRSQRTS
                         (0, 0, 0b11100) => fbits_bool32(fp_eq(f64::from(lhs), f64::from(rhs))),
                         (1, 0, 0b11100) => fbits_bool32(f64::from(lhs) >= f64::from(rhs)),
                         _ => fbits_bool32(f64::from(lhs) > f64::from(rhs)), // (1,1,0b11100) FCMGT
@@ -2030,6 +2069,9 @@ impl Aarch64Interp {
                         (1, 0, 0b11111) => (lhs / rhs).to_bits(),
                         (0, 0, 0b11001) => lhs.mul_add(rhs, acc()).to_bits(),
                         (0, 1, 0b11001) => (-lhs).mul_add(rhs, acc()).to_bits(),
+                        (1, 1, 0b11010) => (lhs - rhs).abs().to_bits(), // FABD
+                        (0, 0, 0b11111) => (2.0 - lhs * rhs).to_bits(), // FRECPS
+                        (0, 1, 0b11111) => ((3.0 - lhs * rhs) / 2.0).to_bits(), // FRSQRTS
                         (0, 0, 0b11100) => fbits_bool64(fp_eq(lhs, rhs)),
                         (1, 0, 0b11100) => fbits_bool64(lhs >= rhs),
                         _ => fbits_bool64(lhs > rhs), // (1,1,0b11100) FCMGT
@@ -2038,6 +2080,49 @@ impl Aarch64Interp {
                 }
                 result
             };
+            return Step::Next;
+        }
+
+        // ---- SIMD scalar three-same (floating-point): FABD/FRECPS/FRSQRTS ----
+        // The scalar (bit28 == 1) counterpart of the vector three-same FP arm
+        // above. No other scalar three-same FP op is implemented here: plain
+        // scalar FADD/FSUB/FMUL/FDIV go through the unrelated, non-SIMD "FP
+        // data-processing (2 source)" encoding instead (see below), and
+        // scalar FMLA/FMLS/FMUL only exist in their by-element form — so only
+        // these three opcodes are handled by this arm.
+        if (instr >> 24) & 0x9f == 0b0_0011110
+            && (instr >> 21) & 1 == 1
+            && (instr >> 10) & 1 == 1
+            && matches!(
+                ((instr >> 29) & 1, (instr >> 23) & 1, (instr >> 11) & 0x1f),
+                (1, 1, 0b11010) // FABD
+                    | (0, 0 | 1, 0b11111) // FRECPS / FRSQRTS
+            )
+        {
+            let uns = (instr >> 29) & 1;
+            let asub = (instr >> 23) & 1;
+            let dbl = (instr >> 22) & 1;
+            let opcode = (instr >> 11) & 0x1f;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            if dbl == 0 {
+                let (a, b) = (self.fp32(rn), self.fp32(rm));
+                let r = match (uns, asub, opcode) {
+                    (1, 1, 0b11010) => (a - b).abs(),      // FABD
+                    (0, 0, 0b11111) => 2.0 - a * b,        // FRECPS
+                    _ => (3.0 - a * b) / 2.0,               // (0,1,0b11111) FRSQRTS
+                };
+                self.set_fp32(rd, r);
+            } else {
+                let (a, b) = (self.fp64(rn), self.fp64(rm));
+                let r = match (uns, asub, opcode) {
+                    (1, 1, 0b11010) => (a - b).abs(),
+                    (0, 0, 0b11111) => 2.0 - a * b,
+                    _ => (3.0 - a * b) / 2.0,
+                };
+                self.set_fp64(rd, r);
+            }
             return Step::Next;
         }
 
@@ -2464,6 +2549,121 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- SIMD two-register misc (scalar + vector): FCMEQ/FCMGT/FCMGE/
+        // FCMLT/FCMLE against #0.0, FRECPE/FRSQRTE, URECPE/URSQRTE ----
+        // Same "two-register miscellaneous" outer format as the FABS/FNEG/
+        // FSQRT/ABS/NEG arm below, whose own opcode guard is broad enough
+        // (any `(uns, hi, opcode)` not in its table falls straight to
+        // `Illegal`) that it would swallow the vector (bit28 == 0) form of
+        // these opcodes before they got a chance to run — so, per this
+        // file's ordering discipline, this more-specific arm is checked
+        // first. This is also the first arm in this file to decode the
+        // *scalar* (bit28 == 1) two-register-misc encoding at all — nothing
+        // below handles it, so there's no shadowing risk on that side.
+        if ((instr >> 24) & 0x1f == 0b0_1110 || (instr >> 24) & 0x1f == 0b1_1110)
+            && (instr >> 17) & 0x1f == 0b1_0000
+            && (instr >> 10) & 3 == 0b10
+            && matches!(
+                (instr >> 12) & 0x1f,
+                0b0_1101 | 0b0_1100 | 0b0_1110 | 0b1_1101 | 0b1_1100
+            )
+        {
+            let scalar = (instr >> 24) & 0x1f == 0b1_1110;
+            let q = (instr >> 30) & 1;
+            let uns = (instr >> 29) & 1;
+            let size = (instr >> 22) & 3;
+            let opcode = (instr >> 12) & 0x1f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            if size >> 1 == 0 {
+                return Step::Illegal; // reserved: needs S/D (float) or 32-bit (int)
+            }
+            let dbl = size & 1 == 1;
+
+            if opcode == 0b1_1100 {
+                // URECPE/URSQRTE: integer, vector-only, 32-bit lanes only.
+                if scalar || dbl {
+                    return Step::Illegal;
+                }
+                let lanes = if q == 1 { 4 } else { 2 };
+                let mut result = 0u128;
+                for i in 0..lanes {
+                    let sh = i * 32;
+                    let x = ((self.v[rn] >> sh) & 0xffff_ffff) as u32;
+                    let r = if uns == 0 {
+                        u32_recip_estimate(x)
+                    } else {
+                        u32_rsqrt_estimate(x)
+                    };
+                    result |= u128::from(r) << sh;
+                }
+                self.v[rd] = result;
+                return Step::Next;
+            }
+
+            if dbl && !scalar && q == 0 {
+                return Step::Illegal; // 1D is not a valid vector arrangement here
+            }
+            let lanes: u32 = if scalar {
+                1
+            } else if dbl {
+                2
+            } else if q == 1 {
+                4
+            } else {
+                2
+            };
+            let esize = if dbl { 64u32 } else { 32 };
+            let mask = ones_u128(esize);
+            let mut result = self.v[rd];
+            for i in 0..lanes {
+                let sh = i * esize;
+                // FRECPE/FRSQRTE "estimate": this interpreter has no hardware
+                // pipeline to approximate, so it uses the exact reciprocal /
+                // reciprocal square root here rather than the ARM ARM's
+                // 8-bit lookup table. Real guest code that relies on the
+                // *_ESTIMATE contract always follows up with a
+                // Newton-Raphson refinement step (FRECPS/FRSQRTS) and
+                // converges either way.
+                let bits: u128 = if dbl {
+                    let x = f64::from_bits(((self.v[rn] >> sh) & mask) as u64);
+                    let r = match (opcode, uns) {
+                        (0b0_1101, 0) => fbits_bool64(fp_eq(x, 0.0)), // FCMEQ #0.0
+                        (0b0_1101, 1) => fbits_bool64(x <= 0.0),      // FCMLE #0.0
+                        (0b0_1100, 0) => fbits_bool64(x > 0.0),       // FCMGT #0.0
+                        (0b0_1100, 1) => fbits_bool64(x >= 0.0),      // FCMGE #0.0
+                        (0b0_1110, 0) => fbits_bool64(x < 0.0),       // FCMLT #0.0
+                        (0b1_1101, 0) => (1.0f64 / x).to_bits(),      // FRECPE
+                        (0b1_1101, 1) => (1.0f64 / x.sqrt()).to_bits(), // FRSQRTE
+                        _ => return Step::Illegal,
+                    };
+                    u128::from(r)
+                } else {
+                    let x = f32::from_bits(((self.v[rn] >> sh) & mask) as u32);
+                    let r = match (opcode, uns) {
+                        (0b0_1101, 0) => fbits_bool32(fp_eq(f64::from(x), 0.0)),
+                        (0b0_1101, 1) => fbits_bool32(x <= 0.0),
+                        (0b0_1100, 0) => fbits_bool32(x > 0.0),
+                        (0b0_1100, 1) => fbits_bool32(x >= 0.0),
+                        (0b0_1110, 0) => fbits_bool32(x < 0.0),
+                        (0b1_1101, 0) => (1.0f32 / x).to_bits(),
+                        (0b1_1101, 1) => (1.0f32 / x.sqrt()).to_bits(),
+                        _ => return Step::Illegal,
+                    };
+                    u128::from(r)
+                };
+                result = (result & !(mask << sh)) | (bits << sh);
+            }
+            self.v[rd] = if scalar {
+                result & mask
+            } else if q == 1 {
+                result
+            } else {
+                result & ones_u128(64)
+            };
+            return Step::Next;
+        }
+
         // ---- SIMD two-reg-misc: FABS/FNEG/FSQRT and ABS/NEG (vector) ----
         // Same outer class as NOT/MVN above but a disjoint opcode field
         // (0b01111/0b11111 vs NOT's 0b00101), so ordering relative to it is
@@ -2652,6 +2852,41 @@ impl Aarch64Interp {
             } else {
                 narrow
             };
+            return Step::Next;
+        }
+
+        // ---- FMAXNMV/FMINNMV/FMAXV/FMINV (across-lanes float reduction, .4S only) ----
+        // Shares its outer bits with the ADDV/UADDLV/S|UMAXV/S|UMINV arm
+        // below, whose own opcode guard is broad enough (any `(u, opcode)`
+        // not in its table falls straight to `Illegal`) that it would
+        // swallow these two opcodes (0b01100/0b01111) before they got a
+        // chance to run — so, per this file's ordering discipline, this
+        // more-specific arm is checked first.
+        if (instr >> 24) & 0x1f == 0b0_1110
+            && (instr >> 17) & 0x1f == 0b1_1000
+            && (instr >> 10) & 3 == 0b10
+            && matches!((instr >> 12) & 0x1f, 0b0_1100 | 0b0_1111)
+        {
+            let q = (instr >> 30) & 1;
+            let is_min = (instr >> 22) & 1 == 1;
+            let is_nm = (instr >> 12) & 0x1f == 0b0_1100;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            if q == 0 {
+                return Step::Illegal; // only the 4S arrangement is defined
+            }
+            let lane = |i: u32| f32::from_bits(((self.v[rn] >> (i * 32)) & 0xffff_ffff) as u32);
+            let mut acc = lane(0);
+            for i in 1..4 {
+                let v = lane(i);
+                acc = match (is_nm, is_min) {
+                    (true, true) => acc.min(v),   // FMINNMV
+                    (true, false) => acc.max(v),  // FMAXNMV
+                    (false, true) => fmin32(acc, v), // FMINV
+                    (false, false) => fmax32(acc, v), // FMAXV
+                };
+            }
+            self.set_fp32(rd, acc);
             return Step::Next;
         }
 
@@ -2845,6 +3080,157 @@ impl Aarch64Interp {
                 i += 1;
             }
             self.v[rd] = result;
+            return Step::Next;
+        }
+
+        // ---- Advanced SIMD (scalar and vector) x indexed element: FMUL/
+        // FMLA/FMLS/FMULX, MUL/MLA/MLS, SMULL/UMULL/SQDMULL (by element) ----
+        // A previously-unhandled top-level class: bits[28:24] == 0b01111
+        // (vector, Q at bit30) or 0b11111 (scalar, bit30 fixed 1) with
+        // bit10 == 0 — disjoint from every "three-same" class above (which
+        // fixes the same bit range to `...1110` and always has bit10 == 1),
+        // so this can't shadow, or be shadowed by, anything already
+        // handled; placement relative to other arms is immaterial.
+        if ((instr >> 24) & 0x1f == 0b0_1111 || (instr >> 24) & 0x1f == 0b1_1111)
+            && (instr >> 10) & 1 == 0
+        {
+            let scalar = (instr >> 24) & 0x1f == 0b1_1111;
+            let q = (instr >> 30) & 1;
+            let u = (instr >> 29) & 1;
+            let size = (instr >> 22) & 3;
+            let l = (instr >> 21) & 1;
+            let m = (instr >> 20) & 1;
+            let rm_lo4 = (instr >> 16) & 0xf; // Rm[3:0]; M (above) supplies bit 4 for S/D sizes
+            let opcode = (instr >> 12) & 0xf;
+            let h = (instr >> 11) & 1;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+
+            // The indexed element's register and lane index; layout depends
+            // on the source element size (ARM `Rm`/`index` tables for this
+            // encoding — H restricts Vm to V0-V15 and folds M into the
+            // index, S/D use the full V0-V31 range via M:Rm).
+            let (esize, rm, index): (u32, usize, u32) = match size {
+                0b01 => (16, rm_lo4 as usize, (h << 2) | (l << 1) | m),
+                0b10 => (32, (((m << 4) | rm_lo4) & 0x1f) as usize, (h << 1) | l),
+                0b11 => (64, (((m << 4) | rm_lo4) & 0x1f) as usize, h),
+                _ => return Step::Illegal,
+            };
+            let mask = ones_u128(esize);
+            let m_elem = (self.v[rm] >> (index * esize)) & mask;
+
+            if matches!(opcode, 0b0001 | 0b0101 | 0b1001) {
+                // FMLA / FMLS / FMUL / FMULX (float; S or D elements only).
+                if esize != 32 && esize != 64 {
+                    return Step::Illegal;
+                }
+                if esize == 64 && !scalar && q == 0 {
+                    return Step::Illegal; // 1D is not a valid vector arrangement
+                }
+                let lanes: u32 = if scalar {
+                    1
+                } else if esize == 32 {
+                    if q == 1 { 4 } else { 2 }
+                } else {
+                    2
+                };
+                let mut result = self.v[rd];
+                for i in 0..lanes {
+                    let sh = i * esize;
+                    let bits: u128 = if esize == 32 {
+                        let mv = f32::from_bits(m_elem as u32);
+                        let nv = f32::from_bits(((self.v[rn] >> sh) & mask) as u32);
+                        let acc = f32::from_bits(((self.v[rd] >> sh) & mask) as u32);
+                        let r = match (opcode, u) {
+                            (0b0001, 0) => nv.mul_add(mv, acc),   // FMLA
+                            (0b0101, 0) => (-nv).mul_add(mv, acc), // FMLS
+                            (0b1001, 0) => nv * mv,                // FMUL
+                            (0b1001, 1) => fmulx32(nv, mv),        // FMULX
+                            _ => return Step::Illegal,
+                        };
+                        u128::from(r.to_bits())
+                    } else {
+                        let mv = f64::from_bits(m_elem as u64);
+                        let nv = f64::from_bits(((self.v[rn] >> sh) & mask) as u64);
+                        let acc = f64::from_bits(((self.v[rd] >> sh) & mask) as u64);
+                        let r = match (opcode, u) {
+                            (0b0001, 0) => nv.mul_add(mv, acc),
+                            (0b0101, 0) => (-nv).mul_add(mv, acc),
+                            (0b1001, 0) => nv * mv,
+                            (0b1001, 1) => fmulx64(nv, mv),
+                            _ => return Step::Illegal,
+                        };
+                        u128::from(r.to_bits())
+                    };
+                    result = (result & !(mask << sh)) | (bits << sh);
+                }
+                self.v[rd] = if scalar {
+                    result & mask
+                } else if esize == 32 && q == 0 {
+                    result & ones_u128(64)
+                } else {
+                    result
+                };
+                return Step::Next;
+            }
+
+            // Integer by-element: MUL/MLA/MLS (non-widening, H/S) and
+            // SMULL/UMULL/SQDMULL (widening H->S or S->D). Vector-only —
+            // none of these have a defined scalar-register form.
+            if scalar || esize == 64 {
+                return Step::Illegal;
+            }
+            match (opcode, u) {
+                (0b1000, 0) | (0b0000 | 0b0100, 1) => {
+                    // MUL / MLA / MLS (non-widening).
+                    let lanes = (if q == 1 { 128 } else { 64 }) / esize;
+                    let mut result = 0u128;
+                    for i in 0..lanes {
+                        let sh = i * esize;
+                        let n_elem = (self.v[rn] >> sh) & mask;
+                        let prod = n_elem.wrapping_mul(m_elem) & mask;
+                        let lane = match (opcode, u) {
+                            (0b1000, 0) => prod, // MUL
+                            (0b0000, 1) => ((self.v[rd] >> sh) & mask).wrapping_add(prod) & mask, // MLA
+                            _ => ((self.v[rd] >> sh) & mask).wrapping_sub(prod) & mask, // MLS
+                        };
+                        result |= lane << sh;
+                    }
+                    self.v[rd] = result;
+                }
+                (0b1010, _) | (0b1011, 0) => {
+                    // SMULL / UMULL / SQDMULL (widening H->S or S->D). Q
+                    // selects which half of the narrow source registers
+                    // supplies the lanes, same convention as SADDL/UADDL.
+                    let src_shift = if q == 1 { 64 } else { 0 };
+                    let lanes = 64 / esize;
+                    let wide_mask = ones_u128(esize * 2);
+                    let mut result = 0u128;
+                    for i in 0..lanes {
+                        let n_elem = (self.v[rn] >> (src_shift + i * esize)) & mask;
+                        let lane = if opcode == 0b1011 {
+                            // SQDMULL: 2 * n * m, signed-saturated to 2*esize bits.
+                            signed_sat(
+                                2 * i128::from(sign_extend(n_elem as u64, esize))
+                                    * i128::from(sign_extend(m_elem as u64, esize)),
+                                esize * 2,
+                            )
+                        } else if u == 0 {
+                            // SMULL
+                            ((i128::from(sign_extend(n_elem as u64, esize))
+                                * i128::from(sign_extend(m_elem as u64, esize)))
+                                as u128)
+                                & wide_mask
+                        } else {
+                            // UMULL
+                            n_elem.wrapping_mul(m_elem) & wide_mask
+                        };
+                        result |= lane << (i * esize * 2);
+                    }
+                    self.v[rd] = result;
+                }
+                _ => return Step::Illegal,
+            }
             return Step::Next;
         }
 
@@ -3400,6 +3786,63 @@ fn fmin64(a: f64, b: f64) -> f64 {
     } else {
         a.min(b)
     }
+}
+
+/// `FMULX` (single): like plain multiplication, except the IEEE-754-awkward
+/// `0.0 * infinity` (or `infinity * 0.0`) case is redefined to `±2.0` (sign
+/// from the XOR of the two operands' signs) instead of the default `NaN` —
+/// every other input is a plain `a * b`. Zero-ness is tested via the bit
+/// pattern (masking off the sign bit) rather than `==` so this doesn't need
+/// a `clippy::float_cmp` exemption.
+fn fmulx32(a: f32, b: f32) -> f32 {
+    let a_zero = a.to_bits() & 0x7fff_ffff == 0;
+    let b_zero = b.to_bits() & 0x7fff_ffff == 0;
+    if (a_zero && b.is_infinite()) || (a.is_infinite() && b_zero) {
+        if a.is_sign_negative() ^ b.is_sign_negative() {
+            -2.0
+        } else {
+            2.0
+        }
+    } else {
+        a * b
+    }
+}
+
+/// As [`fmulx32`], for double precision.
+fn fmulx64(a: f64, b: f64) -> f64 {
+    let a_zero = a.to_bits() & 0x7fff_ffff_ffff_ffff == 0;
+    let b_zero = b.to_bits() & 0x7fff_ffff_ffff_ffff == 0;
+    if (a_zero && b.is_infinite()) || (a.is_infinite() && b_zero) {
+        if a.is_sign_negative() ^ b.is_sign_negative() {
+            -2.0
+        } else {
+            2.0
+        }
+    } else {
+        a * b
+    }
+}
+
+/// `URECPE` unsigned integer reciprocal estimate: `operand` and the result
+/// are both unsigned 0.32 fixed-point fractions (implicitly scaled by
+/// `2^32`) with `operand * result ≈ 2^64` — i.e. the result approximates
+/// `1/operand` in that fixed-point system. The real `URECPE` instead
+/// consults the ARM ARM's 8-bit reciprocal lookup table; this is a plainer
+/// (but reasonably-behaved and monotonic) stand-in, in the same spirit as
+/// using the exact reciprocal for `FRECPE` above.
+fn u32_recip_estimate(operand: u32) -> u32 {
+    let x = operand.max(0x8000_0000); // architecturally clamped to >= 0.5
+    ((1u64 << 63) / u64::from(x)).min(u64::from(u32::MAX)) as u32
+}
+
+/// `URSQRTE` unsigned integer reciprocal-square-root estimate, in the same
+/// 0.32 fixed-point system as [`u32_recip_estimate`] (`sqrt(operand) *
+/// result ≈ 2^47`), using an exact `f64` square root rather than the ARM
+/// ARM's lookup table.
+fn u32_rsqrt_estimate(operand: u32) -> u32 {
+    let x = operand.max(0x4000_0000); // architecturally clamped to >= 0.25
+    let r = 2f64.powi(47) / f64::from(x).sqrt();
+    r.min(f64::from(u32::MAX)) as u32
 }
 
 /// Convert IEEE-754 half-precision bits to `f32` (used by `FCVT`). Rust has no
@@ -4780,5 +5223,134 @@ mod tests {
                 write: false
             }
         );
+    }
+
+    #[test]
+    fn fmul_by_element() {
+        let (mut c, mut m) = (cpu(), scratch());
+        // fmul s0, s1, v2.s[0]  (encoding cross-checked via clang+objdump)
+        c.v[1] = u128::from(3.0f32.to_bits());
+        c.v[2] = quad_f32(2.0, 100.0, 100.0, 100.0); // index 0 -> 2.0
+        c.exec(0x5F82_9020, &mut m);
+        assert_eq!(f32::from_bits(c.v[0] as u32), 6.0);
+
+        // fmul v0.4s, v1.4s, v2.s[1] (vector by-element, index 1 -> 5.0)
+        c.v[1] = quad_f32(1.0, 2.0, 3.0, 4.0);
+        c.v[2] = quad_f32(10.0, 5.0, 10.0, 10.0);
+        c.exec(0x4FA2_9020, &mut m);
+        assert_eq!(
+            c.v[0],
+            quad_f32(5.0, 10.0, 15.0, 20.0),
+            "each lane of v1 * v2.s[1] (5.0)"
+        );
+    }
+
+    #[test]
+    fn fmla_by_element_accumulates() {
+        let (mut c, mut m) = (cpu(), scratch());
+        // fmla v0.4s, v1.4s, v2.s[1]  (Vd += Vn * Vm[index])
+        c.v[0] = quad_f32(1.0, 1.0, 1.0, 1.0); // pre-existing accumulator
+        c.v[1] = quad_f32(1.0, 2.0, 3.0, 4.0);
+        c.v[2] = quad_f32(10.0, 5.0, 10.0, 10.0); // index 1 -> 5.0
+        c.exec(0x4FA2_1020, &mut m);
+        assert_eq!(c.v[0], quad_f32(6.0, 11.0, 16.0, 21.0));
+    }
+
+    #[test]
+    fn frecpe_then_frecps_converges_toward_reciprocal() {
+        let (mut c, mut m) = (cpu(), scratch());
+        let x = 4.0f32;
+        // frecpe s0, s1  (initial estimate of 1/x)
+        c.v[1] = u128::from(x.to_bits());
+        c.exec(0x5EA1_D820, &mut m);
+        let estimate = f32::from_bits(c.v[0] as u32);
+        assert_eq!(estimate, 0.25, "this interpreter's FRECPE is the exact reciprocal");
+
+        // One Newton-Raphson refinement step: y1 = y0 * frecps(x, y0), which
+        // should already have converged to 1/x given an exact-reciprocal
+        // FRECPE estimate.
+        c.v[1] = u128::from(x.to_bits()); // s1 = x
+        c.v[2] = u128::from(estimate.to_bits()); // s2 = y0
+        c.exec(0x5E22_FC20, &mut m); // frecps s0, s1, s2 -> 2.0 - x*y0
+        let step = f32::from_bits(c.v[0] as u32);
+        let refined = estimate * step;
+        assert!(
+            (refined - 1.0 / x).abs() < 1e-6,
+            "refined={refined} should converge to 1/x={}",
+            1.0 / x
+        );
+    }
+
+    #[test]
+    fn fcmeq_vector_vs_zero_mask() {
+        let (mut c, mut m) = (cpu(), scratch());
+        // fcmeq v0.4s, v1.4s, #0.0
+        c.v[1] = quad_f32(0.0, -0.0, 1.0, f32::NAN);
+        c.exec(0x4EA0_D820, &mut m);
+        assert_eq!(
+            c.v[0],
+            quad_u32(u32::MAX, u32::MAX, 0, 0),
+            "lanes 0/1 (+0.0/-0.0) compare equal to zero, lane 2 (1.0) and \
+             lane 3 (NaN, unordered) do not"
+        );
+    }
+
+    #[test]
+    fn fabd_scalar_and_vector() {
+        let (mut c, mut m) = (cpu(), scratch());
+        // fabd s0, s1, s2 -> |5.0 - 8.0| = 3.0
+        c.v[1] = u128::from(5.0f32.to_bits());
+        c.v[2] = u128::from(8.0f32.to_bits());
+        c.exec(0x7EA2_D420, &mut m);
+        assert_eq!(f32::from_bits(c.v[0] as u32), 3.0);
+
+        // fabd v0.4s, v1.4s, v2.4s
+        c.v[1] = quad_f32(1.0, -2.0, 10.0, 0.0);
+        c.v[2] = quad_f32(4.0, 2.0, 3.0, -5.0);
+        c.exec(0x6EA2_D420, &mut m);
+        assert_eq!(c.v[0], quad_f32(3.0, 4.0, 7.0, 5.0));
+    }
+
+    #[test]
+    fn ldnp_stnp_pair_roundtrip() {
+        // LDNP/STNP share the plain LDP/STP decode path in this
+        // interpreter (both addressing modes are identical; only the
+        // non-temporal cache hint differs, which this model doesn't need to
+        // simulate), so this doubles as regression coverage for that reuse.
+        let mut c = cpu();
+        let mut m = GuestMemory::new(0x1_0000, 4 * PAGE_SIZE);
+        m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
+        c.x[2] = 0x1_0040; // base (mapped)
+        c.x[0] = 0x1111_1111_1111_1111;
+        c.x[1] = 0x2222_2222_2222_2222;
+        assert!(matches!(
+            c.exec(0xA800_0440, &mut m), // stnp x0, x1, [x2]
+            Step::Next
+        ));
+        c.x[0] = 0;
+        c.x[1] = 0;
+        assert!(matches!(
+            c.exec(0xA840_0440, &mut m), // ldnp x0, x1, [x2]
+            Step::Next
+        ));
+        assert_eq!(c.x[0], 0x1111_1111_1111_1111);
+        assert_eq!(c.x[1], 0x2222_2222_2222_2222);
+    }
+
+    #[test]
+    fn prfm_decodes_as_noop() {
+        let (mut c, mut m) = (cpu(), scratch());
+        // prfm pldl1keep, [x0] — point at an address with no mapping at
+        // all; a real load would fault here, but a prefetch hint must not.
+        c.x[0] = 0xDEAD_0000;
+        let pc_before = c.pc;
+        assert!(matches!(c.exec(0xF980_0000, &mut m), Step::Next));
+        assert_eq!(c.x[0], 0xDEAD_0000, "PRFM must not touch any register");
+        assert_eq!(c.pc, pc_before, "exec() itself doesn't advance pc; run() does");
+
+        // prfm pldl1keep, [x0, x1] (register-offset form) and the unscaled
+        // immediate form must equally be no-ops, not faults.
+        c.x[1] = 8;
+        assert!(matches!(c.exec(0xF8A1_6800, &mut m), Step::Next));
     }
 }
