@@ -24,6 +24,7 @@ use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 
 mod fd;
 mod fs_ext;
+mod mem_syscalls;
 mod net;
 mod path;
 mod stat;
@@ -322,6 +323,11 @@ impl Kernel {
             Sysno::Mmap => self.sys_mmap(args, mem),
             Sysno::Munmap => self.sys_munmap(args[0], args[1], mem),
             Sysno::Mprotect => self.sys_mprotect(args[0], args[1], args[2], mem),
+            Sysno::Mremap => {
+                self.sys_mremap(args[0], args[1], args[2], args[3], args[4], mem)
+            }
+            Sysno::Madvise => self.sys_madvise(args[0], args[1], args[2], mem),
+            Sysno::Mincore => self.sys_mincore(args[0], args[1], args[2], mem),
             Sysno::Uname => self.sys_uname(args[0], mem),
             Sysno::ClockGettime => sys_clock_gettime(args[1], mem),
             Sysno::Gettimeofday => time::sys_gettimeofday(args[0], mem),
@@ -402,7 +408,14 @@ impl Kernel {
             | Sysno::Fchown
             | Sysno::Utimensat
             | Sysno::Setsockopt
-            | Sysno::Getsockopt => 0,
+            | Sysno::Getsockopt
+            // Locking/sync are no-ops: no swapping or dirty write-back modeled.
+            | Sysno::Mlock
+            | Sysno::Mlock2
+            | Sysno::Munlock
+            | Sysno::Mlockall
+            | Sysno::Munlockall
+            | Sysno::Msync => 0,
             _ => {
                 *self.unsupported.entry(raw).or_default() += 1;
                 err(Errno::ENOSYS)
@@ -1028,6 +1041,20 @@ impl Kernel {
             return err(Errno::ENOMEM);
         }
         base as i64
+    }
+
+    /// Reserve `len` bytes (rounded up to a page) from the downward-growing
+    /// anonymous `mmap` arena, returning the base of the fresh region, or `None`
+    /// if the arena is exhausted. Shares the cursor discipline of [`Self::sys_mmap`]
+    /// so relocating callers (`mremap` MAYMOVE) allocate the same way.
+    pub(super) fn alloc_mmap(&mut self, len: u64) -> Option<u64> {
+        let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let new_top = self.cur.mmap_cursor.checked_sub(len)?;
+        if new_top < self.cur.mmap_floor {
+            return None;
+        }
+        self.cur.mmap_cursor = new_top;
+        Some(new_top)
     }
 
     /// `munmap(addr, len)`.
