@@ -590,13 +590,6 @@ impl Kernel {
     /// `bind` `EADDRINUSE` check); everything else (`TCP_NODELAY`, buffer
     /// size hints, …) is accepted and silently ignored, since this is a
     /// virtual loopback with no real transport to tune.
-    ///
-    /// Not currently reachable from the syscall dispatch: `kernel::mod`
-    /// resolves `Sysno::Setsockopt` to an unconditional no-op before it would
-    /// reach here (see the `net.rs` module ownership note in this crate's
-    /// task history). Kept implemented and unit-tested directly so the
-    /// behavior exists once that wiring is added.
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_setsockopt(
         &mut self,
@@ -623,10 +616,6 @@ impl Kernel {
     /// `getsockopt(fd, level, optname, optval, optlen)` — sane canned values
     /// for `SO_TYPE`/`SO_ERROR`/`SO_REUSEADDR`/`SO_RCVBUF`/`SO_SNDBUF`; `0` for
     /// anything else.
-    ///
-    /// Not currently reachable from the syscall dispatch, for the same reason
-    /// as [`Kernel::sys_setsockopt`].
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_getsockopt(
         &mut self,
@@ -667,13 +656,6 @@ impl Kernel {
     /// inbound queue (fire-and-forget, like real UDP: no error if nothing is
     /// bound there); otherwise (no destination, or a stream socket) this is
     /// just `write`.
-    ///
-    /// Not currently reachable from the syscall dispatch: `kernel::mod`
-    /// resolves both `Sysno::Write` and `Sysno::Sendto` to `sys_write` (3
-    /// args only), so a real `sendto(2)` with a destination address never
-    /// reaches this method today. Kept implemented and unit-tested directly
-    /// so the address-aware behavior exists once that wiring is added.
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_sendto(
         &mut self,
@@ -719,10 +701,6 @@ impl Kernel {
     /// `recvfrom(fd, buf, len, flags, src_addr, addrlen)` — for a datagram
     /// socket, pop the next queued datagram and report its source address;
     /// for a stream socket this is `read` plus (best-effort) the peer address.
-    ///
-    /// Not currently reachable from the syscall dispatch, for the same reason
-    /// as [`Kernel::sys_sendto`].
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_recvfrom(
         &mut self,

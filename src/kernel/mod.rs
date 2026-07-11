@@ -344,9 +344,16 @@ impl Kernel {
             );
         }
         match sys {
-            // sendto/recvfrom on a connected socket are just write/read.
-            Sysno::Write | Sysno::Sendto => self.sys_write(args[0], args[1], args[2], mem),
-            Sysno::Read | Sysno::Recvfrom => self.sys_read(args[0], args[1], args[2], mem),
+            Sysno::Write => self.sys_write(args[0], args[1], args[2], mem),
+            Sysno::Read => self.sys_read(args[0], args[1], args[2], mem),
+            // sendto/recvfrom carry an optional peer address (UDP) beyond
+            // write/read; the address-aware path lives in net.rs.
+            Sysno::Sendto => {
+                self.sys_sendto(args[0], args[1], args[2], args[3], args[4], args[5], mem)
+            }
+            Sysno::Recvfrom => {
+                self.sys_recvfrom(args[0], args[1], args[2], args[3], args[4], args[5], mem)
+            }
             Sysno::Brk => self.sys_brk(args[0], mem),
             Sysno::Mmap => self.sys_mmap(args, mem),
             Sysno::Munmap => self.sys_munmap(args[0], args[1], mem),
@@ -407,6 +414,12 @@ impl Kernel {
             Sysno::Connect => self.sys_connect(args[0], args[1], args[2], mem),
             Sysno::Getsockname => self.sys_getsockname(args[0], args[1], args[2], mem),
             Sysno::Getpeername => self.sys_getpeername(args[0], args[1], args[2], mem),
+            Sysno::Setsockopt => {
+                self.sys_setsockopt(args[0], args[1], args[2], args[3], args[4], mem)
+            }
+            Sysno::Getsockopt => {
+                self.sys_getsockopt(args[0], args[1], args[2], args[3], args[4], mem)
+            }
             Sysno::Shutdown => self.sys_shutdown(args[0], args[1]),
             // Event-notification / readiness syscalls.
             Sysno::Poll => self.sys_poll(args[0], args[1], args[2] as i64, mem),
@@ -476,8 +489,6 @@ impl Kernel {
             | Sysno::Fchownat
             | Sysno::Fchown
             | Sysno::Utimensat
-            | Sysno::Setsockopt
-            | Sysno::Getsockopt
             // Locking/sync + scheduling/process-attr setters: all no-ops.
             | Sysno::Mlock
             | Sysno::Mlock2
