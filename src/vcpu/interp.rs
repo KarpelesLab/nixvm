@@ -124,6 +124,24 @@ impl Aarch64Interp {
         Step::Branched
     }
 
+    /// Read a system register named by the `MRS` encoding. Only `TPIDR_EL0`
+    /// (the user thread pointer) is backed; everything else reads as 0.
+    fn read_sysreg(&self, instr: u32) -> u64 {
+        if (instr >> 5) & 0x7fff == TPIDR_EL0 {
+            self.tpidr
+        } else {
+            0
+        }
+    }
+
+    /// Write a system register named by the `MSR` encoding. Only `TPIDR_EL0` is
+    /// backed; writes to other registers are ignored.
+    fn write_sysreg(&mut self, instr: u32, value: u64) {
+        if (instr >> 5) & 0x7fff == TPIDR_EL0 {
+            self.tpidr = value;
+        }
+    }
+
     /// Perform a single load or store of `1 << size` bytes at `addr`. `opc`
     /// selects: 00 store, 01 load (zero-extend), 10 load (sign-extend to 64),
     /// 11 load (sign-extend to 32).
@@ -204,8 +222,22 @@ impl Aarch64Interp {
         if instr & 0xFFE0_001F == 0xD400_0001 {
             return Step::Syscall; // svc #imm
         }
-        if instr == 0xD503_201F {
-            return Step::Next; // nop
+        // System hints (NOP/YIELD/WFE/…) and barriers (DMB/DSB/ISB) — no-ops on
+        // our single-core, in-order model.
+        if instr & 0xFFFF_F000 == 0xD503_2000 || instr & 0xFFFF_F000 == 0xD503_3000 {
+            return Step::Next;
+        }
+        // MRS Xt, <sysreg> / MSR <sysreg>, Xt
+        if (instr >> 20) & 0xfff == 0xD53 {
+            let rt = reg_field(instr, 0);
+            let val = self.read_sysreg(instr);
+            self.write_x(rt, val);
+            return Step::Next;
+        }
+        if (instr >> 20) & 0xfff == 0xD51 {
+            let rt = reg_field(instr, 0);
+            self.write_sysreg(instr, self.read_x(rt));
+            return Step::Next;
         }
         if instr & 0xFFFF_FC1F == 0xD65F_0000 {
             self.pc = self.read_x(reg_field(instr, 5)); // ret
@@ -701,6 +733,9 @@ impl Vcpu for Aarch64Interp {
     }
 }
 
+/// Encoded `op0<0>:op1:CRn:CRm:op2` field (bits 19:5) for `TPIDR_EL0`.
+const TPIDR_EL0: u32 = 0x5E82;
+
 /// Extract a 5-bit register field starting at bit `lsb`.
 fn reg_field(instr: u32, lsb: u32) -> usize {
     ((instr >> lsb) & 0x1f) as usize
@@ -1111,6 +1146,16 @@ mod tests {
         c.exec(0x3900_0020, &mut m); // strb w0,[x1]
         c.exec(0x3880_0022, &mut m); // ldrsb x2,[x1]
         assert_eq!(c.x[2] as i64, -128, "signed byte load sign-extends");
+    }
+
+    #[test]
+    fn msr_mrs_tpidr_roundtrip() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[0] = 0x1234_5678;
+        c.exec(0xD51B_D040, &mut m); // msr tpidr_el0, x0
+        assert_eq!(c.tpidr, 0x1234_5678);
+        c.exec(0xD53B_D041, &mut m); // mrs x1, tpidr_el0
+        assert_eq!(c.x[1], 0x1234_5678);
     }
 
     #[test]
