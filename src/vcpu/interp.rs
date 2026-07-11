@@ -453,6 +453,32 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- add/subtract extended register (SP arithmetic) ----
+        if (instr >> 24) & 0x1f == 0b0_1011 && (instr >> 21) & 0x7 == 0b001 {
+            let sf = (instr >> 31) & 1;
+            let op = (instr >> 30) & 1;
+            let s = (instr >> 29) & 1;
+            let rm = reg_field(instr, 16);
+            let option = (instr >> 13) & 7;
+            let imm3 = (instr >> 10) & 7;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let a = self.read_sp(rn);
+            let b = extend_reg(self.read_x(rm), option, imm3);
+            if s == 1 {
+                let r = self.addsub_flags(a, b, op == 1, sf == 1);
+                self.write_x(rd, r);
+            } else {
+                let r = if op == 0 {
+                    a.wrapping_add(b)
+                } else {
+                    a.wrapping_sub(b)
+                };
+                self.write_sp(rd, mask_sf(r, sf));
+            }
+            return Step::Next;
+        }
+
         // ---- logical shifted register: AND/ORR/EOR/ANDS (+ BIC via N bit) ----
         if (instr >> 24) & 0x1f == 0b0_1010 {
             let sf = (instr >> 31) & 1;
@@ -817,13 +843,17 @@ fn sdiv(a: u64, b: u64, sf: bool) -> u64 {
     }
 }
 
-/// Extend a register value per the load/store register-offset `option` field,
+/// Extend a register value per the `option` field (UXTB/H/W/X, SXTB/H/W/X),
 /// then shift left by `shift`.
 fn extend_reg(val: u64, option: u32, shift: u32) -> u64 {
     let extended = match option {
+        0b000 => val & 0xff,                                // UXTB
+        0b001 => val & 0xffff,                              // UXTH
         0b010 => val & 0xffff_ffff,                         // UXTW
+        0b100 => sign_extend(val & 0xff, 8) as u64,         // SXTB
+        0b101 => sign_extend(val & 0xffff, 16) as u64,      // SXTH
         0b110 => sign_extend(val & 0xffff_ffff, 32) as u64, // SXTW
-        _ => val,                                           // UXTX/SXTX (LSL) and others
+        _ => val,                                           // UXTX / SXTX (LSL)
     };
     extended << shift
 }
@@ -916,6 +946,15 @@ mod tests {
         assert_eq!(c.x[1], 105);
         c.exec(0xD100_2802, &mut m); // sub x2,x0,#10
         assert_eq!(c.x[2], 90);
+    }
+
+    #[test]
+    fn add_extended_register() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = 0x1000;
+        c.x[2] = 0x1FF;
+        c.exec(0x8B22_0020, &mut m); // add x0,x1,w2,uxtb -> 0x1000 + 0xFF
+        assert_eq!(c.x[0], 0x10FF);
     }
 
     #[test]
