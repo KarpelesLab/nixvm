@@ -148,6 +148,11 @@ pub fn decode(nr: u64) -> Sysno {
         283 => Sysno::TimerfdCreate,
         286 => Sysno::TimerfdSettime,
         287 => Sysno::TimerfdGettime,
+        441 => Sysno::EpollPwait2,
+        // x86-64-only: sets FS/GS base for TLS. The kernel may not implement
+        // it yet; unhandled Sysno variants fall through to the
+        // unsupported-syscall ledger, which is fine for this harness.
+        158 => Sysno::ArchPrctl,
         other => Sysno::Unknown(other),
     }
 }
