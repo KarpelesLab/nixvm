@@ -27,6 +27,7 @@ mod fs_ext;
 mod net;
 mod path;
 mod stat;
+mod time;
 
 pub use fd::{Fd, FdTable};
 use net::Net;
@@ -323,6 +324,13 @@ impl Kernel {
             Sysno::Mprotect => self.sys_mprotect(args[0], args[1], args[2], mem),
             Sysno::Uname => self.sys_uname(args[0], mem),
             Sysno::ClockGettime => sys_clock_gettime(args[1], mem),
+            Sysno::Gettimeofday => time::sys_gettimeofday(args[0], mem),
+            Sysno::ClockGetres => time::sys_clock_getres(args[1], mem),
+            Sysno::Nanosleep => time::sys_nanosleep(args[0], args[1], mem),
+            Sysno::ClockNanosleep => time::sys_nanosleep(args[2], args[3], mem),
+            Sysno::Time => time::sys_time(args[0], mem),
+            // The guest does not own the host clock: refuse to set it.
+            Sysno::Settimeofday | Sysno::ClockSettime => err(Errno::EPERM),
             Sysno::Openat => self.sys_openat(args[0] as i64, args[1], args[2], args[3], mem),
             Sysno::Close => self.sys_close(args[0] as i32),
             Sysno::Lseek => self.sys_lseek(args[0], args[1] as i64, args[2]),
@@ -377,9 +385,11 @@ impl Kernel {
             Sysno::Getpid | Sysno::Gettid | Sysno::SetTidAddress => i64::from(self.cur.pid),
             Sysno::Getppid => i64::from(self.cur.ppid),
             // Succeed as root / no-op: uid queries, signal setup, robust list,
-            // permission/ownership/timestamp changes, and socket options —
-            // none modeled yet.
-            Sysno::Getuid
+            // permission/ownership/timestamp changes, socket options, and clock
+            // adjustment (report TIME_OK) — none modeled yet.
+            Sysno::Adjtimex
+            | Sysno::ClockAdjtime
+            | Sysno::Getuid
             | Sysno::Geteuid
             | Sysno::Getgid
             | Sysno::Getegid
@@ -1519,6 +1529,74 @@ mod tests {
         assert_eq!(mem.read_vec(buf, 1).unwrap(), b"Z");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn time_syscalls() {
+        let (mut k, mut mem, mut v) = setup();
+        let tv = 0x1_0000;
+
+        // gettimeofday writes a nonzero tv_sec.
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Gettimeofday,
+                [tv, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert!(mem.read_u64(tv).unwrap() > 0);
+
+        // clock_getres writes {tv_sec: 0, tv_nsec: 1} (arg[1] is res).
+        let res = 0x1_1000;
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::ClockGetres,
+                [0, res, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(mem.read_u64(res).unwrap(), 0);
+        assert_eq!(mem.read_u64(res + 8).unwrap(), 1);
+
+        // nanosleep with a valid req returns 0 and writes rem = {0, 0}.
+        let req = 0x1_2000;
+        let rem = 0x1_2100;
+        mem.write_init(req, &0u64.to_le_bytes()).unwrap();
+        mem.write_init(req + 8, &500u64.to_le_bytes()).unwrap();
+        mem.write_init(rem, &7u64.to_le_bytes()).unwrap();
+        mem.write_init(rem + 8, &7u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Nanosleep,
+                [req, rem, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(mem.read_u64(rem).unwrap(), 0);
+        assert_eq!(mem.read_u64(rem + 8).unwrap(), 0);
+
+        // nanosleep with tv_nsec >= 1e9 returns -EINVAL.
+        mem.write_init(req + 8, &1_000_000_000u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            call(
+                &mut k,
+                &mut mem,
+                &mut v,
+                Sysno::Nanosleep,
+                [req, 0, 0, 0, 0, 0]
+            ),
+            err(Errno::EINVAL)
+        );
     }
 
     #[test]
