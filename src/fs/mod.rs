@@ -24,12 +24,16 @@ use std::io;
 pub mod fstoolfs;
 pub mod mount;
 pub mod overlay;
+#[cfg(unix)]
+pub mod passthrough;
 pub mod tmpfs;
 
 #[cfg(feature = "fstool")]
 pub use fstoolfs::FsToolMount;
 pub use mount::MountTable;
 pub use overlay::Overlay;
+#[cfg(unix)]
+pub use passthrough::Passthrough;
 pub use tmpfs::TmpFs;
 
 /// The kind of a filesystem node.
