@@ -10,6 +10,18 @@
 //! fstool's open handles borrow the filesystem *and* the device for their
 //! lifetime, so every [`MountFs`] operation opens, does the I/O, and drops the
 //! handle within the call.
+//!
+//! ## Error mapping
+//!
+//! fstool's [`fstool::Error`] is coarser than POSIX errno: in particular
+//! `Error::InvalidArgument` covers "no such path component", "wrong entry
+//! type" (e.g. reading a directory as a file), and genuine bad arguments all
+//! at once — the crate has no dedicated not-found variant. [`to_io`] maps it
+//! to `ENOENT` (the dominant case for a path-based lookup), and the read
+//! paths ([`FsToolMount::read_at`], [`FsToolMount::readdir`],
+//! [`FsToolMount::readlink`]) run one extra `getattr` on failure to
+//! disambiguate the POSIX-significant cases (`EISDIR`, `ENOTDIR`, `EINVAL`)
+//! from a plain miss — see [`FsToolMount::classify`].
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -32,9 +44,33 @@ impl std::fmt::Debug for FsToolMount {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)] // used as a `map_err` function pointer
+/// Map an fstool crate error to the nearest POSIX errno. `Io` passes the
+/// underlying [`io::Error`] through unchanged (preserving its kind/raw errno);
+/// every other variant is a fstool-level condition with no `io::Error`
+/// behind it, so we pick the closest sane errno rather than propagating the
+/// message as an opaque `Other` error (which previously hid corruption,
+/// unsupported-feature, and not-found cases behind one undifferentiated
+/// kind).
 fn to_io(e: fstool::Error) -> io::Error {
-    io::Error::other(e.to_string())
+    match e {
+        fstool::Error::Io(e) => e,
+        // The crate's catch-all for "path didn't resolve" as well as some
+        // genuine bad-argument cases; ENOENT is the correct call for the
+        // former and a defensible default for the latter (callers that care
+        // about the EISDIR/ENOTDIR/EINVAL distinction use `classify` first).
+        fstool::Error::InvalidArgument(_) => enoent(),
+        // On-disk structure failed validation, or a read/write reached past
+        // the device's logical extent: both mean the image itself can't be
+        // trusted for this operation.
+        fstool::Error::InvalidImage(_) | fstool::Error::OutOfBounds { .. } => eio(),
+        // The format lacks a feature this build of fstool implements.
+        fstool::Error::Unsupported(_) => enosys(),
+        // Attempted mutation of a write-once (SquashFS/ISO) or streaming
+        // (tar) format. `FsToolMount` already gates every mutator on
+        // `self.read_only` before reaching fstool, so this is a defensive
+        // fallback rather than the common path.
+        fstool::Error::Streaming { .. } | fstool::Error::Immutable { .. } => erofs(),
+    }
 }
 
 /// fstool paths are absolute; the mount table hands us relative paths.
@@ -54,8 +90,54 @@ fn map_kind(k: EntryKind) -> NodeKind {
         EntryKind::Block => NodeKind::BlockDevice,
         EntryKind::Fifo => NodeKind::Fifo,
         EntryKind::Socket => NodeKind::Socket,
-        _ => NodeKind::File,
+        // `Regular` and the catch-all `Unknown` (a type fstool couldn't
+        // classify) both fold to a plain file — matching fstool's own
+        // `FileAttrs::defaults_for` fallback for kinds it can't otherwise
+        // describe.
+        EntryKind::Regular | EntryKind::Unknown => NodeKind::File,
     }
+}
+
+// Unix `S_IFMT` type bits. fstool's `FileAttrs::mode` is permission-only —
+// every backend (ext, squashfs) masks it to `0o7777` before returning it —
+// so `Attrs::mode`, which per the sibling backends' convention carries both
+// the type *and* permission bits, has to have the type bits OR'd in here.
+const S_IFIFO: u32 = 0o010_000;
+const S_IFCHR: u32 = 0o020_000;
+const S_IFDIR: u32 = 0o040_000;
+const S_IFBLK: u32 = 0o060_000;
+const S_IFREG: u32 = 0o100_000;
+const S_IFLNK: u32 = 0o120_000;
+const S_IFSOCK: u32 = 0o140_000;
+
+/// The `S_IFMT` bits for a [`NodeKind`] — see the module-level note on why
+/// these have to be reattached to fstool's (permission-only) mode.
+const fn type_bits(kind: NodeKind) -> u32 {
+    match kind {
+        NodeKind::File => S_IFREG,
+        NodeKind::Dir => S_IFDIR,
+        NodeKind::Symlink => S_IFLNK,
+        NodeKind::CharDevice => S_IFCHR,
+        NodeKind::BlockDevice => S_IFBLK,
+        NodeKind::Fifo => S_IFIFO,
+        NodeKind::Socket => S_IFSOCK,
+    }
+}
+
+/// The node type an [`FsToolMount`] call site expects at a path, used by
+/// [`FsToolMount::classify`] to turn an ambiguous fstool error into the
+/// POSIX-correct errno.
+#[derive(Clone, Copy)]
+enum WantKind {
+    /// The call needs a directory (`readdir`): a real entry of any other
+    /// kind is `ENOTDIR`.
+    Dir,
+    /// The call needs a non-directory (`read_at`/`open_file_ro`): a real
+    /// directory is `EISDIR`.
+    NotDir,
+    /// The call needs a symlink (`readlink`): a real entry of any other
+    /// kind is `EINVAL`.
+    Symlink,
 }
 
 impl FsToolMount {
@@ -97,10 +179,49 @@ impl FsToolMount {
             read_only: false,
         })
     }
+
+    /// Disambiguate a failed operation at `abs_path` into a POSIX-correct
+    /// errno: an extra `getattr` tells us whether the path actually exists
+    /// and, if so, what kind of node it is, so a real directory read as a
+    /// file comes back `EISDIR` (not `ENOENT`) and so on. When the extra
+    /// `getattr` also fails, `path` genuinely doesn't resolve (or the image
+    /// is unreadable), and the generic [`to_io`] mapping of the original
+    /// error applies.
+    fn classify(&mut self, abs_path: &str, want: WantKind, err: fstool::Error) -> io::Error {
+        let Ok(a) = self.fs.getattr(&mut *self.dev, Path::new(abs_path)) else {
+            return to_io(err);
+        };
+        match (want, a.kind == EntryKind::Dir, a.kind == EntryKind::Symlink) {
+            (WantKind::Dir, true, _) | (WantKind::NotDir, false, _) | (WantKind::Symlink, _, true) => {
+                to_io(err)
+            }
+            (WantKind::Dir, false, _) => enotdir(),
+            (WantKind::NotDir, true, _) => eisdir(),
+            (WantKind::Symlink, _, false) => einval(),
+        }
+    }
 }
 
 fn erofs() -> io::Error {
-    io::Error::from_raw_os_error(30)
+    io::Error::from_raw_os_error(30) // EROFS
+}
+fn enoent() -> io::Error {
+    io::Error::from_raw_os_error(2) // ENOENT
+}
+fn eio() -> io::Error {
+    io::Error::from_raw_os_error(5) // EIO
+}
+fn enosys() -> io::Error {
+    io::Error::from_raw_os_error(38) // ENOSYS
+}
+fn eisdir() -> io::Error {
+    io::Error::from_raw_os_error(21) // EISDIR
+}
+fn enotdir() -> io::Error {
+    io::Error::from_raw_os_error(20) // ENOTDIR
+}
+fn einval() -> io::Error {
+    io::Error::from_raw_os_error(22) // EINVAL
 }
 
 impl MountFs for FsToolMount {
@@ -110,10 +231,13 @@ impl MountFs for FsToolMount {
 
     fn stat(&mut self, rel: &str) -> Option<Attrs> {
         let a = self.fs.getattr(&mut *self.dev, Path::new(&abs(rel))).ok()?;
+        let kind = map_kind(a.kind);
         Some(Attrs {
-            kind: map_kind(a.kind),
+            kind,
             size: a.size,
-            mode: u32::from(a.mode),
+            // fstool's `mode` is permission-only (see the module doc); OR in
+            // the type bits so guest `stat()` sees a complete `st_mode`.
+            mode: type_bits(kind) | (u32::from(a.mode) & 0o7_777),
             uid: a.uid,
             gid: a.gid,
             mtime: i64::from(a.mtime),
@@ -124,19 +248,30 @@ impl MountFs for FsToolMount {
     }
 
     fn read_at(&mut self, rel: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let mut h = self
-            .fs
-            .open_file_ro(&mut *self.dev, Path::new(&abs(rel)))
-            .map_err(to_io)?;
-        h.seek(SeekFrom::Start(off))?;
-        h.read(buf)
+        let path = abs(rel);
+        // The `Ok` arm returns eagerly so the open handle (which borrows
+        // `self.fs`/`self.dev` for its lifetime) never needs to outlive this
+        // match — only an owned `fstool::Error` does, letting the `Err` arm
+        // call back into `self.classify` below without a borrow conflict.
+        let open_err = match self.fs.open_file_ro(&mut *self.dev, Path::new(&path)) {
+            Ok(mut h) => {
+                // The handle clamps an out-of-range seek to `len()` (verified
+                // against both backends), so a read at/past EOF falls
+                // straight through to `Ok(0)` — no separate EOF check needed.
+                h.seek(SeekFrom::Start(off))?;
+                return h.read(buf);
+            }
+            Err(e) => e,
+        };
+        Err(self.classify(&path, WantKind::NotDir, open_err))
     }
 
     fn readdir(&mut self, rel: &str) -> io::Result<Vec<DirEntry>> {
-        let entries = self
-            .fs
-            .list(&mut *self.dev, Path::new(&abs(rel)))
-            .map_err(to_io)?;
+        let path = abs(rel);
+        let entries = match self.fs.list(&mut *self.dev, Path::new(&path)) {
+            Ok(e) => e,
+            Err(e) => return Err(self.classify(&path, WantKind::Dir, e)),
+        };
         Ok(entries
             .into_iter()
             .map(|e| DirEntry {
@@ -218,10 +353,11 @@ impl MountFs for FsToolMount {
     }
 
     fn readlink(&mut self, rel: &str) -> io::Result<String> {
-        let target = self
-            .fs
-            .read_symlink(&mut *self.dev, Path::new(&abs(rel)))
-            .map_err(to_io)?;
+        let path = abs(rel);
+        let target = match self.fs.read_symlink(&mut *self.dev, Path::new(&path)) {
+            Ok(t) => t,
+            Err(e) => return Err(self.classify(&path, WantKind::Symlink, e)),
+        };
         Ok(target.to_string_lossy().into_owned())
     }
 
@@ -251,7 +387,36 @@ impl MountFs for FsToolMount {
 
 #[cfg(test)]
 mod tests {
+    //! `FsToolMount::format_ram` builds a real in-memory ext4 filesystem
+    //! through fstool's own writer, so the tests below exercise the actual
+    //! `fstool` read/write/getattr/list/symlink code paths end-to-end — no
+    //! fabricated image bytes.
+    //!
+    //! There's no squashfs-specific test here: fstool has no in-memory
+    //! squashfs *writer* (it's write-once, built by `mksquashfs`-style
+    //! tooling), so exercising `open_squashfs` needs a real image on disk.
+    //! To test against one locally, point an image at this backend directly,
+    //! e.g. in a scratch integration test:
+    //! ```ignore
+    //! let path = std::path::Path::new(&std::env::var("NIXVM_TEST_SQUASHFS_IMAGE").unwrap());
+    //! let mut fs = FsToolMount::open_squashfs(path).unwrap();
+    //! ```
+    //! No such fixture is available in this checkout or CI, so it's not
+    //! wired into the suite — the ext4-in-RAM tests below already cover the
+    //! same `Filesystem`/`MountFs` bridge code (`stat`, `read_at`, `readdir`,
+    //! `readlink`, error mapping) that `open_squashfs` would exercise.
     use super::*;
+
+    #[test]
+    fn type_bits_cover_every_kind() {
+        assert_eq!(type_bits(NodeKind::File), 0o100_000);
+        assert_eq!(type_bits(NodeKind::Dir), 0o040_000);
+        assert_eq!(type_bits(NodeKind::Symlink), 0o120_000);
+        assert_eq!(type_bits(NodeKind::CharDevice), 0o020_000);
+        assert_eq!(type_bits(NodeKind::BlockDevice), 0o060_000);
+        assert_eq!(type_bits(NodeKind::Fifo), 0o010_000);
+        assert_eq!(type_bits(NodeKind::Socket), 0o140_000);
+    }
 
     #[test]
     fn ram_ext4_create_write_read() {
@@ -272,5 +437,105 @@ mod tests {
             .map(|e| e.name)
             .collect();
         assert!(names.contains(&"hello".to_string()) && names.contains(&"d".to_string()));
+    }
+
+    #[test]
+    fn stat_reports_type_bits_for_file_and_dir() {
+        let mut fs = FsToolMount::format_ram(8 << 20).unwrap();
+        fs.create("f", 0o640).unwrap();
+        fs.mkdir("d", 0o750).unwrap();
+
+        let f = fs.stat("f").unwrap();
+        assert_eq!(f.kind, NodeKind::File);
+        assert_eq!(f.mode & 0o170_000, S_IFREG);
+        assert_eq!(f.mode & 0o7_777, 0o640);
+
+        let d = fs.stat("d").unwrap();
+        assert_eq!(d.kind, NodeKind::Dir);
+        assert_eq!(d.mode & 0o170_000, S_IFDIR);
+        assert_eq!(d.mode & 0o7_777, 0o750);
+    }
+
+    #[test]
+    fn symlink_readlink_and_stat_report_lnk_bits() {
+        let mut fs = FsToolMount::format_ram(8 << 20).unwrap();
+        fs.create("target", 0o644).unwrap();
+        fs.symlink("target", "link").unwrap();
+
+        assert_eq!(fs.readlink("link").unwrap(), "target");
+        let a = fs.stat("link").unwrap();
+        assert_eq!(a.kind, NodeKind::Symlink);
+        assert_eq!(a.mode & 0o170_000, S_IFLNK);
+
+        let names_and_kinds: Vec<_> = fs
+            .readdir("")
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.kind))
+            .collect();
+        assert!(names_and_kinds.contains(&("link".to_string(), NodeKind::Symlink)));
+        assert!(names_and_kinds.contains(&("target".to_string(), NodeKind::File)));
+    }
+
+    #[test]
+    fn missing_path_is_enoent_not_panic() {
+        let mut fs = FsToolMount::format_ram(8 << 20).unwrap();
+        assert!(fs.stat("nope").is_none());
+
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            fs.read_at("nope", 0, &mut buf).unwrap_err().raw_os_error(),
+            Some(2)
+        );
+        assert_eq!(
+            fs.readdir("nope").unwrap_err().raw_os_error(),
+            Some(2)
+        );
+        assert_eq!(
+            fs.readlink("nope").unwrap_err().raw_os_error(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn reading_a_directory_as_a_file_is_eisdir() {
+        let mut fs = FsToolMount::format_ram(8 << 20).unwrap();
+        fs.mkdir("d", 0o755).unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            fs.read_at("d", 0, &mut buf).unwrap_err().raw_os_error(),
+            Some(21) // EISDIR
+        );
+    }
+
+    #[test]
+    fn listing_a_file_as_a_directory_is_enotdir() {
+        let mut fs = FsToolMount::format_ram(8 << 20).unwrap();
+        fs.create("f", 0o644).unwrap();
+        assert_eq!(
+            fs.readdir("f").unwrap_err().raw_os_error(),
+            Some(20) // ENOTDIR
+        );
+    }
+
+    #[test]
+    fn readlink_on_non_symlink_is_einval() {
+        let mut fs = FsToolMount::format_ram(8 << 20).unwrap();
+        fs.create("f", 0o644).unwrap();
+        assert_eq!(
+            fs.readlink("f").unwrap_err().raw_os_error(),
+            Some(22) // EINVAL
+        );
+    }
+
+    #[test]
+    fn read_past_eof_returns_zero() {
+        let mut fs = FsToolMount::format_ram(8 << 20).unwrap();
+        fs.create("f", 0o644).unwrap();
+        fs.write_at("f", 0, b"hi").unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(fs.read_at("f", 100, &mut buf).unwrap(), 0);
+        // Exactly at EOF is also zero, not an error.
+        assert_eq!(fs.read_at("f", 2, &mut buf).unwrap(), 0);
     }
 }
