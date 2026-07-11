@@ -52,8 +52,14 @@
 //! `FNSTSW`/`FNCLEX`/`FNINIT`/`FWAIT`/`FFREE`/`FINCSTP`/`FDECSTP`). Each
 //! 80-bit `long double` register is modeled as an `f64` rather than true
 //! extended precision — an accepted approximation for a software scaffold
-//! (see [`f80_to_f64`]). Anything else surfaces as
-//! [`Exit::IllegalInstruction`].
+//! (see [`f80_to_f64`]). Also: `CPUID`, `RDTSC`/`RDTSCP`, `RDRAND`/`RDSEED`,
+//! `XGETBV`, the `LOCK` prefix (`0xF0`, decoded and otherwise ignored — this
+//! interpreter is single-threaded, so every read-modify-write is already
+//! atomic) alongside the `LOCK`-able ops it decorates (`XADD`, `CMPXCHG`,
+//! `CMPXCHG8B`/`CMPXCHG16B`, and the existing `ADD`/`OR`/`AND`/`SUB`/`XOR`/
+//! `BTS`/`BTR`/`INC`/`DEC`/`NEG`/`NOT`), `MOVNTI`, and the fence/cache-hint
+//! group `LFENCE`/`SFENCE`/`MFENCE`/`CLFLUSH`/`PAUSE` (all no-ops). Anything
+//! else surfaces as [`Exit::IllegalInstruction`].
 
 use crate::abi::Arch;
 
@@ -67,7 +73,6 @@ const MAX_STEPS: u64 = 50_000_000;
 const RAX: usize = 0;
 const RCX: usize = 1;
 const RDX: usize = 2;
-#[allow(dead_code)] // named for documentation of the register file layout
 const RBX: usize = 3;
 const RSP: usize = 4;
 const RBP: usize = 5;
@@ -765,6 +770,12 @@ struct X86Interp {
     /// are stored and read back verbatim but otherwise unused, since this
     /// interpreter doesn't model FPU exceptions at all.
     fpu_cw: u16,
+    /// Free-running counter behind `RDTSC`/`RDTSCP` — see
+    /// [`X86Interp::rdtsc_tick`].
+    tsc: u64,
+    /// PRNG state behind `RDRAND`/`RDSEED` — see
+    /// [`X86Interp::rdrand_or_seed`].
+    prng: u64,
 }
 
 impl X86Interp {
@@ -785,6 +796,8 @@ impl X86Interp {
             fpu_c2: false,
             fpu_c3: false,
             fpu_cw: 0x037F, // the real x87's power-on/FNINIT default control word
+            tsc: 0,
+            prng: 0x9E37_79B9_7F4A_7C15, // arbitrary nonzero seed (golden-ratio constant)
         }
     }
 
@@ -1734,6 +1747,222 @@ impl X86Interp {
         self.next(pc3)
     }
 
+    // ---- LOCK-prefixed atomics (XADD/CMPXCHG/CMPXCHG8B/16B — see also the
+    // `0xF0` LOCK prefix itself, silently consumed alongside 0x66/0xF2/0xF3
+    // in `exec`'s legacy-prefix loop) and the CPUID/RDTSC/RDRAND/XGETBV
+    // family. Since this interpreter is single-threaded, a "LOCK"-prefixed
+    // read-modify-write is automatically atomic — decoding the prefix and
+    // running the plain op is the entire implementation; nothing here needs
+    // a distinct locked/unlocked code path. ----
+
+    /// `XADD Eb,Gb` / `Ev,Gv` (`0F C0`/`C1`): `reg` gets the *old* value of
+    /// the destination, and the destination becomes `dest + reg` — flags are
+    /// set exactly as for `ADD dest, reg`.
+    fn xadd(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, has_rex: bool, width: u32) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let (rm_op, reg_op) = if width == 8 {
+            (resolve8(modrm.kind, pc2, has_rex), reg8_operand(modrm.reg, has_rex))
+        } else {
+            (resolve(modrm.kind, pc2), Operand::Reg(modrm.reg))
+        };
+        let dest = fetch!(self.read_operand(mem, rm_op, width));
+        let src = fetch!(self.read_operand(mem, reg_op, width));
+        let sum = self.add_flags(dest, src, width);
+        fetch!(self.write_operand(mem, reg_op, dest, width)); // reg <- old dest
+        fetch!(self.write_operand(mem, rm_op, sum, width)); // dest <- dest + src
+        self.next(pc2)
+    }
+
+    /// `CMPXCHG Eb,Gb` / `Ev,Gv` (`0F B0`/`B1`): compare `AL`/`rAX` against
+    /// the destination (setting flags like `CMP`); on a match, `ZF=1` and
+    /// `dest <- reg`, otherwise `ZF=0` and `AL`/`rAX <- dest`.
+    fn cmpxchg(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, has_rex: bool, width: u32) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let (rm_op, reg_op) = if width == 8 {
+            (resolve8(modrm.kind, pc2, has_rex), reg8_operand(modrm.reg, has_rex))
+        } else {
+            (resolve(modrm.kind, pc2), Operand::Reg(modrm.reg))
+        };
+        let dest = fetch!(self.read_operand(mem, rm_op, width));
+        let acc = fetch!(self.read_operand(mem, Operand::Reg(RAX), width));
+        self.sub_flags(acc, dest, width); // CMP acc, dest
+        if acc == dest {
+            let src = fetch!(self.read_operand(mem, reg_op, width));
+            fetch!(self.write_operand(mem, rm_op, src, width));
+        } else {
+            fetch!(self.write_operand(mem, Operand::Reg(RAX), dest, width));
+        }
+        self.next(pc2)
+    }
+
+    /// `CMPXCHG8B`/`CMPXCHG16B m64/m128` (`0F C7 /1`; `REX.W` selects the
+    /// 16-byte form). The r/m operand must be memory (the register form is
+    /// `#UD` on real hardware). Only `ZF` is architecturally defined by this
+    /// instruction; the other flags are left untouched.
+    fn cmpxchg8b16b(&mut self, mem: &mut GuestMemory, modrm: ModRm, pc2: u64, rex: Rex) -> Step {
+        let Operand::Mem(addr) = resolve(modrm.kind, pc2) else {
+            return Step::Illegal; // register r/m: not a valid encoding
+        };
+        if rex.w {
+            // CMPXCHG16B: compare RDX:RAX against the 128-bit value at
+            // [addr] (two 64-bit halves, since `read_operand` tops out at 64 bits).
+            let lo = fetch!(self.read_operand(mem, Operand::Mem(addr), 64));
+            let hi = fetch!(self.read_operand(mem, Operand::Mem(addr.wrapping_add(8)), 64));
+            let cur = (u128::from(hi) << 64) | u128::from(lo);
+            let expect = (u128::from(self.gpr[RDX]) << 64) | u128::from(self.gpr[RAX]);
+            if cur == expect {
+                let new_lo = self.gpr[RBX];
+                let new_hi = self.gpr[RCX];
+                fetch!(self.write_operand(mem, Operand::Mem(addr), new_lo, 64));
+                fetch!(self.write_operand(mem, Operand::Mem(addr.wrapping_add(8)), new_hi, 64));
+                self.flags.zf = true;
+            } else {
+                self.gpr[RAX] = lo;
+                self.gpr[RDX] = hi;
+                self.flags.zf = false;
+            }
+        } else {
+            // CMPXCHG8B: a single 64-bit memory read/write *is* the
+            // EDX:EAX-shaped comparand (EAX low 32 bits, EDX high 32 bits).
+            let cur = fetch!(self.read_operand(mem, Operand::Mem(addr), 64));
+            let expect = (mask_w(self.gpr[RDX], 32) << 32) | mask_w(self.gpr[RAX], 32);
+            if cur == expect {
+                let new = (mask_w(self.gpr[RCX], 32) << 32) | mask_w(self.gpr[RBX], 32);
+                fetch!(self.write_operand(mem, Operand::Mem(addr), new, 64));
+                self.flags.zf = true;
+            } else {
+                self.gpr[RAX] = mask_w(cur, 32);
+                self.gpr[RDX] = mask_w(cur >> 32, 32);
+                self.flags.zf = false;
+            }
+        }
+        self.next(pc2)
+    }
+
+    /// `RDRAND`/`RDSEED Rv` (`0F C7 /6`/`/7`, register-only — the memory
+    /// form is a different, unrelated instruction under other prefixes and
+    /// isn't implemented). Advances a simple deterministic PRNG (there's no
+    /// host RNG in this scaffold) and writes the result to the destination,
+    /// always reporting success (`CF=1`); `OF`/`SF`/`ZF`/`PF` are cleared,
+    /// matching the real instructions' defined behavior.
+    fn rdrand_or_seed(&mut self, mem: &mut GuestMemory, modrm: ModRm, pc2: u64, width: u32) -> Step {
+        let RmKind::Reg(r) = modrm.kind else { return Step::Illegal };
+        // A splitmix64-style step: cheap, deterministic, and good enough to
+        // not look like "always the same value" across successive calls.
+        self.prng = self.prng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.prng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        fetch!(self.write_operand(mem, Operand::Reg(r), mask_w(z, width), width));
+        self.flags = Flags { cf: true, zf: false, sf: false, of: false, pf: false };
+        self.next(pc2)
+    }
+
+    /// Group 9 (`0F C7 /r`): `CMPXCHG8B`/`CMPXCHG16B` (`/1`) and `RDRAND`/
+    /// `RDSEED` (`/6`/`/7`).
+    fn group9_c7(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, width: u32) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        match modrm.reg {
+            1 => self.cmpxchg8b16b(mem, modrm, pc2, rex),
+            6 | 7 => self.rdrand_or_seed(mem, modrm, pc2, width),
+            // VMPTRLD/VMCLEAR/VMXON/VMPTRST (/4, /6, /7 under other
+            // mandatory prefixes) and /0,/2,/3,/5: not in our documented
+            // subset. (`rdrand_or_seed` itself rejects a memory r/m, so a
+            // 66/F3-prefixed VMX instruction that happens to hit /6 or /7
+            // still correctly surfaces as illegal rather than misfiring.)
+            _ => Step::Illegal,
+        }
+    }
+
+    /// `MOVNTI Md,Gd`/`Mq,Gq` (`0F C3`, memory-only — the register form is
+    /// `#UD`): a non-temporal store, modeled as an ordinary one (this
+    /// scaffold has no cache to bypass).
+    fn movnti(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, width: u32) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op @ Operand::Mem(_) = resolve(modrm.kind, pc2) else {
+            return Step::Illegal; // register r/m: not a valid encoding
+        };
+        let val = mask_w(self.gpr[modrm.reg], width);
+        fetch!(self.write_operand(mem, rm_op, val, width));
+        self.next(pc2)
+    }
+
+    /// Group 15 (`0F AE /r`): only the fence/cache-hint forms this
+    /// interpreter can meaningfully be a no-op for — `LFENCE`/`MFENCE`/
+    /// `SFENCE` (register form, `/5`/`/6`/`/7`) and `CLFLUSH` (memory form,
+    /// `/7`). `FXSAVE`/`FXRSTOR`/`LDMXCSR`/`STMXCSR`/`XSAVE*` (the other
+    /// memory-form sub-opcodes) would need FPU/SSE state layouts this
+    /// scaffold doesn't model, so they're not implemented.
+    fn group15_ae(&mut self, mem: &GuestMemory, pc: u64, rex: Rex) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        match (modrm.kind, modrm.reg) {
+            // LFENCE/MFENCE/SFENCE (register form) / CLFLUSH (memory form).
+            (RmKind::Reg(_), 5..=7) | (RmKind::Mem(_) | RmKind::MemRip(_), 7) => self.next(pc2),
+            _ => Step::Illegal,
+        }
+    }
+
+    /// `CPUID` (`0F A2`, no `ModRM`): dispatch on the leaf in `EAX` (and, for
+    /// leaf 7, the subleaf in `ECX` — this scaffold only implements subleaf
+    /// 0) and write `EAX`/`EBX`/`ECX`/`EDX`. Feature bits are set *only* for
+    /// what this interpreter actually executes, so glibc/musl's CPUID-gated
+    /// dispatch never picks an unimplemented instruction path. Leaves this
+    /// scaffold doesn't recognize return all-zero registers — a safe
+    /// "nothing extra here" answer, rather than real hardware's leak-the-
+    /// last-valid-leaf behavior.
+    fn cpuid(&mut self) {
+        let leaf = self.gpr[RAX] as u32;
+        let (eax, ebx, ecx, edx): (u32, u32, u32, u32) = match leaf {
+            // Leaf 0: max standard leaf (7) + the "GenuineIntel" vendor
+            // string, split EBX/EDX/ECX = "Genu"/"ineI"/"ntel".
+            0 => (7, 0x756E_6547, 0x6C65_746E, 0x4965_6E69),
+            // Leaf 1: EAX = family/model/stepping (a plausible, unremarkable
+            // identity — no real silicon behind it); EBX = 1 logical
+            // processor, 64-byte CLFLUSH line size; ECX = CX16 (bit 13) |
+            // POPCNT (bit 23) | RDRAND (bit 30); EDX = FPU (0) | TSC (4) |
+            // CX8 (8) | CMOV (15) | CLFSH (19) | SSE (25) | SSE2 (26).
+            1 => (0x0007_06A1, 0x0100_0800, 0x4080_2000, 0x0608_8111),
+            0x8000_0000 => (0x8000_0004, 0, 0, 0), // max extended leaf
+            // Extended feature bits: SYSCALL (11) | RDTSCP (27) | LM (29) —
+            // this is a 64-bit ("long mode") interpreter with SYSCALL and
+            // RDTSCP implemented.
+            0x8000_0001 => (0, 0, 0, 0x2800_0800),
+            0x8000_0002..=0x8000_0004 => Self::cpuid_brand_leaf(leaf),
+            // Leaf 7 subleaf 0 (max subleaf 0; EBX's BMI1/BMI2/AVX2/... bits
+            // are all zero — none of those are implemented) and any other
+            // leaf this scaffold doesn't recognize: nothing extra.
+            _ => (0, 0, 0, 0),
+        };
+        self.gpr[RAX] = u64::from(eax);
+        self.gpr[RBX] = u64::from(ebx);
+        self.gpr[RCX] = u64::from(ecx);
+        self.gpr[RDX] = u64::from(edx);
+    }
+
+    /// The `EAX`/`EBX`/`ECX`/`EDX` quartet for one of `CPUID`'s three
+    /// "processor brand string" leaves (`0x8000_0002..=0x8000_0004`): 16
+    /// ASCII bytes per leaf, 48 total, from a fixed, null-padded identity
+    /// string (there's no real silicon behind it).
+    fn cpuid_brand_leaf(leaf: u32) -> (u32, u32, u32, u32) {
+        const TEXT: &[u8] = b"nixvm software x86-64 CPU";
+        let mut brand = [0u8; 48];
+        brand[..TEXT.len()].copy_from_slice(TEXT);
+        let base = ((leaf - 0x8000_0002) * 16) as usize;
+        let word =
+            |off: usize| u32::from_le_bytes(brand[base + off..base + off + 4].try_into().unwrap());
+        (word(0), word(4), word(8), word(12))
+    }
+
+    /// Advance and return the free-running counter behind `RDTSC`/`RDTSCP`:
+    /// incrementing on every read (rather than tracking real elapsed time,
+    /// which this scaffold has no clock source for) guarantees a guest
+    /// spin-loop that polls it for elapsed time always terminates.
+    fn rdtsc_tick(&mut self) -> u64 {
+        self.tsc = self.tsc.wrapping_add(1);
+        self.tsc
+    }
+
     // ---- REP-prefixed string ops. `rep` is `0` (no prefix, run once and
     // leave rCX alone), `1` (REP/REPE, `0xF3`) or `2` (REPNE, `0xF2`). Each
     // handler runs its whole repeat count in a single `Step` rather than
@@ -1983,6 +2212,60 @@ impl X86Interp {
                 fetch!(self.write_operand(mem, Operand::Reg(r), bs, width));
                 self.next(pc)
             }
+            0xA2 => {
+                self.cpuid();
+                self.next(pc)
+            }
+            0x31 => {
+                // RDTSC: EDX:EAX = a free-running counter (see `rdtsc_tick`).
+                let t = self.rdtsc_tick();
+                self.gpr[RAX] = t & 0xffff_ffff;
+                self.gpr[RDX] = t >> 32;
+                self.next(pc)
+            }
+            0x01 => {
+                // Group 7 is a large, mostly-privileged/system-instruction
+                // opcode map; we only recognize the two register-form
+                // (`mod == 11`) encodings a userspace program can actually
+                // reach: `RDTSCP` (`F9`) and `XGETBV` (`D0`). Peeking at the
+                // raw ModRM byte (rather than a full `decode_modrm`) is safe
+                // here because every other sub-form we don't implement is
+                // rejected outright, with no operand to resolve correctly.
+                let (b, pc2) = fetch!(fetch_u8(mem, pc));
+                match b {
+                    0xF9 => {
+                        // RDTSCP: like RDTSC, plus ECX = TSC_AUX (there's no
+                        // real per-core/node id to report, so always 0).
+                        let t = self.rdtsc_tick();
+                        self.gpr[RAX] = t & 0xffff_ffff;
+                        self.gpr[RDX] = t >> 32;
+                        self.gpr[RCX] = 0;
+                        self.next(pc2)
+                    }
+                    0xD0 => {
+                        // XGETBV (ECX selects the XCR; only XCR0 is
+                        // meaningful and we don't validate it): x87|SSE
+                        // state only (bit 2, AVX/YMM state, is never
+                        // advertised — no AVX support).
+                        self.gpr[RAX] = 0x3;
+                        self.gpr[RDX] = 0;
+                        self.next(pc2)
+                    }
+                    // SGDT/SIDT/LGDT/LIDT/SMSW/LMSW/INVLPG (privileged or
+                    // memory-system state), SWAPGS/MONITOR/MWAIT/XSETBV/
+                    // VMCALL/VMFUNC/XEND/XTEST/RDPKRU/WRPKRU: not in our
+                    // documented subset (either privileged, or no state to
+                    // back them in a single-address-space scaffold).
+                    _ => Step::Illegal,
+                }
+            }
+            0xC0 => self.xadd(mem, pc, rex, has_rex, 8),
+            0xC1 => self.xadd(mem, pc, rex, has_rex, width),
+            0xB0 => self.cmpxchg(mem, pc, rex, has_rex, 8),
+            0xB1 => self.cmpxchg(mem, pc, rex, has_rex, width),
+            0xC3 => self.movnti(mem, pc, rex, width),
+            0xAE => self.group15_ae(mem, pc, rex),
+            0xC7 => self.group9_c7(mem, pc, rex, width),
             _ => self.exec_0f_sse(mem, pc, rex, opsize16, rep, op2),
         }
     }
@@ -3216,8 +3499,13 @@ impl X86Interp {
     #[allow(clippy::too_many_lines)]
     fn exec(&mut self, mem: &mut GuestMemory) -> Step {
         // Legacy prefixes (operand-size `0x66`, `REP`/`REPE` `0xF3`, `REPNE`
-        // `0xF2`) precede any `REX` byte, which in turn must immediately
-        // precede the opcode.
+        // `0xF2`, `LOCK` `0xF0`) precede any `REX` byte, which in turn must
+        // immediately precede the opcode. `LOCK` just decorates the
+        // following read-modify-write with a hardware bus-lock guarantee;
+        // since this interpreter is single-threaded every op is already
+        // atomic, so the prefix is decoded and otherwise ignored (matching
+        // real hardware, we don't validate that the opcode it precedes is
+        // actually one of the lockable ones).
         let mut pc = self.rip;
         let mut opsize16 = false;
         let mut rep: u8 = 0; // 0 = none, 1 = REP/REPE (F3), 2 = REPNE (F2)
@@ -3227,6 +3515,7 @@ impl X86Interp {
                 0x66 => opsize16 = true,
                 0xF3 => rep = 1,
                 0xF2 => rep = 2,
+                0xF0 => {} // LOCK
                 _ => break,
             }
             pc = next;
@@ -4346,6 +4635,108 @@ mod tests {
         cpu.exec(&mut m);
         assert_eq!(cpu.gpr[RDX] & 0xffff_ffff, 0x99);
         assert_eq!(m.read_u64(0x1_8000).unwrap() & 0xffff_ffff, 0x77);
+    }
+
+    #[test]
+    fn cpuid_leaf0_reports_vendor_string_and_max_leaf() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 0;
+        // cpuid (0F A2)
+        m.write_init(CODE, &[0x0F, 0xA2]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX] as u32, 7, "max standard leaf");
+        let mut vendor = Vec::new();
+        vendor.extend_from_slice(&(cpu.gpr[RBX] as u32).to_le_bytes());
+        vendor.extend_from_slice(&(cpu.gpr[RDX] as u32).to_le_bytes());
+        vendor.extend_from_slice(&(cpu.gpr[RCX] as u32).to_le_bytes());
+        assert_eq!(vendor, b"GenuineIntel", "EBX/EDX/ECX spell the vendor string");
+    }
+
+    #[test]
+    fn cpuid_leaf1_edx_has_sse2_bit() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 1;
+        m.write_init(CODE, &[0x0F, 0xA2]).unwrap();
+        cpu.exec(&mut m);
+        assert_ne!(cpu.gpr[RDX] as u32 & (1 << 26), 0, "SSE2 feature bit (EDX bit 26) is set");
+        assert_ne!(cpu.gpr[RDX] as u32 & (1 << 0), 0, "FPU feature bit (EDX bit 0) is set");
+    }
+
+    #[test]
+    fn rdtsc_increases_across_reads() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        // rdtsc (0F 31)
+        m.write_init(CODE, &[0x0F, 0x31]).unwrap();
+        cpu.exec(&mut m);
+        let first = (cpu.gpr[RDX] << 32) | (cpu.gpr[RAX] & 0xffff_ffff);
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        let second = (cpu.gpr[RDX] << 32) | (cpu.gpr[RAX] & 0xffff_ffff);
+        assert!(second > first, "RDTSC must return a monotonically increasing counter");
+    }
+
+    #[test]
+    fn rdrand_sets_cf_and_a_nonzero_value() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        // rdrand eax  (0F C7 /6, modrm=11 110 000)
+        m.write_init(CODE, &[0x0F, 0xC7, 0xF0]).unwrap();
+        cpu.exec(&mut m);
+        assert!(cpu.flags.cf, "RDRAND always reports success");
+        assert_ne!(cpu.gpr[RAX] as u32, 0);
+    }
+
+    #[test]
+    fn cmpxchg_success_sets_zf_and_stores_src_failure_loads_accumulator() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 5; // accumulator
+        cpu.gpr[RCX] = 42; // src, stored into dest on a match
+        cpu.gpr[RBX] = 5; // dest == accumulator -> match
+        // cmpxchg ebx, ecx  (0F B1 /r, modrm=11 001 011: reg=ecx, rm=ebx)
+        m.write_init(CODE, &[0x0F, 0xB1, 0xCB]).unwrap();
+        cpu.exec(&mut m);
+        assert!(cpu.flags.zf, "a match sets ZF");
+        assert_eq!(cpu.gpr[RBX] & 0xffff_ffff, 42, "dest <- src on a match");
+
+        // dest (ebx) is now 42; accumulator is still 5, so this mismatches.
+        cpu.gpr[RCX] = 99;
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert!(!cpu.flags.zf, "a mismatch clears ZF");
+        assert_eq!(cpu.gpr[RAX] & 0xffff_ffff, 42, "accumulator <- dest on a mismatch");
+        assert_eq!(cpu.gpr[RBX] & 0xffff_ffff, 42, "a mismatch leaves dest untouched");
+    }
+
+    #[test]
+    fn xadd_returns_old_dest_value_and_sums() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 10; // dest
+        cpu.gpr[RCX] = 5; // src
+        // xadd eax, ecx  (0F C1 /r, modrm=11 001 000: reg=ecx, rm=eax)
+        m.write_init(CODE, &[0x0F, 0xC1, 0xC8]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RCX] & 0xffff_ffff, 10, "reg gets the old dest value");
+        assert_eq!(cpu.gpr[RAX] & 0xffff_ffff, 15, "dest becomes dest + src");
+    }
+
+    #[test]
+    fn lock_add_updates_memory_and_sets_flags() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let addr = 0x1_2000u64;
+        m.write_init(addr, &10u64.to_le_bytes()).unwrap();
+        cpu.gpr[RBX] = addr;
+        cpu.gpr[RCX] = 5;
+        // lock add [rbx], ecx  (F0 01 /r, modrm=00 001 011: reg=ecx, rm=[rbx])
+        m.write_init(CODE, &[0xF0, 0x01, 0x0B]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(m.read_u32(addr).unwrap(), 15, "LOCK ADD still performs the add on memory");
+        assert!(!cpu.flags.zf);
     }
 
     #[test]
