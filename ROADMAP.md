@@ -189,8 +189,25 @@ The hard core. A process/thread table; `clone`/`clone3` for both threads
 (shared address space) and processes (`fork` via COW); a scheduler mapping guest
 threads onto host vcpus/threads; futexes; signal delivery and return.
 
-- **New:** scheduler (`kernel::sched`), per-thread vcpu ownership, COW fork of
-  `GuestMemory`.
+**State partitioning (drives a `Kernel` refactor).** Today `Kernel` holds the
+fd table, `GuestMemory`, brk/mmap arena, and `cwd` as one flat process. That
+splits into three layers:
+
+- **Task (per thread):** its own **vcpu** (registers/pc/sp — *one vcpu per
+  thread*), its own **cwd**, `clear_child_tid`, signal mask. The scheduler owns
+  the task table and runs each task's vcpu.
+- **Process (shared by a thread group):** address space (`GuestMemory`), fd
+  table, brk/mmap arena, signal handlers, exit state. `clone(CLONE_VM|CLONE_FILES
+  |CLONE_THREAD)` shares these; `fork` copies them (COW `GuestMemory`).
+- **Kernel-global:** the mount table and the scheduler.
+
+The **scheduler** (`kernel::sched`) replaces the single-vcpu `Kernel::run` loop:
+round-robin (or step-budget preemptive) across ready tasks, `Exit::Interrupted`
+as the yield point, futex/`wait4` as block/wake edges — mirroring univdreams'
+per-thread `Cpu` loop.
+
+- **New:** scheduler (`kernel::sched`), `Task`/`Process` split, per-task cwd,
+  per-thread vcpu ownership, COW fork of `GuestMemory`.
 - **Syscalls:** `clone`/`clone3`, `fork`/`vfork`, `execve`/`execveat`, `wait4`,
   `exit` (thread), `futex`(WAIT/WAKE/REQUEUE/PI subset), `tgkill`/`kill`,
   `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `rt_sigpending`,
@@ -331,7 +348,7 @@ the portable path leaked no host dependencies (if it builds for wasm, the
 | **Address-space model** — one flat guest AS per process; how to isolate procs.  | Per-process `GuestMemory`; COW at `fork`; HVF/KVM stage-2 or per-process VM. Decide in Phase 6. |
 | **Signals on a trap-only model** — delivering async signals to guest threads.   | Interrupt the vcpu (`Exit::Interrupted`), push a signal frame, redirect PC — mirrors univdreams' `deliver_signal`. |
 | **Networking fidelity** — userspace TCP/IP vs host passthrough.                  | `smoltcp` NAT by default for isolation; opt-in host passthrough under policy. |
-| **`/work` passthrough safety** — symlink/`..` escapes, TOCTOU.                   | Resolve every path inside the kernel against the mount root; `openat2(RESOLVE_BENEATH)`-style containment on the host side. |
+| **Passthrough/hole escape** — a host symlink inside a shared path, or a TOCTOU swap of a component for a symlink by a concurrent thread, redirecting a lookup *outside* the mapped directory. | Race-free resolution **beneath the root**: hold the mount root as a dir fd and walk components with `openat(O_NOFOLLOW)` — `openat2(RESOLVE_BENEATH\|RESOLVE_NO_MAGICLINKS)` on Linux, a per-component `O_NOFOLLOW`+`fstatat` walk on macOS. Symlinks resolve in *our* VFS within the sandbox root, never on the host. Current passthrough is only lexically contained (`..` rejection) — this is the gap to close before writable holes of untrusted dirs are safe. |
 | **Performance of the trap-per-syscall model.**                                  | Benchmark continuously from Phase 1; fast-path hot syscalls; the point of comparison is Docker/gVisor, not a bare VM. |
 | **Demo-vs-native sequencing** — the interpreter sits at Phase 10, but the browser demo needs only it + the Phase 4 fs (not HVF). | If try-before-install is an adoption priority, pull a *minimal* interpreter (arm64 integer ISA) forward as its own early public milestone, decoupled from the full Phase 10 backend. Decide before Phase 4 lands. |
 

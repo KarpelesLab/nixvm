@@ -10,6 +10,23 @@
 //! Paths are contained to the mapped root: a `..` component is rejected rather
 //! than allowed to escape (the kernel also normalizes paths before they reach
 //! here, so this is defense in depth). Host-only; not built for wasm.
+//!
+//! # Security: symlink containment is NOT complete yet
+//!
+//! Today's containment is purely *lexical* (`..` rejection). It does **not** yet
+//! stop a host **symlink** inside the mapped directory from redirecting a lookup
+//! outside it — and it is vulnerable to the **TOCTOU** race where a concurrent
+//! actor swaps a component for a symlink between a `stat` and the `open`. A
+//! passthrough must never become an escape hatch out of the shared path.
+//!
+//! The race-free fix (tracked in ROADMAP §4): resolve every path **beneath the
+//! root** with the kernel holding the mount root as a directory fd and walking
+//! components with `openat(.., O_NOFOLLOW)` — `openat2(RESOLVE_BENEATH |
+//! RESOLVE_NO_MAGICLINKS)` on Linux, and a per-component `O_NOFOLLOW` walk +
+//! `fstatat` on macOS (no `openat2`). Symlinks are then resolved by *our* VFS
+//! *within the sandbox root* (so a `/work` symlink to `/etc` hits the sealed
+//! squashfs `/etc`, never the host's). Until that lands, treat writable
+//! passthroughs of attacker-influenced directories as unsafe.
 
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
