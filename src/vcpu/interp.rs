@@ -180,6 +180,57 @@ impl Aarch64Interp {
         }
     }
 
+    /// Read the low 32 bits of `v[n]` as an `f32` (scalar single-precision).
+    fn fp32(&self, n: usize) -> f32 {
+        f32::from_bits(self.v[n] as u32)
+    }
+    /// Read the low 64 bits of `v[n]` as an `f64` (scalar double-precision).
+    fn fp64(&self, n: usize) -> f64 {
+        f64::from_bits(self.v[n] as u64)
+    }
+    /// Write `x` to `v[d]`, zeroing the upper bits (scalar single-precision).
+    fn set_fp32(&mut self, d: usize, x: f32) {
+        self.v[d] = u128::from(x.to_bits());
+    }
+    /// Write `x` to `v[d]`, zeroing the upper bits (scalar double-precision).
+    fn set_fp64(&mut self, d: usize, x: f64) {
+        self.v[d] = u128::from(x.to_bits());
+    }
+    /// Set NZCV per the ARM floating-point comparison rules: unordered (a NaN)
+    /// sets C and V; otherwise Z=equal, C=(a>=b), N=(a<b).
+    #[allow(clippy::float_cmp)]
+    fn set_fcmp_flags(&mut self, a: f64, b: f64) {
+        self.flags = if a.is_nan() || b.is_nan() {
+            Flags {
+                n: false,
+                z: false,
+                c: true,
+                v: true,
+            }
+        } else if a == b {
+            Flags {
+                n: false,
+                z: true,
+                c: true,
+                v: false,
+            }
+        } else if a < b {
+            Flags {
+                n: true,
+                z: false,
+                c: false,
+                v: false,
+            }
+        } else {
+            Flags {
+                n: false,
+                z: false,
+                c: true,
+                v: false,
+            }
+        };
+    }
+
     /// Debug: report a store overlapping the `NIXVM_WATCH` address.
     fn note_store(&self, addr: u64, value: u128, nbytes: usize) {
         if let Some(w) = self.watch
@@ -1054,11 +1105,32 @@ impl Aarch64Interp {
         if (instr >> 24) & 0x7f == 0b0011110 && (instr >> 21) & 1 == 1 && (instr >> 10) & 0x3f == 0
         {
             let ftype = (instr >> 22) & 3; // 00 = S (32-bit), 01 = D (64-bit)
+            let sf = (instr >> 31) & 1; // 0 = W (32-bit), 1 = X (64-bit) int register
             let rmode = (instr >> 19) & 3;
             let opcode = (instr >> 16) & 7;
             let rn = reg_field(instr, 5);
             let rd = reg_field(instr, 0);
             match (rmode, opcode) {
+                (0, 0b010 | 0b011) => {
+                    // SCVTF / UCVTF: integer register -> floating-point.
+                    let signed = opcode == 0b010;
+                    let val = self.read_x(rn);
+                    match ftype {
+                        0 => self.set_fp32(rd, int_to_f32(val, signed, sf == 1)),
+                        1 => self.set_fp64(rd, int_to_f64(val, signed, sf == 1)),
+                        _ => return Step::Illegal,
+                    }
+                }
+                (3, 0b000 | 0b001) => {
+                    // FCVTZS / FCVTZU: floating-point -> integer, round toward zero.
+                    let signed = opcode == 0b000;
+                    let x = match ftype {
+                        0 => f64::from(self.fp32(rn)),
+                        1 => self.fp64(rn),
+                        _ => return Step::Illegal,
+                    };
+                    self.write_x(rd, fp_to_int(x, signed, sf == 1));
+                }
                 (0, 0b111) => {
                     // GP -> FP: Vd = Rn (32 or 64 bits), upper bits cleared.
                     let val = self.read_x(rn);
@@ -1085,6 +1157,241 @@ impl Aarch64Interp {
                 (1, 0b110) => self.write_x(rd, (self.v[rn] >> 64) as u64), // Vn.D[1] -> GP
                 _ => return Step::Illegal, // FCVT*/SCVTF/etc: not implemented
             }
+            return Step::Next;
+        }
+
+        // ---- scalar FP data-processing (1 source) ----
+        if (instr >> 24) & 0x7f == 0b0011110
+            && (instr >> 21) & 1 == 1
+            && (instr >> 10) & 0x1f == 0b10000
+        {
+            let ftype = (instr >> 22) & 3;
+            let opcode = (instr >> 15) & 0x3f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            // FCVT (precision change): opcode = 0001<dst>, dst 00=S 01=D 11=H.
+            if opcode & 0b11_1100 == 0b00_0100 {
+                match (ftype, opcode & 3) {
+                    (0, 1) => self.set_fp64(rd, f64::from(self.fp32(rn))), // S -> D
+                    (1, 0) => self.set_fp32(rd, self.fp64(rn) as f32),     // D -> S
+                    _ => return Step::Illegal,
+                }
+                return Step::Next;
+            }
+            match ftype {
+                0 => {
+                    let a = self.fp32(rn);
+                    let r = match opcode {
+                        0b000000 => a,                   // FMOV
+                        0b000001 => a.abs(),             // FABS
+                        0b000010 => -a,                  // FNEG
+                        0b000011 => a.sqrt(),            // FSQRT
+                        0b001000 => a.round_ties_even(), // FRINTN
+                        0b001001 => a.ceil(),            // FRINTP
+                        0b001010 => a.floor(),           // FRINTM
+                        0b001011 => a.trunc(),           // FRINTZ
+                        0b001100 => a.round(),           // FRINTA
+                        _ => return Step::Illegal,
+                    };
+                    self.set_fp32(rd, r);
+                }
+                1 => {
+                    let a = self.fp64(rn);
+                    let r = match opcode {
+                        0b000000 => a,
+                        0b000001 => a.abs(),
+                        0b000010 => -a,
+                        0b000011 => a.sqrt(),
+                        0b001000 => a.round_ties_even(),
+                        0b001001 => a.ceil(),
+                        0b001010 => a.floor(),
+                        0b001011 => a.trunc(),
+                        0b001100 => a.round(),
+                        _ => return Step::Illegal,
+                    };
+                    self.set_fp64(rd, r);
+                }
+                _ => return Step::Illegal,
+            }
+            return Step::Next;
+        }
+
+        // ---- scalar FP data-processing (2 source) ----
+        if (instr >> 24) & 0x7f == 0b0011110
+            && (instr >> 21) & 1 == 1
+            && (instr >> 10) & 0x3 == 0b10
+        {
+            let ftype = (instr >> 22) & 3;
+            let opcode = (instr >> 12) & 0xf;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            match ftype {
+                0 => {
+                    let (a, b) = (self.fp32(rn), self.fp32(rm));
+                    let r = match opcode {
+                        0b0000 => a * b,        // FMUL
+                        0b0001 => a / b,        // FDIV
+                        0b0010 => a + b,        // FADD
+                        0b0011 => a - b,        // FSUB
+                        0b0100 => fmax32(a, b), // FMAX
+                        0b0101 => fmin32(a, b), // FMIN
+                        0b0110 => a.max(b),     // FMAXNM
+                        0b0111 => a.min(b),     // FMINNM
+                        0b1000 => -(a * b),     // FNMUL
+                        _ => return Step::Illegal,
+                    };
+                    self.set_fp32(rd, r);
+                }
+                1 => {
+                    let (a, b) = (self.fp64(rn), self.fp64(rm));
+                    let r = match opcode {
+                        0b0000 => a * b,
+                        0b0001 => a / b,
+                        0b0010 => a + b,
+                        0b0011 => a - b,
+                        0b0100 => fmax64(a, b),
+                        0b0101 => fmin64(a, b),
+                        0b0110 => a.max(b),
+                        0b0111 => a.min(b),
+                        0b1000 => -(a * b),
+                        _ => return Step::Illegal,
+                    };
+                    self.set_fp64(rd, r);
+                }
+                _ => return Step::Illegal,
+            }
+            return Step::Next;
+        }
+
+        // ---- scalar FP compare: FCMP/FCMPE (register and #0.0) ----
+        if (instr >> 24) & 0x7f == 0b0011110
+            && (instr >> 21) & 1 == 1
+            && (instr >> 14) & 0x3 == 0b00
+            && (instr >> 10) & 0xf == 0b1000
+        {
+            let ftype = (instr >> 22) & 3;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let cmp_zero = (instr >> 3) & 1 == 1; // opcode2<3>: compare against +0.0
+            let (a, b) = match ftype {
+                0 => (
+                    f64::from(self.fp32(rn)),
+                    if cmp_zero {
+                        0.0
+                    } else {
+                        f64::from(self.fp32(rm))
+                    },
+                ),
+                1 => (self.fp64(rn), if cmp_zero { 0.0 } else { self.fp64(rm) }),
+                _ => return Step::Illegal,
+            };
+            self.set_fcmp_flags(a, b);
+            return Step::Next;
+        }
+
+        // ---- scalar FP conditional compare: FCCMP/FCCMPE ----
+        if (instr >> 24) & 0x7f == 0b0011110
+            && (instr >> 21) & 1 == 1
+            && (instr >> 10) & 0x3 == 0b01
+        {
+            let ftype = (instr >> 22) & 3;
+            let rm = reg_field(instr, 16);
+            let cond = (instr >> 12) & 0xf;
+            let rn = reg_field(instr, 5);
+            let nzcv = instr & 0xf;
+            if self.cond_holds(cond) {
+                let (a, b) = match ftype {
+                    0 => (f64::from(self.fp32(rn)), f64::from(self.fp32(rm))),
+                    1 => (self.fp64(rn), self.fp64(rm)),
+                    _ => return Step::Illegal,
+                };
+                self.set_fcmp_flags(a, b);
+            } else {
+                self.flags = Flags {
+                    n: nzcv & 8 != 0,
+                    z: nzcv & 4 != 0,
+                    c: nzcv & 2 != 0,
+                    v: nzcv & 1 != 0,
+                };
+            }
+            return Step::Next;
+        }
+
+        // ---- scalar FP conditional select: FCSEL ----
+        if (instr >> 24) & 0x7f == 0b0011110
+            && (instr >> 21) & 1 == 1
+            && (instr >> 10) & 0x3 == 0b11
+        {
+            let ftype = (instr >> 22) & 3;
+            let rm = reg_field(instr, 16);
+            let cond = (instr >> 12) & 0xf;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let src = if self.cond_holds(cond) { rn } else { rm };
+            match ftype {
+                0 => self.set_fp32(rd, self.fp32(src)),
+                1 => self.set_fp64(rd, self.fp64(src)),
+                _ => return Step::Illegal,
+            }
+            return Step::Next;
+        }
+
+        // ---- scalar FP immediate: FMOV (scalar, immediate) via VFPExpandImm ----
+        if (instr >> 24) & 0x7f == 0b0011110
+            && (instr >> 21) & 1 == 1
+            && (instr >> 10) & 0x7 == 0b100
+            && (instr >> 5) & 0x1f == 0
+        {
+            let ftype = (instr >> 22) & 3;
+            let imm8 = (instr >> 13) & 0xff;
+            let rd = reg_field(instr, 0);
+            match ftype {
+                0 => self.v[rd] = u128::from(vfp_expand_imm32(imm8)),
+                1 => self.v[rd] = u128::from(vfp_expand_imm64(imm8)),
+                _ => return Step::Illegal,
+            }
+            return Step::Next;
+        }
+
+        // ---- SIMD three-same (integer): ADD/SUB (vector) and CMEQ (register) ----
+        if (instr >> 24) & 0x9f == 0b0_0001110 && (instr >> 21) & 1 == 1 && (instr >> 10) & 1 == 1 {
+            let q = (instr >> 30) & 1;
+            let u = (instr >> 29) & 1;
+            let size = (instr >> 22) & 3;
+            let opcode = (instr >> 11) & 0x1f;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            // 0 = ADD, 1 = SUB, 2 = CMEQ.
+            let op = match (u, opcode) {
+                (0, 0b10000) => 0u8,
+                (1, 0b10000) => 1,
+                (1, 0b10001) => 2,
+                _ => return Step::Illegal,
+            };
+            let esize = 8u32 << size;
+            let lanes = (if q == 1 { 128 } else { 64 }) / esize;
+            let mask = ones_u128(esize);
+            let mut result = 0u128;
+            for i in 0..lanes {
+                let sh = i * esize;
+                let x = (self.v[rn] >> sh) & mask;
+                let y = (self.v[rm] >> sh) & mask;
+                let lane = match op {
+                    0 => x.wrapping_add(y) & mask,
+                    1 => x.wrapping_sub(y) & mask,
+                    _ => {
+                        if x == y {
+                            mask
+                        } else {
+                            0
+                        }
+                    }
+                };
+                result |= lane << sh;
+            }
+            self.v[rd] = result;
             return Step::Next;
         }
 
@@ -1477,6 +1784,77 @@ fn decode_bit_masks(n: u32, imms: u32, immr: u32, width: u32) -> Option<(u64, u6
     Some((wmask, tmask))
 }
 
+/// Convert an integer register value to `f32` (SCVTF/UCVTF single). `sf`
+/// selects the 64-bit (X) source width; otherwise the low 32 bits (W) are used.
+#[allow(clippy::cast_precision_loss)]
+fn int_to_f32(v: u64, signed: bool, sf: bool) -> f32 {
+    match (signed, sf) {
+        (true, true) => v as i64 as f32,
+        (true, false) => v as i32 as f32,
+        (false, true) => v as f32,
+        (false, false) => v as u32 as f32,
+    }
+}
+
+/// Convert an integer register value to `f64` (SCVTF/UCVTF double).
+#[allow(clippy::cast_precision_loss)]
+fn int_to_f64(v: u64, signed: bool, sf: bool) -> f64 {
+    match (signed, sf) {
+        (true, true) => v as i64 as f64,
+        (true, false) => f64::from(v as i32),
+        (false, true) => v as f64,
+        (false, false) => f64::from(v as u32),
+    }
+}
+
+/// Convert a floating-point value to an integer register value, rounding toward
+/// zero (FCVTZS/FCVTZU). Rust's saturating float-to-int casts give the ARM
+/// behaviour: NaN maps to 0 and out-of-range values saturate to the min/max.
+fn fp_to_int(x: f64, signed: bool, sf: bool) -> u64 {
+    match (signed, sf) {
+        (true, true) => x as i64 as u64,
+        (true, false) => u64::from(x as i32 as u32),
+        (false, true) => x as u64,
+        (false, false) => u64::from(x as u32),
+    }
+}
+
+/// FMAX (single): larger of the two, with NaN propagated.
+fn fmax32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else {
+        a.max(b)
+    }
+}
+
+/// FMIN (single): smaller of the two, with NaN propagated.
+fn fmin32(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else {
+        a.min(b)
+    }
+}
+
+/// FMAX (double): larger of the two, with NaN propagated.
+fn fmax64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.max(b)
+    }
+}
+
+/// FMIN (double): smaller of the two, with NaN propagated.
+fn fmin64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.min(b)
+    }
+}
+
 /// Sign-extend the low `bits` of `v` to a full `i64`.
 const fn sign_extend(v: u64, bits: u32) -> i64 {
     let shift = 64 - bits;
@@ -1485,6 +1863,8 @@ const fn sign_extend(v: u64, bits: u32) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    // FP tests compare exactly-representable results (integers, halves) by value.
+    #![allow(clippy::float_cmp)]
     use super::*;
     use crate::vcpu::mem::{PAGE_SIZE, Prot};
 
@@ -1855,6 +2235,222 @@ mod tests {
         assert_eq!(c.pc, 0x1_0004);
         c.set_syscall_ret(0);
         assert_eq!(c.pc, 0x1_0008);
+    }
+
+    /// Load a scalar `f64` into `v[n]`'s low 64 bits.
+    fn setd(c: &mut Aarch64Interp, n: usize, x: f64) {
+        c.v[n] = u128::from(x.to_bits());
+    }
+    /// Load a scalar `f32` into `v[n]`'s low 32 bits.
+    fn sets(c: &mut Aarch64Interp, n: usize, x: f32) {
+        c.v[n] = u128::from(x.to_bits());
+    }
+    fn getd(c: &Aarch64Interp, n: usize) -> f64 {
+        f64::from_bits(c.v[n] as u64)
+    }
+    fn gets(c: &Aarch64Interp, n: usize) -> f32 {
+        f32::from_bits(c.v[n] as u32)
+    }
+
+    #[test]
+    fn fp_arithmetic_double() {
+        let (mut c, mut m) = (cpu(), scratch());
+        setd(&mut c, 1, 3.5);
+        setd(&mut c, 2, 2.0);
+        c.v[0] = u128::MAX; // ensure upper bits get cleared
+        c.exec(0x1E62_2820, &mut m); // fadd d0,d1,d2
+        assert_eq!(getd(&c, 0), 5.5);
+        assert_eq!(c.v[0] >> 64, 0, "upper bits cleared");
+        c.exec(0x1E62_3820, &mut m); // fsub d0,d1,d2
+        assert_eq!(getd(&c, 0), 1.5);
+        c.exec(0x1E62_0820, &mut m); // fmul d0,d1,d2
+        assert_eq!(getd(&c, 0), 7.0);
+        c.exec(0x1E62_1820, &mut m); // fdiv d0,d1,d2
+        assert_eq!(getd(&c, 0), 1.75);
+        c.exec(0x1E62_4820, &mut m); // fmax d0,d1,d2
+        assert_eq!(getd(&c, 0), 3.5);
+        c.exec(0x1E62_5820, &mut m); // fmin d0,d1,d2
+        assert_eq!(getd(&c, 0), 2.0);
+        c.exec(0x1E62_8820, &mut m); // fnmul d0,d1,d2 -> -(3.5*2)
+        assert_eq!(getd(&c, 0), -7.0);
+    }
+
+    #[test]
+    fn fp_arithmetic_single() {
+        let (mut c, mut m) = (cpu(), scratch());
+        sets(&mut c, 1, 1.5);
+        sets(&mut c, 2, 4.0);
+        c.exec(0x1E22_2820, &mut m); // fadd s0,s1,s2
+        assert_eq!(gets(&c, 0), 5.5);
+        c.exec(0x1E22_0820, &mut m); // fmul s0,s1,s2
+        assert_eq!(gets(&c, 0), 6.0);
+    }
+
+    #[test]
+    fn fp_one_source_ops() {
+        let (mut c, mut m) = (cpu(), scratch());
+        setd(&mut c, 1, -3.25);
+        c.exec(0x1E60_C020, &mut m); // fabs d0,d1
+        assert_eq!(getd(&c, 0), 3.25);
+        c.exec(0x1E61_4020, &mut m); // fneg d0,d1
+        assert_eq!(getd(&c, 0), 3.25);
+        setd(&mut c, 1, 9.0);
+        c.exec(0x1E61_C020, &mut m); // fsqrt d0,d1
+        assert_eq!(getd(&c, 0), 3.0);
+        setd(&mut c, 1, 2.7);
+        c.exec(0x1E65_C020, &mut m); // frintz d0,d1 (toward zero)
+        assert_eq!(getd(&c, 0), 2.0);
+        c.exec(0x1E65_4020, &mut m); // frintm d0,d1 (floor)
+        assert_eq!(getd(&c, 0), 2.0);
+        c.exec(0x1E64_C020, &mut m); // frintp d0,d1 (ceil)
+        assert_eq!(getd(&c, 0), 3.0);
+        setd(&mut c, 1, 2.5);
+        c.exec(0x1E64_4020, &mut m); // frintn d0,d1 (ties to even -> 2)
+        assert_eq!(getd(&c, 0), 2.0);
+        c.exec(0x1E66_4020, &mut m); // frinta d0,d1 (ties away -> 3)
+        assert_eq!(getd(&c, 0), 3.0);
+    }
+
+    #[test]
+    fn fcvt_single_double_roundtrip() {
+        let (mut c, mut m) = (cpu(), scratch());
+        sets(&mut c, 1, 1.5);
+        c.exec(0x1E22_C020, &mut m); // fcvt d0,s1  (single -> double)
+        assert_eq!(getd(&c, 0), 1.5);
+        setd(&mut c, 1, 1.5);
+        c.exec(0x1E62_4020, &mut m); // fcvt s0,d1  (double -> single)
+        assert_eq!(gets(&c, 0), 1.5);
+    }
+
+    #[test]
+    fn fmov_immediate() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.exec(0x1E6E_1000, &mut m); // fmov d0,#1.0
+        assert_eq!(getd(&c, 0), 1.0);
+        c.exec(0x1E60_1000, &mut m); // fmov d0,#2.0
+        assert_eq!(getd(&c, 0), 2.0);
+        c.exec(0x1E2E_1000, &mut m); // fmov s0,#1.0
+        assert_eq!(gets(&c, 0), 1.0);
+    }
+
+    #[test]
+    fn scvtf_fcvtzs_roundtrip_integer() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = (-42i64) as u64;
+        c.exec(0x9E62_0020, &mut m); // scvtf d0,x1
+        assert_eq!(getd(&c, 0), -42.0);
+        // round-trip back to an integer with FCVTZS
+        c.exec(0x9E78_0000, &mut m); // fcvtzs x0,d0
+        assert_eq!(c.x[0] as i64, -42);
+        // unsigned conversion round-trip
+        c.x[3] = 300;
+        c.exec(0x9E63_0060, &mut m); // ucvtf d0,x3
+        assert_eq!(getd(&c, 0), 300.0);
+        setd(&mut c, 0, 300.0);
+        c.exec(0x9E79_0000, &mut m); // fcvtzu x0,d0
+        assert_eq!(c.x[0], 300);
+        // saturation: NaN -> 0, +inf -> i64::MAX
+        setd(&mut c, 0, f64::NAN);
+        c.exec(0x9E78_0000, &mut m); // fcvtzs x0,d0
+        assert_eq!(c.x[0], 0, "NaN converts to 0");
+        setd(&mut c, 0, f64::INFINITY);
+        c.exec(0x9E78_0000, &mut m); // fcvtzs x0,d0
+        assert_eq!(c.x[0] as i64, i64::MAX, "+inf saturates");
+        // W-form: fcvtzs w0,s1 truncates toward zero
+        sets(&mut c, 1, -2.9);
+        c.exec(0x1E38_0020, &mut m); // fcvtzs w0,s1
+        assert_eq!(c.x[0] as i32, -2);
+    }
+
+    #[test]
+    fn fcmp_sets_flags() {
+        let (mut c, mut m) = (cpu(), scratch());
+        setd(&mut c, 1, 1.0);
+        setd(&mut c, 2, 2.0);
+        c.exec(0x1E62_2020, &mut m); // fcmp d1,d2  (1 < 2)
+        assert!(
+            c.flags.n && !c.flags.z && !c.flags.c && !c.flags.v,
+            "less-than"
+        );
+        setd(&mut c, 2, 1.0);
+        c.exec(0x1E62_2020, &mut m); // fcmp d1,d2  (equal)
+        assert!(!c.flags.n && c.flags.z && c.flags.c && !c.flags.v, "equal");
+        setd(&mut c, 2, 0.5);
+        c.exec(0x1E62_2020, &mut m); // fcmp d1,d2  (1 > 0.5)
+        assert!(
+            !c.flags.n && !c.flags.z && c.flags.c && !c.flags.v,
+            "greater-than"
+        );
+        setd(&mut c, 1, f64::NAN);
+        c.exec(0x1E62_2020, &mut m); // fcmp d1,d2  (unordered)
+        assert!(
+            !c.flags.n && !c.flags.z && c.flags.c && c.flags.v,
+            "unordered"
+        );
+        // compare against #0.0
+        setd(&mut c, 1, 0.0);
+        c.exec(0x1E60_2028, &mut m); // fcmp d1,#0.0
+        assert!(c.flags.z && c.flags.c, "d1 == 0.0");
+    }
+
+    #[test]
+    fn fcsel_picks_by_condition() {
+        let (mut c, mut m) = (cpu(), scratch());
+        setd(&mut c, 1, 11.0);
+        setd(&mut c, 2, 22.0);
+        c.flags.z = true; // EQ holds
+        c.exec(0x1E62_0C20, &mut m); // fcsel d0,d1,d2,eq
+        assert_eq!(getd(&c, 0), 11.0);
+        c.flags.z = false; // EQ fails
+        c.exec(0x1E62_0C20, &mut m);
+        assert_eq!(getd(&c, 0), 22.0);
+    }
+
+    #[test]
+    fn fccmp_conditional() {
+        let (mut c, mut m) = (cpu(), scratch());
+        setd(&mut c, 1, 1.0);
+        setd(&mut c, 2, 1.0);
+        c.flags.z = true; // EQ holds -> perform the compare (1.0 == 1.0)
+        c.exec(0x1E62_0420, &mut m); // fccmp d1,d2,#0,eq
+        assert!(c.flags.z && c.flags.c, "compare taken: equal");
+        c.flags = Flags::default();
+        c.flags.z = false; // EQ fails -> load nzcv = 0xF (all set)
+        c.exec(0x1E62_042F, &mut m); // fccmp d1,d2,#0xf,eq
+        assert!(
+            c.flags.n && c.flags.z && c.flags.c && c.flags.v,
+            "nzcv loaded"
+        );
+    }
+
+    #[test]
+    fn vector_add_sub_cmeq() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = (5u128 << 64) | 3;
+        c.v[2] = (7u128 << 64) | 4;
+        c.exec(0x4EE2_8420, &mut m); // add v0.2d,v1.2d,v2.2d
+        assert_eq!(c.v[0], (12u128 << 64) | 7);
+        c.exec(0x6EA2_8420, &mut m); // sub v0.4s,v1.4s,v2.4s
+        // low 32: 3-4 = -1 (0xFFFFFFFF); next 32: 0; high 64: 5-7=-2 lane, 0 lane
+        assert_eq!(c.v[0] & 0xffff_ffff, 0xffff_ffff);
+        c.v[1] = 0x1111_2222;
+        c.v[2] = 0x1111_9999;
+        c.exec(0x6EA2_8C20, &mut m); // cmeq v0.4s,v1.4s,v2.4s
+        assert_eq!(c.v[0] & 0xffff_ffff, 0, "low lane differs -> 0");
+        assert_eq!(
+            (c.v[0] >> 32) & 0xffff_ffff,
+            0xffff_ffff,
+            "high lane equal -> all ones"
+        );
+    }
+
+    #[test]
+    fn fpcr_fpsr_read_zero() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[0] = 0xdead;
+        c.exec(0xD53B_4400, &mut m); // mrs x0, fpcr
+        assert_eq!(c.x[0], 0, "FPCR reads 0");
+        c.exec(0xD51B_4400, &mut m); // msr fpcr, x0  (ignored, no panic)
     }
 
     #[test]
