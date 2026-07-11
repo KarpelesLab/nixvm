@@ -3,16 +3,23 @@
 //! aarch64 interpreter, but decodes variable-length x86 instructions instead
 //! of fixed 4-byte ones).
 //!
-//! This is a scaffold, not a full x86-64 implementation: only enough of the
-//! instruction set to run a trivial statically-linked ELF that does a couple
-//! of syscalls. Coverage: REX-prefixed and non-REX `MOV` (reg/reg, imm→reg,
-//! reg↔mem via ModRM+SIB+disp8/32, RIP-relative, `MOVABS`), `LEA`, the ALU
-//! group (`ADD`/`SUB`/`AND`/`OR`/`XOR`/`CMP`/`TEST`) in register and
-//! immediate forms with full flag computation (CF/ZF/SF/OF/PF), `PUSH`/`POP`
-//! (register and immediate), `CALL rel32`/`RET`, `JMP rel8/rel32`, `Jcc
-//! rel8/rel32` (all 16 conditions), `INC`/`DEC`/`NEG`, `SHL`/`SHR`/`SAR` by an
-//! immediate or `CL`, and `SYSCALL`. Anything else surfaces as
-//! [`Exit::IllegalInstruction`].
+//! This is a scaffold, not a full x86-64 implementation, but it now covers
+//! enough of the instruction set to run a non-trivial statically-linked ELF
+//! (arithmetic loops, byte/word/dword/qword memory traffic, string-copy
+//! idioms). Coverage: REX-prefixed and non-REX `MOV` (reg/reg, imm→reg,
+//! reg↔mem via ModRM+SIB+disp8/32, RIP-relative, `MOVABS`, 8-bit forms),
+//! `MOVZX`/`MOVSX`/`MOVSXD`, `LEA`, the ALU group (`ADD`/`SUB`/`AND`/`OR`/
+//! `XOR`/`CMP`/`TEST`) in register, immediate, and 8-bit forms with full flag
+//! computation (CF/ZF/SF/OF/PF), `MUL`/`IMUL`/`DIV`/`IDIV`/`NOT`/`NEG`,
+//! `CDQ`/`CQO`/`CWDE`/`CDQE`, `CMOVcc`/`SETcc` (all 16 conditions), `PUSH`/
+//! `POP` (register, immediate, and r/m via Group 5), `CALL`/`JMP`
+//! (`rel32` and r/m indirect)/`RET`/`LEAVE`, `Jcc rel8/rel32` (all 16
+//! conditions), `INC`/`DEC` (Group 4/5), `SHL`/`SHR`/`SAR` by an immediate or
+//! `CL`, `XCHG`, the `REP`/`REPE`/`REPNE`-prefixed string ops (`MOVS`/`STOS`/
+//! `LODS`/`SCAS`/`CMPS`, honoring `DF` via `CLD`/`STD`), and `SYSCALL`. The
+//! `0x66` operand-size prefix is decoded (16-bit width) even though most
+//! flag/overflow edge cases are only exercised at 32/64-bit widths. Anything
+//! else surfaces as [`Exit::IllegalInstruction`].
 
 use crate::abi::Arch;
 
@@ -29,7 +36,6 @@ const RDX: usize = 2;
 #[allow(dead_code)] // named for documentation of the register file layout
 const RBX: usize = 3;
 const RSP: usize = 4;
-#[allow(dead_code)]
 const RBP: usize = 5;
 const RSI: usize = 6;
 const RDI: usize = 7;
@@ -135,6 +141,9 @@ enum RmKind {
 #[derive(Clone, Copy)]
 enum Operand {
     Reg(usize),
+    /// The high byte (bits 15:8) of `gpr[r]` — `AH`/`CH`/`DH`/`BH`, only
+    /// reachable for an 8-bit operand with `r` in `0..4` and no `REX` prefix.
+    Reg8Hi(usize),
     Mem(u64),
 }
 
@@ -143,6 +152,26 @@ fn resolve(kind: RmKind, end_pc: u64) -> Operand {
         RmKind::Reg(r) => Operand::Reg(r),
         RmKind::Mem(a) => Operand::Mem(a),
         RmKind::MemRip(disp) => Operand::Mem((end_pc as i64).wrapping_add(disp) as u64),
+    }
+}
+
+/// Like [`resolve`], but for an 8-bit operand: without a `REX` prefix, ModRM
+/// register indices 4..=7 name `AH`/`CH`/`DH`/`BH` (the high byte of
+/// `RAX..RBX`) rather than the low byte of `RSP..RDI`.
+fn resolve8(kind: RmKind, end_pc: u64, has_rex: bool) -> Operand {
+    match kind {
+        RmKind::Reg(r) => reg8_operand(r, has_rex),
+        _ => resolve(kind, end_pc),
+    }
+}
+
+/// Map a ModRM `reg` (or `rm` in register form) field to the 8-bit operand it
+/// names — see [`resolve8`].
+fn reg8_operand(r: usize, has_rex: bool) -> Operand {
+    if !has_rex && (4..=7).contains(&r) {
+        Operand::Reg8Hi(r - 4)
+    } else {
+        Operand::Reg(r)
     }
 }
 
@@ -159,9 +188,32 @@ enum AluOp {
     Test,
 }
 
-/// Mask `v` to the low 32 bits when `width == 32`; a no-op at `width == 64`.
+/// Mask `v` to `width` bits (8/16/32/64); a no-op at `width == 64`.
 const fn mask_w(v: u64, width: u32) -> u64 {
-    if width == 64 { v } else { v & 0xffff_ffff }
+    match width {
+        8 => v & 0xff,
+        16 => v & 0xffff,
+        32 => v & 0xffff_ffff,
+        _ => v,
+    }
+}
+
+/// Sign-extend the low `bits` of `v` (`bits` in `1..=128`) to a full `i128`.
+const fn sign_extend_128(v: u128, bits: u32) -> i128 {
+    let shift = 128 - bits;
+    ((v << shift) as i128) >> shift
+}
+
+/// Does signed `v` fit in a `width`-bit two's-complement integer?
+const fn fits_signed(v: i128, width: u32) -> bool {
+    let max = (1i128 << (width - 1)) - 1;
+    let min = -(1i128 << (width - 1));
+    v >= min && v <= max
+}
+
+/// Does unsigned `v` fit in a `width`-bit integer?
+const fn fits_unsigned(v: u128, width: u32) -> bool {
+    v < (1u128 << width)
 }
 
 /// Parity flag: `true` iff the low byte of `v` has an even number of 1 bits.
@@ -174,12 +226,14 @@ fn sign_bit(v: u64, width: u32) -> bool {
     (v >> (width - 1)) & 1 == 1
 }
 
-/// Sign-extend the low `width` bits of `v` to a full 64-bit signed value.
-fn sign_extend_w(v: u64, width: u32) -> i64 {
-    if width == 64 {
+/// Sign-extend the low `width` bits of `v` (`width` in `1..=64`) to a full
+/// 64-bit signed value.
+const fn sign_extend_w(v: u64, width: u32) -> i64 {
+    if width >= 64 {
         v as i64
     } else {
-        i64::from(v as u32 as i32)
+        let shift = 64 - width;
+        ((v << shift) as i64) >> shift
     }
 }
 
@@ -197,6 +251,18 @@ fn fetch_u8(mem: &GuestMemory, pc: u64) -> Result<(u8, u64), Step> {
 fn fetch_i8(mem: &GuestMemory, pc: u64) -> Result<(i8, u64), Step> {
     let (b, next) = fetch_u8(mem, pc)?;
     Ok((b as i8, next))
+}
+
+fn fetch_u16(mem: &GuestMemory, pc: u64) -> Result<(u16, u64), Step> {
+    let mut b = [0u8; 2];
+    mem.read(pc, &mut b)
+        .map_err(|_| Step::Fault { addr: pc, write: false })?;
+    Ok((u16::from_le_bytes(b), pc + 2))
+}
+
+fn fetch_i16(mem: &GuestMemory, pc: u64) -> Result<(i16, u64), Step> {
+    let (v, next) = fetch_u16(mem, pc)?;
+    Ok((v as i16, next))
 }
 
 fn fetch_u32(mem: &GuestMemory, pc: u64) -> Result<(u32, u64), Step> {
@@ -218,6 +284,26 @@ fn fetch_u64(mem: &GuestMemory, pc: u64) -> Result<(u64, u64), Step> {
     Ok((u64::from_le_bytes(b), pc + 8))
 }
 
+/// Fetch an immediate sized to `width` the way the `0x81`/`0xF7`-family
+/// opcodes do: `imm8` at 8-bit width, `imm16` at 16-bit width, otherwise a
+/// sign-extended `imm32` (there is no `imm64` immediate form in x86-64).
+fn imm_for_width(mem: &GuestMemory, pc: u64, width: u32) -> Result<(i64, u64), Step> {
+    match width {
+        8 => {
+            let (v, p) = fetch_i8(mem, pc)?;
+            Ok((i64::from(v), p))
+        }
+        16 => {
+            let (v, p) = fetch_i16(mem, pc)?;
+            Ok((i64::from(v), p))
+        }
+        _ => {
+            let (v, p) = fetch_i32(mem, pc)?;
+            Ok((i64::from(v), p))
+        }
+    }
+}
+
 /// Bail out of the enclosing `Step`-returning function on fetch/decode
 /// failure, otherwise unwrap the `Ok` value. (`Step` isn't `Result`, so `?`
 /// doesn't apply — this is the equivalent for our fetch/decode helpers.)
@@ -237,6 +323,9 @@ struct X86Interp {
     gpr: [u64; 16],
     rip: u64,
     flags: Flags,
+    /// The direction flag: `false` (`CLD`) advances string-op pointers
+    /// upward, `true` (`STD`) advances them downward.
+    df: bool,
     /// FS.base, set by `arch_prctl(ARCH_SET_FS, ...)` (thread pointer).
     fs_base: u64,
 }
@@ -249,6 +338,7 @@ impl X86Interp {
             gpr,
             rip: entry,
             flags: Flags::default(),
+            df: false,
             fs_base: 0,
         }
     }
@@ -356,6 +446,7 @@ impl X86Interp {
     fn read_operand(&self, mem: &GuestMemory, op: Operand, width: u32) -> Result<u64, Step> {
         match op {
             Operand::Reg(r) => Ok(mask_w(self.gpr[r], width)),
+            Operand::Reg8Hi(r) => Ok((self.gpr[r] >> 8) & 0xff),
             Operand::Mem(a) => {
                 let n = (width / 8) as usize;
                 let mut b = [0u8; 8];
@@ -366,6 +457,11 @@ impl X86Interp {
         }
     }
 
+    /// Write `val` (masked to `width`) into `op`. Register writes follow x86
+    /// partial-write semantics: an 8/16-bit write preserves the untouched
+    /// bits of the full 64-bit register, while a 32-bit write zero-extends
+    /// (the standard "writing `eax` clears the top half of `rax`" rule) and a
+    /// 64-bit write replaces it outright.
     fn write_operand(
         &mut self,
         mem: &mut GuestMemory,
@@ -375,7 +471,15 @@ impl X86Interp {
     ) -> Result<(), Step> {
         match op {
             Operand::Reg(r) => {
-                self.gpr[r] = mask_w(val, width);
+                self.gpr[r] = match width {
+                    8 => (self.gpr[r] & !0xffu64) | (val & 0xff),
+                    16 => (self.gpr[r] & !0xffffu64) | (val & 0xffff),
+                    _ => mask_w(val, width),
+                };
+                Ok(())
+            }
+            Operand::Reg8Hi(r) => {
+                self.gpr[r] = (self.gpr[r] & !0xff00u64) | ((val & 0xff) << 8);
                 Ok(())
             }
             Operand::Mem(a) => {
@@ -547,7 +651,7 @@ impl X86Interp {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let addr = match resolve(modrm.kind, pc2) {
             Operand::Mem(a) => a,
-            Operand::Reg(_) => return Step::Illegal, // LEA requires a memory r/m
+            Operand::Reg(_) | Operand::Reg8Hi(_) => return Step::Illegal, // LEA requires a memory r/m
         };
         self.gpr[modrm.reg] = mask_w(addr, width);
         self.next(pc2)
@@ -615,12 +719,14 @@ impl X86Interp {
         self.next(pc2)
     }
 
-    /// Group 1: `0x81 /r id` and `0x83 /r ib` — ALU op, r/m and an immediate.
+    /// Group 1: `0x81 /r id`, `0x83 /r ib` (16/32/64-bit r/m) and `0x80 /r ib`
+    /// (8-bit r/m) — ALU op, r/m and an immediate.
     fn group1_imm(
         &mut self,
         mem: &mut GuestMemory,
         pc: u64,
         rex: Rex,
+        has_rex: bool,
         width: u32,
         imm8: bool,
     ) -> Step {
@@ -629,8 +735,7 @@ impl X86Interp {
             let (v, p) = fetch!(fetch_i8(mem, pc2));
             (i64::from(v), p)
         } else {
-            let (v, p) = fetch!(fetch_i32(mem, pc2));
-            (i64::from(v), p)
+            fetch!(imm_for_width(mem, pc2, width))
         };
         let op = match modrm.reg {
             0 => AluOp::Add,
@@ -641,7 +746,11 @@ impl X86Interp {
             7 => AluOp::Cmp,
             _ => return Step::Illegal, // ADC/SBB (2,3): not in our documented subset
         };
-        let rm_op = resolve(modrm.kind, pc3);
+        let rm_op = if width == 8 {
+            resolve8(modrm.kind, pc3, has_rex)
+        } else {
+            resolve(modrm.kind, pc3)
+        };
         let a = fetch!(self.read_operand(mem, rm_op, width));
         let b = mask_w(imm as u64, width);
         let r = self.apply_alu(op, a, b, width);
@@ -651,29 +760,126 @@ impl X86Interp {
         self.next(pc3)
     }
 
-    /// Group 3: `0xF7 /r` — `TEST r/m, imm32` (/0) and `NEG r/m` (/3).
-    fn group3(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, width: u32) -> Step {
+    /// `op r/m8, r8` (`Eb,Gb` encoding: destination is the r/m operand).
+    fn alu_rm_gv8(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        has_rex: bool,
+        op: AluOp,
+        store: bool,
+    ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve8(modrm.kind, pc2, has_rex);
+        let reg_op = reg8_operand(modrm.reg, has_rex);
+        let a = fetch!(self.read_operand(mem, rm_op, 8));
+        let b = fetch!(self.read_operand(mem, reg_op, 8));
+        let r = self.apply_alu(op, a, b, 8);
+        if store {
+            fetch!(self.write_operand(mem, rm_op, r, 8));
+        }
+        self.next(pc2)
+    }
+
+    /// `op r8, r/m8` (`Gb,Eb` encoding: destination is the reg operand).
+    fn alu_gv_rm8(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        has_rex: bool,
+        op: AluOp,
+    ) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve8(modrm.kind, pc2, has_rex);
+        let reg_op = reg8_operand(modrm.reg, has_rex);
+        let b = fetch!(self.read_operand(mem, rm_op, 8));
+        let a = fetch!(self.read_operand(mem, reg_op, 8));
+        let r = self.apply_alu(op, a, b, 8);
+        if op != AluOp::Cmp {
+            fetch!(self.write_operand(mem, reg_op, r, 8));
+        }
+        self.next(pc2)
+    }
+
+    /// `XCHG r/m, reg` (`0x86`/`0x87`) — swap the two operands' contents.
+    fn xchg(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, has_rex: bool, width: u32) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let (rm_op, reg_op) = if width == 8 {
+            (resolve8(modrm.kind, pc2, has_rex), reg8_operand(modrm.reg, has_rex))
+        } else {
+            (resolve(modrm.kind, pc2), Operand::Reg(modrm.reg))
+        };
+        let a = fetch!(self.read_operand(mem, rm_op, width));
+        let b = fetch!(self.read_operand(mem, reg_op, width));
+        fetch!(self.write_operand(mem, rm_op, b, width));
+        fetch!(self.write_operand(mem, reg_op, a, width));
+        self.next(pc2)
+    }
+
+    /// Group 3: `0xF6`/`0xF7 /r` — `TEST r/m, imm` (/0, /1), `NOT r/m` (/2),
+    /// `NEG r/m` (/3), `MUL r/m` (/4), `IMUL r/m` (/5, one-operand form),
+    /// `DIV r/m` (/6) and `IDIV r/m` (/7). `0xF6` selects an 8-bit r/m;
+    /// `0xF7` uses `width`.
+    fn group3(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, has_rex: bool, width: u32) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op_at = |end_pc| {
+            if width == 8 {
+                resolve8(modrm.kind, end_pc, has_rex)
+            } else {
+                resolve(modrm.kind, end_pc)
+            }
+        };
         match modrm.reg {
             0 | 1 => {
-                let (imm, pc3) = fetch!(fetch_i32(mem, pc2));
-                let rm_op = resolve(modrm.kind, pc3);
+                let (imm, pc3) = fetch!(imm_for_width(mem, pc2, width));
+                let rm_op = rm_op_at(pc3);
                 let a = fetch!(self.read_operand(mem, rm_op, width));
-                self.apply_alu(AluOp::Test, a, mask_w(i64::from(imm) as u64, width), width);
+                self.apply_alu(AluOp::Test, a, mask_w(imm as u64, width), width);
                 self.next(pc3)
             }
+            2 => {
+                let rm_op = rm_op_at(pc2);
+                let a = fetch!(self.read_operand(mem, rm_op, width));
+                let r = mask_w(!a, width);
+                fetch!(self.write_operand(mem, rm_op, r, width));
+                self.next(pc2)
+            }
             3 => {
-                let rm_op = resolve(modrm.kind, pc2);
+                let rm_op = rm_op_at(pc2);
                 let a = fetch!(self.read_operand(mem, rm_op, width));
                 let r = self.sub_flags(0, a, width); // NEG = 0 - a; CF = (a != 0)
                 fetch!(self.write_operand(mem, rm_op, r, width));
                 self.next(pc2)
             }
-            _ => Step::Illegal, // NOT/MUL/IMUL/DIV/IDIV: not in our documented subset
+            4 => self.mul_op(mem, rm_op_at(pc2), width, false, pc2),
+            5 => self.mul_op(mem, rm_op_at(pc2), width, true, pc2),
+            6 => self.div_op(mem, rm_op_at(pc2), width, false, pc2),
+            _ => self.div_op(mem, rm_op_at(pc2), width, true, pc2), // 7 = IDIV
         }
     }
 
-    /// Group 5: `0xFF /r` — `INC r/m` (/0) and `DEC r/m` (/1).
+    /// Group 4: `0xFE /r` — `INC r/m8` (/0) and `DEC r/m8` (/1).
+    fn group4(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, has_rex: bool) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        match modrm.reg {
+            0 | 1 => {
+                let rm_op = resolve8(modrm.kind, pc2, has_rex);
+                let a = fetch!(self.read_operand(mem, rm_op, 8));
+                let r = self.inc_dec_flags(a, modrm.reg == 1, 8);
+                fetch!(self.write_operand(mem, rm_op, r, 8));
+                self.next(pc2)
+            }
+            _ => Step::Illegal,
+        }
+    }
+
+    /// Group 5: `0xFF /r` — `INC r/m` (/0), `DEC r/m` (/1), `CALL r/m` (/2,
+    /// near indirect), `JMP r/m` (/4, near indirect) and `PUSH r/m` (/6).
+    /// `CALL`/`JMP`/`PUSH r/m` always use a 64-bit operand, matching the
+    /// default (REX.W-independent) operand size these forms have in long
+    /// mode.
     fn group5(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, width: u32) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         match modrm.reg {
@@ -684,8 +890,168 @@ impl X86Interp {
                 fetch!(self.write_operand(mem, rm_op, r, width));
                 self.next(pc2)
             }
-            _ => Step::Illegal, // CALL/JMP/PUSH r/m (2,4,6): not in our documented subset
+            2 => {
+                let rm_op = resolve(modrm.kind, pc2);
+                let target = fetch!(self.read_operand(mem, rm_op, 64));
+                fetch!(self.push(mem, pc2));
+                self.jump(target)
+            }
+            4 => {
+                let rm_op = resolve(modrm.kind, pc2);
+                let target = fetch!(self.read_operand(mem, rm_op, 64));
+                self.jump(target)
+            }
+            6 => {
+                let rm_op = resolve(modrm.kind, pc2);
+                let val = fetch!(self.read_operand(mem, rm_op, 64));
+                fetch!(self.push(mem, val));
+                self.next(pc2)
+            }
+            _ => Step::Illegal, // CALL far / JMP far (3,5): not in our documented subset
         }
+    }
+
+    /// Write a double-`width` product `p` (already reinterpreted as the
+    /// unsigned bit pattern of the true signed or unsigned result) into the
+    /// `MUL`/`IMUL` (one-operand) destination pair: `AX` for an 8-bit
+    /// operand, otherwise `rDX:rAX`.
+    fn write_wide_result(&mut self, width: u32, p: u128) {
+        let lo = p as u64;
+        let hi = (p >> width) as u64;
+        match width {
+            8 => self.gpr[RAX] = (self.gpr[RAX] & !0xffffu64) | (lo & 0xffff),
+            16 => {
+                self.gpr[RAX] = (self.gpr[RAX] & !0xffffu64) | (lo & 0xffff);
+                self.gpr[RDX] = (self.gpr[RDX] & !0xffffu64) | (hi & 0xffff);
+            }
+            32 => {
+                self.gpr[RAX] = lo & 0xffff_ffff;
+                self.gpr[RDX] = hi & 0xffff_ffff;
+            }
+            _ => {
+                self.gpr[RAX] = lo;
+                self.gpr[RDX] = hi;
+            }
+        }
+    }
+
+    /// `MUL`/`IMUL` one-operand form: `rDX:rAX` (or just `AX` at 8-bit width)
+    /// = `rAX` * `r/m`. Only `CF`/`OF` are defined by the ISA for this form;
+    /// `ZF`/`SF`/`PF` are left untouched.
+    fn mul_op(
+        &mut self,
+        mem: &GuestMemory,
+        rm_op: Operand,
+        width: u32,
+        signed: bool,
+        pc2: u64,
+    ) -> Step {
+        let src = fetch!(self.read_operand(mem, rm_op, width));
+        let a = mask_w(self.gpr[RAX], width);
+        let cf = if signed {
+            let av = sign_extend_128(u128::from(a), width);
+            let bv = sign_extend_128(u128::from(src), width);
+            let p = av * bv;
+            self.write_wide_result(width, p as u128);
+            !fits_signed(p, width)
+        } else {
+            let p = u128::from(a) * u128::from(src);
+            self.write_wide_result(width, p);
+            !fits_unsigned(p, width)
+        };
+        self.flags.cf = cf;
+        self.flags.of = cf;
+        self.next(pc2)
+    }
+
+    /// Write the `width`-bit quotient/remainder pair from `DIV`/`IDIV`: `AL`/
+    /// `AH` for an 8-bit divisor, otherwise `rAX`/`rDX`.
+    fn write_div_result(&mut self, width: u32, q: u64, r: u64) {
+        match width {
+            8 => self.gpr[RAX] = (self.gpr[RAX] & !0xffffu64) | (q & 0xff) | ((r & 0xff) << 8),
+            16 => {
+                self.gpr[RAX] = (self.gpr[RAX] & !0xffffu64) | (q & 0xffff);
+                self.gpr[RDX] = (self.gpr[RDX] & !0xffffu64) | (r & 0xffff);
+            }
+            32 => {
+                self.gpr[RAX] = q & 0xffff_ffff;
+                self.gpr[RDX] = r & 0xffff_ffff;
+            }
+            _ => {
+                self.gpr[RAX] = q;
+                self.gpr[RDX] = r;
+            }
+        }
+    }
+
+    /// `DIV`/`IDIV` one-operand form: the `2*width`-bit dividend in
+    /// `rDX:rAX` (or `AX` at 8-bit width) is divided by `r/m`, leaving the
+    /// quotient in `rAX`/`AL` and the remainder in `rDX`/`AH`. A zero divisor
+    /// or an out-of-range quotient is a `#DE` on real hardware; we surface
+    /// both as [`Step::Illegal`] rather than panicking on the division.
+    fn div_op(
+        &mut self,
+        mem: &GuestMemory,
+        rm_op: Operand,
+        width: u32,
+        signed: bool,
+        pc2: u64,
+    ) -> Step {
+        let divisor = fetch!(self.read_operand(mem, rm_op, width));
+        let bits = width * 2;
+        let dividend: u128 = match width {
+            8 => u128::from(self.gpr[RAX] & 0xffff),
+            16 => u128::from(((self.gpr[RDX] & 0xffff) << 16) | (self.gpr[RAX] & 0xffff)),
+            32 => u128::from(((self.gpr[RDX] & 0xffff_ffff) << 32) | (self.gpr[RAX] & 0xffff_ffff)),
+            _ => (u128::from(self.gpr[RDX]) << 64) | u128::from(self.gpr[RAX]),
+        };
+        if signed {
+            let dividend_s = sign_extend_128(dividend, bits);
+            let divisor_s = sign_extend_128(u128::from(divisor), width);
+            if divisor_s == 0 {
+                return Step::Illegal;
+            }
+            let q = dividend_s / divisor_s;
+            let r = dividend_s % divisor_s;
+            if !fits_signed(q, width) {
+                return Step::Illegal;
+            }
+            self.write_div_result(width, q as u64, r as u64);
+        } else {
+            let divisor_u = u128::from(divisor);
+            if divisor_u == 0 {
+                return Step::Illegal;
+            }
+            let q = dividend / divisor_u;
+            let r = dividend % divisor_u;
+            if !fits_unsigned(q, width) {
+                return Step::Illegal;
+            }
+            self.write_div_result(width, q as u64, r as u64);
+        }
+        self.next(pc2)
+    }
+
+    /// `IMUL r, r/m, imm` (`0x69` imm32/imm16, `0x6B` imm8): `reg` = `r/m` *
+    /// sign-extended immediate.
+    fn imul_imm(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, width: u32, imm8: bool) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let (imm, pc3): (i64, u64) = if imm8 {
+            let (v, p) = fetch!(fetch_i8(mem, pc2));
+            (i64::from(v), p)
+        } else {
+            fetch!(imm_for_width(mem, pc2, width))
+        };
+        let rm_op = resolve(modrm.kind, pc3);
+        let b = fetch!(self.read_operand(mem, rm_op, width));
+        let av = sign_extend_128(u128::from(b), width);
+        let bv = i128::from(imm);
+        let p = av * bv;
+        let cf = !fits_signed(p, width);
+        self.gpr[modrm.reg] = mask_w(p as u128 as u64, width);
+        self.flags.cf = cf;
+        self.flags.of = cf;
+        self.next(pc3)
     }
 
     /// Group 2 shifts: `0xC1 /r ib` (by immediate) and `0xD3 /r` (by `CL`).
@@ -722,10 +1088,179 @@ impl X86Interp {
         self.next(pc3)
     }
 
-    fn exec_0f(&mut self, mem: &mut GuestMemory, pc: u64) -> Step {
+    // ---- REP-prefixed string ops. `rep` is `0` (no prefix, run once and
+    // leave rCX alone), `1` (REP/REPE, `0xF3`) or `2` (REPNE, `0xF2`). Each
+    // handler runs its whole repeat count in a single `Step` rather than
+    // yielding to the caller between iterations — real hardware is
+    // interruptible mid-string, but nothing here needs that granularity. ----
+
+    /// `MOVS` (`0xA4`/`0xA5`): copy `[rSI]` to `[rDI]`, advancing both by
+    /// `width` bytes per `DF`.
+    fn movs(&mut self, mem: &mut GuestMemory, pc: u64, width: u32, rep: u8) -> Step {
+        let step = u64::from(width / 8);
+        let n = (width / 8) as usize;
+        let mut count: u64 = if rep == 0 { 1 } else { self.gpr[RCX] };
+        while count > 0 {
+            let mut b = [0u8; 8];
+            fetch!(mem
+                .read(self.gpr[RSI], &mut b[..n])
+                .map_err(|_| Step::Fault { addr: self.gpr[RSI], write: false }));
+            fetch!(mem
+                .write(self.gpr[RDI], &b[..n])
+                .map_err(|_| Step::Fault { addr: self.gpr[RDI], write: true }));
+            self.gpr[RSI] = self.advance_ptr(self.gpr[RSI], step);
+            self.gpr[RDI] = self.advance_ptr(self.gpr[RDI], step);
+            count -= 1;
+            if rep != 0 {
+                self.gpr[RCX] = count;
+            }
+        }
+        self.next(pc)
+    }
+
+    /// `STOS` (`0xAA`/`0xAB`): store `AL`/`rAX` to `[rDI]`, advancing by
+    /// `width` bytes per `DF`.
+    fn stos(&mut self, mem: &mut GuestMemory, pc: u64, width: u32, rep: u8) -> Step {
+        let step = u64::from(width / 8);
+        let n = (width / 8) as usize;
+        let val = mask_w(self.gpr[RAX], width);
+        let mut count: u64 = if rep == 0 { 1 } else { self.gpr[RCX] };
+        while count > 0 {
+            let bytes = val.to_le_bytes();
+            fetch!(mem
+                .write(self.gpr[RDI], &bytes[..n])
+                .map_err(|_| Step::Fault { addr: self.gpr[RDI], write: true }));
+            self.gpr[RDI] = self.advance_ptr(self.gpr[RDI], step);
+            count -= 1;
+            if rep != 0 {
+                self.gpr[RCX] = count;
+            }
+        }
+        self.next(pc)
+    }
+
+    /// `LODS` (`0xAC`/`0xAD`): load `[rSI]` into `AL`/`rAX`, advancing by
+    /// `width` bytes per `DF`.
+    fn lods(&mut self, mem: &mut GuestMemory, pc: u64, width: u32, rep: u8) -> Step {
+        let step = u64::from(width / 8);
+        let n = (width / 8) as usize;
+        let mut count: u64 = if rep == 0 { 1 } else { self.gpr[RCX] };
+        while count > 0 {
+            let mut b = [0u8; 8];
+            fetch!(mem
+                .read(self.gpr[RSI], &mut b[..n])
+                .map_err(|_| Step::Fault { addr: self.gpr[RSI], write: false }));
+            let v = u64::from_le_bytes(b);
+            fetch!(self.write_operand(mem, Operand::Reg(RAX), v, width));
+            self.gpr[RSI] = self.advance_ptr(self.gpr[RSI], step);
+            count -= 1;
+            if rep != 0 {
+                self.gpr[RCX] = count;
+            }
+        }
+        self.next(pc)
+    }
+
+    /// `SCAS` (`0xAE`/`0xAF`): compare `AL`/`rAX` against `[rDI]`, advancing
+    /// by `width` bytes per `DF`; `REPE`/`REPNE` stop early on a `ZF`
+    /// mismatch.
+    fn scas(&mut self, mem: &mut GuestMemory, pc: u64, width: u32, rep: u8) -> Step {
+        let step = u64::from(width / 8);
+        let n = (width / 8) as usize;
+        let a = mask_w(self.gpr[RAX], width);
+        let mut count: u64 = if rep == 0 { 1 } else { self.gpr[RCX] };
+        while count > 0 {
+            let mut b = [0u8; 8];
+            fetch!(mem
+                .read(self.gpr[RDI], &mut b[..n])
+                .map_err(|_| Step::Fault { addr: self.gpr[RDI], write: false }));
+            self.sub_flags(a, mask_w(u64::from_le_bytes(b), width), width);
+            self.gpr[RDI] = self.advance_ptr(self.gpr[RDI], step);
+            count -= 1;
+            if rep != 0 {
+                self.gpr[RCX] = count;
+            }
+            if !self.rep_continues(rep, count) {
+                break;
+            }
+        }
+        self.next(pc)
+    }
+
+    /// `CMPS` (`0xA6`/`0xA7`): compare `[rSI]` against `[rDI]`, advancing
+    /// both by `width` bytes per `DF`; `REPE`/`REPNE` stop early on a `ZF`
+    /// mismatch.
+    fn cmps(&mut self, mem: &mut GuestMemory, pc: u64, width: u32, rep: u8) -> Step {
+        let step = u64::from(width / 8);
+        let n = (width / 8) as usize;
+        let mut count: u64 = if rep == 0 { 1 } else { self.gpr[RCX] };
+        while count > 0 {
+            let (mut bs, mut bd) = ([0u8; 8], [0u8; 8]);
+            fetch!(mem
+                .read(self.gpr[RSI], &mut bs[..n])
+                .map_err(|_| Step::Fault { addr: self.gpr[RSI], write: false }));
+            fetch!(mem
+                .read(self.gpr[RDI], &mut bd[..n])
+                .map_err(|_| Step::Fault { addr: self.gpr[RDI], write: false }));
+            let (vs, vd) = (u64::from_le_bytes(bs), u64::from_le_bytes(bd));
+            self.sub_flags(mask_w(vs, width), mask_w(vd, width), width);
+            self.gpr[RSI] = self.advance_ptr(self.gpr[RSI], step);
+            self.gpr[RDI] = self.advance_ptr(self.gpr[RDI], step);
+            count -= 1;
+            if rep != 0 {
+                self.gpr[RCX] = count;
+            }
+            if !self.rep_continues(rep, count) {
+                break;
+            }
+        }
+        self.next(pc)
+    }
+
+    /// Advance a string-op pointer by `step` bytes, per `DF`.
+    fn advance_ptr(&self, ptr: u64, step: u64) -> u64 {
+        if self.df { ptr.wrapping_sub(step) } else { ptr.wrapping_add(step) }
+    }
+
+    /// Should a `REPE`/`REPNE`-prefixed `SCAS`/`CMPS` loop keep going after
+    /// this iteration? `rep == 1` (`REPE`) continues while `ZF` is set;
+    /// `rep == 2` (`REPNE`) continues while it's clear; `rep == 0` (no
+    /// prefix, single iteration) and `count == 0` always stop.
+    fn rep_continues(&self, rep: u8, count: u64) -> bool {
+        if count == 0 {
+            return false;
+        }
+        match rep {
+            1 => self.flags.zf,
+            2 => !self.flags.zf,
+            _ => true,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn exec_0f(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        has_rex: bool,
+        width: u32,
+    ) -> Step {
         let (op2, pc) = fetch!(fetch_u8(mem, pc));
         match op2 {
             0x05 => Step::Syscall, // `rip` deliberately left on the `syscall` opcode
+            0x40..=0x4F => {
+                // CMOVcc Gv, Ev: only reads the r/m operand when the branch
+                // is taken, mirroring how we skip the write when it isn't.
+                let cc = op2 & 0x0f;
+                let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+                if self.cond_holds(cc) {
+                    let rm_op = resolve(modrm.kind, pc2);
+                    let v = fetch!(self.read_operand(mem, rm_op, width));
+                    self.gpr[modrm.reg] = mask_w(v, width);
+                }
+                self.next(pc2)
+            }
             0x80..=0x8F => {
                 let cc = op2 & 0x0f;
                 let (rel, pc2) = fetch!(fetch_i32(mem, pc));
@@ -735,20 +1270,81 @@ impl X86Interp {
                     self.next(pc2)
                 }
             }
+            0x90..=0x9F => {
+                // SETcc Eb: r/m8 = 1 if the condition holds, else 0.
+                let cc = op2 & 0x0f;
+                let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+                let rm_op = resolve8(modrm.kind, pc2, has_rex);
+                let v = u64::from(self.cond_holds(cc));
+                fetch!(self.write_operand(mem, rm_op, v, 8));
+                self.next(pc2)
+            }
+            0xAF => {
+                // IMUL Gv, Ev: reg *= r/m (signed), CF/OF set on overflow.
+                let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+                let rm_op = resolve(modrm.kind, pc2);
+                let b = fetch!(self.read_operand(mem, rm_op, width));
+                let a = mask_w(self.gpr[modrm.reg], width);
+                let av = sign_extend_128(u128::from(a), width);
+                let bv = sign_extend_128(u128::from(b), width);
+                let p = av * bv;
+                let cf = !fits_signed(p, width);
+                self.gpr[modrm.reg] = mask_w(p as u128 as u64, width);
+                self.flags.cf = cf;
+                self.flags.of = cf;
+                self.next(pc2)
+            }
+            0xB6 | 0xB7 | 0xBE | 0xBF => {
+                // MOVZX/MOVSX Gv, Eb/Ew.
+                let src_width = if op2 == 0xB6 || op2 == 0xBE { 8 } else { 16 };
+                let signed = op2 == 0xBE || op2 == 0xBF;
+                let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+                let rm_op = if src_width == 8 {
+                    resolve8(modrm.kind, pc2, has_rex)
+                } else {
+                    resolve(modrm.kind, pc2)
+                };
+                let raw = fetch!(self.read_operand(mem, rm_op, src_width));
+                let val = if signed { sign_extend_w(raw, src_width) as u64 } else { raw };
+                self.gpr[modrm.reg] = mask_w(val, width);
+                self.next(pc2)
+            }
             _ => Step::Illegal,
         }
     }
 
     #[allow(clippy::too_many_lines)]
     fn exec(&mut self, mem: &mut GuestMemory) -> Step {
-        let (b0, pc) = fetch!(fetch_u8(mem, self.rip));
-        let (rex, opcode, pc) = if (0x40..=0x4f).contains(&b0) {
+        // Legacy prefixes (operand-size `0x66`, `REP`/`REPE` `0xF3`, `REPNE`
+        // `0xF2`) precede any `REX` byte, which in turn must immediately
+        // precede the opcode.
+        let mut pc = self.rip;
+        let mut opsize16 = false;
+        let mut rep: u8 = 0; // 0 = none, 1 = REP/REPE (F3), 2 = REPNE (F2)
+        loop {
+            let (b, next) = fetch!(fetch_u8(mem, pc));
+            match b {
+                0x66 => opsize16 = true,
+                0xF3 => rep = 1,
+                0xF2 => rep = 2,
+                _ => break,
+            }
+            pc = next;
+        }
+        let (b0, pc) = fetch!(fetch_u8(mem, pc));
+        let (rex, has_rex, opcode, pc) = if (0x40..=0x4f).contains(&b0) {
             let (op, pc2) = fetch!(fetch_u8(mem, pc));
-            (Rex::from_byte(b0), op, pc2)
+            (Rex::from_byte(b0), true, op, pc2)
         } else {
-            (Rex::default(), b0, pc)
+            (Rex::default(), false, b0, pc)
         };
-        let width = if rex.w { 64 } else { 32 };
+        let width = if rex.w {
+            64
+        } else if opsize16 {
+            16
+        } else {
+            32
+        };
 
         match opcode {
             0x50..=0x57 => {
@@ -776,6 +1372,119 @@ impl X86Interp {
             0x8D => self.lea(mem, pc, rex, width),
             0x89 => self.mov_rm_gv(mem, pc, rex, width),
             0x8B => self.mov_gv_rm(mem, pc, rex, width),
+            0x88 => {
+                // MOV r/m8, r8 (Eb,Gb).
+                let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+                let rm_op = resolve8(modrm.kind, pc2, has_rex);
+                let val = fetch!(self.read_operand(mem, reg8_operand(modrm.reg, has_rex), 8));
+                fetch!(self.write_operand(mem, rm_op, val, 8));
+                self.next(pc2)
+            }
+            0x8A => {
+                // MOV r8, r/m8 (Gb,Eb).
+                let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+                let rm_op = resolve8(modrm.kind, pc2, has_rex);
+                let val = fetch!(self.read_operand(mem, rm_op, 8));
+                fetch!(self.write_operand(mem, reg8_operand(modrm.reg, has_rex), val, 8));
+                self.next(pc2)
+            }
+            0xB0..=0xB7 => {
+                // MOV r8, imm8.
+                let r = usize::from(opcode - 0xB0) | (usize::from(rex.b) << 3);
+                let (imm, pc2) = fetch!(fetch_u8(mem, pc));
+                fetch!(self.write_operand(mem, reg8_operand(r, has_rex), u64::from(imm), 8));
+                self.next(pc2)
+            }
+            0xC6 => {
+                // MOV r/m8, imm8 (/0 only).
+                let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+                if modrm.reg != 0 {
+                    return Step::Illegal;
+                }
+                let (imm, pc3) = fetch!(fetch_u8(mem, pc2));
+                let rm_op = resolve8(modrm.kind, pc3, has_rex);
+                fetch!(self.write_operand(mem, rm_op, u64::from(imm), 8));
+                self.next(pc3)
+            }
+            0x63 => {
+                // MOVSXD Gv, Ed (sign-extends to 64 bits under REX.W; a
+                // plain 32-bit move otherwise).
+                let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+                let rm_op = resolve(modrm.kind, pc2);
+                let raw = fetch!(self.read_operand(mem, rm_op, 32));
+                let val = if width == 64 { sign_extend_w(raw, 32) as u64 } else { raw };
+                self.gpr[modrm.reg] = mask_w(val, width);
+                self.next(pc2)
+            }
+            0x69 => self.imul_imm(mem, pc, rex, width, false),
+            0x6B => self.imul_imm(mem, pc, rex, width, true),
+            0x86 => self.xchg(mem, pc, rex, has_rex, 8),
+            0x87 => self.xchg(mem, pc, rex, has_rex, width),
+            0x91..=0x97 => {
+                // XCHG rAX, r (0x90 itself is the plain NOP / XCHG eax,eax).
+                let r = usize::from(opcode - 0x90) | (usize::from(rex.b) << 3);
+                let a = fetch!(self.read_operand(mem, Operand::Reg(RAX), width));
+                let b = fetch!(self.read_operand(mem, Operand::Reg(r), width));
+                fetch!(self.write_operand(mem, Operand::Reg(RAX), b, width));
+                fetch!(self.write_operand(mem, Operand::Reg(r), a, width));
+                self.next(pc)
+            }
+            0x98 => {
+                // CBW / CWDE / CDQE: sign-extend AL/AX/EAX into AX/EAX/RAX.
+                match width {
+                    64 => self.gpr[RAX] = sign_extend_w(mask_w(self.gpr[RAX], 32), 32) as u64,
+                    16 => {
+                        let v = sign_extend_w(mask_w(self.gpr[RAX], 8), 8) as u64;
+                        self.gpr[RAX] = (self.gpr[RAX] & !0xffffu64) | (v & 0xffff);
+                    }
+                    _ => {
+                        let v = sign_extend_w(mask_w(self.gpr[RAX], 16), 16) as u64;
+                        self.gpr[RAX] = mask_w(v, 32);
+                    }
+                }
+                self.next(pc)
+            }
+            0x99 => {
+                // CWD / CDQ / CQO: sign-extend AX/EAX/RAX's sign bit into
+                // DX/EDX/RDX.
+                match width {
+                    64 => self.gpr[RDX] = if sign_bit(self.gpr[RAX], 64) { u64::MAX } else { 0 },
+                    16 => {
+                        let d = if sign_bit(self.gpr[RAX] & 0xffff, 16) { 0xffffu64 } else { 0 };
+                        self.gpr[RDX] = (self.gpr[RDX] & !0xffffu64) | d;
+                    }
+                    _ => {
+                        self.gpr[RDX] =
+                            if sign_bit(self.gpr[RAX] & 0xffff_ffff, 32) { 0xffff_ffff } else { 0 };
+                    }
+                }
+                self.next(pc)
+            }
+            0xA4 => self.movs(mem, pc, 8, rep),
+            0xA5 => self.movs(mem, pc, width, rep),
+            0xA6 => self.cmps(mem, pc, 8, rep),
+            0xA7 => self.cmps(mem, pc, width, rep),
+            0xAA => self.stos(mem, pc, 8, rep),
+            0xAB => self.stos(mem, pc, width, rep),
+            0xAC => self.lods(mem, pc, 8, rep),
+            0xAD => self.lods(mem, pc, width, rep),
+            0xAE => self.scas(mem, pc, 8, rep),
+            0xAF => self.scas(mem, pc, width, rep),
+            0xFC => {
+                self.df = false;
+                self.next(pc)
+            }
+            0xFD => {
+                self.df = true;
+                self.next(pc)
+            }
+            0xC9 => {
+                // LEAVE: rsp = rbp; rbp = pop().
+                self.gpr[RSP] = self.gpr[RBP];
+                let val = fetch!(self.pop(mem));
+                self.gpr[RBP] = val;
+                self.next(pc)
+            }
             0xB8..=0xBF => {
                 let r = usize::from(opcode - 0xB8) | (usize::from(rex.b) << 3);
                 if rex.w {
@@ -789,22 +1498,34 @@ impl X86Interp {
                 }
             }
             0xC7 => self.mov_imm(mem, pc, rex, width),
+            0x00 => self.alu_rm_gv8(mem, pc, rex, has_rex, AluOp::Add, true),
+            0x02 => self.alu_gv_rm8(mem, pc, rex, has_rex, AluOp::Add),
             0x01 => self.alu_rm_gv(mem, pc, rex, width, AluOp::Add, true),
             0x03 => self.alu_gv_rm(mem, pc, rex, width, AluOp::Add),
             0x09 => self.alu_rm_gv(mem, pc, rex, width, AluOp::Or, true),
             0x0B => self.alu_gv_rm(mem, pc, rex, width, AluOp::Or),
             0x21 => self.alu_rm_gv(mem, pc, rex, width, AluOp::And, true),
             0x23 => self.alu_gv_rm(mem, pc, rex, width, AluOp::And),
+            0x28 => self.alu_rm_gv8(mem, pc, rex, has_rex, AluOp::Sub, true),
+            0x2A => self.alu_gv_rm8(mem, pc, rex, has_rex, AluOp::Sub),
             0x29 => self.alu_rm_gv(mem, pc, rex, width, AluOp::Sub, true),
             0x2B => self.alu_gv_rm(mem, pc, rex, width, AluOp::Sub),
+            0x30 => self.alu_rm_gv8(mem, pc, rex, has_rex, AluOp::Xor, true),
+            0x32 => self.alu_gv_rm8(mem, pc, rex, has_rex, AluOp::Xor),
             0x31 => self.alu_rm_gv(mem, pc, rex, width, AluOp::Xor, true),
             0x33 => self.alu_gv_rm(mem, pc, rex, width, AluOp::Xor),
+            0x38 => self.alu_rm_gv8(mem, pc, rex, has_rex, AluOp::Cmp, false),
+            0x3A => self.alu_gv_rm8(mem, pc, rex, has_rex, AluOp::Cmp),
             0x39 => self.alu_rm_gv(mem, pc, rex, width, AluOp::Cmp, false),
             0x3B => self.alu_gv_rm(mem, pc, rex, width, AluOp::Cmp),
+            0x84 => self.alu_rm_gv8(mem, pc, rex, has_rex, AluOp::Test, false),
             0x85 => self.alu_rm_gv(mem, pc, rex, width, AluOp::Test, false),
-            0x81 => self.group1_imm(mem, pc, rex, width, false),
-            0x83 => self.group1_imm(mem, pc, rex, width, true),
-            0xF7 => self.group3(mem, pc, rex, width),
+            0x80 => self.group1_imm(mem, pc, rex, has_rex, 8, true),
+            0x81 => self.group1_imm(mem, pc, rex, has_rex, width, false),
+            0x83 => self.group1_imm(mem, pc, rex, has_rex, width, true),
+            0xF6 => self.group3(mem, pc, rex, has_rex, 8),
+            0xF7 => self.group3(mem, pc, rex, has_rex, width),
+            0xFE => self.group4(mem, pc, rex, has_rex),
             0xFF => self.group5(mem, pc, rex, width),
             0xC1 => self.group2(mem, pc, rex, width, false),
             0xD3 => self.group2(mem, pc, rex, width, true),
@@ -834,8 +1555,8 @@ impl X86Interp {
                     self.next(pc2)
                 }
             }
-            0x90 => self.next(pc),
-            0x0F => self.exec_0f(mem, pc),
+            0x90 => self.next(pc), // NOP (also XCHG eax,eax, a no-op either way)
+            0x0F => self.exec_0f(mem, pc, rex, has_rex, width),
             _ => Step::Illegal,
         }
     }
@@ -913,6 +1634,7 @@ impl Vcpu for X86Interp {
         self.gpr[RSP] = sp;
         self.rip = entry;
         self.flags = Flags::default();
+        self.df = false;
         self.fs_base = 0;
     }
 }
@@ -1365,5 +2087,463 @@ mod tests {
         assert_eq!(cpu.pc(), 0x2_0000);
         assert_eq!(cpu.sp(), 0x3_0000);
         assert_eq!(cpu.gpr[RAX], 0);
+    }
+
+    #[test]
+    fn mov_r8_imm8_and_high_byte_regs() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        // mov al, 0x12 ; mov ah, 0x34 ; mov cl, al (88 C1) ; mov bl, ah (8A DC)
+        let code = [0xB0, 0x12, 0xB4, 0x34, 0x88, 0xC1, 0x8A, 0xDC];
+        m.write_init(CODE, &code).unwrap();
+        cpu.exec(&mut m); // mov al, 0x12
+        assert_eq!(cpu.gpr[RAX] & 0xff, 0x12);
+        cpu.exec(&mut m); // mov ah, 0x34
+        assert_eq!((cpu.gpr[RAX] >> 8) & 0xff, 0x34, "AH is the high byte of RAX");
+        cpu.exec(&mut m); // mov cl, al
+        assert_eq!(cpu.gpr[RCX] & 0xff, 0x12);
+        cpu.exec(&mut m); // mov bl, ah
+        assert_eq!(cpu.gpr[RBX] & 0xff, 0x34);
+    }
+
+    #[test]
+    fn mov_r8_via_rex_uses_low_byte_not_high_byte() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RDI] = 0xffff_ffff_ffff_ff00;
+        // mov dil, 0x7f  (REX 40 B7 7F — REX present, so reg 7 is DIL, not BH)
+        m.write_init(CODE, &[0x40, 0xB7, 0x7F]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RDI], 0xffff_ffff_ffff_ff7f);
+    }
+
+    #[test]
+    fn alu_8bit_forms_add_sub_xor_cmp_and_group1() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let code: Vec<u8> = vec![
+            0xB0, 0x05, // mov al, 5
+            0xB1, 0x03, // mov cl, 3
+            0x00, 0xC8, // add al, cl  (Eb,Gb) -> al = 8
+            0x28, 0xC8, // sub al, cl  (Eb,Gb) -> al = 5
+            0x38, 0xC8, // cmp al, cl  (Eb,Gb): 5 vs 3, no borrow
+            0x30, 0xC0, // xor al, al  -> al = 0, ZF set
+            0x80, 0xC0, 0x0A, // add al, 0x0a (group1 /0 imm8) -> al = 10
+            0x80, 0xF8, 0x0A, // cmp al, 0x0a (group1 /7 imm8) -> ZF set
+        ];
+        m.write_init(CODE, &code).unwrap();
+        cpu.exec(&mut m); // mov al, 5
+        cpu.exec(&mut m); // mov cl, 3
+        cpu.exec(&mut m); // add al, cl
+        assert_eq!(cpu.gpr[RAX] & 0xff, 8);
+        cpu.exec(&mut m); // sub al, cl
+        assert_eq!(cpu.gpr[RAX] & 0xff, 5);
+        cpu.exec(&mut m); // cmp al, cl
+        assert!(!cpu.flags.cf, "5 - 3 does not borrow");
+        assert!(!cpu.flags.zf);
+        cpu.exec(&mut m); // xor al, al
+        assert_eq!(cpu.gpr[RAX] & 0xff, 0);
+        assert!(cpu.flags.zf);
+        cpu.exec(&mut m); // add al, 0x0a
+        assert_eq!(cpu.gpr[RAX] & 0xff, 10);
+        cpu.exec(&mut m); // cmp al, 0x0a
+        assert!(cpu.flags.zf, "10 == 10");
+        assert_eq!(cpu.gpr[RAX] & 0xff, 10, "CMP must not write back");
+    }
+
+    #[test]
+    fn movzx_and_movsx_sign_and_zero_extend() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 0xdead_beef_dead_beef;
+        m.write_init(CODE, &[0xB0, 0x80]).unwrap(); // mov al, 0x80
+        cpu.exec(&mut m);
+
+        // movzx rax, al  (48 0F B6 C0)
+        m.write_init(CODE, &[0x48, 0x0F, 0xB6, 0xC0]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 0x80, "MOVZX zero-extends");
+
+        // movsx rbx, al  (48 0F BE D8)
+        m.write_init(CODE, &[0x48, 0x0F, 0xBE, 0xD8]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RBX], 0xffff_ffff_ffff_ff80, "MOVSX sign-extends");
+
+        cpu.gpr[RCX] = 0x8000;
+        // movzx eax, cx  (0F B7 C1)
+        m.write_init(CODE, &[0x0F, 0xB7, 0xC1]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 0x8000);
+
+        // movsx edx, cx  (0F BF D1)
+        m.write_init(CODE, &[0x0F, 0xBF, 0xD1]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(
+            cpu.gpr[RDX], 0xffff_8000,
+            "MOVSX from 16-bit, 32-bit dest zero-extends the upper 32 bits of RDX"
+        );
+    }
+
+    #[test]
+    fn movsxd_sign_extends_dword_to_qword() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RCX] = 0xffff_ffff_8000_0000; // low 32 bits = 0x8000_0000 (negative)
+        // movsxd rax, ecx  (REX.W 63 /r, modrm=11 000 001)
+        m.write_init(CODE, &[0x48, 0x63, 0xC1]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 0xffff_ffff_8000_0000);
+    }
+
+    #[test]
+    fn cmovcc_and_setcc_driven_by_cmp() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 1;
+        cpu.gpr[RCX] = 1;
+        cpu.gpr[RDX] = 0xffff_ffff_ffff_ffff;
+        cpu.gpr[RBX] = 0;
+        cpu.gpr[R8] = 0;
+        // cmp eax, ecx (39 C8); cmove rdx, rax (48 0F 44 D0);
+        // sete r8b (41 0F 94 C0, true — REX.B selects r8 for the rm field);
+        // setne bl (0F 95 C3, false)
+        let code = [
+            0x39, 0xC8, 0x48, 0x0F, 0x44, 0xD0, 0x41, 0x0F, 0x94, 0xC0, 0x0F, 0x95, 0xC3,
+        ];
+        m.write_init(CODE, &code).unwrap();
+        cpu.exec(&mut m); // cmp eax, ecx (equal -> ZF set)
+        assert!(cpu.flags.zf);
+        cpu.exec(&mut m); // cmove rdx, rax (condition true -> rdx = rax)
+        assert_eq!(cpu.gpr[RDX], 1);
+        cpu.exec(&mut m); // sete r8b (condition true -> r8b = 1)
+        assert_eq!(cpu.gpr[R8] & 0xff, 1);
+        cpu.exec(&mut m); // setne bl (condition false -> bl = 0)
+        assert_eq!(cpu.gpr[RBX] & 0xff, 0);
+    }
+
+    #[test]
+    fn cmovcc_does_not_write_when_condition_is_false() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 1;
+        cpu.gpr[RCX] = 2;
+        cpu.gpr[RDX] = 0x1234;
+        // cmp eax, ecx (39 C8, not equal); cmove rdx, rax (48 0F 44 D0)
+        let code = [0x39, 0xC8, 0x48, 0x0F, 0x44, 0xD0];
+        m.write_init(CODE, &code).unwrap();
+        cpu.exec(&mut m);
+        assert!(!cpu.flags.zf);
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RDX], 0x1234, "CMOVcc must not write when the condition is false");
+    }
+
+    #[test]
+    fn mul_and_div_pair() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 6;
+        cpu.gpr[RCX] = 7;
+        // mul ecx  (F7 /4, modrm=11 100 001)
+        m.write_init(CODE, &[0xF7, 0xE1]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX] & 0xffff_ffff, 42);
+        assert_eq!(cpu.gpr[RDX] & 0xffff_ffff, 0);
+        assert!(!cpu.flags.cf, "42 fits in 32 bits, no overflow into edx");
+
+        // div ecx  (F7 /6, modrm=11 110 001): 42 / 7 = 6 r 0
+        m.write_init(CODE, &[0xF7, 0xF1]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX] & 0xffff_ffff, 6);
+        assert_eq!(cpu.gpr[RDX] & 0xffff_ffff, 0);
+
+        // idiv ecx: -20 / 7 = -2 r -6  (signed)
+        cpu.gpr[RAX] = 0xffff_ffec; // -20 as i32, RDX:RAX dividend sign-extended below
+        cpu.gpr[RDX] = 0xffff_ffff; // sign-extension of a negative EAX into EDX (as CDQ would do)
+        cpu.gpr[RCX] = 7;
+        // idiv ecx  (F7 /7, modrm=11 111 001)
+        m.write_init(CODE, &[0xF7, 0xF9]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX] as u32 as i32, -2);
+        assert_eq!(cpu.gpr[RDX] as u32 as i32, -6);
+    }
+
+    #[test]
+    fn mul_8bit_and_div_by_zero_is_illegal() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 20; // AL = 20
+        cpu.gpr[RCX] = 3; // CL = 3
+        // mul cl  (F6 /4, modrm=11 100 001)
+        m.write_init(CODE, &[0xF6, 0xE1]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX] & 0xffff, 60, "AX = AL * CL for an 8-bit operand");
+
+        cpu.gpr[RCX] = 0;
+        // div cl  (F6 /6, modrm=11 110 001): divide by zero
+        m.write_init(CODE, &[0xF6, 0xF1]).unwrap();
+        cpu.rip = CODE;
+        match cpu.run(&mut m).unwrap() {
+            Exit::IllegalInstruction { .. } => {}
+            other => panic!("expected IllegalInstruction on divide-by-zero, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn imul_two_and_three_operand_forms() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 6;
+        cpu.gpr[RCX] = 7;
+        // imul eax, ecx  (0F AF /r, modrm=11 000 001)
+        m.write_init(CODE, &[0x0F, 0xAF, 0xC1]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX] & 0xffff_ffff, 42);
+        assert!(!cpu.flags.cf);
+
+        // imul edx, ecx, 100  (69 /r id): edx = ecx * 100
+        let mut code = vec![0x69, 0xD1];
+        code.extend_from_slice(&100i32.to_le_bytes());
+        m.write_init(CODE, &code).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RDX] & 0xffff_ffff, 700);
+
+        // imul ebx, ecx, 5  (6B /r ib): ebx = ecx * 5
+        m.write_init(CODE, &[0x6B, 0xD9, 0x05]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RBX] & 0xffff_ffff, 35);
+    }
+
+    #[test]
+    fn cdq_cqo_and_cwde_cdqe() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 0xffff_ffff_8000_0000; // eax = 0x8000_0000 (negative)
+        // cdq (99)
+        m.write_init(CODE, &[0x99]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RDX] as u32, 0xffff_ffff);
+
+        cpu.gpr[RAX] = 0x8000_0000; // eax negative
+        // cwde (98): eax = sign_extend(ax) — ax's low bit pattern is 0x0000 here
+        m.write_init(CODE, &[0x98]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 0, "AX=0 sign-extends to EAX=0, clearing the upper 32 bits");
+
+        cpu.gpr[RAX] = 0xffff_ffff_ffff_8000;
+        // cdqe (REX.W 98): rax = sign_extend(eax)
+        m.write_init(CODE, &[0x48, 0x98]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 0xffff_ffff_ffff_8000);
+
+        cpu.gpr[RAX] = 0xffff_ffff;
+        // cqo (REX.W 99): rdx = sign_extend(sign bit of rax)
+        m.write_init(CODE, &[0x48, 0x99]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RDX], 0, "rax's sign bit (bit 63) is 0 here");
+    }
+
+    #[test]
+    fn not_and_group4_inc_dec_byte() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 0x0000_0000_ffff_0f0f;
+        // not eax  (F7 /2, modrm=11 010 000)
+        m.write_init(CODE, &[0xF7, 0xD0]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 0x0000_f0f0);
+
+        cpu.gpr[RCX] = 0x7f;
+        // inc cl  (FE /0, modrm=11 000 001)
+        m.write_init(CODE, &[0xFE, 0xC1]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RCX] & 0xff, 0x80);
+
+        // dec cl  (FE /1, modrm=11 001 001)
+        m.write_init(CODE, &[0xFE, 0xC9]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RCX] & 0xff, 0x7f);
+    }
+
+    #[test]
+    fn group5_call_jmp_and_push_indirect() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = CODE + 0x100;
+        // call rax  (FF /2, modrm=11 010 000)
+        m.write_init(CODE, &[0xFF, 0xD0]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.rip, CODE + 0x100);
+        assert_eq!(m.read_u64(STACK - 8).unwrap(), CODE + 2, "return address pushed");
+
+        cpu.gpr[RBX] = CODE + 0x200;
+        // jmp rbx  (FF /4, modrm=11 100 011)
+        m.write_init(CODE + 0x100, &[0xFF, 0xE3]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.rip, CODE + 0x200);
+
+        cpu.gpr[RCX] = 0xdead_beef;
+        // push rcx  (FF /6, modrm=11 110 001)
+        m.write_init(CODE + 0x200, &[0xFF, 0xF1]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(m.read_u64(STACK - 16).unwrap(), 0xdead_beef);
+    }
+
+    #[test]
+    fn leave_restores_rsp_from_rbp() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RBP] = STACK - 0x40;
+        m.write_init(STACK - 0x40, &0x1122_3344u64.to_le_bytes()).unwrap();
+        // leave (C9)
+        m.write_init(CODE, &[0xC9]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RBP], 0x1122_3344);
+        assert_eq!(cpu.gpr[RSP], STACK - 0x40 + 8);
+    }
+
+    #[test]
+    fn xchg_swaps_registers_and_memory() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 1;
+        cpu.gpr[RCX] = 2;
+        // xchg ecx, eax  (91)
+        m.write_init(CODE, &[0x91]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 2);
+        assert_eq!(cpu.gpr[RCX], 1);
+
+        cpu.gpr[RBX] = 0x1_8000;
+        m.write_init(0x1_8000, &0x99u64.to_le_bytes()).unwrap();
+        cpu.gpr[RDX] = 0x77;
+        // xchg [rbx], edx  (87 /r, modrm=00 010 011)
+        m.write_init(CODE, &[0x87, 0x13]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RDX] & 0xffff_ffff, 0x99);
+        assert_eq!(m.read_u64(0x1_8000).unwrap() & 0xffff_ffff, 0x77);
+    }
+
+    #[test]
+    fn rep_movsb_block_copy() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let src = 0x1_2000u64;
+        let dst = 0x1_3000u64;
+        m.write_init(src, b"hello, nixvm!").unwrap();
+        cpu.gpr[RSI] = src;
+        cpu.gpr[RDI] = dst;
+        cpu.gpr[RCX] = 13;
+        // rep movsb  (F3 A4)
+        m.write_init(CODE, &[0xF3, 0xA4]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RCX], 0);
+        assert_eq!(cpu.gpr[RSI], src + 13);
+        assert_eq!(cpu.gpr[RDI], dst + 13);
+        let mut buf = [0u8; 13];
+        m.read(dst, &mut buf).unwrap();
+        assert_eq!(&buf, b"hello, nixvm!");
+    }
+
+    #[test]
+    fn rep_stosb_and_repe_scasb_and_cmpsb() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let dst = 0x1_2000u64;
+        cpu.gpr[RAX] = 0x41; // 'A'
+        cpu.gpr[RDI] = dst;
+        cpu.gpr[RCX] = 8;
+        // rep stosb  (F3 AA)
+        m.write_init(CODE, &[0xF3, 0xAA]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RCX], 0);
+        assert_eq!(cpu.gpr[RDI], dst + 8);
+        let mut buf = [0u8; 8];
+        m.read(dst, &mut buf).unwrap();
+        assert_eq!(&buf, b"AAAAAAAA");
+
+        // repe scasb: scan for a byte != 'A' (none here, so it runs to completion)
+        cpu.gpr[RAX] = 0x41;
+        cpu.gpr[RDI] = dst;
+        cpu.gpr[RCX] = 8;
+        m.write_init(CODE, &[0xF3, 0xAE]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RCX], 0);
+        assert!(cpu.flags.zf);
+
+        // repe cmpsb over two identical buffers.
+        let dst2 = 0x1_3000u64;
+        m.write_init(dst2, b"AAAAAAAA").unwrap();
+        cpu.gpr[RSI] = dst;
+        cpu.gpr[RDI] = dst2;
+        cpu.gpr[RCX] = 8;
+        m.write_init(CODE, &[0xF3, 0xA6]).unwrap();
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RCX], 0);
+        assert!(cpu.flags.zf, "all 8 bytes matched");
+    }
+
+    #[test]
+    fn cld_std_control_string_op_direction() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let base = 0x1_2000u64;
+        m.write_init(base, b"XYZ").unwrap();
+        cpu.gpr[RSI] = base + 2; // start at the last byte, walk backward
+        cpu.gpr[RDI] = 0x1_3000 + 2;
+        cpu.gpr[RCX] = 3;
+        // std ; rep movsb
+        m.write_init(CODE, &[0xFD, 0xF3, 0xA4]).unwrap();
+        cpu.exec(&mut m); // std
+        assert!(cpu.df);
+        cpu.exec(&mut m); // rep movsb
+        assert_eq!(cpu.gpr[RSI], base - 1);
+        let mut buf = [0u8; 3];
+        m.read(0x1_3000, &mut buf).unwrap();
+        assert_eq!(&buf, b"XYZ");
+    }
+
+    /// A tiny assembled loop — `for (i = 5; i != 0; i--) sum += i;` — that
+    /// exercises `MOV`, `ADD`, `DEC`, and `JNZ` together and leaves `15` in
+    /// `ecx` (the sum of `1..=5`).
+    #[test]
+    fn assembled_loop_sums_one_to_five() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let code: Vec<u8> = vec![
+            0xB9, 0x05, 0x00, 0x00, 0x00, // mov ecx, 5      (loop counter)
+            0x31, 0xD2, // xor edx, edx     (sum = 0)
+            // loop:
+            0x01, 0xCA, // add edx, ecx     (sum += counter)
+            0xFF, 0xC9, // dec ecx
+            0x75, 0xFA, // jnz loop  (rel8 = -6, back to `add edx, ecx`)
+        ];
+        m.write_init(CODE, &code).unwrap();
+        cpu.rip = CODE;
+        let exit = cpu.run(&mut m).unwrap();
+        // The loop never syscalls or faults; it just runs off the end of the
+        // buffer once ecx hits 0, which the harness treats as an illegal
+        // fetch past the mapped code — that's fine, we only care about the
+        // register state at that point.
+        match exit {
+            Exit::IllegalInstruction { .. } | Exit::MemFault { .. } => {}
+            other => panic!("unexpected exit before the loop could fall through: {other:?}"),
+        }
+        assert_eq!(cpu.gpr[RDX] & 0xffff_ffff, 15, "1+2+3+4+5 == 15");
     }
 }
