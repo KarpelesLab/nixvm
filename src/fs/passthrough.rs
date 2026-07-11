@@ -79,6 +79,7 @@ mod sys {
     pub const O_WRONLY: c_int = 0o1;
     pub const O_CREAT: c_int = 0o100;
     pub const O_TRUNC: c_int = 0o1000;
+    pub const O_NONBLOCK: c_int = 0o4000;
     pub const O_DIRECTORY: c_int = 0o200_000;
     pub const O_NOFOLLOW: c_int = 0o400_000;
     pub const O_CLOEXEC: c_int = 0o2_000_000;
@@ -100,6 +101,7 @@ mod sys {
     pub const O_WRONLY: c_int = 0x0001;
     pub const O_CREAT: c_int = 0x0200;
     pub const O_TRUNC: c_int = 0x0400;
+    pub const O_NONBLOCK: c_int = 0x0004;
     pub const O_DIRECTORY: c_int = 0x0010_0000;
     pub const O_NOFOLLOW: c_int = 0x0000_0100;
     pub const O_CLOEXEC: c_int = 0x0100_0000;
@@ -186,6 +188,66 @@ fn cstr(component: &str) -> io::Result<CString> {
     CString::new(component).map_err(|_| io::Error::from_raw_os_error(22)) // EINVAL
 }
 
+/// Canonical (Linux) `ELOOP`, used only when *constructing* a fresh
+/// guest-facing "too many symlinks" error. Never used for *comparing*
+/// against a host-native errno just returned by `openat`/`readlinkat` —
+/// those comparisons must use the platform's own `sys::ELOOP`, since that's
+/// the value the host syscall actually reports.
+const LINUX_ELOOP: i32 = 40;
+
+fn eloop() -> io::Error {
+    io::Error::from_raw_os_error(LINUX_ELOOP)
+}
+
+/// Map a *host*-native `errno` (as produced by the raw `openat`/`unlinkat`/
+/// `mkdirat`/`symlinkat`/`renameat`/`readlinkat` calls below, or by the
+/// plain `open` of the mount root) to the canonical Linux errno the rest of
+/// the kernel expects: guest syscalls hand `io::Error::raw_os_error()`
+/// straight through to the guest as a Linux errno (see
+/// `crate::kernel::io_errno`), so on a Linux host this is the identity map —
+/// but on macOS/BSD a handful of codes that mean the same thing are numbered
+/// differently (`ENOTEMPTY`, `ELOOP`, `ENAMETOOLONG`, the `EAGAIN`/`EDEADLK`
+/// pair, ...), and must be translated so a passthrough mount behaves
+/// identically for the guest regardless of which host OS backs it.
+///
+/// Only ever applied at a point where the raw errno is about to become a
+/// *terminal*, guest-visible result — never at a point where a caller still
+/// needs to compare the untranslated value against the host's own
+/// `sys::ELOOP` to detect "this path component is a symlink" mid-walk.
+#[cfg(target_os = "macos")]
+fn normalize_errno(err: io::Error) -> io::Error {
+    let Some(raw) = err.raw_os_error() else {
+        return err;
+    };
+    let linux = match raw {
+        35 => 11,        // EAGAIN/EWOULDBLOCK
+        11 => 35,        // EDEADLK
+        63 => 36,        // ENAMETOOLONG
+        77 => 37,        // ENOLCK
+        78 => 38,        // ENOSYS
+        66 => 39,        // ENOTEMPTY
+        62 => LINUX_ELOOP, // ELOOP
+        91 => 42,        // ENOMSG
+        90 => 43,        // EIDRM
+        92 => 84,        // EILSEQ
+        94 => 74,        // EBADMSG
+        84 => 75,        // EOVERFLOW
+        70 => 116,       // ESTALE
+        69 => 122,       // EDQUOT
+        89 => 125,       // ECANCELED
+        105 => 130,      // EOWNERDEAD
+        104 => 131,      // ENOTRECOVERABLE
+        45 | 102 => 95,  // ENOTSUP / EOPNOTSUPP (Linux aliases both to 95)
+        other => other,
+    };
+    io::Error::from_raw_os_error(linux)
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_errno(err: io::Error) -> io::Error {
+    err
+}
+
 fn raw_openat(dirfd: RawFd, name: &CStr, flags: c_int, mode: u32) -> io::Result<OwnedFd> {
     let fd = unsafe { openat(dirfd, name.as_ptr(), flags | sys::O_CLOEXEC, mode) };
     if fd < 0 {
@@ -205,29 +267,45 @@ fn raw_readlinkat(dirfd: RawFd, name: &CStr) -> io::Result<Option<String>> {
         if err.raw_os_error() == Some(22) {
             return Ok(None); // EINVAL: exists, but isn't a symlink
         }
-        return Err(err);
+        return Err(normalize_errno(err));
     }
     Ok(Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned()))
 }
 
 fn raw_unlinkat(dirfd: RawFd, name: &CStr, flags: c_int) -> io::Result<()> {
     let r = unsafe { unlinkat(dirfd, name.as_ptr(), flags) };
-    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if r < 0 {
+        Err(normalize_errno(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
 }
 
 fn raw_mkdirat(dirfd: RawFd, name: &CStr, mode: u32) -> io::Result<()> {
     let r = unsafe { mkdirat(dirfd, name.as_ptr(), mode) };
-    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if r < 0 {
+        Err(normalize_errno(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
 }
 
 fn raw_symlinkat(target: &CStr, dirfd: RawFd, name: &CStr) -> io::Result<()> {
     let r = unsafe { symlinkat(target.as_ptr(), dirfd, name.as_ptr()) };
-    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if r < 0 {
+        Err(normalize_errno(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
 }
 
 fn raw_renameat(from_dirfd: RawFd, from: &CStr, to_dirfd: RawFd, to: &CStr) -> io::Result<()> {
     let r = unsafe { renameat(from_dirfd, from.as_ptr(), to_dirfd, to.as_ptr()) };
-    if r < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if r < 0 {
+        Err(normalize_errno(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
 }
 
 /// Open an fd on a symlink *itself* (not its target) — the fd-based
@@ -368,7 +446,8 @@ impl Passthrough {
         let f = fs::OpenOptions::new()
             .read(true)
             .custom_flags(sys::O_DIRECTORY)
-            .open(&self.root)?;
+            .open(&self.root)
+            .map_err(normalize_errno)?;
         Ok(OwnedFd::from(f))
     }
 
@@ -457,7 +536,7 @@ impl Passthrough {
             };
             seen += 1;
             if seen > MAX_COMPONENTS {
-                return Err(io::Error::from_raw_os_error(sys::ELOOP));
+                return Err(eloop());
             }
 
             if name == ".." {
@@ -508,11 +587,8 @@ impl Passthrough {
                     return Ok((parent, name));
                 }
                 Err(e) if e.raw_os_error() == Some(sys::ELOOP) => {
-                    let target = raw_readlinkat(parent_raw, &cname)?
-                        .ok_or_else(|| io::Error::from_raw_os_error(sys::ELOOP))?;
-                    budget = budget
-                        .checked_sub(1)
-                        .ok_or_else(|| io::Error::from_raw_os_error(sys::ELOOP))?;
+                    let target = raw_readlinkat(parent_raw, &cname)?.ok_or_else(eloop)?;
+                    budget = budget.checked_sub(1).ok_or_else(eloop)?;
                     let (absolute, mut target_comps) = Self::split_target(&target);
                     if absolute {
                         stack.truncate(1);
@@ -521,7 +597,7 @@ impl Passthrough {
                         queue.push_front(c);
                     }
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(normalize_errno(e)),
             }
         }
     }
@@ -592,7 +668,8 @@ impl MountFs for Passthrough {
     fn read_at(&mut self, rel: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {
         let (parent, name) = self.resolve(rel, true, false)?;
         let cname = cstr(&name)?;
-        let fd = raw_openat(parent.as_raw_fd(), &cname, sys::O_RDONLY | sys::O_NOFOLLOW, 0)?;
+        let fd = raw_openat(parent.as_raw_fd(), &cname, sys::O_RDONLY | sys::O_NOFOLLOW, 0)
+            .map_err(normalize_errno)?;
         let mut f = fs::File::from(fd);
         f.seek(SeekFrom::Start(off))?;
         f.read(buf)
@@ -609,7 +686,8 @@ impl MountFs for Passthrough {
                 &cname,
                 sys::O_DIRECTORY | sys::O_RDONLY | sys::O_NOFOLLOW,
                 0,
-            )?
+            )
+            .map_err(normalize_errno)?
         };
 
         list_dir_fd(fd)
@@ -619,7 +697,8 @@ impl MountFs for Passthrough {
         self.deny_if_ro()?;
         let (parent, name) = self.resolve(rel, true, false)?;
         let cname = cstr(&name)?;
-        let fd = raw_openat(parent.as_raw_fd(), &cname, sys::O_WRONLY | sys::O_NOFOLLOW, 0)?;
+        let fd = raw_openat(parent.as_raw_fd(), &cname, sys::O_WRONLY | sys::O_NOFOLLOW, 0)
+            .map_err(normalize_errno)?;
         let mut f = fs::File::from(fd);
         f.seek(SeekFrom::Start(off))?;
         f.write(buf)
@@ -634,7 +713,8 @@ impl MountFs for Passthrough {
             &cname,
             sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC | sys::O_NOFOLLOW,
             mode & 0o777,
-        )?;
+        )
+        .map_err(normalize_errno)?;
         // openat's mode is subject to umask; chmod explicitly afterward to
         // match the exact requested bits, as the original `fs::File::create`
         // + `set_permissions` pair did.
@@ -651,7 +731,8 @@ impl MountFs for Passthrough {
             &cname,
             sys::O_DIRECTORY | sys::O_RDONLY | sys::O_NOFOLLOW,
             0,
-        )?;
+        )
+        .map_err(normalize_errno)?;
         fs::File::from(fd).set_permissions(fs::Permissions::from_mode(mode & 0o777))
     }
 
@@ -659,6 +740,22 @@ impl MountFs for Passthrough {
         self.deny_if_ro()?;
         let (parent, name) = self.resolve(rel, false, false)?;
         let cname = cstr(&name)?;
+        // unlink(2)/unlinkat(2) on a directory is nonstandard across
+        // platforms — Linux reports EISDIR, but macOS/BSD reports EPERM
+        // (verified empirically). Guests here model Linux, so probe first
+        // (an O_NOFOLLOW-confined lookup, exactly like every other lookup in
+        // this file) and report EISDIR consistently regardless of host OS.
+        // The probe never follows a symlink, so a symlink *to* a directory
+        // is correctly left unlink-able (it unlinks the link, not the
+        // target) — only a real directory entry short-circuits here. A
+        // benign race (the entry changing between this probe and the actual
+        // `unlinkat` below) can only make the outcome match whatever is
+        // really there at unlink time, never escape confinement.
+        if let Ok(fd) = raw_openat(parent.as_raw_fd(), &cname, sys::O_RDONLY | sys::O_NOFOLLOW, 0)
+            && fs::File::from(fd).metadata().is_ok_and(|m| m.is_dir())
+        {
+            return Err(io::Error::from_raw_os_error(21)); // EISDIR
+        }
         raw_unlinkat(parent.as_raw_fd(), &cname, 0)
     }
 
@@ -673,8 +770,30 @@ impl MountFs for Passthrough {
         self.deny_if_ro()?;
         let (parent, name) = self.resolve(rel, true, false)?;
         let cname = cstr(&name)?;
-        let fd = raw_openat(parent.as_raw_fd(), &cname, sys::O_WRONLY | sys::O_NOFOLLOW, 0)?;
-        fs::File::from(fd).set_len(len)
+        // O_NONBLOCK guards against a FIFO's write-open blocking forever
+        // waiting for a reader — with it, a FIFO either opens immediately or
+        // fails ENXIO, and the type check below then turns any such
+        // non-regular target into a deterministic EINVAL instead of a hang.
+        let fd = raw_openat(
+            parent.as_raw_fd(),
+            &cname,
+            sys::O_WRONLY | sys::O_NOFOLLOW | sys::O_NONBLOCK,
+            0,
+        )
+        .map_err(normalize_errno)?;
+        let file = fs::File::from(fd);
+        let meta = file.metadata()?;
+        if meta.is_dir() {
+            // Defensive: opening a directory O_WRONLY already fails EISDIR
+            // on both supported platforms (verified empirically), so this
+            // is never actually reached, but it keeps the invariant
+            // explicit rather than implicit in open()'s behavior.
+            return Err(io::Error::from_raw_os_error(21)); // EISDIR
+        }
+        if !meta.file_type().is_file() {
+            return Err(io::Error::from_raw_os_error(22)); // EINVAL: ftruncate is only meaningful on a regular file
+        }
+        file.set_len(len)
     }
 
     fn symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {
@@ -872,5 +991,205 @@ mod tests {
         pt.unlink("c.txt").unwrap();
         assert!(pt.stat("c.txt").is_none());
         assert!(pt.stat("b.txt").is_some());
+    }
+
+    #[test]
+    fn full_rw_roundtrip_create_write_read_stat_truncate_unlink() {
+        let tmp = TempDir::new("full-rw");
+        let mut pt = Passthrough::new(tmp.0.clone());
+
+        pt.create("f.txt", 0o640).unwrap();
+        assert_eq!(pt.stat("f.txt").unwrap().size, 0);
+        assert_eq!(pt.stat("f.txt").unwrap().mode & 0o777, 0o640);
+
+        assert_eq!(pt.write_at("f.txt", 0, b"hello world").unwrap(), 11);
+        let mut buf = [0u8; 11];
+        assert_eq!(pt.read_at("f.txt", 0, &mut buf).unwrap(), 11);
+        assert_eq!(&buf, b"hello world");
+        let attrs = pt.stat("f.txt").unwrap();
+        assert_eq!(attrs.size, 11);
+        assert_eq!(attrs.kind, NodeKind::File);
+
+        pt.truncate("f.txt", 5).unwrap();
+        assert_eq!(pt.stat("f.txt").unwrap().size, 5);
+        let mut buf5 = [0u8; 5];
+        assert_eq!(pt.read_at("f.txt", 0, &mut buf5).unwrap(), 5);
+        assert_eq!(&buf5, b"hello");
+
+        pt.unlink("f.txt").unwrap();
+        assert!(pt.stat("f.txt").is_none());
+
+        // The host reflects every step directly.
+        assert!(!tmp.0.join("f.txt").exists());
+    }
+
+    #[test]
+    fn truncate_shrinks_and_grows() {
+        let tmp = TempDir::new("trunc");
+        let mut pt = Passthrough::new(tmp.0.clone());
+        pt.create("g.txt", 0o644).unwrap();
+        pt.write_at("g.txt", 0, b"abcdefghij").unwrap();
+        assert_eq!(pt.stat("g.txt").unwrap().size, 10);
+
+        // Shrink.
+        pt.truncate("g.txt", 4).unwrap();
+        assert_eq!(pt.stat("g.txt").unwrap().size, 4);
+        let mut buf = [0u8; 4];
+        assert_eq!(pt.read_at("g.txt", 0, &mut buf).unwrap(), 4);
+        assert_eq!(&buf, b"abcd");
+
+        // Grow: the extension must read back as zero bytes (a hole), and
+        // the host file must really be that long.
+        pt.truncate("g.txt", 10).unwrap();
+        assert_eq!(pt.stat("g.txt").unwrap().size, 10);
+        let mut tail = [0xffu8; 6];
+        assert_eq!(pt.read_at("g.txt", 4, &mut tail).unwrap(), 6);
+        assert_eq!(&tail, &[0u8; 6]);
+        assert_eq!(fs::metadata(tmp.0.join("g.txt")).unwrap().len(), 10);
+    }
+
+    #[test]
+    fn write_at_offset_beyond_eof_extends_file() {
+        let tmp = TempDir::new("write-extend");
+        let mut pt = Passthrough::new(tmp.0.clone());
+        pt.create("h.txt", 0o644).unwrap();
+        pt.write_at("h.txt", 0, b"abc").unwrap();
+        assert_eq!(pt.write_at("h.txt", 8, b"xyz").unwrap(), 3);
+        assert_eq!(pt.stat("h.txt").unwrap().size, 11);
+        let mut buf = [0u8; 11];
+        assert_eq!(pt.read_at("h.txt", 0, &mut buf).unwrap(), 11);
+        assert_eq!(&buf[..3], b"abc");
+        assert_eq!(&buf[3..8], &[0u8; 5]);
+        assert_eq!(&buf[8..], b"xyz");
+    }
+
+    #[test]
+    fn truncate_on_directory_fails_eisdir() {
+        let tmp = TempDir::new("trunc-dir");
+        let mut pt = Passthrough::new(tmp.0.clone());
+        pt.mkdir("d", 0o755).unwrap();
+        let err = pt.truncate("d", 0).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(21)); // EISDIR
+    }
+
+    #[test]
+    fn read_only_rejects_all_mutators_with_erofs() {
+        let tmp = TempDir::new("ro-full");
+        fs::write(tmp.0.join("x"), b"hi").unwrap();
+        fs::create_dir(tmp.0.join("d")).unwrap();
+        let mut pt = Passthrough::read_only(tmp.0.clone());
+
+        assert_eq!(
+            pt.create("new.txt", 0o644).unwrap_err().raw_os_error(),
+            Some(30) // EROFS
+        );
+        assert_eq!(
+            pt.write_at("x", 0, b"no").unwrap_err().raw_os_error(),
+            Some(30)
+        );
+        assert_eq!(pt.truncate("x", 0).unwrap_err().raw_os_error(), Some(30));
+        assert_eq!(pt.unlink("x").unwrap_err().raw_os_error(), Some(30));
+        assert_eq!(pt.rmdir("d").unwrap_err().raw_os_error(), Some(30));
+        assert_eq!(pt.mkdir("d2", 0o755).unwrap_err().raw_os_error(), Some(30));
+        assert_eq!(
+            pt.symlink("x", "link").unwrap_err().raw_os_error(),
+            Some(30)
+        );
+        assert_eq!(
+            pt.rename("x", "y").unwrap_err().raw_os_error(),
+            Some(30)
+        );
+
+        // Nothing was actually touched on the host.
+        assert_eq!(fs::read(tmp.0.join("x")).unwrap(), b"hi");
+        assert!(tmp.0.join("d").is_dir());
+
+        // Reads still work.
+        let mut buf = [0u8; 2];
+        assert_eq!(pt.read_at("x", 0, &mut buf).unwrap(), 2);
+        assert_eq!(pt.stat("x").unwrap().size, 2);
+    }
+
+    #[test]
+    fn rmdir_nonempty_fails_enotempty() {
+        let tmp = TempDir::new("rmdir-nonempty");
+        let mut pt = Passthrough::new(tmp.0.clone());
+        pt.mkdir("d", 0o755).unwrap();
+        pt.create("d/child.txt", 0o644).unwrap();
+
+        let err = pt.rmdir("d").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(39)); // ENOTEMPTY (host-normalized to the Linux value)
+
+        // Still there, still a dir with its child.
+        assert_eq!(pt.stat("d").unwrap().kind, NodeKind::Dir);
+        assert!(pt.stat("d/child.txt").is_some());
+
+        // Emptying it makes rmdir succeed.
+        pt.unlink("d/child.txt").unwrap();
+        pt.rmdir("d").unwrap();
+        assert!(pt.stat("d").is_none());
+    }
+
+    #[test]
+    fn unlink_on_directory_fails_eisdir() {
+        let tmp = TempDir::new("unlink-dir");
+        let mut pt = Passthrough::new(tmp.0.clone());
+        pt.mkdir("d", 0o755).unwrap();
+
+        let err = pt.unlink("d").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(21)); // EISDIR (normalized; host may report EPERM)
+
+        // Still there.
+        assert_eq!(pt.stat("d").unwrap().kind, NodeKind::Dir);
+
+        // A symlink *to* a directory is a different node — unlinking it
+        // removes the link, not the target, and must still succeed.
+        pt.symlink("d", "link_to_d").unwrap();
+        pt.unlink("link_to_d").unwrap();
+        assert!(pt.stat("link_to_d").is_none());
+        assert!(pt.stat("d").is_some());
+    }
+
+    #[test]
+    fn mkdir_existing_path_fails_eexist() {
+        let tmp = TempDir::new("mkdir-eexist");
+        let mut pt = Passthrough::new(tmp.0.clone());
+        pt.mkdir("d", 0o755).unwrap();
+        let err = pt.mkdir("d", 0o755).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(17)); // EEXIST
+    }
+
+    #[test]
+    fn absolute_symlink_escape_is_not_followed_on_write_or_truncate() {
+        let tmp = TempDir::new("write-escape");
+        std::os::unix::fs::symlink("/etc/passwd", tmp.0.join("evil")).unwrap();
+        let mut pt = Passthrough::new(tmp.0.clone());
+
+        // Confined resolution re-anchors "/etc/passwd" under the mount
+        // root, so it's looked up inside the (otherwise empty) temp root,
+        // where it doesn't exist — never the host's real /etc/passwd.
+        let err = pt.write_at("evil", 0, b"pwned").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(2)); // ENOENT under the root
+        let err = pt.truncate("evil", 0).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(2));
+
+        // The real host file must be untouched.
+        assert!(!fs::read_to_string("/etc/passwd").unwrap().is_empty());
+    }
+
+    #[test]
+    fn ascending_symlink_escape_is_not_followed_on_write_or_truncate() {
+        let tmp = TempDir::new("write-ascend-escape");
+        std::os::unix::fs::symlink(
+            "../../../../../../../../../../etc/passwd",
+            tmp.0.join("up"),
+        )
+        .unwrap();
+        let mut pt = Passthrough::new(tmp.0.clone());
+
+        let err = pt.write_at("up", 0, b"pwned").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(2)); // resolves under the root, not host /etc
+        let err = pt.truncate("up", 0).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(2));
     }
 }
