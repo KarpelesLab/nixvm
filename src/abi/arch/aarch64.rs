@@ -37,6 +37,8 @@ pub fn decode(nr: u64) -> Sysno {
         17 => Sysno::Getcwd,
         49 => Sysno::Chdir,
         278 => Sysno::Getrandom,
+        134 => Sysno::RtSigaction,
+        135 => Sysno::RtSigprocmask,
         other => Sysno::Unknown(other),
     }
 }

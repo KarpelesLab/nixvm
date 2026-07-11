@@ -45,6 +45,8 @@ pub enum Sysno {
     Getcwd,
     Chdir,
     Getrandom,
+    RtSigaction,
+    RtSigprocmask,
     /// A raw guest number with no mapping yet — handled as ENOSYS but logged.
     Unknown(u64),
 }

@@ -187,23 +187,26 @@ impl Kernel {
             Sysno::Chdir => self.sys_chdir(args[0], mem),
             Sysno::Writev => self.sys_writev(args[0], args[1], args[2], mem),
             Sysno::Getrandom => self.sys_getrandom(args[0], args[1], mem),
+            // Terminal ioctls: report "not a tty" for our plain stdio pipes.
+            Sysno::Ioctl => err(Errno::ENOTTY),
             Sysno::ExitGroup | Sysno::Exit => {
                 self.exit_code = Some(args[0] as i32);
                 0
             }
-            // Single-process identity: pid/tid 1, ppid 0, running as root.
+            // Single-process identity: pid/tid 1, running as root.
             Sysno::SetTidAddress | Sysno::Getpid | Sysno::Gettid => 1,
+            // ppid 0, uid/gid 0, and signal setup succeeding (delivery is
+            // Phase 6, so nothing fires yet) — all return 0.
             Sysno::Getppid
             | Sysno::Getuid
             | Sysno::Geteuid
             | Sysno::Getgid
-            | Sysno::Getegid => 0,
-            // Everything else is not wired up yet. Record and return -ENOSYS so
-            // the guest gets a well-formed failure rather than a crash.
-            Sysno::Unknown(nr) => {
-                *self.unsupported.entry(nr).or_default() += 1;
-                err(Errno::ENOSYS)
-            }
+            | Sysno::Getegid
+            | Sysno::RtSigaction
+            | Sysno::RtSigprocmask => 0,
+            // Not wired up yet (Unknown or an unhandled variant). Record the
+            // raw number and return -ENOSYS so the guest gets a well-formed
+            // failure rather than a crash.
             _ => {
                 *self.unsupported.entry(raw).or_default() += 1;
                 err(Errno::ENOSYS)

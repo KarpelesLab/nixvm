@@ -883,6 +883,33 @@ impl Aarch64Interp {
             return step;
         }
 
+        // ---- SIMD modified immediate: MOVI/MVNI/ORR/BIC (vector immediate) ----
+        if (instr >> 19) & 0x3ff == 0b0111100000 && (instr >> 10) & 1 == 1 {
+            let q = (instr >> 30) & 1;
+            let op = (instr >> 29) & 1;
+            let cmode = (instr >> 12) & 0xf;
+            let imm8 = u64::from((((instr >> 16) & 0x7) << 5) | ((instr >> 5) & 0x1f));
+            let rd = reg_field(instr, 0);
+            let imm64 = adv_simd_expand_imm(cmode, op, imm8);
+            let to_q = |x: u64| {
+                if q == 1 {
+                    (u128::from(x) << 64) | u128::from(x)
+                } else {
+                    u128::from(x)
+                }
+            };
+            self.v[rd] = if cmode == 0b1110 || cmode == 0b1111 {
+                to_q(imm64) // MOVI (byte/bytemask/fp)
+            } else if cmode & 1 == 0 {
+                to_q(if op == 0 { imm64 } else { !imm64 }) // MOVI / MVNI
+            } else {
+                // ORR / BIC immediate: modify the existing register.
+                let m = to_q(imm64);
+                if op == 0 { self.v[rd] | m } else { self.v[rd] & !m }
+            };
+            return Step::Next;
+        }
+
         // ---- DUP Vd.T, Rn (replicate a GP register across lanes) ----
         if (instr >> 21) & 0x1ff == 0b0_0111_0000 && (instr >> 10) & 0x3f == 0b00_0011 {
             let q = (instr >> 30) & 1;
@@ -1109,6 +1136,69 @@ fn extend_reg(val: u64, option: u32, shift: u32) -> u64 {
 /// `n` low bits set.
 fn ones(n: u32) -> u64 {
     if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+}
+
+/// ARM `AdvSIMDExpandImm`: build the 64-bit lane value for a SIMD modified
+/// immediate from `cmode`/`op`/`imm8`.
+fn adv_simd_expand_imm(cmode: u32, op: u32, imm8: u64) -> u64 {
+    let rep32 = |x: u64| (x & 0xffff_ffff) | ((x & 0xffff_ffff) << 32);
+    let rep16 = |x: u64| {
+        let x = x & 0xffff;
+        x | (x << 16) | (x << 32) | (x << 48)
+    };
+    match cmode >> 1 {
+        0b000 => rep32(imm8),
+        0b001 => rep32(imm8 << 8),
+        0b010 => rep32(imm8 << 16),
+        0b011 => rep32(imm8 << 24),
+        0b100 => rep16(imm8),
+        0b101 => rep16(imm8 << 8),
+        0b110 => {
+            if cmode & 1 == 0 {
+                rep32((imm8 << 8) | 0xff)
+            } else {
+                rep32((imm8 << 16) | 0xffff)
+            }
+        }
+        _ => {
+            if cmode == 0b1110 {
+                if op == 0 {
+                    (imm8 & 0xff) * 0x0101_0101_0101_0101 // byte replicate
+                } else {
+                    // bytemask: each bit of imm8 expands to a full byte.
+                    let mut r = 0u64;
+                    for i in 0..8 {
+                        if (imm8 >> i) & 1 == 1 {
+                            r |= 0xffu64 << (i * 8);
+                        }
+                    }
+                    r
+                }
+            } else if op == 0 {
+                rep32(u64::from(vfp_expand_imm32(imm8 as u32)))
+            } else {
+                vfp_expand_imm64(imm8 as u32)
+            }
+        }
+    }
+}
+
+/// VFP 32-bit immediate expansion (`FMOV`/`MOVI` fp forms).
+fn vfp_expand_imm32(imm8: u32) -> u32 {
+    let sign = (imm8 >> 7) & 1;
+    let b6 = (imm8 >> 6) & 1;
+    let exp = ((1 - b6) << 7) | (if b6 == 1 { 0x1f } else { 0 } << 2) | ((imm8 >> 4) & 3);
+    let frac = (imm8 & 0xf) << 19;
+    (sign << 31) | (exp << 23) | frac
+}
+
+/// VFP 64-bit immediate expansion.
+fn vfp_expand_imm64(imm8: u32) -> u64 {
+    let sign = u64::from((imm8 >> 7) & 1);
+    let b6 = u64::from((imm8 >> 6) & 1);
+    let exp = ((1 - b6) << 10) | (if b6 == 1 { 0xff } else { 0 } << 2) | u64::from((imm8 >> 4) & 3);
+    let frac = u64::from(imm8 & 0xf) << 48;
+    (sign << 63) | (exp << 52) | frac
 }
 
 /// `n` low bits set, as a `u128`.
