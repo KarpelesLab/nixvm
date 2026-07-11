@@ -21,8 +21,10 @@
 use std::io;
 
 pub mod mount;
+pub mod tmpfs;
 
 pub use mount::MountTable;
+pub use tmpfs::TmpFs;
 
 /// The kind of a filesystem node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
