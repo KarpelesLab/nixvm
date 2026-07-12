@@ -341,7 +341,7 @@ Synthesized pseudo-filesystems and the fd machinery real programs assume.
   `signalfd4`, `inotify_*`, `memfd_create`, and `close_range` are not
   implemented.
 
-### Phase 8 — Networking  🟡 loopback done; no egress yet
+### Phase 8 — Networking  🟡 loopback + host-passthrough egress done (native); smoltcp/browser transport next
 
 A socket layer. Start with loopback + Unix sockets in-process; then egress via a
 userspace TCP/IP stack (`smoltcp`) NAT'd to the host, or host-socket passthrough
@@ -353,18 +353,33 @@ under policy. DNS.
   `send*`/`recv*`, `getsockopt`/`setsockopt`, `getsockname`/`getpeername`,
   `shutdown`, `getaddrinfo` path (`/etc/resolv.conf` + UDP:53).
 - **Exit criteria:** `apk update && apk add <pkg>` and `npm install <small pkg>`
-  complete over the network inside the sandbox.
+  complete over the network inside the sandbox. **`apk update && apk add jq`
+  now works end-to-end on x86-64** (over host-passthrough egress — see below).
 - **Status:** `kernel::net::Net` implements AF_UNIX stream sockets and an
   AF_INET/AF_INET6 loopback (TCP stream via a connected `Pair` of byte
   buffers, UDP datagram via per-port queues), entirely in-process — `socket`,
-  `socketpair`, `bind`, `listen`, `accept4`, `connect`, `sendto`/`recvfrom`
-  (address-aware), `getsockname`/`getpeername`, `setsockopt`/`getsockopt`
-  (`SO_REUSEADDR`/`SO_TYPE`/`SO_SNDBUF`/`SO_RCVBUF`/`SO_ERROR`), `shutdown` are
-  all wired into dispatch. There is **no egress**: no `smoltcp` stack, no NAT,
-  no host-socket passthrough, no DNS/`resolv.conf` — only endpoints that both
-  live inside the same VM can talk to each other, so `apk`/`npm` against the
-  real internet still fails cleanly (connection refused / no route), as
-  expected pre-Phase-8-egress.
+  `socketpair`, `bind`, `listen`, `accept4`, `connect`, `sendto`/`recvfrom`,
+  `sendmsg`/`recvmsg` (iovec scatter/gather), `getsockname`/`getpeername`,
+  `setsockopt`/`getsockopt`, `shutdown`.
+  - **Host-passthrough egress is live (native).** A guest `connect` to a
+    *routable* (non-loopback) address, plus routable UDP (DNS), is bridged
+    onto real host sockets through the `kernel::egress::Egress` trait
+    (`connect_tcp`/`open_udp` → `HostConn`/`HostDgram`). The native impl is
+    `std::net`, behind `cfg(not(wasm32))` and the `NIXVM_NET=host` policy
+    (off by default = loopback-only, ENETUNREACH). `poll`/`select` readiness
+    is a precise non-blocking peek for host sockets (apk's http client trusts
+    poll). `Vm`/`run-elf-x86` inject `/etc/resolv.conf` (the minirootfs ships
+    none). **Verified: `apk update` (24171 pkgs) and `apk add jq` download +
+    install from the real Alpine mirror and `jq` runs**, on x86-64
+    (`tests/alpine_boot.rs::apk_update_over_host_egress`, gated on
+    `NIXVM_NET=host` + `NIXVM_ALPINE_TAR` + internet).
+  - **Still to do:** the browser transport (a WebSocket relay + a
+    `pktkit`-based `Egress` impl — the trait seam is ready for both; a wasm
+    tab has no raw sockets); a `smoltcp` userspace stack + NAT as the
+    "proper VM" alternative to raw host passthrough; and `apk` on the
+    **aarch64** interpreter, which still crashes on NEON instructions the
+    decoder lacks (LD2/3/4 de-interleave, LDR-SIMD register offset) before it
+    even reaches the network — egress itself is arch-agnostic.
 
 ### Phase 9 — Resource limits & isolation policy  ⬜ not started
 

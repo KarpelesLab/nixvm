@@ -74,7 +74,7 @@ See [ROADMAP.md](ROADMAP.md) for the phased plan and what's next.
 | **SMP scheduler** | a pool of `ncpus` host worker threads run guest compute in parallel; syscalls are serviced serially on the main thread (a big-kernel-lock model, `Kernel::set_ncpus`/`NIXVM_CPUS`) |
 | **Signals** | `rt_sigaction`/`rt_sigprocmask`/`kill`/`tgkill` and default-disposition delivery (terminate/ignore) — **custom handler invocation (frame push + PC redirect) is not implemented** |
 | **Filesystem** | `tmpfs` (rw in-memory), `overlay` (COW upper/lower), `passthrough` (host dir, **symlink/TOCTOU-safe** — see below), `devfs`, `procfs`, `sysfs`; a real on-disk squashfs/ext reader (`fstoolfs`, via the optional `fstool` crate) exists but isn't wired into the default mount table yet |
-| **Networking** | in-VM AF_UNIX + AF_INET/AF_INET6 loopback (TCP stream + UDP datagram); no real host/internet networking yet |
+| **Networking** | in-VM AF_UNIX + AF_INET/AF_INET6 loopback (TCP stream + UDP datagram), plus **host-passthrough egress** (opt-in `NIXVM_NET=host`, native only): guest TCP/UDP to routable addresses is bridged to real host sockets, so **`apk update && apk add` work over the real internet on x86-64**. DNS via a host UDP socket + injected `/etc/resolv.conf`. A browser (WebSocket/pktkit) transport and a `smoltcp` NAT stack are the follow-ups. |
 | **I/O multiplexing** | `poll`/`ppoll`/`select`/`pselect6`, `epoll_create1`/`ctl`/`wait`/`pwait2`, `eventfd2`, `timerfd_*` |
 | **Browser demo (wasm)** | working — [**live demo**](https://karpeleslab.github.io/nixvm/): `wasm32-unknown-unknown` + interpreter, built and deployed to GitHub Pages by CI on every push to `main` ([details](#try-it-in-your-browser)) |
 
@@ -128,6 +128,10 @@ Useful environment variables (both harnesses):
   number, args) to stderr.
 - `NIXVM_INTERP=1` — skip the hardware-backend probe in `vcpu::select` and run
   on the software interpreter (a debugging/parity escape hatch).
+- `NIXVM_NET=host` — enable host-passthrough network egress: guest sockets to
+  routable addresses reach the real internet via host sockets (native only;
+  off by default = loopback-only). Lets `apk`/`wget`/`curl` fetch from the
+  network.
 
 ## Default sandbox layout
 
