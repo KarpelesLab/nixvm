@@ -304,8 +304,17 @@ CPUs, rather than pinning one host thread per guest thread.
   `CLONE_SETTLS`/`CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID`/
   `CLONE_CHILD_CLEARTID`. `futex` `FUTEX_WAIT`/`FUTEX_WAKE`(`_BITSET`) is a
   real park/wake (a lone waiter gets a spurious wake instead of deadlocking).
-  `execve` replaces the image in place (no `execveat`, no `vfork` distinction —
-  `vfork` isn't decoded separately). The scheduler exists in **two modes**
+  **Known limitation — heavily-threaded event loops (node):** a program like
+  node loads and runs (dynamic linking, fd-hardening, V8 init all pass — see
+  Phase 5) but doesn't reach quiescence: its ~6 V8/libuv threads busy-spin on
+  `futex(FUTEX_WAIT)` and the main thread's `epoll_pwait(-1)` returns
+  immediately instead of blocking, so the cooperative single-vcpu scheduler
+  never drives the event loop to "no work → exit". Making `epoll_pwait`/
+  `ppoll` genuinely block on an infinite timeout, real per-address futex
+  fairness across the thread group, and timer-driven wakeups are the follow-up
+  (this is the frontier for running node/V8 to completion; every syscall it
+  needs is already implemented). `execve` replaces the image in place. The
+  scheduler exists in **two modes**
   rather than a dedicated `kernel::sched` module: `Kernel::schedule_serial`
   (cooperative single-thread round-robin, default) and `Kernel::schedule_smp`
   (`Kernel::set_ncpus`/`NIXVM_CPUS`> 1 — a pool of host worker threads run
