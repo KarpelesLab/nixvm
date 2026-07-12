@@ -238,7 +238,11 @@ mod browser {
             };
             let tar = crate::fs::tar::gunzip(rootfs_targz, MAX_ROOTFS_BYTES)
                 .map_err(|e| JsError::new(&e))?;
-            let vm = crate::vm::Vm::boot(&tar, argv, MEM_BYTES).map_err(|e| JsError::new(&e))?;
+            // Repack the tar into an in-memory squashfs (read-only lower) under a
+            // writable tmpfs upper — the real copy-on-write overlay layout, so the
+            // guest root stays compressed in RAM and decompresses on demand.
+            let vm = crate::vm::Vm::boot_squashfs(&tar, argv, MEM_BYTES)
+                .map_err(|e| JsError::new(&e))?;
             Ok(Self { vm })
         }
 

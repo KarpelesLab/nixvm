@@ -62,14 +62,44 @@ impl Vm {
     /// Returns a message if the image lacks `argv[0]`/its interpreter, the ELF
     /// is unsupported, or a backend fails to start.
     pub fn boot(tar_bytes: &[u8], argv: Vec<String>, mem_bytes: u64) -> Result<Self, String> {
+        let mut mounts = MountTable::new();
+        mounts.mount("/", Box::new(TmpFs::new()));
+        tar::extract_into(&mut mounts, tar_bytes);
+        Self::finish(mounts, argv, mem_bytes)
+    }
+
+    /// Boot from a `.tar` root image mounted as a **read-only squashfs lower**
+    /// under a writable tmpfs upper (copy-on-write) — the real overlay layout.
+    /// The tar is repacked into an in-memory squashfs via `fstool`, so the guest
+    /// root stays compressed in RAM and decompresses on demand.
+    ///
+    /// # Errors
+    /// Returns a message if the squashfs can't be built/opened, or as [`Vm::boot`].
+    #[cfg(feature = "fstool")]
+    pub fn boot_squashfs(
+        tar_bytes: &[u8],
+        argv: Vec<String>,
+        mem_bytes: u64,
+    ) -> Result<Self, String> {
+        use crate::fs::{FsToolMount, Overlay};
+        let lower = FsToolMount::from_tar(tar_bytes)
+            .map_err(|e| format!("build squashfs from rootfs tar: {e}"))?;
+        let mut mounts = MountTable::new();
+        mounts.mount(
+            "/",
+            Box::new(Overlay::new(Box::new(lower), Box::new(TmpFs::new()))),
+        );
+        Self::finish(mounts, argv, mem_bytes)
+    }
+
+    /// Mount the synthetic filesystems onto `mounts`, load `argv[0]` (following
+    /// its `PT_INTERP` linker for dynamic executables), and boot it interactively.
+    fn finish(mut mounts: MountTable, argv: Vec<String>, mem_bytes: u64) -> Result<Self, String> {
         if argv.is_empty() {
             return Err("empty argv".into());
         }
         let path = argv[0].clone();
 
-        let mut mounts = MountTable::new();
-        mounts.mount("/", Box::new(TmpFs::new()));
-        tar::extract_into(&mut mounts, tar_bytes);
         mounts.mount("/tmp", Box::new(TmpFs::new()));
         mounts.mount("/dev", Box::new(DevFs::new()));
         mounts.mount("/proc", Box::new(ProcFs::new()));

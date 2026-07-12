@@ -49,8 +49,9 @@ fstool = ["dep:fstool"]
 targz = ["dep:compcol"]
 # Browser demo entry point (src/wasm.rs): exposes an interactive `Terminal` and
 # `run_elf` via wasm-bindgen. Pulls in wasm-bindgen + console_error_panic_hook,
-# and `targz` so it can unpack a `.tar.gz` root image in-process.
-wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "targz"]
+# `targz` to unpack a `.tar.gz` root image in-process, and `fstool` to repack it
+# into an in-memory squashfs (read-only lower of a copy-on-write overlay).
+wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "targz", "fstool"]
 # HTTP(S) fetching of guest root images (src/image.rs). Off by default so the
 # core stays dependency-free and wasm-buildable; sha256 verification is
 # hand-rolled in image.rs so it needs no extra dep either way.
@@ -61,7 +62,7 @@ fetch = ["dep:ureq"]
 # optional dependency, gated behind its feature; per-phase additions arrive
 # gated by the features above (object, kvm-ioctls, sha2, a fetch stack, …).
 # `gzip` lets us repack an Alpine .tar.gz minirootfs into an ext4 root image.
-fstool = { version = "0.4.19", optional = true, default-features = false, features = [
+fstool = { version = "0.4.20", optional = true, default-features = false, features = [
     "gzip",
 ] }
 # Blocking HTTP(S) client for downloading guest root images, gated behind the

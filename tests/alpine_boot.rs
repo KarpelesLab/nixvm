@@ -71,6 +71,42 @@ fn boots_alpine_and_runs_shell_commands() {
     assert!(vm.exit_code().is_some(), "shell should exit on `exit`");
 }
 
+/// Boot Alpine from a `.tar` repacked into an **in-memory squashfs** (read-only
+/// lower) under a tmpfs upper — the real copy-on-write overlay layout, and the
+/// path the browser demo takes. Gated on the `fstool` feature and
+/// `NIXVM_ALPINE_TAR`.
+#[cfg(feature = "fstool")]
+#[test]
+fn boots_alpine_from_in_memory_squashfs_overlay() {
+    let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
+        eprintln!("NIXVM_ALPINE_TAR not set; skipping squashfs-overlay boot test");
+        return;
+    };
+    let tar = std::fs::read(&tar_path).expect("read Alpine tar");
+
+    let mut vm = Vm::boot_squashfs(
+        &tar,
+        vec!["/bin/busybox".to_string(), "sh".to_string()],
+        256 * 1024 * 1024,
+    )
+    .expect("boot from in-memory squashfs overlay");
+    let _ = drain(&mut vm);
+    vm.write_stdin(b"cat /etc/alpine-release; echo squashfs-overlay-ok\n");
+    let out = drain(&mut vm);
+    eprintln!("--- squashfs overlay ---\n{out}");
+    assert!(
+        out.contains("squashfs-overlay-ok"),
+        "shell runs from the squashfs-overlay root, got: {out:?}"
+    );
+    // The writable upper works: create a file, read it back.
+    vm.write_stdin(b"echo hi > /tmp/x; cat /tmp/x\n");
+    let out2 = drain(&mut vm);
+    assert!(
+        out2.contains("hi"),
+        "tmpfs upper is writable, got: {out2:?}"
+    );
+}
+
 /// Same, but from the *compressed* `.tar.gz`, decompressed in-process via
 /// `compcol` (the path the browser demo takes). Gated on the `targz` feature
 /// and `NIXVM_ALPINE_TARGZ` pointing at the `.tar.gz`.

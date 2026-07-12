@@ -228,9 +228,9 @@ dependencies = [
 
 [[package]]
 name = "fstool"
-version = "0.4.19"
+version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d46f23a3f55e9b0d54907bbda1b0acffe4fb34e38cdbd80e5f90fd4861c01d8d"
+checksum = "d8198efe113f77219806234e68c2ab1c5cb5f8c3d1cd25bee257154b30ed6eda"
 dependencies = [
  "caseless",
  "clap",

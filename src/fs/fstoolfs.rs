@@ -28,6 +28,7 @@ use std::path::Path;
 
 use fstool::block::{BlockDevice, FileBackend, MemoryBackend};
 use fstool::fs::{EntryKind, FileMeta, FileSource, Filesystem, OpenFlags, ext, squashfs};
+use fstool::repack;
 
 use super::{Attrs, DirEntry, MountFs, NodeKind};
 
@@ -151,6 +152,54 @@ impl FsToolMount {
         Ok(Self {
             fs: Box::new(fs),
             dev: Box::new(dev),
+            read_only: true,
+        })
+    }
+
+    /// Open a **squashfs** image held entirely in memory, read-only. The image
+    /// is copied into an in-memory block device — no filesystem required, so
+    /// this works on wasm32.
+    ///
+    /// # Errors
+    /// fstool error parsing the image.
+    pub fn open_squashfs_bytes(bytes: &[u8]) -> io::Result<Self> {
+        let mut mem = MemoryBackend::new(bytes.len() as u64);
+        io::Write::write_all(&mut mem, bytes)?;
+        let mut dev: Box<dyn BlockDevice> = Box::new(mem);
+        let fs = squashfs::Squashfs::open(&mut *dev).map_err(to_io)?;
+        Ok(Self {
+            fs: Box::new(fs),
+            dev,
+            read_only: true,
+        })
+    }
+
+    /// Build a **squashfs** in memory from an (uncompressed) tar archive and
+    /// open it read-only — the browser demo's "unpack a rootfs image on demand"
+    /// path. The tar is streamed straight into a squashfs writer over an
+    /// in-memory block device (no temp files, no filesystem), then re-opened
+    /// for reading. Used as the read-only lower of a copy-on-write overlay.
+    ///
+    /// # Errors
+    /// fstool error building or re-opening the squashfs.
+    pub fn from_tar(tar: &[u8]) -> io::Result<Self> {
+        // A squashfs of a tar is smaller than the tar's uncompressed content;
+        // size the device at the tar length plus slack for metadata.
+        let cap = tar.len() as u64 + (8 << 20);
+        let mut dev: Box<dyn BlockDevice> = Box::new(MemoryBackend::new(cap));
+        let opts = squashfs::FormatOpts::default();
+        let mut writer = squashfs::Squashfs::format(&mut *dev, &opts).map_err(to_io)?;
+        {
+            let mut sink = repack::FsSink::new(&mut writer, &mut *dev).lossy();
+            let mut stream = fstool::fs::tar::stream::TarArchiveStream::new(io::Cursor::new(tar));
+            repack::walk_stream(&mut stream, &mut sink).map_err(to_io)?;
+        }
+        Filesystem::flush(&mut writer, &mut *dev).map_err(to_io)?;
+        drop(writer);
+        let fs = squashfs::Squashfs::open(&mut *dev).map_err(to_io)?;
+        Ok(Self {
+            fs: Box::new(fs),
+            dev,
             read_only: true,
         })
     }
