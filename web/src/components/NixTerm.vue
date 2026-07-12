@@ -72,6 +72,9 @@ let cachedWasmModule = null;
 let lineBuffer = "";
 let atLineStart = true;
 let busy = false;
+// Set once the wasm instance has trapped (panicked): the session is
+// unrecoverable and every further guest call would throw. Cleared on reboot.
+let guestDead = false;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -119,9 +122,31 @@ function writeErrorBanner(msg) {
   writeRaw(`\r\n\x1b[31m${msg}\x1b[0m\r\n`);
 }
 
+// The wasm sandbox is built with panic=abort, so a Rust panic (an
+// unimplemented syscall path, a bug) traps the whole instance: from then on
+// *every* call into it throws, and there's no recovering this session. Turn
+// that into a visible message + a dead-but-rebootable terminal instead of a
+// silent freeze at the prompt. The real panic text is in the browser console
+// (console_error_panic_hook); we surface a pointer to it.
+function surfaceGuestCrash(err) {
+  if (guestDead) return;
+  guestDead = true;
+  status.value = "error";
+  const detail = err?.message ?? String(err);
+  writeErrorBanner(
+    `guest crashed: ${detail}\r\n(the sandbox panicked and can't continue — see the browser console for the Rust backtrace; click Reboot to start a new session)`,
+  );
+}
+
 async function afterStdinChanged() {
   await tick();
-  const out = guestTerm.pump();
+  let out;
+  try {
+    out = guestTerm.pump();
+  } catch (err) {
+    surfaceGuestCrash(err);
+    return;
+  }
   writeBytes(out);
   if (!guestTerm.is_running()) {
     const code = guestTerm.exit_code();
@@ -133,7 +158,7 @@ async function afterStdinChanged() {
 }
 
 async function handleInput(data) {
-  if (busy || status.value !== "ready") return;
+  if (busy || guestDead || status.value !== "ready") return;
   busy = true;
   try {
     for (const ch of data) {
@@ -217,6 +242,7 @@ async function loadWasmModule() {
 
 async function boot() {
   const archId = arch.value;
+  guestDead = false;
   try {
     const targz = await fetchRootfsTarGz(archId);
     const mod = await loadWasmModule();
@@ -225,7 +251,8 @@ async function boot() {
     atLineStart = true;
     await tick();
     // The wasm Terminal takes the raw .tar.gz and gunzips it in-process; the
-    // guest arch is auto-detected from the ELFs inside it.
+    // guest arch is auto-detected from the ELFs inside it. Construction or the
+    // first pump can trap (panic=abort) — the catch below surfaces it.
     guestTerm = new mod.Terminal(targz, ["/bin/busybox", "sh"]);
     const out = guestTerm.pump();
     writeBanner(`nixvm — Alpine Linux (${archId}), running entirely in your browser.`);
