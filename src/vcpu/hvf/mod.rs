@@ -12,7 +12,9 @@
 //! un-codesigned binary (CI, `cargo test`) gets a graceful error from
 //! [`HvfBackend::new`] and the caller falls back to the interpreter.
 
+mod stub;
 mod sys;
+mod vcpu;
 mod vm;
 
 use crate::abi::Arch;
@@ -43,18 +45,57 @@ impl Backend for HvfBackend {
         Arch::Aarch64
     }
 
-    fn new_vcpu(&self, _entry: u64, _stack: u64) -> Result<Box<dyn Vcpu>, VcpuError> {
-        Err(VcpuError::Backend(
-            "hvf vcpu not implemented yet (next milestone step)".into(),
-        ))
+    fn new_vcpu(&self, entry: u64, stack: u64) -> Result<Box<dyn Vcpu>, VcpuError> {
+        vcpu::HvfVcpu::new(entry, stack)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::sys::*;
+    use super::vcpu::HvfVcpu;
     use super::vm::vm;
     use crate::vcpu::region::{HOST_PAGE, Region};
+    use crate::vcpu::{Exit, GuestMemory, Prot};
+
+    /// Drive a guest EL0 program through the full `Vcpu` surface: two `svc`s,
+    /// with a `set_syscall_ret` in between. Proves the EL0→EL1-stub→HVC trap,
+    /// the syscall-number/argument reads, and that `set_syscall_ret` correctly
+    /// emulates the `eret` back to EL0 so the guest resumes after the `svc`.
+    ///
+    /// Ignored by default (needs entitlement + codesign; run with NIXVM_HVF=1).
+    #[test]
+    #[ignore = "requires the hypervisor entitlement + codesign; run with NIXVM_HVF=1"]
+    fn el0_syscall_trap_and_resume() {
+        if std::env::var_os("NIXVM_HVF").is_none() {
+            return;
+        }
+        let base = 0x1_0000u64;
+        let mut mem = GuestMemory::new(base, 64 * 1024);
+        mem.map(base, 4096, Prot::rwx()).unwrap();
+        // movz x8,#172 ; svc #0 ; movz x8,#93 ; movz x0,#7 ; svc #0
+        let program: [u32; 5] = [0xD2801588, 0xD4000001, 0xD2800BA8, 0xD28000E0, 0xD4000001];
+        let mut bytes = Vec::new();
+        for w in program {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mem.write_init(base, &bytes).unwrap();
+
+        let mut v: Box<dyn crate::vcpu::Vcpu> =
+            HvfVcpu::new(base, base + 0x8000).expect("create HVF vcpu");
+
+        assert_eq!(v.run(&mut mem).unwrap(), Exit::Syscall, "first svc traps");
+        assert_eq!(v.syscall_nr(), 172, "x8 read as the syscall number");
+        v.set_syscall_ret(1234);
+
+        assert_eq!(
+            v.run(&mut mem).unwrap(),
+            Exit::Syscall,
+            "resumed to 2nd svc"
+        );
+        assert_eq!(v.syscall_nr(), 93, "resumed past the first svc");
+        assert_eq!(v.syscall_args()[0], 7, "x0 read as arg0");
+    }
 
     /// Smallest possible bring-up: map one page of guest RAM, run `movz x0,#7 ;
     /// hvc #0` at EL1, and confirm the vcpu exits via an HVC exception with
@@ -121,5 +162,8 @@ mod tests {
 
             assert_eq!(hv_vcpu_destroy(vcpu), HV_SUCCESS);
         }
+        // Release the mapping so it doesn't collide with other HVF tests sharing
+        // this process's single IPA space.
+        vm.unmap(IPA, HOST_PAGE).expect("hv_vm_unmap");
     }
 }
