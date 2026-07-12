@@ -4118,8 +4118,10 @@ impl X86Interp {
             0x6B => self.imul_imm(mem, pc, rex, width, true),
             0x86 => self.xchg(mem, pc, rex, has_rex, 8),
             0x87 => self.xchg(mem, pc, rex, has_rex, width),
-            0x91..=0x97 => {
-                // XCHG rAX, r (0x90 itself is the plain NOP / XCHG eax,eax).
+            // XCHG rAX, r. Plain 0x90 is the NOP (XCHG eax,eax), but REX.B
+            // re-points it at r8 — `49 90` is a real `xchg rax, r8` and gcc
+            // emits it (silently NOP-ing it loses a register's value).
+            0x90..=0x97 if opcode != 0x90 || rex.b => {
                 let r = usize::from(opcode - 0x90) | (usize::from(rex.b) << 3);
                 let a = fetch!(self.read_operand(mem, Operand::Reg(RAX), width));
                 let b = fetch!(self.read_operand(mem, Operand::Reg(r), width));
@@ -4213,6 +4215,8 @@ impl X86Interp {
             0x02 => self.alu_gv_rm8(mem, pc, rex, has_rex, AluOp::Add),
             0x01 => self.alu_rm_gv(mem, pc, rex, width, AluOp::Add, true),
             0x03 => self.alu_gv_rm(mem, pc, rex, width, AluOp::Add),
+            0x08 => self.alu_rm_gv8(mem, pc, rex, has_rex, AluOp::Or, true),
+            0x0A => self.alu_gv_rm8(mem, pc, rex, has_rex, AluOp::Or),
             0x09 => self.alu_rm_gv(mem, pc, rex, width, AluOp::Or, true),
             0x0B => self.alu_gv_rm(mem, pc, rex, width, AluOp::Or),
             0x10 => self.alu_rm_gv8(mem, pc, rex, has_rex, AluOp::Adc, true),
@@ -4227,6 +4231,8 @@ impl X86Interp {
             0x1B => self.alu_gv_rm(mem, pc, rex, width, AluOp::Sbb),
             0x1C => self.alu_acc_imm(mem, pc, 8, AluOp::Sbb),
             0x1D => self.alu_acc_imm(mem, pc, width, AluOp::Sbb),
+            0x20 => self.alu_rm_gv8(mem, pc, rex, has_rex, AluOp::And, true),
+            0x22 => self.alu_gv_rm8(mem, pc, rex, has_rex, AluOp::And),
             0x21 => self.alu_rm_gv(mem, pc, rex, width, AluOp::And, true),
             0x23 => self.alu_gv_rm(mem, pc, rex, width, AluOp::And),
             0x28 => self.alu_rm_gv8(mem, pc, rex, has_rex, AluOp::Sub, true),
@@ -6094,6 +6100,90 @@ mod tests {
         m.write_init(CODE + 8, &[0x48, 0xD1, 0xFE]).unwrap();
         cpu.exec(&mut m);
         assert_eq!(cpu.gpr[RSI], 0xC000_0000_0000_0001, "arithmetic: sign fills");
+    }
+
+    #[test]
+    fn xchg_rax_r8_is_not_a_nop() {
+        // `49 90` is XCHG rax,r8 (REX.B re-points the "NOP" encoding at r8);
+        // treating it as a NOP silently loses a register (found booting
+        // Alpine's busybox, which returns values through exactly this).
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 1;
+        cpu.gpr[R8] = 2;
+        m.write_init(CODE, &[0x49, 0x90]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!((cpu.gpr[RAX], cpu.gpr[R8]), (2, 1));
+        // Plain 0x90 stays a NOP.
+        m.write_init(CODE + 2, &[0x90]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!((cpu.gpr[RAX], cpu.gpr[R8]), (2, 1));
+    }
+
+    #[test]
+    fn alu_8bit_and_or_forms() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 0xF0;
+        cpu.gpr[RCX] = 0x3C;
+        // and al, cl (20 C8) ; or al, cl (08 C8)
+        m.write_init(CODE, &[0x20, 0xC8, 0x08, 0xC8]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 0x30);
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 0x3C);
+    }
+
+    #[test]
+    fn adc_sbb_carry_chains() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = u64::MAX;
+        cpu.gpr[RDX] = 5;
+        // add rax, 1 (sets CF) ; adc rdx, 0 (consumes it)
+        m.write_init(CODE, &[0x48, 0x83, 0xC0, 0x01, 0x48, 0x83, 0xD2, 0x00])
+            .unwrap();
+        cpu.exec(&mut m);
+        assert!(cpu.flags.cf, "add wrapped");
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RDX], 6, "adc added the carry");
+        // sub rax, 1 (0 - 1 borrows) ; sbb rdx, 0 (consumes the borrow)
+        cpu.gpr[RAX] = 0;
+        m.write_init(CODE + 8, &[0x48, 0x83, 0xE8, 0x01, 0x48, 0x83, 0xDA, 0x00])
+            .unwrap();
+        cpu.exec(&mut m);
+        assert!(cpu.flags.cf, "sub borrowed");
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RDX], 5, "sbb subtracted the borrow");
+    }
+
+    #[test]
+    fn eight_bit_flags_are_width_accurate() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        // add al, 1 with AL = 0xFF: the 8-bit result is 0 → ZF and CF set.
+        cpu.gpr[RAX] = 0xFF;
+        m.write_init(CODE, &[0x04, 0x01]).unwrap();
+        cpu.exec(&mut m);
+        assert!(cpu.flags.zf, "8-bit wrap to zero sets ZF");
+        assert!(cpu.flags.cf, "8-bit carry out sets CF");
+        assert_eq!(cpu.gpr[RAX] & 0xff, 0);
+        // cmp al, 1 with AL = 0x81: result 0x80 → SF at bit 7.
+        cpu.gpr[RAX] = 0x81;
+        m.write_init(CODE + 2, &[0x3C, 0x01]).unwrap();
+        cpu.exec(&mut m);
+        assert!(cpu.flags.sf, "8-bit SF comes from bit 7");
+    }
+
+    #[test]
+    fn group2_8bit_shift() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RDI] = 0xAB;
+        // shr dil, 4 (40 C0 EF 04 — REX-extended 8-bit register)
+        m.write_init(CODE, &[0x40, 0xC0, 0xEF, 0x04]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RDI], 0x0A);
     }
 
     #[test]
