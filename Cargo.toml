@@ -3,9 +3,9 @@
 # One crate. Internal structure (abi / vcpu / kernel / fs / loader / image /
 # sandbox) lives as modules, and heavy or platform-specific dependencies are
 # feature-gated rather than split into separate crates. `unsafe` is confined to
-# three documented sites: `vcpu::hvf` (Hypervisor.framework FFI), `vcpu::region`
-# (page-aligned guest-RAM allocation), and `fs::passthrough` (*at(2) FFI). See
-# ROADMAP.md for the plan.
+# four documented sites: `vcpu::hvf` (Hypervisor.framework FFI), `vcpu::kvm`
+# (/dev/kvm ioctl FFI), `vcpu::region` (page-aligned guest-RAM allocation), and
+# `fs::passthrough` (*at(2) FFI). See ROADMAP.md for the plan.
 
 [package]
 name = "nixvm"
@@ -34,13 +34,13 @@ required-features = ["cli"]
 default = ["cli"]
 # CLI-only deps (clap, tracing-subscriber, …) get added here in a later phase.
 cli = []
-# Hardware virtualization backends (per-phase, target-gated deps land with them).
-# Hypervisor.framework (macOS/arm64) is compiled by target cfg, not this feature
-# — it links no extra crates (hand-rolled FFI) and `vcpu::select` probes it at
-# runtime, falling back to the interpreter when unentitled. Feature kept as a
-# reserved placeholder.
+# Hardware virtualization backends. Both are compiled by target cfg, not these
+# features — they link no extra crates (hand-rolled FFI) and `vcpu::select`
+# probes them at runtime, falling back to the interpreter when unavailable
+# (HVF: unentitled binary; KVM: no /dev/kvm). Features kept as reserved
+# placeholders.
 hvf = []    # Hypervisor.framework, macOS/arm64
-kvm = []    # KVM, Linux                          (Phase 10)
+kvm = []    # KVM, Linux/x86-64 (x86-64 guests); arm64 KVM is Phase 10
 # Software CPU interpreter — the no-acceleration fallback (Phase 10).
 interp = []
 # Real on-disk filesystem images (ext2/3/4) via our `fstool` crate, for the

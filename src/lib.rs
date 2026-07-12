@@ -9,15 +9,15 @@
 //! # Module map
 //!
 //! * [`abi`]    — the Linux ABI as data: errno, per-arch syscall tables.
-//! * [`vcpu`]   — execution backends (`hvf`, `interp`) behind one trait.
+//! * [`vcpu`]   — execution backends (`hvf`, `kvm`, `interp`) behind one trait.
 //! * [`loader`] — ELF loading, stack/auxv setup.
 //! * [`fs`]     — the VFS mount table (squashfs, overlay, passthrough, …).
 //! * [`kernel`] — the arch-agnostic syscall engine + process state.
 //! * [`image`]  — guest root-image resolve/download/cache.
 //! * [`sandbox`]— the public [`Sandbox`] builder that wires it all together.
 //!
-//! `unsafe` is confined to the hardware backend (`vcpu::hvf`); everything else
-//! is safe Rust.
+//! `unsafe` is confined to the hardware backends (`vcpu::hvf`, `vcpu::kvm`);
+//! everything else is safe Rust.
 //!
 //! ```no_run
 //! use nixvm::Sandbox;

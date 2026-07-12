@@ -1,7 +1,8 @@
 //! `run-elf-x86` — a development harness: load a host static x86-64 ELF and
-//! run it on the x86-64 software interpreter, printing the exit status, any
-//! fault, and the unsupported-syscall ledger. Mirrors `run-elf` (the aarch64
-//! harness) but selects the x86-64 guest arch and its interpreter backend.
+//! run it on the best available x86-64 backend (KVM on Linux, else the
+//! software interpreter), printing the exit status, any fault, and the
+//! unsupported-syscall ledger. Mirrors `run-elf` (the aarch64 harness) but
+//! selects the x86-64 guest arch.
 //!
 //! ```text
 //! cargo run --bin run-elf-x86 -- <host-elf> [guest-argv...]
@@ -61,8 +62,8 @@ fn main() {
 
     let mid = page_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
 
-    // `vcpu::select` always routes an `X86_64` guest to the dedicated x86-64
-    // software interpreter (there is no hardware backend for it yet).
+    // `vcpu::select` prefers KVM on a Linux/x86-64 host (falling back to the
+    // dedicated x86-64 software interpreter; NIXVM_INTERP=1 forces the latter).
     let backend = nixvm::vcpu::select(Arch::X86_64).unwrap();
     let vcpu = backend.new_vcpu(img.entry, img.stack_pointer).unwrap();
 

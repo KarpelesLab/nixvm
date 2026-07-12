@@ -55,10 +55,13 @@ Functional on the software-interpreter path: a real Rust syscall kernel, two
 working CPU interpreters (aarch64 and a growing x86-64), static, static-PIE, and
 **dynamically-linked** ELF loading (real `ld-musl` boots stock Alpine),
 multi-threaded/multi-process scheduling with an SMP worker-thread pool, an in-VM
-network stack, and several filesystem backends — all covered by 446 tests
-(`cargo test`). Hardware acceleration has begun: the **HVF backend
-(macOS/arm64) runs a static program end-to-end on real hardware**; KVM (Linux)
-is next. The interpreter remains the portable default and the CI-tested path.
+network stack, and several filesystem backends — all covered by 456 tests
+(`cargo test`). Hardware acceleration is live on both target hosts: the **HVF
+backend (macOS/arm64) runs a static program end-to-end**, and the **KVM backend
+(Linux/x86-64) runs a real statically-linked glibc binary end-to-end on real
+hardware** (long mode at ring 3, `syscall` trapped via an `LSTAR` trampoline,
+TLS via `arch_prctl`). `vcpu::select` prefers hardware and falls back to the
+interpreter, which remains the portable default and the everywhere-CI path.
 See [ROADMAP.md](ROADMAP.md) for the phased plan and what's next.
 
 ## What works today
@@ -66,7 +69,7 @@ See [ROADMAP.md](ROADMAP.md) for the phased plan and what's next.
 | Area | Status |
 | --- | --- |
 | **Guest architectures** | aarch64 (interpreter, primary target); x86-64 (interpreter, growing) |
-| **Execution backends** | software interpreter — **working** (portable, CI-tested). HVF (macOS/arm64) — **runs a static program end-to-end on hardware** (guest MMU-off at EL0, `svc` trapped via an EL1 stub); dynamic linking + multi-process on HVF are the follow-up. Needs a codesigned binary (`scripts/hvf-test.sh`); `vcpu::select` falls back to the interpreter when unentitled. KVM (Linux) — not started (planned, reuses the same backend seam). |
+| **Execution backends** | software interpreter — **working** (portable, CI-tested). HVF (macOS/arm64) — **runs a static program end-to-end on hardware** (guest MMU-off at EL0, `svc` trapped via an EL1 stub); needs a codesigned binary (`scripts/hvf-test.sh`). KVM (Linux/x86-64) — **runs a real static glibc binary end-to-end on hardware** (guest at CPL3 in long mode over fixed identity page tables, `syscall` → `LSTAR` trampoline → `KVM_EXIT_HLT`); no entitlement needed, its tests run under plain `cargo test` wherever `/dev/kvm` is accessible and skip elsewhere. `vcpu::select` prefers hardware and falls back to the interpreter (`NIXVM_INTERP=1` forces it); dynamic linking + multi-process on the hardware backends are the follow-up. KVM/arm64 — not started. |
 | **ELF loading** | static (`ET_EXEC`), static-PIE (`ET_DYN` with `R_*_RELATIVE`/`R_*_IRELATIVE` fixups), and **dynamic linking** (`PT_INTERP` → `ld-musl`, file-backed `mmap` of `.so`s) — working; real Alpine boots on the interpreter. |
 | **Processes & threads** | `clone`/`fork`/`execve`/`wait4`/`exit(_group)`; `CLONE_VM`+`CLONE_THREAD` shared-address-space threads; real `futex` WAIT/WAKE parking |
 | **SMP scheduler** | a pool of `ncpus` host worker threads run guest compute in parallel; syscalls are serviced serially on the main thread (a big-kernel-lock model, `Kernel::set_ncpus`/`NIXVM_CPUS`) |
@@ -124,6 +127,8 @@ Useful environment variables (both harnesses):
   scheduler); default is `1` (single-threaded cooperative scheduling).
 - `NIXVM_TRACE=1` — log every dispatched syscall (`pid`, `pc`, name, raw
   number, args) to stderr.
+- `NIXVM_INTERP=1` — skip the hardware-backend probe in `vcpu::select` and run
+  on the software interpreter (a debugging/parity escape hatch).
 
 ## Default sandbox layout
 
@@ -142,10 +147,12 @@ Useful environment variables (both harnesses):
   features (`hvf`, `kvm`, `interp`, `fstool`, `wasm`, `cli`) rather than
   separate crates. The core builds fully offline with zero third-party
   dependencies.
-- **`unsafe` policy.** `unsafe` is confined to three documented sites; the
+- **`unsafe` policy.** `unsafe` is confined to four documented sites; the
   interpreter and kernel paths have none. (1) `vcpu::hvf` — the
-  Hypervisor.framework FFI (`hv_vm_*`/`hv_vcpu_*`); `vcpu::kvm` will be the
-  Linux equivalent. (2) `vcpu::region` — one 16 KiB-aligned `alloc_zeroed`
+  Hypervisor.framework FFI (`hv_vm_*`/`hv_vcpu_*`) — and `vcpu::kvm`, its
+  Linux equivalent (hand-rolled `/dev/kvm` ioctls, structs verified against
+  the kernel headers, plus the mmap'd per-vcpu `kvm_run` page).
+  (2) `vcpu::region` — one 16 KiB-aligned `alloc_zeroed`
   allocation of guest RAM (a hardware backend maps its raw pointer into the
   guest; safe `std` can't express over-aligned allocation), with all raw
   pointer access wrapped in checked copy methods. (3) `fs::passthrough` —

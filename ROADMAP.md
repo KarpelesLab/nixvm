@@ -99,11 +99,13 @@ contracts.
 > hardware backends: the interpreter makes the entire syscall engine testable on
 > any machine and in CI (and is exactly what the wasm demo needs), whereas HVF
 > needs a macOS entitlement + codesign to run. So Phases 1-8 and Phase 10's
-> aarch64/x86-64 ISA all work end-to-end on the interpreter (~446 tests). The
-> **HVF backend is now real** — a static program runs end-to-end on Apple
-> Silicon (Phase 1) — with `vcpu::select` falling back to the interpreter when
-> unentitled so CI stays green; `vcpu::kvm` is next and reuses the same seam.
-> Every step ships with tests. Status is marked per-phase below.
+> aarch64/x86-64 ISA all work end-to-end on the interpreter (~456 tests). Both
+> hardware backends are now real: **HVF** runs a static program end-to-end on
+> Apple Silicon (Phase 1), and **KVM (Linux/x86-64)** runs a real static glibc
+> binary end-to-end on the same `Vcpu`/`Backend` seam — `vcpu::select` prefers
+> hardware and falls back to the interpreter (unentitled HVF, missing
+> `/dev/kvm`, or `NIXVM_INTERP=1`) so CI stays green everywhere. Every step
+> ships with tests. Status is marked per-phase below.
 
 ### Phase 0 — Scaffold ✅ (this commit)
 
@@ -233,17 +235,19 @@ segments, and provide a **vDSO** (`clock_gettime`/`gettimeofday`/`time`/
 `getcpu`) plus `AT_SYSINFO_EHDR`. TLS setup (`TPIDR_EL0` / `arch_prctl` on x86).
 
 - **Syscalls:** `mmap`(file-backed), `mremap` ✅ (added in Phase 2's follow-on
-  work), `madvise` ✅, `arch_prctl`(x86) — not yet, `rseq` (stub/handle),
-  `membarrier` ✅ (no-op).
+  work), `madvise` ✅, `arch_prctl`(x86) ✅ (`ARCH_SET_FS`), `rseq`
+  (stub/handle), `membarrier` ✅ (no-op).
 - **Exit criteria:** dynamically-linked `/bin/sh` and `/bin/ls` from stock
   Alpine run to completion.
 - **Status:** `loader::load_static` handles static PIEs (see Phase 2) but
   `PT_INTERP` is not read and no dynamic linker is loaded — `LoadError`
   doesn't even have a variant for it yet. `mmap` is anonymous-only (no
   file-backed mapping), so a real `ld-musl` couldn't map its own segments this
-  way regardless. TLS is set only via `CLONE_SETTLS`/`Vcpu::set_tls`
-  (aarch64's `TPIDR_EL0`); x86-64's `arch_prctl`(`ARCH_SET_FS`) path doesn't
-  exist, so x86-64 threads have no working TLS yet.
+  way regardless. TLS now works on both arches: `CLONE_SETTLS`/`Vcpu::set_tls`
+  (aarch64's `TPIDR_EL0`) plus `arch_prctl(ARCH_SET_FS)` for x86-64 (landed
+  with the KVM milestone — hardware FS.base on KVM, and the interpreter
+  gained real `fs:`-segment addressing so glibc's TLS/stack-canary reads work
+  on both backends).
 
 ### Phase 6 — Processes, threads, signals  🟡 mostly done; real signal-handler invocation still missing
 
@@ -381,36 +385,37 @@ safe.
   syscall-filter policy exists yet — an infinite loop or fork bomb inside the
   guest is not currently contained by nixvm itself.
 
-### Phase 10 — Portability backends (KVM + interpreter) & x86-64 guests  🟡 interpreters live; HVF runs static programs; KVM not started
+### Phase 10 — Portability backends (KVM + interpreter) & x86-64 guests  🟡 interpreters live; HVF + KVM/x86-64 run static programs; KVM/arm64 not started
 
 Second and third backends, and the second guest arch.
 
-- `vcpu::kvm` — Linux; the `syscall`-trap-via-trampoline technique proven in
-  univdreams' `kvm.rs` (LSTAR → `hlt;sysretq`, `KVM_EXIT_HLT` serviced by the
-  same engine). arm64 KVM too. **Not started** — no `vcpu::kvm` module exists;
-  `vcpu::select` has a `// TODO(Phase 10): KVM on Linux` marker and (on Linux)
-  falls back to an interpreter.
-
-  **KVM reuses the exact backend seam HVF just proved** (see Phase 1): implement
-  `trait Vcpu` + `trait Backend` in a new `vcpu::kvm` module gated
-  `#[cfg(target_os = "linux")]`, and add it to `vcpu::select` with the **same
-  graceful-fallback pattern** — probe (`open("/dev/kvm")` + `KVM_CREATE_VM`),
-  and on failure fall through to the interpreter so non-KVM Linux / CI stays
-  green. Unlike HVF, KVM needs no entitlement and **can run in CI** (a Linux
-  runner with `/dev/kvm`), so its tests need not be `#[ignore]`d.
-
-  Memory: `GuestMemory` is now **one contiguous host allocation**
-  (`vcpu::region::Region`) exactly so a hardware backend can map it — use
-  `host_base()` (raw host pointer) as the `userspace_addr` of a
-  `KVM_SET_USER_MEMORY_REGION` (Linux host pages are 4 KiB, so there's none of
-  HVF's 16 KiB-alignment constraint), and `backing_generation()` to re-issue the
-  memory region when the backing changes (fork/execve) — the same
-  reconcile-on-generation-change the HVF vcpu does. `Exit::MemFault` + the
-  `cow_fault` seam are ready to drive EPT/stage-2 copy-on-write later. Like HVF,
-  the interpreter's flat model maps cleanly onto MMU-off guest-physical == guest
-  -virtual; for x86-64, prefer the univdreams long-mode + `hlt`-trampoline
-  approach; for arm64 KVM, mirror the HVF EL0 + `svc`-trap setup
-  (`KVM_ARM_VCPU_INIT`, exception/`HVC` exits).
+- `vcpu::kvm` — Linux. ✅ **x86-64 done for static programs** — a real
+  statically-linked glibc binary (stock gcc output) runs end-to-end on
+  hardware, TLS and all. Implemented exactly as planned, on the seam HVF
+  proved: `kvm/{sys,vm,vcpu,mod}.rs`, gated
+  `#[cfg(all(target_os = "linux", target_arch = "x86_64"))]`, hand-rolled
+  `/dev/kvm` ioctl FFI (struct layouts pinned by a size test against the
+  kernel ABI), one VM per backend. The guest runs at **CPL3 in long mode**
+  over a control block of fixed identity page tables (guest VA == GPA over
+  the low 4 GiB, 2 MiB pages) — x86-64 can't run paging-off like HVF's
+  MMU-off EL0 trick, so the flat model is reproduced with tables instead.
+  The `syscall`-trap is the univdreams-proven trampoline: `LSTAR` →
+  `hlt; sysretq`, where the `hlt` exits to the host (`KVM_EXIT_HLT`, straight
+  to userspace since no in-kernel irqchip exists) and the resumed `sysretq`
+  drops back to CPL3 at the `rcx`/`r11` context `syscall` saved.
+  `GuestMemory` maps in as one `KVM_SET_USER_MEMORY_REGION` slot from
+  `host_base()`, re-issued on `backing_generation()` change (fork/execve) —
+  the same reconcile the HVF vcpu does; `fork` clones regs+sregs+FPU into a
+  sibling vcpu. `vcpu::select` probes and falls back to the interpreter
+  (`NIXVM_INTERP=1` forces it), and unlike HVF the tests need no entitlement:
+  they run under plain `cargo test` wherever `/dev/kvm` is accessible and
+  skip themselves elsewhere, so `tests/x86_smoke.rs` now exercises real
+  hardware on a KVM host. Follow-ups mirror HVF's: dynamic linking,
+  multi-process slot multiplexing, EPT-driven COW via the `cow_fault` seam,
+  and vcpu-id reuse (KVM never frees a vcpu until the VM dies, so a fork
+  storm eventually hits the max-vcpu cap). **arm64 KVM is not started** —
+  mirror the HVF EL0 + `svc`-trap setup (`KVM_ARM_VCPU_INIT`,
+  exception/`HVC` exits) behind the same probe.
 - `vcpu::interp` — software CPU (arm64 + x86-64 decode/execute), the
   no-acceleration fallback; the syscall gate is just another trap. **Live on
   both guest architectures.** The aarch64 interpreter (`src/vcpu/interp.rs`,
@@ -436,9 +441,10 @@ Second and third backends, and the second guest arch.
 - **Exit criteria:** the Phase 4 and Phase 6 test suites pass on Linux/KVM and,
   more slowly, on the interpreter; an x86-64 Alpine root runs. Met for the
   interpreter (`tests/x86_smoke.rs` and the shared kernel test suite run on
-  both `interp`/`interp_x86`); KVM is unstarted, so the Linux/KVM half is
-  outstanding, and no x86-64 Alpine root has been run end-to-end yet (dynamic
-  linking/TLS from Phase 5 block that).
+  both `interp`/`interp_x86`), and `x86_smoke` now runs on real KVM wherever
+  `/dev/kvm` is accessible (plus the backend's own trap/kernel-e2e tests).
+  Outstanding: the multi-process suites on KVM, and an x86-64 Alpine root
+  end-to-end (dynamic linking from Phase 5 blocks that — x86-64 TLS is done).
 
 ### Phase 11 — Image management & developer experience  ⬜ not started (API shape exists, fetch is a stub)
 

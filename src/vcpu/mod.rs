@@ -138,6 +138,9 @@ pub trait Backend {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod kvm;
+
 pub mod interp;
 pub mod interp_x86;
 
@@ -147,19 +150,35 @@ pub mod interp_x86;
 /// process can create a VM; otherwise falls back to the software interpreter.
 /// The fallback is what keeps an unentitled/unsigned binary (CI, plain
 /// `cargo test`) working — [`hvf::HvfBackend::new`] fails there, and we drop to
-/// the interpreter instead of erroring.
+/// the interpreter instead of erroring. `NIXVM_INTERP=1` skips the hardware
+/// probes entirely (a debugging/parity escape hatch, the env twin of
+/// `SandboxBuilder::prefer_interp`).
 pub fn select(guest: Arch) -> Result<Box<dyn Backend>, VcpuError> {
+    let force_interp = std::env::var_os("NIXVM_INTERP").is_some_and(|v| v == "1");
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         // When the hypervisor is unavailable/unentitled, `new` fails and we fall
         // through to the interpreter.
-        if guest == Arch::Aarch64
+        if !force_interp
+            && guest == Arch::Aarch64
             && let Ok(backend) = hvf::HvfBackend::new()
         {
             return Ok(Box::new(backend) as Box<dyn Backend>);
         }
     }
-    // TODO(Phase 10): KVM on Linux.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        // When `/dev/kvm` is unavailable/inaccessible (a container, CI without
+        // the device), `new` fails and we fall through to the interpreter.
+        if !force_interp
+            && guest == Arch::X86_64
+            && let Ok(backend) = kvm::KvmBackend::new()
+        {
+            return Ok(Box::new(backend) as Box<dyn Backend>);
+        }
+    }
+    let _ = force_interp;
+    // TODO(Phase 10): KVM on Linux/arm64.
     // x86-64 guests run on the dedicated x86 software interpreter; other guest
     // arches fall back to `interp::InterpBackend`.
     if guest == Arch::X86_64 {

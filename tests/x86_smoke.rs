@@ -115,9 +115,10 @@ fn static_x86_64_elf_prints_and_exits() {
     };
     let img = load_static(&mut mem, &elf, &spec).unwrap();
 
-    // `vcpu::select` always routes an `X86_64` guest to the dedicated
-    // software interpreter (`interp_x86`) — there is no hardware backend for
-    // it yet, on any host.
+    // `vcpu::select` prefers hardware for an `X86_64` guest — KVM on a
+    // Linux/x86-64 host with an accessible `/dev/kvm` — and falls back to the
+    // dedicated software interpreter (`interp_x86`) everywhere else, so this
+    // test exercises whichever backend the host really runs.
     let backend = nixvm::vcpu::select(Arch::X86_64).unwrap();
     let vcpu = backend.new_vcpu(img.entry, img.stack_pointer).unwrap();
 
