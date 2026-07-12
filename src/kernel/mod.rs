@@ -88,6 +88,21 @@ struct ProcInfo {
     pgid: i32,
     /// Session id (`setsid`/`getsid`). `0` means "defaults to `pid`".
     sid: i32,
+    /// Writable file-backed `MAP_SHARED` mappings, flushed back to their file
+    /// on `munmap`/`msync`/exit. This is how `apk` (and `install`, `cp
+    /// --sparse`, …) writes large extracted files: create → `ftruncate` →
+    /// `mmap(MAP_SHARED, PROT_WRITE)` → memcpy → `munmap`. Without write-back
+    /// the file stays zero-filled at the right size.
+    shared_maps: Vec<SharedMap>,
+}
+
+/// A writable file-backed `MAP_SHARED` region awaiting flush-back.
+#[derive(Clone, Debug)]
+struct SharedMap {
+    base: u64,
+    len: u64,
+    path: String,
+    offset: u64,
 }
 
 impl Default for ProcInfo {
@@ -114,6 +129,7 @@ impl Default for ProcInfo {
             pending: 0,
             pgid: 0,
             sid: 0,
+            shared_maps: Vec::new(),
         }
     }
 }
@@ -728,6 +744,7 @@ impl Kernel {
             Sysno::Brk => self.sys_brk(args[0], mem),
             Sysno::Mmap => self.sys_mmap(args, mem),
             Sysno::Munmap => self.sys_munmap(args[0], args[1], mem),
+            Sysno::Msync => self.sys_msync(args[0], args[1], mem),
             Sysno::Mprotect => self.sys_mprotect(args[0], args[1], args[2], mem),
             Sysno::Mremap => {
                 self.sys_mremap(args[0], args[1], args[2], args[3], args[4], mem)
@@ -973,7 +990,6 @@ impl Kernel {
             | Sysno::Munlock
             | Sysno::Mlockall
             | Sysno::Munlockall
-            | Sysno::Msync
             | Sysno::SchedYield
             | Sysno::SchedSetaffinity
             | Sysno::SchedGetscheduler
@@ -1516,6 +1532,10 @@ impl Kernel {
     /// notification (so a joiner wakes), close its fds (so pipe peers see EOF),
     /// and become a zombie until reaped.
     fn sys_exit(&mut self, code: i32, mem: &mut GuestMemory) -> i64 {
+        // Flush any un-munmap'd writable shared file mappings first.
+        if !self.cur.shared_maps.is_empty() {
+            self.flush_shared_maps(0, 0, mem);
+        }
         let ctid = self.cur.clear_child_tid;
         let mm = self.cur.mm;
         if ctid != 0 {
@@ -1533,6 +1553,10 @@ impl Kernel {
     /// sibling sharing our `tgid`. Each dying task closes its fds; the running
     /// task also runs its `CLONE_CHILD_CLEARTID` notification.
     fn sys_exit_group(&mut self, code: i32, mem: &mut GuestMemory) -> i64 {
+        // Flush any un-munmap'd writable shared file mappings first.
+        if !self.cur.shared_maps.is_empty() {
+            self.flush_shared_maps(0, 0, mem);
+        }
         let tgid = self.cur.tgid;
         let status = code & 0xff;
         // Collect the siblings' fds first: closing them touches `self.pipes` /
@@ -2426,6 +2450,7 @@ impl Kernel {
     /// flushed back to the backing file (documented limitation), which is
     /// correct for the read-only/executable maps loaders create.
     fn sys_mmap(&mut self, a: &[u64; 6], mem: &mut GuestMemory) -> i64 {
+        const MAP_SHARED: u64 = 0x01;
         const MAP_FIXED: u64 = 0x10;
         const MAP_ANONYMOUS: u64 = 0x20;
 
@@ -2485,8 +2510,51 @@ impl Kernel {
             if mem.write_init(base, &data).is_err() {
                 return err(Errno::ENOMEM);
             }
+            // A writable MAP_SHARED file mapping must have the guest's later
+            // stores flushed back to the file (on munmap/msync/exit).
+            if flags & MAP_SHARED != 0 && prot.contains(Prot::WRITE) {
+                self.cur.shared_maps.push(SharedMap {
+                    base,
+                    len,
+                    path,
+                    offset,
+                });
+            }
         }
         base as i64
+    }
+
+    /// Flush any writable `MAP_SHARED` file mappings overlapping `[addr, addr +
+    /// len)` back to their backing files (their guest memory is the source of
+    /// truth). `len == 0` flushes every shared mapping (process teardown).
+    fn flush_shared_maps(&mut self, addr: u64, len: u64, mem: &GuestMemory) {
+        let hit_all = len == 0;
+        let (lo, hi) = (addr, addr.saturating_add(len));
+        // Take the list out to avoid borrowing `self` twice; retained maps go back.
+        let maps = std::mem::take(&mut self.cur.shared_maps);
+        for m in &maps {
+            let overlaps = hit_all || (m.base < hi && m.base + m.len > lo);
+            if !overlaps {
+                continue;
+            }
+            // Don't grow the file past its real size (the mapping is page-
+            // rounded, but the file was `ftruncate`d to the exact length).
+            let file_size = self.mounts.stat(&m.path).map_or(m.len, |a| a.size);
+            let writable = file_size.saturating_sub(m.offset).min(m.len);
+            if writable == 0 {
+                continue;
+            }
+            if let Ok(bytes) = mem.read_vec(m.base, writable as usize) {
+                let _ = self.mounts.write_at(&m.path, m.offset, &bytes);
+            }
+        }
+        // A partial munmap keeps mappings it didn't cover; a full flush drops all.
+        if !hit_all {
+            self.cur.shared_maps = maps
+                .into_iter()
+                .filter(|m| !(m.base < hi && m.base + m.len > lo))
+                .collect();
+        }
     }
 
     /// Reserve `len` bytes (rounded up to a page) from the downward-growing
@@ -2504,13 +2572,30 @@ impl Kernel {
     }
 
     /// `munmap(addr, len)`.
-    #[allow(clippy::unused_self)]
     fn sys_munmap(&mut self, addr: u64, len: u64, mem: &mut GuestMemory) -> i64 {
         if len == 0 {
             return err(Errno::EINVAL);
         }
         let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-        let _ = mem.unmap(addr - addr % PAGE_SIZE, len);
+        let base = addr - addr % PAGE_SIZE;
+        // Flush any writable shared file mapping before the pages go away.
+        if !self.cur.shared_maps.is_empty() {
+            self.flush_shared_maps(base, len, mem);
+        }
+        let _ = mem.unmap(base, len);
+        0
+    }
+
+    /// `msync(addr, len, flags)` — flush a writable shared file mapping to its
+    /// file without unmapping it.
+    fn sys_msync(&mut self, addr: u64, len: u64, mem: &GuestMemory) -> i64 {
+        if !self.cur.shared_maps.is_empty() {
+            let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+            // msync flushes but keeps the mapping — re-add after the flush.
+            let saved = self.cur.shared_maps.clone();
+            self.flush_shared_maps(addr - addr % PAGE_SIZE, len.max(PAGE_SIZE), mem);
+            self.cur.shared_maps = saved;
+        }
         0
     }
 
@@ -3914,6 +3999,33 @@ mod tests {
         assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::CloseRange, [fd, u64::from(u32::MAX), 0, 0, 0, 0]), 0);
         let buf = 0x1_2000;
         assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, buf, 1, 0, 0, 0]), -9); // EBADF
+    }
+
+    #[test]
+    fn shared_file_mmap_flushes_writes_back() {
+        // The apk large-file extraction pattern: create, ftruncate to size,
+        // mmap(MAP_SHARED, PROT_WRITE), store into the mapping, munmap — and
+        // the bytes must land in the file (this was the "node reads as zeros"
+        // bug: MAP_SHARED writes were never flushed).
+        let (mut k, mut mem, mut v) = setup();
+        // A small mmap arena inside the 16-page test region.
+        k.cur.mmap_cursor = 0x1_8000;
+        k.cur.mmap_floor = 0x1_5000;
+        let fd = open_seeded(&mut k, &mut mem, &mut v, b"");
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Ftruncate, [fd, 6, 0, 0, 0, 0]), 0);
+        // mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0).
+        let base = call(&mut k, &mut mem, &mut v, Sysno::Mmap, [0, 4096, 0x3, 0x1, fd, 0]);
+        assert!(base > 0, "mmap returned {base}");
+        let base = base as u64;
+        // Store "hello!" into the mapping (as a guest memcpy would).
+        mem.write(base, b"hello!").unwrap();
+        // munmap flushes it back to the file.
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Munmap, [base, 4096, 0, 0, 0, 0]), 0);
+        // Read the file: it now holds the mapped bytes, not zeros.
+        call(&mut k, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]);
+        let buf = 0x1_2000;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, buf, 6, 0, 0, 0]), 6);
+        assert_eq!(mem.read_vec(buf, 6).unwrap(), b"hello!");
     }
 
     #[test]
