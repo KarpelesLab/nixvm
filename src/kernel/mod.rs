@@ -1859,9 +1859,10 @@ impl Kernel {
     /// `getrandom(buf, len, flags)`.
     fn sys_getrandom(&mut self, buf: u64, len: u64, mem: &mut GuestMemory) -> i64 {
         if self.rng_state == 0 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0x9E37_79B9_7F4A_7C15, |d| d.as_nanos() as u64);
+            let now = match crate::clock::now_unix().as_nanos() as u64 {
+                0 => 0x9E37_79B9_7F4A_7C15,
+                n => n,
+            };
             self.rng_state = now | 1;
         }
         let mut out = vec![0u8; len as usize];
@@ -1911,9 +1912,7 @@ impl Kernel {
 
 /// `clock_gettime(clk_id, timespec)`.
 fn sys_clock_gettime(ts: u64, mem: &mut GuestMemory) -> i64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    let now = crate::clock::now_unix();
     let mut b = [0u8; 16];
     b[0..8].copy_from_slice(&(now.as_secs()).to_le_bytes());
     b[8..16].copy_from_slice(&u64::from(now.subsec_nanos()).to_le_bytes());

@@ -12,12 +12,10 @@ use super::err;
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
-/// Seconds since the UNIX epoch on the host wall clock (saturating at 0 for a
-/// clock set before 1970).
+/// Time since the UNIX epoch on the host clock (see [`crate::clock`] — the
+/// platform-safe source that also works on wasm32).
 fn host_now() -> std::time::Duration {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+    crate::clock::now_unix()
 }
 
 /// `gettimeofday(tv, tz)` — write `struct timeval { i64 tv_sec; i64 tv_usec }`

@@ -223,6 +223,7 @@ mod browser {
     // inside (e.g. a JS block comment) would close that block early and produce
     // an "Unexpected token" syntax error in the module.
     #[wasm_bindgen]
+    #[derive(Debug)]
     pub struct Terminal {
         vm: crate::vm::Vm,
     }

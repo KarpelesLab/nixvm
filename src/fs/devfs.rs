@@ -22,7 +22,6 @@
 //! device names, directories, and symlinks.
 
 use std::io;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{Attrs, DirEntry, MountFs, NodeKind};
 
@@ -213,9 +212,8 @@ impl DevFs {
     /// lazily from the wall clock on first use.
     fn next_u64(&mut self) -> u64 {
         if self.rng == 0 {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos() as u64);
+            // wasm32-safe clock (see `crate::clock`).
+            let nanos = crate::clock::now_unix().as_nanos() as u64;
             // `| 1` guarantees a non-zero seed (xorshift is stuck at 0).
             self.rng = nanos | 1;
         }

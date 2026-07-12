@@ -31,6 +31,7 @@
 //! ```
 
 pub mod abi;
+pub mod clock;
 pub mod fs;
 pub mod image;
 pub mod kernel;

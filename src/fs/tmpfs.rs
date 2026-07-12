@@ -113,11 +113,10 @@ fn enotempty() -> io::Error {
     io::Error::from_raw_os_error(39)
 }
 
-/// Current wall-clock time as Unix seconds, for `mtime` on write.
+/// Current wall-clock time as Unix seconds, for `mtime` on write
+/// (wasm32-safe — see [`crate::clock`]).
 fn now_ts() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64)
+    crate::clock::now_unix().as_secs() as i64
 }
 
 impl MountFs for TmpFs {
