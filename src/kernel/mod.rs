@@ -206,6 +206,12 @@ pub struct Kernel {
     /// Whether interactive stdin has been closed (EOF / Ctrl-D).
     stdin_closed: bool,
     rng_state: u64,
+    /// The tracked `RLIMIT_NOFILE` `(soft, hard)`. Programs (node/V8) binary-
+    /// search `setrlimit` to raise it to the maximum, then loop over `[0,
+    /// soft)` marking fds cloexec — so the hard cap must be *bounded* or that
+    /// loop runs to `1<<20`. A `setrlimit` that always "succeeds" made node
+    /// conclude it could raise the limit to a million fds and spin there.
+    rlimit_nofile: (u64, u64),
     /// Monotonic counter for `memfd_create` backing-file names.
     memfd_seq: u64,
     trace: bool,
@@ -262,6 +268,7 @@ impl Kernel {
             stdout: Box::new(std::io::stdout()),
             stderr: Box::new(std::io::stderr()),
             rng_state: 0,
+            rlimit_nofile: (1024, 4096),
             memfd_seq: 0,
             trace: std::env::var_os("NIXVM_TRACE").is_some(),
             umask: 0o022,
@@ -949,8 +956,8 @@ impl Kernel {
             Sysno::Times => sys_misc::sys_times(args[0], mem),
             Sysno::Getcpu => sys_misc::sys_getcpu(args[0], args[1], mem),
             Sysno::Capget => sys_misc::sys_capget(args[1], mem),
-            Sysno::Prlimit64 => sys_misc::sys_prlimit64(args[1], args[3], mem),
-            Sysno::Getrlimit => sys_misc::sys_getrlimit(args[0], args[1], mem),
+            Sysno::Prlimit64 => self.sys_prlimit64(args[1], args[2], args[3], mem),
+            Sysno::Getrlimit => self.sys_getrlimit(args[0], args[1], mem),
             Sysno::Prctl => self.sys_prctl(args, mem),
             // arch_prctl(ARCH_SET_FS) — how an x86-64 guest installs its TLS
             // register (FS.base; aarch64 uses the MSR-like TPIDR_EL0 via
@@ -2070,11 +2077,57 @@ impl Kernel {
         total
     }
 
+    /// The `(soft, hard)` limit pair for `resource`, consulting the tracked
+    /// `RLIMIT_NOFILE` and the fixed values for everything else.
+    fn rlimit_pair(&self, resource: u64) -> (u64, u64) {
+        if resource == sys_misc::RLIMIT_NOFILE {
+            self.rlimit_nofile
+        } else {
+            sys_misc::rlimit_for(resource)
+        }
+    }
+
+    /// `prlimit64(pid, resource, new_limit, old_limit)` — report the current
+    /// limit into `old_limit`, then apply `new_limit` (for `RLIMIT_NOFILE`,
+    /// which is the only one we track; the hard limit is capped so a program
+    /// can't raise it into a pathological fd-scan range).
+    fn sys_prlimit64(&mut self, resource: u64, new_limit: u64, old_limit: u64, mem: &mut GuestMemory) -> i64 {
+        let (cur, max) = self.rlimit_pair(resource);
+        if old_limit != 0 {
+            let r = sys_misc::write_rlimit(mem, old_limit, cur, max);
+            if r < 0 {
+                return r;
+            }
+        }
+        if new_limit != 0 && resource == sys_misc::RLIMIT_NOFILE {
+            let Some((mut new_cur, mut new_max)) = sys_misc::read_rlimit(mem, new_limit) else {
+                return err(Errno::EFAULT);
+            };
+            new_max = new_max.min(sys_misc::NOFILE_HARD_CAP);
+            new_cur = new_cur.min(new_max);
+            self.rlimit_nofile = (new_cur, new_max);
+        }
+        0
+    }
+
+    /// `getrlimit(resource, buf)` — report the current limit for `resource`.
+    fn sys_getrlimit(&mut self, resource: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
+        let (cur, max) = self.rlimit_pair(resource);
+        sys_misc::write_rlimit(mem, buf, cur, max)
+    }
+
     /// `fcntl(fd, cmd, ...)` — the subset real programs need at startup.
     fn sys_fcntl(&mut self, fd: u64, cmd: u64) -> i64 {
         const F_DUPFD: u64 = 0;
         const F_GETFL: u64 = 3;
         const F_DUPFD_CLOEXEC: u64 = 1030;
+        // Every fcntl command operates on an open fd. Returning success for a
+        // closed fd breaks the common "mark every fd from 3 up cloexec until
+        // EBADF" loop (node/libuv do this at startup) into an unbounded spin —
+        // it must see EBADF to stop.
+        if self.cur.fds.get(fd as i32).is_none() {
+            return err(Errno::EBADF);
+        }
         match cmd {
             F_DUPFD | F_DUPFD_CLOEXEC => match self.cur.fds.get(fd as i32).cloned() {
                 Some(f) => {
@@ -4026,6 +4079,36 @@ mod tests {
         let buf = 0x1_2000;
         assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, buf, 6, 0, 0, 0]), 6);
         assert_eq!(mem.read_vec(buf, 6).unwrap(), b"hello!");
+    }
+
+    #[test]
+    fn prlimit_nofile_is_tracked_and_hard_capped() {
+        const NOFILE: u64 = 7;
+        let (mut k, mut mem, mut v) = setup();
+        let buf = 0x1_2000;
+        // getrlimit reports the default (1024, 4096).
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getrlimit, [NOFILE, buf, 0, 0, 0, 0]), 0);
+        assert_eq!(mem.read_u64(buf).unwrap(), 1024);
+        assert_eq!(mem.read_u64(buf + 8).unwrap(), 4096);
+        // Try to raise both soft and hard to a million (node/V8's binary
+        // search). The hard limit is capped, and the soft is clamped to it.
+        let newl = 0x1_2100;
+        mem.write(newl, &1_048_576u64.to_le_bytes()).unwrap();
+        mem.write(newl + 8, &1_048_576u64.to_le_bytes()).unwrap();
+        // prlimit64(pid=0, NOFILE, new_limit, old_limit=0)
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Prlimit64, [0, NOFILE, newl, 0, 0, 0]), 0);
+        // getrlimit now reports the capped values, not a million.
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getrlimit, [NOFILE, buf, 0, 0, 0, 0]), 0);
+        assert_eq!(mem.read_u64(buf).unwrap(), 4096, "soft clamped to the hard cap");
+        assert_eq!(mem.read_u64(buf + 8).unwrap(), 4096, "hard capped");
+    }
+
+    #[test]
+    fn fcntl_on_a_closed_fd_is_ebadf() {
+        let (mut k, mut mem, mut v) = setup();
+        // F_SETFD (2) on an unopened fd must fail — else a "cloexec every fd
+        // until EBADF" loop never terminates.
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Fcntl, [99, 2, 1, 0, 0, 0]), -9);
     }
 
     #[test]

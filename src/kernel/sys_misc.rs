@@ -113,38 +113,33 @@ pub(super) fn sys_capget(datap: u64, mem: &mut GuestMemory) -> i64 {
     0
 }
 
-/// `prlimit64(pid, resource, new_limit, old_limit)` — ignore `new_limit`; if
-/// `old_limit` is non-null, report the (constant) limit for `resource`.
-pub(super) fn sys_prlimit64(resource: u64, old_limit: u64, mem: &mut GuestMemory) -> i64 {
-    if old_limit == 0 {
-        return 0;
-    }
-    let (cur, max) = rlimit_for(resource);
-    write_rlimit(mem, old_limit, cur, max)
-}
+pub(super) const RLIMIT_NOFILE: u64 = 7;
+/// The largest `RLIMIT_NOFILE` hard limit we'll grant. This bounds the fd
+/// space a program believes it has — node/V8 binary-search-raise it and then
+/// loop over `[0, soft)` marking every fd cloexec, so an unbounded raise turns
+/// startup into a million-iteration spin.
+pub(super) const NOFILE_HARD_CAP: u64 = 4096;
 
-/// `getrlimit(resource, buf)` — report the (constant) limit for `resource`.
-pub(super) fn sys_getrlimit(resource: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
-    let (cur, max) = rlimit_for(resource);
-    write_rlimit(mem, buf, cur, max)
-}
-
-/// The constant soft/hard limit pair we report for a given `RLIMIT_*` resource.
-fn rlimit_for(resource: u64) -> (u64, u64) {
+/// The constant soft/hard limit pair we report for the resources with a fixed
+/// value (everything except `RLIMIT_NOFILE`, which the kernel tracks).
+pub(super) fn rlimit_for(resource: u64) -> (u64, u64) {
     const RLIMIT_STACK: u64 = 3;
     const RLIMIT_NPROC: u64 = 6;
-    const RLIMIT_NOFILE: u64 = 7;
     const RLIM_INFINITY: u64 = u64::MAX;
     match resource {
-        RLIMIT_NOFILE => (1024, 4096),
         RLIMIT_STACK => (8 * 1024 * 1024, RLIM_INFINITY),
         RLIMIT_NPROC => (4096, 4096),
         _ => (RLIM_INFINITY, RLIM_INFINITY),
     }
 }
 
+/// Read a `struct rlimit { rlim_cur, rlim_max }` (2 x u64) from `addr`.
+pub(super) fn read_rlimit(mem: &GuestMemory, addr: u64) -> Option<(u64, u64)> {
+    Some((mem.read_u64(addr).ok()?, mem.read_u64(addr + 8).ok()?))
+}
+
 /// Write a `struct rlimit { rlim_cur, rlim_max }` (2 x u64) at `addr`.
-fn write_rlimit(mem: &mut GuestMemory, addr: u64, cur: u64, max: u64) -> i64 {
+pub(super) fn write_rlimit(mem: &mut GuestMemory, addr: u64, cur: u64, max: u64) -> i64 {
     let mut b = [0u8; 16];
     b[0..8].copy_from_slice(&cur.to_le_bytes());
     b[8..16].copy_from_slice(&max.to_le_bytes());
@@ -180,21 +175,6 @@ mod tests {
         let mut mem = GuestMemory::new(0x1_0000, 16 * PAGE_SIZE);
         mem.map(0x1_0000, 4 * PAGE_SIZE, Prot::rw()).unwrap();
         (kernel, mem)
-    }
-
-    #[test]
-    fn prlimit64_reports_nofile_limit() {
-        let (_k, mut mem) = setup();
-        let buf = 0x1_0000;
-        assert_eq!(super::sys_prlimit64(7, buf, &mut mem), 0);
-        assert_eq!(mem.read_u64(buf).unwrap(), 1024);
-        assert_eq!(mem.read_u64(buf + 8).unwrap(), 4096);
-    }
-
-    #[test]
-    fn prlimit64_null_old_limit_is_noop() {
-        let (_k, mut mem) = setup();
-        assert_eq!(super::sys_prlimit64(7, 0, &mut mem), 0);
     }
 
     #[test]
