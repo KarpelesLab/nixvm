@@ -818,6 +818,19 @@ impl Kernel {
             Sysno::Prlimit64 => sys_misc::sys_prlimit64(args[1], args[3], mem),
             Sysno::Getrlimit => sys_misc::sys_getrlimit(args[0], args[1], mem),
             Sysno::Prctl => self.sys_prctl(args, mem),
+            // arch_prctl(ARCH_SET_FS) — how an x86-64 guest installs its TLS
+            // register (FS.base; aarch64 uses the MSR-like TPIDR_EL0 via
+            // CLONE_SETTLS instead, so this arm only ever fires for x86-64).
+            // The GS and GET_* subcommands aren't modeled.
+            Sysno::ArchPrctl => {
+                const ARCH_SET_FS: u64 = 0x1002;
+                if args[0] == ARCH_SET_FS {
+                    vcpu.set_tls(args[1]);
+                    0
+                } else {
+                    err(Errno::EINVAL)
+                }
+            }
             // Succeed as root / no-op: uid queries, signal setup, robust list,
             // permission/ownership/timestamp changes, socket options, clock
             // adjustment (TIME_OK), and scheduling/process-attr setters — none
@@ -1671,9 +1684,17 @@ impl Kernel {
             return self.cur.brk as i64;
         }
         if addr > self.cur.brk {
-            let from = self.cur.brk - self.cur.brk % PAGE_SIZE;
+            // Map from the first page NOT already backing the heap: the page a
+            // mid-page `brk` sits on is live (`map` zero-fills, and glibc puts
+            // its TCB — the TLS block and the stack-protector canary — in
+            // early brk memory; rounding down here wiped it and every later
+            // canary check "detected" smashing). A page-aligned `brk` is
+            // exclusive, so its page is not yet part of the heap.
+            let from = self.cur.brk.div_ceil(PAGE_SIZE) * PAGE_SIZE;
             let to = addr.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-            if to > self.cur.heap_limit || mem.map(from, to - from, Prot::rw()).is_err() {
+            if to > self.cur.heap_limit
+                || (to > from && mem.map(from, to - from, Prot::rw()).is_err())
+            {
                 return self.cur.brk as i64;
             }
         } else if addr < self.cur.brk {

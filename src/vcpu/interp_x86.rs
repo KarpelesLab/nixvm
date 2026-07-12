@@ -14,11 +14,18 @@
 //! `CDQ`/`CQO`/`CWDE`/`CDQE`, `CMOVcc`/`SETcc` (all 16 conditions), `PUSH`/
 //! `POP` (register, immediate, and r/m via Group 5), `CALL`/`JMP`
 //! (`rel32` and r/m indirect)/`RET`/`LEAVE`, `Jcc rel8/rel32` (all 16
-//! conditions), `INC`/`DEC` (Group 4/5), `SHL`/`SHR`/`SAR` by an immediate or
-//! `CL`, `XCHG`, the `REP`/`REPE`/`REPNE`-prefixed string ops (`MOVS`/`STOS`/
+//! conditions), `INC`/`DEC` (Group 4/5), `SHL`/`SHR`/`SAR`/`ROL`/`ROR` by an
+//! immediate, `CL`, or the implicit-1 `D1` form, `XCHG`, the
+//! `REP`/`REPE`/`REPNE`-prefixed string ops (`MOVS`/`STOS`/
 //! `LODS`/`SCAS`/`CMPS`, honoring `DF` via `CLD`/`STD`), and `SYSCALL`. The
 //! `0x66` operand-size prefix is decoded (16-bit width) even though most
-//! flag/overflow edge cases are only exercised at 32/64-bit widths.
+//! flag/overflow edge cases are only exercised at 32/64-bit widths; the
+//! `0x67` address-size prefix truncates effective addresses to 32 bits; the
+//! `fs:` segment override adds the `arch_prctl(ARCH_SET_FS)`-set base to
+//! effective addresses (how x86-64 TLS and glibc's stack canary are reached),
+//! while the long-mode zero-based overrides (`cs`/`ds`/`es`/`ss`/`gs`) are
+//! consumed as no-ops; `ENDBR64`/`ENDBR32` and the multi-byte `0F 1F` NOP
+//! (gcc's default function padding/CET landing pads) execute as NOPs.
 //!
 //! Also covers SSE/SSE2: a 16-entry `xmm` register file plus `MOVSS`/`MOVSD`/
 //! `MOVAPS`/`MOVUPS`/`MOVAPD`/`MOVUPD`/`MOVDQA`/`MOVDQU`/`MOVD`/`MOVQ`,
@@ -35,8 +42,10 @@
 //! `POPCNT`/`LZCNT`/`TZCNT`, the `BT`/`BTS`/`BTR`/`BTC` register and
 //! immediate forms, `SHLD`/`SHRD`, `BSWAP`, and the SSE shuffle/unpack/
 //! shift group `PSHUFD`/`PSHUFLW`/`PSHUFHW`/`PSHUFB`/`SHUFPS`/`SHUFPD`/
-//! `UNPCKLPS`/`UNPCKHPS`/`PUNPCKL*`/`PUNPCKH*`/`MOVLHPS`/`MOVHLPS`/
-//! `PSLLDQ`/`PSRLDQ`/`PSLLD`/`PSRLD`/`PSLLQ`/`PSRLQ`.
+//! `UNPCKLPS`/`UNPCKHPS`/`PUNPCKL*`/`PUNPCKH*`/`PSLLDQ`/`PSRLDQ`/`PSLLD`/
+//! `PSRLD`/`PSLLQ`/`PSRLQ`, and the 64-bit half-register moves
+//! `MOVLPS`/`MOVHPS`/`MOVLPD`/`MOVHPD`/`MOVLHPS`/`MOVHLPS`/`MOVDDUP`/
+//! `MOVSLDUP`/`MOVSHDUP`.
 //!
 //! Also a subset of the x87 FPU (the `D8-DF` ESC opcodes, needed since
 //! musl/glibc use x87 for `long double` and some `printf`/`strtod` float
@@ -138,6 +147,15 @@ struct Flags {
     sf: bool,
     of: bool,
     pf: bool,
+}
+
+/// Where a group-2 shift/rotate takes its count from: an immediate byte
+/// (`C0`/`C1`), an implicit 1 (`D0`/`D1`), or `CL` (`D2`/`D3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum G2Count {
+    Imm8,
+    One,
+    Cl,
 }
 
 /// Decoded REX prefix bits (all `false` when the instruction has none).
@@ -775,6 +793,18 @@ struct X86Interp {
     df: bool,
     /// FS.base, set by `arch_prctl(ARCH_SET_FS, ...)` (thread pointer).
     fs_base: u64,
+    /// The `0x67` address-size prefix on the instruction being executed:
+    /// effective addresses truncate to 32 bits. Transient — reset at each
+    /// `exec` and set by the prefix loop. (gcc also emits `0x67` as pure
+    /// padding on `call` in glibc's `_start`, where it affects nothing.)
+    addr32: bool,
+    /// Segment base of the instruction being executed — nonzero only under an
+    /// `fs:` override (`0x64`, how x86-64 reaches TLS: `mov %fs:0x28, ...` is
+    /// every stack-canary check). Added to computed effective addresses in
+    /// [`X86Interp::decode_modrm`]. Transient, like `addr32`. In long mode
+    /// CS/DS/ES/SS (and our never-written GS) are zero-based, so their
+    /// override prefixes are consumed with no effect.
+    seg_base: u64,
     /// The x87 register stack, `ST(0)..ST(7)`, physically indexed (i.e. not
     /// yet rotated by `fpu_top`) — see [`X86Interp::st_get`]. Real x87
     /// registers are 80-bit extended precision; this interpreter models
@@ -818,6 +848,8 @@ impl X86Interp {
             flags: Flags::default(),
             df: false,
             fs_base: 0,
+            addr32: false,
+            seg_base: 0,
             st: [0.0; 8],
             fpu_top: 0,
             fpu_c0: false,
@@ -914,8 +946,10 @@ impl X86Interp {
             };
             let base_val = base.map_or(0, |b| self.gpr[b]);
             let index_val = index.map_or(0, |i| self.gpr[i]);
-            let addr = (base_val.wrapping_add(index_val.wrapping_mul(scale)) as i64)
-                .wrapping_add(disp) as u64;
+            let addr = self.mask_addr(
+                (base_val.wrapping_add(index_val.wrapping_mul(scale)) as i64)
+                    .wrapping_add(disp) as u64,
+            );
             return Ok((
                 ModRm {
                     reg,
@@ -926,6 +960,14 @@ impl X86Interp {
         }
 
         if rm_field == 0b101 && md == 0b00 {
+            // Under `addr32` this form is EIP-relative, and `resolve` (a free
+            // function) can't see a pending segment base either; nothing real
+            // emits these combinations (the prefixes only show up as padding
+            // or with plain registers), so stay honest and fault rather than
+            // resolve them wrong.
+            if self.addr32 || self.seg_base != 0 {
+                return Err(Step::Illegal);
+            }
             let (disp, pc) = fetch_i32(mem, pc)?;
             return Ok((
                 ModRm {
@@ -948,7 +990,7 @@ impl X86Interp {
             }
             _ => (0i64, pc),
         };
-        let addr = (self.gpr[base] as i64).wrapping_add(disp) as u64;
+        let addr = self.mask_addr((self.gpr[base] as i64).wrapping_add(disp) as u64);
         Ok((
             ModRm {
                 reg,
@@ -956,6 +998,14 @@ impl X86Interp {
             },
             pc,
         ))
+    }
+
+    /// Effective address → linear address for the executing instruction:
+    /// truncate to 32 bits under the `0x67` address-size prefix, then add the
+    /// segment base (nonzero only under an `fs:` override — TLS access).
+    fn mask_addr(&self, addr: u64) -> u64 {
+        let ea = if self.addr32 { addr & 0xffff_ffff } else { addr };
+        ea.wrapping_add(self.seg_base)
     }
 
     fn read_operand(&self, mem: &GuestMemory, op: Operand, width: u32) -> Result<u64, Step> {
@@ -1224,6 +1274,13 @@ impl X86Interp {
     // ---- instruction groups ----
 
     fn lea(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, width: u32) -> Step {
+        // LEA computes the *effective* address — hardware ignores a segment
+        // override on it. `decode_modrm` bakes the segment base into the
+        // linear address, so a nonzero base here would be silently wrong;
+        // fault instead (no compiler emits `lea fs:...`).
+        if self.seg_base != 0 {
+            return Step::Illegal;
+        }
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let addr = match resolve(modrm.kind, pc2) {
             Operand::Mem(a) => a,
@@ -1341,6 +1398,24 @@ impl X86Interp {
             fetch!(self.write_operand(mem, rm_op, r, width));
         }
         self.next(pc3)
+    }
+
+    /// `op AL, imm8` / `op eAX, immz` — the accumulator-immediate short forms
+    /// each ALU op reserves at `base+4`/`base+5` (plus `A8`/`A9` for TEST).
+    fn alu_acc_imm(&mut self, mem: &mut GuestMemory, pc: u64, width: u32, op: AluOp) -> Step {
+        let (imm, pc2): (i64, u64) = if width == 8 {
+            let (v, p) = fetch!(fetch_u8(mem, pc));
+            (i64::from(v), p)
+        } else {
+            fetch!(imm_for_width(mem, pc, width))
+        };
+        let a = fetch!(self.read_operand(mem, Operand::Reg(RAX), width));
+        let b = mask_w(imm as u64, width);
+        let r = self.apply_alu(op, a, b, width);
+        if op != AluOp::Cmp && op != AluOp::Test {
+            fetch!(self.write_operand(mem, Operand::Reg(RAX), r, width));
+        }
+        self.next(pc2)
     }
 
     /// `op r/m8, r8` (`Eb,Gb` encoding: destination is the r/m operand).
@@ -1668,16 +1743,16 @@ impl X86Interp {
         pc: u64,
         rex: Rex,
         width: u32,
-        by_cl: bool,
+        by: G2Count,
     ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
-        if !matches!(modrm.reg, 4..=7) {
-            return Step::Illegal; // ROL/ROR/RCL/RCR: not in our documented subset
+        if matches!(modrm.reg, 2 | 3) {
+            return Step::Illegal; // RCL/RCR (through-carry): not in our documented subset
         }
-        let (count, pc3) = if by_cl {
-            (self.gpr[RCX] as u8, pc2)
-        } else {
-            fetch!(fetch_u8(mem, pc2))
+        let (count, pc3) = match by {
+            G2Count::Cl => (self.gpr[RCX] as u8, pc2),
+            G2Count::One => (1, pc2),
+            G2Count::Imm8 => fetch!(fetch_u8(mem, pc2)),
         };
         let mask = if width == 64 { 63 } else { 31 };
         let amt = count & mask;
@@ -1687,12 +1762,48 @@ impl X86Interp {
         }
         let a = fetch!(self.read_operand(mem, rm_op, width));
         let r = match modrm.reg {
+            0 => self.rol_flags(a, amt, width),
+            1 => self.ror_flags(a, amt, width),
             4 | 6 => self.shl_flags(a, amt, width), // SHL and its SAL alias
             5 => self.shr_flags(a, amt, width),
             _ => self.sar_flags(a, amt, width),
         };
         fetch!(self.write_operand(mem, rm_op, r, width));
         self.next(pc3)
+    }
+
+    /// `ROL`: rotate left within `width` bits. Unlike the shifts, rotates
+    /// leave SF/ZF/PF untouched; CF gets the bit rotated across the boundary,
+    /// and OF is defined only for 1-bit rotates. A count that is a multiple
+    /// of the width leaves the value (and, as modeled here, the flags) alone.
+    fn rol_flags(&mut self, a: u64, amt: u8, width: u32) -> u64 {
+        let wa = mask_w(a, width);
+        let k = u32::from(amt) % width;
+        if k == 0 {
+            return wa;
+        }
+        let r = mask_w((wa << k) | (wa >> (width - k)), width);
+        self.flags.cf = r & 1 != 0;
+        if amt == 1 {
+            self.flags.of = ((r >> (width - 1)) & 1 != 0) ^ self.flags.cf;
+        }
+        r
+    }
+
+    /// `ROR`: rotate right within `width` bits (see [`X86Interp::rol_flags`]
+    /// for the flag conventions).
+    fn ror_flags(&mut self, a: u64, amt: u8, width: u32) -> u64 {
+        let wa = mask_w(a, width);
+        let k = u32::from(amt) % width;
+        if k == 0 {
+            return wa;
+        }
+        let r = mask_w((wa >> k) | (wa << (width - k)), width);
+        self.flags.cf = (r >> (width - 1)) & 1 != 0;
+        if amt == 1 {
+            self.flags.of = self.flags.cf ^ ((r >> (width - 2)) & 1 != 0);
+        }
+        r
     }
 
     /// `BSF`/`BSR` (`0F BC`/`BD`, no mandatory prefix) and their `F3`-
@@ -2331,6 +2442,21 @@ impl X86Interp {
         let (op2, pc) = fetch!(fetch_u8(mem, pc));
         match op2 {
             0x05 => Step::Syscall, // `rip` deliberately left on the `syscall` opcode
+            // 0F 1F /0: the canonical multi-byte NOP (any prefix; the ModRM/SIB
+            // is decoded only to consume the instruction's full length).
+            // F3 0F 1E: CET instructions — ENDBR64/ENDBR32 landing pads (FA/FB)
+            // and the RDSSP shadow-stack reads — all architecturally NOPs on a
+            // CPU without CET, which is what this interpreter models. gcc emits
+            // ENDBR64 at every function entry by default (-fcf-protection), so
+            // stock distro binaries hit this on their very first instruction.
+            0x1F => {
+                let (_, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+                self.next(pc2)
+            }
+            0x1E if rep == 1 => {
+                let (_, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+                self.next(pc2)
+            }
             0x40..=0x4F => {
                 // CMOVcc Gv, Ev: only reads the r/m operand when the branch
                 // is taken, mirroring how we skip the write when it isn't.
@@ -2498,10 +2624,9 @@ impl X86Interp {
         let gw = if rex.w { 64 } else { 32 };
         match op2 {
             0x10 | 0x11 => self.sse_move(mem, pc, rex, rep, op2 == 0x11),
-            0x12 => self.sse_movhlps(mem, pc, rex),
+            0x12 | 0x13 | 0x16 | 0x17 => self.sse_mov_half(mem, pc, rex, opsize16, rep, op2),
             0x14 => self.sse_unpck(mem, pc, rex, if opsize16 { 8 } else { 4 }, false),
             0x15 => self.sse_unpck(mem, pc, rex, if opsize16 { 8 } else { 4 }, true),
-            0x16 => self.sse_movlhps(mem, pc, rex),
             0x28 | 0x29 | 0x6F | 0x7F => self.sse_movaps(mem, pc, rex, matches!(op2, 0x29 | 0x7F)),
             0x38 => self.exec_0f_38(mem, pc, rex),
             0x50 => self.sse_movmskp(mem, pc, rex, opsize16),
@@ -2561,6 +2686,96 @@ impl X86Interp {
     /// destination keeps its upper bits, while a *memory* destination or
     /// source has none to preserve (mem-to-reg zeroes the upper lanes, per
     /// the `MOVSS`/`MOVSD` spec).
+    /// `0F 12/13/16/17`: the 64-bit half-register moves — `MOVLPS`/`MOVLPD`
+    /// (load/store the low half), `MOVHPS`/`MOVHPD` (the high half), the
+    /// register forms `MOVHLPS`/`MOVLHPS` (cross-half reg-to-reg), and the
+    /// `F3`/`F2`-selected dup forms sharing `12`/`16`: `MOVDDUP`,
+    /// `MOVSLDUP`/`MOVSHDUP`. glibc's SSE `memcpy`/`strlen` lean on these.
+    fn sse_mov_half(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        opsize16: bool,
+        rep: u8,
+        op2: u8,
+    ) -> Step {
+        const LOW64: u128 = u64::MAX as u128;
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let high = op2 & 0x04 != 0; // 16/17 move the high half, 12/13 the low
+        if op2 & 0x01 != 0 {
+            // 13/17: store — memory destination only, no rep-selected forms.
+            if rep != 0 {
+                return Step::Illegal;
+            }
+            let Operand::Mem(a) = rm_op else {
+                return Step::Illegal;
+            };
+            let v = self.xmm[modrm.reg];
+            let half = if high { (v >> 64) as u64 } else { v as u64 };
+            fetch!(mem.write_trap(a, &half.to_le_bytes()).map_err(|e| Step::Fault {
+                addr: e.fault_addr(),
+                write: true
+            }));
+            return self.next(pc2);
+        }
+        match rep {
+            // F2 0F 12 MOVDDUP: both halves get the source's low 64 bits.
+            2 => {
+                if high || opsize16 {
+                    return Step::Illegal;
+                }
+                let lo = fetch!(self.xmm_read_lo(mem, rm_op, 64));
+                self.xmm[modrm.reg] = (u128::from(lo) << 64) | u128::from(lo);
+            }
+            // F3 0F 12/16 MOVSLDUP/MOVSHDUP: duplicate the even (SL) or odd
+            // (SH) 32-bit lanes of the full 128-bit source.
+            1 => {
+                if opsize16 {
+                    return Step::Illegal;
+                }
+                let src = fetch!(self.xmm_read128(mem, rm_op));
+                let mut out = 0u128;
+                for lane in 0..4u32 {
+                    let pick = if high { lane | 1 } else { lane & !1 };
+                    let v = (src >> (32 * pick)) as u32;
+                    out |= u128::from(v) << (32 * lane);
+                }
+                self.xmm[modrm.reg] = out;
+            }
+            _ => match rm_op {
+                // Register forms: MOVHLPS (12: low ← src's high half) and
+                // MOVLHPS (16: high ← src's low half). No 66-prefixed
+                // register encoding exists.
+                Operand::Reg(r) => {
+                    if opsize16 {
+                        return Step::Illegal;
+                    }
+                    let src = self.xmm[r];
+                    let dst = self.xmm[modrm.reg];
+                    self.xmm[modrm.reg] = if high {
+                        (dst & LOW64) | (u128::from(src as u64) << 64)
+                    } else {
+                        (dst & !LOW64) | u128::from((src >> 64) as u64)
+                    };
+                }
+                // Memory forms: load 64 bits into one half, preserving the other.
+                Operand::Mem(_) => {
+                    let m = fetch!(self.xmm_read_lo(mem, rm_op, 64));
+                    let dst = self.xmm[modrm.reg];
+                    self.xmm[modrm.reg] = if high {
+                        (dst & LOW64) | (u128::from(m) << 64)
+                    } else {
+                        (dst & !LOW64) | u128::from(m)
+                    };
+                }
+                Operand::Reg8Hi(_) => return Step::Illegal,
+            },
+        }
+        self.next(pc2)
+    }
+
     fn sse_move(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex, rep: u8, store: bool) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let rm_op = resolve(modrm.kind, pc2);
@@ -2948,34 +3163,6 @@ impl X86Interp {
             }
         }
         self.gpr[modrm.reg] = result;
-        self.next(pc2)
-    }
-
-    /// `MOVHLPS xmm1, xmm2` (`0F 12`, register form only — the memory form
-    /// is the unrelated `MOVLPS`, not in our documented subset): `dst`'s low
-    /// 64 bits `<- src`'s high 64 bits; `dst`'s high 64 bits are unchanged.
-    fn sse_movhlps(&mut self, mem: &GuestMemory, pc: u64, rex: Rex) -> Step {
-        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
-        let rm_op = resolve(modrm.kind, pc2);
-        let Operand::Reg(r) = rm_op else {
-            return Step::Illegal;
-        };
-        let src_hi = self.xmm[r] >> 64;
-        self.xmm[modrm.reg] = (self.xmm[modrm.reg] & !u128::from(u64::MAX)) | src_hi;
-        self.next(pc2)
-    }
-
-    /// `MOVLHPS xmm1, xmm2` (`0F 16`, register form only — the memory form
-    /// is the unrelated `MOVHPS`): `dst`'s high 64 bits `<- src`'s low 64
-    /// bits; `dst`'s low 64 bits are unchanged.
-    fn sse_movlhps(&mut self, mem: &GuestMemory, pc: u64, rex: Rex) -> Step {
-        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
-        let rm_op = resolve(modrm.kind, pc2);
-        let Operand::Reg(r) = rm_op else {
-            return Step::Illegal;
-        };
-        let src_lo = self.xmm[r] & u128::from(u64::MAX);
-        self.xmm[modrm.reg] = (self.xmm[modrm.reg] & u128::from(u64::MAX)) | (src_lo << 64);
         self.next(pc2)
     }
 
@@ -3813,13 +4000,23 @@ impl X86Interp {
         let mut pc = self.rip;
         let mut opsize16 = false;
         let mut rep: u8 = 0; // 0 = none, 1 = REP/REPE (F3), 2 = REPNE (F2)
+        self.addr32 = false;
+        self.seg_base = 0;
         loop {
             let (b, next) = fetch!(fetch_u8(mem, pc));
             match b {
                 0x66 => opsize16 = true,
                 0xF3 => rep = 1,
                 0xF2 => rep = 2,
-                0xF0 => {} // LOCK
+                0x67 => self.addr32 = true, // address-size: 32-bit effective addresses
+                // FS override (`0x64`) is the one segment with a settable base
+                // (`arch_prctl(ARCH_SET_FS)` → TLS). LOCK (`0xF0`) just
+                // decorates an already-atomic op here, and the remaining
+                // segment overrides — CS/DS/ES/SS are architecturally
+                // zero-based in long mode, GS stays zero until ARCH_SET_GS is
+                // modeled — are no-ops (they mostly appear as padding).
+                0x64 => self.seg_base = self.fs_base,
+                0xF0 | 0x26 | 0x2E | 0x36 | 0x3E | 0x65 => {}
                 _ => break,
             }
             pc = next;
@@ -4028,6 +4225,21 @@ impl X86Interp {
             0x3A => self.alu_gv_rm8(mem, pc, rex, has_rex, AluOp::Cmp),
             0x39 => self.alu_rm_gv(mem, pc, rex, width, AluOp::Cmp, false),
             0x3B => self.alu_gv_rm(mem, pc, rex, width, AluOp::Cmp),
+            // Accumulator-immediate short forms (`op AL, imm8` / `op eAX, immz`).
+            0x04 => self.alu_acc_imm(mem, pc, 8, AluOp::Add),
+            0x05 => self.alu_acc_imm(mem, pc, width, AluOp::Add),
+            0x0C => self.alu_acc_imm(mem, pc, 8, AluOp::Or),
+            0x0D => self.alu_acc_imm(mem, pc, width, AluOp::Or),
+            0x24 => self.alu_acc_imm(mem, pc, 8, AluOp::And),
+            0x25 => self.alu_acc_imm(mem, pc, width, AluOp::And),
+            0x2C => self.alu_acc_imm(mem, pc, 8, AluOp::Sub),
+            0x2D => self.alu_acc_imm(mem, pc, width, AluOp::Sub),
+            0x34 => self.alu_acc_imm(mem, pc, 8, AluOp::Xor),
+            0x35 => self.alu_acc_imm(mem, pc, width, AluOp::Xor),
+            0x3C => self.alu_acc_imm(mem, pc, 8, AluOp::Cmp),
+            0x3D => self.alu_acc_imm(mem, pc, width, AluOp::Cmp),
+            0xA8 => self.alu_acc_imm(mem, pc, 8, AluOp::Test),
+            0xA9 => self.alu_acc_imm(mem, pc, width, AluOp::Test),
             0x84 => self.alu_rm_gv8(mem, pc, rex, has_rex, AluOp::Test, false),
             0x85 => self.alu_rm_gv(mem, pc, rex, width, AluOp::Test, false),
             0x80 => self.group1_imm(mem, pc, rex, has_rex, 8, true),
@@ -4037,8 +4249,9 @@ impl X86Interp {
             0xF7 => self.group3(mem, pc, rex, has_rex, width),
             0xFE => self.group4(mem, pc, rex, has_rex),
             0xFF => self.group5(mem, pc, rex, width),
-            0xC1 => self.group2(mem, pc, rex, width, false),
-            0xD3 => self.group2(mem, pc, rex, width, true),
+            0xC1 => self.group2(mem, pc, rex, width, G2Count::Imm8),
+            0xD1 => self.group2(mem, pc, rex, width, G2Count::One),
+            0xD3 => self.group2(mem, pc, rex, width, G2Count::Cl),
             0xE8 => {
                 let (rel, pc2) = fetch!(fetch_i32(mem, pc));
                 fetch!(self.push(mem, pc2));
@@ -5779,5 +5992,118 @@ mod tests {
         cpu.exec(&mut m); // fxch
         assert_eq!(cpu.st_get(0), 1.0);
         assert_eq!(cpu.st_get(1), 2.0);
+    }
+
+    #[test]
+    fn endbr64_and_long_nop_are_nops() {
+        let mut m = mem();
+        // endbr64 (gcc emits it at every function entry under -fcf-protection).
+        let cpu = run_one(&mut m, &[0xF3, 0x0F, 0x1E, 0xFA]);
+        assert_eq!(cpu.rip, CODE + 4);
+        // The canonical data16 cs-prefixed 10-byte NOP from gcc's padding.
+        let mut m = mem();
+        let cpu = run_one(
+            &mut m,
+            &[0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        );
+        assert_eq!(cpu.rip, CODE + 11);
+    }
+
+    #[test]
+    fn fs_segment_override_adds_fs_base() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.fs_base = 0x1_8000; // TLS block inside the test region
+        m.write_init(0x1_8028, &0xfeed_face_cafe_f00du64.to_le_bytes())
+            .unwrap();
+        // mov rax, fs:[0x28] — the stack-protector canary load.
+        m.write_init(
+            CODE,
+            &[0x64, 0x48, 0x8B, 0x04, 0x25, 0x28, 0x00, 0x00, 0x00],
+        )
+        .unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 0xfeed_face_cafe_f00d);
+        // The override is transient: the next instruction is fs-free.
+        m.write_init(0x1_2000, &42u64.to_le_bytes()).unwrap();
+        // mov rbx, [0x12000]
+        m.write_init(
+            CODE + 9,
+            &[0x48, 0x8B, 0x1C, 0x25, 0x00, 0x20, 0x01, 0x00],
+        )
+        .unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RBX], 42, "seg base must not leak across instructions");
+    }
+
+    #[test]
+    fn alu_accumulator_imm_forms() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RAX] = 0x3d;
+        // cmp al, 0x3d — sets ZF, leaves AL alone.
+        m.write_init(CODE, &[0x3C, 0x3D]).unwrap();
+        cpu.exec(&mut m);
+        assert!(cpu.flags.zf);
+        assert_eq!(cpu.gpr[RAX], 0x3d);
+        // add eax, 0x100 — writes back, zero-extending to 64 bits.
+        m.write_init(CODE + 2, &[0x05, 0x00, 0x01, 0x00, 0x00]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 0x13d);
+        // test al, 0x80 — flags only.
+        m.write_init(CODE + 7, &[0xA8, 0x80]).unwrap();
+        cpu.exec(&mut m);
+        assert!(cpu.flags.zf, "0x3d & 0x80 == 0");
+        assert_eq!(cpu.gpr[RAX], 0x13d, "TEST must not write back");
+    }
+
+    #[test]
+    fn rotates_and_shift_by_one() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RDX] = 0x8000_0000_0000_0001;
+        // rol rdx, 0x11 (glibc's PTR_MANGLE uses exactly this)
+        m.write_init(CODE, &[0x48, 0xC1, 0xC2, 0x11]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RDX], 0x8000_0000_0000_0001u64.rotate_left(0x11));
+        // ror rdx, 0x11 undoes it.
+        m.write_init(CODE + 4, &[0x48, 0xC1, 0xCA, 0x11]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RDX], 0x8000_0000_0000_0001);
+        // sar rsi, 1 (the D1 shift-by-one form).
+        cpu.gpr[RSI] = 0x8000_0000_0000_0002;
+        m.write_init(CODE + 8, &[0x48, 0xD1, 0xFE]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RSI], 0xC000_0000_0000_0001, "arithmetic: sign fills");
+    }
+
+    #[test]
+    fn sse_half_moves() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        m.write_init(0x1_2000, &0x1111_2222_3333_4444u64.to_le_bytes())
+            .unwrap();
+        cpu.xmm[0] = 0xAAAA_BBBB_CCCC_DDDD_0123_4567_89AB_CDEF;
+        // movhps xmm0, [0x12000]: high half loaded, low preserved.
+        m.write_init(CODE, &[0x0F, 0x16, 0x04, 0x25, 0x00, 0x20, 0x01, 0x00])
+            .unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.xmm[0], 0x1111_2222_3333_4444_0123_4567_89AB_CDEF);
+        // movlps [0x12008], xmm0: stores the (preserved) low half.
+        m.write_init(CODE + 8, &[0x0F, 0x13, 0x04, 0x25, 0x08, 0x20, 0x01, 0x00])
+            .unwrap();
+        cpu.exec(&mut m);
+        let mut b = [0u8; 8];
+        m.read(0x1_2008, &mut b).unwrap();
+        assert_eq!(u64::from_le_bytes(b), 0x0123_4567_89AB_CDEF);
+        // movhlps xmm1, xmm0 (reg form): xmm1.low <- xmm0.high.
+        cpu.xmm[1] = u128::MAX;
+        m.write_init(CODE + 16, &[0x0F, 0x12, 0xC8]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(
+            cpu.xmm[1],
+            0xFFFF_FFFF_FFFF_FFFF_1111_2222_3333_4444,
+            "low half replaced, high preserved"
+        );
     }
 }
