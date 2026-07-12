@@ -54,7 +54,7 @@ Functional on the software-interpreter path: a real Rust syscall kernel, two
 working CPU interpreters (aarch64 and a growing x86-64), static, static-PIE, and
 **dynamically-linked** ELF loading (real `ld-musl` boots stock Alpine),
 multi-threaded/multi-process scheduling with an SMP worker-thread pool, an in-VM
-network stack, and several filesystem backends — all covered by 456 tests
+network stack, and several filesystem backends — all covered by 473 tests
 (`cargo test`). Hardware acceleration is live on both target hosts: the **HVF
 backend (macOS/arm64) runs a static program end-to-end**, and the **KVM backend
 (Linux/x86-64) runs a real statically-linked glibc binary end-to-end on real
@@ -78,12 +78,19 @@ See [ROADMAP.md](ROADMAP.md) for the phased plan and what's next.
 | **I/O multiplexing** | `poll`/`ppoll`/`select`/`pselect6`, `epoll_create1`/`ctl`/`wait`/`pwait2`, `eventfd2`, `timerfd_*` |
 | **Browser demo (wasm)** | working — [**live demo**](https://karpeleslab.github.io/nixvm/): `wasm32-unknown-unknown` + interpreter, built and deployed to GitHub Pages by CI on every push to `main` ([details](#try-it-in-your-browser)) |
 
-The syscall dispatch table in `src/kernel/mod.rs` covers process/thread
-lifecycle, fd/file I/O, `mmap`/`brk`/`mprotect`/`mremap`, signals, networking,
-poll/epoll/eventfd/timerfd, and a set of always-succeed/no-op syscalls
-(`uid`/`gid` queries, `sched_*` setters, `Mlock*`, …) real programs probe at
-startup. Anything not in the table returns `ENOSYS` and is recorded in an
-`unsupported()` ledger you can inspect after a run.
+The syscall dispatch table in `src/kernel/mod.rs` is broad: process/thread
+lifecycle (incl. `waitid`/`clone3`/`execveat`), sessions & process groups
+(`setsid`/`setpgid`/…), fd/file I/O including positioned/vectored
+(`pread`/`pwrite`/`preadv`/`pwritev`) and copy (`sendfile`/`copy_file_range`),
+`truncate`/`ftruncate`/`fallocate`, `statx`, `mmap`/`brk`/`mprotect`/`mremap`,
+signals, networking (loopback + host egress, incl. `sendmsg`/`recvmsg`/
+`sendmmsg`/`recvmmsg`), poll/epoll/eventfd/timerfd/`memfd_create`, and a set of
+always-succeed/no-op syscalls (the `uid`/`gid` credential family, `sync`
+family, `sched_*` setters, `Mlock*`, …) real programs probe at startup. A
+busybox command battery, `apk`, and a dynamically-linked binary's startup all
+dispatch with **zero** unsupported syscalls on x86-64. Anything not in the
+table returns `ENOSYS` and is recorded in an `unsupported()` ledger you can
+inspect after a run.
 
 ## Quickstart
 

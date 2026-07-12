@@ -310,7 +310,8 @@ CPUs, rather than pinning one host thread per guest thread.
   (no signal-frame push, no PC redirect, no `rt_sigreturn` trampoline); a
   pending signal with a real handler address is silently dropped rather than
   delivered, specifically to avoid deadlocking the scheduler. `getpgid`/
-  `setpgid`/`setsid` are not implemented.
+  `setpgid`/`getpgrp`/`setsid`/`getsid` **are now implemented** (per-process
+  `pgid`/`sid` state), along with `waitid` and `clone3`.
 
 ### Phase 7 — /proc, /sys, /dev, and IO multiplexing  🟡 mostly done; no real pty
 
@@ -336,10 +337,12 @@ Synthesized pseudo-filesystems and the fd machinery real programs assume.
   allocation yet (`ptmx` reads as EOF, doesn't hand back a pty pair). `poll`/
   `ppoll`/`select`/`pselect6`, `epoll_create1`/`ctl`/`wait`/`pwait`/`pwait2`,
   `eventfd2`, and `timerfd_create`/`settime`/`gettime` are implemented
-  (readiness computed synchronously; socket fds are reported best-effort
-  always-ready since `net.rs`'s connection state is private to it).
-  `signalfd4`, `inotify_*`, `memfd_create`, and `close_range` are not
-  implemented.
+  (readiness computed synchronously; in-VM loopback socket fds are best-effort
+  always-ready, but **host-egress sockets get a precise peek-based readiness**).
+  `memfd_create` (root-backed anonymous file) and `close_range` **are now
+  implemented**; `signalfd4` and `inotify_init1`/`add_watch`/`rm_watch` are
+  **stubbed** (a valid fd that never delivers events/signals — safe for
+  optional watching). A real pty is still the main gap here.
 
 ### Phase 8 — Networking  🟡 loopback + host-passthrough egress done (native); smoltcp/browser transport next
 
