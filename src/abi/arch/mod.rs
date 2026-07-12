@@ -80,6 +80,31 @@ pub enum Sysno {
     Dup2,
     Dup3,
     Clone,
+    /// x86-64 only (aarch64 has no `fork` syscall — everything is `clone`).
+    Fork,
+    /// x86-64 only, like [`Sysno::Fork`].
+    Vfork,
+    /// x86-64 only (aarch64 has no path-based `stat` — only `newfstatat`).
+    Stat,
+    /// x86-64 only, like [`Sysno::Stat`].
+    Lstat,
+    /// x86-64 only: the legacy path-based file syscalls aarch64 replaced
+    /// with their `*at` successors. Each dispatches as `<op>at(AT_FDCWD, …)`.
+    Open,
+    /// x86-64 only — `open(path, O_WRONLY|O_CREAT|O_TRUNC, mode)`.
+    Creat,
+    /// x86-64 only, like [`Sysno::Open`].
+    Mkdir,
+    /// x86-64 only — `unlinkat(AT_FDCWD, path, AT_REMOVEDIR)`.
+    Rmdir,
+    /// x86-64 only, like [`Sysno::Open`].
+    Unlink,
+    /// x86-64 only, like [`Sysno::Open`].
+    Rename,
+    /// x86-64 only, like [`Sysno::Open`].
+    Symlink,
+    /// x86-64 only, like [`Sysno::Open`].
+    Readlink,
     Execve,
     Wait4,
     SetRobustList,

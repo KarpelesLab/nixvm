@@ -215,15 +215,11 @@ fn detect_arch(elf: &[u8]) -> Option<Arch> {
 }
 
 fn select_backend(arch: Arch) -> Result<Box<dyn crate::vcpu::Backend>, String> {
-    use crate::vcpu::Backend;
-    match arch {
-        Arch::Aarch64 => crate::vcpu::interp::InterpBackend::new(arch)
-            .map(|b| Box::new(b) as Box<dyn Backend>)
-            .map_err(|e| e.to_string()),
-        Arch::X86_64 => crate::vcpu::interp_x86::X86Backend::new(arch)
-            .map(|b| Box::new(b) as Box<dyn Backend>)
-            .map_err(|e| e.to_string()),
-    }
+    // Prefer hardware virtualization where the host has it (KVM/HVF, probed
+    // with an interpreter fallback — see `vcpu::select`); on wasm32 the
+    // hardware backends don't build, so this always lands on the interpreter
+    // there.
+    crate::vcpu::select(arch).map_err(|e| e.to_string())
 }
 
 fn default_env() -> Vec<String> {

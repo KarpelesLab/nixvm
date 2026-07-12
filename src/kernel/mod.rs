@@ -491,17 +491,25 @@ impl Kernel {
                     Serviced::Resume
                 } else {
                     eprintln!(
-                        "[fault] pid {} memory fault at {addr:#x} (write={write})",
-                        self.cur.pid
+                        "[fault] pid {} memory fault at {addr:#x} (write={write}, pc={:#x})",
+                        self.cur.pid,
+                        vcpu.pc()
                     );
                     self.cur.run = RunState::Zombie(139);
                     Serviced::Ended
                 }
             }
             Exit::IllegalInstruction { pc } => {
+                // Dump the raw bytes at the fault so an interpreter decode gap
+                // is identifiable from the report alone (the pc is under a
+                // load bias for PIEs/`ld-musl`, so it can't be looked up in
+                // the on-disk ELF directly).
+                let bytes = mem.read_vec(pc, 16).unwrap_or_default();
+                let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
                 eprintln!(
-                    "[fault] pid {} illegal instruction at {pc:#x}",
-                    self.cur.pid
+                    "[fault] pid {} illegal instruction at {pc:#x} [{}]",
+                    self.cur.pid,
+                    hex.join(" ")
                 );
                 self.cur.run = RunState::Zombie(132);
                 Serviced::Ended
@@ -786,6 +794,33 @@ impl Kernel {
             Sysno::Dup => self.sys_dup(args[0]),
             Sysno::Dup2 | Sysno::Dup3 => self.sys_dup2(args[0], args[1]),
             Sysno::Clone => self.sys_clone(args, vcpu, mem),
+            // x86-64's legacy spellings of clone: `fork` is
+            // `clone(SIGCHLD, ...)`, `vfork` is `clone(CLONE_VM|CLONE_VFORK|
+            // SIGCHLD, ...)` — aarch64 never had either as its own syscall.
+            Sysno::Fork => self.sys_clone(&[0x11, 0, 0, 0, 0, 0], vcpu, mem),
+            Sysno::Vfork => self.sys_clone(&[0x4111, 0, 0, 0, 0, 0], vcpu, mem),
+            // x86-64's legacy path-based stat family, in terms of newfstatat.
+            Sysno::Stat => self.sys_newfstatat(AT_FDCWD, args[0], args[1], 0, mem),
+            Sysno::Lstat => {
+                const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+                self.sys_newfstatat(AT_FDCWD, args[0], args[1], AT_SYMLINK_NOFOLLOW, mem)
+            }
+            // x86-64's legacy path-based file syscalls, each the `AT_FDCWD`
+            // special case of its `*at` successor.
+            Sysno::Open => self.sys_openat(AT_FDCWD, args[0], args[1], args[2], mem),
+            Sysno::Creat => {
+                const O_WRONLY_CREAT_TRUNC: u64 = 0o1101;
+                self.sys_openat(AT_FDCWD, args[0], O_WRONLY_CREAT_TRUNC, args[1], mem)
+            }
+            Sysno::Mkdir => self.sys_mkdirat(AT_FDCWD, args[0], args[1], mem),
+            Sysno::Rmdir => {
+                const AT_REMOVEDIR: u64 = 0x200;
+                self.sys_unlinkat(AT_FDCWD, args[0], AT_REMOVEDIR, mem)
+            }
+            Sysno::Unlink => self.sys_unlinkat(AT_FDCWD, args[0], 0, mem),
+            Sysno::Rename => self.sys_renameat(AT_FDCWD, args[0], AT_FDCWD, args[1], mem),
+            Sysno::Symlink => self.sys_symlinkat(args[0], AT_FDCWD, args[1], mem),
+            Sysno::Readlink => self.sys_readlinkat(AT_FDCWD, args[0], args[1], args[2], mem),
             Sysno::Execve => self.sys_execve(args[0], args[1], args[2], vcpu, mem),
             Sysno::Wait4 => self.sys_wait4(args[0] as i64, args[1], args[2], mem),
             Sysno::Exit => self.sys_exit(args[0] as i32, mem),
@@ -1534,7 +1569,7 @@ impl Kernel {
             Some(Fd::Socket { .. }) => stat::socket_attrs(),
             None => return err(Errno::EBADF),
         };
-        write_stat_or_fault(mem, statbuf, &attrs)
+        write_stat_or_fault(mem, statbuf, &attrs, self.arch)
     }
 
     /// `newfstatat(dirfd, path, statbuf, flags)`.
@@ -1557,7 +1592,7 @@ impl Kernel {
         let Some(attrs) = self.mounts.stat(&abs) else {
             return err(Errno::ENOENT);
         };
-        write_stat_or_fault(mem, statbuf, &attrs)
+        write_stat_or_fault(mem, statbuf, &attrs, self.arch)
     }
 
     /// `getdents64(fd, buf, count)`.
@@ -1939,9 +1974,9 @@ fn io_errno(e: &io::Error) -> i64 {
     }
 }
 
-/// Write a `struct stat` for `attrs` at `addr`, or return `-EFAULT`.
-fn write_stat_or_fault(mem: &mut GuestMemory, addr: u64, attrs: &Attrs) -> i64 {
-    let buf = stat::encode_stat(attrs);
+/// Write `arch`'s `struct stat` for `attrs` at `addr`, or return `-EFAULT`.
+fn write_stat_or_fault(mem: &mut GuestMemory, addr: u64, attrs: &Attrs, arch: Arch) -> i64 {
+    let buf = stat::encode_stat(attrs, arch);
     if mem.write(addr, &buf).is_err() {
         err(Errno::EFAULT)
     } else {

@@ -1,9 +1,14 @@
 //! Encoding guest ABI structures: `struct stat` and `linux_dirent64`.
 //!
-//! Layouts follow the arm64 / asm-generic 64-bit definitions. When x86-64 guest
-//! support lands its `stat` layout is identical for these fields, so this is
-//! shared.
+//! `linux_dirent64` and `struct statfs` follow the shared 64-bit definitions,
+//! but `struct stat` is genuinely **per-arch**: arm64 uses the asm-generic
+//! layout (u32 `st_mode` at offset 16, u32 `st_nlink` at 20, 128 bytes) while
+//! x86-64 predates it (u64 `st_nlink` at 16, u32 `st_mode` at 24, 144 bytes).
+//! Writing the arm64 layout to an x86-64 guest puts zeros where it reads
+//! `st_mode` — every file looks unexecutable ("Permission denied" from a
+//! shell's PATH walk), which is how the mismatch was found.
 
+use crate::abi::Arch;
 use crate::fs::{Attrs, NodeKind};
 
 const S_IFCHR: u32 = 0o020_000;
@@ -22,22 +27,42 @@ pub fn makedev(major: u64, minor: u64) -> u64 {
     ((major & 0xfff) << 8) | (minor & 0xff) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
 }
 
-/// The 128-byte `struct stat` for `attrs`.
-pub fn encode_stat(attrs: &Attrs) -> [u8; 128] {
-    let mut b = [0u8; 128];
+/// The guest's `struct stat` for `attrs`, in `arch`'s layout (arm64: 128
+/// bytes; x86-64: 144). The tail — `st_size`(48), `st_blksize`(56),
+/// `st_blocks`(64) and the three timestamps (72/88/104) — happens to coincide
+/// between the two; only the `st_nlink`/`st_mode`/`st_uid`/`st_gid`/`st_rdev`
+/// block differs.
+pub fn encode_stat(attrs: &Attrs, arch: Arch) -> Vec<u8> {
+    let len = match arch {
+        Arch::Aarch64 => 128,
+        Arch::X86_64 => 144,
+    };
+    let mut b = vec![0u8; len];
     let put64 =
-        |b: &mut [u8; 128], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        |b: &mut [u8], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
     let put32 =
-        |b: &mut [u8; 128], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        |b: &mut [u8], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
 
     put64(&mut b, 0, 1); // st_dev
     put64(&mut b, 8, attrs.inode); // st_ino
-    put32(&mut b, 16, attrs.mode); // st_mode (type + perms)
-    put32(&mut b, 20, attrs.nlink); // st_nlink
-    put32(&mut b, 24, attrs.uid);
-    put32(&mut b, 28, attrs.gid);
-    put64(&mut b, 32, attrs.rdev); // st_rdev
-    // 40: __pad1
+    match arch {
+        Arch::Aarch64 => {
+            put32(&mut b, 16, attrs.mode); // st_mode (type + perms)
+            put32(&mut b, 20, attrs.nlink); // st_nlink
+            put32(&mut b, 24, attrs.uid);
+            put32(&mut b, 28, attrs.gid);
+            put64(&mut b, 32, attrs.rdev); // st_rdev
+            // 40: __pad1
+        }
+        Arch::X86_64 => {
+            put64(&mut b, 16, u64::from(attrs.nlink)); // st_nlink (u64 here)
+            put32(&mut b, 24, attrs.mode); // st_mode
+            put32(&mut b, 28, attrs.uid);
+            put32(&mut b, 32, attrs.gid);
+            // 36: __pad0
+            put64(&mut b, 40, attrs.rdev); // st_rdev
+        }
+    }
     put64(&mut b, 48, attrs.size); // st_size
     put32(&mut b, 56, 4096); // st_blksize
     put64(&mut b, 64, attrs.size.div_ceil(512)); // st_blocks (512-byte units)
@@ -172,7 +197,7 @@ mod tests {
             nlink: 1,
             rdev: 0,
         };
-        let b = encode_stat(&attrs);
+        let b = encode_stat(&attrs, Arch::Aarch64);
         assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 42); // st_ino
         assert_eq!(u32::from_le_bytes(b[16..20].try_into().unwrap()), 0o100_644);
         assert_eq!(u64::from_le_bytes(b[48..56].try_into().unwrap()), 1234); // st_size
@@ -191,13 +216,35 @@ mod tests {
             nlink: 1,
             rdev: makedev(1, 3), // /dev/null
         };
-        let b = encode_stat(&attrs);
+        let b = encode_stat(&attrs, Arch::Aarch64);
         // st_rdev sits at offset 32 and must round-trip the attrs value.
         assert_eq!(
             u64::from_le_bytes(b[32..40].try_into().unwrap()),
             attrs.rdev
         );
         assert_eq!(attrs.rdev, makedev(1, 3));
+    }
+
+    #[test]
+    fn stat_x86_64_layout_places_mode_at_24() {
+        let attrs = Attrs {
+            kind: NodeKind::File,
+            size: 1234,
+            mode: 0o100_755,
+            uid: 3,
+            gid: 4,
+            mtime: 0,
+            inode: 42,
+            nlink: 2,
+            rdev: 0,
+        };
+        let b = encode_stat(&attrs, Arch::X86_64);
+        assert_eq!(b.len(), 144, "x86-64 struct stat is 144 bytes");
+        assert_eq!(u64::from_le_bytes(b[16..24].try_into().unwrap()), 2); // st_nlink (u64)
+        assert_eq!(u32::from_le_bytes(b[24..28].try_into().unwrap()), 0o100_755); // st_mode
+        assert_eq!(u32::from_le_bytes(b[28..32].try_into().unwrap()), 3); // st_uid
+        assert_eq!(u32::from_le_bytes(b[32..36].try_into().unwrap()), 4); // st_gid
+        assert_eq!(u64::from_le_bytes(b[48..56].try_into().unwrap()), 1234); // st_size
     }
 
     #[test]

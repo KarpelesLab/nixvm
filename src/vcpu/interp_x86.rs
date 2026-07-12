@@ -246,9 +246,11 @@ fn reg8_operand(r: usize, has_rex: bool) -> Operand {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AluOp {
     Add,
+    Adc,
     Or,
     And,
     Sub,
+    Sbb,
     Xor,
     Cmp,
     Test,
@@ -1119,54 +1121,48 @@ impl X86Interp {
 
     // ---- flags ----
 
+    /// `ADD` (and, with `carry_in`, `ADC`): result masked to `width`, all
+    /// arithmetic flags computed *at that width* — an 8-bit `0xFF + 1` must
+    /// set ZF and CF even though the value fits easily in a host integer.
+    fn add_carry_flags(&mut self, a: u64, b: u64, carry_in: bool, width: u32) -> u64 {
+        let m = mask_w(u64::MAX, width);
+        let (a, b) = (a & m, b & m);
+        let c = u64::from(carry_in);
+        let full = u128::from(a) + u128::from(b) + u128::from(c);
+        let r = (full as u64) & m;
+        self.flags = Flags {
+            cf: full > u128::from(m),
+            zf: r == 0,
+            sf: sign_bit(r, width),
+            of: (((a ^ r) & (b ^ r)) >> (width - 1)) & 1 == 1,
+            pf: parity(r as u8),
+        };
+        r
+    }
+
     fn add_flags(&mut self, a: u64, b: u64, width: u32) -> u64 {
-        if width == 64 {
-            let (r, cf) = a.overflowing_add(b);
-            self.flags = Flags {
-                cf,
-                zf: r == 0,
-                sf: sign_bit(r, 64),
-                of: (((a ^ r) & (b ^ r)) >> 63) & 1 == 1,
-                pf: parity(r as u8),
-            };
-            r
-        } else {
-            let (a32, b32) = (a as u32, b as u32);
-            let (r, cf) = a32.overflowing_add(b32);
-            self.flags = Flags {
-                cf,
-                zf: r == 0,
-                sf: sign_bit(u64::from(r), 32),
-                of: (((a32 ^ r) & (b32 ^ r)) >> 31) & 1 == 1,
-                pf: parity(r as u8),
-            };
-            u64::from(r)
-        }
+        self.add_carry_flags(a, b, false, width)
+    }
+
+    /// `SUB`/`CMP` (and, with `borrow_in`, `SBB`): width-masked result and
+    /// width-accurate flags, like [`X86Interp::add_carry_flags`].
+    fn sub_borrow_flags(&mut self, a: u64, b: u64, borrow_in: bool, width: u32) -> u64 {
+        let m = mask_w(u64::MAX, width);
+        let (a, b) = (a & m, b & m);
+        let c = u64::from(borrow_in);
+        let r = a.wrapping_sub(b).wrapping_sub(c) & m;
+        self.flags = Flags {
+            cf: u128::from(a) < u128::from(b) + u128::from(c),
+            zf: r == 0,
+            sf: sign_bit(r, width),
+            of: (((a ^ b) & (a ^ r)) >> (width - 1)) & 1 == 1,
+            pf: parity(r as u8),
+        };
+        r
     }
 
     fn sub_flags(&mut self, a: u64, b: u64, width: u32) -> u64 {
-        if width == 64 {
-            let r = a.wrapping_sub(b);
-            self.flags = Flags {
-                cf: a < b,
-                zf: r == 0,
-                sf: sign_bit(r, 64),
-                of: (((a ^ b) & (a ^ r)) >> 63) & 1 == 1,
-                pf: parity(r as u8),
-            };
-            r
-        } else {
-            let (a32, b32) = (a as u32, b as u32);
-            let r = a32.wrapping_sub(b32);
-            self.flags = Flags {
-                cf: a32 < b32,
-                zf: r == 0,
-                sf: sign_bit(u64::from(r), 32),
-                of: (((a32 ^ b32) & (a32 ^ r)) >> 31) & 1 == 1,
-                pf: parity(r as u8),
-            };
-            u64::from(r)
-        }
+        self.sub_borrow_flags(a, b, false, width)
     }
 
     fn logic_flags(&mut self, r: u64, width: u32) -> u64 {
@@ -1184,7 +1180,9 @@ impl X86Interp {
     fn apply_alu(&mut self, op: AluOp, a: u64, b: u64, width: u32) -> u64 {
         match op {
             AluOp::Add => self.add_flags(a, b, width),
+            AluOp::Adc => self.add_carry_flags(a, b, self.flags.cf, width),
             AluOp::Sub | AluOp::Cmp => self.sub_flags(a, b, width),
+            AluOp::Sbb => self.sub_borrow_flags(a, b, self.flags.cf, width),
             AluOp::And | AluOp::Test => self.logic_flags(a & b, width),
             AluOp::Or => self.logic_flags(a | b, width),
             AluOp::Xor => self.logic_flags(a ^ b, width),
@@ -1380,11 +1378,12 @@ impl X86Interp {
         let op = match modrm.reg {
             0 => AluOp::Add,
             1 => AluOp::Or,
+            2 => AluOp::Adc,
+            3 => AluOp::Sbb,
             4 => AluOp::And,
             5 => AluOp::Sub,
             6 => AluOp::Xor,
-            7 => AluOp::Cmp,
-            _ => return Step::Illegal, // ADC/SBB (2,3): not in our documented subset
+            _ => AluOp::Cmp, // 7
         };
         let rm_op = if width == 8 {
             resolve8(modrm.kind, pc3, has_rex)
@@ -1742,6 +1741,7 @@ impl X86Interp {
         mem: &mut GuestMemory,
         pc: u64,
         rex: Rex,
+        has_rex: bool,
         width: u32,
         by: G2Count,
     ) -> Step {
@@ -1756,7 +1756,11 @@ impl X86Interp {
         };
         let mask = if width == 64 { 63 } else { 31 };
         let amt = count & mask;
-        let rm_op = resolve(modrm.kind, pc3);
+        let rm_op = if width == 8 {
+            resolve8(modrm.kind, pc3, has_rex)
+        } else {
+            resolve(modrm.kind, pc3)
+        };
         if amt == 0 {
             return self.next(pc3); // shift by 0 leaves flags and value unchanged
         }
@@ -4211,6 +4215,18 @@ impl X86Interp {
             0x03 => self.alu_gv_rm(mem, pc, rex, width, AluOp::Add),
             0x09 => self.alu_rm_gv(mem, pc, rex, width, AluOp::Or, true),
             0x0B => self.alu_gv_rm(mem, pc, rex, width, AluOp::Or),
+            0x10 => self.alu_rm_gv8(mem, pc, rex, has_rex, AluOp::Adc, true),
+            0x12 => self.alu_gv_rm8(mem, pc, rex, has_rex, AluOp::Adc),
+            0x11 => self.alu_rm_gv(mem, pc, rex, width, AluOp::Adc, true),
+            0x13 => self.alu_gv_rm(mem, pc, rex, width, AluOp::Adc),
+            0x14 => self.alu_acc_imm(mem, pc, 8, AluOp::Adc),
+            0x15 => self.alu_acc_imm(mem, pc, width, AluOp::Adc),
+            0x18 => self.alu_rm_gv8(mem, pc, rex, has_rex, AluOp::Sbb, true),
+            0x1A => self.alu_gv_rm8(mem, pc, rex, has_rex, AluOp::Sbb),
+            0x19 => self.alu_rm_gv(mem, pc, rex, width, AluOp::Sbb, true),
+            0x1B => self.alu_gv_rm(mem, pc, rex, width, AluOp::Sbb),
+            0x1C => self.alu_acc_imm(mem, pc, 8, AluOp::Sbb),
+            0x1D => self.alu_acc_imm(mem, pc, width, AluOp::Sbb),
             0x21 => self.alu_rm_gv(mem, pc, rex, width, AluOp::And, true),
             0x23 => self.alu_gv_rm(mem, pc, rex, width, AluOp::And),
             0x28 => self.alu_rm_gv8(mem, pc, rex, has_rex, AluOp::Sub, true),
@@ -4249,9 +4265,12 @@ impl X86Interp {
             0xF7 => self.group3(mem, pc, rex, has_rex, width),
             0xFE => self.group4(mem, pc, rex, has_rex),
             0xFF => self.group5(mem, pc, rex, width),
-            0xC1 => self.group2(mem, pc, rex, width, G2Count::Imm8),
-            0xD1 => self.group2(mem, pc, rex, width, G2Count::One),
-            0xD3 => self.group2(mem, pc, rex, width, G2Count::Cl),
+            0xC0 => self.group2(mem, pc, rex, has_rex, 8, G2Count::Imm8),
+            0xC1 => self.group2(mem, pc, rex, has_rex, width, G2Count::Imm8),
+            0xD0 => self.group2(mem, pc, rex, has_rex, 8, G2Count::One),
+            0xD1 => self.group2(mem, pc, rex, has_rex, width, G2Count::One),
+            0xD2 => self.group2(mem, pc, rex, has_rex, 8, G2Count::Cl),
+            0xD3 => self.group2(mem, pc, rex, has_rex, width, G2Count::Cl),
             0xE8 => {
                 let (rel, pc2) = fetch!(fetch_i32(mem, pc));
                 fetch!(self.push(mem, pc2));

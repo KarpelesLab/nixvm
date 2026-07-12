@@ -51,6 +51,16 @@ pub struct KvmVcpu {
     regs_dirty: bool,
     sregs: sys::kvm_sregs,
     sregs_dirty: bool,
+    /// Trapped in a syscall whose return value has not been written yet. A
+    /// *blocked* syscall (kernel parks the task, sets no return) is retried
+    /// by simply running the vcpu again — the interpreter re-executes the
+    /// `syscall` instruction because its pc still points at it, but this vcpu
+    /// is already past the trampoline's `hlt`, so "running" it would `sysretq`
+    /// back to user code with a stale rax. Instead, while this flag is set,
+    /// [`KvmVcpu::run`] re-delivers [`Exit::Syscall`] from the cached
+    /// registers without entering the guest; [`KvmVcpu::set_syscall_ret`]
+    /// (and `reset`) clear it.
+    in_syscall: bool,
 }
 
 // The register caches and run page are noise in a debug dump; the fd
@@ -143,6 +153,7 @@ impl KvmVcpu {
             regs_dirty: true,
             sregs,
             sregs_dirty: true,
+            in_syscall: false,
         })
     }
 
@@ -372,9 +383,18 @@ fn init_user_sregs(sregs: &mut sys::kvm_sregs) {
 
 impl Vcpu for KvmVcpu {
     fn run(&mut self, mem: &mut GuestMemory) -> Result<Exit, VcpuError> {
+        // A trapped syscall whose return was never written is being retried
+        // (it blocked) — re-deliver it without touching the guest.
+        if self.in_syscall {
+            return Ok(Exit::Syscall);
+        }
         self.vm.reconcile_guest(mem)?;
         let reason = self.run_once()?;
-        self.decode_exit(reason)
+        let exit = self.decode_exit(reason)?;
+        if exit == Exit::Syscall {
+            self.in_syscall = true;
+        }
+        Ok(exit)
     }
 
     fn syscall_nr(&self) -> u64 {
@@ -397,6 +417,7 @@ impl Vcpu for KvmVcpu {
         // that returns to user code — only the return register needs writing.
         self.regs.rax = value;
         self.regs_dirty = true;
+        self.in_syscall = false;
     }
 
     fn reg(&self, idx: usize) -> u64 {
@@ -437,6 +458,7 @@ impl Vcpu for KvmVcpu {
         child.regs_dirty = true;
         child.sregs = self.sregs;
         child.sregs_dirty = true;
+        child.in_syscall = self.in_syscall;
         // FPU/SSE state is not cached host-side; copy it fd-to-fd.
         let mut fpu = sys::kvm_fpu::default();
         // SAFETY: valid out-pointer; both fds are live vcpus of this VM.
@@ -461,6 +483,7 @@ impl Vcpu for KvmVcpu {
         init_user_sregs(&mut self.sregs);
         self.sregs.fs.base = 0;
         self.sregs_dirty = true;
+        self.in_syscall = false;
     }
 }
 

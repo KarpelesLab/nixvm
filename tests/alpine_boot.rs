@@ -60,11 +60,15 @@ fn boots_alpine_and_runs_shell_commands() {
         "shell should echo the command output, got: {out:?}"
     );
 
-    // A second command, then exit.
+    // A second command, then exit. The rootfs may be either guest arch (the
+    // env var picks it), so accept the machine name of both.
     vm.write_stdin(b"uname -m\n");
     let out2 = drain(&mut vm);
     eprintln!("--- after uname ---\n{out2}");
-    assert!(out2.contains("aarch64"), "uname -m should print aarch64");
+    assert!(
+        out2.contains("aarch64") || out2.contains("x86_64"),
+        "uname -m should print the guest machine, got: {out2:?}"
+    );
 
     vm.write_stdin(b"exit\n");
     let _ = drain(&mut vm);
