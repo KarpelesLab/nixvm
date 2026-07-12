@@ -1,7 +1,7 @@
 //! Interactive VM driver — boot a root image and drive it a step at a time,
 //! feeding terminal input and draining output between steps.
 //!
-//! This is the engine behind the browser terminal ([`crate::wasm`]): the page
+//! This is the engine behind the browser terminal (`crate::wasm`): the page
 //! unpacks a distro root image (an Alpine minirootfs `.tar`) into an in-memory
 //! filesystem, starts a shell, and then pumps keystrokes in and stdout/stderr
 //! out — exactly what an xterm-style widget needs. It is deliberately

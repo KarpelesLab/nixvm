@@ -2,12 +2,12 @@
 //! and schedules multiple guest processes.
 //!
 //! State is split between **global** kernel state (mount table, pipes, stdio,
-//! process table) and **per-process** state ([`ProcInfo`]: fds, cwd, brk, mmap
-//! arena, pid). The currently-running process's [`ProcInfo`] is swapped into
+//! process table) and **per-process** state (`ProcInfo`: fds, cwd, brk, mmap
+//! arena, pid). The currently-running process's `ProcInfo` is swapped into
 //! `self.cur` while it runs, so the syscall handlers read/write `self.cur.*`
 //! for per-process state and `self.*` for globals — no per-handler `Process`
 //! threading. The scheduler ([`Kernel::run`]) is a cooperative round-robin over
-//! [`Process`]es; a syscall that would block re-traps later (we simply don't
+//! `Process`es; a syscall that would block re-traps later (we simply don't
 //! advance the guest PC), which the interpreter turns back into the same
 //! syscall on the next slice.
 

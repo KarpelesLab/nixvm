@@ -16,12 +16,12 @@
 //! fstool's [`fstool::Error`] is coarser than POSIX errno: in particular
 //! `Error::InvalidArgument` covers "no such path component", "wrong entry
 //! type" (e.g. reading a directory as a file), and genuine bad arguments all
-//! at once — the crate has no dedicated not-found variant. [`to_io`] maps it
+//! at once — the crate has no dedicated not-found variant. `to_io` maps it
 //! to `ENOENT` (the dominant case for a path-based lookup), and the read
 //! paths ([`FsToolMount::read_at`], [`FsToolMount::readdir`],
 //! [`FsToolMount::readlink`]) run one extra `getattr` on failure to
 //! disambiguate the POSIX-significant cases (`EISDIR`, `ENOTDIR`, `EINVAL`)
-//! from a plain miss — see [`FsToolMount::classify`].
+//! from a plain miss — see `FsToolMount::classify`.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -126,7 +126,7 @@ const fn type_bits(kind: NodeKind) -> u32 {
 }
 
 /// The node type an [`FsToolMount`] call site expects at a path, used by
-/// [`FsToolMount::classify`] to turn an ambiguous fstool error into the
+/// `FsToolMount::classify` to turn an ambiguous fstool error into the
 /// POSIX-correct errno.
 #[derive(Clone, Copy)]
 enum WantKind {
@@ -234,7 +234,7 @@ impl FsToolMount {
     /// and, if so, what kind of node it is, so a real directory read as a
     /// file comes back `EISDIR` (not `ENOENT`) and so on. When the extra
     /// `getattr` also fails, `path` genuinely doesn't resolve (or the image
-    /// is unreadable), and the generic [`to_io`] mapping of the original
+    /// is unreadable), and the generic `to_io` mapping of the original
     /// error applies.
     fn classify(&mut self, abs_path: &str, want: WantKind, err: fstool::Error) -> io::Error {
         let Ok(a) = self.fs.getattr(&mut *self.dev, Path::new(abs_path)) else {

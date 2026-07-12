@@ -33,7 +33,7 @@ impl MountTable {
     /// Mount `fs` at absolute `point`. Deeper mount points win via
     /// longest-prefix resolution.
     ///
-    /// `point` is normalized (see [`normalize`]) before being stored, so
+    /// `point` is normalized (see `normalize`) before being stored, so
     /// callers may pass e.g. `"/dev/"` or `"/dev/../dev"` and still get the
     /// expected `"/dev"` mount point.
     pub fn mount(&mut self, point: impl Into<String>, fs: Box<dyn MountFs>) {

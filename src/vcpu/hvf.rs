@@ -1,9 +1,9 @@
 //! Hypervisor.framework backend (macOS / arm64) — the primary target.
 //!
-//! Plan (Phase 1): create a VM via `hv_vm_create`, map [`GuestMemory`] with
+//! Plan (Phase 1): create a VM via `hv_vm_create`, map `GuestMemory` with
 //! `hv_vm_map`, create a vcpu with `hv_vcpu_create`, and run guest code at
 //! EL1/EL0. A guest `svc #0` traps out as `HV_EXIT_REASON_EXCEPTION` with an
-//! ESR indicating a system call; we decode that into [`Exit::Syscall`] and
+//! ESR indicating a system call; we decode that into `Exit::Syscall` and
 //! return to the kernel. This is where the crate's only `unsafe` FFI lives.
 //!
 //! Compile-time stub until the FFI bindings land.

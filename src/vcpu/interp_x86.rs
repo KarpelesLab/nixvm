@@ -52,7 +52,7 @@
 //! `FNSTSW`/`FNCLEX`/`FNINIT`/`FWAIT`/`FFREE`/`FINCSTP`/`FDECSTP`). Each
 //! 80-bit `long double` register is modeled as an `f64` rather than true
 //! extended precision — an accepted approximation for a software scaffold
-//! (see [`f80_to_f64`]). Also: `CPUID`, `RDTSC`/`RDTSCP`, `RDRAND`/`RDSEED`,
+//! (see `f80_to_f64`). Also: `CPUID`, `RDTSC`/`RDTSCP`, `RDRAND`/`RDSEED`,
 //! `XGETBV`, the `LOCK` prefix (`0xF0`, decoded and otherwise ignored — this
 //! interpreter is single-threaded, so every read-modify-write is already
 //! atomic) alongside the `LOCK`-able ops it decorates (`XADD`, `CMPXCHG`,
@@ -377,7 +377,7 @@ fn f80_to_f64(mantissa: u64, exp: u16, sign: bool) -> f64 {
 }
 
 /// Encode an `f64` as the 10-byte x87 extended-precision (`m80fp`) format —
-/// see [`f80_to_f64`]. Finite normal and subnormal `f64` values, `0`, `±inf`
+/// see `f80_to_f64`. Finite normal and subnormal `f64` values, `0`, `±inf`
 /// and `NaN` are all handled exactly (mapping through the nearest `f64`, per
 /// the same accepted approximation).
 fn f64_to_f80_bytes(v: f64) -> [u8; 10] {
@@ -769,7 +769,7 @@ struct X86Interp {
     /// yet rotated by `fpu_top`) — see [`X86Interp::st_get`]. Real x87
     /// registers are 80-bit extended precision; this interpreter models
     /// each as an `f64` instead (an accepted approximation for a software
-    /// scaffold — see [`f80_to_f64`]), so values round-tripped through the
+    /// scaffold — see `f80_to_f64`), so values round-tripped through the
     /// register stack lose precision beyond `f64`'s ~15-17 significant
     /// digits relative to true 80-bit `long double`.
     st: [f64; 8],

@@ -73,3 +73,22 @@ jobs:
       # bins, matching how pages.yml builds the deployable artifact.
       - name: Build wasm demo library
         run: cargo build --lib --target wasm32-unknown-unknown --features wasm --no-default-features
+
+  docs:
+    name: Docs build (warnings denied)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      # `--all-features` is avoided (wasm/hvf/kvm don't build on a host doc run);
+      # `fstool` covers the one optional module with public docs.
+      - name: cargo doc --no-deps --features fstool
+        run: cargo doc --no-deps --features fstool
