@@ -228,26 +228,33 @@ The actual root. Implement the `MountFs` backends and compose them:
     `image::ImageStore::ensure` (download/cache) is still the Phase 11 stub,
     so the `nixvm run -- <cmd>` CLI path isn't runnable end-to-end yet.
 
-### Phase 5 — Dynamic linking  ⬜ not started (static-PIE landed ahead of it)
+### Phase 5 — Dynamic linking  ✅ working (real `ld-musl` boots stock Alpine; large C++ programs load)
 
-Load `PT_INTERP` (`ld-musl-aarch64.so.1`) from the guest rootfs, map file-backed
-segments, and provide a **vDSO** (`clock_gettime`/`gettimeofday`/`time`/
-`getcpu`) plus `AT_SYSINFO_EHDR`. TLS setup (`TPIDR_EL0` / `arch_prctl` on x86).
+Load `PT_INTERP` (`ld-musl-*.so.1`) from the guest rootfs, map file-backed
+segments, TLS setup (`TPIDR_EL0` / `arch_prctl` on x86).
 
-- **Syscalls:** `mmap`(file-backed), `mremap` ✅ (added in Phase 2's follow-on
-  work), `madvise` ✅, `arch_prctl`(x86) ✅ (`ARCH_SET_FS`), `rseq`
-  (stub/handle), `membarrier` ✅ (no-op).
+- **Syscalls:** `mmap`(file-backed) ✅ (incl. writable `MAP_SHARED` flush-back),
+  `mremap` ✅, `madvise` ✅, `arch_prctl`(x86) ✅ (`ARCH_SET_FS`), `rseq` ✅
+  (stub), `membarrier` ✅ (no-op).
 - **Exit criteria:** dynamically-linked `/bin/sh` and `/bin/ls` from stock
-  Alpine run to completion.
-- **Status:** `loader::load_static` handles static PIEs (see Phase 2) but
-  `PT_INTERP` is not read and no dynamic linker is loaded — `LoadError`
-  doesn't even have a variant for it yet. `mmap` is anonymous-only (no
-  file-backed mapping), so a real `ld-musl` couldn't map its own segments this
-  way regardless. TLS now works on both arches: `CLONE_SETTLS`/`Vcpu::set_tls`
-  (aarch64's `TPIDR_EL0`) plus `arch_prctl(ARCH_SET_FS)` for x86-64 (landed
-  with the KVM milestone — hardware FS.base on KVM, and the interpreter
-  gained real `fs:`-segment addressing so glibc's TLS/stack-canary reads work
-  on both backends).
+  Alpine run to completion. **Met** — `busybox sh` (the whole Alpine shell) and
+  `apk` run dynamically-linked.
+- **Status:** `loader::load_dynamic` reads `PT_INTERP`, loads `ld-musl`, and
+  hands off; `ld-musl` maps the executable's and every shared library's
+  segments via file-backed `mmap` and resolves relocations itself. TLS works on
+  both arches (`CLONE_SETTLS`/`TPIDR_EL0`; `arch_prctl(ARCH_SET_FS)` +
+  interpreter `fs:`-segment addressing on x86-64). Two subtle bugs that blocked
+  *large* dynamically-linked programs are fixed: **(1)** writable `MAP_SHARED`
+  file mappings are now flushed back to their file on munmap/msync/exit — apk
+  extracts big files (e.g. node, 43 MiB) via `mmap(MAP_SHARED)` and they were
+  landing zero-filled; **(2)** overlay upper/lower inodes are now disjoint, so
+  musl's `(st_dev, st_ino)` library dedup no longer conflates an apk-installed
+  library with a base-image one (this was resolving node's `libbrotli*` symbols
+  to "not found"). With both, node's full ~15-library dependency graph loads and
+  node executes. No **vDSO** yet (`clock_gettime` et al. always trap to a real
+  syscall rather than a fast userspace path — a perf item, not a correctness
+  one); `dlopen` of additional `.so`s at runtime is not exercised beyond what
+  `ld-musl` does at load time.
 
 ### Phase 6 — Processes, threads, signals  🟡 mostly done; real signal-handler invocation still missing
 

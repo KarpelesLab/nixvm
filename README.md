@@ -52,9 +52,10 @@ also still exposes the original static-ELF runner, `run_elf`).
 
 Functional on the software-interpreter path: a real Rust syscall kernel, two
 working CPU interpreters (aarch64 and a growing x86-64), static, static-PIE, and
-**dynamically-linked** ELF loading (real `ld-musl` boots stock Alpine),
+**dynamically-linked** ELF loading (real `ld-musl` boots stock Alpine and loads
+large C++ programs' full shared-library graphs, e.g. node's ~15 libs),
 multi-threaded/multi-process scheduling with an SMP worker-thread pool, an in-VM
-network stack, and several filesystem backends — all covered by 473 tests
+network stack, and several filesystem backends — all covered by 475 tests
 (`cargo test`). Hardware acceleration is live on both target hosts: the **HVF
 backend (macOS/arm64) runs a static program end-to-end**, and the **KVM backend
 (Linux/x86-64) runs a real statically-linked glibc binary end-to-end on real
