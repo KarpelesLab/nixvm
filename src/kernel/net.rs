@@ -1414,6 +1414,44 @@ impl Kernel {
         self.send_bytes(fd, &data, hdr.name, u64::from(hdr.namelen), mem)
     }
 
+    /// `sendmmsg(fd, msgvec, vlen, flags)` — send an array of `struct mmsghdr`
+    /// `{ msghdr msg_hdr; u32 msg_len }` (64 bytes each), writing each sent
+    /// byte count back into `msg_len`. Returns the number of messages sent.
+    pub(super) fn sys_sendmmsg(&mut self, fd: u64, msgvec: u64, vlen: u64, mem: &mut GuestMemory) -> i64 {
+        let mut sent = 0i64;
+        for i in 0..vlen {
+            let ent = msgvec + i * 64;
+            let r = self.sys_sendmsg(fd, ent, 0, mem);
+            if r < 0 {
+                return if sent > 0 { sent } else { r };
+            }
+            let _ = mem.write(ent + 56, &(r as u32).to_le_bytes());
+            sent += 1;
+        }
+        sent
+    }
+
+    /// `recvmmsg(fd, msgvec, vlen, flags, timeout)` — receive into an array of
+    /// `struct mmsghdr`, writing each received byte count into `msg_len`.
+    /// Returns the number of messages received (stops at the first that would
+    /// block, like the real syscall).
+    pub(super) fn sys_recvmmsg(&mut self, fd: u64, msgvec: u64, vlen: u64, flags: u64, mem: &mut GuestMemory) -> i64 {
+        let mut got = 0i64;
+        for i in 0..vlen {
+            let ent = msgvec + i * 64;
+            let r = self.sys_recvmsg(fd, ent, flags, mem);
+            if r < 0 {
+                // EAGAIN after at least one message is a normal stop, not an error.
+                if got > 0 { return got; }
+                return r;
+            }
+            let _ = mem.write(ent + 56, &(r as u32).to_le_bytes());
+            got += 1;
+            // Only force the first recv to block; the rest are best-effort.
+        }
+        got
+    }
+
     /// `recvmsg(fd, msghdr, flags)` — receive one message into a scratch buffer
     /// sized to the `msg_iov` total, scatter it across the iovecs, and fill in
     /// `msg_name`/`msg_namelen` (source address) and `msg_flags`. Control data

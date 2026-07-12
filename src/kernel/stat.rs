@@ -73,6 +73,47 @@ pub fn encode_stat(attrs: &Attrs, arch: Arch) -> Vec<u8> {
     b
 }
 
+/// The 256-byte `struct statx` for `attrs` — the modern arch-neutral stat
+/// (glibc's `fstatat`/`stat` go through this on recent systems). Only the
+/// `STATX_BASIC_STATS` fields are filled; `stx_mask` reports which are valid.
+pub fn encode_statx(attrs: &Attrs) -> [u8; 256] {
+    /// `STATX_BASIC_STATS`: type|mode|nlink|uid|gid|atime|mtime|ctime|ino|
+    /// size|blocks (the fields this fills).
+    const STATX_BASIC_STATS: u32 = 0x7ff;
+    let mut b = [0u8; 256];
+    let put16 = |b: &mut [u8; 256], o: usize, v: u16| b[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    let put32 = |b: &mut [u8; 256], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let put64 = |b: &mut [u8; 256], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+    // One `struct statx_timestamp { s64 tv_sec; u32 tv_nsec; s32 pad }`.
+    let put_ts = |b: &mut [u8; 256], o: usize, secs: i64| {
+        b[o..o + 8].copy_from_slice(&secs.to_le_bytes());
+    };
+
+    put32(&mut b, 0, STATX_BASIC_STATS); // stx_mask
+    put32(&mut b, 4, 4096); // stx_blksize
+    // stx_attributes @8 = 0
+    put32(&mut b, 16, attrs.nlink); // stx_nlink
+    put32(&mut b, 20, attrs.uid); // stx_uid
+    put32(&mut b, 24, attrs.gid); // stx_gid
+    put16(&mut b, 28, attrs.mode as u16); // stx_mode (type + perms)
+    put64(&mut b, 32, attrs.inode); // stx_ino
+    put64(&mut b, 40, attrs.size); // stx_size
+    put64(&mut b, 48, attrs.size.div_ceil(512)); // stx_blocks
+    // stx_attributes_mask @56 = 0
+    let t = attrs.mtime;
+    put_ts(&mut b, 64, t); // stx_atime
+    put_ts(&mut b, 80, t); // stx_btime
+    put_ts(&mut b, 96, t); // stx_ctime
+    put_ts(&mut b, 112, t); // stx_mtime
+    // stx_rdev_major/minor @128/132, stx_dev_major/minor @136/140.
+    let rdev = attrs.rdev;
+    put32(&mut b, 128, ((rdev >> 8) & 0xfff) as u32); // major
+    put32(&mut b, 132, (rdev & 0xff | ((rdev >> 12) & !0xff)) as u32); // minor
+    put32(&mut b, 136, 0); // stx_dev_major
+    put32(&mut b, 140, 1); // stx_dev_minor
+    b
+}
+
 /// The 120-byte `struct statfs` (arm64 / x86-64 layout). Reports a large,
 /// mostly-empty in-memory filesystem with 4 KiB blocks.
 pub fn encode_statfs() -> [u8; 120] {

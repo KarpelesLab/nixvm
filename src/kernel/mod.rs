@@ -83,6 +83,11 @@ struct ProcInfo {
     blocked: u64,
     /// Pending-signal mask (bit `sig-1` set = pending).
     pending: u64,
+    /// Process-group id (`setpgid`/`getpgid`/`getpgrp`). `0` means "not set
+    /// yet — defaults to `pid`". Inherited across `fork`.
+    pgid: i32,
+    /// Session id (`setsid`/`getsid`). `0` means "defaults to `pid`".
+    sid: i32,
 }
 
 impl Default for ProcInfo {
@@ -107,6 +112,8 @@ impl Default for ProcInfo {
             handlers: [0; 65],
             blocked: 0,
             pending: 0,
+            pgid: 0,
+            sid: 0,
         }
     }
 }
@@ -183,6 +190,8 @@ pub struct Kernel {
     /// Whether interactive stdin has been closed (EOF / Ctrl-D).
     stdin_closed: bool,
     rng_state: u64,
+    /// Monotonic counter for `memfd_create` backing-file names.
+    memfd_seq: u64,
     trace: bool,
     /// The process file-creation mask (`umask`); global for our single session.
     umask: u32,
@@ -237,6 +246,7 @@ impl Kernel {
             stdout: Box::new(std::io::stdout()),
             stderr: Box::new(std::io::stderr()),
             rng_state: 0,
+            memfd_seq: 0,
             trace: std::env::var_os("NIXVM_TRACE").is_some(),
             umask: 0o022,
             procname: [0u8; 16],
@@ -731,11 +741,70 @@ impl Kernel {
             Sysno::Nanosleep => time::sys_nanosleep(args[0], args[1], mem),
             Sysno::ClockNanosleep => time::sys_nanosleep(args[2], args[3], mem),
             Sysno::Time => time::sys_time(args[0], mem),
-            // The guest does not own the host clock: refuse to set it.
-            Sysno::Settimeofday | Sysno::ClockSettime => err(Errno::EPERM),
+            // The guest does not own the host clock: refuse to set it. ptrace
+            // is refused too (no debugging surface).
+            Sysno::Settimeofday | Sysno::ClockSettime | Sysno::Ptrace => err(Errno::EPERM),
             Sysno::Openat => self.sys_openat(args[0] as i64, args[1], args[2], args[3], mem),
             Sysno::Close => self.sys_close(args[0] as i32),
+            Sysno::CloseRange => self.sys_close_range(args[0], args[1]),
             Sysno::Lseek => self.sys_lseek(args[0], args[1] as i64, args[2]),
+            // Positioned & vectored I/O.
+            Sysno::Pread64 => self.sys_pread(args[0], args[1], args[2], args[3], mem),
+            Sysno::Pwrite64 => self.sys_pwrite(args[0], args[1], args[2], args[3], mem),
+            Sysno::Preadv => self.sys_preadv(args[0], args[1], args[2], args[3], mem),
+            Sysno::Pwritev => self.sys_pwritev(args[0], args[1], args[2], args[3], mem),
+            // File size / sync. The sync family has no durable backing store to
+            // flush (everything is in-memory or host-passthrough), so they just
+            // succeed; `readahead`/`fadvise64`/`sync_file_range` are advisory.
+            Sysno::Ftruncate => self.sys_ftruncate(args[0], args[1]),
+            Sysno::Truncate => self.sys_truncate(args[0], args[1], mem),
+            Sysno::Fallocate => self.sys_fallocate(args[0], args[2], args[3]),
+            // File copy / link.
+            Sysno::Sendfile => self.sys_sendfile(args[0], args[1], args[2], args[3], mem),
+            Sysno::CopyFileRange => self.sys_copy_file_range(args, mem),
+            Sysno::Link => self.sys_linkat(AT_FDCWD, args[0], AT_FDCWD, args[1], 0, mem),
+            Sysno::Linkat => {
+                self.sys_linkat(args[0] as i64, args[1], args[2] as i64, args[3], args[4], mem)
+            }
+            Sysno::Statx => self.sys_statx(args[0] as i64, args[1], args[2], args[4], mem),
+            // Credentials: this VM runs as root and models no multi-user
+            // policy, so the setters all succeed and the getters report root.
+            Sysno::Getresuid | Sysno::Getresgid => {
+                self.sys_getres_id(args[0], args[1], args[2], mem)
+            }
+            // Process groups / sessions.
+            Sysno::Setpgid => self.sys_setpgid(args[0] as i32, args[1] as i32),
+            Sysno::Getpgid => self.sys_getpgid(args[0] as i32),
+            Sysno::Getpgrp => i64::from(pgid_of(&self.cur)),
+            Sysno::Setsid => self.sys_setsid(),
+            Sysno::Getsid => self.sys_getsid(args[0] as i32),
+            // Process lifecycle.
+            Sysno::Waitid => self.sys_waitid(args[0], args[1] as i64, args[2], args[3], mem),
+            Sysno::Clone3 => self.sys_clone3(args[0], args[1], vcpu, mem),
+            Sysno::Execveat => {
+                self.sys_execveat(args[0] as i64, args[1], args[2], args[3], args[4], vcpu, mem)
+            }
+            // Sockets: `accept` is `accept4` with no flags; the `mmsg` forms
+            // loop the single-message path over the message array.
+            Sysno::Accept => self.sys_accept4(args[0], args[1], args[2], 0, mem),
+            Sysno::Recvmmsg => self.sys_recvmmsg(args[0], args[1], args[2], args[3], mem),
+            Sysno::Sendmmsg => self.sys_sendmmsg(args[0], args[1], args[2], mem),
+            // Anonymous / notification fds. inotify/signalfd get an fd that
+            // never becomes readable (no events/signals delivered — a safe
+            // degradation for optional watching).
+            Sysno::MemfdCreate => self.sys_memfd_create(args[0], mem),
+            Sysno::InotifyInit1 | Sysno::Signalfd4 => self.sys_inotify_init1(),
+            // A watch descriptor the guest can pass to inotify_rm_watch (which
+            // is a no-op in the always-succeed group below).
+            Sysno::InotifyAddWatch => 1,
+            // restart_syscall reports the interrupted call didn't resume.
+            Sysno::RestartSyscall => err(Errno::EINTR),
+            // pause() blocks until a signal; with our minimal signal delivery
+            // it simply parks (the guest re-traps).
+            Sysno::Pause => {
+                self.block = true;
+                0
+            }
             Sysno::Fstat => self.sys_fstat(args[0], args[1], mem),
             Sysno::Newfstatat => {
                 self.sys_newfstatat(args[0] as i64, args[1], args[2], args[3], mem)
@@ -927,6 +996,40 @@ impl Kernel {
             // Not modeled (no SIGALRM delivery yet) — a no-op just means the
             // timeout never fires.
             | Sysno::Setitimer
+            // Sync family: nothing is durably backed (in-memory / host
+            // passthrough), so there's nothing to flush.
+            | Sysno::Fsync
+            | Sysno::Fdatasync
+            | Sysno::Sync
+            | Sysno::Syncfs
+            | Sysno::Readahead
+            | Sysno::Fadvise64
+            | Sysno::SyncFileRange
+            // Credential setters: single-user (root) VM, so they all succeed
+            // (setfsuid/setfsgid return the previous id, which is always 0).
+            | Sysno::Setuid
+            | Sysno::Setgid
+            | Sysno::Setreuid
+            | Sysno::Setregid
+            | Sysno::Setresuid
+            | Sysno::Setresgid
+            | Sysno::Setfsuid
+            | Sysno::Setfsgid
+            | Sysno::Setgroups
+            // Namespacing/mount ops we accept but don't model (no real jail
+            // layering yet): chroot, mount, umount2 succeed as no-ops.
+            | Sysno::Chroot
+            | Sysno::Mount
+            | Sysno::Umount2
+            // syslog: accept and drop (no kernel ring buffer to read).
+            | Sysno::Syslog
+            // rseq: accept the registration; single-cpu so the cached cpu_id
+            // never goes stale. get_robust_list: nothing registered.
+            | Sysno::Rseq
+            | Sysno::GetRobustList
+            | Sysno::InotifyRmWatch
+            // getgroups: no supplementary groups (count 0).
+            | Sysno::Getgroups
             | Sysno::Membarrier => 0,
             _ => {
                 *self.unsupported.entry(raw).or_default() += 1;
@@ -1089,12 +1192,56 @@ impl Kernel {
         let Some(abs) = self.resolve_exec(&rel) else {
             return err(Errno::ENOENT);
         };
-        let Some(elf) = self.read_file(&abs) else {
-            return err(Errno::ENOENT);
+        let argv = read_string_array(mem, argv_ptr);
+        let envp = read_string_array(mem, envp_ptr);
+        self.exec_image(&abs, argv, envp, vcpu, mem)
+    }
+
+    /// `execveat(dirfd, path, argv, envp, flags)` — like `execve` but resolves
+    /// `path` relative to `dirfd`, and (with `AT_EMPTY_PATH`) can exec the file
+    /// `dirfd` itself refers to.
+    #[allow(clippy::too_many_arguments)]
+    fn sys_execveat(
+        &mut self,
+        dirfd: i64,
+        path_ptr: u64,
+        argv_ptr: u64,
+        envp_ptr: u64,
+        flags: u64,
+        vcpu: &mut dyn Vcpu,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        let Some(rel) = read_path(mem, path_ptr) else {
+            return err(Errno::EFAULT);
+        };
+        let abs = if rel.is_empty() && flags & AT_EMPTY_PATH != 0 {
+            match self.cur.fds.get(dirfd as i32) {
+                Some(Fd::File { path, .. }) => path.clone(),
+                _ => return err(Errno::EBADF),
+            }
+        } else {
+            self.resolve_path(dirfd, &rel)
         };
         let argv = read_string_array(mem, argv_ptr);
         let envp = read_string_array(mem, envp_ptr);
+        self.exec_image(&abs, argv, envp, vcpu, mem)
+    }
 
+    /// Load `abs` (following `PT_INTERP` for dynamic executables) into a fresh
+    /// address space and reset the vcpu onto it — the shared core of
+    /// `execve`/`execveat`.
+    fn exec_image(
+        &mut self,
+        abs: &str,
+        argv: Vec<String>,
+        envp: Vec<String>,
+        vcpu: &mut dyn Vcpu,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        let Some(elf) = self.read_file(abs) else {
+            return err(Errno::ENOENT);
+        };
         let (base, size) = (mem.base(), mem.size());
         let mut new_mem = GuestMemory::new(base, size);
         let spec = ProcessSpec { argv, envp };
@@ -1158,6 +1305,211 @@ impl Kernel {
         }
         self.block = true; // wait for a child to exit
         0
+    }
+
+    /// `waitid(idtype, id, infop, options, rusage)` — the siginfo-based wait.
+    /// Reaps a zombie child (or, with `WNOWAIT`, reports without reaping) and
+    /// fills a `siginfo_t` instead of `wait4`'s status word.
+    fn sys_waitid(&mut self, idtype: u64, id: i64, infop: u64, options: u64, mem: &mut GuestMemory) -> i64 {
+        const P_ALL: u64 = 0;
+        const P_PID: u64 = 1;
+        const P_PGID: u64 = 2;
+        const WNOHANG: u64 = 1;
+        const WNOWAIT: u64 = 0x0100_0000;
+        const CLD_EXITED: i32 = 1;
+        let cur = self.cur.pid;
+        let matches_id = |p: &ProcInfo| match idtype {
+            P_ALL => true,
+            P_PID => i64::from(p.pid) == id,
+            P_PGID => i64::from(pgid_of(p)) == id,
+            _ => false,
+        };
+        let mut zombie = None;
+        let mut has_child = false;
+        for p in self.procs.iter().flatten() {
+            if p.info.ppid == cur && !p.info.is_thread && matches_id(&p.info) {
+                has_child = true;
+                if let RunState::Zombie(code) = p.info.run {
+                    zombie = Some((p.info.pid, code));
+                    break;
+                }
+            }
+        }
+        if let Some((child, code)) = zombie {
+            if infop != 0 {
+                // siginfo_t: si_signo(0)=SIGCHLD(17), si_errno(4)=0,
+                // si_code(8)=CLD_EXITED, si_pid(16), si_uid(20), si_status(24).
+                let mut si = [0u8; 128];
+                si[0..4].copy_from_slice(&17i32.to_le_bytes());
+                si[8..12].copy_from_slice(&CLD_EXITED.to_le_bytes());
+                si[16..20].copy_from_slice(&child.to_le_bytes());
+                si[24..28].copy_from_slice(&(code & 0xff).to_le_bytes());
+                let _ = mem.write(infop, &si);
+            }
+            if options & WNOWAIT == 0 {
+                for slot in &mut self.procs {
+                    if slot.as_ref().is_some_and(|p| p.info.pid == child) {
+                        *slot = None;
+                        break;
+                    }
+                }
+            }
+            return 0;
+        }
+        if !has_child {
+            return err(Errno::ECHILD);
+        }
+        if options & WNOHANG != 0 {
+            return 0;
+        }
+        self.block = true;
+        0
+    }
+
+    /// `clone3(cl_args, size)` — the modern `clone`. Reads the `clone_args`
+    /// struct and forwards to [`Kernel::sys_clone`] with the equivalent
+    /// register arguments.
+    fn sys_clone3(&mut self, args_ptr: u64, size: u64, vcpu: &mut dyn Vcpu, mem: &mut GuestMemory) -> i64 {
+        if size < 64 {
+            return err(Errno::EINVAL);
+        }
+        // clone_args: flags@0, pidfd@8, child_tid@16, parent_tid@24,
+        // exit_signal@32, stack@40, stack_size@48, tls@56.
+        let rd = |off: u64| mem.read_u64(args_ptr + off).unwrap_or(0);
+        let flags = rd(0);
+        let child_tid = rd(16);
+        let parent_tid = rd(24);
+        let exit_signal = rd(32);
+        let stack = rd(40);
+        let stack_size = rd(48);
+        let tls = rd(56);
+        // The child SP is the top of the provided stack region (grows down).
+        let sp = stack.wrapping_add(stack_size);
+        let legacy = [flags | (exit_signal & 0xff), sp, parent_tid, child_tid, tls, 0];
+        self.sys_clone(&legacy, vcpu, mem)
+    }
+
+    /// `close_range(first, last, flags)` — close every open fd in `[first,
+    /// last]`. `flags` (e.g. `CLOSE_RANGE_CLOEXEC`) is ignored beyond the
+    /// close itself.
+    fn sys_close_range(&mut self, first: u64, last: u64) -> i64 {
+        let last = last.min(4095); // bound the sweep to a sane fd ceiling
+        for fd in first..=last {
+            let _ = self.sys_close(fd as i32);
+        }
+        0
+    }
+
+    /// `getresuid`/`getresgid` — write `(real, effective, saved)` = `(0,0,0)`
+    /// (this VM is single-user root).
+    #[allow(clippy::unused_self)] // method form keeps the dispatch table uniform
+    fn sys_getres_id(&self, a: u64, b: u64, c: u64, mem: &mut GuestMemory) -> i64 {
+        for p in [a, b, c] {
+            if p != 0 && mem.write(p, &0u32.to_le_bytes()).is_err() {
+                return err(Errno::EFAULT);
+            }
+        }
+        0
+    }
+
+    /// `setpgid(pid, pgid)` — set the process group of `pid` (0 = self) to
+    /// `pgid` (0 = the target's own pid). Only the current task is tracked.
+    fn sys_setpgid(&mut self, pid: i32, pgid: i32) -> i64 {
+        if pid != 0 && pid != self.cur.pid {
+            // Setting another process's pgid isn't modeled; accept for self only.
+            return err(Errno::ESRCH);
+        }
+        self.cur.pgid = if pgid == 0 { self.cur.pid } else { pgid };
+        0
+    }
+
+    /// `getpgid(pid)` — the process group of `pid` (0 = self).
+    fn sys_getpgid(&mut self, pid: i32) -> i64 {
+        if pid == 0 || pid == self.cur.pid {
+            return i64::from(pgid_of(&self.cur));
+        }
+        for p in self.procs.iter().flatten() {
+            if p.info.pid == pid {
+                return i64::from(pgid_of(&p.info));
+            }
+        }
+        err(Errno::ESRCH)
+    }
+
+    /// `setsid()` — start a new session: sid = pgid = the caller's pid.
+    fn sys_setsid(&mut self) -> i64 {
+        self.cur.sid = self.cur.pid;
+        self.cur.pgid = self.cur.pid;
+        i64::from(self.cur.pid)
+    }
+
+    /// `getsid(pid)` — the session id of `pid` (0 = self).
+    fn sys_getsid(&mut self, pid: i32) -> i64 {
+        if pid == 0 || pid == self.cur.pid {
+            return i64::from(if self.cur.sid == 0 { self.cur.pid } else { self.cur.sid });
+        }
+        for p in self.procs.iter().flatten() {
+            if p.info.pid == pid {
+                return i64::from(if p.info.sid == 0 { p.info.pid } else { p.info.sid });
+            }
+        }
+        err(Errno::ESRCH)
+    }
+
+    /// `statx(dirfd, path, flags, mask, buf)` — the modern `stat`. Fills the
+    /// basic-stats fields of `struct statx` from the resolved node's [`Attrs`].
+    fn sys_statx(&mut self, dirfd: i64, path_ptr: u64, flags: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        let Some(rel) = read_path(mem, path_ptr) else {
+            return err(Errno::EFAULT);
+        };
+        let attrs = if rel.is_empty() && flags & AT_EMPTY_PATH != 0 {
+            match self.cur.fds.get(dirfd as i32) {
+                Some(Fd::File { path, .. } | Fd::Dir { path, .. }) => {
+                    self.mounts.stat(&path.clone())
+                }
+                Some(Fd::Stdin | Fd::Stdout | Fd::Stderr) => Some(stat::char_device_attrs()),
+                _ => None,
+            }
+        } else {
+            let abs = self.resolve_path(dirfd, &rel);
+            self.mounts.stat(&abs)
+        };
+        let Some(a) = attrs else {
+            return err(Errno::ENOENT);
+        };
+        let buf_bytes = stat::encode_statx(&a);
+        if mem.write(buf, &buf_bytes).is_err() {
+            return err(Errno::EFAULT);
+        }
+        0
+    }
+
+    /// `memfd_create(name, flags)` — an anonymous, initially-empty read/write
+    /// file. Backed by a uniquely-named node in `/tmp` (a tmpfs), which gives
+    /// the read/write/`ftruncate`/`mmap` behavior programs expect from a memfd
+    /// (the "not linked into any directory" nuance is not modeled).
+    fn sys_memfd_create(&mut self, name_ptr: u64, mem: &GuestMemory) -> i64 {
+        let name = read_path(mem, name_ptr).unwrap_or_default();
+        let short: String = name.chars().take(64).filter(|c| *c != '/').collect();
+        self.memfd_seq += 1;
+        // Back it at the (always-writable) root with a dot-prefixed name so it
+        // stays out of ordinary `ls` output — the root is a tmpfs/overlay in
+        // every configuration, so this doesn't depend on `/tmp` existing.
+        let path = format!("/.memfd.{short}.{}", self.memfd_seq);
+        if self.mounts.create(&path, 0o600).is_err() {
+            return err(Errno::ENOSPC);
+        }
+        i64::from(self.cur.fds.alloc(Fd::File { path, offset: 0 }))
+    }
+
+    /// `inotify_init1`/`signalfd4` stub — a descriptor that is always empty
+    /// (never becomes readable). Programs get a valid fd and simply never see
+    /// events/signals, which is a safe degradation for optional watching.
+    fn sys_inotify_init1(&mut self) -> i64 {
+        let idx = self.eventfds.len();
+        self.eventfds.push(EventFdInst::default());
+        i64::from(self.cur.fds.alloc(Fd::Eventfd(idx)))
     }
 
     /// `exit` — terminate just this task: run its `CLONE_CHILD_CLEARTID`
@@ -1387,6 +1739,263 @@ impl Kernel {
         }
         self.pipes[i].buf.extend(data.iter().copied());
         data.len() as i64
+    }
+
+    /// `pread64(fd, buf, count, offset)` — read at `offset` without moving the
+    /// fd's position. Files only (a pipe/socket has no position → `ESPIPE`).
+    fn sys_pread(&mut self, fd: u64, buf: u64, count: u64, offset: u64, mem: &mut GuestMemory) -> i64 {
+        let Some(Fd::File { path, .. }) = self.cur.fds.get(fd as i32).cloned() else {
+            return err(Errno::ESPIPE);
+        };
+        let mut tmp = vec![0u8; count as usize];
+        match self.mounts.read_at(&path, offset, &mut tmp) {
+            Ok(n) => {
+                if mem.write(buf, &tmp[..n]).is_err() {
+                    return err(Errno::EFAULT);
+                }
+                n as i64
+            }
+            Err(e) => io_errno(&e),
+        }
+    }
+
+    /// `pwrite64(fd, buf, count, offset)` — write at `offset` without moving
+    /// the fd's position.
+    fn sys_pwrite(&mut self, fd: u64, buf: u64, count: u64, offset: u64, mem: &GuestMemory) -> i64 {
+        let Some(Fd::File { path, .. }) = self.cur.fds.get(fd as i32).cloned() else {
+            return err(Errno::ESPIPE);
+        };
+        let Ok(data) = mem.read_vec(buf, count as usize) else {
+            return err(Errno::EFAULT);
+        };
+        match self.mounts.write_at(&path, offset, &data) {
+            Ok(n) => n as i64,
+            Err(e) => io_errno(&e),
+        }
+    }
+
+    /// `preadv(fd, iov, iovcnt, offset)` — scatter a positioned read across
+    /// iovecs. `offset` is `pos_l` (`pos_h`, the 32-bit-compat high word, is 0
+    /// for 64-bit callers).
+    fn sys_preadv(&mut self, fd: u64, iov: u64, iovcnt: u64, offset: u64, mem: &mut GuestMemory) -> i64 {
+        let mut cur = offset;
+        let mut total = 0i64;
+        for i in 0..iovcnt {
+            let ent = iov + i * 16;
+            let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
+                return if total > 0 { total } else { err(Errno::EFAULT) };
+            };
+            if len == 0 {
+                continue;
+            }
+            let r = self.sys_pread(fd, base, len, cur, mem);
+            if r < 0 {
+                return if total > 0 { total } else { r };
+            }
+            total += r;
+            cur += r as u64;
+            if (r as u64) < len {
+                break;
+            }
+        }
+        total
+    }
+
+    /// `pwritev(fd, iov, iovcnt, offset)` — gather a positioned write.
+    fn sys_pwritev(&mut self, fd: u64, iov: u64, iovcnt: u64, offset: u64, mem: &GuestMemory) -> i64 {
+        let mut cur = offset;
+        let mut total = 0i64;
+        for i in 0..iovcnt {
+            let ent = iov + i * 16;
+            let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
+                return if total > 0 { total } else { err(Errno::EFAULT) };
+            };
+            if len == 0 {
+                continue;
+            }
+            let r = self.sys_pwrite(fd, base, len, cur, mem);
+            if r < 0 {
+                return if total > 0 { total } else { r };
+            }
+            total += r;
+            cur += r as u64;
+            if (r as u64) < len {
+                break;
+            }
+        }
+        total
+    }
+
+    /// `ftruncate(fd, len)` — resize the file the fd refers to.
+    fn sys_ftruncate(&mut self, fd: u64, len: u64) -> i64 {
+        let Some(Fd::File { path, .. }) = self.cur.fds.get(fd as i32).cloned() else {
+            return err(Errno::EBADF);
+        };
+        match self.mounts.truncate(&path, len) {
+            Ok(()) => 0,
+            Err(e) => io_errno(&e),
+        }
+    }
+
+    /// `truncate(path, len)` — resize by path.
+    fn sys_truncate(&mut self, pathptr: u64, len: u64, mem: &GuestMemory) -> i64 {
+        let Some(rel) = read_path(mem, pathptr) else {
+            return err(Errno::EFAULT);
+        };
+        let abs = self.resolve_path(AT_FDCWD, &rel);
+        match self.mounts.truncate(&abs, len) {
+            Ok(()) => 0,
+            Err(e) => io_errno(&e),
+        }
+    }
+
+    /// `fallocate(fd, mode, offset, len)` — for the default allocate/extend
+    /// mode, grow the file to at least `offset + len`; other modes (punch
+    /// hole, and so on) are accepted as no-ops.
+    fn sys_fallocate(&mut self, fd: u64, offset: u64, len: u64) -> i64 {
+        let Some(Fd::File { path, .. }) = self.cur.fds.get(fd as i32).cloned() else {
+            return err(Errno::EBADF);
+        };
+        let want = offset.saturating_add(len);
+        let cur = self.mounts.stat(&path).map_or(0, |a| a.size);
+        if want > cur {
+            match self.mounts.truncate(&path, want) {
+                Ok(()) => 0,
+                Err(e) => io_errno(&e),
+            }
+        } else {
+            0
+        }
+    }
+
+    /// `sendfile(out_fd, in_fd, offset_ptr, count)` — copy up to `count` bytes
+    /// from `in_fd` to `out_fd`. If `offset_ptr` is non-null it names the start
+    /// offset in `in_fd` (and is advanced), and `in_fd`'s own position is left
+    /// alone; otherwise `in_fd`'s position is used and advanced.
+    fn sys_sendfile(&mut self, out_fd: u64, in_fd: u64, offset_ptr: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+        // Resolve the source position.
+        let use_ptr = offset_ptr != 0;
+        let start = if use_ptr {
+            match mem.read_u64(offset_ptr) {
+                Ok(v) => v,
+                Err(_) => return err(Errno::EFAULT),
+            }
+        } else {
+            match self.cur.fds.get(in_fd as i32) {
+                Some(Fd::File { offset, .. }) => *offset,
+                _ => return err(Errno::EINVAL),
+            }
+        };
+        let Some(Fd::File { path, .. }) = self.cur.fds.get(in_fd as i32).cloned() else {
+            return err(Errno::EINVAL);
+        };
+        let mut buf = vec![0u8; count as usize];
+        let n = match self.mounts.read_at(&path, start, &mut buf) {
+            Ok(n) => n,
+            Err(e) => return io_errno(&e),
+        };
+        buf.truncate(n);
+        // Write it out through the normal write path (files, pipes, sockets).
+        let written = match self.cur.fds.get(out_fd as i32).cloned() {
+            Some(Fd::File { path, offset }) => match self.mounts.write_at(&path, offset, &buf) {
+                Ok(w) => {
+                    if let Some(Fd::File { offset, .. }) = self.cur.fds.get_mut(out_fd as i32) {
+                        *offset += w as u64;
+                    }
+                    w as i64
+                }
+                Err(e) => io_errno(&e),
+            },
+            Some(Fd::Stdout) => self.stdout.write_all(&buf).map_or(err(Errno::EIO), |()| buf.len() as i64),
+            Some(Fd::Stderr) => self.stderr.write_all(&buf).map_or(err(Errno::EIO), |()| buf.len() as i64),
+            Some(Fd::PipeWrite(i)) => self.write_pipe(i, &buf),
+            Some(Fd::Socket { sock, end }) => self.write_socket(sock, end, &buf),
+            _ => err(Errno::EBADF),
+        };
+        if written < 0 {
+            return written;
+        }
+        let advanced = written as u64;
+        if use_ptr {
+            let _ = mem.write_u64(offset_ptr, start + advanced);
+        } else if let Some(Fd::File { offset, .. }) = self.cur.fds.get_mut(in_fd as i32) {
+            *offset += advanced;
+        }
+        written
+    }
+
+    /// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)` — copy
+    /// between two files, honoring the optional in/out offset pointers.
+    fn sys_copy_file_range(&mut self, a: &[u64; 6], mem: &mut GuestMemory) -> i64 {
+        let (fd_in, off_in_p, fd_out, off_out_p, len) = (a[0], a[1], a[2], a[3], a[4]);
+        let Some(Fd::File { path: in_path, offset: in_pos }) = self.cur.fds.get(fd_in as i32).cloned() else {
+            return err(Errno::EBADF);
+        };
+        let in_off = if off_in_p != 0 {
+            mem.read_u64(off_in_p).unwrap_or(in_pos)
+        } else {
+            in_pos
+        };
+        let mut buf = vec![0u8; len as usize];
+        let n = match self.mounts.read_at(&in_path, in_off, &mut buf) {
+            Ok(n) => n,
+            Err(e) => return io_errno(&e),
+        };
+        buf.truncate(n);
+        let Some(Fd::File { path: out_path, offset: out_pos }) = self.cur.fds.get(fd_out as i32).cloned() else {
+            return err(Errno::EBADF);
+        };
+        let out_off = if off_out_p != 0 {
+            mem.read_u64(off_out_p).unwrap_or(out_pos)
+        } else {
+            out_pos
+        };
+        let w = match self.mounts.write_at(&out_path, out_off, &buf) {
+            Ok(w) => w,
+            Err(e) => return io_errno(&e),
+        };
+        // Advance the offsets (pointer or fd position).
+        if off_in_p != 0 {
+            let _ = mem.write_u64(off_in_p, in_off + w as u64);
+        } else if let Some(Fd::File { offset, .. }) = self.cur.fds.get_mut(fd_in as i32) {
+            *offset += w as u64;
+        }
+        if off_out_p != 0 {
+            let _ = mem.write_u64(off_out_p, out_off + w as u64);
+        } else if let Some(Fd::File { offset, .. }) = self.cur.fds.get_mut(fd_out as i32) {
+            *offset += w as u64;
+        }
+        w as i64
+    }
+
+    /// `linkat(olddirfd, old, newdirfd, new, flags)` (and plain `link`) — the
+    /// mount table has no true hard-link primitive, so this copies the source
+    /// file's contents to the new path (correct for the overwhelmingly common
+    /// use — same-content at a second name; the shared-inode nuance is lost).
+    fn sys_linkat(&mut self, olddirfd: i64, oldp: u64, newdirfd: i64, newp: u64, _flags: u64, mem: &GuestMemory) -> i64 {
+        let (Some(orel), Some(nrel)) = (read_path(mem, oldp), read_path(mem, newp)) else {
+            return err(Errno::EFAULT);
+        };
+        let old_abs = self.resolve_path(olddirfd, &orel);
+        let new_abs = self.resolve_path(newdirfd, &nrel);
+        let Some(attrs) = self.mounts.stat(&old_abs) else {
+            return err(Errno::ENOENT);
+        };
+        if attrs.kind == NodeKind::Dir {
+            return err(Errno::EPERM); // can't hard-link a directory
+        }
+        // Read the whole source, create the target, copy.
+        let mut data = vec![0u8; attrs.size as usize];
+        if self.mounts.read_at(&old_abs, 0, &mut data).is_err() {
+            return err(Errno::EIO);
+        }
+        if let Err(e) = self.mounts.create(&new_abs, attrs.mode & 0o7777) {
+            return io_errno(&e);
+        }
+        match self.mounts.write_at(&new_abs, 0, &data) {
+            Ok(_) => 0,
+            Err(e) => io_errno(&e),
+        }
     }
 
     /// `readv(fd, iov, iovcnt)` — scatter a read across `struct iovec` entries.
@@ -2027,6 +2636,11 @@ fn parent_of(p: &str) -> &str {
 
 fn page_down(v: u64) -> u64 {
     v - v % PAGE_SIZE
+}
+
+/// The process group of `p` — its explicit `pgid`, or its pid when unset.
+fn pgid_of(p: &ProcInfo) -> i32 {
+    if p.pgid == 0 { p.pid } else { p.pgid }
 }
 
 /// Map a host `io::Error` to a negative guest errno.
@@ -3176,5 +3790,141 @@ mod tests {
             call(&mut k, &mut mem, &mut v, Sysno::Kill, [999, 15, 0, 0, 0, 0]),
             -3
         );
+    }
+
+    /// Open a file, seed it, and return its fd — for the I/O syscall tests.
+    fn open_seeded(k: &mut Kernel, mem: &mut GuestMemory, v: &mut DummyVcpu, content: &[u8]) -> u64 {
+        let path = 0x1_0000;
+        mem.write_init(path, b"/f\0").unwrap();
+        let fd = call(k, mem, v, Sysno::Openat, [AT_CWD, path, 0o102, 0o644, 0, 0]) as u64;
+        let src = 0x1_3000;
+        mem.write_init(src, content).unwrap();
+        call(k, mem, v, Sysno::Write, [fd, src, content.len() as u64, 0, 0, 0]);
+        fd
+    }
+
+    #[test]
+    fn pread_pwrite_do_not_move_the_offset() {
+        let (mut k, mut mem, mut v) = setup();
+        let fd = open_seeded(&mut k, &mut mem, &mut v, b"0123456789");
+        // Read the fd position back to 0 via lseek, then pread at offset 4.
+        call(&mut k, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]);
+        let buf = 0x1_2000;
+        let n = call(&mut k, &mut mem, &mut v, Sysno::Pread64, [fd, buf, 3, 4, 0, 0]);
+        assert_eq!(n, 3);
+        assert_eq!(mem.read_vec(buf, 3).unwrap(), b"456");
+        // The fd position is still 0, so a plain read starts at the beginning.
+        let n = call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, buf, 2, 0, 0, 0]);
+        assert_eq!(n, 2);
+        assert_eq!(mem.read_vec(buf, 2).unwrap(), b"01");
+        // pwrite at offset 4 overwrites in place, again without moving the pos.
+        let src = 0x1_1000;
+        mem.write_init(src, b"XY").unwrap();
+        call(&mut k, &mut mem, &mut v, Sysno::Pwrite64, [fd, src, 2, 4, 0, 0]);
+        call(&mut k, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]);
+        call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, buf, 10, 0, 0, 0]);
+        assert_eq!(mem.read_vec(buf, 10).unwrap(), b"0123XY6789");
+    }
+
+    #[test]
+    fn ftruncate_and_truncate_resize() {
+        let (mut k, mut mem, mut v) = setup();
+        let fd = open_seeded(&mut k, &mut mem, &mut v, b"abcdef");
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Ftruncate, [fd, 3, 0, 0, 0, 0]), 0);
+        assert_eq!(k.mounts.stat("/f").unwrap().size, 3);
+        // truncate by path can also grow (zero-extend).
+        let path = 0x1_0000;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Truncate, [path, 8, 0, 0, 0, 0]), 0);
+        assert_eq!(k.mounts.stat("/f").unwrap().size, 8);
+    }
+
+    #[test]
+    fn statx_reports_size_and_mode() {
+        let (mut k, mut mem, mut v) = setup();
+        open_seeded(&mut k, &mut mem, &mut v, b"hello world");
+        let path = 0x1_0000;
+        let buf = 0x1_2000;
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Statx, [AT_CWD, path, 0, 0x7ff, buf, 0]),
+            0
+        );
+        // stx_size @40, stx_mode @28.
+        assert_eq!(u64::from_le_bytes(mem.read_vec(buf + 40, 8).unwrap().try_into().unwrap()), 11);
+        let mode = u16::from_le_bytes(mem.read_vec(buf + 28, 2).unwrap().try_into().unwrap());
+        assert_eq!(mode & 0o170000, 0o100000, "S_IFREG");
+    }
+
+    #[test]
+    fn sendfile_copies_between_files() {
+        let (mut k, mut mem, mut v) = setup();
+        let infd = open_seeded(&mut k, &mut mem, &mut v, b"payload!");
+        call(&mut k, &mut mem, &mut v, Sysno::Lseek, [infd, 0, 0, 0, 0, 0]);
+        // A second file as the destination.
+        let path2 = 0x1_1000;
+        mem.write_init(path2, b"/g\0").unwrap();
+        let outfd = call(&mut k, &mut mem, &mut v, Sysno::Openat, [AT_CWD, path2, 0o102, 0o644, 0, 0]) as u64;
+        let n = call(&mut k, &mut mem, &mut v, Sysno::Sendfile, [outfd, infd, 0, 8, 0, 0]);
+        assert_eq!(n, 8);
+        assert_eq!(k.mounts.stat("/g").unwrap().size, 8);
+        let buf = 0x1_2000;
+        call(&mut k, &mut mem, &mut v, Sysno::Lseek, [outfd, 0, 0, 0, 0, 0]);
+        call(&mut k, &mut mem, &mut v, Sysno::Read, [outfd, buf, 8, 0, 0, 0]);
+        assert_eq!(mem.read_vec(buf, 8).unwrap(), b"payload!");
+    }
+
+    #[test]
+    fn session_and_pgid_tracking() {
+        let (mut k, mut mem, mut v) = setup();
+        k.cur.pid = 5;
+        // getpgid(0) defaults to the pid.
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getpgid, [0; 6]), 5);
+        // setpgid(0, 42) sets it.
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Setpgid, [0, 42, 0, 0, 0, 0]), 0);
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getpgid, [0; 6]), 42);
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getpgrp, [0; 6]), 42);
+        // setsid starts a new session: sid = pgid = pid.
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Setsid, [0; 6]), 5);
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getsid, [0; 6]), 5);
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getpgid, [0; 6]), 5);
+    }
+
+    #[test]
+    fn memfd_create_is_a_readwrite_fd() {
+        let (mut k, mut mem, mut v) = setup();
+        let name = 0x1_0000;
+        mem.write_init(name, b"scratch\0").unwrap();
+        let fd = call(&mut k, &mut mem, &mut v, Sysno::MemfdCreate, [name, 0, 0, 0, 0, 0]);
+        assert!(fd >= 3, "a real fd");
+        let fd = fd as u64;
+        let src = 0x1_2000;
+        mem.write_init(src, b"data").unwrap();
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Write, [fd, src, 4, 0, 0, 0]), 4);
+        call(&mut k, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]);
+        let buf = 0x1_3000;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, buf, 4, 0, 0, 0]), 4);
+        assert_eq!(mem.read_vec(buf, 4).unwrap(), b"data");
+    }
+
+    #[test]
+    fn close_range_closes_fds() {
+        let (mut k, mut mem, mut v) = setup();
+        let fd = open_seeded(&mut k, &mut mem, &mut v, b"x");
+        assert!(fd >= 3);
+        // Close everything from `fd` up; a subsequent op on it is EBADF.
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::CloseRange, [fd, u64::from(u32::MAX), 0, 0, 0, 0]), 0);
+        let buf = 0x1_2000;
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, buf, 1, 0, 0, 0]), -9); // EBADF
+    }
+
+    #[test]
+    fn credential_setters_succeed_as_root() {
+        let (mut k, mut mem, mut v) = setup();
+        for s in [Sysno::Setuid, Sysno::Setgid, Sysno::Setresuid, Sysno::Setgroups] {
+            assert_eq!(call(&mut k, &mut mem, &mut v, s, [0; 6]), 0, "{s:?}");
+        }
+        // getresuid writes (0,0,0).
+        let (a, b, c) = (0x1_2000, 0x1_2010, 0x1_2020);
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Getresuid, [a, b, c, 0, 0, 0]), 0);
+        assert_eq!(mem.read_u32(a).unwrap(), 0);
     }
 }
