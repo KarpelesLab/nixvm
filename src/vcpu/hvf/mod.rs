@@ -28,10 +28,12 @@ pub struct HvfBackend {
 }
 
 impl HvfBackend {
-    /// Construct the backend handle. The process VM is created lazily (and its
-    /// availability probed, for the interpreter fallback) when `select` wires
-    /// this backend in — a later milestone step; for now the vcpu is not built.
+    /// Probe the hypervisor by creating (once) the process VM. Returns an error
+    /// — which [`crate::vcpu::select`] turns into an interpreter fallback — when
+    /// the hypervisor is unavailable or the process lacks the
+    /// `com.apple.security.hypervisor` entitlement (an unsigned binary / CI).
     pub fn new() -> Result<Self, VcpuError> {
+        vm::vm()?;
         Ok(Self { _private: () })
     }
 }
@@ -95,6 +97,81 @@ mod tests {
         );
         assert_eq!(v.syscall_nr(), 93, "resumed past the first svc");
         assert_eq!(v.syscall_args()[0], 7, "x0 read as arg0");
+    }
+
+    /// End-to-end through the real kernel: a guest program does
+    /// `write(1,"hi\n",3)` then `exit(0)`, run on HVF and driven by the actual
+    /// `Kernel` run/serve loop. Proves that ordinary syscalls dispatch correctly
+    /// off the HVF vcpu's registers (the syscall number/args and the buffer read
+    /// from guest memory all come through the hardware path) and that the exit
+    /// code and captured stdout are right — the milestone's "static program runs
+    /// entirely through HVF" deliverable.
+    ///
+    /// Ignored by default (needs entitlement + codesign; run with NIXVM_HVF=1).
+    #[test]
+    #[ignore = "requires the hypervisor entitlement + codesign; run with NIXVM_HVF=1"]
+    fn program_write_exit_through_kernel() {
+        use crate::abi::Arch;
+        use crate::fs::MountTable;
+        use crate::kernel::Kernel;
+        use crate::vcpu::Backend;
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        if std::env::var_os("NIXVM_HVF").is_none() {
+            return;
+        }
+
+        let base = 0x1_0000u64;
+        // write(1, base+0x24, 3) ; exit(0)     ("hi\n" lives at offset 0x24)
+        let program: [u32; 9] = [
+            0xD2800020, // movz x0,#1        (fd)
+            0xD2800481, // movz x1,#0x24
+            0xF2A00021, // movk x1,#1,lsl#16 -> x1 = base+0x24 (buf)
+            0xD2800062, // movz x2,#3        (len)
+            0xD2800808, // movz x8,#64       (__NR_write)
+            0xD4000001, // svc #0
+            0xD2800000, // movz x0,#0        (exit code)
+            0xD2800BA8, // movz x8,#93       (__NR_exit)
+            0xD4000001, // svc #0
+        ];
+        let mut bytes = Vec::new();
+        for w in program {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        bytes.extend_from_slice(b"hi\n"); // at offset 36 == 0x24
+
+        let mut mem = GuestMemory::new(base, 256 * 4096);
+        mem.map(base, 4096, Prot::rwx()).unwrap();
+        mem.write_init(base, &bytes).unwrap();
+
+        let backend = super::HvfBackend::new().expect("HVF backend (codesigned + entitled?)");
+        let vcpu = backend.new_vcpu(base, base + 0x1_0000).expect("new_vcpu");
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let mut kernel = Kernel::new(Arch::Aarch64, MountTable::new());
+        kernel.set_ncpus(1); // HVF vcpus are thread-bound: run serial, same thread.
+        kernel.set_stdout(Box::new(Sink(captured.clone())));
+
+        let code = kernel.run(vcpu, mem).expect("kernel run");
+        assert_eq!(code, 0, "exit code");
+        assert_eq!(
+            &*captured.lock().unwrap(),
+            b"hi\n",
+            "stdout via HVF write()"
+        );
     }
 
     /// Smallest possible bring-up: map one page of guest RAM, run `movz x0,#7 ;

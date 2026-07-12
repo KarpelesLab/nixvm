@@ -143,13 +143,20 @@ pub mod interp_x86;
 
 /// Pick the best backend available for the host, targeting `guest`.
 ///
-/// Prefers hardware virtualization when the guest arch matches the host;
-/// otherwise falls back to the software interpreter.
+/// Prefers hardware virtualization when the guest arch matches the host and the
+/// process can create a VM; otherwise falls back to the software interpreter.
+/// The fallback is what keeps an unentitled/unsigned binary (CI, plain
+/// `cargo test`) working — [`hvf::HvfBackend::new`] fails there, and we drop to
+/// the interpreter instead of erroring.
 pub fn select(guest: Arch) -> Result<Box<dyn Backend>, VcpuError> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        if guest == Arch::Aarch64 {
-            return hvf::HvfBackend::new().map(|b| Box::new(b) as Box<dyn Backend>);
+        // When the hypervisor is unavailable/unentitled, `new` fails and we fall
+        // through to the interpreter.
+        if guest == Arch::Aarch64
+            && let Ok(backend) = hvf::HvfBackend::new()
+        {
+            return Ok(Box::new(backend) as Box<dyn Backend>);
         }
     }
     // TODO(Phase 10): KVM on Linux.
