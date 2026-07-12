@@ -8,13 +8,16 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 // ---------------------------------------------------------------------------
 // nixvm browser terminal.
 //
-// Boots a real Alpine Linux minirootfs (fetched same-origin as
-// `rootfs.tar.gz` and handed to the wasm as-is — nixvm gunzips it itself via
-// the `compcol` crate) into the nixvm wasm
+// Boots a real Alpine Linux minirootfs — the user picks the guest
+// architecture (arm64 or x86-64) first, then Start fetches the matching
+// same-origin `rootfs-<arch>.tar.gz` and hands it to the wasm as-is (nixvm
+// gunzips it itself via the `compcol` crate) — into the nixvm wasm
 // sandbox's `Terminal` class (from `../../pkg/nixvm.js`, assembled next to
 // this app's build output by `.github/workflows/pages.yml` — see
 // `web/README.md` for how to get it locally) and drives an interactive
-// `/bin/busybox sh` session.
+// `/bin/busybox sh` session. Both arches run on the same wasm build: the
+// sandbox picks its aarch64 or x86-64 interpreter off the ELF headers
+// inside the image.
 //
 // `busybox sh` here is not attached to a real TTY (no line editor, no
 // local echo), so *this component* does the line editing: it buffers the
@@ -27,10 +30,21 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 
 const PROMPT = "/ $ ";
 
+/// Guest architectures the demo can boot. Both run on the same wasm
+/// interpreter build — the arch is auto-detected from the ELFs inside the
+/// selected rootfs image; the choice here only picks which Alpine image
+/// (`rootfs-<arch>.tar.gz`, bundled by pages.yml) is fetched and booted.
+const ARCHES = [
+  { id: "aarch64", label: "arm64" },
+  { id: "x86_64", label: "x86-64" },
+];
+
 const termEl = ref(null);
 const status = ref("idle");
+const arch = ref("aarch64");
+const hasBooted = ref(false);
 const statusMessages = {
-  idle: "idle",
+  idle: "pick an architecture and press Start",
   downloading: "downloading Alpine rootfs…",
   decompressing: "decompressing rootfs…",
   loading: "loading WebAssembly module…",
@@ -42,15 +56,17 @@ const statusMessages = {
 const statusText = computed(() => statusMessages[status.value] ?? status.value);
 const bootingPhases = new Set(["downloading", "decompressing", "loading", "booting"]);
 const rebootDisabled = computed(() => bootingPhases.has(status.value));
+const bootLabel = computed(() => (hasBooted.value ? "Reboot" : "Start"));
 
 let xterm = null;
 let fitAddon = null;
 let resizeObserver = null;
 let guestTerm = null;
 
-// Cached across reboots so hitting "Reboot" doesn't re-download the rootfs
-// or re-instantiate the wasm module — only a fresh `Terminal` is created.
-let cachedTar = null;
+// Cached across reboots so hitting "Reboot" doesn't re-download a rootfs
+// (one entry per arch) or re-instantiate the wasm module — only a fresh
+// `Terminal` is created.
+const cachedTars = new Map();
 let cachedWasmModule = null;
 
 let lineBuffer = "";
@@ -164,21 +180,23 @@ async function handleInput(data) {
   }
 }
 
-async function fetchRootfsTarGz() {
-  if (cachedTar) return cachedTar;
+async function fetchRootfsTarGz(archId) {
+  const cached = cachedTars.get(archId);
+  if (cached) return cached;
   // Fetch the compressed image as-is; nixvm's wasm decompresses the gzip
   // itself (via the `compcol` crate), so there's no DecompressionStream
   // dependency and it works in any wasm-capable browser.
   status.value = "downloading";
   await tick();
-  const url = siteUrl("rootfs.tar.gz");
+  const url = siteUrl(`rootfs-${archId}.tar.gz`);
   const res = await fetch(url);
   if (!res.ok) {
     throw new Error(`failed to fetch ${url}: ${res.status} ${res.statusText}`);
   }
   const buf = await res.arrayBuffer();
-  cachedTar = new Uint8Array(buf);
-  return cachedTar;
+  const tar = new Uint8Array(buf);
+  cachedTars.set(archId, tar);
+  return tar;
 }
 
 async function loadWasmModule() {
@@ -198,19 +216,22 @@ async function loadWasmModule() {
 }
 
 async function boot() {
+  const archId = arch.value;
   try {
-    const targz = await fetchRootfsTarGz();
+    const targz = await fetchRootfsTarGz(archId);
     const mod = await loadWasmModule();
     status.value = "booting";
     lineBuffer = "";
     atLineStart = true;
     await tick();
-    // The wasm Terminal takes the raw .tar.gz and gunzips it in-process.
+    // The wasm Terminal takes the raw .tar.gz and gunzips it in-process; the
+    // guest arch is auto-detected from the ELFs inside it.
     guestTerm = new mod.Terminal(targz, ["/bin/busybox", "sh"]);
     const out = guestTerm.pump();
-    writeBanner("nixvm — Alpine Linux, running entirely in your browser.");
-    writeBanner('Type commands and press Enter. Try: uname -a; ls /; cat /etc/os-release');
+    writeBanner(`nixvm — Alpine Linux (${archId}), running entirely in your browser.`);
+    writeBanner('Type commands and press Enter. Try: uname -m; ls /; cat /etc/os-release');
     writeBytes(out);
+    hasBooted.value = true;
     status.value = "ready";
     writePrompt();
   } catch (err) {
@@ -278,7 +299,10 @@ onMounted(() => {
   resizeObserver.observe(termEl.value);
   window.addEventListener("resize", fit);
 
-  boot();
+  // No auto-boot: the guest architecture is chosen first, then Start fetches
+  // and boots the matching Alpine image.
+  writeBanner("nixvm — a real Alpine Linux userland, entirely in your browser.");
+  writeBanner("Pick a guest architecture above, then press Start.");
 });
 
 onBeforeUnmount(() => {
@@ -298,7 +322,23 @@ onBeforeUnmount(() => {
     <div class="term-toolbar">
       <span class="status-dot" :class="`is-${status}`"></span>
       <span class="status-text">{{ statusText }}</span>
-      <button class="reboot-btn" :disabled="rebootDisabled" @click="reboot">Reboot</button>
+      <div class="arch-picker" role="radiogroup" aria-label="Guest architecture">
+        <button
+          v-for="a in ARCHES"
+          :key="a.id"
+          class="arch-btn"
+          :class="{ 'is-selected': arch === a.id }"
+          :disabled="rebootDisabled"
+          role="radio"
+          :aria-checked="arch === a.id"
+          @click="arch = a.id"
+        >
+          {{ a.label }}
+        </button>
+      </div>
+      <button class="reboot-btn" :disabled="rebootDisabled" @click="hasBooted ? reboot() : boot()">
+        {{ bootLabel }}
+      </button>
     </div>
     <div ref="termEl" class="term-container"></div>
   </div>
@@ -364,6 +404,42 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.arch-picker {
+  flex: none;
+  display: flex;
+  border: 1px solid var(--panel-border);
+  border-radius: 0.4rem;
+  overflow: hidden;
+}
+
+.arch-btn {
+  background: var(--panel);
+  color: var(--muted);
+  border: none;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.8rem;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.arch-btn + .arch-btn {
+  border-left: 1px solid var(--panel-border);
+}
+
+.arch-btn.is-selected {
+  background: var(--panel-border);
+  color: var(--accent-strong, var(--fg));
+}
+
+.arch-btn:hover:not(:disabled):not(.is-selected) {
+  color: var(--fg);
+}
+
+.arch-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .reboot-btn {

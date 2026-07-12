@@ -30,24 +30,23 @@ signals, and networking are all implemented in userspace, under our control.
 
 **▶ [karpeleslab.github.io/nixvm](https://karpeleslab.github.io/nixvm/)**
 
-Because the whole thing — the CPU interpreter *and* the syscall kernel — is
+Because the whole thing — the CPU interpreters *and* the syscall kernel — is
 portable Rust with no OS dependencies, it compiles to WebAssembly and runs
-entirely in the page. There's no server: the ELF you give it is executed
+entirely in the page. There's no server: a real Alpine Linux userland boots
 locally, in a sandbox, inside your browser's sandbox.
 
-- **Drag in (or pick) a static Linux ELF** — aarch64 or x86-64; the arch is
-  detected from the ELF header and the matching interpreter runs it.
-- **Bundled samples** let you see output with zero setup.
-- You get the program's **stdout/stderr, its exit code, and the ledger of any
-  syscalls it hit that nixvm doesn't implement yet** — the same
-  `unsupported()` view you'd get from the native `run-elf` harness.
+- **Pick a guest architecture** — arm64 or x86-64 — and press Start: the
+  matching stock Alpine minirootfs boots to an interactive `busybox sh`
+  (dynamic linking, real `ld-musl`, fork/exec — the same kernel the native
+  build runs).
+- Everything is client-side: the rootfs is repacked into an in-memory
+  squashfs under a copy-on-write tmpfs upper, and the guest runs on the
+  software CPU interpreter for whichever arch you picked.
 
-It's a try-before-you-install demo, so it's deliberately minimal: a
-statically-linked ELF runner (dynamic linking and a full Alpine shell run on
-the native build, not the wasm demo yet). CI rebuilds and redeploys it to
-GitHub Pages on every push to `main` (see
-[`.github/workflows/pages.yml`](.github/workflows/pages.yml)); the page is
-`web/index.html` and the wasm entry point is `src/wasm.rs`.
+CI rebuilds and redeploys it to GitHub Pages on every push to `master` (see
+[`.github/workflows/pages.yml`](.github/workflows/pages.yml)); the frontend
+is the Vue app in `web/` and the wasm entry point is `src/wasm.rs` (which
+also still exposes the original static-ELF runner, `run_elf`).
 
 ## Status
 

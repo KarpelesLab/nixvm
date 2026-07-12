@@ -66,15 +66,19 @@ jobs:
         working-directory: web
         run: npm run build
 
-      - name: Fetch the Alpine minirootfs
-        # Resolve the current v3.20 aarch64 minirootfs filename from the
-        # release manifest rather than hardcoding a version, so this keeps
-        # working as Alpine ships point releases.
+      - name: Fetch the Alpine minirootfs images (both guest arches)
+        # Resolve the current v3.20 minirootfs filenames from the release
+        # manifests rather than hardcoding a version, so this keeps working
+        # as Alpine ships point releases. The page offers an arm64/x86-64
+        # choice before boot, so both images are bundled
+        # (`rootfs-<arch>.tar.gz`, fetched on demand by NixTerm.vue).
         run: |
           set -euo pipefail
-          VER=$(curl -sSL https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/latest-releases.yaml | grep -m1 -oE 'alpine-minirootfs-[0-9.]+-aarch64.tar.gz')
-          echo "Resolved Alpine minirootfs: $VER"
-          curl -sSL -o web/dist/rootfs.tar.gz "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/$VER"
+          for ARCH in aarch64 x86_64; do
+            VER=$(curl -sSL "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/$ARCH/latest-releases.yaml" | grep -m1 -oE "alpine-minirootfs-[0-9.]+-$ARCH.tar.gz")
+            echo "Resolved Alpine minirootfs ($ARCH): $VER"
+            curl -sSL -o "web/dist/rootfs-$ARCH.tar.gz" "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/$ARCH/$VER"
+          done
 
       - name: Copy the wasm-pack output into the built site
         # web/dist/index.html's `import('./pkg/nixvm.js')` (see

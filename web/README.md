@@ -14,12 +14,14 @@ biggest pieces the app needs at runtime — neither is a JS/npm artifact:
 - **`pkg/`** — the wasm-bindgen output of `wasm-pack build --target web
   --no-default-features --features wasm`, run against `../src/wasm.rs` at
   the repo root. This is `nixvm.js` + `nixvm_bg.wasm`.
-- **`rootfs.tar.gz`** — an upstream Alpine `aarch64` minirootfs tarball,
+- **`rootfs-aarch64.tar.gz` / `rootfs-x86_64.tar.gz`** — upstream Alpine
+  minirootfs tarballs (one per guest architecture the page offers),
   downloaded as-is (nothing repacked).
 
 At runtime the app fetches/imports both **same-origin, next to the built
-`index.html`**: `./pkg/nixvm.js` (dynamic `import()`) and `./rootfs.tar.gz`
-(`fetch`, then decompressed in-browser with `DecompressionStream('gzip')`).
+`index.html`**: `./pkg/nixvm.js` (dynamic `import()`) and the
+`./rootfs-<arch>.tar.gz` matching the arch picked in the toolbar (`fetch`;
+nixvm gunzips it in-process via the `compcol` crate).
 Neither path is known to Vite at build time (they don't exist in this
 source tree), so `vite.config.js` sets `base: './'` and the app resolves
 both via `import.meta.env.BASE_URL` at runtime rather than as bundled
@@ -37,7 +39,7 @@ npm run dev
 ```
 
 This starts the Vite dev server, but **the app will fail to boot** unless
-`pkg/` and `rootfs.tar.gz` are also reachable at the site root — Vite's
+`pkg/` and the `rootfs-<arch>.tar.gz` images are also reachable at the site root — Vite's
 `public/` directory is served as-is at `/`, so the easiest way to get a
 fully working `npm run dev` is to build those two artifacts once yourself
 and drop them into `public/` (already gitignored — see `.gitignore`):
@@ -49,9 +51,12 @@ cargo install wasm-pack
 wasm-pack build --target web --no-default-features --features wasm
 cp pkg/nixvm.js pkg/nixvm_bg.wasm web/public/pkg/  # mkdir -p web/public/pkg first
 
-# any aarch64 Alpine minirootfs works for local testing; e.g.:
-curl -sSL -o web/public/rootfs.tar.gz \
+# any Alpine minirootfs works for local testing (fetch one per arch you
+# want the picker to offer); e.g.:
+curl -sSL -o web/public/rootfs-aarch64.tar.gz \
   https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.3-aarch64.tar.gz
+curl -sSL -o web/public/rootfs-x86_64.tar.gz \
+  https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
 ```
 
 With those in place, `npm run dev` serves a fully working demo at
@@ -65,10 +70,10 @@ npm run build
 
 Produces `web/dist/` (plain static files: `index.html`, hashed JS/CSS
 assets). This is the command CI runs; CI additionally copies `pkg/` and
-`rootfs.tar.gz` into `web/dist/` afterwards (see
+the rootfs images into `web/dist/` afterwards (see
 `.github/workflows/pages.yml`) — running `npm run build` alone does **not**
-produce a bootable site unless `web/public/pkg` and
-`web/public/rootfs.tar.gz` were already populated as above, in which case
+produce a bootable site unless `web/public/pkg` and the
+`web/public/rootfs-<arch>.tar.gz` images were already populated as above, in which case
 Vite copies them into `dist/` automatically as static assets.
 
 ## Browser requirements
@@ -76,11 +81,7 @@ Vite copies them into `dist/` automatically as static assets.
 - `WebAssembly.instantiateStreaming` + ES modules (wasm-pack's `--target
   web` output).
 - Top-level `await` (Vite `build.target: 'esnext'`).
-- `DecompressionStream('gzip')` (used to inflate `rootfs.tar.gz` in-browser;
-  no fallback is bundled — the app detects its absence and shows an error
-  instead of hanging).
-
-All three are supported by current Chrome, Edge, Firefox, and Safari; no
+All are supported by current Chrome, Edge, Firefox, and Safari; no
 extra polyfills are included.
 
 ## UX notes
