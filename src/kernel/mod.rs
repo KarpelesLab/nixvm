@@ -704,6 +704,8 @@ impl Kernel {
             Sysno::Recvfrom => {
                 self.sys_recvfrom(args[0], args[1], args[2], args[3], args[4], args[5], mem)
             }
+            Sysno::Sendmsg => self.sys_sendmsg(args[0], args[1], args[2], mem),
+            Sysno::Recvmsg => self.sys_recvmsg(args[0], args[1], args[2], mem),
             Sysno::Brk => self.sys_brk(args[0], mem),
             Sysno::Mmap => self.sys_mmap(args, mem),
             Sysno::Munmap => self.sys_munmap(args[0], args[1], mem),
@@ -905,6 +907,11 @@ impl Kernel {
             | Sysno::Sethostname
             | Sysno::Setdomainname
             | Sysno::Capset
+            // flock: advisory whole-file locks. One kernel instance runs one
+            // cooperating process tree and nothing else can touch the in-VM
+            // files, so granting every request immediately is safe — apk
+            // locks its database this way.
+            | Sysno::Flock
             | Sysno::Membarrier => 0,
             _ => {
                 *self.unsupported.entry(raw).or_default() += 1;

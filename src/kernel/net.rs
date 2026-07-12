@@ -1058,6 +1058,23 @@ impl Kernel {
         dest_addrlen: u64,
         mem: &GuestMemory,
     ) -> i64 {
+        let Ok(data) = mem.read_vec(buf, len as usize) else {
+            return err(Errno::EFAULT);
+        };
+        self.send_bytes(fd, &data, dest_addr, dest_addrlen, mem)
+    }
+
+    /// The shared core of `sendto`/`sendmsg`: send an already-gathered `data`
+    /// buffer on socket `fd`, optionally to `dest_addr` (a guest `sockaddr` of
+    /// `dest_addrlen` bytes; `0` = no address, e.g. a connected socket).
+    fn send_bytes(
+        &mut self,
+        fd: u64,
+        data: &[u8],
+        dest_addr: u64,
+        dest_addrlen: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
         let Some((sock, end)) = self.sock_of(fd) else {
             return err(Errno::ENOTSOCK);
         };
@@ -1066,10 +1083,7 @@ impl Kernel {
             // kernel), so a `dest_addr` sockaddr_nl, if given at all, carries
             // no information this module needs — it's the same request path
             // as a plain `write`.
-            let Ok(data) = mem.read_vec(buf, len as usize) else {
-                return err(Errno::EFAULT);
-            };
-            return self.write_socket(sock, end, &data);
+            return self.write_socket(sock, end, data);
         }
         let Some(Addr::Inet(dest)) = read_sockaddr(mem, dest_addr, dest_addrlen) else {
             return err(Errno::EINVAL);
@@ -1080,15 +1094,12 @@ impl Kernel {
         if !dest.valid_bind() {
             return err(Errno::EINVAL); // no route beyond this VM's loopback
         }
-        let Ok(data) = mem.read_vec(buf, len as usize) else {
-            return err(Errno::EFAULT);
-        };
         let src = self.ensure_dgram_bound(sock);
         let key = route_key("udp", dest);
         if let Some(&tgt) = self.net.dgram_ports.get(&key)
             && let Kind::Dgram(td) = &mut self.net.socks[tgt].kind
         {
-            td.queue.push_back((src, data.clone()));
+            td.queue.push_back((src, data.to_vec()));
         }
         data.len() as i64
     }
@@ -1162,6 +1173,164 @@ impl Kernel {
             data.len() as i64
         } else {
             n as i64
+        }
+    }
+
+    /// `sendmsg(fd, msghdr, flags)` — gather the `msg_iov` scatter/gather list
+    /// into one buffer and send it, honoring `msg_name` as the destination
+    /// (the datagram case). apk's HTTP/TLS client and musl's resolver use
+    /// `sendmsg` rather than `sendto`.
+    pub(super) fn sys_sendmsg(&mut self, fd: u64, msg: u64, flags: u64, mem: &GuestMemory) -> i64 {
+        let Some(hdr) = MsgHdr::read(mem, msg) else {
+            return err(Errno::EFAULT);
+        };
+        let mut data = Vec::new();
+        for i in 0..hdr.iovlen {
+            let ent = hdr.iov + i * 16;
+            let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
+                return err(Errno::EFAULT);
+            };
+            match mem.read_vec(base, len as usize) {
+                Ok(mut chunk) => data.append(&mut chunk),
+                Err(_) => return err(Errno::EFAULT),
+            }
+        }
+        let _ = flags;
+        self.send_bytes(fd, &data, hdr.name, u64::from(hdr.namelen), mem)
+    }
+
+    /// `recvmsg(fd, msghdr, flags)` — receive one message into a scratch buffer
+    /// sized to the `msg_iov` total, scatter it across the iovecs, and fill in
+    /// `msg_name`/`msg_namelen` (source address) and `msg_flags`. Control data
+    /// is not modeled: `msg_controllen` is cleared.
+    pub(super) fn sys_recvmsg(
+        &mut self,
+        fd: u64,
+        msg: u64,
+        flags: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        let Some(hdr) = MsgHdr::read(mem, msg) else {
+            return err(Errno::EFAULT);
+        };
+        // Total scatter capacity, and the (base, len) list to scatter into.
+        let mut iovs = Vec::with_capacity(hdr.iovlen as usize);
+        let mut total = 0u64;
+        for i in 0..hdr.iovlen {
+            let ent = hdr.iov + i * 16;
+            let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
+                return err(Errno::EFAULT);
+            };
+            iovs.push((base, len));
+            total += len;
+        }
+        // Receive into a bounce buffer at a scratch guest address? No — reuse
+        // recvfrom by receiving into the first iovec when there's exactly one
+        // (the common case), else into a temporary host staging area via a
+        // single-shot read. We stage in host memory: read the datagram/stream
+        // bytes out through the existing path into iov[0]-sized reads.
+        //
+        // Simplest correct approach: pull up to `total` bytes with recvfrom
+        // into the first iovec region is wrong when total spans many iovecs.
+        // Instead gather into a host Vec by receiving into the largest single
+        // iovec repeatedly is also wrong for datagrams. So: receive once into
+        // a host buffer via a dedicated helper.
+        let (src, mut got, msg_flags) = match self.recv_message(fd, total, flags) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        // Scatter `got` across the iovecs.
+        let mut off = 0usize;
+        for (base, len) in iovs {
+            if off >= got.len() {
+                break;
+            }
+            let take = ((len as usize).min(got.len() - off)).min(got.len());
+            if mem.write(base, &got[off..off + take]).is_err() {
+                return err(Errno::EFAULT);
+            }
+            off += take;
+        }
+        got.truncate(off);
+        // Fill msg_name (source address) and msg_flags; clear control length.
+        // `msg_namelen` (socklen_t at msg+8) doubles as write_sockaddr's
+        // in/out length word — it carries the caller's capacity in and the
+        // written length out, exactly as recvmsg wants.
+        if hdr.name != 0 && hdr.namelen > 0 {
+            let domain = self
+                .sock_of(fd)
+                .map_or(AF_INET, |(s, _)| self.net.socks[s].domain);
+            write_sockaddr(mem, hdr.name, msg + 8, domain, src.as_ref());
+        }
+        // msg_controllen := 0 (offset 40), msg_flags := msg_flags (offset 48).
+        let _ = mem.write(msg + 40, &0u64.to_le_bytes());
+        let _ = mem.write(msg + 48, &(msg_flags as i32).to_le_bytes());
+        off as i64
+    }
+
+    /// Receive one message's bytes (up to `cap`) from socket `fd` into a host
+    /// `Vec`, returning the source address (datagram) and out `msg_flags`. The
+    /// shared core of `recvmsg`, factored out of `recvfrom` so both can drive
+    /// the netlink / stream / datagram paths without a guest bounce buffer.
+    fn recv_message(
+        &mut self,
+        fd: u64,
+        cap: u64,
+        flags: u64,
+    ) -> Result<(Option<Addr>, Vec<u8>, u64), i64> {
+        let Some((sock, end)) = self.sock_of(fd) else {
+            return Err(err(Errno::ENOTSOCK));
+        };
+        match &self.net.socks[sock].kind {
+            Kind::Netlink(_) => {
+                let nonblock = self.net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
+                match self.drain_netlink(sock, cap as usize) {
+                    Some(data) => Ok((None, data, 0)),
+                    None => {
+                        if nonblock {
+                            Err(err(Errno::EAGAIN))
+                        } else {
+                            self.block = true;
+                            Ok((None, Vec::new(), 0))
+                        }
+                    }
+                }
+            }
+            Kind::Dgram(_) => {
+                let nonblock = self.net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
+                match self.recv_dgram_msg(sock, flags) {
+                    Some((from, mut data)) => {
+                        let truncated = data.len() as u64 > cap;
+                        data.truncate(cap as usize);
+                        let mf = if truncated { MSG_TRUNC } else { 0 };
+                        Ok((Some(Addr::Inet(from)), data, mf))
+                    }
+                    None => {
+                        if nonblock {
+                            Err(err(Errno::EAGAIN))
+                        } else {
+                            self.block = true;
+                            Ok((None, Vec::new(), 0))
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Stream: pull bytes directly out of the inbound queue (the
+                // flag-aware `recv_stream` writes to guest memory, so replicate
+                // its dequeue here against a host buffer instead).
+                let data = self.recv_stream_bytes(sock, end, cap, flags);
+                match data {
+                    Ok(bytes) => {
+                        let peer = match &self.net.socks[sock].kind {
+                            Kind::Pair(p) => p.addrs[1 - end].map(Addr::Inet),
+                            _ => None,
+                        };
+                        Ok((peer, bytes, 0))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
         }
     }
 
@@ -1319,6 +1488,51 @@ impl Kernel {
         data.len() as i64
     }
 
+    /// Host-buffer twin of [`Self::recv_stream`]: dequeue up to `count` stream
+    /// bytes into a `Vec` (for `recvmsg`, which scatters across iovecs rather
+    /// than writing one guest region). Same block/`EAGAIN`/EOF semantics.
+    fn recv_stream_bytes(
+        &mut self,
+        sock: usize,
+        end: usize,
+        count: u64,
+        flags: u64,
+    ) -> Result<Vec<u8>, i64> {
+        let (shut_rd, avail, peer_open, nonblock) = match &self.net.socks[sock].kind {
+            Kind::Pair(p) => (
+                p.shut_rd[end],
+                p.to[end].len(),
+                p.refs[1 - end] > 0 && !p.shut_wr[1 - end],
+                p.nonblock[end] || flags & MSG_DONTWAIT != 0,
+            ),
+            _ => return Err(err(Errno::EINVAL)),
+        };
+        if shut_rd {
+            return Ok(Vec::new());
+        }
+        if avail == 0 {
+            if peer_open {
+                if nonblock {
+                    return Err(err(Errno::EAGAIN));
+                }
+                self.block = true;
+            }
+            return Ok(Vec::new());
+        }
+        let peek = flags & MSG_PEEK != 0;
+        match &mut self.net.socks[sock].kind {
+            Kind::Pair(p) => {
+                let n = (count as usize).min(p.to[end].len());
+                Ok(if peek {
+                    p.to[end].iter().take(n).copied().collect()
+                } else {
+                    p.to[end].drain(..n).collect()
+                })
+            }
+            _ => Err(err(Errno::EINVAL)),
+        }
+    }
+
     /// Append to socket `sock`'s outbound queue for `end`. For a stream pair,
     /// `EPIPE` if this end's write side was `shutdown(SHUT_WR)` or the peer
     /// end is fully closed. For a datagram socket, this is `send` (i.e.
@@ -1434,6 +1648,27 @@ impl Kernel {
 /// NUL byte, abstract and path names can never collide, and two guest
 /// processes can rendezvous on an abstract name exactly like a path one — no
 /// separate table needed.
+/// The fields of a guest `struct msghdr` `sendmsg`/`recvmsg` need. 64-bit
+/// layout: `msg_name`(0), `msg_namelen`(8, u32 + 4 pad), `msg_iov`(16),
+/// `msg_iovlen`(24), `msg_control`(32), `msg_controllen`(40), `msg_flags`(48).
+struct MsgHdr {
+    name: u64,
+    namelen: u32,
+    iov: u64,
+    iovlen: u64,
+}
+
+impl MsgHdr {
+    fn read(mem: &GuestMemory, ptr: u64) -> Option<Self> {
+        Some(Self {
+            name: mem.read_u64(ptr).ok()?,
+            namelen: mem.read_u32(ptr + 8).ok()?,
+            iov: mem.read_u64(ptr + 16).ok()?,
+            iovlen: mem.read_u64(ptr + 24).ok()?,
+        })
+    }
+}
+
 fn read_sockaddr(mem: &GuestMemory, ptr: u64, addrlen: u64) -> Option<Addr> {
     if addrlen < 2 {
         return None;
@@ -2889,6 +3124,57 @@ mod tests {
         let b = mem.read_vec(name, 8).unwrap();
         assert_eq!(u16::from_le_bytes([b[0], b[1]]), AF_NETLINK);
         assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), 4242);
+    }
+
+    #[test]
+    fn socketpair_sendmsg_recvmsg_roundtrip() {
+        // A connected UNIX socketpair: send via sendmsg (2 iovecs gathered)
+        // and receive via recvmsg (scattered across 2 iovecs). Exercises the
+        // msghdr/iovec plumbing apk's HTTP client relies on.
+        let (mut k, mut mem, mut v) = setup();
+        let fds = 0x1_1000;
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, fds, 0, 0]),
+            0
+        );
+        let a = u64::from(mem.read_u32(fds).unwrap());
+        let b = u64::from(mem.read_u32(fds + 4).unwrap());
+
+        // Two source chunks "he" + "llo", gathered by sendmsg.
+        let (buf1, buf2) = (0x1_1100u64, 0x1_1110u64);
+        mem.write_init(buf1, b"he").unwrap();
+        mem.write_init(buf2, b"llo").unwrap();
+        let iov_out = 0x1_1200;
+        mem.write_init(iov_out, &buf1.to_le_bytes()).unwrap();
+        mem.write_init(iov_out + 8, &2u64.to_le_bytes()).unwrap();
+        mem.write_init(iov_out + 16, &buf2.to_le_bytes()).unwrap();
+        mem.write_init(iov_out + 24, &3u64.to_le_bytes()).unwrap();
+        let msg_out = 0x1_1300; // msghdr: name=0, namelen=0, iov, iovlen=2
+        mem.write_init(msg_out + 16, &iov_out.to_le_bytes()).unwrap();
+        mem.write_init(msg_out + 24, &2u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Sendmsg, [a, msg_out, 0, 0, 0, 0]),
+            5,
+            "sendmsg gathers both iovecs"
+        );
+
+        // Receive scattered into a 2-byte then a 4-byte iovec.
+        let (rb1, rb2) = (0x1_1400u64, 0x1_1410u64);
+        let iov_in = 0x1_1500;
+        mem.write_init(iov_in, &rb1.to_le_bytes()).unwrap();
+        mem.write_init(iov_in + 8, &2u64.to_le_bytes()).unwrap();
+        mem.write_init(iov_in + 16, &rb2.to_le_bytes()).unwrap();
+        mem.write_init(iov_in + 24, &4u64.to_le_bytes()).unwrap();
+        let msg_in = 0x1_1600;
+        mem.write_init(msg_in + 16, &iov_in.to_le_bytes()).unwrap();
+        mem.write_init(msg_in + 24, &2u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Recvmsg, [b, msg_in, 0, 0, 0, 0]),
+            5,
+            "recvmsg returns the full message"
+        );
+        assert_eq!(mem.read_vec(rb1, 2).unwrap(), b"he");
+        assert_eq!(mem.read_vec(rb2, 3).unwrap(), b"llo", "scattered across iovecs");
     }
 
     #[test]

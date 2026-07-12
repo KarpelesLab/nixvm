@@ -69,6 +69,7 @@ pub fn decode(nr: u64) -> Sysno {
         234 => Sysno::Tgkill,
         202 => Sysno::Futex,
         72 => Sysno::Fcntl,
+        73 => Sysno::Flock,
         // 22 is the legacy `pipe`: the handler only reads the fd-pair pointer.
         22 | 293 => Sysno::Pipe2,
         32 => Sysno::Dup,
@@ -119,6 +120,8 @@ pub fn decode(nr: u64) -> Sysno {
         288 => Sysno::Accept4,
         44 => Sysno::Sendto,
         45 => Sysno::Recvfrom,
+        46 => Sysno::Sendmsg,
+        47 => Sysno::Recvmsg,
         48 => Sysno::Shutdown,
         49 => Sysno::Bind,
         50 => Sysno::Listen,
