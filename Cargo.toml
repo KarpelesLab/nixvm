@@ -3,7 +3,9 @@
 # One crate. Internal structure (abi / vcpu / kernel / fs / loader / image /
 # sandbox) lives as modules, and heavy or platform-specific dependencies are
 # feature-gated rather than split into separate crates. `unsafe` is confined to
-# the `vcpu::hvf` backend. See ROADMAP.md for the plan.
+# three documented sites: `vcpu::hvf` (Hypervisor.framework FFI), `vcpu::region`
+# (page-aligned guest-RAM allocation), and `fs::passthrough` (*at(2) FFI). See
+# ROADMAP.md for the plan.
 
 [package]
 name = "nixvm"
@@ -33,7 +35,11 @@ default = ["cli"]
 # CLI-only deps (clap, tracing-subscriber, …) get added here in a later phase.
 cli = []
 # Hardware virtualization backends (per-phase, target-gated deps land with them).
-hvf = []    # Hypervisor.framework, macOS/arm64  (Phase 1)
+# Hypervisor.framework (macOS/arm64) is compiled by target cfg, not this feature
+# — it links no extra crates (hand-rolled FFI) and `vcpu::select` probes it at
+# runtime, falling back to the interpreter when unentitled. Feature kept as a
+# reserved placeholder.
+hvf = []    # Hypervisor.framework, macOS/arm64
 kvm = []    # KVM, Linux                          (Phase 10)
 # Software CPU interpreter — the no-acceleration fallback (Phase 10).
 interp = []

@@ -51,22 +51,23 @@ GitHub Pages on every push to `main` (see
 
 ## Status
 
-Early but functional on the software-interpreter path: a real Rust syscall
-kernel, two working CPU interpreters (aarch64 and a growing x86-64), static +
-static-PIE ELF loading, multi-threaded/multi-process scheduling with an SMP
-worker-thread pool, an in-VM network stack, and several filesystem backends —
-all covered by 253 unit tests + 8 integration tests + 1 doctest (`cargo test`).
-Hardware acceleration (HVF, KVM) is not wired up yet; everything below runs on
-the portable interpreter today. See [ROADMAP.md](ROADMAP.md) for the phased
-plan and what's next.
+Functional on the software-interpreter path: a real Rust syscall kernel, two
+working CPU interpreters (aarch64 and a growing x86-64), static, static-PIE, and
+**dynamically-linked** ELF loading (real `ld-musl` boots stock Alpine),
+multi-threaded/multi-process scheduling with an SMP worker-thread pool, an in-VM
+network stack, and several filesystem backends — all covered by 446 tests
+(`cargo test`). Hardware acceleration has begun: the **HVF backend
+(macOS/arm64) runs a static program end-to-end on real hardware**; KVM (Linux)
+is next. The interpreter remains the portable default and the CI-tested path.
+See [ROADMAP.md](ROADMAP.md) for the phased plan and what's next.
 
 ## What works today
 
 | Area | Status |
 | --- | --- |
 | **Guest architectures** | aarch64 (interpreter, primary target); x86-64 (interpreter, growing) |
-| **Execution backends** | software interpreter — **working**. HVF (macOS/arm64) — module scaffolded, `new_vcpu` still returns "not implemented" (planned). KVM (Linux) — not started (planned). |
-| **ELF loading** | static (`ET_EXEC`) and static-PIE (`ET_DYN` with `R_*_RELATIVE`/`R_*_IRELATIVE` fixups) — working. Dynamic linking (`PT_INTERP` → `ld-musl`) — **not implemented** (planned). |
+| **Execution backends** | software interpreter — **working** (portable, CI-tested). HVF (macOS/arm64) — **runs a static program end-to-end on hardware** (guest MMU-off at EL0, `svc` trapped via an EL1 stub); dynamic linking + multi-process on HVF are the follow-up. Needs a codesigned binary (`scripts/hvf-test.sh`); `vcpu::select` falls back to the interpreter when unentitled. KVM (Linux) — not started (planned, reuses the same backend seam). |
+| **ELF loading** | static (`ET_EXEC`), static-PIE (`ET_DYN` with `R_*_RELATIVE`/`R_*_IRELATIVE` fixups), and **dynamic linking** (`PT_INTERP` → `ld-musl`, file-backed `mmap` of `.so`s) — working; real Alpine boots on the interpreter. |
 | **Processes & threads** | `clone`/`fork`/`execve`/`wait4`/`exit(_group)`; `CLONE_VM`+`CLONE_THREAD` shared-address-space threads; real `futex` WAIT/WAKE parking |
 | **SMP scheduler** | a pool of `ncpus` host worker threads run guest compute in parallel; syscalls are serviced serially on the main thread (a big-kernel-lock model, `Kernel::set_ncpus`/`NIXVM_CPUS`) |
 | **Signals** | `rt_sigaction`/`rt_sigprocmask`/`kill`/`tgkill` and default-disposition delivery (terminate/ignore) — **custom handler invocation (frame push + PC redirect) is not implemented** |
@@ -87,6 +88,14 @@ startup. Anything not in the table returns `ENOSYS` and is recorded in an
 ```sh
 cargo build --release
 cargo test
+```
+
+On macOS/arm64 the HVF backend is exercised by a separate, `#[ignore]`d test
+suite (it needs a binary codesigned with the `com.apple.security.hypervisor`
+entitlement, which `cargo test` can't do for itself):
+
+```sh
+scripts/hvf-test.sh          # builds, ad-hoc codesigns, runs the HVF tests
 ```
 
 The `nixvm` CLI and the public `Sandbox::run()` API drive the full
@@ -133,13 +142,17 @@ Useful environment variables (both harnesses):
   features (`hvf`, `kvm`, `interp`, `fstool`, `wasm`, `cli`) rather than
   separate crates. The core builds fully offline with zero third-party
   dependencies.
-- **`unsafe` policy.** `unsafe` is meant to live only in the hardware vcpu
-  backends (`vcpu::hvf`, later `vcpu::kvm`) — the interpreter path has none.
-  One deliberate, documented exception: `fs::passthrough` hand-declares a
-  handful of dirfd-relative `*at(2)` FFI calls (`openat`/`unlinkat`/
-  `mkdirat`/`symlinkat`/`renameat`/`readlinkat`/`fdopendir`/`readdir`) because
-  safe, TOCTOU-free path confinement genuinely requires them and `std`
-  exposes none of it. Resolution walks the host path one component at a time
+- **`unsafe` policy.** `unsafe` is confined to three documented sites; the
+  interpreter and kernel paths have none. (1) `vcpu::hvf` — the
+  Hypervisor.framework FFI (`hv_vm_*`/`hv_vcpu_*`); `vcpu::kvm` will be the
+  Linux equivalent. (2) `vcpu::region` — one 16 KiB-aligned `alloc_zeroed`
+  allocation of guest RAM (a hardware backend maps its raw pointer into the
+  guest; safe `std` can't express over-aligned allocation), with all raw
+  pointer access wrapped in checked copy methods. (3) `fs::passthrough` —
+  hand-declares a handful of dirfd-relative `*at(2)` FFI calls (`openat`/
+  `unlinkat`/`mkdirat`/`symlinkat`/`renameat`/`readlinkat`/`fdopendir`/
+  `readdir`) because safe, TOCTOU-free path confinement genuinely requires them
+  and `std` exposes none of it. Resolution walks the host path one component at a time
   from a dirfd opened on the mount root, with `O_NOFOLLOW` on every
   component; a symlink is never handed to the kernel to auto-follow — its
   target is read and re-spliced into the walk, re-anchored so an absolute

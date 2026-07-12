@@ -95,15 +95,15 @@ Each phase is a vertical slice that ends in something runnable and testable.
 "Syscalls" lists the *new* surface introduced. Numbers are guidance, not
 contracts.
 
-> **Build order note.** The **interpreter path is being built first**, ahead of
-> HVF: the hardware backend needs macOS entitlements and can't run in CI,
-> whereas the interpreter makes the entire syscall engine testable on any
-> machine (and is exactly what the wasm demo needs). As a result, Phases 1-3
-> and most of Phases 6-8 and 10's aarch64/x86-64 ISA already work end-to-end on
-> the interpreter (253 unit + 8 integration tests), while `vcpu::hvf` remains a
-> compile-time stub (`new_vcpu` returns "not implemented") and `vcpu::kvm`
-> hasn't been started. Every step ships with tests. Status is marked per-phase
-> below.
+> **Build order note.** The **interpreter path was built first**, ahead of the
+> hardware backends: the interpreter makes the entire syscall engine testable on
+> any machine and in CI (and is exactly what the wasm demo needs), whereas HVF
+> needs a macOS entitlement + codesign to run. So Phases 1-8 and Phase 10's
+> aarch64/x86-64 ISA all work end-to-end on the interpreter (~446 tests). The
+> **HVF backend is now real** — a static program runs end-to-end on Apple
+> Silicon (Phase 1) — with `vcpu::select` falling back to the interpreter when
+> unentitled so CI stays green; `vcpu::kvm` is next and reuses the same seam.
+> Every step ships with tests. Status is marked per-phase below.
 
 ### Phase 0 — Scaffold ✅ (this commit)
 
@@ -115,25 +115,38 @@ its first unimplemented frontier; `nixvm` CLI (`run`/`shell`/`version`).
 - **Exit criteria:** `cargo build`, `cargo test`, `cargo clippy` all clean;
   `nixvm run -- <cmd>` walks the pipeline and reports the current frontier.
 
-### Phase 1 — HVF backend + first syscall  🟡 outcome met on interpreter; HVF pending
+### Phase 1 — HVF backend + first syscall  ✅ static program runs on hardware
 
 Bring up Hypervisor.framework on macOS/arm64. Create a VM, map a flat
-`GuestMemory`, create a vcpu at EL0/EL1, and trap `svc #0` into `Exit::Syscall`.
-Hand-load a tiny **static** arm64 program (raw bytes, no ELF yet) that does
-`write(1, "hi\n", 3); exit_group(0)`.
+`GuestMemory`, create a vcpu at EL0, and trap `svc #0` into `Exit::Syscall`.
 
-- **New:** `vcpu::hvf` FFI (`hv_vm_*`, `hv_vcpu_*`), ESR decode, register
-  get/set, PC advance. The crate's first `unsafe`.
-- **Syscalls:** `write` (to host stdio only), `exit_group`, `exit`.
-- **Exit criteria:** a static arm64 blob prints to stdout and exits with a
-  chosen code, entirely through the HVF run/serve loop.
-- **Status:** `tests/hello_interp.rs` meets this outcome on the interpreter.
-  `src/vcpu/hvf.rs` is still a module scaffold: `HvfBackend::new()` succeeds
-  but `new_vcpu()` unconditionally returns `VcpuError::Backend("not
-  implemented yet")` — no `hv_vm_*`/`hv_vcpu_*` FFI has landed. `vcpu::select`
-  still prefers HVF for an aarch64 guest on macOS/arm64, so callers that don't
-  force the interpreter (`prefer_interp(true)`, or the `run-elf`/`run-elf-x86`
-  harnesses, which always use it) hit that error on macOS/arm64 today.
+- **New:** `vcpu::hvf` (`hvf/{sys,vm,stub,vcpu,mod}.rs`) — hand-rolled
+  `hv_vm_*`/`hv_vcpu_*` FFI (the register constants are the ARM `MRS`/`MSR`
+  encodings), one process-global VM (`OnceLock`; Apple Silicon's small VM
+  quota), ESR decode, register get/set. The crate's hardware-virtualization
+  `unsafe`.
+- **Trap model:** the guest runs **MMU-off at EL0**, so its virtual addresses
+  are the IPAs of the contiguous `GuestMemory` region `hv_vm_map`'d into the VM
+  (guest VA == IPA — the same flat model the interpreter uses). A guest `svc`
+  traps to a process-global EL1 stub page (`hvc #0` in every vector slot) that
+  `hvc`s out to the host → `Exit::Syscall`; `set_syscall_ret` emulates the
+  `eret` back to EL0 from the captured `ELR_EL1`/`SPSR_EL1`. A guest access
+  outside the mapped region is a stage-2 abort → `Exit::MemFault`.
+- **Status: DONE for a single static program.** A guest doing
+  `write(1,"hi\n",3); exit(0)` runs entirely through HVF, driven by the real
+  `Kernel` run/serve loop, with syscalls dispatched off the hardware vcpu's
+  registers. `vcpu::select` probes `hv_vm_create` and **falls back to the
+  interpreter** when the process isn't entitled, so default `cargo test`/CI stay
+  green. Running HVF needs a codesigned binary — `scripts/hvf-test.sh` builds,
+  ad-hoc signs with `tests/hvf.entitlements` (`com.apple.security.hypervisor`),
+  and runs the `#[ignore]`d, `NIXVM_HVF=1`-gated tests; 3 pass on Apple Silicon,
+  incl. `program_write_exit_through_kernel`.
+- **Deferred to follow-up:** dynamic linking through HVF; multi-process (the one
+  IPA space holds a single process today — remap-on-context-switch via
+  `backing_generation` is the seam); SMP vcpu thread-affinity (`hv_vcpu` is
+  thread-bound, so M1 forces `ncpus=1` / the serial scheduler); and lazy/shared
+  copy-on-write via stage-2 `hv_vm_protect` (fork is eager-copy for now — see
+  the memory-model note in Phase 10).
 
 ### Phase 2 — Memory manager + static ELF loader  ✅ (interpreter path)
 
@@ -368,15 +381,36 @@ safe.
   syscall-filter policy exists yet — an infinite loop or fork bomb inside the
   guest is not currently contained by nixvm itself.
 
-### Phase 10 — Portability backends (KVM + interpreter) & x86-64 guests  🟡 both interpreters live; KVM/HVF not started
+### Phase 10 — Portability backends (KVM + interpreter) & x86-64 guests  🟡 interpreters live; HVF runs static programs; KVM not started
 
 Second and third backends, and the second guest arch.
 
 - `vcpu::kvm` — Linux; the `syscall`-trap-via-trampoline technique proven in
   univdreams' `kvm.rs` (LSTAR → `hlt;sysretq`, `KVM_EXIT_HLT` serviced by the
   same engine). arm64 KVM too. **Not started** — no `vcpu::kvm` module exists;
-  `vcpu::select` has a `// TODO(Phase 10): KVM on Linux` marker and always
+  `vcpu::select` has a `// TODO(Phase 10): KVM on Linux` marker and (on Linux)
   falls back to an interpreter.
+
+  **KVM reuses the exact backend seam HVF just proved** (see Phase 1): implement
+  `trait Vcpu` + `trait Backend` in a new `vcpu::kvm` module gated
+  `#[cfg(target_os = "linux")]`, and add it to `vcpu::select` with the **same
+  graceful-fallback pattern** — probe (`open("/dev/kvm")` + `KVM_CREATE_VM`),
+  and on failure fall through to the interpreter so non-KVM Linux / CI stays
+  green. Unlike HVF, KVM needs no entitlement and **can run in CI** (a Linux
+  runner with `/dev/kvm`), so its tests need not be `#[ignore]`d.
+
+  Memory: `GuestMemory` is now **one contiguous host allocation**
+  (`vcpu::region::Region`) exactly so a hardware backend can map it — use
+  `host_base()` (raw host pointer) as the `userspace_addr` of a
+  `KVM_SET_USER_MEMORY_REGION` (Linux host pages are 4 KiB, so there's none of
+  HVF's 16 KiB-alignment constraint), and `backing_generation()` to re-issue the
+  memory region when the backing changes (fork/execve) — the same
+  reconcile-on-generation-change the HVF vcpu does. `Exit::MemFault` + the
+  `cow_fault` seam are ready to drive EPT/stage-2 copy-on-write later. Like HVF,
+  the interpreter's flat model maps cleanly onto MMU-off guest-physical == guest
+  -virtual; for x86-64, prefer the univdreams long-mode + `hlt`-trampoline
+  approach; for arm64 KVM, mirror the HVF EL0 + `svc`-trap setup
+  (`KVM_ARM_VCPU_INIT`, exception/`HVC` exits).
 - `vcpu::interp` — software CPU (arm64 + x86-64 decode/execute), the
   no-acceleration fallback; the syscall gate is just another trap. **Live on
   both guest architectures.** The aarch64 interpreter (`src/vcpu/interp.rs`,
@@ -494,8 +528,8 @@ discipline held).
 
 | Risk / question                                                                 | Approach |
 | ------------------------------------------------------------------------------- | -------- |
-| **HVF syscall-trap ergonomics** — cleanest way to trap `svc` at low overhead.   | Prototype early in Phase 1; measure exit cost; consider running guest at EL1 with a minimal trap vector vs EL0 + EL1 stub. |
-| **Address-space model** — one flat guest AS per process; how to isolate procs.  | Per-process `GuestMemory`; COW at `fork`; HVF/KVM stage-2 or per-process VM. Decide in Phase 6. |
+| **HVF syscall-trap ergonomics** — cleanest way to trap `svc` at low overhead.   | ✅ **Resolved (Phase 1).** Guest at **EL0 + a minimal EL1 stub** (`hvc #0` in every vector slot) — `svc` traps to the stub, which `hvc`s out to the host; `set_syscall_ret` emulates the `eret`. Chosen because an EL0 `svc` traps to EL1 (`VBAR_EL1`), never straight to the host. Exit-cost measurement is a later optimization. |
+| **Address-space model** — one flat guest AS per process; how to isolate procs.  | ⏳ **Partially resolved.** `GuestMemory` is now **one contiguous host allocation per process** (`vcpu::region`), mapped into a **single shared IPA space** on the hardware backend; a hardware vcpu re-maps that window when `backing_generation()` changes (the seam for remap-on-context-switch across processes). Single-process works today; multi-process IPA multiplexing and stage-2 COW (`hv_vm_protect`/EPT driving the `cow_fault` seam) are the follow-up (M2). Interpreter isolates per-process by holding a distinct `GuestMemory`. |
 | **Signals on a trap-only model** — delivering async signals to guest threads.   | Interrupt the vcpu (`Exit::Interrupted`), push a signal frame, redirect PC — mirrors univdreams' `deliver_signal`. |
 | **Networking fidelity** — userspace TCP/IP vs host passthrough.                  | `smoltcp` NAT by default for isolation; opt-in host passthrough under policy. |
 | **Passthrough/hole escape** — a host symlink inside a shared path, or a TOCTOU swap of a component for a symlink by a concurrent thread, redirecting a lookup *outside* the mapped directory. | ✅ **Resolved.** `fs::passthrough` resolves every lookup component-by-component from a dirfd on the mount root with `O_NOFOLLOW`; a symlink's target is read and re-spliced into the walk (re-anchored so absolute targets and `..` chains can't climb above the root); the final syscall is always issued directly against `(parent_dirfd, name)` so a last-instant swap fails safely instead of redirecting. See README's `unsafe` policy note and `src/fs/passthrough.rs`'s tests. |
