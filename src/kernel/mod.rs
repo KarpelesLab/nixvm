@@ -862,7 +862,9 @@ impl Kernel {
     /// shares the caller's address space).
     ///
     /// `CLONE_VM` shares the address space (the new task's `mm` points at the
-    /// same [`Kernel::spaces`] slot); otherwise the space is copied. `CLONE_THREAD`
+    /// same [`Kernel::spaces`] slot); otherwise the space is copied. The one
+    /// exception is `vfork` (`CLONE_VM | CLONE_VFORK`, no `CLONE_THREAD`), which
+    /// is copied anyway — see the `is_vfork` comment below. `CLONE_THREAD`
     /// puts the new task in the caller's thread group (shared `tgid`, distinct
     /// `pid`/tid, not reaped by `wait4`). `CLONE_SETTLS` seeds the thread pointer;
     /// the `*_SETTID`/`CHILD_CLEARTID` flags write/clear the tid words musl's
@@ -871,6 +873,7 @@ impl Kernel {
     /// fds between each other after creation).
     fn sys_clone(&mut self, args: &[u64; 6], vcpu: &mut dyn Vcpu, mem: &mut GuestMemory) -> i64 {
         const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_VFORK: u64 = 0x0000_4000;
         const CLONE_THREAD: u64 = 0x0001_0000;
         const CLONE_SETTLS: u64 = 0x0008_0000;
         const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
@@ -887,8 +890,20 @@ impl Kernel {
             Arch::X86_64 => (args[4], args[3]),
             Arch::Aarch64 => (args[3], args[4]),
         };
-        let share_vm = flags & CLONE_VM != 0;
+        // `vfork` (CLONE_VM | CLONE_VFORK, no CLONE_THREAD) asks to *borrow* the
+        // parent's address space, relying on real page tables: the child runs in
+        // it only until it `execve`s (which installs a fresh mm) or `_exit`s,
+        // with the parent frozen meanwhile. This kernel's `execve` replaces the
+        // space in place (`*mem = new_mem`), so a truly shared slot would be
+        // clobbered out from under the parent shell — the classic symptom being
+        // `vi` and the shell fighting for the console. We instead give `vfork` a
+        // copied address space (plain-fork semantics), which is the standard
+        // user-mode emulation (QEMU does the same) and correct for how libc uses
+        // it: the child only ever `execve`s or `_exit`s before touching memory.
+        // Genuine threads always set CLONE_THREAD and keep sharing.
         let is_thread = flags & CLONE_THREAD != 0;
+        let is_vfork = flags & CLONE_VFORK != 0;
+        let share_vm = flags & CLONE_VM != 0 && (is_thread || !is_vfork);
 
         let pid = self.next_pid;
         self.next_pid += 1;
@@ -2399,6 +2414,63 @@ mod tests {
         assert_eq!(reaped, 2);
         // WIFEXITED status: (code & 0xff) << 8
         assert_eq!(mem.read_u32(ws).unwrap(), 7 << 8);
+    }
+
+    #[test]
+    fn vfork_copies_the_address_space_but_a_thread_shares_it() {
+        // vfork = CLONE_VM | CLONE_VFORK (no CLONE_THREAD). Real Linux lets the
+        // child borrow the parent's mm until it execs, but this kernel's execve
+        // replaces the space in place, so a shared slot would be clobbered out
+        // from under the parent (vi/sh fighting for the console). vfork must get
+        // its own copied space; only genuine threads keep sharing.
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_VFORK: u64 = 0x0000_4000;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+
+        // Give the parent a real address-space slot at index 0.
+        let (mut k, mut mem, mut v) = setup();
+        k.spaces.push(Arc::new(Mutex::new(mem.clone())));
+        k.cur.mm = 0;
+
+        let child = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [CLONE_VM | CLONE_VFORK, 0, 0, 0, 0, 0],
+        );
+        let cmm = k
+            .procs
+            .iter()
+            .flatten()
+            .find(|p| p.info.pid == child as i32)
+            .unwrap()
+            .info
+            .mm;
+        assert_ne!(
+            cmm, k.cur.mm,
+            "vfork child gets its own copied address space"
+        );
+
+        let thread = call(
+            &mut k,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [CLONE_VM | CLONE_THREAD, 0, 0, 0, 0, 0],
+        );
+        let tmm = k
+            .procs
+            .iter()
+            .flatten()
+            .find(|p| p.info.pid == thread as i32)
+            .unwrap()
+            .info
+            .mm;
+        assert_eq!(
+            tmm, k.cur.mm,
+            "a real thread shares the caller's address space"
+        );
     }
 
     /// Build a bare task record for scheduler/thread-table tests.

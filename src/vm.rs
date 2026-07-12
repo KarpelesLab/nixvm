@@ -135,7 +135,10 @@ impl Vm {
         kernel.set_interactive(true);
         kernel.set_stdout(Box::new(CaptureSink(stdout.clone())));
         kernel.set_stderr(Box::new(CaptureSink(stderr.clone())));
-        kernel.set_cwd("/root");
+        // Start at `/` so the demo's hard-coded `/ $` prompt is accurate and a
+        // bare `ls` lists the populated root (Alpine's /root home is empty, which
+        // made `ls` look like it did nothing).
+        kernel.set_cwd("/");
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
         kernel.boot(vcpu, mem);
