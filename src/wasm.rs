@@ -215,8 +215,13 @@ mod browser {
     /// term.write_stdin(new TextEncoder().encode("uname -a\n"));
     /// const out = term.pump();        // Uint8Array of stdout+stderr
     /// xterm.write(out);
-    /// if (!term.is_running()) { /* exited with term.exit_code() */ }
+    /// // once !term.is_running(), term.exit_code() has the exit code
     /// ```
+    //
+    // NOTE: keep this doc comment free of `*/` — wasm-bindgen copies it verbatim
+    // into the generated `pkg/nixvm.js` as a `/** … */` JSDoc block, and a `*/`
+    // inside (e.g. a JS block comment) would close that block early and produce
+    // an "Unexpected token" syntax error in the module.
     #[wasm_bindgen]
     pub struct Terminal {
         vm: crate::vm::Vm,
