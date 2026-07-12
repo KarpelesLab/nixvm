@@ -430,8 +430,10 @@ fn fpu_read_f32(mem: &GuestMemory, addr: u64) -> Result<f64, Step> {
 #[allow(clippy::cast_possible_truncation)] // FST/FSTP m32fp is exactly this narrowing
 fn fpu_write_f32(mem: &mut GuestMemory, addr: u64, v: f64) -> Result<(), Step> {
     let bytes = (v as f32).to_le_bytes();
-    mem.write(addr, &bytes)
-        .map_err(|_| Step::Fault { addr, write: true })
+    mem.write_trap(addr, &bytes).map_err(|e| Step::Fault {
+        addr: e.fault_addr(),
+        write: true,
+    })
 }
 
 fn fpu_read_f64(mem: &GuestMemory, addr: u64) -> Result<f64, Step> {
@@ -442,8 +444,11 @@ fn fpu_read_f64(mem: &GuestMemory, addr: u64) -> Result<f64, Step> {
 }
 
 fn fpu_write_f64(mem: &mut GuestMemory, addr: u64, v: f64) -> Result<(), Step> {
-    mem.write(addr, &v.to_le_bytes())
-        .map_err(|_| Step::Fault { addr, write: true })
+    mem.write_trap(addr, &v.to_le_bytes())
+        .map_err(|e| Step::Fault {
+            addr: e.fault_addr(),
+            write: true,
+        })
 }
 
 fn fpu_read_f80(mem: &GuestMemory, addr: u64) -> Result<f64, Step> {
@@ -456,8 +461,11 @@ fn fpu_read_f80(mem: &GuestMemory, addr: u64) -> Result<f64, Step> {
 }
 
 fn fpu_write_f80(mem: &mut GuestMemory, addr: u64, v: f64) -> Result<(), Step> {
-    mem.write(addr, &f64_to_f80_bytes(v))
-        .map_err(|_| Step::Fault { addr, write: true })
+    mem.write_trap(addr, &f64_to_f80_bytes(v))
+        .map_err(|e| Step::Fault {
+            addr: e.fault_addr(),
+            write: true,
+        })
 }
 
 /// `FILD`/`FIADD`/`FICOM`/... source: a `width`-bit two's-complement
@@ -475,8 +483,10 @@ fn fpu_read_int(mem: &GuestMemory, addr: u64, width: u32) -> Result<i64, Step> {
 fn fpu_write_int(mem: &mut GuestMemory, addr: u64, val: i64, width: u32) -> Result<(), Step> {
     let n = (width / 8) as usize;
     let bytes = (val as u64).to_le_bytes();
-    mem.write(addr, &bytes[..n])
-        .map_err(|_| Step::Fault { addr, write: true })
+    mem.write_trap(addr, &bytes[..n]).map_err(|e| Step::Fault {
+        addr: e.fault_addr(),
+        write: true,
+    })
 }
 
 /// The `D8`/`DA`/`DC`/`DE` memory-form arithmetic source, at the width `w`
@@ -832,10 +842,11 @@ impl X86Interp {
 
     fn push(&mut self, mem: &mut GuestMemory, val: u64) -> Result<(), Step> {
         let sp = self.gpr[RSP].wrapping_sub(8);
-        mem.write(sp, &val.to_le_bytes()).map_err(|_| Step::Fault {
-            addr: sp,
-            write: true,
-        })?;
+        mem.write_trap(sp, &val.to_le_bytes())
+            .map_err(|e| Step::Fault {
+                addr: e.fault_addr(),
+                write: true,
+            })?;
         self.gpr[RSP] = sp;
         Ok(())
     }
@@ -991,8 +1002,8 @@ impl X86Interp {
             Operand::Mem(a) => {
                 let n = (width / 8) as usize;
                 let bytes = val.to_le_bytes();
-                mem.write(a, &bytes[..n]).map_err(|_| Step::Fault {
-                    addr: a,
+                mem.write_trap(a, &bytes[..n]).map_err(|e| Step::Fault {
+                    addr: e.fault_addr(),
                     write: true,
                 })
             }
@@ -1046,10 +1057,12 @@ impl X86Interp {
                 self.xmm[r] = val;
                 Ok(())
             }
-            Operand::Mem(a) => mem.write(a, &val.to_le_bytes()).map_err(|_| Step::Fault {
-                addr: a,
-                write: true,
-            }),
+            Operand::Mem(a) => mem
+                .write_trap(a, &val.to_le_bytes())
+                .map_err(|e| Step::Fault {
+                    addr: e.fault_addr(),
+                    write: true,
+                }),
             Operand::Reg8Hi(_) => unreachable!("SSE decode never yields an 8-bit-high operand"),
         }
     }
@@ -2141,10 +2154,13 @@ impl X86Interp {
                         write: false
                     })
             );
-            fetch!(mem.write(self.gpr[RDI], &b[..n]).map_err(|_| Step::Fault {
-                addr: self.gpr[RDI],
-                write: true
-            }));
+            fetch!(
+                mem.write_trap(self.gpr[RDI], &b[..n])
+                    .map_err(|e| Step::Fault {
+                        addr: e.fault_addr(),
+                        write: true
+                    })
+            );
             self.gpr[RSI] = self.advance_ptr(self.gpr[RSI], step);
             self.gpr[RDI] = self.advance_ptr(self.gpr[RDI], step);
             count -= 1;
@@ -2165,9 +2181,9 @@ impl X86Interp {
         while count > 0 {
             let bytes = val.to_le_bytes();
             fetch!(
-                mem.write(self.gpr[RDI], &bytes[..n])
-                    .map_err(|_| Step::Fault {
-                        addr: self.gpr[RDI],
+                mem.write_trap(self.gpr[RDI], &bytes[..n])
+                    .map_err(|e| Step::Fault {
+                        addr: e.fault_addr(),
                         write: true
                     })
             );
@@ -2581,8 +2597,8 @@ impl X86Interp {
                     let src = mask_w(self.xmm[modrm.reg] as u64, w);
                     let n = (w / 8) as usize;
                     let bytes = src.to_le_bytes();
-                    fetch!(mem.write(a, &bytes[..n]).map_err(|_| Step::Fault {
-                        addr: a,
+                    fetch!(mem.write_trap(a, &bytes[..n]).map_err(|e| Step::Fault {
+                        addr: e.fault_addr(),
                         write: true
                     }));
                 }
@@ -2652,10 +2668,13 @@ impl X86Interp {
         match rm_op {
             Operand::Reg(r) => self.xmm[r] = u128::from(lo),
             Operand::Mem(a) => {
-                fetch!(mem.write(a, &lo.to_le_bytes()).map_err(|_| Step::Fault {
-                    addr: a,
-                    write: true
-                }));
+                fetch!(
+                    mem.write_trap(a, &lo.to_le_bytes())
+                        .map_err(|e| Step::Fault {
+                            addr: e.fault_addr(),
+                            write: true
+                        })
+                );
             }
             Operand::Reg8Hi(_) => unreachable!("SSE decode never yields an 8-bit-high operand"),
         }
@@ -3487,10 +3506,10 @@ impl X86Interp {
                     7 => {
                         // FNSTCW m2byte
                         let bytes = self.fpu_cw.to_le_bytes();
-                        fetch!(
-                            mem.write(addr, &bytes)
-                                .map_err(|_| Step::Fault { addr, write: true })
-                        );
+                        fetch!(mem.write_trap(addr, &bytes).map_err(|e| Step::Fault {
+                            addr: e.fault_addr(),
+                            write: true,
+                        }));
                         self.next(pc2)
                     }
                     // /1, FLDENV (/4), FNSTENV (/6): not in our documented subset
@@ -3659,8 +3678,11 @@ impl X86Interp {
                     7 => {
                         let sw = self.fpu_sw(); // FNSTSW m2byte
                         fetch!(
-                            mem.write(addr, &sw.to_le_bytes())
-                                .map_err(|_| Step::Fault { addr, write: true })
+                            mem.write_trap(addr, &sw.to_le_bytes())
+                                .map_err(|e| Step::Fault {
+                                    addr: e.fault_addr(),
+                                    write: true,
+                                })
                         );
                         self.next(pc2)
                     }

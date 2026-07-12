@@ -198,8 +198,11 @@ impl Aarch64Interp {
         } else {
             self.note_store(addr, self.v[rt], nbytes);
             let bytes = self.v[rt].to_le_bytes();
-            if mem.write(addr, &bytes[..nbytes]).is_err() {
-                return Step::Fault { addr, write: true };
+            if let Err(e) = mem.write_trap(addr, &bytes[..nbytes]) {
+                return Step::Fault {
+                    addr: e.fault_addr(),
+                    write: true,
+                };
             }
         }
         Step::Next
@@ -372,8 +375,11 @@ impl Aarch64Interp {
             let value = self.read_x(rt);
             self.note_store(addr, u128::from(value), nbytes);
             let val = value.to_le_bytes();
-            if mem.write(addr, &val[..nbytes]).is_err() {
-                return Step::Fault { addr, write: true };
+            if let Err(e) = mem.write_trap(addr, &val[..nbytes]) {
+                return Step::Fault {
+                    addr: e.fault_addr(),
+                    write: true,
+                };
             }
             return Step::Next;
         }
@@ -402,7 +408,10 @@ impl Aarch64Interp {
         val: u64,
     ) -> bool {
         self.note_store(addr, u128::from(val), nbytes);
-        mem.write(addr, &val.to_le_bytes()[..nbytes]).is_ok()
+        // `write_trap` so a copy-on-write page faults (the atomic is retried
+        // after the kernel privatizes it). LSE atomics are naturally aligned, so
+        // the access lies in one page and the caller's `addr` names that page.
+        mem.write_trap(addr, &val.to_le_bytes()[..nbytes]).is_ok()
     }
 
     /// CAS/CASA/CASL/CASAL (and the CASB/CASH byte/halfword forms): compare
@@ -658,8 +667,10 @@ impl Aarch64Interp {
                     // DC_ZVA_BLOCK_BYTES bytes (see that const).
                     let addr = self.read_x(rt) & !(DC_ZVA_BLOCK_BYTES - 1);
                     self.note_store(addr, 0u128, DC_ZVA_BLOCK_BYTES as usize);
+                    // Block-aligned and ≤ one page, so `addr` names the faulting
+                    // (COW) page directly.
                     if mem
-                        .write(addr, &[0u8; DC_ZVA_BLOCK_BYTES as usize])
+                        .write_trap(addr, &[0u8; DC_ZVA_BLOCK_BYTES as usize])
                         .is_err()
                     {
                         Step::Fault { addr, write: true }
@@ -1324,9 +1335,9 @@ impl Aarch64Interp {
                 } else {
                     self.note_store(a, self.v[r], nbytes);
                     let bytes = self.v[r].to_le_bytes();
-                    if mem.write(a, &bytes[..nbytes]).is_err() {
+                    if let Err(e) = mem.write_trap(a, &bytes[..nbytes]) {
                         return Step::Fault {
-                            addr: a,
+                            addr: e.fault_addr(),
                             write: true,
                         };
                     }
@@ -1418,7 +1429,17 @@ impl Aarch64Interp {
                     return Step::Next;
                 }
                 let step = self.ldst(addr, size, 0b00, rt, mem);
-                self.excl_monitor = false; // consumed by this attempt either way
+                if let Step::Fault { .. } = step {
+                    // The store faulted (e.g. a copy-on-write page not yet
+                    // privatized) and will be retried from the same PC — it did
+                    // not architecturally complete. `ldst` already cleared the
+                    // monitor via `note_store`, so restore it, or the retry would
+                    // see a closed monitor and spuriously fail the store (losing
+                    // the write for a lone STXR with no retry loop).
+                    self.excl_monitor = true;
+                    return step;
+                }
+                self.excl_monitor = false; // consumed by a completed attempt
                 if matches!(step, Step::Next) {
                     self.write_x(rs, 0); // status = 0: success
                 }
@@ -1472,9 +1493,9 @@ impl Aarch64Interp {
                 } else {
                     self.note_store(a, u128::from(self.read_x(r)), nbytes);
                     let val = self.read_x(r).to_le_bytes();
-                    if mem.write(a, &val[..nbytes]).is_err() {
+                    if let Err(e) = mem.write_trap(a, &val[..nbytes]) {
                         return Step::Fault {
-                            addr: a,
+                            addr: e.fault_addr(),
                             write: true,
                         };
                     }
@@ -4808,6 +4829,53 @@ mod tests {
         assert_eq!(c.sp, sp, "sp restored to its original value");
     }
 
+    /// End-to-end copy-on-write: a guest `STR` into a page shared by `fork`
+    /// surfaces as a precise write fault (the vcpu emits `MemFault`, PC parked on
+    /// the store); after the kernel-side `cow_fault` privatizes the page, the
+    /// re-run store lands, and the forked sibling space never sees the write.
+    #[test]
+    fn store_into_cow_page_faults_then_privatizes_and_retries() {
+        let base = 0x1_0000u64;
+        let data = base + 4 * PAGE_SIZE; // 0x1_4000 — page-aligned data page
+        let mut mem = GuestMemory::new(base, 8 * PAGE_SIZE);
+        mem.map(base, PAGE_SIZE, Prot::rx()).unwrap();
+        mem.map(data, PAGE_SIZE, Prot::rw()).unwrap();
+        mem.write_init(data, &0xAAu64.to_le_bytes()).unwrap(); // seed shared value
+
+        let program: [u32; 5] = [
+            0xD288_0001, // movz x1,#0x4000
+            0xF2A0_0021, // movk x1,#1,lsl#16   -> x1 = 0x1_4000 (data)
+            0xD280_0840, // movz x0,#0x42
+            0xF900_0020, // str  x0,[x1]
+            0xD400_0001, // svc
+        ];
+        let mut bytes = Vec::new();
+        for w in program {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mem.write_init(base, &bytes).unwrap();
+
+        // Fork: the data page becomes copy-on-write, aliased by the sibling.
+        let sibling = mem.fork();
+
+        let mut c = Aarch64Interp::new(base, base + 7 * PAGE_SIZE);
+        // The STR into the shared page faults precisely at that page...
+        assert_eq!(
+            c.run(&mut mem).unwrap(),
+            Exit::MemFault {
+                addr: data,
+                write: true
+            }
+        );
+        // ...the page-fault handler privatizes it (retry warranted)...
+        assert!(mem.cow_fault(data, true));
+        // ...and re-running from the parked PC completes the store, hits the svc.
+        assert_eq!(c.run(&mut mem).unwrap(), Exit::Syscall);
+        assert_eq!(mem.read_u64(data).unwrap(), 0x42);
+        // The sibling's copy is untouched — true isolation, no shared mutation.
+        assert_eq!(sibling.read_u64(data).unwrap(), 0xAA);
+    }
+
     #[test]
     fn indexed_and_register_offset_load_store() {
         let base = 0x1_0000u64;
@@ -4883,6 +4951,44 @@ mod tests {
         let mut buf = [0u8; 8];
         m.read(addr, &mut buf).unwrap();
         assert_eq!(u64::from_le_bytes(buf), 0x99, "STXR's store took effect");
+    }
+
+    /// Regression: a store-exclusive into a copy-on-write page must not consume
+    /// the exclusive monitor on its *faulting* attempt. Otherwise the retry
+    /// (after the kernel privatizes the page) would see a closed monitor, report
+    /// spurious exclusive-failure, and drop the store — silently losing a write
+    /// for a lone STXR with no surrounding retry loop.
+    #[test]
+    fn stxr_into_cow_page_keeps_monitor_and_succeeds_on_retry() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        let addr = base + 0x40;
+        m.write(addr, &0x42u64.to_le_bytes()).unwrap();
+        c.x[1] = addr;
+        // ldxr x0,[x1] opens the monitor (a load never COW-faults).
+        assert!(matches!(c.exec(0xC85F_7C20, &mut m), Step::Next));
+        // Fork *after* opening the monitor: the data page is now COW-shared.
+        let sibling = m.fork();
+        c.x[3] = 0x99;
+        // stxr w2,x3,[x1] faults on the COW page (the store did not complete)...
+        let step = c.exec(0xC802_7C23, &mut m);
+        let Step::Fault { addr: fa, write } = step else {
+            panic!("STXR into a COW page must fault");
+        };
+        assert!(write);
+        assert!(
+            c.excl_monitor,
+            "a faulting STXR must not consume the monitor"
+        );
+        // ...the handler privatizes the page...
+        assert!(m.cow_fault(fa, true));
+        // ...and the retried STXR now completes: success status and the store.
+        assert!(matches!(c.exec(0xC802_7C23, &mut m), Step::Next));
+        assert_eq!(c.x[2], 0, "STXR reports success on retry");
+        assert_eq!(m.read_u64(addr).unwrap(), 0x99, "store took effect");
+        assert_eq!(sibling.read_u64(addr).unwrap(), 0x42, "sibling untouched");
     }
 
     #[test]

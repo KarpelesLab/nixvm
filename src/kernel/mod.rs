@@ -481,12 +481,22 @@ impl Kernel {
             }
             Exit::Interrupted => Serviced::Resume,
             Exit::MemFault { addr, write } => {
-                eprintln!(
-                    "[fault] pid {} memory fault at {addr:#x} (write={write})",
-                    self.cur.pid
-                );
-                self.cur.run = RunState::Zombie(139);
-                Serviced::Ended
+                // A write fault on a copy-on-write page is resolved by
+                // privatizing the page and re-running the instruction (the vcpu
+                // left PC on the faulting store). Anything else — a read fault, a
+                // write to read-only/unmapped memory, or an already-private page
+                // — is a genuine segfault. This is the software mirror of a
+                // hardware MMU's page-fault-driven COW.
+                if mem.cow_fault(addr, write) {
+                    Serviced::Resume
+                } else {
+                    eprintln!(
+                        "[fault] pid {} memory fault at {addr:#x} (write={write})",
+                        self.cur.pid
+                    );
+                    self.cur.run = RunState::Zombie(139);
+                    Serviced::Ended
+                }
             }
             Exit::IllegalInstruction { pc } => {
                 eprintln!(
@@ -922,8 +932,10 @@ impl Kernel {
             info.is_thread = false;
         }
 
-        // Address space: share the caller's slot (CLONE_VM) or take a fresh copy.
-        let mut child_mem = if share_vm { None } else { Some(mem.clone()) };
+        // Address space: share the caller's slot (CLONE_VM), or fork a
+        // copy-on-write child (both parent and child pages become shared and
+        // read-on-write until the first store privatizes a page).
+        let mut child_mem = if share_vm { None } else { Some(mem.fork()) };
         info.mm = if share_vm {
             self.cur.mm
         } else {
@@ -2429,7 +2441,7 @@ mod tests {
 
         // Give the parent a real address-space slot at index 0.
         let (mut k, mut mem, mut v) = setup();
-        k.spaces.push(Arc::new(Mutex::new(mem.clone())));
+        k.spaces.push(Arc::new(Mutex::new(mem.fork())));
         k.cur.mm = 0;
 
         let child = call(
