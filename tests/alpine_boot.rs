@@ -111,6 +111,82 @@ fn boots_alpine_from_in_memory_squashfs_overlay() {
     );
 }
 
+/// Live host-egress smoke test: boot Alpine with `NIXVM_NET=host` set and run
+/// `apk update` against the real mirror over plain HTTP. Gated on **both**
+/// `NIXVM_ALPINE_TAR` *and* `NIXVM_NET=host` (so CI, with neither, skips it)
+/// and needs real outbound internet. Proves the full egress path: DNS over a
+/// host UDP socket, TCP connect passthrough, and poll/read/write bridging.
+#[cfg(feature = "fstool")]
+#[test]
+fn apk_update_over_host_egress() {
+    let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
+        eprintln!("NIXVM_ALPINE_TAR not set; skipping egress test");
+        return;
+    };
+    if std::env::var("NIXVM_NET").ok().as_deref() != Some("host") {
+        eprintln!("NIXVM_NET != host; skipping egress test");
+        return;
+    }
+    let tar = std::fs::read(&tar_path).expect("read Alpine tar");
+    let mut vm = Vm::boot_squashfs(
+        &tar,
+        vec!["/bin/busybox".to_string(), "sh".to_string()],
+        256 * 1024 * 1024,
+    )
+    .expect("boot");
+    // Spin-pump: a guest blocked on async host I/O needs the driver to keep
+    // pumping until the network completes.
+    let drain = |vm: &mut Vm| -> String {
+        let mut out = Vec::new();
+        let mut idle = 0;
+        for _ in 0..2_000_000 {
+            let step = vm.pump().expect("pump");
+            let got = !step.stdout.is_empty() || !step.stderr.is_empty();
+            out.extend_from_slice(&step.stdout);
+            out.extend_from_slice(&step.stderr);
+            if step.exit_code.is_some() {
+                break;
+            }
+            if got {
+                idle = 0;
+                continue;
+            }
+            idle += 1;
+            if idle > 3000 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    };
+    let _ = drain(&mut vm);
+    // apk's aarch64 build starts up through NEON instructions the interpreter
+    // doesn't decode yet (LD2/3/4 de-interleave, LDR-SIMD register offset), so
+    // it can't run there regardless of networking. The egress path itself is
+    // arch-agnostic (it lives in the kernel); assert the full apk flow only on
+    // x86-64, where the interpreter is complete enough.
+    vm.write_stdin(b"uname -m\n");
+    let machine = drain(&mut vm);
+    if !machine.contains("x86_64") {
+        eprintln!(
+            "guest is not x86_64 ({}); apk needs more NEON interpreter coverage, \
+             skipping the apk assertion (egress itself is arch-agnostic)",
+            machine.trim()
+        );
+        return;
+    }
+
+    // The stock repositories are https; the minirootfs has no CA certs, so
+    // rewrite to http for this smoke test (egress itself is scheme-agnostic).
+    vm.write_stdin(b"sed -i 's|https|http|' /etc/apk/repositories; apk update; echo DONE=$?\n");
+    let out = drain(&mut vm);
+    eprintln!("--- apk update ---\n{out}");
+    assert!(
+        out.contains("packages available") && out.contains("DONE=0"),
+        "apk update should succeed over host egress, got: {out:?}"
+    );
+}
+
 /// Same, but from the *compressed* `.tar.gz`, decompressed in-process via
 /// `compcol` (the path the browser demo takes). Gated on the `targz` feature
 /// and `NIXVM_ALPINE_TARGZ` pointing at the `.tar.gz`.

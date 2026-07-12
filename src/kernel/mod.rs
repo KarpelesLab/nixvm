@@ -23,6 +23,7 @@ use crate::loader::{ProcessSpec, interp_path, load_dynamic, load_static};
 use crate::vcpu::mem::{PAGE_SIZE, Prot};
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 
+pub mod egress;
 mod fd;
 mod fs_ext;
 mod mem_syscalls;
@@ -264,6 +265,14 @@ impl Kernel {
     /// Redirect the source backing guest fd 0 (`stdin`).
     pub fn set_stdin(&mut self, r: Box<dyn Read + Send>) {
         self.stdin = r;
+    }
+
+    /// Install a host-network egress backend: guest `connect`s to routable
+    /// addresses (and UDP/DNS) are bridged onto real host sockets, so
+    /// `apk`/`curl`/`npm` reach the internet. Without this the network is
+    /// loopback-only. See [`crate::kernel::egress`].
+    pub fn set_egress(&mut self, egress: Box<dyn egress::Egress>) {
+        self.net.set_egress(egress);
     }
 
     /// Set the initial heap window for the first process: `start` is the program
@@ -734,6 +743,7 @@ impl Kernel {
             Sysno::Getdents64 => self.sys_getdents64(args[0], args[1], args[2], mem),
             Sysno::Getcwd => self.sys_getcwd(args[0], args[1], mem),
             Sysno::Chdir => self.sys_chdir(args[0], mem),
+            Sysno::Fchdir => self.sys_fchdir(args[0]),
             Sysno::Statfs => self.sys_statfs(args[0], args[1], mem),
             Sysno::Fstatfs => self.sys_fstatfs(args[0], args[1], mem),
             Sysno::Readlinkat => {
@@ -752,6 +762,7 @@ impl Kernel {
             Sysno::Umask => self.sys_umask(args[0]),
             // No extended attributes: report "no such attribute".
             Sysno::Getxattr | Sysno::Lgetxattr | Sysno::Fgetxattr => err(Errno::ENODATA),
+            Sysno::Readv => self.sys_readv(args[0], args[1], args[2], mem),
             Sysno::Writev => self.sys_writev(args[0], args[1], args[2], mem),
             Sysno::Getrandom => self.sys_getrandom(args[0], args[1], mem),
             Sysno::Ioctl => err(Errno::ENOTTY),
@@ -912,6 +923,10 @@ impl Kernel {
             // files, so granting every request immediately is safe — apk
             // locks its database this way.
             | Sysno::Flock
+            // setitimer: wget/curl set an interval timer for request timeouts.
+            // Not modeled (no SIGALRM delivery yet) — a no-op just means the
+            // timeout never fires.
+            | Sysno::Setitimer
             | Sysno::Membarrier => 0,
             _ => {
                 *self.unsupported.entry(raw).or_default() += 1;
@@ -1374,6 +1389,31 @@ impl Kernel {
         data.len() as i64
     }
 
+    /// `readv(fd, iov, iovcnt)` — scatter a read across `struct iovec` entries.
+    /// A short read (or a blocking fd) stops after the first partially-filled
+    /// iovec, like the real syscall.
+    fn sys_readv(&mut self, fd: u64, iov: u64, iovcnt: u64, mem: &mut GuestMemory) -> i64 {
+        let mut total = 0i64;
+        for i in 0..iovcnt {
+            let ent = iov + i * 16;
+            let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
+                return if total > 0 { total } else { err(Errno::EFAULT) };
+            };
+            if len == 0 {
+                continue;
+            }
+            let r = self.sys_read(fd, base, len, mem);
+            if r < 0 {
+                return if total > 0 { total } else { r };
+            }
+            total += r;
+            if (r as u64) < len {
+                break; // short read: don't touch the remaining iovecs
+            }
+        }
+        total
+    }
+
     /// `writev(fd, iov, iovcnt)` — gather `struct iovec { base; len }` entries.
     fn sys_writev(&mut self, fd: u64, iov: u64, iovcnt: u64, mem: &GuestMemory) -> i64 {
         let mut total = 0i64;
@@ -1657,6 +1697,23 @@ impl Kernel {
             }
             Some(_) => err(Errno::ENOTDIR),
             None => err(Errno::ENOENT),
+        }
+    }
+
+    /// `fchdir(fd)` — change cwd to the directory `fd` refers to. apk's
+    /// busybox post-install triggers `fchdir` back to a saved dir fd.
+    fn sys_fchdir(&mut self, fd: u64) -> i64 {
+        let path = match self.cur.fds.get(fd as i32) {
+            Some(Fd::Dir { path, .. }) => path.clone(),
+            Some(_) => return err(Errno::ENOTDIR),
+            None => return err(Errno::EBADF),
+        };
+        match self.mounts.stat(&path) {
+            Some(a) if a.kind == NodeKind::Dir => {
+                self.cur.cwd = path;
+                0
+            }
+            _ => err(Errno::ENOTDIR),
         }
     }
 

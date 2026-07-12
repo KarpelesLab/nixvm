@@ -145,10 +145,12 @@ impl Kernel {
             // Host stdin readiness isn't tracked; assume data may be waiting.
             Fd::Stdin => POLLIN,
             Fd::Stdout | Fd::Stderr => POLLOUT,
-            // Regular files/dirs never block in this kernel; nor, per the
-            // module doc, do sockets (whose internals live in the sibling
-            // `net` module and are not observable from here).
-            Fd::File { .. } | Fd::Dir { .. } | Fd::Socket { .. } => POLLIN | POLLOUT,
+            // Regular files/dirs never block in this kernel.
+            Fd::File { .. } | Fd::Dir { .. } => POLLIN | POLLOUT,
+            // A host-bridged socket gets a precise readable answer (a peek);
+            // in-VM loopback sockets stay best-effort always-ready, since
+            // their queues aren't observable from here.
+            Fd::Socket { sock, .. } => self.host_socket_readiness(sock).unwrap_or(POLLIN | POLLOUT),
             Fd::PipeRead(i) => {
                 let p = &self.pipes[i];
                 if !p.buf.is_empty() {

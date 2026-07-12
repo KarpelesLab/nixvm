@@ -24,7 +24,14 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
+use super::egress::{Egress, HostConn, HostDgram};
 use super::{Fd, Kernel, err};
+
+impl Net {
+    pub(super) fn set_egress(&mut self, egress: Box<dyn Egress>) {
+        self.egress = Some(egress);
+    }
+}
 
 impl Errno {
     /// Not (yet) in [`crate::abi::errno::Errno`]'s generic subset — only this
@@ -34,6 +41,12 @@ impl Errno {
     const ENOTCONN: Errno = Errno(107);
     /// `socket(AF_NETLINK, _, protocol)` with an unsupported `protocol`.
     const EPROTONOSUPPORT: Errno = Errno(93);
+    /// A routable connect with no egress backend installed (loopback-only VM).
+    const ENETUNREACH: Errno = Errno(101);
+    /// A host `connect_tcp` that timed out.
+    const ETIMEDOUT: Errno = Errno(110);
+    /// A host socket read/write errored (connection reset).
+    const ECONNRESET: Errno = Errno(104);
 }
 
 const AF_UNIX: u16 = 1;
@@ -125,13 +138,29 @@ const RT_SCOPE_HOST: u8 = 254;
 const LOOPBACK_IFINDEX: i32 = 1;
 
 /// The kernel's socket table plus the AF_UNIX/AF_INET(6) address registries.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct Net {
     socks: Vec<Sock>,
     /// AF_UNIX path, or `"tcp4:port"`/`"tcp6:port"` -> listening slot.
     listeners: BTreeMap<String, usize>,
     /// `"udp4:port"`/`"udp6:port"` -> bound `Dgram` slot.
     dgram_ports: BTreeMap<String, usize>,
+    /// Host-egress backend. `None` = loopback-only (the default, and the only
+    /// possible mode with no backend installed); `Some` bridges guest
+    /// connections to *routable* addresses onto real host sockets. Installed
+    /// by [`Kernel::set_egress`].
+    egress: Option<Box<dyn Egress>>,
+}
+
+impl std::fmt::Debug for Net {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Net")
+            .field("socks", &self.socks)
+            .field("listeners", &self.listeners)
+            .field("dgram_ports", &self.dgram_ports)
+            .field("egress", &self.egress.is_some())
+            .finish()
+    }
 }
 
 /// One entry in the socket table.
@@ -224,6 +253,28 @@ enum Kind {
     Dgram(Dgram),
     /// An `AF_NETLINK`/`NETLINK_ROUTE` endpoint.
     Netlink(Netlink),
+    /// A stream socket bridged onto a real host connection (egress): the guest
+    /// `connect`ed to a routable address and the host-egress backend was
+    /// installed. Reads/writes go straight to [`HostConn`].
+    Host(HostSock),
+}
+
+/// A guest stream socket bridged onto a real host connection.
+struct HostSock {
+    conn: Box<dyn HostConn>,
+    /// The routable peer the guest connected to (for `getpeername`).
+    peer: InetAddr,
+    /// The guest's `shutdown(SHUT_WR)` has been forwarded to the host.
+    wr_shut: bool,
+    nonblock: bool,
+}
+
+// Only `peer` is meaningful in a dump; the boxed conn and flags are noise.
+#[allow(clippy::missing_fields_in_debug)]
+impl std::fmt::Debug for HostSock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostSock").field("peer", &self.peer).finish()
+    }
 }
 
 /// A connected socket: `to[e]` holds bytes destined for end `e` (so end `e`
@@ -263,11 +314,27 @@ impl Pair {
 /// A `SOCK_DGRAM` endpoint: `local` is the bound (or lazily ephemeral-assigned)
 /// address, `peer` is the `connect()`-ed destination (if any), and `queue`
 /// holds inbound `(source address, payload)` datagrams awaiting `recv`.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Dgram {
     local: Option<InetAddr>,
     peer: Option<InetAddr>,
     queue: VecDeque<(InetAddr, Vec<u8>)>,
+    /// A host UDP socket, opened lazily the first time this datagram socket
+    /// sends to a *routable* address with egress enabled. Once present, all
+    /// sends go out through it and inbound host datagrams are drained into
+    /// `queue` on recv. `None` = pure in-VM datagram socket.
+    host: Option<Box<dyn HostDgram>>,
+}
+
+impl std::fmt::Debug for Dgram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dgram")
+            .field("local", &self.local)
+            .field("peer", &self.peer)
+            .field("queue", &self.queue)
+            .field("host", &self.host.is_some())
+            .finish()
+    }
 }
 
 /// An `AF_NETLINK` endpoint (only `NETLINK_ROUTE` is modeled). There is no
@@ -655,10 +722,27 @@ impl Kernel {
         if mismatched {
             return err(Errno::EINVAL);
         }
-        if let Addr::Inet(a) = &target
-            && !a.valid_bind()
-        {
-            return err(Errno::ECONNREFUSED); // no route beyond this VM's loopback
+        // A routable (non-loopback) destination: with a host-egress backend
+        // installed, bridge it to the real internet; without one, it's
+        // unreachable (loopback-only VM).
+        let routable = matches!(&target, Addr::Inet(a) if !a.valid_bind());
+        if routable {
+            let Addr::Inet(dest) = target else {
+                unreachable!("routable implies Inet")
+            };
+            if matches!(self.net.socks[sock].kind, Kind::Dgram(_)) {
+                // UDP: remember the routable peer; the host socket is opened
+                // lazily on first send (see `send_bytes`/`write_socket`).
+                if self.net.egress.is_none() {
+                    return err(Errno::ENETUNREACH);
+                }
+                self.ensure_dgram_bound(sock);
+                if let Kind::Dgram(d) = &mut self.net.socks[sock].kind {
+                    d.peer = Some(dest);
+                }
+                return 0;
+            }
+            return self.connect_host(sock, end, dest);
         }
 
         if matches!(self.net.socks[sock].kind, Kind::Dgram(_)) {
@@ -714,6 +798,37 @@ impl Kernel {
             backlog.push_back(sock);
         }
         0
+    }
+
+    /// Bridge a stream socket onto a real host connection to routable `dest`
+    /// (egress). The socket must be an idle client end. Returns `0` on a
+    /// completed connection (the host `connect` is synchronous here), else a
+    /// negative errno.
+    fn connect_host(&mut self, sock: usize, end: usize, dest: InetAddr) -> i64 {
+        if !matches!(&self.net.socks[sock].kind, Kind::Idle { .. } if end == 0) {
+            return err(Errno::EINVAL);
+        }
+        let Some(egress) = &self.net.egress else {
+            return err(Errno::ENETUNREACH);
+        };
+        match egress.connect_tcp(dest.ip, dest.v6, dest.port) {
+            Ok(conn) => {
+                let nonblock = self.net.socks[sock].nonblock;
+                self.net.socks[sock].kind = Kind::Host(HostSock {
+                    conn,
+                    peer: dest,
+                    wr_shut: false,
+                    nonblock,
+                });
+                0
+            }
+            // Map the common connect failures to the errnos guest clients
+            // branch on; anything else is a generic "connection refused".
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::TimedOut => err(Errno::ETIMEDOUT),
+                _ => err(Errno::ECONNREFUSED),
+            },
+        }
     }
 
     /// `accept4(fd, addr, addrlen, flags)` — hand back the server-side end of a
@@ -809,7 +924,9 @@ impl Kernel {
             Kind::Listener { addr, .. } => addr.clone(),
             Kind::Pair(p) => p.addrs[end].map(Addr::Inet),
             Kind::Dgram(d) => d.local.map(Addr::Inet),
-            Kind::Netlink(_) => None,
+            // A host-bridged socket has an ephemeral local address the guest
+            // never bound and doesn't inspect; report the wildcard.
+            Kind::Host(_) | Kind::Netlink(_) => None,
         };
         write_sockaddr(mem, addr, addrlen, domain, resolved.as_ref())
     }
@@ -837,6 +954,10 @@ impl Kernel {
             Kind::Dgram(d) if d.peer.is_some() => {
                 write_sockaddr(mem, addr, addrlen, domain, d.peer.map(Addr::Inet).as_ref())
             }
+            Kind::Host(h) => {
+                let peer = Addr::Inet(h.peer);
+                write_sockaddr(mem, addr, addrlen, domain, Some(&peer))
+            }
             _ => err(Errno::ENOTCONN),
         }
     }
@@ -863,6 +984,13 @@ impl Kernel {
                         p.shut_wr[end] = true;
                     }
                     _ => return err(Errno::EINVAL),
+                }
+                0
+            }
+            Kind::Host(h) => {
+                if matches!(how, SHUT_WR | SHUT_RDWR) {
+                    h.wr_shut = true;
+                    h.conn.shutdown_write();
                 }
                 0
             }
@@ -1091,8 +1219,13 @@ impl Kernel {
         if !matches!(self.net.socks[sock].kind, Kind::Dgram(_)) {
             return err(Errno::EINVAL); // real errno: EOPNOTSUPP/EISCONN
         }
+        // A routable destination (DNS, chiefly) goes out through a real host
+        // UDP socket when egress is enabled; without egress it's unreachable.
         if !dest.valid_bind() {
-            return err(Errno::EINVAL); // no route beyond this VM's loopback
+            if self.net.egress.is_none() {
+                return err(Errno::ENETUNREACH);
+            }
+            return self.host_udp_send(sock, data, dest);
         }
         let src = self.ensure_dgram_bound(sock);
         let key = route_key("udp", dest);
@@ -1102,6 +1235,88 @@ impl Kernel {
             td.queue.push_back((src, data.to_vec()));
         }
         data.len() as i64
+    }
+
+    /// Readiness (`POLLIN`/`POLLOUT`) for a host-bridged socket slot, or `None`
+    /// for a non-host socket (which uses the generic best-effort answer). Only
+    /// host sockets get a precise readable answer (via a peek), so a guest that
+    /// trusts `poll` (apk's http client) doesn't spin on spurious readiness.
+    pub(super) fn host_socket_readiness(&mut self, sock: usize) -> Option<u32> {
+        const POLLIN: u32 = 0x1;
+        const POLLOUT: u32 = 0x4;
+        if !matches!(
+            self.net.socks.get(sock).map(|s| &s.kind),
+            Some(Kind::Host(_) | Kind::Dgram(Dgram { host: Some(_), .. }))
+        ) {
+            return None;
+        }
+        if let Kind::Dgram(_) = &self.net.socks[sock].kind {
+            self.host_udp_drain(sock);
+            let readable =
+                matches!(&self.net.socks[sock].kind, Kind::Dgram(d) if !d.queue.is_empty());
+            return Some(POLLOUT | if readable { POLLIN } else { 0 });
+        }
+        let Kind::Host(h) = &mut self.net.socks[sock].kind else {
+            return None;
+        };
+        let mut mask = if h.wr_shut { 0 } else { POLLOUT };
+        if h.conn.poll_readable() {
+            mask |= POLLIN;
+        }
+        Some(mask)
+    }
+
+    /// Send a datagram out through this socket's host UDP socket (opening it
+    /// lazily on first use), for egress to a routable address.
+    fn host_udp_send(&mut self, sock: usize, data: &[u8], dest: InetAddr) -> i64 {
+        if let Kind::Dgram(d) = &self.net.socks[sock].kind
+            && d.host.is_none()
+        {
+            match self.net.egress.as_ref().map(|e| e.open_udp()) {
+                Some(Ok(h)) => {
+                    if let Kind::Dgram(d) = &mut self.net.socks[sock].kind {
+                        d.host = Some(h);
+                    }
+                }
+                _ => return err(Errno::ENETUNREACH),
+            }
+        }
+        let Kind::Dgram(d) = &mut self.net.socks[sock].kind else {
+            return err(Errno::EINVAL);
+        };
+        let Some(host) = d.host.as_mut() else {
+            return err(Errno::ENETUNREACH);
+        };
+        match host.send_to(data, dest.ip, dest.v6, dest.port) {
+            Ok(n) => n as i64,
+            Err(_) => data.len() as i64, // UDP is fire-and-forget; swallow errors
+        }
+    }
+
+    /// Drain any datagrams waiting on socket `sock`'s host UDP socket into its
+    /// inbound queue, so a following `recvfrom`/`recvmsg` sees them. No-op for
+    /// a non-host datagram socket.
+    fn host_udp_drain(&mut self, sock: usize) {
+        let Kind::Dgram(d) = &mut self.net.socks[sock].kind else {
+            return;
+        };
+        let Some(host) = d.host.as_mut() else {
+            return;
+        };
+        // Pull whatever is ready (non-blocking), then push into the queue —
+        // collect first so the host borrow ends before the queue borrow.
+        let mut arrived = Vec::new();
+        for _ in 0..64 {
+            match host.recv_from() {
+                Ok(Some((ip, v6, port, payload))) => {
+                    arrived.push((InetAddr { v6, port, ip }, payload));
+                }
+                _ => break,
+            }
+        }
+        if let Kind::Dgram(d) = &mut self.net.socks[sock].kind {
+            d.queue.extend(arrived);
+        }
     }
 
     /// `recvfrom(fd, buf, len, flags, src_addr, addrlen)` — for a datagram
@@ -1315,6 +1530,14 @@ impl Kernel {
                     }
                 }
             }
+            Kind::Host(_) => {
+                let bytes = self.host_recv(sock, cap as usize, flags & MSG_DONTWAIT != 0)?;
+                let peer = match &self.net.socks[sock].kind {
+                    Kind::Host(h) => Some(Addr::Inet(h.peer)),
+                    _ => None,
+                };
+                Ok((peer, bytes, 0))
+            }
             _ => {
                 // Stream: pull bytes directly out of the inbound queue (the
                 // flag-aware `recv_stream` writes to guest memory, so replicate
@@ -1338,6 +1561,9 @@ impl Kernel {
     /// inbound `(source, payload)`. A pure query: the caller decides the
     /// block/`EAGAIN` behavior when this returns `None` (an empty queue).
     fn recv_dgram_msg(&mut self, sock: usize, flags: u64) -> Option<(InetAddr, Vec<u8>)> {
+        // Pull any host-arrived datagrams (egress replies, e.g. DNS) into the
+        // queue first, so they're visible to this dequeue.
+        self.host_udp_drain(sock);
         let peek = flags & MSG_PEEK != 0;
         match &mut self.net.socks[sock].kind {
             Kind::Dgram(d) if peek => d.queue.front().cloned(),
@@ -1391,7 +1617,45 @@ impl Kernel {
             }
             return data.len() as i64;
         }
+        if matches!(self.net.socks[sock].kind, Kind::Host(_)) {
+            return match self.host_recv(sock, count as usize, false) {
+                Ok(data) => {
+                    if mem.write(buf, &data).is_err() {
+                        return err(Errno::EFAULT);
+                    }
+                    data.len() as i64
+                }
+                Err(e) => e,
+            };
+        }
         self.recv_stream(sock, end, buf, count, mem, 0)
+    }
+
+    /// Read up to `cap` bytes from a host-bridged stream socket. `Ok(bytes)`
+    /// (possibly empty on EOF); `Err(errno)` on `EAGAIN`/error. When the host
+    /// side has no data yet and the socket is blocking, sets `self.block` and
+    /// returns `Ok(empty)` so the caller returns 0 and the guest re-traps.
+    fn host_recv(&mut self, sock: usize, cap: usize, force_nonblock: bool) -> Result<Vec<u8>, i64> {
+        let Kind::Host(h) = &mut self.net.socks[sock].kind else {
+            return Err(err(Errno::EINVAL));
+        };
+        let nonblock = h.nonblock || force_nonblock;
+        let mut buf = vec![0u8; cap.min(256 * 1024)];
+        match h.conn.recv(&mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(buf) // n == 0 is a genuine EOF
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if nonblock {
+                    Err(err(Errno::EAGAIN))
+                } else {
+                    self.block = true;
+                    Ok(Vec::new())
+                }
+            }
+            Err(_) => Err(err(Errno::ECONNRESET)),
+        }
     }
 
     /// Drain up to `want` bytes' worth of complete, already-encoded messages
@@ -1444,6 +1708,17 @@ impl Kernel {
         mem: &mut GuestMemory,
         flags: u64,
     ) -> i64 {
+        if matches!(self.net.socks[sock].kind, Kind::Host(_)) {
+            return match self.host_recv(sock, count as usize, flags & MSG_DONTWAIT != 0) {
+                Ok(data) => {
+                    if mem.write(buf, &data).is_err() {
+                        return err(Errno::EFAULT);
+                    }
+                    data.len() as i64
+                }
+                Err(e) => e,
+            };
+        }
         let (shut_rd, avail, peer_open, nonblock) = match &self.net.socks[sock].kind {
             Kind::Pair(p) => (
                 p.shut_rd[end],
@@ -1559,6 +1834,24 @@ impl Kernel {
                 td.queue.push_back((src, data.to_vec()));
             }
             return data.len() as i64;
+        }
+        if let Kind::Host(h) = &mut self.net.socks[sock].kind {
+            if h.wr_shut {
+                return err(Errno::EPIPE);
+            }
+            return match h.conn.send(data) {
+                Ok(n) => n as i64,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if h.nonblock {
+                        err(Errno::EAGAIN)
+                    } else {
+                        // The host send buffer is full; ask the guest to retry.
+                        self.block = true;
+                        0
+                    }
+                }
+                Err(_) => err(Errno::ECONNRESET),
+            };
         }
         match &mut self.net.socks[sock].kind {
             Kind::Pair(p) => {

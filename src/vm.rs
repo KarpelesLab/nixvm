@@ -105,6 +105,13 @@ impl Vm {
         mounts.mount("/proc", Box::new(ProcFs::new()));
         mounts.mount("/sys", Box::new(SysFs::new()));
 
+        // With host egress enabled, give the guest resolver a nameserver
+        // (a stock Alpine minirootfs ships no /etc/resolv.conf, so musl would
+        // otherwise default to 127.0.0.1 and every lookup would fail).
+        if egress_enabled() {
+            install_resolv_conf(&mut mounts);
+        }
+
         let elf = read_mount_file(&mut mounts, &path)
             .ok_or_else(|| format!("{path} not found in the root image"))?;
         let arch = detect_arch(&elf).ok_or("unrecognized ELF machine type")?;
@@ -141,6 +148,7 @@ impl Vm {
         kernel.set_cwd("/");
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
+        install_egress(&mut kernel);
         kernel.boot(vcpu, mem);
 
         Ok(Self {
@@ -212,6 +220,44 @@ fn detect_arch(elf: &[u8]) -> Option<Arch> {
         EM_X86_64 => Some(Arch::X86_64),
         _ => None,
     }
+}
+
+/// Whether host-network egress is requested (`NIXVM_NET=host`) and available
+/// (native only — the browser has no raw sockets, so this is always `false` on
+/// wasm regardless of the env var; a WebSocket/pktkit transport will hook in
+/// here later).
+fn egress_enabled() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::var_os("NIXVM_NET").is_some_and(|v| v == "host")
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
+
+/// Install the host egress backend on `kernel` when [`egress_enabled`].
+fn install_egress(kernel: &mut Kernel) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if egress_enabled() {
+        kernel.set_egress(Box::new(crate::kernel::egress::HostEgress));
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = kernel;
+}
+
+/// Write a minimal `/etc/resolv.conf` (public resolvers) into the guest root,
+/// so musl's DNS has somewhere to send queries when egress is on.
+fn install_resolv_conf(mounts: &mut MountTable) {
+    const RESOLV: &[u8] = b"nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
+    if mounts.stat("/etc").is_none() {
+        let _ = mounts.mkdir("/etc", 0o755);
+    }
+    // Overwrite any existing file: create is a no-op if present, so truncate
+    // via a fresh create then write.
+    let _ = mounts.create("/etc/resolv.conf", 0o644);
+    let _ = mounts.write_at("/etc/resolv.conf", 0, RESOLV);
 }
 
 fn select_backend(arch: Arch) -> Result<Box<dyn crate::vcpu::Backend>, String> {

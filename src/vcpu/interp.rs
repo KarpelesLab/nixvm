@@ -1624,15 +1624,25 @@ impl Aarch64Interp {
             return step;
         }
 
-        // ---- LD1/ST1 (single register, multiple structures: 8B/16B) ----
-        // Covers `ld1 {Vt.16b},[Xn]` and the post-indexed (reg or #16/#8)
-        // forms used heavily by memcpy-style code; element arrangement
-        // (`size`) is irrelevant to us since we move the raw bytes as-is.
+        // ---- LD1/ST1 (multiple structures: 1..4 consecutive registers) ----
+        // Covers `ld1/st1 {Vt.16b[, Vt2.16b …]},[Xn]` and the post-indexed
+        // (reg or immediate) forms — including the 2/3/4-register variants
+        // aarch64 memcpy (musl/apk) leans on. LD1 with N registers is just N
+        // consecutive full-width loads/stores (no de-interleave, unlike
+        // LD2/3/4); element arrangement (`size`) is irrelevant since we move
+        // raw bytes. The `opcode` field selects the register count.
         if (instr >> 31) & 1 == 0
             && (instr >> 29) & 1 == 0
             && (instr >> 24) & 0x1f == 0b0_1100
             && (instr >> 21) & 1 == 0
-            && (instr >> 12) & 0xf == 0b0111
+            && let regs = match (instr >> 12) & 0xf {
+                0b0111 => 1,
+                0b1010 => 2,
+                0b0110 => 3,
+                0b0010 => 4,
+                _ => 0,
+            }
+            && regs != 0
         {
             let q = (instr >> 30) & 1;
             let post = (instr >> 23) & 1 == 1;
@@ -1641,13 +1651,21 @@ impl Aarch64Interp {
             let rn = reg_field(instr, 5);
             let rt = reg_field(instr, 0);
             let (nbytes, scale) = if q == 1 { (16u64, 4) } else { (8u64, 3) };
-            let addr = self.read_sp(rn);
-            let step = self.ldst_vec(addr, scale, l == 1, rt, mem);
-            if matches!(step, Step::Next) && post {
-                let inc = if rm == 31 { nbytes } else { self.read_x(rm) };
-                self.write_sp(rn, addr.wrapping_add(inc));
+            let base = self.read_sp(rn);
+            for i in 0..regs {
+                // Registers wrap around the 32-entry SIMD file (v31 -> v0).
+                let vt = (rt + i) & 31;
+                let step = self.ldst_vec(base.wrapping_add(i as u64 * nbytes), scale, l == 1, vt, mem);
+                if !matches!(step, Step::Next) {
+                    return step;
+                }
             }
-            return step;
+            if post {
+                let total = nbytes * regs as u64;
+                let inc = if rm == 31 { total } else { self.read_x(rm) };
+                self.write_sp(rn, base.wrapping_add(inc));
+            }
+            return Step::Next;
         }
 
         // ---- SIMD modified immediate: MOVI/MVNI/ORR/BIC (vector immediate) ----
@@ -5480,6 +5498,29 @@ mod tests {
         assert!(matches!(c.exec(0x4CDF_7020, &mut m), Step::Next));
         assert_eq!(c.v[0], 0x1122_3344_5566_7788_99AA_BBCC_DDEE_FF00u128);
         assert_eq!(c.x[1], base + 0x50, "post-index advanced by 16 bytes");
+    }
+
+    #[test]
+    fn neon_ld1_st1_two_registers() {
+        // The 2-register form (`{v0.16b, v1.16b}`) aarch64 memcpy uses — the
+        // gap that stopped apk on aarch64. Store the pair, reload it, and
+        // check the post-index advances by 2 * 16 bytes.
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        c.x[2] = base + 0x40;
+        c.v[0] = 0x0101_0101_0101_0101_0101_0101_0101_0101u128;
+        c.v[1] = 0x0202_0202_0202_0202_0202_0202_0202_0202u128;
+        // st1 {v0.16b, v1.16b}, [x2]   (opcode 0b1010)
+        assert!(matches!(c.exec(0x4C00_A040, &mut m), Step::Next));
+        c.v[0] = 0;
+        c.v[1] = 0;
+        // ld1 {v0.16b, v1.16b}, [x2], #32  (post-index by the 2-reg total)
+        assert!(matches!(c.exec(0x4CDF_A040, &mut m), Step::Next));
+        assert_eq!(c.v[0], 0x0101_0101_0101_0101_0101_0101_0101_0101u128);
+        assert_eq!(c.v[1], 0x0202_0202_0202_0202_0202_0202_0202_0202u128);
+        assert_eq!(c.x[2], base + 0x60, "post-index advanced by 2*16 bytes");
     }
 
     /// Pack four `f32` lanes into a 128-bit vector register value (lane 0 low).

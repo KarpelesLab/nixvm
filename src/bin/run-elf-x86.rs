@@ -88,6 +88,11 @@ fn main() {
     kernel.set_cwd("/work");
     kernel.set_heap(img.program_break, mid);
     kernel.set_mmap_area(img.stack_bottom, mid);
+    // NIXVM_NET=host bridges guest sockets to the real internet (see
+    // kernel::egress). Off by default (loopback-only).
+    if std::env::var_os("NIXVM_NET").is_some_and(|v| v == "host") {
+        kernel.set_egress(Box::new(nixvm::kernel::egress::HostEgress));
+    }
 
     let result = kernel.run(vcpu, mem);
     eprintln!("\nrun-elf-x86: result = {result:?}");
