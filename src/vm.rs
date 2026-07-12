@@ -232,7 +232,7 @@ fn default_env() -> Vec<String> {
         "HOME=/root".to_string(),
         "TERM=xterm-256color".to_string(),
         "PS1=nixvm:\\w\\$ ".to_string(),
-        "PWD=/root".to_string(),
+        "PWD=/".to_string(),
         "USER=root".to_string(),
         "HOSTNAME=nixvm".to_string(),
     ]
