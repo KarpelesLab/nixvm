@@ -11,6 +11,22 @@ use std::io;
 
 use super::{Attrs, DirEntry, MountFs, NodeKind};
 
+/// High bit set on an upper-layer inode so it can never collide with a
+/// lower-layer one. The upper (tmpfs, inodes from 2) and the lower (squashfs,
+/// its own image inodes) each start numbering low, so without this an
+/// apk-installed file and a base-image file share an inode number — and since
+/// every node reports the same `st_dev`, `(dev, ino)` collides. musl's dynamic
+/// linker dedups already-loaded libraries by `(dev, ino)`, so a collision made
+/// it skip loading a library (e.g. libbrotlicommon), and the symbols it
+/// exported went "not found" — which is what stopped `node` from starting.
+const UPPER_INODE_TAG: u64 = 1 << 63;
+
+/// Tag an upper-layer node's inode as distinct from the lower layer's.
+fn tag_upper(mut a: Attrs) -> Attrs {
+    a.inode |= UPPER_INODE_TAG;
+    a
+}
+
 #[derive(Debug)]
 pub struct Overlay {
     upper: Box<dyn MountFs>,
@@ -151,7 +167,10 @@ impl MountFs for Overlay {
         if self.is_whited(rel) {
             return None;
         }
-        self.upper.stat(rel).or_else(|| self.lower.stat(rel))
+        self.upper
+            .stat(rel)
+            .map(tag_upper)
+            .or_else(|| self.lower.stat(rel))
     }
 
     fn read_at(&mut self, rel: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {
@@ -178,7 +197,8 @@ impl MountFs for Overlay {
             }
         }
         if let Ok(entries) = self.upper.readdir(rel) {
-            for e in entries {
+            for mut e in entries {
+                e.inode |= UPPER_INODE_TAG; // match `stat`'s upper-layer tag
                 seen.insert(e.name.clone(), e); // upper shadows lower
             }
         }
@@ -474,6 +494,24 @@ mod tests {
         let mut lb = [0u8; 3];
         lower_check.read_at("f", 0, &mut lb).unwrap();
         assert_eq!(&lb, b"low");
+    }
+
+    #[test]
+    fn upper_and_lower_inodes_never_collide() {
+        // The lower's `/f` and a fresh upper file can have the same raw inode
+        // (both tmpfs, both counting from low numbers). Without the layer tag
+        // they'd report the same inode — which broke musl's `(dev,ino)` library
+        // dedup and stopped node from loading. They must differ here.
+        let mut o = overlay();
+        o.create("g", 0o644).unwrap(); // upper-only file
+        let lower_ino = o.stat("f").unwrap().inode; // lower `/f`
+        let upper_ino = o.stat("g").unwrap().inode; // upper `/g`
+        assert_ne!(lower_ino, upper_ino, "upper and lower inodes must be distinct");
+        assert_eq!(upper_ino & UPPER_INODE_TAG, UPPER_INODE_TAG, "upper is tagged");
+        assert_eq!(lower_ino & UPPER_INODE_TAG, 0, "lower is untagged");
+        // readdir agrees with stat on the upper tag.
+        let g = o.readdir("").unwrap().into_iter().find(|e| e.name == "g").unwrap();
+        assert_eq!(g.inode, upper_ino, "readdir and stat agree on the inode");
     }
 
     #[test]
