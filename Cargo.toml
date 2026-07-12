@@ -61,7 +61,7 @@ fetch = ["dep:ureq"]
 # optional dependency, gated behind its feature; per-phase additions arrive
 # gated by the features above (object, kvm-ioctls, sha2, a fetch stack, …).
 # `gzip` lets us repack an Alpine .tar.gz minirootfs into an ext4 root image.
-fstool = { version = "0.4.18", optional = true, default-features = false, features = [
+fstool = { version = "0.4.19", optional = true, default-features = false, features = [
     "gzip",
 ] }
 # Blocking HTTP(S) client for downloading guest root images, gated behind the
