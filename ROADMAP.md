@@ -328,13 +328,18 @@ CPUs, rather than pinning one host thread per guest thread.
   leaving it stale corrupted their control flow) carry V8 much deeper. A
   purpose-built differential debugger (mask KVM's CPUID down to the
   interpreter's feature set, freeze the clock/RNG, then diff the two backends'
-  per-syscall register snapshots and per-page memory hashes) now shows the
-  interpreter matching KVM *exactly* across all ~4800 of node's main-thread
-  startup syscalls. The one remaining divergence is a single byte — a bit in
-  V8's `CpuFeatures` word that it derives from `CPUID` — which routes V8 into a
-  codegen path that later faults. Nailing the exact `CPUID` sub-detail (or the
-  instruction on that path) is the last mile. `execve` replaces the image in
-  place. The
+  per-syscall register snapshots, per-page memory hashes, and a store
+  watchpoint) shows the interpreter matching KVM *exactly* across all ~4800 of
+  node's main-thread startup syscalls, then faulting shortly after by `ret`-ing
+  to a tagged heap pointer. That value is *correctly* loaded from the heap in a
+  V8 hot loop — so the bug is not a wrong value or a missing opcode but a
+  **control-flow divergence**: a flag/comparison the interpreter computes
+  slightly wrong makes the loop take a different branch than KVM. It reproduces
+  on both the SSE2 and (with SSSE3/SSE4.1 advertised) the modern codegen path,
+  so it's on the common path; pinning the exact instruction needs lockstep
+  single-stepping against KVM (`KVM_GUESTDBG`) — the last mile. `PALIGNR`/`PTEST`
+  are implemented toward eventually advertising SSSE3/SSE4.1. `execve` replaces
+  the image in place. The
   scheduler exists in **two modes**
   rather than a dedicated `kernel::sched` module: `Kernel::schedule_serial`
   (cooperative single-thread round-robin, default) and `Kernel::schedule_smp`

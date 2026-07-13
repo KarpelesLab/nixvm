@@ -2764,6 +2764,7 @@ impl X86Interp {
             0x15 => self.sse_unpck(mem, pc, rex, if opsize16 { 8 } else { 4 }, true),
             0x28 | 0x29 | 0x6F | 0x7F => self.sse_movaps(mem, pc, rex, matches!(op2, 0x29 | 0x7F)),
             0x38 => self.exec_0f_38(mem, pc, rex),
+            0x3A => self.exec_0f_3a(mem, pc, rex),
             0x50 => self.sse_movmskp(mem, pc, rex, opsize16),
             0x63 => self.sse_pack(mem, pc, rex, 2, true),  // PACKSSWB
             0x67 => self.sse_pack(mem, pc, rex, 2, false), // PACKUSWB
@@ -3501,8 +3502,57 @@ impl X86Interp {
         let (op3, pc) = fetch!(fetch_u8(mem, pc));
         match op3 {
             0x00 => self.sse_pshufb(mem, pc, rex),
+            0x17 => self.sse_ptest(mem, pc, rex),
             _ => Step::Illegal,
         }
+    }
+
+    /// `PTEST xmm1, xmm2/m128` (`66 0F 38 17`): set `ZF` when `dst & src` is all
+    /// zero and `CF` when `~dst & src` is all zero; clear the other arithmetic
+    /// flags. V8 uses it to test SIMD bitmaps.
+    fn sse_ptest(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let dst = self.xmm[modrm.reg];
+        self.flags = Flags {
+            zf: (dst & src) == 0,
+            cf: (!dst & src) == 0,
+            sf: false,
+            of: false,
+            pf: false,
+        };
+        self.next(pc2)
+    }
+
+    /// The three-byte `0F 3A` opcode map (SSSE3/SSE4 immediate forms).
+    fn exec_0f_3a(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex) -> Step {
+        let (op3, pc) = fetch!(fetch_u8(mem, pc));
+        match op3 {
+            0x0F => self.sse_palignr(mem, pc, rex),
+            _ => Step::Illegal,
+        }
+    }
+
+    /// `PALIGNR xmm1, xmm2/m128, imm8` (`66 0F 3A 0F /r ib`): concatenate
+    /// `dst:src` (dst high, src low) into 256 bits, shift right by `imm8` bytes,
+    /// and keep the low 128. V8 emits it for `memmove`/`String` byte shuffles.
+    fn sse_palignr(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let (imm, pc3) = fetch!(fetch_u8(mem, pc2));
+        let rm_op = resolve(modrm.kind, pc3);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let dst = self.xmm[modrm.reg];
+        let mut cat = [0u8; 32];
+        cat[0..16].copy_from_slice(&src.to_le_bytes());
+        cat[16..32].copy_from_slice(&dst.to_le_bytes());
+        let sh = usize::from(imm);
+        let mut out = [0u8; 16];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = cat.get(sh + i).copied().unwrap_or(0);
+        }
+        self.xmm[modrm.reg] = u128::from_le_bytes(out);
+        self.next(pc3)
     }
 
     /// `PSHUFB xmm1, xmm2/m128` (`66 0F 38 00`): each byte of `dst` becomes
@@ -6527,6 +6577,36 @@ mod tests {
         cpu.exec(&mut m);
         assert_eq!(cpu.gpr[RAX], 0xDEAD_BEEF);
         assert_eq!(cpu.gpr[RSP], STACK + 8);
+    }
+
+    #[test]
+    fn palignr_concatenates_and_shifts() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.xmm[0] = 0x03; // dst byte 0 = 3
+        cpu.xmm[1] = 0x01; // src byte 0 = 1
+        // palignr xmm0, xmm1, 15  (66 0F 3A 0F C1 0F): result[1] = dst[0].
+        m.write_init(CODE, &[0x66, 0x0F, 0x3A, 0x0F, 0xC1, 0x0F]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.xmm[0], 0x0300);
+    }
+
+    #[test]
+    fn ptest_sets_zf_and_cf() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.xmm[0] = 0x0f;
+        cpu.xmm[1] = 0xf0;
+        // ptest xmm0, xmm1  (66 0F 38 17 C1): dst&src=0 → ZF; ~dst&src≠0 → !CF.
+        m.write_init(CODE, &[0x66, 0x0F, 0x38, 0x17, 0xC1]).unwrap();
+        cpu.exec(&mut m);
+        assert!(cpu.flags.zf && !cpu.flags.cf);
+        // dst covers all of src's bits → ~dst&src=0 → CF; dst&src≠0 → !ZF.
+        cpu.xmm[0] = 0xff;
+        cpu.xmm[1] = 0x0f;
+        cpu.rip = CODE;
+        cpu.exec(&mut m);
+        assert!(!cpu.flags.zf && cpu.flags.cf);
     }
 
     #[test]
