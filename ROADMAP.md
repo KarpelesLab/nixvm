@@ -313,12 +313,21 @@ CPUs, rather than pinning one host thread per guest thread.
   instead of deadlocking. `poll`/`ppoll`/`epoll_pwait` with a finite timeout
   honor a wall-clock deadline, so `setTimeout`/`setInterval` fire and libuv
   drives the loop to "no work → exit".
-  **node runs:** `node -e …` executes real JavaScript to completion — the
-  event loop, timers, intervals, promises/microtasks, JSON, and stdio all work
-  and the process exits 0. The one remaining gap is V8's **JIT**: a hot loop
-  that tiers up to TurboFan emits native x86 the interpreter doesn't fully
-  decode and faults a background thread; `node --jitless` avoids it and runs
-  everything (Ignition-only). `execve` replaces the image in place. The
+  **node runs (on hardware):** under the KVM/HVF backend `node -e …` executes
+  real JavaScript to completion — the event loop, timers, intervals,
+  promises/microtasks, JSON, and stdio all work and the process exits 0. A hot
+  loop that tiers up to V8's TurboFan JIT still faults a background thread;
+  `node --jitless` runs those too.
+  **node on the software interpreter (the wasm path)** is a work in progress:
+  V8's builtins are baked-in native x86, so even trivial JS exercises a wide
+  instruction mix. Recent decode fixes — the `0x66`-prefixed `mov r/m16,imm16`
+  immediate length (a general bug that desynced *any* 16-bit immediate move),
+  `ANDNPD`/`ORPD`, `CMPPS`/`CMPSS`/`CMPPD`/`CMPSD`, the `PACKSSWB`/`PACKUSWB`/
+  `PACKSSDW` saturating packs, `RET imm16`, and `POP r/m` — carry V8 far deeper,
+  but a remaining wrong-*value* bug (not a missing opcode) still corrupts a
+  return address mid-run. Pinning it down needs instruction-level register
+  diffing of the interpreter against KVM, which is the next step. `execve`
+  replaces the image in place. The
   scheduler exists in **two modes**
   rather than a dedicated `kernel::sched` module: `Kernel::schedule_serial`
   (cooperative single-thread round-robin, default) and `Kernel::schedule_smp`

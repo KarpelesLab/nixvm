@@ -580,6 +580,54 @@ fn f32_lane_unop(dst: u128, src: u128, lanes: usize, f: impl Fn(f32) -> f32) -> 
     u128::from_le_bytes(out)
 }
 
+/// Whether an SSE compare predicate (`CMPPS`/`CMPSD`/… imm8, low 3 bits) holds
+/// for a float pair whose ordering is `ord` (`None` = unordered, i.e. a NaN
+/// operand — which the "not"-forms 4–6 and `UNORD` 3 treat as true).
+fn cmp_pred_holds(pred: u8, ord: Option<std::cmp::Ordering>) -> bool {
+    use std::cmp::Ordering::{Equal, Less};
+    match pred & 7 {
+        0 => ord == Some(Equal),
+        1 => ord == Some(Less),
+        2 => matches!(ord, Some(Less | Equal)),
+        3 => ord.is_none(),
+        4 => ord != Some(Equal),
+        5 => ord != Some(Less),
+        6 => !matches!(ord, Some(Less | Equal)),
+        _ => ord.is_some(),
+    }
+}
+
+/// `CMPPD`/`CMPSD` (`0F C2` with a `0x66`/`0xF2` prefix): per double lane, write
+/// an all-ones mask when `pred` holds, else all-zeros. Lanes past `lanes` keep
+/// `dst` (so the scalar `CMPSD` form preserves the high quadword).
+fn f64_lane_cmp(dst: u128, src: u128, lanes: usize, pred: u8) -> u128 {
+    let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+    let mut out = d;
+    for i in 0..lanes {
+        let o = i * 8;
+        let a = f64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+        let b = f64::from_le_bytes(s[o..o + 8].try_into().unwrap());
+        let hit = cmp_pred_holds(pred, a.partial_cmp(&b));
+        out[o..o + 8].copy_from_slice(&(if hit { u64::MAX } else { 0 }).to_le_bytes());
+    }
+    u128::from_le_bytes(out)
+}
+
+/// `CMPPS`/`CMPSS` (`0F C2` with no prefix or `0xF3`): the single-precision
+/// counterpart of [`f64_lane_cmp`].
+fn f32_lane_cmp(dst: u128, src: u128, lanes: usize, pred: u8) -> u128 {
+    let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+    let mut out = d;
+    for i in 0..lanes {
+        let o = i * 4;
+        let a = f32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+        let b = f32::from_le_bytes(s[o..o + 4].try_into().unwrap());
+        let hit = cmp_pred_holds(pred, a.partial_cmp(&b));
+        out[o..o + 4].copy_from_slice(&(if hit { u32::MAX } else { 0 }).to_le_bytes());
+    }
+    u128::from_le_bytes(out)
+}
+
 /// Zero-extend up to 8 little-endian bytes into a `u64` — a lane-width-
 /// generic byte read for the packed-integer lane ops below.
 fn u64_from_le(bytes: &[u8]) -> u64 {
@@ -606,6 +654,46 @@ fn unpck(dst: u128, src: u128, lane_bytes: usize, high: bool) -> u128 {
         let o1 = (2 * i + 1) * lane_bytes;
         out[o0..o0 + lane_bytes].copy_from_slice(&d[src_off..src_off + lane_bytes]);
         out[o1..o1 + lane_bytes].copy_from_slice(&s[src_off..src_off + lane_bytes]);
+    }
+    u128::from_le_bytes(out)
+}
+
+/// `PACKSSWB`/`PACKUSWB`/`PACKSSDW` (`0F 63`/`0F 67`/`0F 6B`): narrow each
+/// signed `in_bytes`-wide lane of `dst` then `src` to a saturated half-width
+/// lane, writing `dst`'s lanes to the low half of the result and `src`'s to the
+/// high half. `signed_out` selects signed saturation (`PACKSS`) vs unsigned
+/// (`PACKUS`).
+fn pack128(dst: u128, src: u128, in_bytes: usize, signed_out: bool) -> u128 {
+    let lanes = 16 / in_bytes; // input lanes per operand
+    let out_bytes = in_bytes / 2;
+    let read_lane = |bytes: &[u8; 16], i: usize| -> i64 {
+        let o = i * in_bytes;
+        if in_bytes == 2 {
+            i64::from(i16::from_le_bytes([bytes[o], bytes[o + 1]]))
+        } else {
+            i64::from(i32::from_le_bytes(bytes[o..o + 4].try_into().unwrap()))
+        }
+    };
+    let clamp = |v: i64| -> i64 {
+        match (out_bytes, signed_out) {
+            (1, true) => v.clamp(-128, 127),
+            (1, false) => v.clamp(0, 255),
+            (_, true) => v.clamp(-32768, 32767),
+            (_, false) => v.clamp(0, 65535),
+        }
+    };
+    let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+    let mut out = [0u8; 16];
+    for (half, base) in [(&d, 0usize), (&s, lanes)] {
+        for i in 0..lanes {
+            let c = clamp(read_lane(half, i));
+            let oo = (base + i) * out_bytes;
+            if out_bytes == 1 {
+                out[oo] = c as u8;
+            } else {
+                out[oo..oo + 2].copy_from_slice(&(c as u16).to_le_bytes());
+            }
+        }
     }
     u128::from_le_bytes(out)
 }
@@ -1309,9 +1397,14 @@ impl X86Interp {
         if modrm.reg != 0 {
             return Step::Illegal; // 0xC7 /0 only
         }
-        let (imm, pc3) = fetch!(fetch_i32(mem, pc2));
+        // The immediate follows the operand size: `imm16` under a `0x66`
+        // prefix, else `imm32` (sign-extended to 64 bits for a `REX.W` store).
+        // Reading a fixed `imm32` here mis-sized every 16-bit `mov word ptr,
+        // imm16` — the two extra bytes desynced decoding and ran the CPU into
+        // the middle of the next instruction.
+        let (imm, pc3) = fetch!(imm_for_width(mem, pc2, width));
         let rm_op = resolve(modrm.kind, pc3);
-        let val = mask_w(i64::from(imm) as u64, width);
+        let val = mask_w(imm as u64, width);
         fetch!(self.write_operand(mem, rm_op, val, width));
         self.next(pc3)
     }
@@ -2634,6 +2727,9 @@ impl X86Interp {
             0x28 | 0x29 | 0x6F | 0x7F => self.sse_movaps(mem, pc, rex, matches!(op2, 0x29 | 0x7F)),
             0x38 => self.exec_0f_38(mem, pc, rex),
             0x50 => self.sse_movmskp(mem, pc, rex, opsize16),
+            0x63 => self.sse_pack(mem, pc, rex, 2, true),  // PACKSSWB
+            0x67 => self.sse_pack(mem, pc, rex, 2, false), // PACKUSWB
+            0x6B => self.sse_pack(mem, pc, rex, 4, true),  // PACKSSDW
             0x60 => self.sse_unpck(mem, pc, rex, 1, false), // PUNPCKLBW
             0x61 => self.sse_unpck(mem, pc, rex, 2, false), // PUNPCKLWD
             0x62 => self.sse_unpck(mem, pc, rex, 4, false), // PUNPCKLDQ
@@ -2655,6 +2751,9 @@ impl X86Interp {
             0x2E | 0x2F => self.sse_comis(mem, pc, rex, opsize16),
             0x51 => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Sqrt),
             0x54 | 0xDB => self.sse_bitwise(mem, pc, rex, BitOp::And),
+            0x55 | 0xDF => self.sse_bitwise(mem, pc, rex, BitOp::Andn), // ANDNPS/ANDNPD, PANDN
+            0x56 | 0xEB => self.sse_bitwise(mem, pc, rex, BitOp::Or),   // ORPS/ORPD, POR
+            0xC2 => self.sse_cmp(mem, pc, rex, opsize16, rep),   // CMPPS/CMPSS/CMPPD/CMPSD
             0x57 | 0xEF => self.sse_bitwise(mem, pc, rex, BitOp::Xor),
             0x58 => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Add),
             0x59 => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Mul),
@@ -2672,8 +2771,6 @@ impl X86Interp {
             0xD4 => self.sse_paddsub(mem, pc, rex, 8, true), // PADDQ
             0xDA => self.sse_pminmaxub(mem, pc, rex, true),  // PMINUB
             0xDE => self.sse_pminmaxub(mem, pc, rex, false), // PMAXUB
-            0xDF => self.sse_bitwise(mem, pc, rex, BitOp::Andn),
-            0xEB => self.sse_bitwise(mem, pc, rex, BitOp::Or),
             0xFA => self.sse_paddsub(mem, pc, rex, 4, false), // PSUBD
             0xFB => self.sse_paddsub(mem, pc, rex, 8, false), // PSUBQ
             0xFC => self.sse_paddsubb(mem, pc, rex, true),
@@ -3096,6 +3193,48 @@ impl X86Interp {
     /// `ANDPS`/`ANDPD`/`PAND` (`0F 54`/`66 0F 54`/`66 0F DB`), `XORPS`/
     /// `XORPD`/`PXOR` (`0F 57`/`66 0F 57`/`66 0F EF`), `POR` (`66 0F EB`)
     /// and `PANDN` (`66 0F DF`): a plain 128-bit bitwise op, `dst = dst OP
+    /// `CMPPS`/`CMPSS`/`CMPPD`/`CMPSD` (`0F C2 /r ib`): compare float lanes
+    /// against the imm8 predicate, writing an all-ones or all-zeros mask per
+    /// lane. The prefix selects the form — `0xF2` scalar-double, `0xF3`
+    /// scalar-single, `0x66` packed-double, none packed-single — exactly as the
+    /// arithmetic ops. The immediate follows the r/m operand, so it's fetched
+    /// before resolving a RIP-relative address (which is relative to the end of
+    /// the whole instruction). V8's JIT emits these for JavaScript's relational
+    /// operators on doubles.
+    fn sse_cmp(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        opsize16: bool,
+        rep: u8,
+    ) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let (pred, pc3) = fetch!(fetch_u8(mem, pc2));
+        let rm_op = resolve(modrm.kind, pc3);
+        let dst = self.xmm[modrm.reg];
+        let result = match rep {
+            2 => {
+                let b = fetch!(self.xmm_read_lo(mem, rm_op, 64));
+                f64_lane_cmp(dst, u128::from(b), 1, pred)
+            }
+            1 => {
+                let b = fetch!(self.xmm_read_lo(mem, rm_op, 32));
+                f32_lane_cmp(dst, u128::from(b), 1, pred)
+            }
+            _ if opsize16 => {
+                let src = fetch!(self.xmm_read128(mem, rm_op));
+                f64_lane_cmp(dst, src, 2, pred)
+            }
+            _ => {
+                let src = fetch!(self.xmm_read128(mem, rm_op));
+                f32_lane_cmp(dst, src, 4, pred)
+            }
+        };
+        self.xmm[modrm.reg] = result;
+        self.next(pc3)
+    }
+
     /// src`. The float-tagged (`ANDPS`/`XORPS`) and integer-tagged (`PAND`/
     /// `PXOR`) opcodes compute an identical bit pattern, so [`BitOp`]
     /// doesn't need to distinguish which opcode selected it.
@@ -3186,6 +3325,24 @@ impl X86Interp {
         let src = fetch!(self.xmm_read128(mem, rm_op));
         let dst = self.xmm[modrm.reg];
         self.xmm[modrm.reg] = unpck(dst, src, lane_bytes, high);
+        self.next(pc2)
+    }
+
+    /// `PACKSSWB`/`PACKUSWB`/`PACKSSDW` (`0F 63`/`0F 67`/`0F 6B`): saturating
+    /// narrow-and-pack of `dst`||`src`. See [`pack128`].
+    fn sse_pack(
+        &mut self,
+        mem: &mut GuestMemory,
+        pc: u64,
+        rex: Rex,
+        in_bytes: usize,
+        signed_out: bool,
+    ) -> Step {
+        let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+        let rm_op = resolve(modrm.kind, pc2);
+        let src = fetch!(self.xmm_read128(mem, rm_op));
+        let dst = self.xmm[modrm.reg];
+        self.xmm[modrm.reg] = pack128(dst, src, in_bytes, signed_out);
         self.next(pc2)
     }
 
@@ -4053,6 +4210,20 @@ impl X86Interp {
                 self.gpr[r] = val;
                 self.next(pc)
             }
+            // POP r/m64 (`8F /0`): pop into a register or memory slot. The
+            // address is resolved after the stack pointer moves, matching how
+            // hardware computes an `[rsp+…]` destination post-pop. Only /0 is a
+            // valid encoding.
+            0x8F => {
+                let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+                if modrm.reg != 0 {
+                    return Step::Illegal;
+                }
+                let val = fetch!(self.pop(mem));
+                let rm_op = resolve(modrm.kind, pc2);
+                fetch!(self.write_operand(mem, rm_op, val, 64));
+                self.next(pc2)
+            }
             0x68 => {
                 let (imm, pc2) = fetch!(fetch_i32(mem, pc));
                 fetch!(self.push(mem, i64::from(imm) as u64));
@@ -4284,6 +4455,15 @@ impl X86Interp {
             }
             0xC3 => {
                 let target = fetch!(self.pop(mem));
+                self.jump(target)
+            }
+            // RET imm16: pop the return address, then release `imm16` bytes of
+            // caller-pushed arguments from the stack. gcc/V8 emit this for
+            // stdcall-style callees that clean up their own stack slots.
+            0xC2 => {
+                let (imm, _) = fetch!(fetch_u16(mem, pc));
+                let target = fetch!(self.pop(mem));
+                self.gpr[RSP] = self.gpr[RSP].wrapping_add(u64::from(imm));
                 self.jump(target)
             }
             0xE9 => {
@@ -6214,5 +6394,100 @@ mod tests {
             0xFFFF_FFFF_FFFF_FFFF_1111_2222_3333_4444,
             "low half replaced, high preserved"
         );
+    }
+
+    #[test]
+    fn mov_mem_imm16_consumes_exactly_two_immediate_bytes() {
+        // `66 C7 /0` is `mov word ptr, imm16`. Reading a fixed imm32 here
+        // over-consumed by two bytes and desynced every following instruction
+        // (the bug that crashed V8's JIT). Verify the length and the value.
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let data = 0x1_2000u64;
+        cpu.gpr[RBP] = data;
+        // mov word [rbp+0], 0x1234  (66 C7 45 00 34 12) — exactly 6 bytes.
+        m.write_init(CODE, &[0x66, 0xC7, 0x45, 0x00, 0x34, 0x12]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.rip, CODE + 6, "imm16 form is 6 bytes, not 8");
+        assert_eq!(m.read_vec(data, 2).unwrap(), vec![0x34, 0x12]);
+    }
+
+    #[test]
+    fn andnpd_and_orpd() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        // andnpd xmm0, xmm1  (66 0F 55 C1): xmm0 <- ~xmm0 & xmm1.
+        cpu.xmm[0] = 0x0F;
+        cpu.xmm[1] = 0xFF;
+        m.write_init(CODE, &[0x66, 0x0F, 0x55, 0xC1]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.xmm[0], (!0x0Fu128) & 0xFF);
+        // orpd xmm0, xmm1  (66 0F 56 C1): xmm0 <- xmm0 | xmm1.
+        cpu.xmm[0] = 0x0F;
+        cpu.xmm[1] = 0xF0;
+        cpu.rip = CODE;
+        m.write_init(CODE, &[0x66, 0x0F, 0x56, 0xC1]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.xmm[0], 0xFF);
+    }
+
+    #[test]
+    fn cmpsd_predicate_masks() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.xmm[0] = u128::from(3.0f64.to_bits());
+        cpu.xmm[1] = u128::from(3.0f64.to_bits());
+        // cmpsd xmm0, xmm1, 0 (EQ): equal → low quadword all ones, high kept.
+        m.write_init(CODE, &[0xF2, 0x0F, 0xC2, 0xC1, 0x00]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.xmm[0] as u64, u64::MAX, "3==3 is true");
+        assert_eq!(cpu.xmm[0] >> 64, 0, "high quadword preserved");
+        // cmpsd xmm0, xmm1, 1 (LT): 3<3 false → all zeros.
+        cpu.xmm[0] = u128::from(3.0f64.to_bits());
+        cpu.rip = CODE;
+        m.write_init(CODE, &[0xF2, 0x0F, 0xC2, 0xC1, 0x01]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.xmm[0] as u64, 0, "3<3 is false");
+    }
+
+    #[test]
+    fn packuswb_saturates() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        // dst words: [0x0005, 0x1234, 0, …]; 5 stays, 0x1234 saturates to 255.
+        cpu.xmm[0] = 0x1234_0005;
+        // src word0 = 0x8000 (negative i16) saturates to 0 (unsigned).
+        cpu.xmm[1] = 0x8000;
+        // packuswb xmm0, xmm1  (66 0F 67 C1).
+        m.write_init(CODE, &[0x66, 0x0F, 0x67, 0xC1]).unwrap();
+        cpu.exec(&mut m);
+        // low bytes from dst: 0x05, 0xFF, then zeros; src half all zero.
+        assert_eq!(cpu.xmm[0], 0xFF05);
+    }
+
+    #[test]
+    fn ret_imm16_pops_and_releases_args() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RSP] = STACK;
+        m.write_init(STACK, &0x1_3000u64.to_le_bytes()).unwrap();
+        // ret 0x10  (C2 10 00): pop target, then rsp += 0x10.
+        m.write_init(CODE, &[0xC2, 0x10, 0x00]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.rip, 0x1_3000);
+        assert_eq!(cpu.gpr[RSP], STACK + 8 + 0x10);
+    }
+
+    #[test]
+    fn pop_rm_into_register() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RSP] = STACK;
+        m.write_init(STACK, &0xDEAD_BEEFu64.to_le_bytes()).unwrap();
+        // pop rax  (8F C0): 8F /0 with a register operand.
+        m.write_init(CODE, &[0x8F, 0xC0]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RAX], 0xDEAD_BEEF);
+        assert_eq!(cpu.gpr[RSP], STACK + 8);
     }
 }
