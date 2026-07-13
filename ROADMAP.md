@@ -320,14 +320,21 @@ CPUs, rather than pinning one host thread per guest thread.
   `node --jitless` runs those too.
   **node on the software interpreter (the wasm path)** is a work in progress:
   V8's builtins are baked-in native x86, so even trivial JS exercises a wide
-  instruction mix. Recent decode fixes — the `0x66`-prefixed `mov r/m16,imm16`
+  instruction mix. Decode fixes — the `0x66`-prefixed `mov r/m16,imm16`
   immediate length (a general bug that desynced *any* 16-bit immediate move),
   `ANDNPD`/`ORPD`, `CMPPS`/`CMPSS`/`CMPPD`/`CMPSD`, the `PACKSSWB`/`PACKUSWB`/
-  `PACKSSDW` saturating packs, `RET imm16`, and `POP r/m` — carry V8 far deeper,
-  but a remaining wrong-*value* bug (not a missing opcode) still corrupts a
-  return address mid-run. Pinning it down needs instruction-level register
-  diffing of the interpreter against KVM, which is the next step. `execve`
-  replaces the image in place. The
+  `PACKSSDW` saturating packs, `RET imm16`, `POP r/m`, and **`syscall` writing
+  `RCX`←RIP / `R11`←RFLAGS** (musl/V8 trampolines read `RCX` after the call —
+  leaving it stale corrupted their control flow) carry V8 much deeper. A
+  purpose-built differential debugger (mask KVM's CPUID down to the
+  interpreter's feature set, freeze the clock/RNG, then diff the two backends'
+  per-syscall register snapshots and per-page memory hashes) now shows the
+  interpreter matching KVM *exactly* across all ~4800 of node's main-thread
+  startup syscalls. The one remaining divergence is a single byte — a bit in
+  V8's `CpuFeatures` word that it derives from `CPUID` — which routes V8 into a
+  codegen path that later faults. Nailing the exact `CPUID` sub-detail (or the
+  instruction on that path) is the last mile. `execve` replaces the image in
+  place. The
   scheduler exists in **two modes**
   rather than a dedicated `kernel::sched` module: `Kernel::schedule_serial`
   (cooperative single-thread round-robin, default) and `Kernel::schedule_smp`

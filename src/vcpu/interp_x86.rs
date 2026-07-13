@@ -90,6 +90,7 @@ const RDI: usize = 7;
 const R8: usize = 8;
 const R9: usize = 9;
 const R10: usize = 10;
+const R11: usize = 11;
 
 #[derive(Debug)]
 pub struct X86Backend {
@@ -2282,6 +2283,33 @@ impl X86Interp {
     }
 
     /// `CPUID` (`0F A2`, no `ModRM`): dispatch on the leaf in `EAX` (and, for
+    /// Pack the tracked arithmetic flags into an `RFLAGS` word, matching the
+    /// bit layout the CPU writes to `R11` on `syscall`. Reserved bit 1 and the
+    /// interrupt flag (bit 9, always set from a user task's view) are hardwired;
+    /// `AF`/`TF` aren't modeled and read back as 0.
+    fn rflags_word(&self) -> u64 {
+        let mut f = 0x202u64; // bit 1 (reserved) | IF
+        if self.flags.cf {
+            f |= 1 << 0;
+        }
+        if self.flags.pf {
+            f |= 1 << 2;
+        }
+        if self.flags.zf {
+            f |= 1 << 6;
+        }
+        if self.flags.sf {
+            f |= 1 << 7;
+        }
+        if self.df {
+            f |= 1 << 10;
+        }
+        if self.flags.of {
+            f |= 1 << 11;
+        }
+        f
+    }
+
     /// leaf 7, the subleaf in `ECX` — this scaffold only implements subleaf
     /// 0) and write `EAX`/`EBX`/`ECX`/`EDX`. Feature bits are set *only* for
     /// what this interpreter actually executes, so glibc/musl's CPUID-gated
@@ -2538,7 +2566,17 @@ impl X86Interp {
     ) -> Step {
         let (op2, pc) = fetch!(fetch_u8(mem, pc));
         match op2 {
-            0x05 => Step::Syscall, // `rip` deliberately left on the `syscall` opcode
+            0x05 => {
+                // `syscall` copies RIP→RCX and RFLAGS→R11 before entering the
+                // kernel, exactly as hardware does. musl/V8 syscall trampolines
+                // read RCX afterward (it holds the return address), so leaving
+                // it stale silently corrupted their control flow. `rip` itself
+                // stays on the opcode — the kernel advances it when it writes
+                // the return value.
+                self.gpr[RCX] = pc;
+                self.gpr[R11] = self.rflags_word();
+                Step::Syscall
+            }
             // 0F 1F /0: the canonical multi-byte NOP (any prefix; the ModRM/SIB
             // is decoded only to consume the instruction's full length).
             // F3 0F 1E: CET instructions — ENDBR64/ENDBR32 landing pads (FA/FB)
@@ -6489,5 +6527,19 @@ mod tests {
         cpu.exec(&mut m);
         assert_eq!(cpu.gpr[RAX], 0xDEAD_BEEF);
         assert_eq!(cpu.gpr[RSP], STACK + 8);
+    }
+
+    #[test]
+    fn syscall_sets_rcx_and_r11_like_hardware() {
+        // `syscall` copies RIP→RCX and RFLAGS→R11. Leaving RCX stale silently
+        // broke V8/musl trampolines that read it after the call.
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.flags.cf = true; // CF should show up in R11 (bit 0).
+        m.write_init(CODE, &[0x0F, 0x05]).unwrap();
+        let step = cpu.exec(&mut m);
+        assert!(matches!(step, Step::Syscall));
+        assert_eq!(cpu.gpr[RCX], CODE + 2, "RCX holds the post-syscall RIP");
+        assert_eq!(cpu.gpr[R11] & 0x203, 0x203, "R11 = RFLAGS (reserved|IF|CF)");
     }
 }
