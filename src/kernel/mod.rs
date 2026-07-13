@@ -67,6 +67,14 @@ struct ProcInfo {
     /// Address-space id: an index into [`Kernel::spaces`]. Threads that share
     /// memory (`CLONE_VM`) share one `mm`; a forked child gets a fresh copy.
     mm: usize,
+    /// File-descriptor-table id: an index into [`Kernel::file_tables`]. Threads
+    /// created with `CLONE_FILES` (every pthread) share one table, so an fd
+    /// opened by one thread is visible to all — load-bearing for libuv, whose
+    /// async wakeups write an eventfd from one thread that another polls. A
+    /// forked child gets a private copy. While a task runs its slice its table
+    /// is *checked out* into [`ProcInfo::fds`]; between slices it lives in
+    /// `file_tables[files]` (and `fds` holds an empty placeholder).
+    files: usize,
     /// `set_tid_address` / `CLONE_CHILD_CLEARTID`: on exit, zero this guest
     /// word and futex-wake it (lets `pthread_join` return). 0 = unset.
     clear_child_tid: u64,
@@ -88,12 +96,26 @@ struct ProcInfo {
     pgid: i32,
     /// Session id (`setsid`/`getsid`). `0` means "defaults to `pid`".
     sid: i32,
+    /// Parked: the task blocked on its last slice (futex/poll/wait4/stdin) and
+    /// should not be re-run until something might wake it. Distinct from
+    /// `RunState::Running` so the scheduler doesn't busy-spin re-running a
+    /// blocked task, and so "is another task runnable?" excludes parked
+    /// siblings (else a thread group all parks itself into a false deadlock).
+    parked: bool,
     /// Writable file-backed `MAP_SHARED` mappings, flushed back to their file
     /// on `munmap`/`msync`/exit. This is how `apk` (and `install`, `cp
     /// --sparse`, …) writes large extracted files: create → `ftruncate` →
     /// `mmap(MAP_SHARED, PROT_WRITE)` → memcpy → `munmap`. Without write-back
     /// the file stays zero-filled at the right size.
     shared_maps: Vec<SharedMap>,
+    /// Absolute wall-clock deadline (ns since the UNIX epoch) at which a timed
+    /// wait (`poll`/`ppoll`/`epoll_pwait` with a finite timeout) gives up and
+    /// returns 0. `None` when the task holds no timed wait. Set on the first
+    /// re-trap of the blocking syscall and checked on each later re-trap; once
+    /// the wall clock passes it, the syscall completes with "timed out" instead
+    /// of re-parking. This is what makes `setTimeout` fire — libuv sleeps in
+    /// `epoll_pwait(timeout)` until the next timer is due.
+    wake_deadline: Option<u128>,
 }
 
 /// A writable file-backed `MAP_SHARED` region awaiting flush-back.
@@ -120,6 +142,7 @@ impl Default for ProcInfo {
             tgid: 0,
             is_thread: false,
             mm: 0,
+            files: 0,
             clear_child_tid: 0,
             futex_wait: None,
             futex_woken: false,
@@ -129,7 +152,9 @@ impl Default for ProcInfo {
             pending: 0,
             pgid: 0,
             sid: 0,
+            parked: false,
             shared_maps: Vec::new(),
+            wake_deadline: None,
         }
     }
 }
@@ -232,6 +257,11 @@ pub struct Kernel {
     /// access between a worker running compute and the main thread servicing a
     /// syscall against the same address space.
     spaces: Vec<Arc<Mutex<GuestMemory>>>,
+    /// File-descriptor tables indexed by [`ProcInfo::files`]. A `CLONE_FILES`
+    /// thread group shares one entry; a forked child gets its own. The slot is
+    /// `None` while its owning task is mid-slice (the table is checked out into
+    /// [`ProcInfo::fds`]); see [`Kernel::check_out_files`].
+    file_tables: Vec<Option<FdTable>>,
     /// Number of virtual CPUs: how many host worker threads run guest compute
     /// in parallel. `1` uses the single-threaded cooperative scheduler.
     ncpus: usize,
@@ -277,6 +307,7 @@ impl Kernel {
             cur: ProcInfo::default(),
             procs: Vec::new(),
             spaces: Vec::new(),
+            file_tables: Vec::new(),
             ncpus: 1,
             interactive: false,
             stdin_buf: VecDeque::new(),
@@ -346,6 +377,8 @@ impl Kernel {
         info.tgid = 1;
         info.mm = self.spaces.len();
         info.run = RunState::Running;
+        info.files = self.file_tables.len();
+        self.file_tables.push(Some(std::mem::take(&mut info.fds)));
         self.spaces.push(Arc::new(Mutex::new(mem)));
         self.procs.push(Some(Process {
             vcpu: Some(vcpu),
@@ -364,7 +397,14 @@ impl Kernel {
             if let Some(code) = self.pid1_code() {
                 return Ok(code);
             }
-            if !self.serial_sweep()? {
+            if self.serial_sweep()? {
+                continue;
+            }
+            // No runnable task made progress. Wake the parked tasks so they
+            // re-check their conditions (a futex value that changed under a
+            // lost wake, a child that exited, host I/O). If nothing was parked
+            // to re-check, it's a genuine deadlock.
+            if !self.unpark_all() {
                 if self.any_running() {
                     return Err(VcpuError::Backend(
                         "deadlock: every process is blocked".into(),
@@ -372,7 +412,80 @@ impl Kernel {
                 }
                 return Ok(self.pid1_code().unwrap_or(0));
             }
+            // Re-sweep the just-unparked tasks. If they all immediately re-park
+            // without progress, either a timer is pending (sleep until it, then
+            // the re-run of that task's wait sees its deadline passed and
+            // returns) or it's a genuine deadlock.
+            if !self.serial_sweep()? && self.everything_parked() {
+                if self.wait_for_timer() {
+                    continue;
+                }
+                return Err(VcpuError::Backend(
+                    "deadlock: every process is blocked".into(),
+                ));
+            }
         }
+    }
+
+    /// If any live task holds a timed-wait deadline, sleep the host thread until
+    /// the earliest one (so the wall clock actually advances) and return `true`;
+    /// the caller re-sweeps and the waiter, re-checking its now-passed deadline,
+    /// returns "timed out". Returns `false` when nothing is timed — a genuine
+    /// deadlock. This is what lets a fully-parked machine make `setTimeout`
+    /// progress instead of being declared deadlocked.
+    fn wait_for_timer(&self) -> bool {
+        let now = poll::now_ns();
+        let Some(dl) = self
+            .procs
+            .iter()
+            .flatten()
+            .filter(|p| p.info.run == RunState::Running)
+            .filter_map(|p| p.info.wake_deadline)
+            .min()
+        else {
+            return false;
+        };
+        if dl > now {
+            let ns = (dl - now).min(3_600_000_000_000) as u64; // cap at 1h
+            std::thread::sleep(std::time::Duration::from_nanos(ns));
+        }
+        true
+    }
+
+    /// True if every live, non-zombie task is parked (blocked). Used to break
+    /// out of the unpark/re-sweep loop when a re-check produced no progress.
+    fn everything_parked(&self) -> bool {
+        let mut any_live = false;
+        for p in self.procs.iter().flatten() {
+            if p.info.run == RunState::Running {
+                any_live = true;
+                if !p.info.parked {
+                    return false;
+                }
+            }
+        }
+        any_live
+    }
+
+    /// Check the running task's shared fd table out of [`Kernel::file_tables`]
+    /// into `cur.fds` for the duration of its slice. Called right after `cur` is
+    /// swapped in. Its sibling threads (same `files` id) are parked, so the slot
+    /// is free; servicing is single-threaded, so no two tasks are ever checked
+    /// out at once.
+    fn check_out_files(&mut self) {
+        let f = self.cur.files;
+        self.cur.fds = self.file_tables[f]
+            .take()
+            .expect("fd table already checked out");
+    }
+
+    /// Check the running task's fd table back into [`Kernel::file_tables`] so its
+    /// siblings see any changes it made. Called right before `cur` is swapped
+    /// out. If the task exited as the last user of its table, `cur.fds` was
+    /// drained and we store the emptied table back (its slot is now idle).
+    fn check_in_files(&mut self) {
+        let f = self.cur.files;
+        self.file_tables[f] = Some(std::mem::take(&mut self.cur.fds));
     }
 
     /// One pass over the process table on the current thread: run each runnable
@@ -381,9 +494,11 @@ impl Kernel {
     fn serial_sweep(&mut self) -> Result<bool, VcpuError> {
         let mut progressed = false;
         for i in 0..self.procs.len() {
+            // Run only tasks that are Running *and not parked*: a parked task
+            // blocked last slice and won't make progress until woken.
             let runnable = matches!(
                 self.procs.get(i),
-                Some(Some(p)) if p.info.run == RunState::Running
+                Some(Some(p)) if p.info.run == RunState::Running && !p.info.parked
             );
             if !runnable {
                 continue;
@@ -394,14 +509,38 @@ impl Kernel {
             let space_arc = Arc::clone(&self.spaces[mm]);
             let mut guard = space_arc.lock().unwrap();
             std::mem::swap(&mut self.cur, &mut proc.info);
+            self.check_out_files();
+            self.block = false;
             let made = self.run_slice(&mut vcpu, &mut guard)?;
+            // The slice ended either by exiting or by blocking; `self.block`
+            // reflects the last syscall. A blocked task parks until a wake.
+            let blocked = self.block;
+            self.check_in_files();
             std::mem::swap(&mut self.cur, &mut proc.info);
+            proc.info.parked = blocked && proc.info.run == RunState::Running;
             drop(guard);
             proc.vcpu = Some(vcpu);
             self.procs[i] = Some(proc);
             progressed |= made;
         }
         Ok(progressed)
+    }
+
+    /// Wake parked tasks so they re-check their block condition on the next
+    /// sweep. Called when the scheduler would otherwise stall — it catches
+    /// wakeups that don't flow through an explicit unpark (a futex value that
+    /// changed under a "lost" wake, host-socket data arriving, a child that
+    /// became a zombie). Returns whether anything was parked (i.e. worth a
+    /// re-sweep).
+    fn unpark_all(&mut self) -> bool {
+        let mut any = false;
+        for p in self.procs.iter_mut().flatten() {
+            if p.info.parked {
+                p.info.parked = false;
+                any = true;
+            }
+        }
+        any
     }
 
     // ---- interactive driver (the browser terminal) -----------------------
@@ -432,6 +571,10 @@ impl Kernel {
         info.tgid = 1;
         info.mm = self.spaces.len();
         info.run = RunState::Running;
+        // Check the initial fd table (the standard streams) into slot 0; the
+        // scheduler checks it out into `cur.fds` for each slice.
+        info.files = self.file_tables.len();
+        self.file_tables.push(Some(std::mem::take(&mut info.fds)));
         self.spaces.push(Arc::new(Mutex::new(mem)));
         self.procs.push(Some(Process {
             vcpu: Some(vcpu),
@@ -449,13 +592,27 @@ impl Kernel {
             if let Some(code) = self.pid1_code() {
                 return Ok(Pumped::Exited(code));
             }
-            if !self.serial_sweep()? {
-                return Ok(if self.any_running() {
-                    Pumped::Blocked
-                } else {
-                    Pumped::Exited(self.pid1_code().unwrap_or(0))
-                });
+            if self.serial_sweep()? {
+                continue;
             }
+            // Stalled. Re-check parked tasks once (catches lost futex wakes,
+            // host-socket data, child exits). If the re-check makes progress,
+            // keep going; otherwise the machine is genuinely parked — for the
+            // interactive driver that means "waiting for input" (the embedder
+            // feeds stdin / host I/O completes and re-pumps), not a deadlock.
+            if self.unpark_all() && self.serial_sweep()? {
+                continue;
+            }
+            // Genuinely parked. A task holding a timed-wait deadline (setTimeout
+            // → epoll_pwait) isn't waiting for input — it just needs the wall
+            // clock to advance. We don't sleep here (this drives the single-
+            // threaded wasm terminal too), so the embedder must re-pump; each
+            // re-pump re-checks the deadline and fires the timer once it passes.
+            return Ok(if self.any_running() {
+                Pumped::Blocked
+            } else {
+                Pumped::Exited(self.pid1_code().unwrap_or(0))
+            });
         }
     }
 
@@ -511,6 +668,12 @@ impl Kernel {
                 self.exec_ok = false;
                 let ret = self.dispatch(sys, raw, &args, vcpu, mem);
                 self.deliver_pending_signals();
+                // A syscall that returns (didn't re-block) has consumed any
+                // timed-wait deadline it set; the next blocking syscall starts
+                // a fresh one.
+                if !self.block {
+                    self.cur.wake_deadline = None;
+                }
                 if let RunState::Zombie(_) = self.cur.run {
                     Serviced::Ended
                 } else if self.block {
@@ -665,10 +828,12 @@ impl Kernel {
             let flow = {
                 let mut proc = self.procs[i].take().unwrap();
                 std::mem::swap(&mut self.cur, &mut proc.info);
+                self.check_out_files();
                 let flow = {
                     let mut mem = space.lock().unwrap();
                     self.service(exit, vcpu.as_mut(), &mut mem)
                 };
+                self.check_in_files();
                 std::mem::swap(&mut self.cur, &mut proc.info);
                 self.procs[i] = Some(proc);
                 flow
@@ -1074,11 +1239,11 @@ impl Kernel {
     /// puts the new task in the caller's thread group (shared `tgid`, distinct
     /// `pid`/tid, not reaped by `wait4`). `CLONE_SETTLS` seeds the thread pointer;
     /// the `*_SETTID`/`CHILD_CLEARTID` flags write/clear the tid words musl's
-    /// pthread layer relies on. The fd table is still copied (a `CLONE_FILES`
-    /// approximation: correct for fork, and fine for threads that don't pass
-    /// fds between each other after creation).
+    /// pthread layer relies on. `CLONE_FILES` shares the fd table (every pthread
+    /// sets it); without it — fork — the child gets a private copy.
     fn sys_clone(&mut self, args: &[u64; 6], vcpu: &mut dyn Vcpu, mem: &mut GuestMemory) -> i64 {
         const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FILES: u64 = 0x0000_0400;
         const CLONE_VFORK: u64 = 0x0000_4000;
         const CLONE_THREAD: u64 = 0x0001_0000;
         const CLONE_SETTLS: u64 = 0x0008_0000;
@@ -1110,6 +1275,7 @@ impl Kernel {
         let is_thread = flags & CLONE_THREAD != 0;
         let is_vfork = flags & CLONE_VFORK != 0;
         let share_vm = flags & CLONE_VM != 0 && (is_thread || !is_vfork);
+        let share_files = flags & CLONE_FILES != 0;
 
         let pid = self.next_pid;
         self.next_pid += 1;
@@ -1161,21 +1327,35 @@ impl Kernel {
             }
         }
 
-        // The child holds copies of every open fd; bump pipe/socket refcounts.
-        let (mut r, mut w) = (Vec::new(), Vec::new());
-        for fd in info.fds.values() {
-            match fd {
-                Fd::PipeRead(i) => r.push(*i),
-                Fd::PipeWrite(i) => w.push(*i),
-                Fd::Socket { .. } => self.net.bump(fd, true),
-                _ => {}
+        // File-descriptor table. `info.fds` is only a placeholder — the real
+        // table lives in `self.file_tables`, checked out into `cur.fds` while a
+        // task runs. `CLONE_FILES` (every pthread) shares the caller's table id,
+        // so both threads see the same open fds — libuv relies on this: one
+        // thread's `uv_async_send` writes an eventfd another thread polls.
+        // Without it (fork) the child gets a private copy, and its fds hold
+        // independent references, so bump pipe/socket refcounts for the copy.
+        info.fds = FdTable::default();
+        if share_files {
+            info.files = self.cur.files;
+        } else {
+            let copy = self.cur.fds.clone();
+            let (mut r, mut w) = (Vec::new(), Vec::new());
+            for fd in copy.values() {
+                match fd {
+                    Fd::PipeRead(i) => r.push(*i),
+                    Fd::PipeWrite(i) => w.push(*i),
+                    Fd::Socket { .. } => self.net.bump(fd, true),
+                    _ => {}
+                }
             }
-        }
-        for i in r {
-            self.pipes[i].readers += 1;
-        }
-        for i in w {
-            self.pipes[i].writers += 1;
+            for i in r {
+                self.pipes[i].readers += 1;
+            }
+            for i in w {
+                self.pipes[i].writers += 1;
+            }
+            info.files = self.file_tables.len();
+            self.file_tables.push(Some(copy));
         }
 
         if let Some(cm) = child_mem.take() {
@@ -1549,8 +1729,20 @@ impl Kernel {
             let _ = mem.write(ctid, &0u32.to_le_bytes());
             self.futex_wake(mm, ctid, i32::MAX);
         }
-        for fd in self.cur.fds.drain() {
-            self.bump_pipe(&fd, false);
+        // Only close the fds when this is the last user of the shared table: a
+        // thread exiting while siblings live must leave the (`CLONE_FILES`)
+        // table — and its pipe/socket references — intact. `check_in_files`
+        // stores whatever remains back for the survivors.
+        let files = self.cur.files;
+        let others_share = self
+            .procs
+            .iter()
+            .flatten()
+            .any(|p| p.info.files == files && !matches!(p.info.run, RunState::Zombie(_)));
+        if !others_share {
+            for fd in self.cur.fds.drain() {
+                self.bump_pipe(&fd, false);
+            }
         }
         self.cur.run = RunState::Zombie(code & 0xff);
         0
@@ -1566,16 +1758,29 @@ impl Kernel {
         }
         let tgid = self.cur.tgid;
         let status = code & 0xff;
-        // Collect the siblings' fds first: closing them touches `self.pipes` /
-        // `self.net`, which we cannot borrow while iterating `self.procs`.
-        let mut to_close: Vec<Fd> = Vec::new();
+        // Zombify every sibling and note the distinct fd-table ids they used.
+        // Their `info.fds` are placeholders — the real tables live in
+        // `file_tables` (each shared table drained once, below).
+        let mut files_ids: Vec<usize> = Vec::new();
         for slot in &mut self.procs {
             let Some(p) = slot.as_mut() else { continue };
             if p.info.tgid != tgid || matches!(p.info.run, RunState::Zombie(_)) {
                 continue;
             }
-            to_close.extend(p.info.fds.drain());
+            if !files_ids.contains(&p.info.files) {
+                files_ids.push(p.info.files);
+            }
             p.info.run = RunState::Zombie(status);
+        }
+        // Close each distinct table's fds (touches `self.pipes`/`self.net`, so
+        // it can't run while borrowing `self.procs`). The current task's table
+        // is checked out into `cur.fds` (its slot is `None`), so it's skipped
+        // here and closed by the `sys_exit` tail call.
+        let mut to_close: Vec<Fd> = Vec::new();
+        for f in files_ids {
+            if let Some(Some(t)) = self.file_tables.get_mut(f) {
+                to_close.extend(t.drain());
+            }
         }
         for fd in to_close {
             self.bump_pipe(&fd, false);
@@ -1599,6 +1804,8 @@ impl Kernel {
     fn sys_futex(&mut self, args: &[u64; 6], mem: &GuestMemory) -> i64 {
         const FUTEX_WAIT: u64 = 0;
         const FUTEX_WAKE: u64 = 1;
+        const FUTEX_REQUEUE: u64 = 3;
+        const FUTEX_CMP_REQUEUE: u64 = 4;
         const FUTEX_WAIT_BITSET: u64 = 9;
         const FUTEX_WAKE_BITSET: u64 = 10;
         let uaddr = args[0];
@@ -1607,28 +1814,47 @@ impl Kernel {
         let mm = self.cur.mm;
         match op {
             FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-                // Already parked here: consult the wake flag only.
-                if self.cur.futex_wait == Some((mm, uaddr)) {
-                    if self.cur.futex_woken {
-                        self.cur.futex_wait = None;
-                        self.cur.futex_woken = false;
-                        return 0;
-                    }
+                // Woken by an explicit FUTEX_WAKE (directly, or after being
+                // requeued to another address by a condvar signal): consume it,
+                // regardless of which address the wake targeted.
+                if self.cur.futex_woken {
+                    self.cur.futex_wait = None;
+                    self.cur.futex_woken = false;
+                    return 0;
+                }
+                // Parked on a *different* address than this call names — i.e.
+                // requeued (pthread_cond_signal moved us from the condvar futex
+                // to the mutex futex). Stay parked; only an explicit wake on the
+                // requeue target releases us, so don't re-compare this address's
+                // value (which would spuriously return EAGAIN and desync the
+                // condvar wait).
+                if matches!(self.cur.futex_wait, Some(w) if w != (mm, uaddr)) {
                     self.block = true;
                     return 0;
                 }
+                // Fresh wait, or a re-check on the same address. Re-read the
+                // word: if it no longer equals `val`, the wait is over (this is
+                // what makes a "lost" plain wake safe — an unlock that changed
+                // the word is caught here). A real futex compares atomically at
+                // wait time; we compare on every re-run.
                 match mem.read_u32(uaddr) {
-                    Ok(cur) if cur != val => err(Errno::EAGAIN),
+                    Ok(cur) if cur != val => {
+                        self.cur.futex_wait = None;
+                        self.cur.futex_woken = false;
+                        err(Errno::EAGAIN)
+                    }
+                    Ok(_) if !self.has_cowaiter(mm) => {
+                        // No sibling shares this address space, so no one can
+                        // ever `FUTEX_WAKE` us — parking would be a false
+                        // deadlock. Report a spurious wake instead (permitted by
+                        // the futex contract; the caller re-checks its predicate
+                        // and loops). This is the common single-threaded-musl
+                        // case; a real thread group takes the parking path.
+                        self.cur.futex_wait = None;
+                        self.cur.futex_woken = false;
+                        0
+                    }
                     Ok(_) => {
-                        // Park only if some other task could wake us; otherwise a
-                        // lone waiter would deadlock, so fake a wake.
-                        let others =
-                            self.procs.iter().flatten().any(|p| {
-                                p.info.pid != self.cur.pid && p.info.run == RunState::Running
-                            });
-                        if !others {
-                            return 0;
-                        }
                         self.cur.futex_wait = Some((mm, uaddr));
                         self.cur.futex_woken = false;
                         self.block = true;
@@ -1638,8 +1864,63 @@ impl Kernel {
                 }
             }
             FUTEX_WAKE | FUTEX_WAKE_BITSET => self.futex_wake(mm, uaddr, val as i32),
+            // Requeue: wake up to `val` waiters on `uaddr`, then move up to
+            // `val2` of the rest to wait on `uaddr2` instead. This is how
+            // musl's pthread_cond_signal/broadcast hand a woken thread off to
+            // the mutex — without it the condvar futex keeps the waiters and
+            // the later mutex wake finds no one (the deadlock node hit).
+            FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+                if op == FUTEX_CMP_REQUEUE {
+                    let expected = args[5] as u32;
+                    match mem.read_u32(uaddr) {
+                        Ok(cur) if cur != expected => return err(Errno::EAGAIN),
+                        Err(_) => return err(Errno::EFAULT),
+                        Ok(_) => {}
+                    }
+                }
+                let nr_wake = i64::from(val);
+                let nr_requeue = args[3] as i64;
+                let uaddr2 = args[4];
+                self.futex_requeue(mm, uaddr, uaddr2, nr_wake, nr_requeue)
+            }
             _ => 0,
         }
+    }
+
+    /// Whether any *other* live task shares this address space (`mm`) and could
+    /// therefore issue a `FUTEX_WAKE` against it. `self.cur` is out of the table
+    /// during its slice, so a scan of `self.procs` sees only the siblings.
+    fn has_cowaiter(&self, mm: usize) -> bool {
+        self.procs
+            .iter()
+            .flatten()
+            .any(|p| p.info.mm == mm && !matches!(p.info.run, RunState::Zombie(_)))
+    }
+
+    /// Wake up to `nr_wake` waiters on `(mm, uaddr)`, then requeue up to
+    /// `nr_requeue` of the remaining waiters to wait on `(mm, uaddr2)`. Returns
+    /// the number of waiters woken (Linux's `FUTEX_REQUEUE` return value).
+    fn futex_requeue(&mut self, mm: usize, uaddr: u64, uaddr2: u64, nr_wake: i64, nr_requeue: i64) -> i64 {
+        let mut woken = 0i64;
+        let mut requeued = 0i64;
+        for p in self.procs.iter_mut().flatten() {
+            if p.info.futex_wait != Some((mm, uaddr)) || p.info.futex_woken {
+                continue;
+            }
+            if woken < nr_wake {
+                p.info.futex_woken = true;
+                p.info.parked = false;
+                woken += 1;
+            } else if requeued < nr_requeue {
+                // Move it to the new address; it stays parked until an explicit
+                // wake on `uaddr2`.
+                p.info.futex_wait = Some((mm, uaddr2));
+                requeued += 1;
+            } else {
+                break;
+            }
+        }
+        woken
     }
 
     /// Release up to `n` tasks parked in `FUTEX_WAIT` on `(mm, uaddr)`; returns
@@ -1652,6 +1933,7 @@ impl Kernel {
             }
             if p.info.futex_wait == Some((mm, uaddr)) && !p.info.futex_woken {
                 p.info.futex_woken = true;
+                p.info.parked = false; // make it runnable so the sweep re-runs it
                 woken += 1;
             }
         }

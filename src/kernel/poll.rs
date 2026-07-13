@@ -67,7 +67,7 @@ pub(super) struct EpollInst {
 }
 
 /// Nanoseconds since the UNIX epoch on the host wall clock.
-fn now_ns() -> u128 {
+pub(super) fn now_ns() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -88,6 +88,18 @@ fn read_timespec(mem: &GuestMemory, ptr: u64) -> Option<(u64, u64)> {
     let sec = mem.read_u64(ptr).ok()?;
     let nsec = mem.read_u64(ptr + 8).ok()?;
     Some((sec, nsec))
+}
+
+/// Convert a `timespec` duration to whole milliseconds, rounding a non-zero
+/// sub-millisecond remainder up to 1 (so a tiny timeout still parks briefly
+/// rather than collapsing to the zero-timeout "poll and return" case).
+fn timespec_to_ms(sec: u64, nsec: u64) -> i64 {
+    let ms = sec.saturating_mul(1000) + (nsec / 1_000_000);
+    if ms == 0 && nsec > 0 {
+        1
+    } else {
+        ms.min(i64::MAX as u64) as i64
+    }
 }
 
 /// Write a `struct timespec` (16 bytes).
@@ -188,6 +200,42 @@ impl Kernel {
         }
     }
 
+    /// Decide what a timed wait with no ready fd should do. Returns `true` if
+    /// the caller should return "timed out" (0 ready) — either because the
+    /// deadline has now passed, or (defensively) `timeout_ms == 0`. Returns
+    /// `false` after arranging to park (`self.block = true`); a negative
+    /// `timeout_ms` means "wait forever" and always parks.
+    ///
+    /// The absolute deadline lives on `cur.wake_deadline`, seeded on the first
+    /// call and re-checked on every re-trap of the same blocking syscall (the
+    /// guest PC never advanced past the `svc`). [`Kernel::service`] clears it
+    /// once the syscall finally completes.
+    fn block_or_timeout(&mut self, timeout_ms: i64) -> bool {
+        if timeout_ms == 0 {
+            return true;
+        }
+        if timeout_ms < 0 {
+            self.block = true;
+            return false;
+        }
+        let now = now_ns();
+        match self.cur.wake_deadline {
+            Some(dl) if now >= dl => {
+                self.cur.wake_deadline = None;
+                true
+            }
+            Some(_) => {
+                self.block = true;
+                false
+            }
+            None => {
+                self.cur.wake_deadline = Some(now + (timeout_ms as u128) * 1_000_000);
+                self.block = true;
+                false
+            }
+        }
+    }
+
     // ---- poll / ppoll -------------------------------------------------
 
     /// `poll(fds, nfds, timeout_ms)`.
@@ -226,10 +274,10 @@ impl Kernel {
             }
         }
 
-        if ready_count > 0 || timeout_ms == 0 {
+        if ready_count > 0 {
             return ready_count;
         }
-        self.block = true;
+        self.block_or_timeout(timeout_ms);
         0
     }
 
@@ -251,7 +299,7 @@ impl Kernel {
             let Some((sec, nsec)) = read_timespec(mem, timeout_ts) else {
                 return err(Errno::EFAULT);
             };
-            i64::from(sec != 0 || nsec != 0)
+            timespec_to_ms(sec, nsec)
         };
         self.sys_poll(fds_ptr, nfds, timeout_ms, mem)
     }
@@ -491,10 +539,10 @@ impl Kernel {
             n += 1;
         }
 
-        if n > 0 || timeout_ms == 0 {
+        if n > 0 {
             return n as i64;
         }
-        self.block = true;
+        self.block_or_timeout(timeout_ms);
         0
     }
 
@@ -514,7 +562,7 @@ impl Kernel {
             let Some((sec, nsec)) = read_timespec(mem, timeout_ts) else {
                 return err(Errno::EFAULT);
             };
-            i64::from(sec != 0 || nsec != 0)
+            timespec_to_ms(sec, nsec)
         };
         self.sys_epoll_wait(epfd, events_ptr, maxevents, timeout_ms, mem)
     }

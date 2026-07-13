@@ -41,7 +41,7 @@ pub enum Fd {
 }
 
 /// Maps small integer descriptors to [`Fd`]s, allocating the lowest free number.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FdTable {
     map: BTreeMap<i32, Fd>,
 }

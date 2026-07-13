@@ -302,18 +302,23 @@ CPUs, rather than pinning one host thread per guest thread.
   `GuestMemory`) and `CLONE_VM|CLONE_THREAD` threads (shared `mm`, shared
   `tgid`, distinct `pid`/tid, not reaped by `wait4`), including
   `CLONE_SETTLS`/`CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID`/
-  `CLONE_CHILD_CLEARTID`. `futex` `FUTEX_WAIT`/`FUTEX_WAKE`(`_BITSET`) is a
-  real park/wake (a lone waiter gets a spurious wake instead of deadlocking).
-  **Known limitation — heavily-threaded event loops (node):** a program like
-  node loads and runs (dynamic linking, fd-hardening, V8 init all pass — see
-  Phase 5) but doesn't reach quiescence: its ~6 V8/libuv threads busy-spin on
-  `futex(FUTEX_WAIT)` and the main thread's `epoll_pwait(-1)` returns
-  immediately instead of blocking, so the cooperative single-vcpu scheduler
-  never drives the event loop to "no work → exit". Making `epoll_pwait`/
-  `ppoll` genuinely block on an infinite timeout, real per-address futex
-  fairness across the thread group, and timer-driven wakeups are the follow-up
-  (this is the frontier for running node/V8 to completion; every syscall it
-  needs is already implemented). `execve` replaces the image in place. The
+  `CLONE_CHILD_CLEARTID`. `CLONE_FILES` (every pthread) **shares one fd table**
+  across the thread group — a checked-out/checked-in table keyed by a per-task
+  `files` id — so an eventfd one thread creates is the same fd another writes;
+  without this libuv's cross-thread `uv_async_send` wakeups landed on the wrong
+  descriptor. `futex` implements `FUTEX_WAIT`/`FUTEX_WAKE`(`_BITSET`) and
+  `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE` (musl's `pthread_cond_signal` hands a
+  woken waiter to the mutex via requeue) as a real park/wake; a task blocked on
+  its slice *parks* (no busy-spin) and a lone waiter gets a spurious wake
+  instead of deadlocking. `poll`/`ppoll`/`epoll_pwait` with a finite timeout
+  honor a wall-clock deadline, so `setTimeout`/`setInterval` fire and libuv
+  drives the loop to "no work → exit".
+  **node runs:** `node -e …` executes real JavaScript to completion — the
+  event loop, timers, intervals, promises/microtasks, JSON, and stdio all work
+  and the process exits 0. The one remaining gap is V8's **JIT**: a hot loop
+  that tiers up to TurboFan emits native x86 the interpreter doesn't fully
+  decode and faults a background thread; `node --jitless` avoids it and runs
+  everything (Ignition-only). `execve` replaces the image in place. The
   scheduler exists in **two modes**
   rather than a dedicated `kernel::sched` module: `Kernel::schedule_serial`
   (cooperative single-thread round-robin, default) and `Kernel::schedule_smp`
