@@ -522,6 +522,34 @@ fn fpu_read_src(mem: &GuestMemory, addr: u64, w: MemWidth) -> Result<f64, Step> 
     }
 }
 
+/// `FXTRACT`: split `x` into its base-2 exponent (`ST(0)`, unbiased, as a
+/// float) and its significand in `[1, 2)` carrying `x`'s sign (pushed to become
+/// the new `ST(0)`). Working from the `f64` bit pattern gives the exact split
+/// for normals; the zero/inf/NaN corners match hardware (`0 → -inf`, `inf →
+/// inf`, `NaN → NaN`), and subnormals fall back to a `log2` normalization.
+#[allow(clippy::cast_precision_loss)] // the unbiased exponent is in [-1074, 1023] — exact in f64
+fn fxtract(x: f64) -> (f64, f64) {
+    if x == 0.0 {
+        return (f64::NEG_INFINITY, x); // significand keeps ±0's sign
+    }
+    if x.is_nan() {
+        return (x, x);
+    }
+    if x.is_infinite() {
+        return (f64::INFINITY, x);
+    }
+    let bits = x.to_bits();
+    let raw = ((bits >> 52) & 0x7ff) as i64;
+    if raw == 0 {
+        // Subnormal: no stored exponent bits to read directly.
+        let exp = x.abs().log2().floor();
+        return (exp, x / exp.exp2());
+    }
+    // Force the exponent field to the bias (unbiased 0) → significand in [1, 2).
+    let sig = f64::from_bits((bits & !(0x7ffu64 << 52)) | (1023u64 << 52));
+    ((raw - 1023) as f64, sig)
+}
+
 /// Apply `f` lane-wise (`f64`) to the low `lanes` 8-byte lanes of `dst`/`src`,
 /// leaving the untouched upper lanes of `dst` as-is — this is exactly the
 /// "scalar op preserves the destination's upper bits" rule SSE arithmetic
@@ -3815,6 +3843,35 @@ impl X86Interp {
         }
     }
 
+    /// `FPREM` (`round == false`, quotient truncated toward zero — the C
+    /// `fmod`) and `FPREM1` (`round == true`, quotient to nearest-even — the
+    /// IEEE-754 remainder): `ST(0) = ST(0) - ST(1)*Q`. Real hardware reduces by
+    /// at most one 2^63 step per execution and reports "reduction incomplete" in
+    /// `C2`, so a software loop (musl/libm `fmod`: `FPREM; FNSTSW; TEST AH,4;
+    /// JNZ`) repeats until `C2` clears. Modelled in `f64` the reduction always
+    /// completes in a single step, so `C2` is cleared unconditionally and the low
+    /// three quotient bits are published in `C1`/`C3`/`C0` — the argument-
+    /// reduction form (`FPREM1` feeding `__rem_pio2`) reads them back.
+    fn fpu_prem(&mut self, round: bool) {
+        let a = self.st_get(0);
+        let b = self.st_get(1);
+        let quotient = a / b;
+        let (r, q) = if round {
+            let q = quotient.round_ties_even();
+            (a - b * q, q)
+        } else {
+            // `a % b` is a single-rounding fmod; `trunc(a/b)` only feeds the
+            // condition-code bits below.
+            (a % b, quotient.trunc())
+        };
+        self.st_set(0, r);
+        let qi = q.abs() as i64 as u64;
+        self.fpu_c0 = (qi >> 2) & 1 != 0;
+        self.fpu_c3 = (qi >> 1) & 1 != 0;
+        self.fpu_c1 = qi & 1 != 0;
+        self.fpu_c2 = false;
+    }
+
     /// The status word `FNSTSW`/`FSTSW` report: `TOP` (bits 11-13) and
     /// `C0`/`C1`/`C2`/`C3` (bits 8/9/10/14); the busy, exception-summary and
     /// exception-flag bits are always `0` (never modeled).
@@ -3889,7 +3946,10 @@ impl X86Interp {
 
     /// `D9`: `FLD`/`FST`/`FSTP m32fp`, `FLDCW`/`FNSTCW`, `FLD ST(i)`,
     /// `FXCH`, `FNOP`, `FCHS`/`FABS`/`FTST`, the constant loads
-    /// (`FLD1`/`FLDZ`/...), `FDECSTP`/`FINCSTP`, `FSQRT`, `FRNDINT`.
+    /// (`FLD1`/`FLDZ`/...), `FDECSTP`/`FINCSTP`, `FSQRT`, `FRNDINT`, and the
+    /// F-row transcendentals `F2XM1`/`FYL2X`/`FPTAN`/`FPATAN`/`FXTRACT`/
+    /// `FPREM1`/`FPREM`/`FYL2XP1`/`FSINCOS`/`FSCALE`/`FSIN`/`FCOS` (computed in
+    /// `f64`, matching the `st` model — `FPREM`/`FPREM1` back musl/libm `fmod`).
     #[allow(clippy::too_many_lines)] // one flat opcode dispatch, same style as exec_0f_sse
     #[allow(clippy::single_match_else)] // the register-vs-memory ModRM split is the real structure, not a single-pattern match
     fn fpu_d9(&mut self, mem: &mut GuestMemory, modrm: ModRm, pc2: u64) -> Step {
@@ -3945,6 +4005,41 @@ impl X86Interp {
                         self.next(pc2)
                     }
                     6 => match rm {
+                        0 => {
+                            self.st_set(0, self.st_get(0).exp2() - 1.0); // F2XM1
+                            self.fpu_c2 = false;
+                            self.next(pc2)
+                        }
+                        1 => {
+                            // FYL2X: ST(1) = ST(1) * log2(ST(0)), then pop.
+                            let r = self.st_get(1) * self.st_get(0).log2();
+                            self.st_set(1, r);
+                            self.fpu_pop();
+                            self.next(pc2)
+                        }
+                        2 => {
+                            self.st_set(0, self.st_get(0).tan()); // FPTAN
+                            self.fpu_push(1.0);
+                            self.fpu_c2 = false;
+                            self.next(pc2)
+                        }
+                        3 => {
+                            // FPATAN: ST(1) = atan2(ST(1), ST(0)), then pop.
+                            let r = self.st_get(1).atan2(self.st_get(0));
+                            self.st_set(1, r);
+                            self.fpu_pop();
+                            self.next(pc2)
+                        }
+                        4 => {
+                            let (exp, sig) = fxtract(self.st_get(0)); // FXTRACT
+                            self.st_set(0, exp);
+                            self.fpu_push(sig);
+                            self.next(pc2)
+                        }
+                        5 => {
+                            self.fpu_prem(true); // FPREM1
+                            self.next(pc2)
+                        }
                         6 => {
                             self.fpu_top = self.fpu_top.wrapping_sub(1) & 7; // FDECSTP
                             self.next(pc2)
@@ -3953,12 +4048,30 @@ impl X86Interp {
                             self.fpu_top = (self.fpu_top + 1) & 7; // FINCSTP
                             self.next(pc2)
                         }
-                        // F2XM1/FYL2X/FPTAN/FPATAN/FXTRACT/FPREM1: not in our documented subset
                         _ => Step::Illegal,
                     },
                     7 => match rm {
+                        0 => {
+                            self.fpu_prem(false); // FPREM
+                            self.next(pc2)
+                        }
+                        1 => {
+                            // FYL2XP1: ST(1) = ST(1) * log2(ST(0) + 1), then pop.
+                            let r = self.st_get(1) * (self.st_get(0) + 1.0).log2();
+                            self.st_set(1, r);
+                            self.fpu_pop();
+                            self.next(pc2)
+                        }
                         2 => {
                             self.st_set(0, self.st_get(0).sqrt()); // FSQRT
+                            self.next(pc2)
+                        }
+                        3 => {
+                            // FSINCOS: ST(0) = sin(ST(0)), push cos(ST(0)).
+                            let x = self.st_get(0);
+                            self.st_set(0, x.sin());
+                            self.fpu_push(x.cos());
+                            self.fpu_c2 = false;
                             self.next(pc2)
                         }
                         4 => {
@@ -3966,7 +4079,22 @@ impl X86Interp {
                             self.st_set(0, v);
                             self.next(pc2)
                         }
-                        // FPREM/FYL2XP1/FSINCOS/FSCALE/FSIN/FCOS: not in our documented subset
+                        5 => {
+                            // FSCALE: ST(0) = ST(0) * 2^trunc(ST(1)).
+                            let r = self.st_get(0) * self.st_get(1).trunc().exp2();
+                            self.st_set(0, r);
+                            self.next(pc2)
+                        }
+                        6 => {
+                            self.st_set(0, self.st_get(0).sin()); // FSIN
+                            self.fpu_c2 = false;
+                            self.next(pc2)
+                        }
+                        7 => {
+                            self.st_set(0, self.st_get(0).cos()); // FCOS
+                            self.fpu_c2 = false;
+                            self.next(pc2)
+                        }
                         _ => Step::Illegal,
                     },
                     _ => Step::Illegal, // D9 /1, /3 register forms: not in our documented subset
@@ -6311,6 +6439,88 @@ mod tests {
         equal.exec(&mut m);
         assert!(!equal.flags.cf);
         assert!(equal.flags.zf, "equal operands set ZF");
+    }
+
+    #[test]
+    fn fprem_computes_fmod_and_reports_complete() {
+        // The `FPREM; FNSTSW; TEST AH,4; JNZ` reduction loop musl/libm emit for
+        // `fmod`: one FPREM must produce the full remainder and clear C2 so the
+        // loop runs exactly once. (This exact sequence SIGILL'd node's
+        // `Number.toString(16)` before FPREM was implemented.)
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.fpu_push(2.0); // ST(1) divisor
+        cpu.fpu_push(5.3); // ST(0) dividend
+        m.write_init(CODE, &[0xD9, 0xF8]).unwrap(); // FPREM
+        cpu.exec(&mut m);
+        assert!((cpu.st_get(0) - (5.3f64 % 2.0)).abs() < 1e-12, "{}", cpu.st_get(0));
+        assert!(!cpu.fpu_c2, "single-step reduction is always complete");
+        // trunc(5.3/2.0) = 2 = 0b010 → Q0=0 (C1), Q1=1 (C3), Q2=0 (C0).
+        assert!(!cpu.fpu_c1 && cpu.fpu_c3 && !cpu.fpu_c0, "quotient bits in C1/C3/C0");
+    }
+
+    #[test]
+    fn fprem1_uses_the_nearest_even_quotient() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.fpu_push(2.0); // ST(1)
+        cpu.fpu_push(5.3); // ST(0)
+        m.write_init(CODE, &[0xD9, 0xF5]).unwrap(); // FPREM1
+        cpu.exec(&mut m);
+        // IEEE remainder: 5.3 - 2.0*round(2.65) = 5.3 - 6.0 = -0.7.
+        assert!((cpu.st_get(0) + 0.7).abs() < 1e-12, "{}", cpu.st_get(0));
+        assert!(!cpu.fpu_c2);
+    }
+
+    #[test]
+    fn x87_transcendentals_match_f64_math() {
+        // FSIN(π/2) = 1.
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.fpu_push(std::f64::consts::FRAC_PI_2);
+        m.write_init(CODE, &[0xD9, 0xFE]).unwrap();
+        cpu.exec(&mut m);
+        assert!((cpu.st_get(0) - 1.0).abs() < 1e-12);
+
+        // FSCALE: 3.0 * 2^trunc(4.7) = 3 * 16 = 48.
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.fpu_push(4.7); // ST(1)
+        cpu.fpu_push(3.0); // ST(0)
+        m.write_init(CODE, &[0xD9, 0xFD]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.st_get(0), 48.0);
+
+        // F2XM1(0.5) = 2^0.5 - 1.
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.fpu_push(0.5);
+        m.write_init(CODE, &[0xD9, 0xF0]).unwrap();
+        cpu.exec(&mut m);
+        assert!((cpu.st_get(0) - (2f64.sqrt() - 1.0)).abs() < 1e-12);
+
+        // FYL2X: ST(1)*log2(ST(0)), then pop → 3 * log2(8) = 9.
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.fpu_push(3.0); // ST(1) = y
+        cpu.fpu_push(8.0); // ST(0) = x
+        m.write_init(CODE, &[0xD9, 0xF1]).unwrap();
+        cpu.exec(&mut m);
+        assert!((cpu.st_get(0) - 9.0).abs() < 1e-12);
+        assert_eq!(cpu.fpu_top, 7, "FYL2X pops one operand");
+
+        // FPATAN: atan2(ST(1), ST(0)), then pop → atan2(1,1) = π/4.
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.fpu_push(1.0); // ST(1) = y
+        cpu.fpu_push(1.0); // ST(0) = x
+        m.write_init(CODE, &[0xD9, 0xF3]).unwrap();
+        cpu.exec(&mut m);
+        assert!((cpu.st_get(0) - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
+
+        // FXTRACT: 12.0 = 1.5 * 2^3 → exponent 3 in ST(1), significand 1.5 in ST(0).
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.fpu_push(12.0);
+        m.write_init(CODE, &[0xD9, 0xF4]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.st_get(0), 1.5, "significand in [1,2)");
+        assert_eq!(cpu.st_get(1), 3.0, "unbiased exponent");
     }
 
     #[test]
