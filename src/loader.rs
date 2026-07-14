@@ -127,8 +127,20 @@ const HWCAP_X86_64: u64 = (1 << 0)   // FPU
 /// safer than claiming e.g. SVE2/MTE/AVX512 support the interpreter lacks.
 const HWCAP2_NONE: u64 = 0;
 
-/// Guest stack size reserved at the top of the address space.
-const STACK_SIZE: u64 = 256 * 1024;
+/// Guest stack reserved at the top of the address space, for the *initial*
+/// thread. This region is mapped once and never grows (there is no
+/// grow-down/`VM_GROWSDOWN` fault handler), and the anonymous-`mmap` arena
+/// starts immediately below it — so an undersized stack does not fault, it
+/// silently runs off the bottom into whatever the arena handed out (a thread
+/// stack, the JS heap) and corrupts it. Linux's default `RLIMIT_STACK` is
+/// 8 MiB and a real JS engine (JSC/V8) recurses deeply enough to want it, so
+/// match that, clamped so a small test address space still leaves room for the
+/// image itself.
+fn stack_size(mem_size: u64) -> u64 {
+    const LINUX_DEFAULT: u64 = 8 * 1024 * 1024;
+    const FLOOR: u64 = 256 * 1024;
+    LINUX_DEFAULT.min(mem_size / 8).max(FLOOR)
+}
 
 // ---- public API ----------------------------------------------------------
 
@@ -228,7 +240,7 @@ pub fn load_static(
         entry,
         stack_pointer,
         program_break: mapped.program_break,
-        stack_bottom: (mem.base() + mem.size()) - STACK_SIZE,
+        stack_bottom: (mem.base() + mem.size()) - stack_size(mem.size()),
     })
 }
 
@@ -389,7 +401,7 @@ pub fn load_dynamic(
         entry: interp_entry,
         stack_pointer,
         program_break: interp_map.program_break.max(exe_map.program_break),
-        stack_bottom: (mem.base() + mem.size()) - STACK_SIZE,
+        stack_bottom: (mem.base() + mem.size()) - stack_size(mem.size()),
     })
 }
 
@@ -675,8 +687,9 @@ fn build_stack(
     interp_base: u64,
 ) -> Result<u64, LoadError> {
     let top = mem.base() + mem.size();
-    let stack_bottom = top - STACK_SIZE;
-    mem.map(stack_bottom, STACK_SIZE, Prot::rw())?;
+    let size = stack_size(mem.size());
+    let stack_bottom = top - size;
+    mem.map(stack_bottom, size, Prot::rw())?;
 
     let (hwcap, platform_name) = arch_hints(ehdr.machine);
 

@@ -177,6 +177,105 @@ pub enum Pumped {
 
 /// The result of servicing one guest exit, telling the scheduler what to do
 /// with the task's vcpu next.
+/// The anonymous-`mmap` arena for one address space: a region `[floor, top)`
+/// carved downward from `top`, plus a free list of ranges returned by `munmap`.
+///
+/// The free list is what makes this an allocator rather than a bump pointer. A
+/// long-running guest that maps and unmaps repeatedly — a JS engine cycling JIT
+/// code buffers and heap blocks is the extreme case — would otherwise walk the
+/// cursor to the floor and start failing with `ENOMEM` while most of the arena
+/// sat unused, since nothing ever reclaimed it.
+#[derive(Debug, Clone, Default)]
+struct Arena {
+    /// Next bump allocation ends here (allocations grow *down* from `top`).
+    cursor: u64,
+    /// Allocations may not go below this.
+    floor: u64,
+    /// The arena's high bound — the initial `cursor`. Used to tell an address
+    /// inside the arena (reclaimable) from one outside it (an image segment).
+    top: u64,
+    /// Freed ranges `(addr, len)`, sorted by address and coalesced.
+    free: Vec<(u64, u64)>,
+}
+
+impl Arena {
+    fn new(top: u64, floor: u64) -> Self {
+        Self { cursor: top, floor, top, free: Vec::new() }
+    }
+
+    /// Carve `len` bytes: reuse a freed range if one fits, else bump the cursor.
+    /// `None` when the arena is exhausted.
+    fn alloc(&mut self, len: u64) -> Option<u64> {
+        // First fit over the free list, splitting the remainder back in.
+        if let Some(i) = self.free.iter().position(|&(_, flen)| flen >= len) {
+            let (addr, flen) = self.free[i];
+            if flen == len {
+                self.free.remove(i);
+            } else {
+                // Keep the low part free, hand back the high part, so adjacent
+                // frees still coalesce downward.
+                self.free[i] = (addr, flen - len);
+            }
+            return Some(addr + (flen - len));
+        }
+        let new_top = self.cursor.checked_sub(len)?;
+        if new_top < self.floor {
+            return None;
+        }
+        self.cursor = new_top;
+        Some(new_top)
+    }
+
+    /// Return `[addr, addr+len)` to the arena, coalescing with its neighbours.
+    ///
+    /// The guest is not trusted here: it may `munmap` an image segment, a
+    /// `MAP_FIXED` range we never handed out, or the same range twice. Anything
+    /// outside the *allocated* window `[cursor, top)` is ignored, and a range
+    /// already on the free list is ignored — otherwise a double free would walk
+    /// the cursor past `top` and later allocations would hand out addresses
+    /// above the arena, i.e. inside the initial stack.
+    fn free_range(&mut self, addr: u64, len: u64) {
+        let Some(end) = addr.checked_add(len) else {
+            return;
+        };
+        if len == 0 || addr < self.cursor || end > self.top {
+            return;
+        }
+        // Already free? (double munmap, or a sub-range of a freed block)
+        if self.free.iter().any(|&(a, l)| addr < a + l && a < end) {
+            return;
+        }
+        // Sitting right on the cursor: give it straight back to the bump region
+        // and absorb anything that just became adjacent.
+        if addr == self.cursor {
+            self.cursor = end;
+            while let Some(i) = self.free.iter().position(|&(a, _)| a == self.cursor) {
+                self.cursor += self.free[i].1;
+                self.free.remove(i);
+            }
+            debug_assert!(self.cursor <= self.top);
+            return;
+        }
+        let pos = self.free.partition_point(|&(a, _)| a < addr);
+        self.free.insert(pos, (addr, len));
+        // Coalesce with the next, then the previous, entry.
+        if pos + 1 < self.free.len() {
+            let (na, nl) = self.free[pos + 1];
+            if end == na {
+                self.free[pos].1 += nl;
+                self.free.remove(pos + 1);
+            }
+        }
+        if pos > 0 {
+            let (pa, pl) = self.free[pos - 1];
+            if pa + pl == addr {
+                self.free[pos - 1].1 += self.free[pos].1;
+                self.free.remove(pos);
+            }
+        }
+    }
+}
+
 enum Serviced {
     /// Syscall done; write this value into the vcpu's result register, resume.
     SetRet(i64),
@@ -262,21 +361,23 @@ pub struct Kernel {
     /// `None` while its owning task is mid-slice (the table is checked out into
     /// [`ProcInfo::fds`]); see [`Kernel::check_out_files`].
     file_tables: Vec<Option<FdTable>>,
-    /// Anonymous-`mmap` arenas indexed by [`ProcInfo::mm`]. Every task sharing an
-    /// address space (`CLONE_VM` threads) shares one `(cursor, floor)` entry, so
-    /// their `mmap`s carve disjoint regions from a single downward-growing arena.
-    /// The running task checks this out into `cur.mmap_cursor`/`cur.mmap_floor`
-    /// for its slice; see [`Kernel::check_out_mmap`]. Without sharing, two threads
-    /// in one address space would each `mmap` downward from the same cursor and
-    /// hand back overlapping ranges — fatal once a JIT drops code into memory a
-    /// sibling thinks is free.
-    mmap_areas: Vec<(u64, u64)>,
+    /// Anonymous-`mmap` arenas indexed by [`ProcInfo::mm`] — one per address
+    /// space, so every `CLONE_VM` thread allocates from the same arena and two
+    /// threads can never be handed overlapping ranges.
+    mmap_areas: Vec<Arena>,
     /// Number of virtual CPUs: how many host worker threads run guest compute
     /// in parallel. `1` uses the single-threaded cooperative scheduler.
     ncpus: usize,
     next_pid: i32,
     /// Set by a handler when the syscall would block (re-trap it later).
     block: bool,
+    /// Set by `sched_yield`: end this task's slice but leave it *runnable*.
+    /// Distinct from `block` (which parks the task until a wake) — a yielding
+    /// task wants to go around again, just not before its siblings do. Without
+    /// this the cooperative scheduler never leaves a thread that spins on
+    /// `sched_yield` waiting for a sibling to make progress, and the whole
+    /// process livelocks (Bun's event loop does exactly that).
+    yield_now: bool,
     /// Set by `execve` when it replaced the process image (resume at the new
     /// PC without setting a syscall return).
     exec_ok: bool,
@@ -324,6 +425,7 @@ impl Kernel {
             stdin_closed: false,
             next_pid: 2,
             block: false,
+            yield_now: false,
             exec_ok: false,
         }
     }
@@ -389,7 +491,7 @@ impl Kernel {
         info.run = RunState::Running;
         info.files = self.file_tables.len();
         self.file_tables.push(Some(std::mem::take(&mut info.fds)));
-        self.mmap_areas.push((info.mmap_cursor, info.mmap_floor));
+        self.mmap_areas.push(Arena::new(info.mmap_cursor, info.mmap_floor));
         self.spaces.push(Arc::new(Mutex::new(mem)));
         self.procs.push(Some(Process {
             vcpu: Some(vcpu),
@@ -499,19 +601,11 @@ impl Kernel {
         self.file_tables[f] = Some(std::mem::take(&mut self.cur.fds));
     }
 
-    /// Load the running task's shared `mmap` arena into `cur` for its slice, so
-    /// every allocation this slice makes advances the arena its address-space
-    /// siblings see. Paired with [`Kernel::check_in_mmap`] around each slice.
-    fn check_out_mmap(&mut self) {
-        let (cursor, floor) = self.mmap_areas[self.cur.mm];
-        self.cur.mmap_cursor = cursor;
-        self.cur.mmap_floor = floor;
-    }
-
-    /// Store the running task's `mmap` cursor back into the shared arena so its
-    /// siblings resume allocating below what it just carved out.
-    fn check_in_mmap(&mut self) {
-        self.mmap_areas[self.cur.mm] = (self.cur.mmap_cursor, self.cur.mmap_floor);
+    /// The running task's `mmap` arena — the one shared by every task in its
+    /// address space, so `CLONE_VM` siblings allocate from a single pool.
+    fn arena(&mut self) -> &mut Arena {
+        let mm = self.cur.mm;
+        &mut self.mmap_areas[mm]
     }
 
     /// One pass over the process table on the current thread: run each runnable
@@ -536,13 +630,11 @@ impl Kernel {
             let mut guard = space_arc.lock().unwrap();
             std::mem::swap(&mut self.cur, &mut proc.info);
             self.check_out_files();
-            self.check_out_mmap();
             self.block = false;
             let made = self.run_slice(&mut vcpu, &mut guard)?;
             // The slice ended either by exiting or by blocking; `self.block`
             // reflects the last syscall. A blocked task parks until a wake.
             let blocked = self.block;
-            self.check_in_mmap();
             self.check_in_files();
             std::mem::swap(&mut self.cur, &mut proc.info);
             proc.info.parked = blocked && proc.info.run == RunState::Running;
@@ -603,7 +695,7 @@ impl Kernel {
         // scheduler checks it out into `cur.fds` for each slice.
         info.files = self.file_tables.len();
         self.file_tables.push(Some(std::mem::take(&mut info.fds)));
-        self.mmap_areas.push((info.mmap_cursor, info.mmap_floor));
+        self.mmap_areas.push(Arena::new(info.mmap_cursor, info.mmap_floor));
         self.spaces.push(Arc::new(Mutex::new(mem)));
         self.procs.push(Some(Process {
             vcpu: Some(vcpu),
@@ -674,6 +766,13 @@ impl Kernel {
                 Serviced::SetRet(ret) => {
                     vcpu.set_syscall_ret(ret as u64);
                     progressed = true;
+                    // `sched_yield`: the call succeeded (its return value is
+                    // written above), but end the slice so siblings run. The
+                    // task is *not* parked — `self.block` stays clear.
+                    if self.yield_now {
+                        self.yield_now = false;
+                        return Ok(true);
+                    }
                 }
                 Serviced::Resume => progressed = true,
                 Serviced::Blocked => return Ok(progressed),
@@ -729,6 +828,7 @@ impl Kernel {
                         self.cur.pid,
                         vcpu.pc()
                     );
+                    self.dump_fault_context(vcpu, mem);
                     self.cur.run = RunState::Zombie(139);
                     Serviced::Ended
                 }
@@ -740,6 +840,7 @@ impl Kernel {
                 // the on-disk ELF directly).
                 let bytes = mem.read_vec(pc, 16).unwrap_or_default();
                 let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                self.dump_fault_context(vcpu, mem);
                 eprintln!(
                     "[fault] pid {} illegal instruction at {pc:#x} [{}]",
                     self.cur.pid,
@@ -858,12 +959,10 @@ impl Kernel {
                 let mut proc = self.procs[i].take().unwrap();
                 std::mem::swap(&mut self.cur, &mut proc.info);
                 self.check_out_files();
-                self.check_out_mmap();
                 let flow = {
                     let mut mem = space.lock().unwrap();
                     self.service(exit, vcpu.as_mut(), &mut mem)
                 };
-                self.check_in_mmap();
                 self.check_in_files();
                 std::mem::swap(&mut self.cur, &mut proc.info);
                 self.procs[i] = Some(proc);
@@ -915,7 +1014,41 @@ impl Kernel {
 
     /// The syscall table. Returns the value the guest sees in its result
     /// register: a non-negative result, or a negative errno.
-    #[allow(clippy::too_many_lines)] // one arm per syscall; a flat table is clearest.
+    /// Print registers and the top of the stack at a fatal guest fault. A guest
+    /// that dies deep inside a JIT is otherwise a bare address; the register
+    /// file plus the words at `rsp` usually say immediately whether control flow
+    /// was corrupted (a `ret` to a data address) or a pointer was simply null.
+    #[allow(clippy::unused_self)] // reads self.cur.pid context in the caller; kept a method for symmetry
+    fn dump_fault_context(&self, vcpu: &dyn Vcpu, mem: &GuestMemory) {
+        const NAMES: [&str; 16] = [
+            "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11",
+            "r12", "r13", "r14", "r15",
+        ];
+        let line: Vec<String> = NAMES
+            .iter()
+            .enumerate()
+            .map(|(i, n)| format!("{n}={:#x}", vcpu.reg(i)))
+            .collect();
+        eprintln!("[fault]   regs: {}", line.join(" "));
+        let pc = vcpu.pc();
+        if let Ok(b) = mem.read_vec(pc, 16) {
+            let hex: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
+            eprintln!("[fault]   code@pc: {}", hex.join(" "));
+        }
+        let sp = vcpu.sp();
+        let stack: Vec<String> = (0..8u64)
+            .map(|i| match mem.read_u64(sp + i * 8) {
+                Ok(v) => format!("{v:#x}"),
+                Err(_) => "<unmapped>".to_string(),
+            })
+            .collect();
+        eprintln!("[fault]   [rsp+0..64]: {}", stack.join(" "));
+    }
+
+    /// `NIXVM_TRACE` wrapper around [`Kernel::dispatch_inner`]: logs each call
+    /// *and its return value*, since a syscall's result (an `-errno`, or the
+    /// address an `mmap` actually handed back) is usually what explains a guest
+    /// that aborts right after the call.
     fn dispatch(
         &mut self,
         sys: Sysno,
@@ -924,13 +1057,29 @@ impl Kernel {
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
     ) -> i64 {
-        if self.trace {
-            eprintln!(
-                "[trace] pid={} pc={:#x} {sys:?} raw={raw} args={args:x?}",
-                self.cur.pid,
-                vcpu.pc()
-            );
+        if !self.trace {
+            return self.dispatch_inner(sys, raw, args, vcpu, mem);
         }
+        let (pid, pc) = (self.cur.pid, vcpu.pc());
+        eprintln!("[trace] pid={pid} pc={pc:#x} {sys:?} raw={raw} args={args:x?}");
+        let ret = self.dispatch_inner(sys, raw, args, vcpu, mem);
+        if (-4095..0).contains(&ret) {
+            eprintln!("[trace]   = {ret} (errno {})", -ret);
+        } else {
+            eprintln!("[trace]   = {ret:#x}");
+        }
+        ret
+    }
+
+    #[allow(clippy::too_many_lines)] // one arm per syscall; a flat table is clearest.
+    fn dispatch_inner(
+        &mut self,
+        sys: Sysno,
+        raw: u64,
+        args: &[u64; 6],
+        vcpu: &mut dyn Vcpu,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         match sys {
             Sysno::Write => self.sys_write(args[0], args[1], args[2], mem),
             Sysno::Read => self.sys_read(args[0], args[1], args[2], mem),
@@ -944,6 +1093,12 @@ impl Kernel {
             }
             Sysno::Sendmsg => self.sys_sendmsg(args[0], args[1], args[2], mem),
             Sysno::Recvmsg => self.sys_recvmsg(args[0], args[1], args[2], mem),
+            // `sched_yield` succeeds *and* ends the slice, so a sibling gets the
+            // CPU — see [`Kernel::yield_now`].
+            Sysno::SchedYield => {
+                self.yield_now = true;
+                0
+            }
             Sysno::Brk => self.sys_brk(args[0], mem),
             Sysno::Mmap => self.sys_mmap(args, mem),
             Sysno::Munmap => self.sys_munmap(args[0], args[1], mem),
@@ -1193,7 +1348,6 @@ impl Kernel {
             | Sysno::Munlock
             | Sysno::Mlockall
             | Sysno::Munlockall
-            | Sysno::SchedYield
             | Sysno::SchedSetaffinity
             | Sysno::SchedGetscheduler
             | Sysno::SchedSetscheduler
@@ -1393,7 +1547,8 @@ impl Kernel {
             // A forked address space inherits the parent's arena position (its
             // pages were copied); `CLONE_VM` threads instead share the parent's
             // `mmap_areas[mm]` entry and never reach here.
-            self.mmap_areas.push((self.cur.mmap_cursor, self.cur.mmap_floor));
+            let inherited = self.mmap_areas[self.cur.mm].clone();
+            self.mmap_areas.push(inherited);
             self.spaces.push(Arc::new(Mutex::new(cm)));
         }
 
@@ -1502,6 +1657,9 @@ impl Kernel {
         self.cur.heap_limit = mid;
         self.cur.mmap_cursor = img.stack_bottom;
         self.cur.mmap_floor = mid;
+        // The image was replaced in place: the arena starts over, free list and all.
+        let mm = self.cur.mm;
+        self.mmap_areas[mm] = Arena::new(img.stack_bottom, mid);
         self.exec_ok = true;
         0
     }
@@ -2847,14 +3005,10 @@ impl Kernel {
         let base = if flags & MAP_FIXED != 0 && addr != 0 {
             addr - addr % PAGE_SIZE
         } else {
-            let Some(new_top) = self.cur.mmap_cursor.checked_sub(len) else {
+            let Some(base) = self.arena().alloc(len) else {
                 return err(Errno::ENOMEM);
             };
-            if new_top < self.cur.mmap_floor {
-                return err(Errno::ENOMEM);
-            }
-            self.cur.mmap_cursor = new_top;
-            new_top
+            base
         };
         if mem.map(base, len, prot).is_err() {
             return err(Errno::ENOMEM);
@@ -2927,18 +3081,13 @@ impl Kernel {
         }
     }
 
-    /// Reserve `len` bytes (rounded up to a page) from the downward-growing
-    /// anonymous `mmap` arena, returning the base of the fresh region, or `None`
-    /// if the arena is exhausted. Shares the cursor discipline of [`Self::sys_mmap`]
-    /// so relocating callers (`mremap` MAYMOVE) allocate the same way.
+    /// Reserve `len` bytes (rounded up to a page) from the anonymous `mmap`
+    /// arena, returning the base of the fresh region, or `None` if the arena is
+    /// exhausted. Shares [`Self::sys_mmap`]'s allocator (free-list reuse, then
+    /// bump) so relocating callers (`mremap` MAYMOVE) allocate the same way.
     pub(super) fn alloc_mmap(&mut self, len: u64) -> Option<u64> {
         let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-        let new_top = self.cur.mmap_cursor.checked_sub(len)?;
-        if new_top < self.cur.mmap_floor {
-            return None;
-        }
-        self.cur.mmap_cursor = new_top;
-        Some(new_top)
+        self.arena().alloc(len)
     }
 
     /// `munmap(addr, len)`.
@@ -2953,6 +3102,10 @@ impl Kernel {
             self.flush_shared_maps(base, len, mem);
         }
         let _ = mem.unmap(base, len);
+        // Give the range back to the arena so it can be handed out again — a
+        // guest that cycles mappings (a JS engine's JIT/heap blocks) would
+        // otherwise exhaust the arena while most of it sat free.
+        self.arena().free_range(base, len);
         0
     }
 
@@ -3375,6 +3528,10 @@ mod tests {
         let mut kernel = Kernel::new(Arch::Aarch64, mounts);
         kernel.cur.pid = 1;
         kernel.cur.tgid = 1;
+        // Tests call syscall handlers directly (no boot/run), so give mm 0 its
+        // mmap arena here — a small one inside the 16-page test region.
+        kernel.cur.mm = 0;
+        kernel.mmap_areas.push(Arena::new(0x1_8000, 0x1_5000));
         let mut mem = GuestMemory::new(0x1_0000, 16 * PAGE);
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
         (kernel, mem, DummyVcpu)
@@ -3630,7 +3787,7 @@ mod tests {
         // Give the parent a real address-space slot at index 0.
         let (mut k, mut mem, mut v) = setup();
         k.spaces.push(Arc::new(Mutex::new(mem.fork())));
-        k.mmap_areas.push((0, 0));
+
         k.cur.mm = 0;
 
         let child = call(
@@ -4380,8 +4537,6 @@ mod tests {
         // bug: MAP_SHARED writes were never flushed).
         let (mut k, mut mem, mut v) = setup();
         // A small mmap arena inside the 16-page test region.
-        k.cur.mmap_cursor = 0x1_8000;
-        k.cur.mmap_floor = 0x1_5000;
         let fd = open_seeded(&mut k, &mut mem, &mut v, b"");
         assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Ftruncate, [fd, 6, 0, 0, 0, 0]), 0);
         // mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0).
@@ -4401,37 +4556,57 @@ mod tests {
 
     #[test]
     fn threads_sharing_an_address_space_get_disjoint_mmaps() {
-        // Two threads in one address space (CLONE_VM — every pthread) must never
-        // hand back overlapping anonymous mmaps. The arena is shared per-mm in
-        // `mmap_areas` and checked out into `cur` each slice; a thread's stale
-        // per-slice cursor must not resurrect a region a sibling already took.
-        // Before the shared arena, each thread advanced its own copy of the
-        // cursor from the same start, so concurrent mmaps overlapped — fatal
-        // once V8's background compile threads dropped JIT code onto memory the
-        // main thread believed was free (the concurrent-recompilation teardown
-        // SIGSEGV).
+        // Every task in one address space (CLONE_VM — every pthread) allocates
+        // from the same per-mm `Arena`, so two threads can never be handed
+        // overlapping ranges. Before the arena was shared, each thread bumped
+        // its own copy of the cursor from the same start and they collided —
+        // fatal once a JIT dropped code onto memory a sibling thought was free.
         let (mut k, mut mem, mut v) = setup();
         k.cur.mm = 0;
-        k.mmap_areas = vec![(0x1_8000, 0x1_5000)];
 
-        // Thread A's slice: check the shared arena out, map a page, check it in.
-        k.check_out_mmap();
+
         let a = call(&mut k, &mut mem, &mut v, Sysno::Mmap, [0, 4096, 0x3, 0x22, u64::MAX, 0]);
-        k.check_in_mmap();
-        assert!(a > 0, "mmap A returned {a}");
-
-        // A different thread swaps in carrying a *stale* cursor from when it last
-        // ran (here, the original arena top). The check-out must overwrite it
-        // with the shared cursor A already advanced — not re-hand A's page.
-        k.cur.mmap_cursor = 0x1_8000;
-        k.cur.mmap_floor = 0x1_5000;
-        k.check_out_mmap();
         let b = call(&mut k, &mut mem, &mut v, Sysno::Mmap, [0, 4096, 0x3, 0x22, u64::MAX, 0]);
-        k.check_in_mmap();
-        assert!(b > 0, "mmap B returned {b}");
-
+        assert!(a > 0 && b > 0, "mmaps returned {a}, {b}");
         let (a, b) = (a as u64, b as u64);
         assert!(a.abs_diff(b) >= 4096, "sibling mmaps overlap: A={a:#x} B={b:#x}");
+    }
+
+    #[test]
+    fn munmap_returns_the_range_to_the_arena_for_reuse() {
+        // The arena must be an allocator, not a bump pointer: a guest that
+        // cycles mappings (a JS engine recycling JIT/heap blocks) would
+        // otherwise walk the cursor to the floor and start failing with ENOMEM
+        // while nearly the whole arena sat free.
+        let (mut k, mut mem, mut v) = setup();
+        k.cur.mm = 0;
+        // A 3-page arena: exactly three single-page mmaps fit.
+
+        let anon = [0u64, 4096, 0x3, 0x22, u64::MAX, 0];
+
+        let a = call(&mut k, &mut mem, &mut v, Sysno::Mmap, anon);
+        let b = call(&mut k, &mut mem, &mut v, Sysno::Mmap, anon);
+        let c = call(&mut k, &mut mem, &mut v, Sysno::Mmap, anon);
+        assert!(a > 0 && b > 0 && c > 0);
+        // Arena is now full: a fourth fails.
+        assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Mmap, anon), -12); // ENOMEM
+
+        // Free the middle one and the next mmap must reuse exactly that page,
+        // rather than reporting the arena exhausted.
+        assert_eq!(
+            call(&mut k, &mut mem, &mut v, Sysno::Munmap, [b as u64, 4096, 0, 0, 0, 0]),
+            0
+        );
+        let reused = call(&mut k, &mut mem, &mut v, Sysno::Mmap, anon);
+        assert_eq!(reused, b, "munmap'd page must be handed out again");
+
+        // Freeing all three coalesces back into one contiguous run, so a
+        // 3-page mmap fits again.
+        for p in [a, b, c] {
+            call(&mut k, &mut mem, &mut v, Sysno::Munmap, [p as u64, 4096, 0, 0, 0, 0]);
+        }
+        let big = call(&mut k, &mut mem, &mut v, Sysno::Mmap, [0, 3 * 4096, 0x3, 0x22, u64::MAX, 0]);
+        assert!(big > 0, "coalesced free space must satisfy a 3-page mmap, got {big}");
     }
 
     #[test]

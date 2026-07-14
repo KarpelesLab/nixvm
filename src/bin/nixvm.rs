@@ -58,6 +58,22 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 builder = builder.work_dir(dir);
                 i += 2;
             }
+            Some("--root") => {
+                let Some(dir) = args.get(i + 1) else {
+                    eprintln!("nixvm: --root needs a directory");
+                    return ExitCode::FAILURE;
+                };
+                builder = builder.root_dir(dir);
+                i += 2;
+            }
+            Some("--env" | "-e") => {
+                let Some(kv) = args.get(i + 1) else {
+                    eprintln!("nixvm: --env needs KEY=VALUE");
+                    return ExitCode::FAILURE;
+                };
+                builder = builder.env(kv);
+                i += 2;
+            }
             Some(_) => break args[i..].to_vec(), // no `--`: rest is the command
             None => break Vec::new(),
         }
@@ -93,9 +109,11 @@ fn print_usage() {
     eprintln!(
         "nixvm — a portable Linux syscall sandbox\n\n\
          USAGE:\n    \
-         nixvm run [--mem <size>] [--workdir <dir>] -- <cmd> [args...]\n    \
+         nixvm run [--mem <size>] [--workdir <dir>] [--root <dir>]\n              \
+                   [--env KEY=VAL]... -- <cmd> [args...]\n    \
          nixvm shell\n    \
          nixvm version\n\n\
-         The current directory is exposed inside the sandbox at /work."
+         The current directory is exposed inside the sandbox at /work.\n\
+         --root uses an extracted host rootfs directory as the guest root."
     );
 }

@@ -30,6 +30,18 @@ fn page_down(v: u64) -> u64 {
 /// Whether every page in `[start, end)` is unmapped (and thus in-bounds room we
 /// could grow a mapping into). A mapped, protected, or out-of-bounds page all
 /// count as "not free".
+/// Whether every page in `[start, end)` is currently mapped.
+fn range_is_mapped(mem: &GuestMemory, start: u64, end: u64) -> bool {
+    let mut p = start;
+    while p < end {
+        if matches!(mem.read_vec(p, 1), Err(MemError::Unmapped(_))) {
+            return false;
+        }
+        p += PAGE_SIZE;
+    }
+    true
+}
+
 fn range_is_free(mem: &GuestMemory, start: u64, end: u64) -> bool {
     let mut p = start;
     while p < end {
@@ -66,10 +78,24 @@ impl Kernel {
         let old_size = page_up(old_size);
         let new_size = page_up(new_size);
 
+        // The source must actually be mapped; Linux answers EFAULT otherwise.
+        // musl's `pthread_getattr_np` finds the main thread's stack extent by
+        // walking `mremap` *down* the stack until the call stops failing with
+        // ENOMEM, so this is a hot path with a load-bearing errno — silently
+        // succeeding here would both mis-size the guest's stack and map stray
+        // pages under it.
+        if !range_is_mapped(mem, old_addr, old_addr + old_size) {
+            return err(Errno::EFAULT);
+        }
+
         if new_size <= old_size {
-            // Shrink (or no-op): drop the tail, keep the base.
+            // Shrink (or no-op): drop the tail, keep the base. The tail goes
+            // back to the arena — leaking it here would bleed the arena dry in
+            // a guest that resizes buffers in a loop.
             let tail = old_addr + new_size;
-            let _ = mem.unmap(tail, old_size - new_size);
+            let freed = old_size - new_size;
+            let _ = mem.unmap(tail, freed);
+            self.arena().free_range(tail, freed);
             return old_addr as i64;
         }
 
@@ -97,6 +123,11 @@ impl Kernel {
             let _ = mem.write(base, &data);
         }
         let _ = mem.unmap(old_addr, old_size);
+        // The old block is ours again — without this, every relocating mremap
+        // leaks its source and the arena runs out (Bun resizes buffers by the
+        // thousand, which exhausted it and turned every later allocation into a
+        // NULL the guest promptly dereferenced).
+        self.arena().free_range(old_addr, old_size);
         base as i64
     }
 
@@ -194,6 +225,11 @@ mod tests {
         mounts.mount("/", Box::new(TmpFs::new()));
         let mut kernel = Kernel::new(Arch::Aarch64, mounts);
         kernel.cur.pid = 1;
+        // These tests drive the handlers directly (no boot/run), so mm 0 needs
+        // its mmap arena set up here.
+        kernel.cur.mm = 0;
+        kernel.set_mmap_area(0x1_0000 + 16 * PAGE, 0x1_0000);
+        kernel.mmap_areas.push(crate::kernel::Arena::new(0x1_0000 + 16 * PAGE, 0x1_0000));
         let mem = GuestMemory::new(0x1_0000, 16 * PAGE);
         (kernel, mem)
     }

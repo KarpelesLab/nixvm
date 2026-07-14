@@ -9,7 +9,8 @@
 //!   whenever [`GuestMemory::backing_generation`] changes (fork/execve/context
 //!   switch), mapped at `guest_phys == guest base` so guest VA == GPA.
 //! * **slot 1** — the **control block** at [`CTRL_GPA`]: the identity page
-//!   tables (guest VA == PA over the low 4 GiB, 2 MiB pages, user-accessible),
+//!   tables (guest VA == PA over the low [`IDENTITY_TOP`], 2 MiB pages,
+//!   user-accessible),
 //!   the GDT, and the one-instruction-pair syscall trampoline
 //!   (`hlt; sysretq`) that `IA32_LSTAR` points at. x86-64 long mode cannot run
 //!   with paging off (unlike the arm64 MMU-off trick HVF uses), so the flat
@@ -30,23 +31,30 @@ use std::ffi::c_int;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Guest-physical base of the control block (slot 1) — just under 4 GiB, the
-/// top of the identity-mapped window, far above any guest region in use
-/// (`run-elf*` and the sandbox place guests at `0x1_0000` with ≤ 512 MiB).
-pub const CTRL_GPA: u64 = 0xFF80_0000;
+/// How much of the guest-physical space the identity map covers (2 MiB pages,
+/// present/writable/user). Everything a guest can architecturally address must
+/// be below this; the control block sits at its top, so this is also the guest
+/// memory ceiling. Page tables are the only cost of raising it — one 4 KiB PD
+/// per GiB mapped (64 GiB ⇒ 256 KiB of tables) — and a real JS engine wants far
+/// more than 4 GiB of address space (JSC reserves multi-hundred-MiB regions up
+/// front), so map generously.
+const IDENTITY_TOP: u64 = 64 << 30;
+
+/// One page directory per GiB of identity map.
+const PD_PAGES: usize = (IDENTITY_TOP >> 30) as usize;
 
 // Byte offsets of the control block's pieces within its region.
 const PML4_OFF: usize = 0x0000;
 const PDPT_OFF: usize = 0x1000;
-const PD_OFF: usize = 0x2000; // 4 pages, one per GiB mapped
-const GDT_OFF: usize = 0x6000;
-const TRAMP_OFF: usize = 0x7000;
-const CTRL_SIZE: usize = 0x8000;
+const PD_OFF: usize = 0x2000; // PD_PAGES pages, one per GiB mapped
+const GDT_OFF: usize = PD_OFF + PD_PAGES * 0x1000;
+const TRAMP_OFF: usize = GDT_OFF + 0x1000;
+const CTRL_SIZE: usize = TRAMP_OFF + 0x1000;
 
-/// How much of the guest-physical space the identity map covers (2 MiB pages,
-/// present/writable/user). Everything a guest can architecturally address must
-/// be below this; the control block sits at its top.
-const IDENTITY_TOP: u64 = 4 << 30;
+/// Guest-physical base of the control block (slot 1) — the top 2 MiB of the
+/// identity-mapped window, above any guest region. Guest memory must end below
+/// it.
+pub const CTRL_GPA: u64 = IDENTITY_TOP - (2 << 20);
 
 /// The virtual address `IA32_LSTAR` points at: the `hlt; sysretq` trampoline
 /// (identity-mapped, so VA == GPA).
@@ -293,7 +301,7 @@ impl Vm {
     }
 }
 
-/// Build the control block: identity page tables over the low 4 GiB (2 MiB
+/// Build the control block: identity page tables over the low `IDENTITY_TOP` (2 MiB
 /// pages, present/writable/user — per-page W^X is a later milestone, matching
 /// HVF's uniformly-RWX stage 2), the flat GDT, and the syscall trampoline.
 fn build_control_block() -> Region {
@@ -303,8 +311,8 @@ fn build_control_block() -> Region {
     let pml4e = (CTRL_GPA + PDPT_OFF as u64) | PTE_P_RW_US;
     ctrl.write(PML4_OFF, &pml4e.to_le_bytes());
 
-    // PDPT[0..4] → one PD per GiB.
-    for g in 0..4usize {
+    // PDPT[0..PD_PAGES] → one PD per GiB.
+    for g in 0..PD_PAGES {
         let pdpte = (CTRL_GPA + (PD_OFF + g * 0x1000) as u64) | PTE_P_RW_US;
         ctrl.write(PDPT_OFF + g * 8, &pdpte.to_le_bytes());
     }

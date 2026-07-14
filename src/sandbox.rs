@@ -91,6 +91,9 @@ pub struct Config {
     /// Extra host directories shared into the sandbox ("holes"): specific,
     /// chosen paths — never the whole home.
     pub binds: Vec<Bind>,
+    /// Extra `KEY=VALUE` entries appended to the guest environment, overriding
+    /// the preconfigured defaults on a key collision.
+    pub env: Vec<String>,
 }
 
 /// A host directory shared into the sandbox at a guest mount point.
@@ -129,6 +132,7 @@ impl Default for SandboxBuilder {
                 arch,
                 prefer_interp: false,
                 binds: Vec::new(),
+                env: Vec::new(),
             },
         }
     }
@@ -186,6 +190,14 @@ impl SandboxBuilder {
             guest: guest.into(),
             read_only: true,
         });
+        self
+    }
+
+    /// Add a `KEY=VALUE` entry to the guest environment (overrides the
+    /// preconfigured default for that key).
+    #[must_use]
+    pub fn env(mut self, kv: impl Into<String>) -> Self {
+        self.config.env.push(kv.into());
         self
     }
 
@@ -373,6 +385,12 @@ impl Sandbox {
         if self.config.mode == RunMode::Booted {
             env.push("RUNLEVEL=3".to_string());
             env.push("PREVLEVEL=N".to_string());
+        }
+        // Caller-supplied entries win: drop any default sharing their key.
+        for kv in &self.config.env {
+            let key = kv.split('=').next().unwrap_or(kv);
+            env.retain(|e| e.split('=').next() != Some(key));
+            env.push(kv.clone());
         }
         env
     }
