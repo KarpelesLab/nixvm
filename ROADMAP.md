@@ -99,7 +99,7 @@ contracts.
 > hardware backends: the interpreter makes the entire syscall engine testable on
 > any machine and in CI (and is exactly what the wasm demo needs), whereas HVF
 > needs a macOS entitlement + codesign to run. So Phases 1-8 and Phase 10's
-> aarch64/x86-64 ISA all work end-to-end on the interpreter (~490 tests). Both
+> aarch64/x86-64 ISA all work end-to-end on the interpreter (~505 tests). Both
 > hardware backends are now real: **HVF** runs a static program end-to-end on
 > Apple Silicon (Phase 1), and **KVM (Linux/x86-64)** runs a real static glibc
 > binary end-to-end on the same `Vcpu`/`Backend` seam — `vcpu::select` prefers
@@ -349,6 +349,18 @@ CPUs, rather than pinning one host thread per guest thread.
   bookkeeping bug, not an instruction gap). The arena now lives **per-mm**
   (`Kernel::mmap_areas`, checked out into the running task's slice like the fd
   table), so every thread in an address space allocates from one shared cursor.
+  **Floating point is a dependency-free soft-float** (`vcpu::softfloat`) rather
+  than the host FPU, so it is bit-identical across native and wasm and models
+  what `f64` hardware can't: the x87 register stack is **true 80-bit extended
+  precision** (64-bit significand, not an `f64` approximation), and SSE honors
+  the **`MXCSR` rounding-control field** (round toward −∞/+∞/zero, not just
+  nearest) with the IEEE **exception flags** (`invalid`/`overflow`/`inexact`/…)
+  reported back through `MXCSR`/`FNSTSW`. One `round` routine serves f32/f64/f80,
+  so directed rounding is a single correct rounding of the exact result — never a
+  double-rounded `f64`. Correctness is pinned two ways: in round-to-nearest the
+  soft f32/f64 results are bit-identical to the host's native arithmetic over
+  tens of millions of random inputs, and directed rounding + 80-bit + flags are
+  diffed against real x87/SSE hardware via KVM (`tests/float_diff.rs`).
   `execve` replaces the image in place. The
   scheduler exists in **two modes**
   rather than a dedicated `kernel::sched` module: `Kernel::schedule_serial`

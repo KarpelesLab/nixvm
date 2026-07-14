@@ -72,6 +72,7 @@
 
 use crate::abi::Arch;
 
+use super::softfloat::{self, F80, Round};
 use super::{Backend, Exit, GuestMemory, Vcpu, VcpuError};
 
 /// Upper bound on instructions executed per `run()` call before yielding —
@@ -350,15 +351,15 @@ impl FpuOp {
 /// special-case compares before calling this) to `dst OP src`; the `R`
 /// ("reversed") variants swap the operand order (`FSUBR`/`FDIVR` compute
 /// `src - dst`/`src / dst`).
-fn fpu_binop(op: FpuOp, dst: f64, src: f64) -> f64 {
+fn fpu_binop(op: FpuOp, dst: F80, src: F80, mode: Round) -> (F80, u32) {
     match op {
-        FpuOp::Add => dst + src,
-        FpuOp::Mul => dst * src,
-        FpuOp::Sub => dst - src,
-        FpuOp::SubR => src - dst,
-        FpuOp::Div => dst / src,
-        FpuOp::DivR => src / dst,
-        FpuOp::Com | FpuOp::Comp => dst, // unreachable in practice; see doc comment above
+        FpuOp::Add => dst.add(src, mode),
+        FpuOp::Mul => dst.mul(src, mode),
+        FpuOp::Sub => dst.sub(src, mode),
+        FpuOp::SubR => src.sub(dst, mode),
+        FpuOp::Div => dst.div(src, mode),
+        FpuOp::DivR => src.div(dst, mode),
+        FpuOp::Com | FpuOp::Comp => (dst, 0), // unreachable; compares are special-cased
     }
 }
 
@@ -373,120 +374,58 @@ enum MemWidth {
     I32,
 }
 
-/// Decode an x87 80-bit extended-precision value (`m80fp`: 64-bit
-/// significand with an explicit integer bit, then a 16-bit sign+exponent) to
-/// the nearest `f64`. This interpreter models the x87 register stack with
-/// `f64` throughout rather than true 80-bit precision — an accepted
-/// approximation (see [`X86Interp::st`]) — so this conversion, and its
-/// [`f64_to_f80_bytes`] inverse, are the only places 80-bit precision is
-/// even nominally in play, and both narrow through `f64` immediately.
-#[allow(clippy::cast_precision_loss)] // mantissa/2^63 is exactly the extended-precision significand formula
-fn f80_to_f64(mantissa: u64, exp: u16, sign: bool) -> f64 {
-    let value = if exp == 0 && mantissa == 0 {
-        0.0
-    } else if exp == 0x7fff {
-        if mantissa == (1u64 << 63) {
-            f64::INFINITY
-        } else {
-            f64::NAN
-        }
-    } else {
-        let m = mantissa as f64 / (1u64 << 63) as f64;
-        m * 2f64.powi(i32::from(exp) - 16383)
-    };
-    if sign { -value } else { value }
-}
-
-/// Encode an `f64` as the 10-byte x87 extended-precision (`m80fp`) format —
-/// see `f80_to_f64`. Finite normal and subnormal `f64` values, `0`, `±inf`
-/// and `NaN` are all handled exactly (mapping through the nearest `f64`, per
-/// the same accepted approximation).
-fn f64_to_f80_bytes(v: f64) -> [u8; 10] {
-    let bits = v.to_bits();
-    let sign = bits >> 63;
-    let biased_exp = (bits >> 52) & 0x7ff;
-    let frac = bits & 0x000f_ffff_ffff_ffff;
-    let (mantissa, exp): (u64, u64) = if biased_exp == 0x7ff {
-        if frac == 0 {
-            (1u64 << 63, 0x7fff)
-        } else {
-            (0xC000_0000_0000_0000, 0x7fff)
-        }
-    } else if biased_exp == 0 {
-        if frac == 0 {
-            (0, 0)
-        } else {
-            // Subnormal f64: normalize by shifting the fraction so its
-            // leading set bit lands at bit 63 (the extended format's
-            // explicit integer bit), adjusting the exponent to match.
-            let shift = frac.leading_zeros();
-            let mantissa = frac << shift;
-            let unbiased = -1011i64 - i64::from(shift);
-            (mantissa, (unbiased + 16383) as u64)
-        }
-    } else {
-        let mantissa = (1u64 << 63) | (frac << 11);
-        let unbiased = biased_exp as i64 - 1023;
-        (mantissa, (unbiased + 16383) as u64)
-    };
-    let mut out = [0u8; 10];
-    out[0..8].copy_from_slice(&mantissa.to_le_bytes());
-    let exp16 = (exp as u16) | ((sign as u16) << 15);
-    out[8..10].copy_from_slice(&exp16.to_le_bytes());
-    out
-}
-
 // ---- x87 memory operand read/write. Free functions (not `X86Interp`
 // methods, unlike the GPR/XMM `read_operand`/`xmm_read128` family) since
 // none of them touch FPU register-file state — only the ModRM/opcode
-// dispatch in `fpu_d8`..`fpu_df` needs `self`. ----
+// dispatch in `fpu_d8`..`fpu_df` needs `self`. Every value crosses into the
+// register file as an [`F80`], so the 80-bit stack keeps full precision;
+// narrowing stores round per the control word and report their IEEE flags. ----
 
-fn fpu_read_f32(mem: &GuestMemory, addr: u64) -> Result<f64, Step> {
+fn fpu_read_f32(mem: &GuestMemory, addr: u64) -> Result<F80, Step> {
     let mut b = [0u8; 4];
     mem.read(addr, &mut b)
         .map_err(|_| Step::Fault { addr, write: false })?;
-    Ok(f64::from(f32::from_le_bytes(b)))
+    Ok(F80::from_f32(u32::from_le_bytes(b)))
 }
 
-#[allow(clippy::cast_possible_truncation)] // FST/FSTP m32fp is exactly this narrowing
-fn fpu_write_f32(mem: &mut GuestMemory, addr: u64, v: f64) -> Result<(), Step> {
-    let bytes = (v as f32).to_le_bytes();
-    mem.write_trap(addr, &bytes).map_err(|e| Step::Fault {
-        addr: e.fault_addr(),
-        write: true,
-    })
+fn fpu_write_f32(mem: &mut GuestMemory, addr: u64, v: F80, mode: Round) -> Result<u32, Step> {
+    let (bits, flags) = v.to_f32_round(mode);
+    mem.write_trap(addr, &bits.to_le_bytes())
+        .map(|()| flags)
+        .map_err(|e| Step::Fault { addr: e.fault_addr(), write: true })
 }
 
-fn fpu_read_f64(mem: &GuestMemory, addr: u64) -> Result<f64, Step> {
+fn fpu_read_f64(mem: &GuestMemory, addr: u64) -> Result<F80, Step> {
     let mut b = [0u8; 8];
     mem.read(addr, &mut b)
         .map_err(|_| Step::Fault { addr, write: false })?;
-    Ok(f64::from_le_bytes(b))
+    Ok(F80::from_f64(u64::from_le_bytes(b)))
 }
 
-fn fpu_write_f64(mem: &mut GuestMemory, addr: u64, v: f64) -> Result<(), Step> {
-    mem.write_trap(addr, &v.to_le_bytes())
-        .map_err(|e| Step::Fault {
-            addr: e.fault_addr(),
-            write: true,
-        })
+fn fpu_write_f64(mem: &mut GuestMemory, addr: u64, v: F80, mode: Round) -> Result<u32, Step> {
+    let (bits, flags) = v.to_f64_round(mode);
+    mem.write_trap(addr, &bits.to_le_bytes())
+        .map(|()| flags)
+        .map_err(|e| Step::Fault { addr: e.fault_addr(), write: true })
 }
 
-fn fpu_read_f80(mem: &GuestMemory, addr: u64) -> Result<f64, Step> {
+fn fpu_read_f80(mem: &GuestMemory, addr: u64) -> Result<F80, Step> {
     let mut b = [0u8; 10];
     mem.read(addr, &mut b)
         .map_err(|_| Step::Fault { addr, write: false })?;
-    let mantissa = u64::from_le_bytes(b[0..8].try_into().unwrap());
-    let se = u16::from_le_bytes(b[8..10].try_into().unwrap());
-    Ok(f80_to_f64(mantissa, se & 0x7fff, se & 0x8000 != 0))
+    let lo = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let hi = u16::from_le_bytes(b[8..10].try_into().unwrap());
+    Ok(F80((u128::from(hi) << 64) | u128::from(lo)))
 }
 
-fn fpu_write_f80(mem: &mut GuestMemory, addr: u64, v: f64) -> Result<(), Step> {
-    mem.write_trap(addr, &f64_to_f80_bytes(v))
-        .map_err(|e| Step::Fault {
-            addr: e.fault_addr(),
-            write: true,
-        })
+fn fpu_write_f80(mem: &mut GuestMemory, addr: u64, v: F80) -> Result<(), Step> {
+    let mut out = [0u8; 10];
+    out[0..8].copy_from_slice(&(v.0 as u64).to_le_bytes());
+    out[8..10].copy_from_slice(&((v.0 >> 64) as u16).to_le_bytes());
+    mem.write_trap(addr, &out).map_err(|e| Step::Fault {
+        addr: e.fault_addr(),
+        write: true,
+    })
 }
 
 /// `FILD`/`FIADD`/`FICOM`/... source: a `width`-bit two's-complement
@@ -499,8 +438,8 @@ fn fpu_read_int(mem: &GuestMemory, addr: u64, width: u32) -> Result<i64, Step> {
     Ok(sign_extend_w(u64::from_le_bytes(b), width))
 }
 
-/// `FIST`/`FISTP` destination: truncate `val` (already rounded per
-/// [`X86Interp::round_per_cw`] by the caller) to `width` bits.
+/// `FIST`/`FISTP` destination: write the already-rounded integer `val`
+/// truncated to `width` bits.
 fn fpu_write_int(mem: &mut GuestMemory, addr: u64, val: i64, width: u32) -> Result<(), Step> {
     let n = (width / 8) as usize;
     let bytes = (val as u64).to_le_bytes();
@@ -510,15 +449,14 @@ fn fpu_write_int(mem: &mut GuestMemory, addr: u64, val: i64, width: u32) -> Resu
     })
 }
 
-/// The `D8`/`DA`/`DC`/`DE` memory-form arithmetic source, at the width `w`
-/// dictates ([`MemWidth`]).
-#[allow(clippy::cast_precision_loss)] // FILD's int->f64 load is exactly this
-fn fpu_read_src(mem: &GuestMemory, addr: u64, w: MemWidth) -> Result<f64, Step> {
+/// The `D8`/`DA`/`DC`/`DE` memory-form arithmetic source, widened to `F80` at
+/// the width `w` dictates ([`MemWidth`]).
+fn fpu_read_src(mem: &GuestMemory, addr: u64, w: MemWidth) -> Result<F80, Step> {
     match w {
         MemWidth::F32 => fpu_read_f32(mem, addr),
         MemWidth::F64 => fpu_read_f64(mem, addr),
-        MemWidth::I16 => fpu_read_int(mem, addr, 16).map(|v| v as f64),
-        MemWidth::I32 => fpu_read_int(mem, addr, 32).map(|v| v as f64),
+        MemWidth::I16 => fpu_read_int(mem, addr, 16).map(F80::from_i64),
+        MemWidth::I32 => fpu_read_int(mem, addr, 32).map(F80::from_i64),
     }
 }
 
@@ -567,20 +505,6 @@ fn f64_lane_binop(dst: u128, src: u128, lanes: usize, f: impl Fn(f64, f64) -> f6
     u128::from_le_bytes(out)
 }
 
-/// Unary counterpart of [`f64_lane_binop`] (e.g. `SQRTSD`/`SQRTPD`): each
-/// touched lane comes from `src`, not from combining it with `dst`.
-#[allow(clippy::many_single_char_names)] // dst/src/lanes/f is the natural naming for a lane op
-fn f64_lane_unop(dst: u128, src: u128, lanes: usize, f: impl Fn(f64) -> f64) -> u128 {
-    let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
-    let mut out = d;
-    for i in 0..lanes {
-        let o = i * 8;
-        let b = f64::from_le_bytes(s[o..o + 8].try_into().unwrap());
-        out[o..o + 8].copy_from_slice(&f(b).to_le_bytes());
-    }
-    u128::from_le_bytes(out)
-}
-
 /// `f32` counterpart of [`f64_lane_binop`] (4-byte lanes, up to 4 of them for
 /// the packed `PS` forms).
 #[allow(clippy::many_single_char_names)] // dst/src/lanes/f is the natural naming for a lane op
@@ -596,17 +520,73 @@ fn f32_lane_binop(dst: u128, src: u128, lanes: usize, f: impl Fn(f32, f32) -> f3
     u128::from_le_bytes(out)
 }
 
-/// `f32` counterpart of [`f64_lane_unop`].
-#[allow(clippy::many_single_char_names)] // dst/src/lanes/f is the natural naming for a lane op
-fn f32_lane_unop(dst: u128, src: u128, lanes: usize, f: impl Fn(f32) -> f32) -> u128 {
+/// Apply an SSE arithmetic op (`ADD`/`SUB`/`MUL`/`DIV`) across `lanes` 8-byte
+/// lanes through [`softfloat`], honoring the `MXCSR` rounding `mode` and
+/// OR-ing every lane's IEEE exception flags. A scalar op (`lanes == 1`) leaves
+/// the destination's upper lanes untouched, as SSE requires.
+#[allow(clippy::many_single_char_names)]
+fn f64_lanes_op(dst: u128, src: u128, lanes: usize, op: softfloat::Op, mode: Round) -> (u128, u32) {
     let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
     let mut out = d;
+    let mut flags = 0;
+    for i in 0..lanes {
+        let o = i * 8;
+        let a = u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+        let b = u64::from_le_bytes(s[o..o + 8].try_into().unwrap());
+        let (r, f) = softfloat::f64_op(a, b, op, mode);
+        out[o..o + 8].copy_from_slice(&r.to_le_bytes());
+        flags |= f;
+    }
+    (u128::from_le_bytes(out), flags)
+}
+
+/// `f32` counterpart of [`f64_lanes_op`] (4-byte lanes, up to 4 packed).
+#[allow(clippy::many_single_char_names)]
+fn f32_lanes_op(dst: u128, src: u128, lanes: usize, op: softfloat::Op, mode: Round) -> (u128, u32) {
+    let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+    let mut out = d;
+    let mut flags = 0;
     for i in 0..lanes {
         let o = i * 4;
-        let b = f32::from_le_bytes(s[o..o + 4].try_into().unwrap());
-        out[o..o + 4].copy_from_slice(&f(b).to_le_bytes());
+        let a = u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+        let b = u32::from_le_bytes(s[o..o + 4].try_into().unwrap());
+        let (r, f) = softfloat::f32_op(a, b, op, mode);
+        out[o..o + 4].copy_from_slice(&r.to_le_bytes());
+        flags |= f;
     }
-    u128::from_le_bytes(out)
+    (u128::from_le_bytes(out), flags)
+}
+
+/// `SQRTSD`/`SQRTPD` through [`softfloat`]: each touched lane is `√src`.
+#[allow(clippy::many_single_char_names)]
+fn f64_lanes_sqrt(dst: u128, src: u128, lanes: usize, mode: Round) -> (u128, u32) {
+    let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+    let mut out = d;
+    let mut flags = 0;
+    for i in 0..lanes {
+        let o = i * 8;
+        let b = u64::from_le_bytes(s[o..o + 8].try_into().unwrap());
+        let (r, f) = softfloat::f64_sqrt(b, mode);
+        out[o..o + 8].copy_from_slice(&r.to_le_bytes());
+        flags |= f;
+    }
+    (u128::from_le_bytes(out), flags)
+}
+
+/// `SQRTSS`/`SQRTPS` through [`softfloat`].
+#[allow(clippy::many_single_char_names)]
+fn f32_lanes_sqrt(dst: u128, src: u128, lanes: usize, mode: Round) -> (u128, u32) {
+    let (d, s) = (dst.to_le_bytes(), src.to_le_bytes());
+    let mut out = d;
+    let mut flags = 0;
+    for i in 0..lanes {
+        let o = i * 4;
+        let b = u32::from_le_bytes(s[o..o + 4].try_into().unwrap());
+        let (r, f) = softfloat::f32_sqrt(b, mode);
+        out[o..o + 4].copy_from_slice(&r.to_le_bytes());
+        flags |= f;
+    }
+    (u128::from_le_bytes(out), flags)
 }
 
 /// Whether an SSE compare predicate (`CMPPS`/`CMPSD`/… imm8, low 3 bits) holds
@@ -943,13 +923,11 @@ struct X86Interp {
     /// override prefixes are consumed with no effect.
     seg_base: u64,
     /// The x87 register stack, `ST(0)..ST(7)`, physically indexed (i.e. not
-    /// yet rotated by `fpu_top`) — see [`X86Interp::st_get`]. Real x87
-    /// registers are 80-bit extended precision; this interpreter models
-    /// each as an `f64` instead (an accepted approximation for a software
-    /// scaffold — see `f80_to_f64`), so values round-tripped through the
-    /// register stack lose precision beyond `f64`'s ~15-17 significant
-    /// digits relative to true 80-bit `long double`.
-    st: [f64; 8],
+    /// yet rotated by `fpu_top`) — see [`X86Interp::st_get`]. Each register
+    /// holds a true 80-bit extended-precision value (its `m80` encoding); all
+    /// arithmetic runs at 64-bit-significand precision via [`softfloat`], so a
+    /// `long double` computation keeps every bit real hardware would.
+    st: [F80; 8],
     /// The status word's `TOP` field: `ST(i)` physically lives at
     /// `st[(fpu_top + i) & 7]`. `FLD`-family pushes decrement it (then
     /// write the new `ST(0)`); pops increment it.
@@ -960,12 +938,15 @@ struct X86Interp {
     fpu_c1: bool,
     fpu_c2: bool,
     fpu_c3: bool,
-    /// The control word (`FLDCW`/`FNSTCW`): only the rounding-control field
-    /// (bits 10-11) is consulted, by [`X86Interp::round_per_cw`] (`FIST`/
-    /// `FISTP`/`FRNDINT`); the precision-control and exception-mask fields
-    /// are stored and read back verbatim but otherwise unused, since this
-    /// interpreter doesn't model FPU exceptions at all.
+    /// The control word (`FLDCW`/`FNSTCW`): the rounding-control field
+    /// (bits 10-11) drives every x87 rounding via [`X86Interp::fpu_round`]; the
+    /// precision-control and exception-mask fields are stored and read back
+    /// verbatim (this model always computes at full 64-bit precision and leaves
+    /// exceptions masked).
     fpu_cw: u16,
+    /// Accumulated x87 exception flags (`IE`/`DE`/`ZE`/`OE`/`UE`/`PE`, bits 0-5
+    /// — the [`softfloat`] flag layout), reported through the status word.
+    fpu_flags: u16,
     /// Free-running counter behind `RDTSC`/`RDTSCP` — see
     /// [`X86Interp::rdtsc_tick`].
     tsc: u64,
@@ -991,13 +972,14 @@ impl X86Interp {
             fs_base: 0,
             addr32: false,
             seg_base: 0,
-            st: [0.0; 8],
+            st: [F80(0); 8],
             fpu_top: 0,
             fpu_c0: false,
             fpu_c1: false,
             fpu_c2: false,
             fpu_c3: false,
             fpu_cw: 0x037F, // the real x87's power-on/FNINIT default control word
+            fpu_flags: 0,
             tsc: 0,
             prng: 0x9E37_79B9_7F4A_7C15, // arbitrary nonzero seed (golden-ratio constant)
             mxcsr: 0x1f80,               // the power-on default (all exceptions masked)
@@ -3152,12 +3134,15 @@ impl X86Interp {
         let rm_op = resolve(modrm.kind, pc2);
         let raw = fetch!(self.read_operand(mem, rm_op, gw));
         let ival = sign_extend_w(raw, gw);
+        let mode = self.sse_round();
         self.xmm[modrm.reg] = if rep == 2 {
-            let bits = u128::from((ival as f64).to_bits());
-            (self.xmm[modrm.reg] & !u128::from(u64::MAX)) | bits
+            let (bits, flags) = softfloat::i64_to_f64(ival, mode);
+            self.mxcsr |= flags & 0x3f;
+            (self.xmm[modrm.reg] & !u128::from(u64::MAX)) | u128::from(bits)
         } else {
-            let bits = u128::from((ival as f32).to_bits());
-            (self.xmm[modrm.reg] & !u128::from(u32::MAX)) | bits
+            let (bits, flags) = softfloat::i64_to_f32(ival, mode);
+            self.mxcsr |= flags & 0x3f;
+            (self.xmm[modrm.reg] & !u128::from(u32::MAX)) | u128::from(bits)
         };
         self.next(pc2)
     }
@@ -3178,22 +3163,14 @@ impl X86Interp {
     ) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let rm_op = resolve(modrm.kind, pc2);
+        // `CVT*` rounds per MXCSR; `CVTT*` always truncates toward zero.
+        let mode = if round { self.sse_round() } else { Round::Zero };
         let result: i64 = if rep == 2 {
             let bits = fetch!(self.xmm_read_lo(mem, rm_op, 64));
-            let f = f64::from_bits(bits);
-            if round {
-                f.round_ties_even() as i64
-            } else {
-                f.trunc() as i64
-            }
+            softfloat::f64_to_i64(bits, mode)
         } else {
             let bits = fetch!(self.xmm_read_lo(mem, rm_op, 32));
-            let f = f32::from_bits(bits as u32);
-            if round {
-                f.round_ties_even() as i64
-            } else {
-                f.trunc() as i64
-            }
+            softfloat::f32_to_i64(bits as u32, mode)
         };
         self.gpr[modrm.reg] = if gw == 64 {
             result as u64
@@ -3210,16 +3187,19 @@ impl X86Interp {
         let rm_op = resolve(modrm.kind, pc2);
         match rep {
             2 => {
+                // CVTSD2SS: narrow, rounding per MXCSR.
                 let bits = fetch!(self.xmm_read_lo(mem, rm_op, 64));
-                let f = f64::from_bits(bits) as f32;
+                let (f, flags) = softfloat::f64_to_f32(bits, self.sse_round());
+                self.mxcsr |= flags & 0x3f;
                 self.xmm[modrm.reg] =
-                    (self.xmm[modrm.reg] & !u128::from(u32::MAX)) | u128::from(f.to_bits());
+                    (self.xmm[modrm.reg] & !u128::from(u32::MAX)) | u128::from(f);
             }
             1 => {
+                // CVTSS2SD: widen (exact, never rounds).
                 let bits = fetch!(self.xmm_read_lo(mem, rm_op, 32));
-                let f = f64::from(f32::from_bits(bits as u32));
+                let f = softfloat::f32_to_f64(bits as u32);
                 self.xmm[modrm.reg] =
-                    (self.xmm[modrm.reg] & !u128::from(u64::MAX)) | u128::from(f.to_bits());
+                    (self.xmm[modrm.reg] & !u128::from(u64::MAX)) | u128::from(f);
             }
             _ => return Step::Illegal, // CVTPS2PD/CVTPD2PS (packed): not in our documented subset
         }
@@ -3235,23 +3215,20 @@ impl X86Interp {
     /// `#I` exception behavior since this interpreter doesn't model FP
     /// exceptions at all.
     fn sse_comis(&mut self, mem: &GuestMemory, pc: u64, rex: Rex, opsize16: bool) -> Step {
+        use core::cmp::Ordering;
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let rm_op = resolve(modrm.kind, pc2);
-        let (unordered, gt, lt) = if opsize16 {
-            let a = f64::from_bits(self.xmm[modrm.reg] as u64);
+        let ord = if opsize16 {
             let bits = fetch!(self.xmm_read_lo(mem, rm_op, 64));
-            let b = f64::from_bits(bits);
-            (a.is_nan() || b.is_nan(), a > b, a < b)
+            softfloat::f64_cmp(self.xmm[modrm.reg] as u64, bits)
         } else {
-            let a = f32::from_bits(self.xmm[modrm.reg] as u32);
             let bits = fetch!(self.xmm_read_lo(mem, rm_op, 32));
-            let b = f32::from_bits(bits as u32);
-            (a.is_nan() || b.is_nan(), a > b, a < b)
+            softfloat::f32_cmp(self.xmm[modrm.reg] as u32, bits as u32)
         };
         self.flags = Flags {
-            cf: unordered || lt,
-            zf: unordered || (!gt && !lt),
-            pf: unordered,
+            cf: matches!(ord, None | Some(Ordering::Less)),
+            zf: matches!(ord, None | Some(Ordering::Equal)),
+            pf: ord.is_none(),
             of: false,
             sf: false,
         };
@@ -3278,25 +3255,35 @@ impl X86Interp {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         let rm_op = resolve(modrm.kind, pc2);
         let dst = self.xmm[modrm.reg];
-        let apply_f64 = |dst: u128, src: u128, lanes: usize| match op {
-            SseOp::Add => f64_lane_binop(dst, src, lanes, |a, b| a + b),
-            SseOp::Sub => f64_lane_binop(dst, src, lanes, |a, b| a - b),
-            SseOp::Mul => f64_lane_binop(dst, src, lanes, |a, b| a * b),
-            SseOp::Div => f64_lane_binop(dst, src, lanes, |a, b| a / b),
-            SseOp::Min => f64_lane_binop(dst, src, lanes, |a, b| if a < b { a } else { b }),
-            SseOp::Max => f64_lane_binop(dst, src, lanes, |a, b| if a > b { a } else { b }),
-            SseOp::Sqrt => f64_lane_unop(dst, src, lanes, f64::sqrt),
+        let mode = self.sse_round();
+        // ADD/SUB/MUL/DIV/SQRT round per MXCSR and report IEEE flags via
+        // softfloat; MIN/MAX select one operand's exact bits (they never round —
+        // `MINx`/`MAXx` return the second operand on unordered/equal, the x86
+        // NaN rule) so they stay on the plain bit-preserving lane helpers.
+        let arith_op = |op: SseOp| match op {
+            SseOp::Add => Some(softfloat::Op::Add),
+            SseOp::Sub => Some(softfloat::Op::Sub),
+            SseOp::Mul => Some(softfloat::Op::Mul),
+            SseOp::Div => Some(softfloat::Op::Div),
+            _ => None,
         };
-        let apply_f32 = |dst: u128, src: u128, lanes: usize| match op {
-            SseOp::Add => f32_lane_binop(dst, src, lanes, |a, b| a + b),
-            SseOp::Sub => f32_lane_binop(dst, src, lanes, |a, b| a - b),
-            SseOp::Mul => f32_lane_binop(dst, src, lanes, |a, b| a * b),
-            SseOp::Div => f32_lane_binop(dst, src, lanes, |a, b| a / b),
-            SseOp::Min => f32_lane_binop(dst, src, lanes, |a, b| if a < b { a } else { b }),
-            SseOp::Max => f32_lane_binop(dst, src, lanes, |a, b| if a > b { a } else { b }),
-            SseOp::Sqrt => f32_lane_unop(dst, src, lanes, f32::sqrt),
+        let apply_f64 = |dst: u128, src: u128, lanes: usize| -> (u128, u32) {
+            match op {
+                SseOp::Sqrt => f64_lanes_sqrt(dst, src, lanes, mode),
+                SseOp::Min => (f64_lane_binop(dst, src, lanes, |a, b| if a < b { a } else { b }), 0),
+                SseOp::Max => (f64_lane_binop(dst, src, lanes, |a, b| if a > b { a } else { b }), 0),
+                other => f64_lanes_op(dst, src, lanes, arith_op(other).unwrap(), mode),
+            }
         };
-        let result = match rep {
+        let apply_f32 = |dst: u128, src: u128, lanes: usize| -> (u128, u32) {
+            match op {
+                SseOp::Sqrt => f32_lanes_sqrt(dst, src, lanes, mode),
+                SseOp::Min => (f32_lane_binop(dst, src, lanes, |a, b| if a < b { a } else { b }), 0),
+                SseOp::Max => (f32_lane_binop(dst, src, lanes, |a, b| if a > b { a } else { b }), 0),
+                other => f32_lanes_op(dst, src, lanes, arith_op(other).unwrap(), mode),
+            }
+        };
+        let (result, flags) = match rep {
             2 => {
                 let bits = fetch!(self.xmm_read_lo(mem, rm_op, 64));
                 apply_f64(dst, u128::from(bits), 1)
@@ -3315,7 +3302,13 @@ impl X86Interp {
             }
         };
         self.xmm[modrm.reg] = result;
+        self.mxcsr |= flags & 0x3f;
         self.next(pc2)
+    }
+
+    /// The active SSE rounding mode from `MXCSR`'s RC field (bits 13-14).
+    fn sse_round(&self) -> Round {
+        Round::from_x86(self.mxcsr >> 13)
     }
 
     /// `ANDPS`/`ANDPD`/`PAND` (`0F 54`/`66 0F 54`/`66 0F DB`), `XORPS`/
@@ -3756,37 +3749,53 @@ impl X86Interp {
         ((self.fpu_top.wrapping_add(i)) & 7) as usize
     }
 
-    fn st_get(&self, i: u8) -> f64 {
+    fn st_get(&self, i: u8) -> F80 {
         self.st[self.st_idx(i)]
     }
 
-    fn st_set(&mut self, i: u8, v: f64) {
+    fn st_set(&mut self, i: u8, v: F80) {
         let idx = self.st_idx(i);
         self.st[idx] = v;
     }
 
-    fn fpu_push(&mut self, v: f64) {
+    fn fpu_push(&mut self, v: F80) {
         self.fpu_top = self.fpu_top.wrapping_sub(1) & 7;
         self.st[self.fpu_top as usize] = v;
     }
 
     /// Pop and return the old `ST(0)`.
-    fn fpu_pop(&mut self) -> f64 {
+    fn fpu_pop(&mut self) -> F80 {
         let v = self.st[self.fpu_top as usize];
         self.fpu_top = (self.fpu_top + 1) & 7;
         v
     }
 
+    /// The active x87 rounding mode from the control word's `RC` field.
+    fn fpu_round(&self) -> Round {
+        Round::from_x86(u32::from(self.fpu_cw >> 10))
+    }
+
+    /// Apply an `f64` transcendental to `ST(0)` in place. The x87
+    /// transcendentals (`FSIN`/`FCOS`/`FYL2X`/…) are not correctly-rounded even
+    /// on real silicon, so computing them in `f64` and widening back to the
+    /// 80-bit stack is a faithful approximation — the arithmetic ops that *are*
+    /// exactly specified (add/sub/mul/div/sqrt/rem) stay full 80-bit.
+    fn fpu_unop_f64(&mut self, f: impl Fn(f64) -> f64) {
+        let x = self.st_get(0).to_f64();
+        self.st_set(0, F80::from_f64_val(f(x)));
+    }
+
     /// `FNINIT`: the power-on-reset FPU state (used both by the `FNINIT`
     /// opcode and by [`Vcpu::reset`]).
     fn fpu_init(&mut self) {
-        self.st = [0.0; 8];
+        self.st = [F80(0); 8];
         self.fpu_top = 0;
         self.fpu_c0 = false;
         self.fpu_c1 = false;
         self.fpu_c2 = false;
         self.fpu_c3 = false;
         self.fpu_cw = 0x037F;
+        self.fpu_flags = 0;
     }
 
     /// The compare core shared by `FCOM`/`FCOMP`/`FCOMPP`/`FUCOM`/`FUCOMP`/
@@ -3797,12 +3806,30 @@ impl X86Interp {
     /// greater-than holds, with `C2` clear. `C1` is always cleared (this
     /// interpreter never raises the stack-fault/inexact conditions real
     /// hardware would report there).
-    fn fpu_compare(&mut self, a: f64, b: f64) {
-        let unordered = a.is_nan() || b.is_nan();
-        let (lt, gt) = (a < b, a > b);
-        self.fpu_c0 = unordered || lt;
-        self.fpu_c2 = unordered;
-        self.fpu_c3 = unordered || (!lt && !gt); // equal, without a direct `==` (see sse_comis)
+    fn fpu_compare(&mut self, a: F80, b: F80) {
+        use core::cmp::Ordering;
+        match a.partial_cmp(b) {
+            None => {
+                self.fpu_c0 = true;
+                self.fpu_c2 = true;
+                self.fpu_c3 = true;
+            }
+            Some(Ordering::Less) => {
+                self.fpu_c0 = true;
+                self.fpu_c2 = false;
+                self.fpu_c3 = false;
+            }
+            Some(Ordering::Equal) => {
+                self.fpu_c0 = false;
+                self.fpu_c2 = false;
+                self.fpu_c3 = true;
+            }
+            Some(Ordering::Greater) => {
+                self.fpu_c0 = false;
+                self.fpu_c2 = false;
+                self.fpu_c3 = false;
+            }
+        }
         self.fpu_c1 = false;
     }
 
@@ -3815,14 +3842,12 @@ impl X86Interp {
     /// at all), so both share this one implementation; `pop` is set for the
     /// `...IP` forms.
     fn fpu_comi(&mut self, i: u8, pop: bool) {
-        let a = self.st_get(0);
-        let b = self.st_get(i);
-        let unordered = a.is_nan() || b.is_nan();
-        let (lt, gt) = (a < b, a > b);
+        use core::cmp::Ordering;
+        let ord = self.st_get(0).partial_cmp(self.st_get(i));
         self.flags = Flags {
-            cf: unordered || lt,
-            zf: unordered || (!lt && !gt), // equal, without a direct `==` (see sse_comis)
-            pf: unordered,
+            cf: matches!(ord, None | Some(Ordering::Less)),
+            zf: matches!(ord, None | Some(Ordering::Equal)),
+            pf: ord.is_none(),
             of: false,
             sf: false,
         };
@@ -3831,41 +3856,18 @@ impl X86Interp {
         }
     }
 
-    /// `FIST`/`FISTP`/`FRNDINT`'s rounding mode, per the control word's `RC`
-    /// field (bits 10-11) — the default control word (`0x037F`) selects
-    /// round-to-nearest-even.
-    fn round_per_cw(&self, v: f64) -> f64 {
-        match (self.fpu_cw >> 10) & 3 {
-            1 => v.floor(),
-            2 => v.ceil(),
-            3 => v.trunc(),
-            _ => v.round_ties_even(),
-        }
-    }
-
-    /// `FPREM` (`round == false`, quotient truncated toward zero — the C
-    /// `fmod`) and `FPREM1` (`round == true`, quotient to nearest-even — the
+    /// `FPREM` (`nearest == false`, quotient truncated toward zero — the C
+    /// `fmod`) and `FPREM1` (`nearest == true`, quotient to nearest-even — the
     /// IEEE-754 remainder): `ST(0) = ST(0) - ST(1)*Q`. Real hardware reduces by
     /// at most one 2^63 step per execution and reports "reduction incomplete" in
     /// `C2`, so a software loop (musl/libm `fmod`: `FPREM; FNSTSW; TEST AH,4;
-    /// JNZ`) repeats until `C2` clears. Modelled in `f64` the reduction always
-    /// completes in a single step, so `C2` is cleared unconditionally and the low
-    /// three quotient bits are published in `C1`/`C3`/`C0` — the argument-
-    /// reduction form (`FPREM1` feeding `__rem_pio2`) reads them back.
-    fn fpu_prem(&mut self, round: bool) {
-        let a = self.st_get(0);
-        let b = self.st_get(1);
-        let quotient = a / b;
-        let (r, q) = if round {
-            let q = quotient.round_ties_even();
-            (a - b * q, q)
-        } else {
-            // `a % b` is a single-rounding fmod; `trunc(a/b)` only feeds the
-            // condition-code bits below.
-            (a % b, quotient.trunc())
-        };
+    /// JNZ`) repeats until `C2` clears. The reduction here always completes in a
+    /// single step, so `C2` is cleared unconditionally and the low three
+    /// quotient bits are published in `C1`/`C3`/`C0` — the argument-reduction
+    /// form (`FPREM1` feeding `__rem_pio2`) reads them back.
+    fn fpu_prem(&mut self, nearest: bool) {
+        let (r, qi) = self.st_get(0).remainder(self.st_get(1), nearest);
         self.st_set(0, r);
-        let qi = q.abs() as i64 as u64;
         self.fpu_c0 = (qi >> 2) & 1 != 0;
         self.fpu_c3 = (qi >> 1) & 1 != 0;
         self.fpu_c1 = qi & 1 != 0;
@@ -3876,7 +3878,12 @@ impl X86Interp {
     /// `C0`/`C1`/`C2`/`C3` (bits 8/9/10/14); the busy, exception-summary and
     /// exception-flag bits are always `0` (never modeled).
     fn fpu_sw(&self) -> u16 {
-        let mut sw = (u16::from(self.fpu_top) & 7) << 11;
+        // Exception flags (IE/DE/ZE/OE/UE/PE) occupy bits 0-5, matching the
+        // softfloat flag layout; the exception summary (ES, bit 7) is the OR of
+        // the unmasked flags — with the default all-masked control word it stays
+        // clear, which is what guests reading FNSTSW after arithmetic expect.
+        let mut sw = self.fpu_flags & 0x3f;
+        sw |= (u16::from(self.fpu_top) & 7) << 11;
         if self.fpu_c0 {
             sw |= 1 << 8;
         }
@@ -3895,7 +3902,7 @@ impl X86Interp {
     /// Shared body of `D8`'s register form and every arithmetic group's
     /// `dst == ST(0)` case: apply `op` (arithmetic) or compare (`Com`/
     /// `Comp`, the latter also popping) against `src`.
-    fn fpu_arith_st0(&mut self, op: FpuOp, src: f64) {
+    fn fpu_arith_st0(&mut self, op: FpuOp, src: F80) {
         match op {
             FpuOp::Com => self.fpu_compare(self.st_get(0), src),
             FpuOp::Comp => {
@@ -3904,7 +3911,9 @@ impl X86Interp {
             }
             _ => {
                 let dst = self.st_get(0);
-                self.st_set(0, fpu_binop(op, dst, src));
+                let (r, flags) = fpu_binop(op, dst, src, self.fpu_round());
+                self.fpu_flags |= flags as u16;
+                self.st_set(0, r);
             }
         }
     }
@@ -3975,7 +3984,7 @@ impl X86Interp {
                     2 if rm == 0 => self.next(pc2), // FNOP
                     4 => match rm {
                         0 => {
-                            self.st_set(0, -self.st_get(0)); // FCHS
+                            self.st_set(0, self.st_get(0).neg()); // FCHS
                             self.next(pc2)
                         }
                         1 => {
@@ -3983,57 +3992,59 @@ impl X86Interp {
                             self.next(pc2)
                         }
                         4 => {
-                            self.fpu_compare(self.st_get(0), 0.0); // FTST
+                            self.fpu_compare(self.st_get(0), F80(0)); // FTST vs +0.0
                             self.next(pc2)
                         }
                         _ => Step::Illegal, // FXAM (D9 E5): not in our documented subset
                     },
                     5 => {
+                        // The exact 80-bit constants the real x87 loads (not the
+                        // f64-rounded values), so FLDPI et al. match hardware.
                         let Some(c) = (match rm {
-                            0 => Some(1.0),                       // FLD1
-                            1 => Some(std::f64::consts::LOG2_10), // FLDL2T
-                            2 => Some(std::f64::consts::LOG2_E),  // FLDL2E
-                            3 => Some(std::f64::consts::PI),      // FLDPI
-                            4 => Some(std::f64::consts::LOG10_2), // FLDLG2
-                            5 => Some(std::f64::consts::LN_2),    // FLDLN2
-                            6 => Some(0.0),                       // FLDZ
+                            0 => Some(0x3fff_8000_0000_0000_0000_u128), // FLD1
+                            1 => Some(0x4000_d49a_784b_cd1b_8afe), // FLDL2T  log2(10)
+                            2 => Some(0x3fff_b8aa_3b29_5c17_f0bc), // FLDL2E  log2(e)
+                            3 => Some(0x4000_c90f_daa2_2168_c235), // FLDPI   π
+                            4 => Some(0x3ffd_9a20_9a84_fbcf_f799), // FLDLG2  log10(2)
+                            5 => Some(0x3ffe_b172_17f7_d1cf_79ac), // FLDLN2  ln(2)
+                            6 => Some(0u128),                      // FLDZ    +0.0
                             _ => None,
                         }) else {
                             return Step::Illegal;
                         };
-                        self.fpu_push(c);
+                        self.fpu_push(F80(c));
                         self.next(pc2)
                     }
                     6 => match rm {
                         0 => {
-                            self.st_set(0, self.st_get(0).exp2() - 1.0); // F2XM1
+                            self.fpu_unop_f64(|x| x.exp2() - 1.0); // F2XM1
                             self.fpu_c2 = false;
                             self.next(pc2)
                         }
                         1 => {
                             // FYL2X: ST(1) = ST(1) * log2(ST(0)), then pop.
-                            let r = self.st_get(1) * self.st_get(0).log2();
-                            self.st_set(1, r);
+                            let (y, x) = (self.st_get(1).to_f64(), self.st_get(0).to_f64());
+                            self.st_set(1, F80::from_f64_val(y * x.log2()));
                             self.fpu_pop();
                             self.next(pc2)
                         }
                         2 => {
-                            self.st_set(0, self.st_get(0).tan()); // FPTAN
-                            self.fpu_push(1.0);
+                            self.fpu_unop_f64(f64::tan); // FPTAN
+                            self.fpu_push(F80::from_f64_val(1.0));
                             self.fpu_c2 = false;
                             self.next(pc2)
                         }
                         3 => {
                             // FPATAN: ST(1) = atan2(ST(1), ST(0)), then pop.
-                            let r = self.st_get(1).atan2(self.st_get(0));
-                            self.st_set(1, r);
+                            let (y, x) = (self.st_get(1).to_f64(), self.st_get(0).to_f64());
+                            self.st_set(1, F80::from_f64_val(y.atan2(x)));
                             self.fpu_pop();
                             self.next(pc2)
                         }
                         4 => {
-                            let (exp, sig) = fxtract(self.st_get(0)); // FXTRACT
-                            self.st_set(0, exp);
-                            self.fpu_push(sig);
+                            let (exp, sig) = fxtract(self.st_get(0).to_f64()); // FXTRACT
+                            self.st_set(0, F80::from_f64_val(exp));
+                            self.fpu_push(F80::from_f64_val(sig));
                             self.next(pc2)
                         }
                         5 => {
@@ -4057,41 +4068,43 @@ impl X86Interp {
                         }
                         1 => {
                             // FYL2XP1: ST(1) = ST(1) * log2(ST(0) + 1), then pop.
-                            let r = self.st_get(1) * (self.st_get(0) + 1.0).log2();
-                            self.st_set(1, r);
+                            let (y, x) = (self.st_get(1).to_f64(), self.st_get(0).to_f64());
+                            self.st_set(1, F80::from_f64_val(y * (x + 1.0).log2()));
                             self.fpu_pop();
                             self.next(pc2)
                         }
                         2 => {
-                            self.st_set(0, self.st_get(0).sqrt()); // FSQRT
+                            let (r, flags) = self.st_get(0).sqrt(self.fpu_round()); // FSQRT
+                            self.fpu_flags |= flags as u16;
+                            self.st_set(0, r);
                             self.next(pc2)
                         }
                         3 => {
                             // FSINCOS: ST(0) = sin(ST(0)), push cos(ST(0)).
-                            let x = self.st_get(0);
-                            self.st_set(0, x.sin());
-                            self.fpu_push(x.cos());
+                            let x = self.st_get(0).to_f64();
+                            self.st_set(0, F80::from_f64_val(x.sin()));
+                            self.fpu_push(F80::from_f64_val(x.cos()));
                             self.fpu_c2 = false;
                             self.next(pc2)
                         }
                         4 => {
-                            let v = self.round_per_cw(self.st_get(0)); // FRNDINT
+                            let v = self.st_get(0).round_to_int(self.fpu_round()); // FRNDINT
                             self.st_set(0, v);
                             self.next(pc2)
                         }
                         5 => {
                             // FSCALE: ST(0) = ST(0) * 2^trunc(ST(1)).
-                            let r = self.st_get(0) * self.st_get(1).trunc().exp2();
-                            self.st_set(0, r);
+                            let (a, b) = (self.st_get(0).to_f64(), self.st_get(1).to_f64());
+                            self.st_set(0, F80::from_f64_val(a * b.trunc().exp2()));
                             self.next(pc2)
                         }
                         6 => {
-                            self.st_set(0, self.st_get(0).sin()); // FSIN
+                            self.fpu_unop_f64(f64::sin); // FSIN
                             self.fpu_c2 = false;
                             self.next(pc2)
                         }
                         7 => {
-                            self.st_set(0, self.st_get(0).cos()); // FCOS
+                            self.fpu_unop_f64(f64::cos); // FCOS
                             self.fpu_c2 = false;
                             self.next(pc2)
                         }
@@ -4113,12 +4126,14 @@ impl X86Interp {
                     }
                     2 => {
                         let v = self.st_get(0); // FST m32fp
-                        fetch!(fpu_write_f32(mem, addr, v));
+                        let f = fetch!(fpu_write_f32(mem, addr, v, self.fpu_round()));
+                        self.fpu_flags |= f as u16;
                         self.next(pc2)
                     }
                     3 => {
                         let v = self.st_get(0); // FSTP m32fp
-                        fetch!(fpu_write_f32(mem, addr, v));
+                        let f = fetch!(fpu_write_f32(mem, addr, v, self.fpu_round()));
+                        self.fpu_flags |= f as u16;
                         self.fpu_pop();
                         self.next(pc2)
                     }
@@ -4199,17 +4214,17 @@ impl X86Interp {
                 match modrm.reg & 7 {
                     0 => {
                         let v = fetch!(fpu_read_int(mem, addr, 32)); // FILD m32int
-                        self.fpu_push(v as f64);
+                        self.fpu_push(F80::from_i64(v));
                         self.next(pc2)
                     }
                     2 => {
-                        let v = self.round_per_cw(self.st_get(0)); // FIST m32int
-                        fetch!(fpu_write_int(mem, addr, v as i64, 32));
+                        let v = self.st_get(0).to_i64_round(self.fpu_round()); // FIST m32int
+                        fetch!(fpu_write_int(mem, addr, v, 32));
                         self.next(pc2)
                     }
                     3 => {
-                        let v = self.round_per_cw(self.st_get(0)); // FISTP m32int
-                        fetch!(fpu_write_int(mem, addr, v as i64, 32));
+                        let v = self.st_get(0).to_i64_round(self.fpu_round()); // FISTP m32int
+                        fetch!(fpu_write_int(mem, addr, v, 32));
                         self.fpu_pop();
                         self.next(pc2)
                     }
@@ -4243,7 +4258,9 @@ impl X86Interp {
                 let i = (r & 7) as u8;
                 let dst = self.st_get(i);
                 let src = self.st_get(0);
-                self.st_set(i, fpu_binop(op, dst, src));
+                let (res, flags) = fpu_binop(op, dst, src, self.fpu_round());
+                self.fpu_flags |= flags as u16;
+                self.st_set(i, res);
                 self.next(pc2)
             }
             _ => self.fpu_arith_mem(mem, modrm.reg, modrm.kind, pc2, MemWidth::F64),
@@ -4295,12 +4312,14 @@ impl X86Interp {
                     }
                     2 => {
                         let v = self.st_get(0); // FST m64fp
-                        fetch!(fpu_write_f64(mem, addr, v));
+                        let f = fetch!(fpu_write_f64(mem, addr, v, self.fpu_round()));
+                        self.fpu_flags |= f as u16;
                         self.next(pc2)
                     }
                     3 => {
                         let v = self.st_get(0); // FSTP m64fp
-                        fetch!(fpu_write_f64(mem, addr, v));
+                        let f = fetch!(fpu_write_f64(mem, addr, v, self.fpu_round()));
+                        self.fpu_flags |= f as u16;
                         self.fpu_pop();
                         self.next(pc2)
                     }
@@ -4342,7 +4361,9 @@ impl X86Interp {
                 };
                 let dst = self.st_get(rm);
                 let src = self.st_get(0);
-                self.st_set(rm, fpu_binop(op, dst, src));
+                let (res, flags) = fpu_binop(op, dst, src, self.fpu_round());
+                self.fpu_flags |= flags as u16;
+                self.st_set(rm, res);
                 self.fpu_pop();
                 self.next(pc2)
             }
@@ -4380,28 +4401,28 @@ impl X86Interp {
                 match modrm.reg & 7 {
                     0 => {
                         let v = fetch!(fpu_read_int(mem, addr, 16)); // FILD m16int
-                        self.fpu_push(v as f64);
+                        self.fpu_push(F80::from_i64(v));
                         self.next(pc2)
                     }
                     2 => {
-                        let v = self.round_per_cw(self.st_get(0)); // FIST m16int
-                        fetch!(fpu_write_int(mem, addr, v as i64, 16));
+                        let v = self.st_get(0).to_i64_round(self.fpu_round()); // FIST m16int
+                        fetch!(fpu_write_int(mem, addr, v, 16));
                         self.next(pc2)
                     }
                     3 => {
-                        let v = self.round_per_cw(self.st_get(0)); // FISTP m16int
-                        fetch!(fpu_write_int(mem, addr, v as i64, 16));
+                        let v = self.st_get(0).to_i64_round(self.fpu_round()); // FISTP m16int
+                        fetch!(fpu_write_int(mem, addr, v, 16));
                         self.fpu_pop();
                         self.next(pc2)
                     }
                     5 => {
                         let v = fetch!(fpu_read_int(mem, addr, 64)); // FILD m64int
-                        self.fpu_push(v as f64);
+                        self.fpu_push(F80::from_i64(v));
                         self.next(pc2)
                     }
                     7 => {
-                        let v = self.round_per_cw(self.st_get(0)); // FISTP m64int
-                        fetch!(fpu_write_int(mem, addr, v as i64, 64));
+                        let v = self.st_get(0).to_i64_round(self.fpu_round()); // FISTP m64int
+                        fetch!(fpu_write_int(mem, addr, v, 64));
                         self.fpu_pop();
                         self.next(pc2)
                     }
@@ -6326,6 +6347,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn divsd_honors_mxcsr_rounding_and_flags() {
+        // 1/10 rounds *up* under round-to-nearest, so round-toward-zero yields a
+        // distinct (one ulp lower) result — proving MXCSR's RC field is honored.
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.xmm[0] = u128::from(1.0f64.to_bits());
+        cpu.xmm[1] = u128::from(10.0f64.to_bits());
+        cpu.mxcsr = 0x7f80; // exceptions masked, RC = toward zero
+        m.write_init(CODE, &[0xF2, 0x0F, 0x5E, 0xC1]).unwrap(); // divsd xmm0, xmm1
+        cpu.exec(&mut m);
+        let got = cpu.xmm[0] as u64;
+        let want = softfloat::f64_op(
+            1.0f64.to_bits(),
+            10.0f64.to_bits(),
+            softfloat::Op::Div,
+            Round::Zero,
+        )
+        .0;
+        assert_eq!(got, want, "divsd rounded per MXCSR");
+        assert_eq!(got, (1.0f64 / 10.0).to_bits() - 1, "one ulp below round-to-nearest");
+        assert!(cpu.mxcsr & 0x20 != 0, "PE (inexact) flag accumulated");
+    }
+
     // ---- x87 FPU ----
 
     #[test]
@@ -6365,7 +6410,7 @@ mod tests {
         cpu.exec(&mut m);
         cpu.exec(&mut m);
         cpu.exec(&mut m);
-        assert_eq!(cpu.st_get(0), 6.0);
+        assert_eq!(cpu.st_get(0).to_f64(), 6.0);
         assert_eq!(cpu.fpu_top, 7, "FMULP pops one value off the stack");
     }
 
@@ -6380,7 +6425,7 @@ mod tests {
         m.write_init(CODE, &[0xDB, 0x03, 0xD9, 0xFA]).unwrap();
         cpu.exec(&mut m); // fild
         cpu.exec(&mut m); // fsqrt
-        assert_eq!(cpu.st_get(0), 4.0);
+        assert_eq!(cpu.st_get(0).to_f64(), 4.0);
     }
 
     #[test]
@@ -6390,10 +6435,10 @@ mod tests {
         // fld1 (D9 E8) ; fldz (D9 EE)
         m.write_init(CODE, &[0xD9, 0xE8, 0xD9, 0xEE]).unwrap();
         cpu.exec(&mut m);
-        assert_eq!(cpu.st_get(0), 1.0);
+        assert_eq!(cpu.st_get(0).to_f64(), 1.0);
         cpu.exec(&mut m);
-        assert_eq!(cpu.st_get(0), 0.0, "FLDZ pushes 0.0 as the new ST(0)");
-        assert_eq!(cpu.st_get(1), 1.0, "FLD1's value is still ST(1)");
+        assert_eq!(cpu.st_get(0).to_f64(), 0.0, "FLDZ pushes 0.0 as the new ST(0)");
+        assert_eq!(cpu.st_get(1).to_f64(), 1.0, "FLD1's value is still ST(1)");
     }
 
     #[test]
@@ -6449,11 +6494,11 @@ mod tests {
         // `Number.toString(16)` before FPREM was implemented.)
         let mut m = mem();
         let mut cpu = X86Interp::new(CODE, STACK);
-        cpu.fpu_push(2.0); // ST(1) divisor
-        cpu.fpu_push(5.3); // ST(0) dividend
+        cpu.fpu_push(F80::from_f64_val(2.0)); // ST(1) divisor
+        cpu.fpu_push(F80::from_f64_val(5.3)); // ST(0) dividend
         m.write_init(CODE, &[0xD9, 0xF8]).unwrap(); // FPREM
         cpu.exec(&mut m);
-        assert!((cpu.st_get(0) - (5.3f64 % 2.0)).abs() < 1e-12, "{}", cpu.st_get(0));
+        assert!((cpu.st_get(0).to_f64() - (5.3f64 % 2.0)).abs() < 1e-12, "{}", cpu.st_get(0).to_f64());
         assert!(!cpu.fpu_c2, "single-step reduction is always complete");
         // trunc(5.3/2.0) = 2 = 0b010 → Q0=0 (C1), Q1=1 (C3), Q2=0 (C0).
         assert!(!cpu.fpu_c1 && cpu.fpu_c3 && !cpu.fpu_c0, "quotient bits in C1/C3/C0");
@@ -6463,12 +6508,12 @@ mod tests {
     fn fprem1_uses_the_nearest_even_quotient() {
         let mut m = mem();
         let mut cpu = X86Interp::new(CODE, STACK);
-        cpu.fpu_push(2.0); // ST(1)
-        cpu.fpu_push(5.3); // ST(0)
+        cpu.fpu_push(F80::from_f64_val(2.0)); // ST(1)
+        cpu.fpu_push(F80::from_f64_val(5.3)); // ST(0)
         m.write_init(CODE, &[0xD9, 0xF5]).unwrap(); // FPREM1
         cpu.exec(&mut m);
         // IEEE remainder: 5.3 - 2.0*round(2.65) = 5.3 - 6.0 = -0.7.
-        assert!((cpu.st_get(0) + 0.7).abs() < 1e-12, "{}", cpu.st_get(0));
+        assert!((cpu.st_get(0).to_f64() + 0.7).abs() < 1e-12, "{}", cpu.st_get(0).to_f64());
         assert!(!cpu.fpu_c2);
     }
 
@@ -6477,50 +6522,50 @@ mod tests {
         // FSIN(π/2) = 1.
         let mut m = mem();
         let mut cpu = X86Interp::new(CODE, STACK);
-        cpu.fpu_push(std::f64::consts::FRAC_PI_2);
+        cpu.fpu_push(F80::from_f64_val(std::f64::consts::FRAC_PI_2));
         m.write_init(CODE, &[0xD9, 0xFE]).unwrap();
         cpu.exec(&mut m);
-        assert!((cpu.st_get(0) - 1.0).abs() < 1e-12);
+        assert!((cpu.st_get(0).to_f64() - 1.0).abs() < 1e-12);
 
         // FSCALE: 3.0 * 2^trunc(4.7) = 3 * 16 = 48.
         let mut cpu = X86Interp::new(CODE, STACK);
-        cpu.fpu_push(4.7); // ST(1)
-        cpu.fpu_push(3.0); // ST(0)
+        cpu.fpu_push(F80::from_f64_val(4.7)); // ST(1)
+        cpu.fpu_push(F80::from_f64_val(3.0)); // ST(0)
         m.write_init(CODE, &[0xD9, 0xFD]).unwrap();
         cpu.exec(&mut m);
-        assert_eq!(cpu.st_get(0), 48.0);
+        assert_eq!(cpu.st_get(0).to_f64(), 48.0);
 
         // F2XM1(0.5) = 2^0.5 - 1.
         let mut cpu = X86Interp::new(CODE, STACK);
-        cpu.fpu_push(0.5);
+        cpu.fpu_push(F80::from_f64_val(0.5));
         m.write_init(CODE, &[0xD9, 0xF0]).unwrap();
         cpu.exec(&mut m);
-        assert!((cpu.st_get(0) - (2f64.sqrt() - 1.0)).abs() < 1e-12);
+        assert!((cpu.st_get(0).to_f64() - (2f64.sqrt() - 1.0)).abs() < 1e-12);
 
         // FYL2X: ST(1)*log2(ST(0)), then pop → 3 * log2(8) = 9.
         let mut cpu = X86Interp::new(CODE, STACK);
-        cpu.fpu_push(3.0); // ST(1) = y
-        cpu.fpu_push(8.0); // ST(0) = x
+        cpu.fpu_push(F80::from_f64_val(3.0)); // ST(1) = y
+        cpu.fpu_push(F80::from_f64_val(8.0)); // ST(0) = x
         m.write_init(CODE, &[0xD9, 0xF1]).unwrap();
         cpu.exec(&mut m);
-        assert!((cpu.st_get(0) - 9.0).abs() < 1e-12);
+        assert!((cpu.st_get(0).to_f64() - 9.0).abs() < 1e-12);
         assert_eq!(cpu.fpu_top, 7, "FYL2X pops one operand");
 
         // FPATAN: atan2(ST(1), ST(0)), then pop → atan2(1,1) = π/4.
         let mut cpu = X86Interp::new(CODE, STACK);
-        cpu.fpu_push(1.0); // ST(1) = y
-        cpu.fpu_push(1.0); // ST(0) = x
+        cpu.fpu_push(F80::from_f64_val(1.0)); // ST(1) = y
+        cpu.fpu_push(F80::from_f64_val(1.0)); // ST(0) = x
         m.write_init(CODE, &[0xD9, 0xF3]).unwrap();
         cpu.exec(&mut m);
-        assert!((cpu.st_get(0) - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
+        assert!((cpu.st_get(0).to_f64() - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
 
         // FXTRACT: 12.0 = 1.5 * 2^3 → exponent 3 in ST(1), significand 1.5 in ST(0).
         let mut cpu = X86Interp::new(CODE, STACK);
-        cpu.fpu_push(12.0);
+        cpu.fpu_push(F80::from_f64_val(12.0));
         m.write_init(CODE, &[0xD9, 0xF4]).unwrap();
         cpu.exec(&mut m);
-        assert_eq!(cpu.st_get(0), 1.5, "significand in [1,2)");
-        assert_eq!(cpu.st_get(1), 3.0, "unbiased exponent");
+        assert_eq!(cpu.st_get(0).to_f64(), 1.5, "significand in [1,2)");
+        assert_eq!(cpu.st_get(1).to_f64(), 3.0, "unbiased exponent");
     }
 
     #[test]
@@ -6563,8 +6608,8 @@ mod tests {
         cpu.exec(&mut m); // ST(0) = 1.0
         cpu.exec(&mut m); // ST(0) = 2.0, ST(1) = 1.0
         cpu.exec(&mut m); // fxch
-        assert_eq!(cpu.st_get(0), 1.0);
-        assert_eq!(cpu.st_get(1), 2.0);
+        assert_eq!(cpu.st_get(0).to_f64(), 1.0);
+        assert_eq!(cpu.st_get(1).to_f64(), 2.0);
     }
 
     #[test]

@@ -143,6 +143,7 @@ pub mod kvm;
 
 pub mod interp;
 pub mod interp_x86;
+pub(crate) mod softfloat;
 
 /// Pick the best backend available for the host, targeting `guest`.
 ///

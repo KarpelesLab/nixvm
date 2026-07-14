@@ -56,12 +56,16 @@ working CPU interpreters (aarch64 and a growing x86-64), static, static-PIE, and
 large C++ programs' full shared-library graphs, e.g. node's ~15 libs),
 multi-threaded/multi-process scheduling with an SMP worker-thread pool
 (POSIX threads share one fd table, so libuv's cross-thread wakeups work), an
-in-VM network stack, and several filesystem backends — all covered by 490 tests
+in-VM network stack, and several filesystem backends — all covered by 505 tests
 (`cargo test`). **Node.js runs** — on the software interpreter *and* the
 hardware backends: `node -e …` executes real JavaScript to completion — event
 loop, `setTimeout`/`setInterval`, promises, JSON, stdio — and exits cleanly,
 including a hot loop that tiers up to V8's TurboFan JIT with concurrent
-background compilation on. Hardware acceleration is live on both target hosts: the **HVF
+background compilation on. Floating point is a dependency-free **soft-float**
+(bit-identical on native and wasm) that models what `f64` hardware can't:
+**true 80-bit x87** extended precision and SSE **`MXCSR` directed rounding** +
+IEEE exception flags — validated bit-for-bit against the host's native
+arithmetic and against real x87/SSE hardware via KVM. Hardware acceleration is live on both target hosts: the **HVF
 backend (macOS/arm64) runs a static program end-to-end**, and the **KVM backend
 (Linux/x86-64) runs a real statically-linked glibc binary end-to-end on real
 hardware** (long mode at ring 3, `syscall` trapped via an `LSTAR` trampoline,
