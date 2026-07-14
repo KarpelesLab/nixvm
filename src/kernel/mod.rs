@@ -262,6 +262,15 @@ pub struct Kernel {
     /// `None` while its owning task is mid-slice (the table is checked out into
     /// [`ProcInfo::fds`]); see [`Kernel::check_out_files`].
     file_tables: Vec<Option<FdTable>>,
+    /// Anonymous-`mmap` arenas indexed by [`ProcInfo::mm`]. Every task sharing an
+    /// address space (`CLONE_VM` threads) shares one `(cursor, floor)` entry, so
+    /// their `mmap`s carve disjoint regions from a single downward-growing arena.
+    /// The running task checks this out into `cur.mmap_cursor`/`cur.mmap_floor`
+    /// for its slice; see [`Kernel::check_out_mmap`]. Without sharing, two threads
+    /// in one address space would each `mmap` downward from the same cursor and
+    /// hand back overlapping ranges — fatal once a JIT drops code into memory a
+    /// sibling thinks is free.
+    mmap_areas: Vec<(u64, u64)>,
     /// Number of virtual CPUs: how many host worker threads run guest compute
     /// in parallel. `1` uses the single-threaded cooperative scheduler.
     ncpus: usize,
@@ -308,6 +317,7 @@ impl Kernel {
             procs: Vec::new(),
             spaces: Vec::new(),
             file_tables: Vec::new(),
+            mmap_areas: Vec::new(),
             ncpus: 1,
             interactive: false,
             stdin_buf: VecDeque::new(),
@@ -379,6 +389,7 @@ impl Kernel {
         info.run = RunState::Running;
         info.files = self.file_tables.len();
         self.file_tables.push(Some(std::mem::take(&mut info.fds)));
+        self.mmap_areas.push((info.mmap_cursor, info.mmap_floor));
         self.spaces.push(Arc::new(Mutex::new(mem)));
         self.procs.push(Some(Process {
             vcpu: Some(vcpu),
@@ -488,6 +499,21 @@ impl Kernel {
         self.file_tables[f] = Some(std::mem::take(&mut self.cur.fds));
     }
 
+    /// Load the running task's shared `mmap` arena into `cur` for its slice, so
+    /// every allocation this slice makes advances the arena its address-space
+    /// siblings see. Paired with [`Kernel::check_in_mmap`] around each slice.
+    fn check_out_mmap(&mut self) {
+        let (cursor, floor) = self.mmap_areas[self.cur.mm];
+        self.cur.mmap_cursor = cursor;
+        self.cur.mmap_floor = floor;
+    }
+
+    /// Store the running task's `mmap` cursor back into the shared arena so its
+    /// siblings resume allocating below what it just carved out.
+    fn check_in_mmap(&mut self) {
+        self.mmap_areas[self.cur.mm] = (self.cur.mmap_cursor, self.cur.mmap_floor);
+    }
+
     /// One pass over the process table on the current thread: run each runnable
     /// task's slice. Returns whether any task made progress. Shared by the
     /// blocking scheduler and the interactive [`Kernel::pump`] loop.
@@ -510,11 +536,13 @@ impl Kernel {
             let mut guard = space_arc.lock().unwrap();
             std::mem::swap(&mut self.cur, &mut proc.info);
             self.check_out_files();
+            self.check_out_mmap();
             self.block = false;
             let made = self.run_slice(&mut vcpu, &mut guard)?;
             // The slice ended either by exiting or by blocking; `self.block`
             // reflects the last syscall. A blocked task parks until a wake.
             let blocked = self.block;
+            self.check_in_mmap();
             self.check_in_files();
             std::mem::swap(&mut self.cur, &mut proc.info);
             proc.info.parked = blocked && proc.info.run == RunState::Running;
@@ -575,6 +603,7 @@ impl Kernel {
         // scheduler checks it out into `cur.fds` for each slice.
         info.files = self.file_tables.len();
         self.file_tables.push(Some(std::mem::take(&mut info.fds)));
+        self.mmap_areas.push((info.mmap_cursor, info.mmap_floor));
         self.spaces.push(Arc::new(Mutex::new(mem)));
         self.procs.push(Some(Process {
             vcpu: Some(vcpu),
@@ -829,10 +858,12 @@ impl Kernel {
                 let mut proc = self.procs[i].take().unwrap();
                 std::mem::swap(&mut self.cur, &mut proc.info);
                 self.check_out_files();
+                self.check_out_mmap();
                 let flow = {
                     let mut mem = space.lock().unwrap();
                     self.service(exit, vcpu.as_mut(), &mut mem)
                 };
+                self.check_in_mmap();
                 self.check_in_files();
                 std::mem::swap(&mut self.cur, &mut proc.info);
                 self.procs[i] = Some(proc);
@@ -1359,6 +1390,10 @@ impl Kernel {
         }
 
         if let Some(cm) = child_mem.take() {
+            // A forked address space inherits the parent's arena position (its
+            // pages were copied); `CLONE_VM` threads instead share the parent's
+            // `mmap_areas[mm]` entry and never reach here.
+            self.mmap_areas.push((self.cur.mmap_cursor, self.cur.mmap_floor));
             self.spaces.push(Arc::new(Mutex::new(cm)));
         }
 
@@ -3595,6 +3630,7 @@ mod tests {
         // Give the parent a real address-space slot at index 0.
         let (mut k, mut mem, mut v) = setup();
         k.spaces.push(Arc::new(Mutex::new(mem.fork())));
+        k.mmap_areas.push((0, 0));
         k.cur.mm = 0;
 
         let child = call(
@@ -4361,6 +4397,41 @@ mod tests {
         let buf = 0x1_2000;
         assert_eq!(call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, buf, 6, 0, 0, 0]), 6);
         assert_eq!(mem.read_vec(buf, 6).unwrap(), b"hello!");
+    }
+
+    #[test]
+    fn threads_sharing_an_address_space_get_disjoint_mmaps() {
+        // Two threads in one address space (CLONE_VM — every pthread) must never
+        // hand back overlapping anonymous mmaps. The arena is shared per-mm in
+        // `mmap_areas` and checked out into `cur` each slice; a thread's stale
+        // per-slice cursor must not resurrect a region a sibling already took.
+        // Before the shared arena, each thread advanced its own copy of the
+        // cursor from the same start, so concurrent mmaps overlapped — fatal
+        // once V8's background compile threads dropped JIT code onto memory the
+        // main thread believed was free (the concurrent-recompilation teardown
+        // SIGSEGV).
+        let (mut k, mut mem, mut v) = setup();
+        k.cur.mm = 0;
+        k.mmap_areas = vec![(0x1_8000, 0x1_5000)];
+
+        // Thread A's slice: check the shared arena out, map a page, check it in.
+        k.check_out_mmap();
+        let a = call(&mut k, &mut mem, &mut v, Sysno::Mmap, [0, 4096, 0x3, 0x22, u64::MAX, 0]);
+        k.check_in_mmap();
+        assert!(a > 0, "mmap A returned {a}");
+
+        // A different thread swaps in carrying a *stale* cursor from when it last
+        // ran (here, the original arena top). The check-out must overwrite it
+        // with the shared cursor A already advanced — not re-hand A's page.
+        k.cur.mmap_cursor = 0x1_8000;
+        k.cur.mmap_floor = 0x1_5000;
+        k.check_out_mmap();
+        let b = call(&mut k, &mut mem, &mut v, Sysno::Mmap, [0, 4096, 0x3, 0x22, u64::MAX, 0]);
+        k.check_in_mmap();
+        assert!(b > 0, "mmap B returned {b}");
+
+        let (a, b) = (a as u64, b as u64);
+        assert!(a.abs_diff(b) >= 4096, "sibling mmaps overlap: A={a:#x} B={b:#x}");
     }
 
     #[test]

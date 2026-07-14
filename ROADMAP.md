@@ -99,7 +99,7 @@ contracts.
 > hardware backends: the interpreter makes the entire syscall engine testable on
 > any machine and in CI (and is exactly what the wasm demo needs), whereas HVF
 > needs a macOS entitlement + codesign to run. So Phases 1-8 and Phase 10's
-> aarch64/x86-64 ISA all work end-to-end on the interpreter (~456 tests). Both
+> aarch64/x86-64 ISA all work end-to-end on the interpreter (~490 tests). Both
 > hardware backends are now real: **HVF** runs a static program end-to-end on
 > Apple Silicon (Phase 1), and **KVM (Linux/x86-64)** runs a real static glibc
 > binary end-to-end on the same `Vcpu`/`Backend` seam — `vcpu::select` prefers
@@ -316,8 +316,8 @@ CPUs, rather than pinning one host thread per guest thread.
   **node runs (on hardware):** under the KVM/HVF backend `node -e …` executes
   real JavaScript to completion — the event loop, timers, intervals,
   promises/microtasks, JSON, and stdio all work and the process exits 0. A hot
-  loop that tiers up to V8's TurboFan JIT still faults a background thread;
-  `node --jitless` runs those too.
+  loop that tiers up to V8's TurboFan JIT — with its background compile threads —
+  runs and exits 0 too.
   **node also runs on the software interpreter** — the wasm path, where V8's
   baked-in native x86 builtins mean even trivial JS exercises a wide instruction
   mix. Getting there took a chain of instruction fixes: the `0x66`-prefixed
@@ -334,16 +334,22 @@ CPUs, rather than pinning one host thread per guest thread.
   by masking KVM's CPUID down to the interpreter's feature set and freezing the
   clock/RNG; their per-instruction register + XMM + stack-hash traces are then
   diffed to the first divergence). `node -e …` now executes to completion on the
-  interpreter too, and **its TurboFan JIT runs**: a hot loop tiers up, JIT-emits
-  optimized native code, and computes the correct result — the SIMD/control
-  instructions that codegen needs (the packed word shifts `PSLLW`/`PSRLW`/
-  `PSRAW`, `LDMXCSR`/`STMXCSR`, …) are implemented. The remaining gap is *not*
-  the JIT itself but V8's **concurrent-compilation worker threads**: on both
-  backends, tearing them down at process exit trips a null dereference in
-  shared cleanup state — a synchronization issue in the cooperative scheduler,
-  not an instruction gap (a compute loop exits 0 cleanly with the JIT on the
-  main thread, e.g. `--no-concurrent-recompilation`/`--predictable`). `execve`
-  replaces the image in place. The
+  interpreter too, and **its TurboFan JIT runs to a clean exit**: a hot loop
+  tiers up, JIT-emits optimized native code, computes the correct result, and the
+  process exits 0 — with V8's *concurrent-compilation* worker threads left on
+  (the default). Getting the JIT itself to codegen took the SIMD/control
+  instructions it emits (the packed word shifts `PSLLW`/`PSRLW`/`PSRAW`,
+  `LDMXCSR`/`STMXCSR`, …). Getting the *concurrent* path to tear down cleanly
+  took fixing the anonymous-`mmap` arena: it was tracked **per task** even though
+  `CLONE_VM` threads share one address space, so a background compile thread and
+  the main thread each carved downward from their own copy of the same cursor and
+  handed back **overlapping** regions — benign until the JIT dropped code onto a
+  page a sibling still believed was free, which surfaced as a null dereference in
+  shared cleanup state at exit (identically on both backends — a kernel
+  bookkeeping bug, not an instruction gap). The arena now lives **per-mm**
+  (`Kernel::mmap_areas`, checked out into the running task's slice like the fd
+  table), so every thread in an address space allocates from one shared cursor.
+  `execve` replaces the image in place. The
   scheduler exists in **two modes**
   rather than a dedicated `kernel::sched` module: `Kernel::schedule_serial`
   (cooperative single-thread round-robin, default) and `Kernel::schedule_smp`
