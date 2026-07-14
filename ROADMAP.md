@@ -334,10 +334,16 @@ CPUs, rather than pinning one host thread per guest thread.
   by masking KVM's CPUID down to the interpreter's feature set and freezing the
   clock/RNG; their per-instruction register + XMM + stack-hash traces are then
   diffed to the first divergence). `node -e …` now executes to completion on the
-  interpreter too. The one remaining gap is the same on both backends — a hot
-  loop that tiers up to V8's TurboFan JIT emits instructions (e.g. `STMXCSR`)
-  the interpreter doesn't cover; `node --jitless` avoids it. `execve` replaces
-  the image in place. The
+  interpreter too, and **its TurboFan JIT runs**: a hot loop tiers up, JIT-emits
+  optimized native code, and computes the correct result — the SIMD/control
+  instructions that codegen needs (the packed word shifts `PSLLW`/`PSRLW`/
+  `PSRAW`, `LDMXCSR`/`STMXCSR`, …) are implemented. The remaining gap is *not*
+  the JIT itself but V8's **concurrent-compilation worker threads**: on both
+  backends, tearing them down at process exit trips a null dereference in
+  shared cleanup state — a synchronization issue in the cooperative scheduler,
+  not an instruction gap (a compute loop exits 0 cleanly with the JIT on the
+  main thread, e.g. `--no-concurrent-recompilation`/`--predictable`). `execve`
+  replaces the image in place. The
   scheduler exists in **two modes**
   rather than a dedicated `kernel::sched` module: `Kernel::schedule_serial`
   (cooperative single-thread round-robin, default) and `Kernel::schedule_smp`

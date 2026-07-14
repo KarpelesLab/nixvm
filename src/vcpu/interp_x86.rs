@@ -718,6 +718,24 @@ fn pack_shift_right(v: u128, lane_bits: u32, count: u32) -> u128 {
 }
 
 /// Left-shift counterpart of [`pack_shift_right`] (`PSLLD`/`PSLLQ`).
+/// Arithmetic (sign-propagating) right shift of each `lane_bits`-wide lane —
+/// `PSRAW`/`PSRAD`. A count at or past the lane width saturates to a lane full
+/// of the sign bit, as hardware does.
+fn pack_shift_arith_right(v: u128, lane_bits: u32, count: u32) -> u128 {
+    let c = count.min(lane_bits - 1);
+    let mask = (1u128 << lane_bits) - 1;
+    let up = 128 - lane_bits;
+    let lanes = 128 / lane_bits;
+    let mut out = 0u128;
+    for i in 0..lanes {
+        let lane = (v >> (i * lane_bits)) & mask;
+        // Sign-extend the lane to the full width, shift, then re-mask.
+        let signed = ((lane << up) as i128) >> up;
+        out |= ((signed >> c) as u128 & mask) << (i * lane_bits);
+    }
+    out
+}
+
 fn pack_shift_left(v: u128, lane_bits: u32, count: u32) -> u128 {
     if count >= lane_bits {
         return 0;
@@ -926,6 +944,10 @@ struct X86Interp {
     /// PRNG state behind `RDRAND`/`RDSEED` — see
     /// [`X86Interp::rdrand_or_seed`].
     prng: u64,
+    /// The SSE control/status register (`LDMXCSR`/`STMXCSR`). Stored and
+    /// reloaded verbatim; this interpreter always computes in the default
+    /// round-to-nearest, exceptions-masked mode, so the value only round-trips.
+    mxcsr: u32,
 }
 
 impl X86Interp {
@@ -950,6 +972,7 @@ impl X86Interp {
             fpu_cw: 0x037F, // the real x87's power-on/FNINIT default control word
             tsc: 0,
             prng: 0x9E37_79B9_7F4A_7C15, // arbitrary nonzero seed (golden-ratio constant)
+            mxcsr: 0x1f80,               // the power-on default (all exceptions masked)
         }
     }
 
@@ -2289,17 +2312,32 @@ impl X86Interp {
         self.next(pc2)
     }
 
-    /// Group 15 (`0F AE /r`): only the fence/cache-hint forms this
-    /// interpreter can meaningfully be a no-op for — `LFENCE`/`MFENCE`/
-    /// `SFENCE` (register form, `/5`/`/6`/`/7`) and `CLFLUSH` (memory form,
-    /// `/7`). `FXSAVE`/`FXRSTOR`/`LDMXCSR`/`STMXCSR`/`XSAVE*` (the other
-    /// memory-form sub-opcodes) would need FPU/SSE state layouts this
-    /// scaffold doesn't model, so they're not implemented.
-    fn group15_ae(&mut self, mem: &GuestMemory, pc: u64, rex: Rex) -> Step {
+    /// Group 15 (`0F AE /r`): the fence/cache-hint forms are no-ops
+    /// (`LFENCE`/`MFENCE`/`SFENCE` register `/5`/`/6`/`/7`, `CLFLUSH` memory
+    /// `/7`), and `LDMXCSR`/`STMXCSR` (memory `/2`/`/3`) load/store the SSE
+    /// control word — V8's JIT saves and restores it around float code.
+    /// `FXSAVE`/`FXRSTOR`/`XSAVE*` still aren't modeled.
+    fn group15_ae(&mut self, mem: &mut GuestMemory, pc: u64, rex: Rex) -> Step {
         let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
         match (modrm.kind, modrm.reg) {
             // LFENCE/MFENCE/SFENCE (register form) / CLFLUSH (memory form).
             (RmKind::Reg(_), 5..=7) | (RmKind::Mem(_) | RmKind::MemRip(_), 7) => self.next(pc2),
+            // LDMXCSR (/2) / STMXCSR (/3): a 32-bit load/store to memory.
+            (RmKind::Mem(_) | RmKind::MemRip(_), 2 | 3) => {
+                let rm_op = resolve(modrm.kind, pc2);
+                let Operand::Mem(addr) = rm_op else {
+                    return Step::Illegal;
+                };
+                if modrm.reg == 2 {
+                    match mem.read_u32(addr) {
+                        Ok(v) => self.mxcsr = v,
+                        Err(_) => return Step::Fault { addr, write: false },
+                    }
+                } else if mem.write(addr, &self.mxcsr.to_le_bytes()).is_err() {
+                    return Step::Fault { addr, write: true };
+                }
+                self.next(pc2)
+            }
             _ => Step::Illegal,
         }
     }
@@ -2824,6 +2862,7 @@ impl X86Interp {
             0x5E => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Div),
             0x5F => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Max),
             0x70 => self.sse_pshuf(mem, pc, rex, rep, opsize16),
+            0x71 => self.sse_shift_imm_group(mem, pc, rex, 2),
             0x72 => self.sse_shift_imm_group(mem, pc, rex, 4),
             0x73 => self.sse_shift_imm_group(mem, pc, rex, 8),
             0x74 => self.sse_pcmpeq(mem, pc, rex, 1),
@@ -3502,7 +3541,11 @@ impl X86Interp {
         let dst = fetch!(self.xmm_read128(mem, rm_op));
         let count = u32::from(imm);
         let result = match (lane_bytes, modrm.reg) {
+            (2, 2) => pack_shift_right(dst, 16, count), // PSRLW
+            (2, 4) => pack_shift_arith_right(dst, 16, count), // PSRAW
+            (2, 6) => pack_shift_left(dst, 16, count), // PSLLW
             (4, 2) => pack_shift_right(dst, 32, count),
+            (4, 4) => pack_shift_arith_right(dst, 32, count), // PSRAD
             (4, 6) => pack_shift_left(dst, 32, count),
             (8, 2) => pack_shift_right(dst, 64, count),
             (8, 6) => pack_shift_left(dst, 64, count),
@@ -3512,7 +3555,7 @@ impl X86Interp {
             (8, 7) => {
                 if count >= 16 { 0 } else { dst << (count * 8) } // PSLLDQ
             }
-            _ => return Step::Illegal, // PSRAW/PSRAD (/4) and other sub-ops: not in our documented subset
+            _ => return Step::Illegal, // other sub-ops: not in our documented subset
         };
         fetch!(self.xmm_write128(mem, rm_op, result));
         self.next(pc3)
@@ -6604,6 +6647,49 @@ mod tests {
         cpu.exec(&mut m);
         assert_eq!(cpu.gpr[RAX], 0xDEAD_BEEF);
         assert_eq!(cpu.gpr[RSP], STACK + 8);
+    }
+
+    #[test]
+    fn psrlw_psraw_psllw_word_shifts() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        // psrlw xmm0, 4  (66 0F 71 D0 04): logical word shift right.
+        cpu.xmm[0] = 0x8000_0010_0000_ffff_u128 << 64 | 0xffff_0080_0010_8000;
+        m.write_init(CODE, &[0x66, 0x0F, 0x71, 0xD0, 0x04]).unwrap();
+        cpu.exec(&mut m);
+        // each 16-bit lane >> 4, zero-filled.
+        assert_eq!(cpu.xmm[0], 0x0800_0001_0000_0fff_u128 << 64 | 0x0fff_0008_0001_0800);
+        // psraw xmm0, 4  (66 0F 71 E0 04): arithmetic — 0x8000 → 0xF800.
+        cpu.xmm[0] = 0x8000;
+        cpu.rip = CODE;
+        m.write_init(CODE, &[0x66, 0x0F, 0x71, 0xE0, 0x04]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.xmm[0], 0xF800);
+        // psllw xmm0, 4  (66 0F 71 F0 04).
+        cpu.xmm[0] = 0x0011;
+        cpu.rip = CODE;
+        m.write_init(CODE, &[0x66, 0x0F, 0x71, 0xF0, 0x04]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.xmm[0], 0x0110);
+    }
+
+    #[test]
+    fn ldmxcsr_stmxcsr_roundtrip() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let addr = 0x1_2000u64;
+        m.write_init(addr, &0x0000_1f80u32.to_le_bytes()).unwrap();
+        cpu.gpr[RAX] = addr;
+        // ldmxcsr [rax]  (0F AE 10): load MXCSR from memory.
+        m.write_init(CODE, &[0x0F, 0xAE, 0x10]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.mxcsr, 0x1f80);
+        // stmxcsr [rax+8]  (0F AE 58 08): store it back.
+        cpu.mxcsr = 0x9fc0;
+        cpu.rip = CODE;
+        m.write_init(CODE, &[0x0F, 0xAE, 0x58, 0x08]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(m.read_vec(addr + 8, 4).unwrap(), 0x9fc0u32.to_le_bytes());
     }
 
     #[test]
