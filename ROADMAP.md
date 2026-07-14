@@ -318,27 +318,25 @@ CPUs, rather than pinning one host thread per guest thread.
   promises/microtasks, JSON, and stdio all work and the process exits 0. A hot
   loop that tiers up to V8's TurboFan JIT still faults a background thread;
   `node --jitless` runs those too.
-  **node on the software interpreter (the wasm path)** is a work in progress:
-  V8's builtins are baked-in native x86, so even trivial JS exercises a wide
-  instruction mix. Decode fixes — the `0x66`-prefixed `mov r/m16,imm16`
-  immediate length (a general bug that desynced *any* 16-bit immediate move),
-  `ANDNPD`/`ORPD`, `CMPPS`/`CMPSS`/`CMPPD`/`CMPSD`, the `PACKSSWB`/`PACKUSWB`/
-  `PACKSSDW` saturating packs, `RET imm16`, `POP r/m`, and **`syscall` writing
-  `RCX`←RIP / `R11`←RFLAGS** (musl/V8 trampolines read `RCX` after the call —
-  leaving it stale corrupted their control flow) carry V8 much deeper. A
-  purpose-built differential debugger (mask KVM's CPUID down to the
-  interpreter's feature set, freeze the clock/RNG, then diff the two backends'
-  per-syscall register snapshots, per-page memory hashes, and a store
-  watchpoint) shows the interpreter matching KVM *exactly* across all ~4800 of
-  node's main-thread startup syscalls, then faulting shortly after by `ret`-ing
-  to a tagged heap pointer. That value is *correctly* loaded from the heap in a
-  V8 hot loop — so the bug is not a wrong value or a missing opcode but a
-  **control-flow divergence**: a flag/comparison the interpreter computes
-  slightly wrong makes the loop take a different branch than KVM. It reproduces
-  on both the SSE2 and (with SSSE3/SSE4.1 advertised) the modern codegen path,
-  so it's on the common path; pinning the exact instruction needs lockstep
-  single-stepping against KVM (`KVM_GUESTDBG`) — the last mile. `PALIGNR`/`PTEST`
-  are implemented toward eventually advertising SSSE3/SSE4.1. `execve` replaces
+  **node also runs on the software interpreter** — the wasm path, where V8's
+  baked-in native x86 builtins mean even trivial JS exercises a wide instruction
+  mix. Getting there took a chain of instruction fixes: the `0x66`-prefixed
+  `mov r/m16,imm16` immediate length (a general bug that desynced *any* 16-bit
+  immediate move), `ANDNPD`/`ORPD`, `CMPPS`/`CMPSS`/`CMPPD`/`CMPSD`, the
+  `PACKSSWB`/`PACKUSWB`/`PACKSSDW` saturating packs, `RET imm16`, `PALIGNR`,
+  `PTEST`, `syscall` writing `RCX`←RIP / `R11`←RFLAGS (trampolines read `RCX`
+  after the call), the undefined-but-relied-on `IMUL`/`MUL` and multi-bit
+  shift flags, and finally **`POP r/m` with an RSP-relative destination**, which
+  must use the post-increment RSP — writing it one slot too low corrupted a
+  saved return address so a later `ret` jumped into a heap pointer. The last few
+  were pinned down with a purpose-built lockstep single-stepper (`KVM_GUESTDBG`
+  drives KVM one instruction at a time; the two backends are made deterministic
+  by masking KVM's CPUID down to the interpreter's feature set and freezing the
+  clock/RNG; their per-instruction register + XMM + stack-hash traces are then
+  diffed to the first divergence). `node -e …` now executes to completion on the
+  interpreter too. The one remaining gap is the same on both backends — a hot
+  loop that tiers up to V8's TurboFan JIT emits instructions (e.g. `STMXCSR`)
+  the interpreter doesn't cover; `node --jitless` avoids it. `execve` replaces
   the image in place. The
   scheduler exists in **two modes**
   rather than a dedicated `kernel::sched` module: `Kernel::schedule_serial`

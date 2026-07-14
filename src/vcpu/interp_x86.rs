@@ -1300,9 +1300,11 @@ impl X86Interp {
         self.flags.zf = r == 0;
         self.flags.sf = sign_bit(r, width);
         self.flags.pf = parity(r as u8);
-        if amt == 1 {
-            self.flags.of = sign_bit(r, width) != cf;
-        }
+        // `OF` is architecturally defined only for 1-bit shifts, but real CPUs
+        // (and the code V8 generates) compute it the same way for any nonzero
+        // count — leaving it stale, as this interpreter used to, diverges a
+        // later `jo`/`pushf`. `SHL`: sign of the result XOR the carried-out bit.
+        self.flags.of = sign_bit(r, width) != cf;
         r
     }
 
@@ -1315,9 +1317,9 @@ impl X86Interp {
         self.flags.zf = r == 0;
         self.flags.sf = sign_bit(r, width);
         self.flags.pf = parity(r as u8);
-        if amt == 1 {
-            self.flags.of = sign_bit(a, width);
-        }
+        // `SHR`: the most-significant bit of the *original* operand, set for any
+        // nonzero count (see the note in `shl_flags`).
+        self.flags.of = sign_bit(a, width);
         r
     }
 
@@ -1330,9 +1332,8 @@ impl X86Interp {
         self.flags.zf = r == 0;
         self.flags.sf = sign_bit(r, width);
         self.flags.pf = parity(r as u8);
-        if amt == 1 {
-            self.flags.of = false;
-        }
+        // `SAR` always clears `OF` for any nonzero count (see `shl_flags`).
+        self.flags.of = false;
         r
     }
 
@@ -1704,8 +1705,10 @@ impl X86Interp {
     }
 
     /// `MUL`/`IMUL` one-operand form: `rDX:rAX` (or just `AX` at 8-bit width)
-    /// = `rAX` * `r/m`. Only `CF`/`OF` are defined by the ISA for this form;
-    /// `ZF`/`SF`/`PF` are left untouched.
+    /// = `rAX` * `r/m`. `CF`/`OF` flag a non-representable result; the ISA leaves
+    /// `SF`/`ZF`/`PF` undefined, but real CPUs (unlike the two-operand `IMUL`,
+    /// which clears `ZF`) set them from the low-half result — matching KVM so a
+    /// dependent branch doesn't diverge.
     fn mul_op(
         &mut self,
         mem: &GuestMemory,
@@ -1727,8 +1730,12 @@ impl X86Interp {
             self.write_wide_result(width, p);
             !fits_unsigned(p, width)
         };
+        let lo = mask_w(self.gpr[RAX], width);
         self.flags.cf = cf;
         self.flags.of = cf;
+        self.flags.zf = lo == 0;
+        self.flags.sf = sign_bit(lo, width);
+        self.flags.pf = parity(lo as u8);
         self.next(pc2)
     }
 
@@ -1823,10 +1830,25 @@ impl X86Interp {
         let bv = i128::from(imm);
         let p = av * bv;
         let cf = !fits_signed(p, width);
-        self.gpr[modrm.reg] = mask_w(p as u128 as u64, width);
+        let result = mask_w(p as u128 as u64, width);
+        self.gpr[modrm.reg] = result;
+        self.set_imul_flags(cf, result, width);
+        self.next(pc3)
+    }
+
+    /// Set flags after an `IMUL`. `CF`/`OF` mark a truncated result; the Intel
+    /// manual calls `SF`/`ZF`/`PF` *undefined*, but real CPUs (and thus the code
+    /// V8 generates) set them deterministically — leaving them stale, as this
+    /// interpreter used to, makes a `js`/`jns`/`jp` after an `imul` diverge.
+    /// Matching the host CPUs KVM runs on: `SF` = the low-half result's sign,
+    /// `PF` = its low byte's parity, and `ZF` is cleared even for a zero result
+    /// (verified against KVM — IMUL does *not* set `ZF` from `result == 0`).
+    fn set_imul_flags(&mut self, cf: bool, result: u64, width: u32) {
         self.flags.cf = cf;
         self.flags.of = cf;
-        self.next(pc3)
+        self.flags.zf = false;
+        self.flags.sf = sign_bit(result, width);
+        self.flags.pf = parity(result as u8);
     }
 
     /// Group 2 shifts: `0xC1 /r ib` (by immediate) and `0xD3 /r` (by `CL`).
@@ -2632,9 +2654,9 @@ impl X86Interp {
                 let bv = sign_extend_128(u128::from(b), width);
                 let p = av * bv;
                 let cf = !fits_signed(p, width);
-                self.gpr[modrm.reg] = mask_w(p as u128 as u64, width);
-                self.flags.cf = cf;
-                self.flags.of = cf;
+                let result = mask_w(p as u128 as u64, width);
+                self.gpr[modrm.reg] = result;
+                self.set_imul_flags(cf, result, width);
                 self.next(pc2)
             }
             0xB6 | 0xB7 | 0xBE | 0xBF => {
@@ -4298,16 +4320,20 @@ impl X86Interp {
                 self.gpr[r] = val;
                 self.next(pc)
             }
-            // POP r/m64 (`8F /0`): pop into a register or memory slot. The
-            // address is resolved after the stack pointer moves, matching how
-            // hardware computes an `[rsp+…]` destination post-pop. Only /0 is a
-            // valid encoding.
+            // POP r/m64 (`8F /0`): pop into a register or memory slot. A memory
+            // destination that uses RSP as a base is addressed with the RSP
+            // value *after* the pop's `RSP += 8` (Intel SDM; verified against
+            // KVM by lockstep). `decode_modrm` folds the base register into the
+            // effective address, so it must be re-run *after* the pop to pick up
+            // the new RSP — the first decode only validates the `/0` encoding.
+            // Only /0 is a valid encoding.
             0x8F => {
-                let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
+                let (modrm, _) = fetch!(self.decode_modrm(mem, pc, rex));
                 if modrm.reg != 0 {
                     return Step::Illegal;
                 }
                 let val = fetch!(self.pop(mem));
+                let (modrm, pc2) = fetch!(self.decode_modrm(mem, pc, rex));
                 let rm_op = resolve(modrm.kind, pc2);
                 fetch!(self.write_operand(mem, rm_op, val, 64));
                 self.next(pc2)
@@ -4658,6 +4684,7 @@ impl Vcpu for X86Interp {
         self.fs_base = 0;
         self.fpu_init();
     }
+
 }
 
 #[cfg(test)]
@@ -6607,6 +6634,52 @@ mod tests {
         cpu.rip = CODE;
         cpu.exec(&mut m);
         assert!(!cpu.flags.zf && cpu.flags.cf);
+    }
+
+    #[test]
+    fn pop_rm_rsp_relative_uses_post_pop_rsp() {
+        // `pop [rsp+disp]` addresses the destination with RSP *after* the pop's
+        // `RSP += 8` — the bug that let node's saved return address be written
+        // one slot too low and later `ret` into a heap pointer.
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RSP] = STACK;
+        m.write_init(STACK, &0xCAFEu64.to_le_bytes()).unwrap();
+        // pop qword [rsp+8]  (8F 44 24 08): pop [STACK] (rsp→STACK+8), then store
+        // to [new_rsp + 8] = [STACK+16], not [old_rsp + 8] = [STACK+8].
+        m.write_init(CODE, &[0x8F, 0x44, 0x24, 0x08]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RSP], STACK + 8);
+        assert_eq!(m.read_vec(STACK + 16, 8).unwrap(), 0xCAFEu64.to_le_bytes());
+    }
+
+    #[test]
+    fn imul_clears_zf_and_sets_sf_pf() {
+        // Two/three-operand IMUL sets SF/PF from the result and *clears* ZF even
+        // for a zero result (verified against KVM), rather than leaving flags
+        // stale — a `jz`/`js` after it would otherwise diverge from hardware.
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.flags.zf = true; // stale ZF must be cleared
+        cpu.flags.sf = true; // stale SF must be recomputed to 0
+        cpu.gpr[RAX] = 0;
+        // imul rcx, rax, 5  (48 6B C8 05): result 0.
+        m.write_init(CODE, &[0x48, 0x6B, 0xC8, 0x05]).unwrap();
+        cpu.exec(&mut m);
+        assert_eq!(cpu.gpr[RCX], 0);
+        assert!(!cpu.flags.zf && !cpu.flags.sf);
+    }
+
+    #[test]
+    fn shr_multibit_sets_of_from_original_msb() {
+        // `OF` is set for any nonzero shift count, not only 1-bit shifts.
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.gpr[RCX] = 0xa0; // CL, bit 7 set
+        // shr cl, 5  (C0 E9 05): OF = MSB of the original operand = 1.
+        m.write_init(CODE, &[0xC0, 0xE9, 0x05]).unwrap();
+        cpu.exec(&mut m);
+        assert!(cpu.flags.of);
     }
 
     #[test]
