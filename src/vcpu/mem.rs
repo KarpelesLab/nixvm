@@ -253,6 +253,14 @@ impl GuestMemory {
         Ok((addr - self.base) as usize)
     }
 
+    /// Whether the page at `addr` is mapped and executable — the check an
+    /// instruction fetch makes, so a jump into a writable-only page (a data
+    /// buffer, the stack) faults instead of executing, as `NX` hardware does.
+    #[must_use]
+    pub fn can_exec(&self, addr: u64) -> bool {
+        self.check(addr, 1, Prot::EXEC).is_ok()
+    }
+
     /// Read `buf.len()` bytes from guest `addr` (requires `READ`). Unwritten
     /// pages read as zero.
     pub fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemError> {

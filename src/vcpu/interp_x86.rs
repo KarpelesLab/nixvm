@@ -4460,6 +4460,13 @@ impl X86Interp {
         // atomic, so the prefix is decoded and otherwise ignored (matching
         // real hardware, we don't validate that the opcode it precedes is
         // actually one of the lockable ones).
+        // NX: an instruction fetch requires EXEC on the page at rip. Jumping to
+        // a non-executable page (the stack, a data buffer) faults here rather
+        // than running whatever bytes are there — matching real hardware and
+        // keeping the sandbox from executing injected data.
+        if !mem.can_exec(self.rip) {
+            return Step::Fault { addr: self.rip, write: false };
+        }
         let mut pc = self.rip;
         let mut opsize16 = false;
         let mut rep: u8 = 0; // 0 = none, 1 = REP/REPE (F3), 2 = REPNE (F2)
@@ -4935,6 +4942,24 @@ mod tests {
         let mut cpu = X86Interp::new(CODE, STACK);
         cpu.exec(mem);
         cpu
+    }
+
+    #[test]
+    fn executing_a_non_exec_page_faults() {
+        // A page mapped RW (no EXEC) holds a valid `nop`; executing from it must
+        // fault at rip rather than run the byte — NX enforcement.
+        let mut m = GuestMemory::new(0x1_0000, 16 * crate::vcpu::mem::PAGE_SIZE);
+        m.map(0x1_0000, crate::vcpu::mem::PAGE_SIZE, Prot::rw()).unwrap(); // data page
+        m.map(0x1_1000, crate::vcpu::mem::PAGE_SIZE, Prot::rx()).unwrap(); // code page
+        m.write_init(0x1_0000, &[0x90]).unwrap(); // nop on the data page
+        m.write_init(0x1_1000, &[0x90]).unwrap(); // nop on the code page
+
+        // Executing the data page faults at its address.
+        let mut cpu = X86Interp::new(0x1_0000, STACK);
+        assert!(matches!(cpu.exec(&mut m), Step::Fault { addr: 0x1_0000, write: false }));
+        // Executing the code page runs the nop.
+        let mut cpu = X86Interp::new(0x1_1000, STACK);
+        assert!(matches!(cpu.exec(&mut m), Step::Next));
     }
 
     #[test]
