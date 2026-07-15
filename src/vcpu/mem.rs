@@ -109,6 +109,13 @@ pub struct GuestMemory {
     prot: Vec<Prot>,
     mapped: Vec<bool>,
     generation: u64,
+    /// Bumps on any `map`/`protect`/`unmap`. A hardware backend that mirrors the
+    /// protection map into real page tables watches this to know when to resync.
+    layout_gen: u64,
+    /// Page ranges `(first, last)` whose protection changed since the last
+    /// [`GuestMemory::drain_pt_dirty`], so a backend can update just those page
+    /// tables instead of rebuilding the whole map on every `mmap`.
+    pt_dirty: Vec<(usize, usize)>,
 }
 
 impl GuestMemory {
@@ -128,7 +135,44 @@ impl GuestMemory {
             prot: vec![Prot::NONE; npages],
             mapped: vec![false; npages],
             generation: next_generation(),
+            layout_gen: next_generation(),
+            pt_dirty: Vec::new(),
         }
+    }
+
+    /// Generation of the protection layout; changes on every `map`/`protect`/
+    /// `unmap`. A backend resyncs its page tables when this moves.
+    #[must_use]
+    pub fn layout_generation(&self) -> u64 {
+        self.layout_gen
+    }
+
+    /// The effective protection of the page containing `addr`, or `None` if that
+    /// page is unmapped. For a backend building page-table entries.
+    #[must_use]
+    pub fn page_prot(&self, addr: u64) -> Option<Prot> {
+        if addr < self.base {
+            return None;
+        }
+        let p = ((addr - self.base) / PAGE_SIZE) as usize;
+        (*self.mapped.get(p)?).then(|| self.prot[p])
+    }
+
+    /// Take the accumulated dirty page ranges (each `(first_addr, last_addr)`,
+    /// inclusive, page-aligned), clearing the list.
+    #[must_use]
+    pub fn drain_pt_dirty(&mut self) -> Vec<(u64, u64)> {
+        self.pt_dirty
+            .drain(..)
+            .map(|(f, l)| (self.base + (f as u64) * PAGE_SIZE, self.base + (l as u64) * PAGE_SIZE))
+            .collect()
+    }
+
+    /// Record that pages `[first, last]` changed protection, and bump the layout
+    /// generation. Called by `map`/`protect`/`unmap`.
+    fn mark_pt_dirty(&mut self, first: usize, last: usize) {
+        self.layout_gen = next_generation();
+        self.pt_dirty.push((first, last));
     }
 
     #[must_use]
@@ -199,6 +243,7 @@ impl GuestMemory {
             self.prot[p] = prot;
         }
         self.region.fill(first * PS, (last - first + 1) * PS, 0);
+        self.mark_pt_dirty(first, last);
         Ok(())
     }
 
@@ -216,6 +261,7 @@ impl GuestMemory {
             }
             self.prot[p] = prot;
         }
+        self.mark_pt_dirty(first, last);
         Ok(())
     }
 
@@ -232,6 +278,7 @@ impl GuestMemory {
             self.mapped[p] = false;
             self.prot[p] = Prot::NONE;
         }
+        self.mark_pt_dirty(first, last);
         Ok(())
     }
 
@@ -329,6 +376,10 @@ impl GuestMemory {
             prot: self.prot.clone(),
             mapped: self.mapped.clone(),
             generation: next_generation(),
+            // Fresh layout gen with no pending dirty: a backend sees the new
+            // backing generation and rebuilds this child's page tables in full.
+            layout_gen: next_generation(),
+            pt_dirty: Vec::new(),
         }
     }
 

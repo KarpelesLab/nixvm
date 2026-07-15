@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// per GiB mapped (64 GiB ⇒ 256 KiB of tables) — and a real JS engine wants far
 /// more than 4 GiB of address space (JSC reserves multi-hundred-MiB regions up
 /// front), so map generously.
-const IDENTITY_TOP: u64 = 64 << 30;
+pub(super) const IDENTITY_TOP: u64 = 64 << 30;
 
 /// One page directory per GiB of identity map.
 const PD_PAGES: usize = (IDENTITY_TOP >> 30) as usize;
@@ -54,7 +54,7 @@ const CTRL_SIZE: usize = TRAMP_OFF + 0x1000;
 /// Guest-physical base of the control block (slot 1) — the top 2 MiB of the
 /// identity-mapped window, above any guest region. Guest memory must end below
 /// it.
-pub const CTRL_GPA: u64 = IDENTITY_TOP - (2 << 20);
+pub(super) const CTRL_GPA: u64 = IDENTITY_TOP - (2 << 20);
 
 /// The virtual address `IA32_LSTAR` points at: the `hlt; sysretq` trampoline
 /// (identity-mapped, so VA == GPA).
@@ -62,9 +62,6 @@ pub const LSTAR_VA: u64 = CTRL_GPA + TRAMP_OFF as u64;
 
 /// Linear address of the GDT (identity-mapped).
 pub const GDT_BASE: u64 = CTRL_GPA + GDT_OFF as u64;
-
-/// `CR3` for every vcpu: the PML4's guest-physical address.
-pub const CR3_PML4: u64 = CTRL_GPA + PML4_OFF as u64;
 
 // GDT layout (selectors). `syscall` loads CS/SS from `STAR[47:32]` (= 0x08,
 // +8 for SS); `sysretq` loads them from `STAR[63:48]` (= 0x13: +16 → CS
@@ -118,6 +115,10 @@ pub fn check(ret: c_int, what: &str) -> Result<c_int, VcpuError> {
 struct GuestSlot {
     /// `backing_generation` of the [`GuestMemory`] currently mapped.
     generation: Option<u64>,
+    /// The guest page tables (built on first run, then kept in sync with the
+    /// running address space's protection map). Their memslot is registered
+    /// once, when they are created.
+    page_tables: Option<super::paging::PageTables>,
 }
 
 /// One KVM virtual machine. Holds `/dev/kvm`, the VM fd, the control-block
@@ -240,25 +241,37 @@ impl Vm {
     /// switch just work. The mapping is `guest_phys == mem.base()`, so the
     /// guest's flat virtual addresses hit the identity map and land on the
     /// same bytes the kernel's copy-in/out reads.
-    pub fn reconcile_guest(&self, mem: &GuestMemory) -> Result<(), VcpuError> {
+    pub fn reconcile_guest(&self, mem: &mut GuestMemory) -> Result<(), VcpuError> {
         let generation = mem.backing_generation();
         let mut slot = self.guest_slot.lock().unwrap();
-        if slot.generation == Some(generation) {
-            return Ok(());
+
+        // First run for this VM: build the page tables and register their
+        // memslot (their GPA/size are fixed by the guest base/size).
+        if slot.page_tables.is_none() {
+            let end = mem.base() + mem.size();
+            if end > CTRL_GPA {
+                return Err(VcpuError::Backend(format!(
+                    "guest region [{:#x}, {end:#x}) reaches past the control block at {CTRL_GPA:#x}",
+                    mem.base()
+                )));
+            }
+            let pt = super::paging::PageTables::new(mem.base(), mem.size());
+            self.set_slot(2, pt.gpa(), pt.size(), pt.host_base())?;
+            slot.page_tables = Some(pt);
         }
-        let end = mem.base() + mem.size();
-        if end > CTRL_GPA {
-            return Err(VcpuError::Backend(format!(
-                "guest region [{:#x}, {end:#x}) reaches past the control block at {CTRL_GPA:#x}",
-                mem.base()
-            )));
+
+        // (Re)map guest RAM when the backing changed (fork/execve/switch).
+        if slot.generation != Some(generation) {
+            if slot.generation.is_some() {
+                self.set_slot(0, 0, 0, std::ptr::null_mut())?; // delete stale slot
+            }
+            self.set_slot(0, mem.base(), mem.size(), mem.host_base())?;
+            slot.generation = Some(generation);
         }
-        if slot.generation.is_some() {
-            // Delete the stale slot (size 0) before mapping the new backing.
-            self.set_slot(0, 0, 0, std::ptr::null_mut())?;
-        }
-        self.set_slot(0, mem.base(), mem.size(), mem.host_base())?;
-        slot.generation = Some(generation);
+
+        // Bring the page-table leaves in step with the protection map (full
+        // rebuild on an address-space switch, incremental on mmap/mprotect).
+        slot.page_tables.as_mut().unwrap().sync(mem);
         Ok(())
     }
 

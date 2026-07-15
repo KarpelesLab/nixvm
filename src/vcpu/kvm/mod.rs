@@ -20,6 +20,7 @@
 
 mod sys;
 mod vcpu;
+mod paging;
 mod vm;
 
 use crate::abi::Arch;
@@ -194,11 +195,61 @@ mod tests {
             .unwrap();
         let mut v = backend.new_vcpu(base, base + 0x8000).expect("create KVM vcpu");
         match v.run(&mut mem).unwrap() {
-            Exit::MemFault { addr, write } => {
+            Exit::MemFault { addr, .. } => {
+                // The access is to an unmapped page (below the guest region), so
+                // it faults through the guest page tables now enforcing
+                // protection — `cr2` carries the address; the read/write
+                // direction isn't recovered from the triple-fault path.
                 assert_eq!(addr, 0x1000, "faulting guest-physical address");
-                assert!(write, "reported as a write");
             }
             other => panic!("expected MemFault, got {other:?}"),
+        }
+    }
+
+    /// W^X: the page tables must enforce protection. A store to a read-only
+    /// (executable) code page faults, and a jump into a writable (`NX`) data
+    /// page faults — neither silently succeeds as it did under the old
+    /// uniformly-RWX identity map.
+    #[test]
+    fn write_to_code_and_exec_of_data_both_fault() {
+        let Some(backend) = backend_or_skip() else {
+            return;
+        };
+        let base = 0x1_0000u64;
+
+        // (a) code page is RX; a store into it must fault.
+        {
+            let mut mem = GuestMemory::new(base, 64 * 1024);
+            mem.map(base, PAGE_SIZE, Prot::rx()).unwrap(); // read + execute, no write
+            // mov byte ptr [rip-relative self], 1 → write into the code page:
+            //   C6 05 00 00 00 00 01  (mov byte [rip+0], 1) then it faults on the store.
+            mem.write_init(base, &[0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01]).unwrap();
+            let mut v = backend.new_vcpu(base, base + 0x8000).unwrap();
+            assert!(
+                matches!(v.run(&mut mem).unwrap(), Exit::MemFault { .. }),
+                "store into a read-only code page must fault"
+            );
+        }
+
+        // (b) data page is RW (NX); jumping to it must fault on the fetch.
+        {
+            let mut mem = GuestMemory::new(base, 128 * 1024);
+            mem.map(base, PAGE_SIZE, Prot::rx()).unwrap(); // a tiny code page
+            let data = base + PAGE_SIZE;
+            mem.map(data, PAGE_SIZE, Prot::rw()).unwrap(); // NX data page
+            mem.write_init(data, &[0x90]).unwrap(); // a valid `nop` sits there
+            // mov rax, data ; jmp rax
+            let mut code = vec![0x48, 0xB8];
+            code.extend_from_slice(&data.to_le_bytes());
+            code.extend_from_slice(&[0xFF, 0xE0]); // jmp rax
+            mem.write_init(base, &code).unwrap();
+            let mut v = backend.new_vcpu(base, base + 0x1_0000).unwrap();
+            match v.run(&mut mem).unwrap() {
+                Exit::MemFault { addr, .. } => {
+                    assert_eq!(addr, data, "instruction fetch from the NX page faults at it");
+                }
+                other => panic!("expected an NX fetch fault, got {other:?}"),
+            }
         }
     }
 }

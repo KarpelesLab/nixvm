@@ -25,7 +25,7 @@
 
 use super::sys;
 use super::vm::{
-    CR3_PML4, GDT_BASE, GDT_LIMIT, LSTAR_VA, SEL_UCODE, SEL_UDATA, STAR_VALUE, Vm, check,
+    GDT_BASE, GDT_LIMIT, LSTAR_VA, SEL_UCODE, SEL_UDATA, STAR_VALUE, Vm, check,
 };
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 use std::sync::Arc;
@@ -39,8 +39,9 @@ const FMASK_VALUE: u64 = 0x700;
 const CR0_LONG: u64 = 0x8005_0033;
 /// `CR4`: PAE (long mode requires it) + OSFXSR|OSXMMEXCPT (SSE enabled).
 const CR4_LONG: u64 = 0x620;
-/// `EFER`: SCE (enable `syscall`/`sysret`) | LME | LMA.
-const EFER_LONG: u64 = 0x501;
+/// `EFER`: SCE (`syscall`) | LME | LMA | **NXE** (bit 11) — NXE lets the page
+/// tables' `NX` bit take effect, so non-executable pages actually fault.
+const EFER_LONG: u64 = 0xD01;
 
 pub struct KvmVcpu {
     vm: Arc<Vm>,
@@ -376,7 +377,9 @@ fn init_user_sregs(sregs: &mut sys::kvm_sregs) {
     sregs.idt = sys::kvm_dtable::default();
     sregs.cr0 = CR0_LONG;
     sregs.cr2 = 0;
-    sregs.cr3 = CR3_PML4;
+    // The protection-enforcing page tables (super::paging), not the control
+    // block's old uniformly-RWX identity map. Their PML4 is at the region base.
+    sregs.cr3 = super::paging::PT_AREA_GPA;
     sregs.cr4 = CR4_LONG;
     sregs.efer = EFER_LONG;
 }
