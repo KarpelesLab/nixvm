@@ -111,6 +111,23 @@ pub trait Vcpu: Send {
     fn sp(&self) -> u64;
     fn set_sp(&mut self, sp: u64);
 
+    /// The condition/status flags register (`RFLAGS`/`PSTATE`), read and written
+    /// as one word so signal delivery can save it into the guest's `ucontext`
+    /// and `rt_sigreturn` can restore it. Backends that don't model the full
+    /// word return a sane default; the low condition bits are what matter.
+    fn rflags(&self) -> u64 {
+        0
+    }
+    fn set_rflags(&mut self, _value: u64) {}
+
+    /// Read/replace the SIMD/FP register file as raw bytes (x86 `XMM0..15` as a
+    /// 256-byte little-endian blob), so a signal frame can save and restore it.
+    /// Backends without SIMD return an empty vector and ignore a set.
+    fn simd_state(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn set_simd_state(&mut self, _bytes: &[u8]) {}
+
     /// Thread pointer (arm64 `TPIDR_EL0` / x86-64 `FS.base`), set by TLS syscalls.
     fn set_tls(&mut self, value: u64);
 

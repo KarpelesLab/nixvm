@@ -84,9 +84,14 @@ struct ProcInfo {
     /// Set by `FUTEX_WAKE` to release a parked waiter on its next slice.
     futex_woken: bool,
     run: RunState,
-    /// Per-signal disposition: `SIG_DFL` (0), `SIG_IGN` (1), or a handler
-    /// address. Indexed by signal number (1..=64); index 0 is unused.
-    handlers: [u64; 65],
+    /// Per-signal disposition (handler address / `SIG_DFL` / `SIG_IGN`, plus the
+    /// flags, restorer, and mask from `rt_sigaction`). Indexed by signal number
+    /// (1..=64); index 0 is unused.
+    handlers: [SigAction; 65],
+    /// Alternate signal stack (`sigaltstack`): `(base, size, flags)`. A handler
+    /// registered `SA_ONSTACK` runs here instead of the interrupted stack —
+    /// which is exactly how a runtime catches its own stack-overflow fault.
+    altstack: (u64, u64, u64),
     /// Blocked-signal mask (bit `sig-1` set = blocked).
     blocked: u64,
     /// Pending-signal mask (bit `sig-1` set = pending).
@@ -147,7 +152,8 @@ impl Default for ProcInfo {
             futex_wait: None,
             futex_woken: false,
             run: RunState::Running,
-            handlers: [0; 65],
+            handlers: [SigAction::default(); 65],
+            altstack: (0, 0, SS_DISABLE),
             blocked: 0,
             pending: 0,
             pgid: 0,
@@ -177,6 +183,47 @@ pub enum Pumped {
 
 /// The result of servicing one guest exit, telling the scheduler what to do
 /// with the task's vcpu next.
+/// Unmapped guard reserved between the initial stack's low bound and the top of
+/// the anonymous-`mmap` arena, mirroring Linux's `stack_guard_gap` (256 pages).
+///
+/// A runtime that measures its own stack by probing downward until it hits
+/// unmapped memory (JSC/Bun does this with `mremap`, to size its JS-recursion
+/// limit) must find that boundary at the real stack bottom. Without the gap the
+/// arena's first mapping sits flush against the stack, so the probe walks past
+/// the true bottom and the runtime concludes it has a far larger stack than is
+/// mapped — then recurses off the end of it into the heap.
+const STACK_GUARD_GAP: u64 = 256 * PAGE_SIZE;
+
+/// `sigaltstack` disabled (`SS_DISABLE`).
+const SS_DISABLE: u64 = 2;
+/// `sigaction` flag: run the handler on the alternate signal stack.
+const SA_ONSTACK: u64 = 0x0800_0000;
+/// The synchronous fault signals this kernel can deliver to a handler.
+const SIGILL: u64 = 4;
+const SIGSEGV: u64 = 11;
+
+/// One signal's disposition, as `rt_sigaction` records it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SigAction {
+    /// Handler address, `SIG_DFL` (0), or `SIG_IGN` (1).
+    handler: u64,
+    flags: u64,
+    /// Trampoline the handler returns *to*; it invokes `rt_sigreturn`.
+    restorer: u64,
+    /// Signals blocked for the duration of the handler.
+    mask: u64,
+}
+
+/// Top of the anonymous-`mmap` arena given the initial stack's low bound and the
+/// arena floor: a guard gap below the stack (full [`STACK_GUARD_GAP`] when the
+/// arena is roomy, one page when it is tiny — as in unit tests — so the arena
+/// stays usable), clamped to the floor.
+fn arena_top(stack_bottom: u64, floor: u64) -> u64 {
+    let room = stack_bottom.saturating_sub(floor);
+    let guard = if room > STACK_GUARD_GAP * 4 { STACK_GUARD_GAP } else { PAGE_SIZE };
+    stack_bottom.saturating_sub(guard).max(floor)
+}
+
 /// The anonymous-`mmap` arena for one address space: a region `[floor, top)`
 /// carved downward from `top`, plus a free list of ranges returned by `munmap`.
 ///
@@ -381,6 +428,10 @@ pub struct Kernel {
     /// Set by `execve` when it replaced the process image (resume at the new
     /// PC without setting a syscall return).
     exec_ok: bool,
+    /// `NIXVM_WATCHCODE` debug watch: address whose 8 bytes are checked after
+    /// every syscall, and the last value seen there.
+    watch_addr: Option<u64>,
+    watch_last: u64,
 }
 
 impl std::fmt::Debug for Kernel {
@@ -427,6 +478,8 @@ impl Kernel {
             block: false,
             yield_now: false,
             exec_ok: false,
+            watch_addr: std::env::var("NIXVM_WATCHCODE").ok().and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
+            watch_last: 0,
         }
     }
 
@@ -459,9 +512,12 @@ impl Kernel {
         self.cur.heap_limit = limit;
     }
 
-    /// Set the initial anonymous-`mmap` arena for the first process.
+    /// Set the initial anonymous-`mmap` arena for the first process. `top` is
+    /// the initial stack's low bound; the arena is placed a guard gap below it
+    /// so an unmapped region separates the stack from any `mmap` — see
+    /// [`STACK_GUARD_GAP`].
     pub fn set_mmap_area(&mut self, top: u64, floor: u64) {
-        self.cur.mmap_cursor = top;
+        self.cur.mmap_cursor = arena_top(top, floor);
         self.cur.mmap_floor = floor;
     }
 
@@ -802,6 +858,7 @@ impl Kernel {
                 if !self.block {
                     self.cur.wake_deadline = None;
                 }
+                self.watch_code(vcpu, mem, sys);
                 if let RunState::Zombie(_) = self.cur.run {
                     Serviced::Ended
                 } else if self.block {
@@ -822,6 +879,9 @@ impl Kernel {
                 // hardware MMU's page-fault-driven COW.
                 if mem.cow_fault(addr, write) {
                     Serviced::Resume
+                } else if self.deliver_fault_signal(SIGSEGV, addr, vcpu, mem) {
+                    // The guest caught it (JIT trap handler): run the handler.
+                    Serviced::Resume
                 } else {
                     eprintln!(
                         "[fault] pid {} memory fault at {addr:#x} (write={write}, pc={:#x})",
@@ -838,6 +898,9 @@ impl Kernel {
                 // is identifiable from the report alone (the pc is under a
                 // load bias for PIEs/`ld-musl`, so it can't be looked up in
                 // the on-disk ELF directly).
+                if self.deliver_fault_signal(SIGILL, pc, vcpu, mem) {
+                    return Serviced::Resume; // guest's SIGILL handler (JIT trap)
+                }
                 let bytes = mem.read_vec(pc, 16).unwrap_or_default();
                 let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
                 self.dump_fault_context(vcpu, mem);
@@ -1018,6 +1081,24 @@ impl Kernel {
     /// that dies deep inside a JIT is otherwise a bare address; the register
     /// file plus the words at `rsp` usually say immediately whether control flow
     /// was corrupted (a `ret` to a data address) or a pointer was simply null.
+    /// Debug: watch a guest address (`NIXVM_WATCHCODE=0xADDR`) for its 8 bytes
+    /// changing, printing the syscall/pc window it changed in — for tracking
+    /// down a wild write that corrupts a code page real hardware would fault on.
+    fn watch_code(&mut self, vcpu: &dyn Vcpu, mem: &GuestMemory, after: Sysno) {
+        let Some(addr) = self.watch_addr else {
+            return;
+        };
+        let now = mem.read_u64(addr).unwrap_or(0);
+        if now != self.watch_last {
+            eprintln!(
+                "[watch] {addr:#x}: {:#018x} -> {now:#018x} in the window before {after:?} (pc={:#x})",
+                self.watch_last,
+                vcpu.pc()
+            );
+            self.watch_last = now;
+        }
+    }
+
     #[allow(clippy::unused_self)] // reads self.cur.pid context in the caller; kept a method for symmetry
     fn dump_fault_context(&self, vcpu: &dyn Vcpu, mem: &GuestMemory) {
         const NAMES: [&str; 16] = [
@@ -1283,6 +1364,14 @@ impl Kernel {
             Sysno::Exit => self.sys_exit(args[0] as i32, mem),
             Sysno::ExitGroup => self.sys_exit_group(args[0] as i32, mem),
             Sysno::RtSigaction => self.sys_rt_sigaction(args[0], args[1], args[2], mem),
+            Sysno::Sigaltstack => self.sys_sigaltstack(args[0], args[1], mem),
+            Sysno::RtSigreturn => {
+                self.sys_rt_sigreturn(vcpu, mem);
+                // The return value is whatever the restored context's rax holds;
+                // it was just written into the vcpu, so don't overwrite it.
+                self.exec_ok = true;
+                0
+            }
             Sysno::RtSigprocmask => self.sys_rt_sigprocmask(args[0], args[1], args[2], mem),
             Sysno::RtSigpending => self.sys_rt_sigpending(args[0], mem),
             Sysno::RtSigtimedwait => err(Errno::EAGAIN),
@@ -1333,9 +1422,7 @@ impl Kernel {
             | Sysno::Geteuid
             | Sysno::Getgid
             | Sysno::Getegid
-            | Sysno::Sigaltstack
             | Sysno::RtSigsuspend
-            | Sysno::RtSigreturn
             | Sysno::SetRobustList
             | Sysno::Fchmodat
             | Sysno::Fchmod
@@ -1655,11 +1742,13 @@ impl Kernel {
         self.cur.brk = img.program_break;
         self.cur.heap_start = img.program_break;
         self.cur.heap_limit = mid;
-        self.cur.mmap_cursor = img.stack_bottom;
+        // Arena top sits a guard gap below the stack (see STACK_GUARD_GAP).
+        let top = arena_top(img.stack_bottom, mid);
+        self.cur.mmap_cursor = top;
         self.cur.mmap_floor = mid;
         // The image was replaced in place: the arena starts over, free list and all.
         let mm = self.cur.mm;
-        self.mmap_areas[mm] = Arena::new(img.stack_bottom, mid);
+        self.mmap_areas[mm] = Arena::new(top, mid);
         self.exec_ok = true;
         0
     }
@@ -4284,6 +4373,52 @@ mod tests {
     }
 
     #[test]
+    fn fault_signal_delivery_and_rt_sigreturn_round_trip() {
+        use crate::vcpu::Backend;
+        // A real interpreter vcpu with distinctive register state.
+        let backend = crate::vcpu::interp_x86::X86Backend::new(Arch::X86_64).unwrap();
+        let mut vcpu = backend.new_vcpu(0x1_1111, 0x1_3000).unwrap();
+        vcpu.set_reg(3, 0xdead); // rbx (callee-saved) — must survive the handler
+        vcpu.set_reg(0, 0x1234); // rax
+        let (orig_pc, orig_sp) = (vcpu.pc(), vcpu.sp());
+
+        let (mut k, mut mem, _v) = setup();
+        mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
+        k.cur.mm = 0;
+        k.cur.handlers[11] = SigAction { handler: 0x2_0000, flags: 0, restorer: 0x2_1000, mask: 0 };
+
+        // Deliver SIGSEGV (fault addr 0xcafe) → the vcpu enters the handler.
+        assert!(k.deliver_fault_signal(11, 0xcafe, vcpu.as_mut(), &mut mem));
+        assert_eq!(vcpu.pc(), 0x2_0000, "pc → handler");
+        assert_eq!(vcpu.reg(7), 11, "rdi = signum");
+        let frame = vcpu.sp();
+        assert_eq!(vcpu.reg(2), frame + 8, "rdx = &ucontext");
+        assert_eq!(vcpu.reg(6), frame + 8 + super::signal::signal_ucontext_size(), "rsi = &siginfo");
+        assert_eq!(mem.read_u64(frame).unwrap(), 0x2_1000, "pretcode = restorer");
+        assert_eq!(k.cur.blocked & (1 << 10), 1 << 10, "SIGSEGV blocked in handler");
+
+        // The handler clobbers rbx; rt_sigreturn must restore it.
+        vcpu.set_reg(3, 0);
+        vcpu.set_sp(frame + 8); // as if the restorer's `ret` popped pretcode
+        k.sys_rt_sigreturn(vcpu.as_mut(), &mem);
+        assert_eq!(vcpu.pc(), orig_pc, "pc restored");
+        assert_eq!(vcpu.sp(), orig_sp, "rsp restored");
+        assert_eq!(vcpu.reg(3), 0xdead, "rbx restored");
+        assert_eq!(vcpu.reg(0), 0x1234, "rax restored");
+        assert_eq!(k.cur.blocked, 0, "signal mask restored");
+    }
+
+    #[test]
+    fn fault_with_no_handler_is_not_delivered() {
+        use crate::vcpu::Backend;
+        let backend = crate::vcpu::interp_x86::X86Backend::new(Arch::X86_64).unwrap();
+        let mut vcpu = backend.new_vcpu(0x1_1111, 0x1_3000).unwrap();
+        let (mut k, mut mem, _v) = setup();
+        // SIG_DFL for SIGSEGV: not deliverable (stays a fatal fault).
+        assert!(!k.deliver_fault_signal(11, 0, vcpu.as_mut(), &mut mem));
+    }
+
+    #[test]
     fn rt_sigaction_stores_and_returns_old_handler() {
         let (mut k, mut mem, mut v) = setup();
         let act = 0x1_0000;
@@ -4301,7 +4436,7 @@ mod tests {
             ),
             0
         );
-        assert_eq!(k.cur.handlers[2], 0xdead);
+        assert_eq!(k.cur.handlers[2].handler, 0xdead);
 
         // Install 0xbeef and read back the previous (0xdead) via oldact.
         mem.write_init(act, &0xbeefu64.to_le_bytes()).unwrap();
@@ -4316,7 +4451,7 @@ mod tests {
             0
         );
         assert_eq!(mem.read_u64(oldact).unwrap(), 0xdead);
-        assert_eq!(k.cur.handlers[2], 0xbeef);
+        assert_eq!(k.cur.handlers[2].handler, 0xbeef);
     }
 
     #[test]

@@ -441,6 +441,15 @@ impl Vcpu for KvmVcpu {
         self.regs.rsp = sp;
         self.regs_dirty = true;
     }
+    fn rflags(&self) -> u64 {
+        self.regs.rflags
+    }
+    fn set_rflags(&mut self, value: u64) {
+        // Force the always-set reserved bit and keep interrupts enabled at CPL3;
+        // clearing IF or the reserved bit would make the vcpu unrunnable.
+        self.regs.rflags = (value & 0x00dd_5dd5) | 0x0000_0202;
+        self.regs_dirty = true;
+    }
 
     fn set_tls(&mut self, value: u64) {
         self.sregs.fs.base = value;

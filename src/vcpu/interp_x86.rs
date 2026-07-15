@@ -4858,6 +4858,33 @@ impl Vcpu for X86Interp {
         self.gpr[RSP] = sp;
     }
 
+    fn rflags(&self) -> u64 {
+        self.rflags_word()
+    }
+
+    fn set_rflags(&mut self, v: u64) {
+        self.flags.cf = v & (1 << 0) != 0;
+        self.flags.pf = v & (1 << 2) != 0;
+        self.flags.zf = v & (1 << 6) != 0;
+        self.flags.sf = v & (1 << 7) != 0;
+        self.df = v & (1 << 10) != 0;
+        self.flags.of = v & (1 << 11) != 0;
+    }
+
+    fn simd_state(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        for x in &self.xmm {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out
+    }
+
+    fn set_simd_state(&mut self, bytes: &[u8]) {
+        for (i, chunk) in bytes.chunks_exact(16).take(16).enumerate() {
+            self.xmm[i] = u128::from_le_bytes(chunk.try_into().unwrap());
+        }
+    }
+
     fn set_tls(&mut self, value: u64) {
         self.fs_base = value;
     }
