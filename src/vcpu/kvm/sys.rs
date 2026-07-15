@@ -60,6 +60,7 @@ pub const KVM_SET_MSRS: c_ulong = 0x4008_AE89;
 pub const KVM_GET_FPU: c_ulong = 0x81A0_AE8C;
 pub const KVM_SET_FPU: c_ulong = 0x41A0_AE8D;
 pub const KVM_SET_CPUID2: c_ulong = 0x4008_AE90;
+pub const KVM_SET_XCRS: c_ulong = 0x4188_AEA7;
 
 // `kvm_run.exit_reason` values this backend decodes.
 pub const KVM_EXIT_IO: u32 = 2;
@@ -237,6 +238,28 @@ impl Default for kvm_cpuid2 {
 }
 
 // The entries array is deliberately elided — 128 leaves of raw CPUID data.
+
+/// One extended control register (`XCR0`, …) for `KVM_SET_XCRS`. 16 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct kvm_xcr {
+    pub xcr: u32,
+    pub reserved: u32,
+    pub value: u64,
+}
+
+/// `struct kvm_xcrs` (`KVM_SET_XCRS`): the guest's extended control registers.
+/// We set only `XCR0` so the guest can use the SSE + AVX xsave state — the
+/// CPL3 guest has no kernel to run `xsetbv` itself, and without it a runtime's
+/// `xgetbv`-based AVX probe reports the feature unusable. 392 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct kvm_xcrs {
+    pub nr_xcrs: u32,
+    pub flags: u32,
+    pub xcrs: [kvm_xcr; 16],
+    pub padding: [u64; 16],
+}
 #[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for kvm_cpuid2 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

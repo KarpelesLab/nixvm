@@ -127,20 +127,25 @@ const HWCAP_X86_64: u64 = (1 << 0)   // FPU
 /// safer than claiming e.g. SVE2/MTE/AVX512 support the interpreter lacks.
 const HWCAP2_NONE: u64 = 0;
 
-/// Guest stack reserved at the top of the address space, for the *initial*
-/// thread. This region is mapped once and never grows (there is no
-/// grow-down/`VM_GROWSDOWN` fault handler), and the anonymous-`mmap` arena
-/// starts immediately below it — so an undersized stack does not fault, it
-/// silently runs off the bottom into whatever the arena handed out (a thread
-/// stack, the JS heap) and corrupts it. Linux's default `RLIMIT_STACK` is
-/// 8 MiB and a real JS engine (JSC/V8) recurses deeply enough to want it, so
-/// match that, clamped so a small test address space still leaves room for the
-/// image itself.
+/// The initial thread's stack *reservation* (its growth limit), clamped so a
+/// small test address space still leaves room for the image. Deliberately
+/// larger than the reported `RLIMIT_STACK` (8 MiB): a runtime that reserves a
+/// full `RLIMIT_STACK` frame anchored a little below the stack top (JSC does)
+/// needs that much room *below* the current SP, so the growable region must
+/// exceed `RLIMIT_STACK` by more than the startup usage. Only
+/// [`INITIAL_STACK_MAP`] is mapped up front; the rest grows down on demand.
 fn stack_size(mem_size: u64) -> u64 {
-    const LINUX_DEFAULT: u64 = 8 * 1024 * 1024;
+    const RESERVATION: u64 = 8 * 1024 * 1024;
     const FLOOR: u64 = 256 * 1024;
-    LINUX_DEFAULT.min(mem_size / 8).max(FLOOR)
+    RESERVATION.min(mem_size / 8).max(FLOOR)
 }
+
+/// How much of the initial stack is mapped up front; the rest grows down on
+/// demand (Linux's `VM_GROWSDOWN`). Big enough for the loader's argv/envp/auxv
+/// block and the first frames, small enough that a runtime probing for its own
+/// stack size measures roughly a freshly-started stack, not the whole
+/// reservation (which made JSC size structures to 8 MiB and overflow).
+const INITIAL_STACK_MAP: u64 = 256 * 1024;
 
 // ---- public API ----------------------------------------------------------
 
@@ -688,8 +693,14 @@ fn build_stack(
 ) -> Result<u64, LoadError> {
     let top = mem.base() + mem.size();
     let size = stack_size(mem.size());
+    // `stack_bottom` is the growth *limit* (the lowest the stack may reach); the
+    // stack grows down to it on demand (see the kernel's stack-fault handler).
+    // Only a small initial window is mapped up front — a fully-mapped stack
+    // makes a runtime that probes for its own stack size (JSC walks the mapping)
+    // measure the whole reservation and then size structures to it, overflowing.
     let stack_bottom = top - size;
-    mem.map(stack_bottom, size, Prot::rw())?;
+    let initial = INITIAL_STACK_MAP.min(size);
+    mem.map(top - initial, initial, Prot::rw())?;
 
     let (hwcap, platform_name) = arch_hints(ehdr.machine);
 

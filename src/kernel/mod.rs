@@ -54,6 +54,12 @@ struct ProcInfo {
     heap_limit: u64,
     mmap_cursor: u64,
     mmap_floor: u64,
+    /// Lowest address the initial thread's stack may grow to. A fault in
+    /// `[stack_limit, stack_top)` on an unmapped page grows the stack there
+    /// (Linux's `VM_GROWSDOWN`); only a small window is mapped at startup so a
+    /// runtime that probes its own stack size doesn't measure the whole
+    /// reservation. `stack_top` is the address space's top (`base + size`).
+    stack_limit: u64,
     /// Task id (a.k.a. tid): unique per task, returned by `gettid`.
     pid: i32,
     ppid: i32,
@@ -142,6 +148,7 @@ impl Default for ProcInfo {
             heap_limit: 0,
             mmap_cursor: 0,
             mmap_floor: 0,
+            stack_limit: 0,
             pid: 0,
             ppid: 0,
             tgid: 0,
@@ -517,6 +524,7 @@ impl Kernel {
     /// so an unmapped region separates the stack from any `mmap` — see
     /// [`STACK_GUARD_GAP`].
     pub fn set_mmap_area(&mut self, top: u64, floor: u64) {
+        self.cur.stack_limit = top; // `top` is the stack's growth floor
         self.cur.mmap_cursor = arena_top(top, floor);
         self.cur.mmap_floor = floor;
     }
@@ -879,6 +887,10 @@ impl Kernel {
                 // hardware MMU's page-fault-driven COW.
                 if mem.cow_fault(addr, write) {
                     Serviced::Resume
+                } else if self.grow_stack(addr, mem) {
+                    // A fault in the reserved stack region grows it (VM_GROWSDOWN)
+                    // and re-runs the faulting instruction.
+                    Serviced::Resume
                 } else if self.deliver_fault_signal(SIGSEGV, addr, vcpu, mem) {
                     // The guest caught it (JIT trap handler): run the handler.
                     Serviced::Resume
@@ -1097,6 +1109,35 @@ impl Kernel {
             );
             self.watch_last = now;
         }
+    }
+
+    /// Grow the initial thread's stack to cover a fault at `addr` (Linux's
+    /// `VM_GROWSDOWN`): if `addr` lies in the reserved-but-unmapped stack region
+    /// `[stack_limit, stack_top)`, map from its page up to the existing stack
+    /// and return `true` so the faulting instruction re-runs. Like Linux ≥ 6.5,
+    /// any access down to the reservation floor grows the stack (the old
+    /// "must be near `sp`" heuristic was removed upstream). This is why only a
+    /// small stack window is mapped at startup — the rest materializes on
+    /// demand, and a runtime that measures its stack sees a fresh-looking size.
+    fn grow_stack(&mut self, addr: u64, mem: &mut GuestMemory) -> bool {
+        let stack_top = mem.base() + mem.size();
+        if addr < self.cur.stack_limit || addr >= stack_top {
+            return false;
+        }
+        // Only grow genuinely-unmapped pages (a fault on a mapped stack page is
+        // a real protection error, not a growth request).
+        if mem.page_prot(addr).is_some() {
+            return false;
+        }
+        let page = addr - addr % PAGE_SIZE;
+        // Map from the faulting page up to the first already-mapped page, so a
+        // large downward sweep (JSC zeroing a frame) grows in one step rather
+        // than faulting per page.
+        let mut end = page;
+        while end < stack_top && mem.page_prot(end).is_none() {
+            end += PAGE_SIZE;
+        }
+        mem.map(page, end - page, crate::vcpu::mem::Prot::rw()).is_ok()
     }
 
     #[allow(clippy::unused_self)] // reads self.cur.pid context in the caller; kept a method for symmetry
@@ -1742,6 +1783,7 @@ impl Kernel {
         self.cur.brk = img.program_break;
         self.cur.heap_start = img.program_break;
         self.cur.heap_limit = mid;
+        self.cur.stack_limit = img.stack_bottom; // stack grows down to here on demand
         // Arena top sits a guard gap below the stack (see STACK_GUARD_GAP).
         let top = arena_top(img.stack_bottom, mid);
         self.cur.mmap_cursor = top;

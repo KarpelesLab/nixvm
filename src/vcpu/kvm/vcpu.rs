@@ -25,7 +25,7 @@
 
 use super::sys;
 use super::vm::{
-    GDT_BASE, GDT_LIMIT, LSTAR_VA, SEL_UCODE, SEL_UDATA, STAR_VALUE, Vm, check,
+    FAULT_TRAMP_VA, GDT_BASE, GDT_LIMIT, LSTAR_VA, SEL_UCODE, SEL_UDATA, STAR_VALUE, Vm, check,
 };
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 use std::sync::Arc;
@@ -37,8 +37,15 @@ const RFLAGS_USER: u64 = 0x202;
 const FMASK_VALUE: u64 = 0x700;
 /// `CR0`: PE|MP|ET|NE|WP|AM|PG — protected, paged, natural FPU error handling.
 const CR0_LONG: u64 = 0x8005_0033;
-/// `CR4`: PAE (long mode requires it) + OSFXSR|OSXMMEXCPT (SSE enabled).
-const CR4_LONG: u64 = 0x620;
+/// `CR4`: PAE (long mode requires it) + OSFXSR|OSXMMEXCPT (SSE enabled) +
+/// OSXSAVE (bit 18) so `xgetbv`/AVX state is usable — paired with `XCR0` set to
+/// x87|SSE|AVX via `KVM_SET_XCRS`. Without OSXSAVE a runtime's AVX probe (which
+/// checks OSXSAVE then `xgetbv`) reports AVX unavailable and may fall back to a
+/// slower/rarer path.
+const CR4_LONG: u64 = 0x620 | 0x4_0000;
+
+/// `XCR0` value: enable x87 (bit 0), SSE (bit 1) and AVX (bit 2) xsave state.
+const XCR0_AVX: u64 = 0x7;
 /// `EFER`: SCE (`syscall`) | LME | LMA | **NXE** (bit 11) — NXE lets the page
 /// tables' `NX` bit take effect, so non-executable pages actually fault.
 const EFER_LONG: u64 = 0xD01;
@@ -146,6 +153,21 @@ impl KvmVcpu {
         check(ret, "KVM_GET_SREGS")?;
         init_user_sregs(&mut sregs);
 
+        // Enable AVX xsave state (XCR0 = x87|SSE|AVX). CR4.OSXSAVE is set in
+        // sregs above; a CPL3 guest can't run `xsetbv`, so the host sets XCR0.
+        let mut xcrs = sys::kvm_xcrs {
+            nr_xcrs: 1,
+            ..sys::kvm_xcrs::default()
+        };
+        xcrs.xcrs[0] = sys::kvm_xcr {
+            xcr: 0,
+            reserved: 0,
+            value: XCR0_AVX,
+        };
+        // SAFETY: valid struct pointer; the fd is live.
+        let ret = unsafe { sys::ioctl(fd.0, sys::KVM_SET_XCRS, std::ptr::from_ref(&xcrs)) };
+        check(ret, "KVM_SET_XCRS")?;
+
         Ok(Self {
             vm,
             fd,
@@ -212,6 +234,44 @@ impl KvmVcpu {
     /// Decode one exit reason into an [`Exit`].
     fn decode_exit(&mut self, reason: u32) -> Result<Exit, VcpuError> {
         match reason {
+            // A `hlt` exit is either the syscall trampoline or the #PF
+            // trampoline; the vcpu `rip` (just past the executed `hlt`)
+            // distinguishes them.
+            sys::KVM_EXIT_HLT if self.regs.rip == FAULT_TRAMP_VA + 1 => {
+                // A page fault vectored here at CPL0. The CPU pushed
+                // [error_code, RIP, CS, RFLAGS, RSP, SS] onto the kernel stack
+                // (now `rsp`). Recover the faulting user state so accessors and
+                // signal delivery see it, and report the fault at cr2.
+                let ksp = self.regs.rsp;
+                let frame = (|| {
+                    Some((
+                        self.vm.read_ctrl_u64(ksp)?,
+                        self.vm.read_ctrl_u64(ksp + 8)?,
+                        self.vm.read_ctrl_u64(ksp + 24)?,
+                        self.vm.read_ctrl_u64(ksp + 32)?,
+                    ))
+                })();
+                if let Some((err, fault_rip, fault_rflags, fault_rsp)) = frame {
+                    self.regs.rip = fault_rip;
+                    self.regs.rsp = fault_rsp;
+                    self.regs.rflags = fault_rflags;
+                    self.regs_dirty = true; // resume re-runs the faulting instruction
+                    // The exception entered CPL0; restore the user segments so
+                    // the resumed guest runs at CPL3, not with kernel privilege
+                    // (and so its next fault switches to RSP0 again).
+                    self.sregs.cs = user_cs();
+                    self.sregs.ss = user_ss();
+                    self.sregs_dirty = true;
+                    Ok(Exit::MemFault {
+                        addr: self.sregs.cr2,
+                        write: err & 0x2 != 0, // #PF error-code bit 1 = write
+                    })
+                } else {
+                    // The frame wasn't on the kernel stack (unexpected); fall
+                    // back to a bare fault at cr2 rather than crashing.
+                    Ok(Exit::MemFault { addr: self.sregs.cr2, write: false })
+                }
+            }
             // The trampoline's `hlt` — a guest `syscall`. (With no in-kernel
             // irqchip, `hlt` exits straight to userspace and the next KVM_RUN
             // resumes after it, at the `sysretq`.)
@@ -312,11 +372,9 @@ impl KvmVcpu {
     }
 }
 
-/// Switch `sregs` into flat 64-bit user mode: the control block's GDT and
-/// page tables, user code/data segments, long mode enabled. Everything not
-/// set here (apic_base, interrupt_bitmap) keeps its current value.
-fn init_user_sregs(sregs: &mut sys::kvm_sregs) {
-    let code = sys::kvm_segment {
+/// The flat 64-bit user code segment (CPL3).
+fn user_cs() -> sys::kvm_segment {
+    sys::kvm_segment {
         base: 0,
         limit: 0xFFFF_FFFF,
         selector: SEL_UCODE,
@@ -330,28 +388,41 @@ fn init_user_sregs(sregs: &mut sys::kvm_sregs) {
         avl: 0,
         unusable: 0,
         padding: 0,
-    };
-    let data = sys::kvm_segment {
+    }
+}
+
+/// The flat 64-bit user data segment (CPL3).
+fn user_ss() -> sys::kvm_segment {
+    sys::kvm_segment {
         limit: 0xFFFF_FFFF,
         selector: SEL_UDATA,
         type_: 0x3, // read/write, accessed
         dpl: 3,
         db: 1,
         l: 0,
-        ..code
-    };
+        ..user_cs()
+    }
+}
+
+/// Switch `sregs` into flat 64-bit user mode: the control block's GDT and
+/// page tables, user code/data segments, long mode enabled. Everything not
+/// set here (apic_base, interrupt_bitmap) keeps its current value.
+fn init_user_sregs(sregs: &mut sys::kvm_sregs) {
+    let code = user_cs();
+    let data = user_ss();
     sregs.cs = code;
     sregs.ss = data;
     sregs.ds = data;
     sregs.es = data;
     sregs.fs = data;
     sregs.gs = data;
-    // A present 64-bit TSS descriptor state is required for VM entry; the
-    // guest never task-switches, so a zero-based dummy suffices.
+    // The real TSS (base = TSS_BASE, RSP0 set): the CPU switches to RSP0 on a
+    // CPL3→CPL0 exception (a #PF vectoring through the IDT), where it pushes the
+    // exception frame the host reads back.
     sregs.tr = sys::kvm_segment {
-        base: 0,
+        base: super::vm::TSS_BASE,
         limit: 0x67,
-        selector: 0,
+        selector: super::vm::SEL_TSS,
         type_: 0xB, // busy 64-bit TSS
         present: 1,
         dpl: 0,
@@ -372,9 +443,14 @@ fn init_user_sregs(sregs: &mut sys::kvm_sregs) {
         limit: GDT_LIMIT,
         padding: [0; 3],
     };
-    // Empty IDT: any guest exception escalates to a triple fault, which exits
-    // to the host as KVM_EXIT_SHUTDOWN (decoded via cr2).
-    sregs.idt = sys::kvm_dtable::default();
+    // IDT with a #PF gate (see the control block); a page fault vectors to the
+    // fault trampoline and exits cleanly with the real register state, instead
+    // of triple-faulting (which loses it). Other exceptions still triple-fault.
+    sregs.idt = sys::kvm_dtable {
+        base: super::vm::IDT_BASE,
+        limit: 0xFFF,
+        padding: [0; 3],
+    };
     sregs.cr0 = CR0_LONG;
     sregs.cr2 = 0;
     // The protection-enforcing page tables (super::paging), not the control

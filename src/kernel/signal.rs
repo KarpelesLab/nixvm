@@ -277,6 +277,12 @@ impl Kernel {
         vcpu: &mut dyn crate::vcpu::Vcpu,
         mem: &mut GuestMemory,
     ) -> bool {
+        // Debug escape hatch: skip delivery so a fault is fatal and the kernel
+        // dumps its context (used to inspect a stack overflow that a guest
+        // handler would otherwise catch and hide).
+        if std::env::var_os("NIXVM_NOSIG").is_some() {
+            return false;
+        }
         let act = self.cur.handlers[sig as usize];
         // Only a real, non-default, non-ignore handler is deliverable.
         if act.handler == SIG_DFL || act.handler == SIG_IGN {

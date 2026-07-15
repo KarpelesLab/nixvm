@@ -49,7 +49,14 @@ const PDPT_OFF: usize = 0x1000;
 const PD_OFF: usize = 0x2000; // PD_PAGES pages, one per GiB mapped
 const GDT_OFF: usize = PD_OFF + PD_PAGES * 0x1000;
 const TRAMP_OFF: usize = GDT_OFF + 0x1000;
-const CTRL_SIZE: usize = TRAMP_OFF + 0x1000;
+/// The `#PF` (page fault) trampoline: a lone `hlt`. A protection/not-present
+/// fault vectors here at CPL0 (via the IDT); the `hlt` exits to the host, which
+/// reads the exception frame the CPU pushed onto the kernel stack.
+const FAULT_TRAMP_OFF: usize = TRAMP_OFF + 0x1000;
+const IDT_OFF: usize = FAULT_TRAMP_OFF + 0x1000; // 256 × 16-byte gates
+const TSS_OFF: usize = IDT_OFF + 0x1000;
+const KSTACK_OFF: usize = TSS_OFF + 0x1000; // one page; RSP0 = its top
+const CTRL_SIZE: usize = KSTACK_OFF + 0x1000;
 
 /// Guest-physical base of the control block (slot 1) — the top 2 MiB of the
 /// identity-mapped window, above any guest region. Guest memory must end below
@@ -62,6 +69,17 @@ pub const LSTAR_VA: u64 = CTRL_GPA + TRAMP_OFF as u64;
 
 /// Linear address of the GDT (identity-mapped).
 pub const GDT_BASE: u64 = CTRL_GPA + GDT_OFF as u64;
+
+/// The `#PF` trampoline's virtual address (the host recognizes a fault exit by
+/// the vcpu `rip` landing just past it).
+pub(super) const FAULT_TRAMP_VA: u64 = CTRL_GPA + FAULT_TRAMP_OFF as u64;
+/// Linear address of the IDT and of the TSS, and the kernel stack top the TSS
+/// switches to on a CPL3→CPL0 exception (`RSP0`).
+pub(super) const IDT_BASE: u64 = CTRL_GPA + IDT_OFF as u64;
+pub(super) const TSS_BASE: u64 = CTRL_GPA + TSS_OFF as u64;
+pub(super) const KSTACK_TOP: u64 = CTRL_GPA + (KSTACK_OFF + 0x1000) as u64;
+/// GDT selector of the TSS descriptor (a 16-byte descriptor at slots 5–6).
+pub(super) const SEL_TSS: u16 = 0x28;
 
 // GDT layout (selectors). `syscall` loads CS/SS from `STAR[47:32]` (= 0x08,
 // +8 for SS); `sysretq` loads them from `STAR[63:48]` (= 0x13: +16 → CS
@@ -82,7 +100,7 @@ const PTE_P_RW_US: u64 = 0b111;
 const PTE_PS: u64 = 1 << 7;
 
 /// The number of GDT bytes in use (5 descriptors), for the GDTR limit.
-pub const GDT_LIMIT: u16 = 5 * 8 - 1;
+pub const GDT_LIMIT: u16 = 7 * 8 - 1; // 5 segment descriptors + a 16-byte TSS descriptor
 
 /// An owned Unix fd that closes on drop (std's `OwnedFd` would work too, but
 /// the raw `c_int` keeps this module symmetric with the hand-rolled FFI).
@@ -312,6 +330,19 @@ impl Vm {
     pub fn cpuid(&self) -> &sys::kvm_cpuid2 {
         &self.cpuid
     }
+
+    /// Read 8 bytes of the control block at guest-physical `gpa` (used to read
+    /// the exception frame the CPU pushed onto the kernel stack), or `None` if
+    /// `gpa` is outside `[CTRL_GPA, CTRL_GPA + CTRL_SIZE)`.
+    pub fn read_ctrl_u64(&self, gpa: u64) -> Option<u64> {
+        let off = gpa.checked_sub(CTRL_GPA)? as usize;
+        if off + 8 > CTRL_SIZE {
+            return None;
+        }
+        let mut b = [0u8; 8];
+        self.ctrl.read(off, &mut b);
+        Some(u64::from_le_bytes(b))
+    }
 }
 
 /// Build the control block: identity page tables over the low `IDENTITY_TOP` (2 MiB
@@ -353,11 +384,41 @@ fn build_control_block() -> Region {
         ctrl.write(GDT_OFF + i * 8, &d.to_le_bytes());
     }
 
-    // The trampoline `IA32_LSTAR` points at: exit to the host, then return to
-    // the guest. `syscall` leaves the user rip in rcx and rflags in r11, which
-    // `sysretq` restores — so between the two, the host services the syscall
-    // and writes the return value into rax.
+    // TSS descriptor (16 bytes, GDT slots 5–6): a 64-bit available TSS at
+    // TSS_BASE, limit 0x67. `ltr SEL_TSS` loads it; `RSP0` is where the CPU
+    // switches to on a CPL3→CPL0 exception.
+    let base = TSS_BASE;
+    let limit = 0x67u64;
+    let lo = (limit & 0xFFFF)
+        | ((base & 0xFFFF) << 16)
+        | (((base >> 16) & 0xFF) << 32)
+        | (0x8Bu64 << 40) // present | type 0xB (busy 64-bit TSS, matching sregs.tr)
+        | (((limit >> 16) & 0xF) << 48)
+        | (((base >> 24) & 0xFF) << 56);
+    let hi = (base >> 32) & 0xFFFF_FFFF;
+    ctrl.write(GDT_OFF + 5 * 8, &lo.to_le_bytes());
+    ctrl.write(GDT_OFF + 6 * 8, &hi.to_le_bytes());
+
+    // The 64-bit TSS: only RSP0 (offset 4) matters — the kernel stack the CPU
+    // uses when an exception raises the privilege level.
+    ctrl.write(TSS_OFF + 4, &KSTACK_TOP.to_le_bytes());
+    ctrl.write(TSS_OFF + 102, &0x68u16.to_le_bytes()); // iomap base past the TSS
+
+    // IDT entry 14 (#PF) → the fault trampoline, a 64-bit interrupt gate at
+    // CPL0. Every other vector is absent, so non-#PF exceptions still escalate
+    // to a triple fault (decoded via cr2 / reported as illegal).
+    let off = FAULT_TRAMP_VA;
+    let gate_lo = (off & 0xFFFF)
+        | ((SEL_KCODE as u64) << 16)
+        | (0x8Eu64 << 40) // present | DPL0 | 64-bit interrupt gate
+        | (((off >> 16) & 0xFFFF) << 48);
+    let gate_hi = (off >> 32) & 0xFFFF_FFFF;
+    ctrl.write(IDT_OFF + 14 * 16, &gate_lo.to_le_bytes());
+    ctrl.write(IDT_OFF + 14 * 16 + 8, &gate_hi.to_le_bytes());
+
+    // Trampolines: the syscall one (`IA32_LSTAR`) and the #PF one.
     ctrl.write(TRAMP_OFF, &[0xF4, 0x48, 0x0F, 0x07]); // hlt ; sysretq
+    ctrl.write(FAULT_TRAMP_OFF, &[0xF4]); // hlt
 
     ctrl
 }
