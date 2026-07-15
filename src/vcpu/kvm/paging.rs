@@ -41,6 +41,11 @@ const MIB2: u64 = 2 << 20;
 /// write/NX from the protection bits). The physical frame is OR-ed in by the
 /// caller.
 fn leaf_flags(prot: Prot) -> u64 {
+    // Debug: NIXVM_NOWX forces every mapped page RWX (no W^X), to test whether
+    // the protection page tables are corrupting/losing writes.
+    if std::env::var_os("NIXVM_NOWX").is_some() {
+        return P | RW | US;
+    }
     let mut f = P | US;
     if prot.contains(Prot::WRITE) {
         f |= RW;
