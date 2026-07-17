@@ -393,6 +393,16 @@ pub struct Kernel {
     /// Monotonic counter for `memfd_create` backing-file names.
     memfd_seq: u64,
     trace: bool,
+    /// Debug (`NIXVM_SCHEDTRACE`): log every scheduler slice (pid, syscalls run,
+    /// how it ended) to see how threads interleave.
+    schedtrace: bool,
+    /// Syscalls serviced in the current slice.
+    slice_syscalls: u32,
+    /// Preemption quantum: end a running task's slice after this many serviced
+    /// syscalls even if it never blocks, so no task monopolizes the single CPU
+    /// (a busy-waiting thread otherwise starves the workers it is waiting on).
+    /// Tunable via `NIXVM_SLICE`; 0 disables preemption (old run-until-block).
+    slice_cap: u32,
     /// The process file-creation mask (`umask`); global for our single session.
     umask: u32,
     /// The process name (`prctl(PR_SET_NAME)`); a fixed 16-byte, NUL-padded field.
@@ -469,6 +479,12 @@ impl Kernel {
             rlimit_nofile: (1024, 4096),
             memfd_seq: 0,
             trace: std::env::var_os("NIXVM_TRACE").is_some(),
+            schedtrace: std::env::var_os("NIXVM_SCHEDTRACE").is_some(),
+            slice_syscalls: 0,
+            slice_cap: std::env::var("NIXVM_SLICE")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(1024),
             umask: 0o022,
             procname: [0u8; 16],
             unsupported: BTreeMap::new(),
@@ -695,7 +711,21 @@ impl Kernel {
             std::mem::swap(&mut self.cur, &mut proc.info);
             self.check_out_files();
             self.block = false;
+            self.slice_syscalls = 0;
             let made = self.run_slice(&mut vcpu, &mut guard)?;
+            if self.schedtrace {
+                let end = if matches!(self.cur.run, RunState::Zombie(_)) {
+                    "ended"
+                } else if self.block {
+                    "blocked"
+                } else {
+                    "yield"
+                };
+                eprintln!(
+                    "[sched] pid={} slice={} syscalls={} end={end}",
+                    self.cur.pid, i, self.slice_syscalls
+                );
+            }
             // The slice ended either by exiting or by blocking; `self.block`
             // reflects the last syscall. A blocked task parks until a wake.
             let blocked = self.block;
@@ -842,6 +872,14 @@ impl Kernel {
                 Serviced::Blocked => return Ok(progressed),
                 Serviced::Ended => return Ok(true),
             }
+            // Preemption: after a full quantum of syscalls, end the slice so a
+            // sibling can run even though this task never blocked. This keeps a
+            // busy-waiting thread from monopolizing the single CPU while the
+            // worker it is spinning on starves. The task stays runnable (not
+            // parked) — `self.block` is clear — so the next sweep resumes it.
+            if self.slice_cap != 0 && self.slice_syscalls >= self.slice_cap {
+                return Ok(progressed);
+            }
         }
     }
 
@@ -856,6 +894,7 @@ impl Kernel {
                 let raw = vcpu.syscall_nr();
                 let sys = arch::decode(self.arch, raw);
                 let args = vcpu.syscall_args();
+                self.slice_syscalls = self.slice_syscalls.saturating_add(1);
                 self.block = false;
                 self.exec_ok = false;
                 let ret = self.dispatch(sys, raw, &args, vcpu, mem);
