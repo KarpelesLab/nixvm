@@ -300,6 +300,22 @@ fn map_image(
                 .get(ph.offset as usize..file_end as usize)
                 .ok_or(LoadError::Truncated)?;
             mem.write_init(vaddr, bytes)?;
+            // Debug: read the segment back from guest memory and compare with
+            // the source, to catch a loader/memory bug that drops bytes on a
+            // large segment.
+            if std::env::var_os("NIXVM_VERIFY_LOAD").is_some() {
+                let back = mem.read_vec(vaddr, ph.filesz as usize).unwrap_or_default();
+                let mism = back.iter().zip(bytes).position(|(a, b)| a != b);
+                eprintln!(
+                    "[load] seg vaddr={vaddr:#x} filesz={:#x} verify={}",
+                    ph.filesz,
+                    match mism {
+                        None if back.len() == bytes.len() => "OK".to_string(),
+                        None => format!("SHORT readback {} vs {}", back.len(), bytes.len()),
+                        Some(i) => format!("MISMATCH at +{i:#x} (guest {:#04x} != file {:#04x})", back[i], bytes[i]),
+                    }
+                );
+            }
         }
 
         program_break = program_break.max(round_up(vaddr + ph.memsz, PAGE_SIZE));

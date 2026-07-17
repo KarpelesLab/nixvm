@@ -2803,6 +2803,9 @@ impl Kernel {
         };
         let abs = self.resolve_path(dirfd, &rel);
         let abs = self.follow_symlinks(&abs).unwrap_or(abs);
+        if self.trace {
+            eprintln!("[open] pid={} {abs:?}", self.cur.pid);
+        }
 
         if self.mounts.stat(&abs).is_none() {
             if flags & O_CREAT != 0 {
