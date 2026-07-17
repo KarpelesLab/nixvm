@@ -69,6 +69,12 @@ pub struct KvmVcpu {
     /// registers without entering the guest; [`KvmVcpu::set_syscall_ret`]
     /// (and `reset`) clear it.
     in_syscall: bool,
+    /// Debug: linear addresses of armed 4-byte write watchpoints
+    /// (`NIXVM_WATCHPOINT`), used to log every write to them. Empty when unarmed.
+    watchpoint: Vec<u64>,
+    /// Debug: an execute breakpoint (`NIXVM_EBP`); logs `r8`/`rdi` state each
+    /// time the address is reached. `None` when unarmed.
+    ebp: Option<u64>,
 }
 
 // The register caches and run page are noise in a debug dump; the fd
@@ -168,6 +174,55 @@ impl KvmVcpu {
         let ret = unsafe { sys::ioctl(fd.0, sys::KVM_SET_XCRS, std::ptr::from_ref(&xcrs)) };
         check(ret, "KVM_SET_XCRS")?;
 
+        // Debug: NIXVM_EBP=0xADDR arms an execute breakpoint on DR0 (fires
+        // *before* the instruction); otherwise NIXVM_WATCHPOINT arms up to four
+        // 4-byte write watchpoints (DR0..3). Both exit with KVM_EXIT_DEBUG.
+        let ebp = std::env::var("NIXVM_EBP")
+            .ok()
+            .and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
+        let watchpoints: Vec<u64> = std::env::var("NIXVM_WATCHPOINT")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|p| u64::from_str_radix(p.trim().trim_start_matches("0x"), 16).ok())
+                    .take(4)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(addr) = ebp {
+            // DR0 execute breakpoint: L0, R/W0=00 (execute), LEN0=00 (1 byte).
+            let dbg = sys::kvm_guest_debug {
+                control: sys::KVM_GUESTDBG_ENABLE | sys::KVM_GUESTDBG_USE_HW_BP,
+                pad: 0,
+                debugreg: [addr, 0, 0, 0, 0, 0, 0, (1 << 10) | 1],
+            };
+            // SAFETY: valid struct pointer; the fd is live.
+            let ret =
+                unsafe { sys::ioctl(fd.0, sys::KVM_SET_GUEST_DEBUG, std::ptr::from_ref(&dbg)) };
+            check(ret, "KVM_SET_GUEST_DEBUG")?;
+        } else if !watchpoints.is_empty() {
+            let mut debugreg = [0u64; 8];
+            let mut dr7 = 1u64 << 10; // reserved bit 10
+            for (i, &addr) in watchpoints.iter().enumerate() {
+                debugreg[i] = addr;
+                // DRi: Li (bit 2i), R/Wi=01 write (bits 16+4i..), LENi=11 4-byte.
+                dr7 |= 1 << (2 * i); // local enable
+                dr7 |= 0b01 << (16 + 4 * i); // write
+                dr7 |= 0b11 << (18 + 4 * i); // 4-byte
+            }
+            debugreg[7] = dr7;
+            let dbg = sys::kvm_guest_debug {
+                control: sys::KVM_GUESTDBG_ENABLE | sys::KVM_GUESTDBG_USE_HW_BP,
+                pad: 0,
+                debugreg,
+            };
+            // SAFETY: valid struct pointer; the fd is live.
+            let ret =
+                unsafe { sys::ioctl(fd.0, sys::KVM_SET_GUEST_DEBUG, std::ptr::from_ref(&dbg)) };
+            check(ret, "KVM_SET_GUEST_DEBUG")?;
+        }
+        let watchpoint = watchpoints;
+
         Ok(Self {
             vm,
             fd,
@@ -177,6 +232,8 @@ impl KvmVcpu {
             sregs,
             sregs_dirty: true,
             in_syscall: false,
+            watchpoint,
+            ebp,
         })
     }
 
@@ -468,12 +525,48 @@ impl Vcpu for KvmVcpu {
             return Ok(Exit::Syscall);
         }
         self.vm.reconcile_guest(mem)?;
-        let reason = self.run_once()?;
-        let exit = self.decode_exit(reason)?;
-        if exit == Exit::Syscall {
-            self.in_syscall = true;
+        loop {
+            let reason = self.run_once()?;
+            // Debug watchpoint hit: log the write (value + faulting pc) and
+            // resume — the write already completed (a data #DB is a trap).
+            if reason == sys::KVM_EXIT_DEBUG {
+                // SAFETY: the run page is live; `debug` is the arm the kernel
+                // wrote for KVM_EXIT_DEBUG. dr6 bits 0..3 say which DRn matched.
+                let (pc, dr6) = unsafe {
+                    let d = (*self.run).exit.debug;
+                    (d.pc, d.dr6)
+                };
+                if self.ebp.is_some() {
+                    // Execute breakpoint: log the register state each time the
+                    // address is reached (for tracing a specific instruction).
+                    let r = &self.regs;
+                    eprintln!(
+                        "[ebp] pc={pc:#x} rax={:#x} rdi={:#x} rsi={:#x} rdx={:#x} rcx={:#x} r8={:#x} rsp={:#x}",
+                        r.rax, r.rdi, r.rsi, r.rdx, r.rcx, r.r8, r.rsp
+                    );
+                    // An execute #DB is a fault (rip unchanged); set RF so the
+                    // resumed instruction runs once without re-triggering.
+                    self.regs.rflags |= 0x1_0000;
+                    self.regs_dirty = true;
+                    continue;
+                }
+                for (i, &addr) in self.watchpoint.iter().enumerate() {
+                    if dr6 & (1 << i) != 0 {
+                        let val = mem.read_u64(addr).unwrap_or(0);
+                        eprintln!(
+                            "[wp] {addr:#x} <- {val:#018x} (pc={pc:#x}) rsp={:#x}",
+                            self.regs.rsp
+                        );
+                    }
+                }
+                continue;
+            }
+            let exit = self.decode_exit(reason)?;
+            if exit == Exit::Syscall {
+                self.in_syscall = true;
+            }
+            return Ok(exit);
         }
-        Ok(exit)
     }
 
     fn syscall_nr(&self) -> u64 {

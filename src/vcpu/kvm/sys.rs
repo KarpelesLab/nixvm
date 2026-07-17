@@ -61,6 +61,11 @@ pub const KVM_GET_FPU: c_ulong = 0x81A0_AE8C;
 pub const KVM_SET_FPU: c_ulong = 0x41A0_AE8D;
 pub const KVM_SET_CPUID2: c_ulong = 0x4008_AE90;
 pub const KVM_SET_XCRS: c_ulong = 0x4188_AEA7;
+pub const KVM_SET_GUEST_DEBUG: c_ulong = 0x4048_AE9B;
+
+// `kvm_guest_debug.control` flags.
+pub const KVM_GUESTDBG_ENABLE: u32 = 0x0000_0001;
+pub const KVM_GUESTDBG_USE_HW_BP: u32 = 0x0002_0000;
 
 // `kvm_run.exit_reason` values this backend decodes.
 pub const KVM_EXIT_IO: u32 = 2;
@@ -70,6 +75,7 @@ pub const KVM_EXIT_SHUTDOWN: u32 = 8;
 pub const KVM_EXIT_FAIL_ENTRY: u32 = 9;
 pub const KVM_EXIT_INTR: u32 = 10;
 pub const KVM_EXIT_INTERNAL_ERROR: u32 = 17;
+pub const KVM_EXIT_DEBUG: u32 = 4;
 
 // MSR indices the trampoline setup writes.
 pub const MSR_IA32_STAR: u32 = 0xC000_0081;
@@ -295,6 +301,29 @@ pub struct kvm_run_internal {
     pub data: [u64; 16],
 }
 
+/// `KVM_EXIT_DEBUG` payload (x86 `kvm_debug_exit_arch`): a guest-debug hardware
+/// breakpoint/watchpoint fired. `dr6` says which `DRn` matched.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct kvm_run_debug {
+    pub exception: u32,
+    pub pad: u32,
+    pub pc: u64,
+    pub dr6: u64,
+    pub dr7: u64,
+}
+
+/// `struct kvm_guest_debug` (`KVM_SET_GUEST_DEBUG`): arm hardware debug
+/// registers on the vcpu. `debugreg` is the flattened x86 `kvm_guest_debug_arch`
+/// (`__u64 debugreg[8]` = DR0..DR3, DR6, DR7 in slots 0..=3, 6, 7). 72 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct kvm_guest_debug {
+    pub control: u32,
+    pub pad: u32,
+    pub debugreg: [u64; 8],
+}
+
 /// The per-exit payload union at byte offset 32 of `struct kvm_run`.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -302,6 +331,7 @@ pub union kvm_run_exit {
     pub mmio: kvm_run_mmio,
     pub fail_entry: kvm_run_fail_entry,
     pub internal: kvm_run_internal,
+    pub debug: kvm_run_debug,
     /// Sized to the kernel's 256-byte exit union so the header layout is exact.
     pub raw: [u64; 32],
 }
