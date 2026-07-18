@@ -11,7 +11,7 @@
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
-use super::{AT_FDCWD, Kernel, err, io_errno, read_path, stat};
+use super::{AT_FDCWD, Fd, Kernel, err, io_errno, read_path, stat};
 
 /// `unlinkat` flag: remove a directory, like `rmdir(2)`.
 const AT_REMOVEDIR: u64 = 0x200;
@@ -41,6 +41,28 @@ impl Kernel {
 
     /// `readlinkat(dirfd, path, buf, bufsz)` — copy the link target (truncated
     /// to `bufsz`, not NUL-terminated) and return the byte count.
+    /// If `abs` is `/proc/self/fd/<n>` or `/proc/<this-pid>/fd/<n>`, return the
+    /// symlink target for descriptor `n` from the running task's live fd table
+    /// (the path for a file/dir, an `anon_inode:`/`pipe:`/`socket:` name
+    /// otherwise). `None` if the path isn't such a link or the fd is closed.
+    fn proc_fd_link(&self, abs: &str) -> Option<String> {
+        let rest = abs.strip_prefix("/proc/")?;
+        let (who, tail) = rest.split_once("/fd/")?;
+        if who != "self" && who != self.cur.pid.to_string() {
+            return None;
+        }
+        let n: i32 = tail.parse().ok()?;
+        Some(match self.cur.fds.get(n)? {
+            Fd::File { path, .. } | Fd::Dir { path, .. } => path.clone(),
+            Fd::Stdin | Fd::Stdout | Fd::Stderr => "/dev/null".to_string(),
+            Fd::PipeRead(i) | Fd::PipeWrite(i) => format!("pipe:[{i}]"),
+            Fd::Socket { sock, .. } => format!("socket:[{sock}]"),
+            Fd::Eventfd(_) => "anon_inode:[eventfd]".to_string(),
+            Fd::Timerfd(_) => "anon_inode:[timerfd]".to_string(),
+            Fd::Epoll(_) => "anon_inode:[eventpoll]".to_string(),
+        })
+    }
+
     pub(super) fn sys_readlinkat(
         &mut self,
         dirfd: i64,
@@ -53,9 +75,16 @@ impl Kernel {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(dirfd, &rel);
-        let target = match self.mounts.readlink(&abs) {
-            Ok(t) => t,
-            Err(e) => return io_errno(&e),
+        // /proc/self/fd/<n> (and /proc/<pid>/fd/<n> for this task) must resolve
+        // against the *live* fd table, not procfs's static snapshot — programs
+        // canonicalize a path by opening it and reading this link (realpath).
+        let target = if let Some(t) = self.proc_fd_link(&abs) {
+            t
+        } else {
+            match self.mounts.readlink(&abs) {
+                Ok(t) => t,
+                Err(e) => return io_errno(&e),
+            }
         };
         let bytes = target.as_bytes();
         let n = bytes.len().min(bufsz as usize);
