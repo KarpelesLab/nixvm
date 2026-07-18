@@ -300,6 +300,11 @@ fn map_image(
                 .get(ph.offset as usize..file_end as usize)
                 .ok_or(LoadError::Truncated)?;
             mem.write_init(vaddr, bytes)?;
+            // These pages hold file contents (like a MAP_PRIVATE file mapping),
+            // so MADV_DONTNEED must preserve them rather than zero them — a
+            // runtime may lazily re-read read-only data from here after
+            // advising it away (Bun's embedded bytecode does exactly this).
+            mem.mark_file_backed(vaddr, ph.filesz);
             // Debug: read the segment back from guest memory and compare with
             // the source, to catch a loader/memory bug that drops bytes on a
             // large segment.

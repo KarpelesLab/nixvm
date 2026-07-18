@@ -147,8 +147,15 @@ impl Kernel {
             let end = page_up(addr + len);
             let zero = [0u8; PAGE_SIZE as usize];
             while p < end {
-                // Only mapped, writable pages take zeros; ignore everything else.
-                let _ = mem.write(p, &zero);
+                // File-backed (ELF-segment) pages must keep their contents: on
+                // Linux MADV_DONTNEED discards the private copy and the next
+                // access reloads the file, so an unmodified page is unchanged.
+                // Zeroing them would wipe read-only data a runtime lazily
+                // re-reads (Bun's embedded bytecode lives in such a segment).
+                if !mem.is_file_backed(p) {
+                    // Only mapped, writable pages take zeros; ignore the rest.
+                    let _ = mem.write(p, &zero);
+                }
                 p += PAGE_SIZE;
             }
         }

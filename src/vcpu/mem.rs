@@ -108,6 +108,12 @@ pub struct GuestMemory {
     /// Per-4 KiB-page protection; meaningful only when `mapped[i]`.
     prot: Vec<Prot>,
     mapped: Vec<bool>,
+    /// Per-page: loaded from a file (an ELF segment), i.e. a `MAP_PRIVATE`
+    /// file-backed page whose bytes are the file's contents. `MADV_DONTNEED`
+    /// must *not* zero these — on real Linux it discards the private copy and a
+    /// later access reloads the file, so for the common (unmodified) case the
+    /// content is unchanged. Cleared when a page is re-`map`ped anonymously.
+    file_backed: Vec<bool>,
     generation: u64,
     /// Bumps on any `map`/`protect`/`unmap`. A hardware backend that mirrors the
     /// protection map into real page tables watches this to know when to resync.
@@ -134,6 +140,7 @@ impl GuestMemory {
             region: Region::new(size as usize),
             prot: vec![Prot::NONE; npages],
             mapped: vec![false; npages],
+            file_backed: vec![false; npages],
             generation: next_generation(),
             layout_gen: next_generation(),
             pt_dirty: Vec::new(),
@@ -241,10 +248,35 @@ impl GuestMemory {
         for p in first..=last {
             self.mapped[p] = true;
             self.prot[p] = prot;
+            self.file_backed[p] = false; // a fresh anonymous mapping
         }
         self.region.fill(first * PS, (last - first + 1) * PS, 0);
         self.mark_pt_dirty(first, last);
         Ok(())
+    }
+
+    /// Mark `[addr, addr + len)` as file-backed (loaded from an ELF segment):
+    /// `MADV_DONTNEED` will preserve rather than zero these pages. Silently
+    /// ignores pages outside the region.
+    pub fn mark_file_backed(&mut self, addr: u64, len: u64) {
+        if len == 0 || addr < self.base {
+            return;
+        }
+        let start = ((addr - self.base) / PAGE_SIZE) as usize;
+        let end = ((round_up(addr + len, PAGE_SIZE) - self.base) / PAGE_SIZE) as usize;
+        for p in start..end.min(self.file_backed.len()) {
+            self.file_backed[p] = true;
+        }
+    }
+
+    /// Whether the page containing `addr` is file-backed (see `mark_file_backed`).
+    #[must_use]
+    pub fn is_file_backed(&self, addr: u64) -> bool {
+        if addr < self.base {
+            return false;
+        }
+        let p = ((addr - self.base) / PAGE_SIZE) as usize;
+        self.file_backed.get(p).copied().unwrap_or(false)
     }
 
     /// Change protection on already-mapped pages covering `[addr, addr + len)`.
@@ -277,6 +309,7 @@ impl GuestMemory {
         for p in first..=last {
             self.mapped[p] = false;
             self.prot[p] = Prot::NONE;
+            self.file_backed[p] = false;
         }
         self.mark_pt_dirty(first, last);
         Ok(())
@@ -375,6 +408,7 @@ impl GuestMemory {
             region,
             prot: self.prot.clone(),
             mapped: self.mapped.clone(),
+            file_backed: self.file_backed.clone(),
             generation: next_generation(),
             // Fresh layout gen with no pending dirty: a backend sees the new
             // backing generation and rebuilds this child's page tables in full.
