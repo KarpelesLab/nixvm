@@ -118,6 +118,47 @@ pub trait Vcpu: Send {
     /// hypervisor (once) and the guest writes through to the same buffer.
     fn run(&mut self, mem: &mut GuestMemory) -> Result<Exit, VcpuError>;
 
+    /// Whether [`Vcpu::run`] must hold the `GuestMemory` lock for its whole
+    /// duration. The software interpreter reads and writes guest memory *through*
+    /// the `GuestMemory` struct as it executes, so it genuinely needs the lock the
+    /// entire time — `true`. Hardware backends (KVM) execute against a memory slot
+    /// the hypervisor maps once; guest loads/stores go straight to the shared
+    /// backing with no Rust borrow, so the SMP scheduler can [`Vcpu::reconcile`]
+    /// under the lock, drop it, and then run the guest in parallel with siblings
+    /// of the same address space — `false`.
+    fn needs_locked_run(&self) -> bool {
+        true
+    }
+
+    /// Prepare the backend's view of `mem` for a subsequent lockless
+    /// [`Vcpu::run_bare`] (the SMP path). Hardware backends sync their memory
+    /// slots and shadow page tables here — the one step that must see `mem` — so
+    /// that `run_bare` needs no `GuestMemory` borrow. A no-op for backends whose
+    /// `needs_locked_run` is `true` (the interpreter), which are never split this
+    /// way.
+    fn reconcile(&mut self, _mem: &mut GuestMemory) -> Result<(), VcpuError> {
+        Ok(())
+    }
+
+    /// Run guest code after a prior [`Vcpu::reconcile`], without a `GuestMemory`
+    /// borrow — the lockless half of the SMP split. Only called on backends whose
+    /// [`Vcpu::needs_locked_run`] is `false`; the default panics so a mis-paired
+    /// backend fails loudly instead of silently running unreconciled.
+    fn run_bare(&mut self) -> Result<Exit, VcpuError> {
+        unreachable!("run_bare on a backend that requires a locked run")
+    }
+
+    /// Whether a memory fault at `addr` is only a *stale shadow* fault: the page
+    /// is mapped/accessible in `mem`, but this backend's page tables — synced at
+    /// the vcpu's last dispatch — do not yet reflect a mapping change a sibling
+    /// made mid-run. The SMP scheduler retries such a fault (re-dispatch
+    /// reconciles the tables) rather than turning it into a signal. Always `false`
+    /// for backends without lazily-synced shadow tables (the interpreter, which
+    /// consults `mem` directly, and serial KVM, which reconciles before every run).
+    fn shadow_stale(&self, _mem: &GuestMemory, _addr: u64) -> bool {
+        false
+    }
+
     /// The syscall number the guest requested (arm64 `x8` / x86-64 `rax`).
     fn syscall_nr(&self) -> u64;
 

@@ -127,7 +127,13 @@ impl Default for SandboxBuilder {
                 root: RootSource::Empty,
                 mode: RunMode::Nude,
                 init: None,
-                ncpus: 1,
+                // NIXVM_CPUS=N runs guest compute on N host worker threads (the
+                // SMP scheduler); unset or unparseable means 1 (serial). An
+                // explicit `.ncpus()` on the builder still overrides this.
+                ncpus: std::env::var("NIXVM_CPUS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .map_or(1, |n| n.max(1)),
                 mem_bytes: DEFAULT_MEM_BYTES,
                 arch,
                 prefer_interp: false,

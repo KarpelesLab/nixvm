@@ -930,6 +930,15 @@ impl Kernel {
                     // A fault in the reserved stack region grows it (VM_GROWSDOWN)
                     // and re-runs the faulting instruction.
                     Serviced::Resume
+                } else if vcpu.shadow_stale(mem, addr) {
+                    // SMP/KVM only: a sibling mapped or re-protected this page
+                    // (serviced here on the main thread) while this vcpu was mid
+                    // run with shadow page tables synced at its last dispatch, so
+                    // its hardware walk faulted on a page that is in fact
+                    // accessible. Re-dispatch reconciles the tables and re-runs
+                    // the faulting instruction. Never true for the interpreter or
+                    // the serial path, which are always coherent with `mem`.
+                    Serviced::Resume
                 } else if self.deliver_fault_signal(SIGSEGV, addr, vcpu, mem) {
                     // The guest caught it (JIT trap handler): run the handler.
                     Serviced::Resume
@@ -988,12 +997,22 @@ impl Kernel {
         }
         type Done = (usize, Box<dyn Vcpu>, Result<Exit, VcpuError>);
 
-        let queue: Arc<(Mutex<VecDeque<Work>>, Condvar)> =
-            Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        // One queue per worker, not one shared queue: a vcpu is always dispatched
+        // to the *same* worker thread (its home, `task index % ncpus`). KVM's model
+        // is one host thread per vcpu — running a vcpu from a rotating set of
+        // threads makes each KVM_RUN pay a vcpu-migration cost (measured at ~27 ms
+        // vs sub-millisecond same-thread), which for a single-threaded guest phase
+        // is catastrophic. Home affinity keeps consecutive KVM_RUNs of a vcpu on
+        // one thread while still spreading distinct tasks across the workers for
+        // real parallelism.
+        let nworkers = self.ncpus;
+        let queues: Vec<Arc<(Mutex<VecDeque<Work>>, Condvar)>> = (0..nworkers)
+            .map(|_| Arc::new((Mutex::new(VecDeque::new()), Condvar::new())))
+            .collect();
         let (done_tx, done_rx) = mpsc::channel::<Done>();
-        let mut workers = Vec::with_capacity(self.ncpus);
-        for _ in 0..self.ncpus {
-            let q = Arc::clone(&queue);
+        let mut workers = Vec::with_capacity(nworkers);
+        for home in &queues {
+            let q = Arc::clone(home);
             let out = done_tx.clone();
             workers.push(std::thread::spawn(move || {
                 loop {
@@ -1010,9 +1029,25 @@ impl Kernel {
                     match work {
                         Work::Stop => break,
                         Work::Run(id, mut vcpu, space) => {
-                            let exit = {
+                            // Interpreter reads/writes guest memory *through*
+                            // GuestMemory, so it must hold the lock for the whole
+                            // run. KVM executes against the mapped memslot: take
+                            // the lock only to reconcile the memslot + shadow page
+                            // tables, then drop it so KVM_RUN runs in parallel
+                            // with siblings of the same address space — the guest
+                            // touches the shared backing directly, no Rust borrow.
+                            let exit = if vcpu.needs_locked_run() {
                                 let mut mem = space.lock().unwrap();
                                 vcpu.run(&mut mem)
+                            } else {
+                                let reconciled = {
+                                    let mut mem = space.lock().unwrap();
+                                    vcpu.reconcile(&mut mem)
+                                };
+                                match reconciled {
+                                    Ok(()) => vcpu.run_bare(),
+                                    Err(e) => Err(e),
+                                }
                             };
                             if out.send((id, vcpu, exit)).is_err() {
                                 break;
@@ -1024,9 +1059,11 @@ impl Kernel {
         }
         drop(done_tx);
 
-        let push = |w: Work| {
-            let (lock, cv) = &*queue;
-            lock.lock().unwrap().push_back(w);
+        // Route a run to its home worker (`task index % nworkers`); broadcast a
+        // Stop to every worker at shutdown.
+        let push_run = |i: usize, vcpu, space| {
+            let (lock, cv) = &*queues[i % nworkers];
+            lock.lock().unwrap().push_back(Work::Run(i, vcpu, space));
             cv.notify_one();
         };
 
@@ -1048,7 +1085,7 @@ impl Kernel {
                 let mm = self.procs[i].as_ref().unwrap().info.mm;
                 let space = Arc::clone(&self.spaces[mm]);
                 let vcpu = self.procs[i].as_mut().unwrap().vcpu.take().unwrap();
-                push(Work::Run(i, vcpu, space));
+                push_run(i, vcpu, space);
                 inflight += 1;
             }
             if inflight == 0 {
@@ -1104,8 +1141,10 @@ impl Kernel {
             }
         };
 
-        for _ in 0..self.ncpus {
-            push(Work::Stop);
+        // One Stop per worker, into its own queue.
+        for q in &queues {
+            q.0.lock().unwrap().push_back(Work::Stop);
+            q.1.notify_one();
         }
         for h in workers {
             let _ = h.join();

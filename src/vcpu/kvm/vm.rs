@@ -28,7 +28,7 @@ use crate::vcpu::VcpuError;
 use crate::vcpu::mem::GuestMemory;
 use crate::vcpu::region::Region;
 use std::ffi::c_int;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// How much of the guest-physical space the identity map covers (2 MiB pages,
@@ -137,6 +137,15 @@ struct GuestSlot {
     /// running address space's protection map). Their memslot is registered
     /// once, when they are created.
     page_tables: Option<super::paging::PageTables>,
+    /// How many vcpus are currently inside a *lockless* `KVM_RUN` against the
+    /// backing named by `generation` (the SMP path; see [`Vm::begin_lockless_run`]).
+    /// The single guest memslot (slot 0) can map only one backing at a time, so
+    /// re-pointing it to a different generation — a context switch to a forked
+    /// child or an execve'd image — must wait for this to drain to zero, or it
+    /// would swap guest RAM out from under a running sibling. Zero on the serial
+    /// path (which runs one vcpu at a time and never overlaps a re-point with a
+    /// run).
+    active: usize,
 }
 
 /// One KVM virtual machine. Holds `/dev/kvm`, the VM fd, the control-block
@@ -155,6 +164,9 @@ pub struct Vm {
     /// `KVM_GET_SUPPORTED_CPUID` snapshot handed to each vcpu.
     cpuid: Box<sys::kvm_cpuid2>,
     guest_slot: Mutex<GuestSlot>,
+    /// Signalled when [`GuestSlot::active`] reaches zero, so a thread waiting to
+    /// re-point slot 0 to a different backing generation can proceed.
+    slot_drained: Condvar,
     next_vcpu_id: AtomicU32,
 }
 
@@ -226,6 +238,7 @@ impl Vm {
             ctrl,
             cpuid,
             guest_slot: Mutex::new(GuestSlot::default()),
+            slot_drained: Condvar::new(),
             next_vcpu_id: AtomicU32::new(0),
         };
         vm.set_slot(1, CTRL_GPA, CTRL_SIZE as u64, vm.ctrl.as_ptr())?;
@@ -262,23 +275,12 @@ impl Vm {
     pub fn reconcile_guest(&self, mem: &mut GuestMemory) -> Result<(), VcpuError> {
         let generation = mem.backing_generation();
         let mut slot = self.guest_slot.lock().unwrap();
+        self.ensure_page_tables(&mut slot, mem)?;
 
-        // First run for this VM: build the page tables and register their
-        // memslot (their GPA/size are fixed by the guest base/size).
-        if slot.page_tables.is_none() {
-            let end = mem.base() + mem.size();
-            if end > CTRL_GPA {
-                return Err(VcpuError::Backend(format!(
-                    "guest region [{:#x}, {end:#x}) reaches past the control block at {CTRL_GPA:#x}",
-                    mem.base()
-                )));
-            }
-            let pt = super::paging::PageTables::new(mem.base(), mem.size());
-            self.set_slot(2, pt.gpa(), pt.size(), pt.host_base())?;
-            slot.page_tables = Some(pt);
-        }
-
-        // (Re)map guest RAM when the backing changed (fork/execve/switch).
+        // (Re)map guest RAM when the backing changed (fork/execve/switch). The
+        // serial scheduler runs exactly one vcpu at a time, so re-pointing slot 0
+        // here never overlaps another vcpu's run — no drain is needed (the SMP
+        // path, `begin_lockless_run`, is the one that must quiesce first).
         if slot.generation != Some(generation) {
             if slot.generation.is_some() {
                 self.set_slot(0, 0, 0, std::ptr::null_mut())?; // delete stale slot
@@ -291,6 +293,104 @@ impl Vm {
         // rebuild on an address-space switch, incremental on mmap/mprotect).
         slot.page_tables.as_mut().unwrap().sync(mem);
         Ok(())
+    }
+
+    /// On the VM's first run, build the guest page tables and register their
+    /// (fixed) memslot. A no-op once built.
+    fn ensure_page_tables(
+        &self,
+        slot: &mut GuestSlot,
+        mem: &GuestMemory,
+    ) -> Result<(), VcpuError> {
+        if slot.page_tables.is_none() {
+            let end = mem.base() + mem.size();
+            if end > CTRL_GPA {
+                return Err(VcpuError::Backend(format!(
+                    "guest region [{:#x}, {end:#x}) reaches past the control block at {CTRL_GPA:#x}",
+                    mem.base()
+                )));
+            }
+            let pt = super::paging::PageTables::new(mem.base(), mem.size());
+            self.set_slot(2, pt.gpa(), pt.size(), pt.host_base())?;
+            slot.page_tables = Some(pt);
+        }
+        Ok(())
+    }
+
+    /// The SMP scheduler's lockless-run entry: reconcile slot 0 and the shadow
+    /// page tables for `mem`, then register this vcpu as an in-flight runner of
+    /// `mem`'s backing generation. Pair every success with exactly one
+    /// [`Vm::end_lockless_run`]; between them the vcpu may execute `KVM_RUN` with
+    /// the `GuestMemory` lock dropped.
+    ///
+    /// The single guest memslot (slot 0) can map only one backing at a time. When
+    /// this vcpu's backing differs from the one currently mapped — a context
+    /// switch to a forked child or an execve'd image, since one `Vm` is shared by
+    /// every address space (`vcpu.fork()` clones the `Arc<Vm>`) — the re-point
+    /// must wait until every runner of the old backing has left `KVM_RUN`, or it
+    /// would unmap guest RAM out from under one. The wait is bounded by the
+    /// preemption quantum, which forces a compute-bound `KVM_RUN` to return.
+    /// Runners of the *same* backing proceed concurrently: `sync`'s leaf updates
+    /// are atomic 64-bit stores (see `Region::write_u64_atomic`), so a sibling's
+    /// page walk never sees a torn PTE, and a mapping change a sibling has not yet
+    /// picked up surfaces as a retriable stale-shadow fault (`shadow_leaf_stale`).
+    pub fn begin_lockless_run(&self, mem: &mut GuestMemory) -> Result<(), VcpuError> {
+        let generation = mem.backing_generation();
+        let mut slot = self.guest_slot.lock().unwrap();
+        self.ensure_page_tables(&mut slot, mem)?;
+
+        // Re-point slot 0 to this backing if it isn't already, first draining any
+        // runners of the currently-mapped backing. Re-check each wakeup: another
+        // thread may have switched slot 0 (possibly to *our* generation) while we
+        // waited.
+        loop {
+            if slot.generation == Some(generation) {
+                break;
+            }
+            if slot.active == 0 {
+                if slot.generation.is_some() {
+                    self.set_slot(0, 0, 0, std::ptr::null_mut())?; // delete stale slot
+                }
+                self.set_slot(0, mem.base(), mem.size(), mem.host_base())?;
+                slot.generation = Some(generation);
+                break;
+            }
+            slot = self.slot_drained.wait(slot).unwrap();
+        }
+
+        // With slot 0 on our backing, bring the shadow leaves into step (a full
+        // rebuild only on a backing switch — which just drained, so no runner is
+        // executing; incremental atomic updates otherwise, safe alongside running
+        // same-backing siblings).
+        slot.page_tables.as_mut().unwrap().sync(mem);
+        slot.active += 1;
+        Ok(())
+    }
+
+    /// End the lockless run begun by [`Vm::begin_lockless_run`]: drop this vcpu's
+    /// in-flight count and, when it reaches zero, wake any thread waiting to
+    /// re-point slot 0 to a different backing.
+    pub fn end_lockless_run(&self) {
+        let mut slot = self.guest_slot.lock().unwrap();
+        slot.active -= 1;
+        if slot.active == 0 {
+            self.slot_drained.notify_all();
+        }
+    }
+
+    /// Whether the shadow leaf PTE for `addr` is out of step with `mem` — a
+    /// mapping change a sibling made while this address space's tables were synced
+    /// for an earlier dispatch. See [`super::paging::PageTables::leaf_is_stale`].
+    /// If the tables momentarily reflect a different backing than `mem` (a
+    /// concurrent context switch), the comparison mismatches and the caller
+    /// retries — the retry's reconcile brings the tables back to `mem`, so the
+    /// outcome is still correct.
+    #[must_use]
+    pub fn shadow_leaf_stale(&self, mem: &GuestMemory, addr: u64) -> bool {
+        let slot = self.guest_slot.lock().unwrap();
+        slot.page_tables
+            .as_ref()
+            .is_some_and(|pt| pt.leaf_is_stale(mem, addr))
     }
 
     /// Create a vcpu: its fd and the shared `kvm_run` page. vcpu ids are never

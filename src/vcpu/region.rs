@@ -22,6 +22,7 @@
 
 use std::alloc::{self, Layout};
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Host page size on Apple Silicon and the alignment `hv_vm_map` requires of the
 /// host pointer, guest IPA, and length. Used as the region's alignment on every
@@ -105,6 +106,40 @@ impl Region {
         // SAFETY: the source range is checked in-bounds above; `buf` is a
         // distinct allocation, so source and destination do not overlap.
         unsafe { ptr::copy_nonoverlapping(self.ptr.add(off), buf.as_mut_ptr(), buf.len()) };
+    }
+
+    /// Store `val` as a single atomic, aligned 64-bit write at byte offset `off`.
+    ///
+    /// `off` must be 8-byte aligned; since the region base is [`HOST_PAGE`]-aligned
+    /// this holds for any 8-aligned offset. An aligned 64-bit store is atomic on
+    /// x86-64, so a concurrent *reader* — notably a hardware page-table walker of a
+    /// running sibling vcpu, when this region backs the KVM shadow page tables —
+    /// observes either the whole old value or the whole new value, never a torn mix
+    /// of bytes. That tear-freedom is what lets the SMP scheduler rewrite page-table
+    /// leaves (an `mmap`/`mprotect`) while sibling vcpus execute `KVM_RUN` lockless.
+    ///
+    /// Takes `&self` deliberately: the store targets the separate heap allocation
+    /// `ptr` owns, not the borrowed struct fields, so it mutates nothing reachable
+    /// through the shared reference — and the atomicity guards the pointed-to bytes
+    /// against the (non-Rust) hardware walker, not against another Rust thread.
+    ///
+    /// # Panics
+    /// If `off` is not 8-aligned or `[off, off + 8)` is out of range.
+    pub fn write_u64_atomic(&self, off: usize, val: u64) {
+        assert!(
+            off.is_multiple_of(8) && off.checked_add(8).is_some_and(|end| end <= self.len),
+            "region atomic u64 store out of bounds or misaligned"
+        );
+        // SAFETY: `off` is 8-aligned and in-bounds and `ptr` is 16 KiB-aligned, so
+        // `ptr + off` is a valid, naturally-aligned `*AtomicU64` into this region's
+        // allocation (the cast_ptr_alignment lint can't see the runtime alignment
+        // the assert enforces). The store is a single aligned mov; see the doc
+        // comment for why `&self` is sound here.
+        #[allow(clippy::cast_ptr_alignment)]
+        unsafe {
+            let p = self.ptr.add(off).cast::<AtomicU64>();
+            (*p).store(val, Ordering::Release);
+        }
     }
 
     /// Set the `len` bytes at `off` to `val`.

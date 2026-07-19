@@ -253,6 +253,89 @@ mod tests {
         }
     }
 
+    /// Real intra-process parallelism: two KVM vcpus in the *same* address space
+    /// (one shared VM, one `GuestMemory`) must execute `KVM_RUN` on two host cores
+    /// at once — the whole point of the lockless SMP split. Each thread mirrors the
+    /// scheduler: reconcile under the memory lock, then run with it dropped. A
+    /// `jmp $` guest is compute-bound, so each `run_bare` spans a full preemption
+    /// quantum; an instrument around it records the peak number of vcpus inside
+    /// `KVM_RUN` simultaneously. If the run still held the memory lock (the bug
+    /// this milestone fixes), the two threads would serialize on that one Mutex and
+    /// the peak would never exceed 1. Also checks each vcpu's independent write
+    /// landed in its own slot — no corruption from the concurrent runs + the
+    /// concurrent shadow-page-table sync. Skips cleanly without `/dev/kvm`.
+    #[test]
+    fn two_vcpus_run_concurrently_in_one_address_space() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier, Mutex};
+
+        let Some(backend) = backend_or_skip() else {
+            return;
+        };
+        let base = 0x1_0000u64;
+        let code = base;
+        let data = base + PAGE_SIZE; // each vcpu's result slot lives here
+        let mut mem = GuestMemory::new(base, 64 * 1024);
+        mem.map(code, PAGE_SIZE, Prot::rwx()).unwrap();
+        mem.map(data, PAGE_SIZE, Prot::rw()).unwrap();
+        // mov [rsi], eax ; jmp $  — store this vcpu's value to its slot, then spin.
+        mem.write_init(code, &[0x89, 0x06, 0xEB, 0xFE]).unwrap();
+        let mem = Arc::new(Mutex::new(mem));
+
+        // Two vcpus over the one shared VM (backend), each with a distinct value
+        // (eax) and slot (rsi) so their writes must not collide.
+        let magic = [0x1111_1111u32, 0x2222_2222u32];
+        let slots = [data, data + 8];
+        let mut vcpus = Vec::new();
+        for i in 0..2usize {
+            let mut v = backend
+                .new_vcpu(code, base + 0x8000 + (i as u64) * 0x1000)
+                .expect("create KVM vcpu");
+            v.set_reg(0, u64::from(magic[i])); // eax
+            v.set_reg(6, slots[i]); // rsi
+            vcpus.push(v);
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = vcpus
+            .into_iter()
+            .map(|mut v| {
+                let mem = Arc::clone(&mem);
+                let in_flight = Arc::clone(&in_flight);
+                let max_seen = Arc::clone(&max_seen);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..8 {
+                        {
+                            let mut m = mem.lock().unwrap();
+                            v.reconcile(&mut m).unwrap();
+                        }
+                        let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_seen.fetch_max(n, Ordering::SeqCst);
+                        let exit = v.run_bare().expect("KVM run");
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        assert_eq!(exit, Exit::Interrupted, "compute-bound guest is preempted");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(
+            max_seen.load(Ordering::SeqCst) >= 2,
+            "two vcpus in one address space must be inside KVM_RUN at once (peak {})",
+            max_seen.load(Ordering::SeqCst)
+        );
+        let m = mem.lock().unwrap();
+        assert_eq!(m.read_u32(slots[0]).unwrap(), magic[0], "vcpu 0 wrote its slot");
+        assert_eq!(m.read_u32(slots[1]).unwrap(), magic[1], "vcpu 1 wrote its slot");
+    }
+
     /// Time-based preemption on the hardware path: a guest spinning forever in a
     /// `jmp $` self-loop makes no syscall and never faults, so without the
     /// per-thread preemption timer `KVM_RUN` would never return and `run` would

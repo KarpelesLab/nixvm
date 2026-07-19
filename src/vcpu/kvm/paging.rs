@@ -33,6 +33,11 @@ const RW: u64 = 1 << 1; // writable
 const US: u64 = 1 << 2; // user-accessible
 const PS: u64 = 1 << 7; // 2 MiB leaf (in a PD entry)
 const NX: u64 = 1 << 63; // no-execute (needs EFER.NXE)
+/// Accessed/Dirty bits: the CPU sets these in a leaf PTE as a side effect of a
+/// walk, so a leaf read back from the region may carry them even though `sync`
+/// never writes them. They are masked out before comparing an entry to its
+/// desired value (see [`PageTables::leaf_is_stale`]).
+const AD: u64 = (1 << 5) | (1 << 6);
 
 const GIB: u64 = 1 << 30;
 const MIB2: u64 = 2 << 20;
@@ -91,7 +96,11 @@ impl PageTables {
         let total_pages = 2 + n_pd_guest + 1 + n_pt;
         let mut region = Region::new(total_pages * PAGE_SIZE as usize);
 
-        let put = |region: &mut Region, off: usize, v: u64| region.write(off, &v.to_le_bytes());
+        // Every table entry is an aligned 64-bit store (see `Region::write_u64_atomic`):
+        // uniform with the leaf updates below, and tear-free should this skeleton ever
+        // be touched while a walker runs (it is not, today — the skeleton is built
+        // before the memslot is registered).
+        let put = |region: &mut Region, off: usize, v: u64| region.write_u64_atomic(off, v);
 
         // PML4[0] → PDPT.
         put(&mut region, pml4_off, (PT_AREA_GPA + pdpt_off as u64) | P | RW | US);
@@ -159,7 +168,44 @@ impl PageTables {
             Some(pr) => gpa | leaf_flags(pr),
             None => 0, // not present
         };
-        self.region.write(off, &entry.to_le_bytes());
+        // A single aligned 64-bit store: a sibling vcpu's hardware page walker,
+        // running lockless under the SMP scheduler, sees the whole old or whole
+        // new PTE, never a torn value.
+        self.region.write_u64_atomic(off, entry);
+    }
+
+    /// Whether the shadow leaf PTE for the page containing `gpa` differs from what
+    /// `mem`'s protection map currently wants — i.e. a [`PageTables::sync`] would
+    /// change it. The SMP scheduler uses this to tell a *stale-shadow* fault (a
+    /// sibling changed the mapping while this vcpu ran with page tables synced at
+    /// its last dispatch — retry after reconcile) from a *genuine* protection or
+    /// unmapped fault (the shadow already matches `mem`, so the access really is
+    /// illegal). Returns `false` for an address outside the covered range: such a
+    /// fault is always genuine.
+    ///
+    /// The comparison masks the CPU-managed Accessed/Dirty bits, which a walk sets
+    /// in the leaf without `sync` ever writing them — otherwise a genuine
+    /// read-only-write fault would look "stale" forever and retry endlessly.
+    #[must_use]
+    pub fn leaf_is_stale(&self, mem: &GuestMemory, gpa: u64) -> bool {
+        let page = gpa & !(PAGE_SIZE - 1);
+        if page < self.guest_base || page >= self.guest_end {
+            return false;
+        }
+        let slot = (page / MIB2) as usize;
+        let idx = ((page % MIB2) / PAGE_SIZE) as usize;
+        if slot >= self.n_pt {
+            return false;
+        }
+        let off = self.pt_off + slot * 0x1000 + idx * 8;
+        let mut b = [0u8; 8];
+        self.region.read(off, &mut b);
+        let actual = u64::from_le_bytes(b) & !AD;
+        let desired = match mem.page_prot(page) {
+            Some(pr) => page | leaf_flags(pr),
+            None => 0,
+        };
+        actual != desired
     }
 
     /// Rebuild every PT leaf from `mem`'s protection map (an address-space

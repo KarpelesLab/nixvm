@@ -229,11 +229,14 @@ impl std::fmt::Debug for KvmVcpu {
     }
 }
 
-// SAFETY: the vcpu is only ever *run* by one thread at a time (the serial
-// scheduler this milestone pairs hardware backends with — same policy as HVF),
-// and KVM permits moving a vcpu between threads as long as its ioctls are not
-// issued concurrently. The raw `run` pointer is a per-vcpu mapping owned by
-// this value.
+// SAFETY: a `KvmVcpu` is owned and run by one thread at a time — the SMP
+// scheduler hands each vcpu to a single worker for the duration of a run and
+// only moves it between workers between runs (never issuing its ioctls
+// concurrently), and KVM permits that migration. Distinct vcpus of one VM *do*
+// run concurrently on different workers, which their per-vcpu fds and the
+// shared VM's internally-serialized state (the `guest_slot` Mutex, atomic
+// page-table stores) support. The raw `run` pointer is a per-vcpu mapping owned
+// by this value.
 unsafe impl Send for KvmVcpu {}
 
 impl KvmVcpu {
@@ -440,6 +443,59 @@ impl KvmVcpu {
         // SAFETY: the run page is a live mapping; the kernel just wrote the
         // exit reason for the KVM_RUN that returned.
         Ok(unsafe { (*self.run).exit_reason })
+    }
+
+    /// Drive `KVM_RUN` until a real [`Exit`], having already reconciled memory.
+    ///
+    /// `mem` is `Some` only on the serial path (a locked run), where it is used
+    /// solely to read the value written at a debug watchpoint; the lockless SMP
+    /// path passes `None` (no `GuestMemory` borrow is held) and logs the hit
+    /// without the value. Everything else — fault-frame recovery, exit decode —
+    /// reads the control block via `self.vm`, never guest memory, so it works
+    /// identically with or without `mem`.
+    fn run_loop(&mut self, mem: Option<&GuestMemory>) -> Result<Exit, VcpuError> {
+        loop {
+            let reason = self.run_once()?;
+            // Debug watchpoint hit: log the write (value + faulting pc) and
+            // resume — the write already completed (a data #DB is a trap).
+            if reason == sys::KVM_EXIT_DEBUG {
+                // SAFETY: the run page is live; `debug` is the arm the kernel
+                // wrote for KVM_EXIT_DEBUG. dr6 bits 0..3 say which DRn matched.
+                let (pc, dr6) = unsafe {
+                    let d = (*self.run).exit.debug;
+                    (d.pc, d.dr6)
+                };
+                if self.ebp.is_some() {
+                    // Execute breakpoint: log the register state each time the
+                    // address is reached (for tracing a specific instruction).
+                    let r = &self.regs;
+                    eprintln!(
+                        "[ebp] pc={pc:#x} rax={:#x} rdi={:#x} rsi={:#x} rdx={:#x} rcx={:#x} r8={:#x} rsp={:#x}",
+                        r.rax, r.rdi, r.rsi, r.rdx, r.rcx, r.r8, r.rsp
+                    );
+                    // An execute #DB is a fault (rip unchanged); set RF so the
+                    // resumed instruction runs once without re-triggering.
+                    self.regs.rflags |= 0x1_0000;
+                    self.regs_dirty = true;
+                    continue;
+                }
+                for (i, &addr) in self.watchpoint.iter().enumerate() {
+                    if dr6 & (1 << i) != 0 {
+                        let val = mem.and_then(|m| m.read_u64(addr).ok()).unwrap_or(0);
+                        eprintln!(
+                            "[wp] {addr:#x} <- {val:#018x} (pc={pc:#x}) rsp={:#x}",
+                            self.regs.rsp
+                        );
+                    }
+                }
+                continue;
+            }
+            let exit = self.decode_exit(reason)?;
+            if exit == Exit::Syscall {
+                self.in_syscall = true;
+            }
+            return Ok(exit);
+        }
     }
 
     /// Decode one exit reason into an [`Exit`].
@@ -678,49 +734,44 @@ impl Vcpu for KvmVcpu {
         if self.in_syscall {
             return Ok(Exit::Syscall);
         }
+        // The serial path: reconcile and run under the caller's held memory lock.
         self.vm.reconcile_guest(mem)?;
-        loop {
-            let reason = self.run_once()?;
-            // Debug watchpoint hit: log the write (value + faulting pc) and
-            // resume — the write already completed (a data #DB is a trap).
-            if reason == sys::KVM_EXIT_DEBUG {
-                // SAFETY: the run page is live; `debug` is the arm the kernel
-                // wrote for KVM_EXIT_DEBUG. dr6 bits 0..3 say which DRn matched.
-                let (pc, dr6) = unsafe {
-                    let d = (*self.run).exit.debug;
-                    (d.pc, d.dr6)
-                };
-                if self.ebp.is_some() {
-                    // Execute breakpoint: log the register state each time the
-                    // address is reached (for tracing a specific instruction).
-                    let r = &self.regs;
-                    eprintln!(
-                        "[ebp] pc={pc:#x} rax={:#x} rdi={:#x} rsi={:#x} rdx={:#x} rcx={:#x} r8={:#x} rsp={:#x}",
-                        r.rax, r.rdi, r.rsi, r.rdx, r.rcx, r.r8, r.rsp
-                    );
-                    // An execute #DB is a fault (rip unchanged); set RF so the
-                    // resumed instruction runs once without re-triggering.
-                    self.regs.rflags |= 0x1_0000;
-                    self.regs_dirty = true;
-                    continue;
-                }
-                for (i, &addr) in self.watchpoint.iter().enumerate() {
-                    if dr6 & (1 << i) != 0 {
-                        let val = mem.read_u64(addr).unwrap_or(0);
-                        eprintln!(
-                            "[wp] {addr:#x} <- {val:#018x} (pc={pc:#x}) rsp={:#x}",
-                            self.regs.rsp
-                        );
-                    }
-                }
-                continue;
-            }
-            let exit = self.decode_exit(reason)?;
-            if exit == Exit::Syscall {
-                self.in_syscall = true;
-            }
-            return Ok(exit);
+        self.run_loop(Some(mem))
+    }
+
+    fn needs_locked_run(&self) -> bool {
+        // KVM executes against the mapped memslot: `KVM_RUN` needs no Rust borrow
+        // of GuestMemory, so the SMP scheduler runs it with the lock dropped.
+        false
+    }
+
+    fn reconcile(&mut self, mem: &mut GuestMemory) -> Result<(), VcpuError> {
+        // Re-delivering a blocked syscall: `run_bare` returns Syscall without a
+        // KVM_RUN, so it never enters the run gate — don't enter it here either.
+        if self.in_syscall {
+            return Ok(());
         }
+        // Reconcile slot 0 + the shadow page tables and enter the run gate, all
+        // under the memory lock the SMP worker holds around this call.
+        self.vm.begin_lockless_run(mem)
+    }
+
+    fn run_bare(&mut self) -> Result<Exit, VcpuError> {
+        if self.in_syscall {
+            return Ok(Exit::Syscall);
+        }
+        // `reconcile` entered the run gate; leave it once KVM_RUN is done, whether
+        // it exited cleanly or errored, so a re-point of slot 0 can't stall.
+        let exit = self.run_loop(None);
+        self.vm.end_lockless_run();
+        exit
+    }
+
+    fn shadow_stale(&self, mem: &GuestMemory, addr: u64) -> bool {
+        // A fault on a page mapped in `mem` but not yet in the shadow tables this
+        // vcpu ran with (a sibling changed the mapping mid-run): retriable, not a
+        // real fault. See `Vm::shadow_leaf_stale`.
+        self.vm.shadow_leaf_stale(mem, addr)
     }
 
     fn syscall_nr(&self) -> u64 {
