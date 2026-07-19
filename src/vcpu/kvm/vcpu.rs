@@ -29,6 +29,143 @@ use super::vm::{
 };
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Per-thread wall-clock preemption for `KVM_RUN`.
+///
+/// `KVM_RUN` only returns on a vmexit or a delivered signal, so a compute-bound
+/// guest (a JIT hot loop, a GC sweep) that never faults or syscalls would run
+/// its whole time slice on hardware. To bound that, each host thread arms a
+/// POSIX timer just before entering the guest; when it fires it raises a
+/// dedicated signal *at that very thread* (`SIGEV_THREAD_ID`), whose no-op
+/// handler — installed without `SA_RESTART` — makes `KVM_RUN` return `-EINTR`,
+/// which [`KvmVcpu::run_once`] already turns into [`Exit::Interrupted`].
+///
+/// A `KvmVcpu` can migrate between the SMP worker threads, so the timer is a
+/// thread-local keyed to the thread that actually runs the guest, created lazily
+/// and re-armed around each `KVM_RUN`.
+mod preempt {
+    use super::sys;
+    use std::cell::Cell;
+    use std::sync::Once;
+    use std::time::Duration;
+
+    /// The signal the preemption timer raises. A real-time signal above the two
+    /// (`SIGRTMIN`, `SIGRTMIN+1`) that glibc's NPTL reserves for thread
+    /// cancellation and `setxid`, so it collides with nothing the host runtime
+    /// or the guest-signal emulation (which is entirely in-VM and touches no
+    /// host signal) uses. The number is the kernel's raw signal, not glibc's
+    /// remapped `SIGRTMIN`.
+    const PREEMPT_SIG: i32 = 40;
+
+    /// The signal handler: it does nothing. Its entire purpose is to be a
+    /// non-`SA_RESTART` handler so that its delivery interrupts the `KVM_RUN`
+    /// ioctl (returning `-EINTR`) rather than being ignored or restarting it.
+    extern "C" fn on_preempt(_sig: i32) {}
+
+    fn install_handler() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let act = sys::sigaction {
+                sa_handler: on_preempt as *const () as usize,
+                sa_mask: [0; 16],
+                // No SA_RESTART: the delivery must break KVM_RUN out with EINTR.
+                sa_flags: 0,
+                sa_restorer: 0,
+            };
+            // SAFETY: `act` is a valid, fully-initialized sigaction; we install
+            // our own no-op handler for a signal nothing else uses. glibc's
+            // wrapper supplies the SA_RESTORER trampoline.
+            unsafe {
+                sys::sigaction(PREEMPT_SIG, std::ptr::from_ref(&act), std::ptr::null_mut());
+            }
+        });
+    }
+
+    thread_local! {
+        /// This thread's one-shot preemption timer, created on first use and
+        /// targeting this thread's tid. `None` until created (or if creation
+        /// failed — then preemption silently degrades to the syscall-count cap).
+        static TIMER: Cell<Option<sys::timer_t>> = const { Cell::new(None) };
+    }
+
+    /// This thread's timer id, creating it (and installing the handler) on first
+    /// use. The timer notifies via `SIGEV_THREAD_ID` at *this* thread, so the
+    /// signal always lands on whoever is inside `KVM_RUN`.
+    fn thread_timer() -> Option<sys::timer_t> {
+        install_handler();
+        TIMER.with(|slot| {
+            if let Some(id) = slot.get() {
+                return Some(id);
+            }
+            // SAFETY: `gettid` takes no arguments and only reads the caller's tid.
+            let tid = unsafe { sys::gettid() };
+            let mut ev = sys::sigevent {
+                sigev_signo: PREEMPT_SIG,
+                sigev_notify: sys::SIGEV_THREAD_ID,
+                sigev_notify_thread_id: tid,
+                ..sys::sigevent::default()
+            };
+            let mut id: sys::timer_t = std::ptr::null_mut();
+            // SAFETY: valid out-pointers; creates a per-thread CLOCK_MONOTONIC
+            // timer bound to this thread via SIGEV_THREAD_ID.
+            let ret = unsafe {
+                sys::timer_create(
+                    sys::CLOCK_MONOTONIC,
+                    std::ptr::from_mut(&mut ev),
+                    std::ptr::from_mut(&mut id),
+                )
+            };
+            if ret != 0 {
+                return None;
+            }
+            slot.set(Some(id));
+            Some(id)
+        })
+    }
+
+    /// Arm this thread's timer to fire once after `d` (a zero `it_interval`
+    /// makes it one-shot). Call immediately before `KVM_RUN`.
+    pub fn arm(d: Duration) {
+        let Some(id) = thread_timer() else {
+            return;
+        };
+        let spec = sys::itimerspec {
+            it_interval: sys::timespec::default(),
+            it_value: sys::timespec {
+                // A zero it_value would *disarm* the timer, so a sub-nanosecond
+                // quantum still asks for at least one nanosecond.
+                tv_sec: d.as_secs() as i64,
+                tv_nsec: i64::from(d.subsec_nanos().max(1)),
+            },
+        };
+        // SAFETY: valid timer id and itimerspec; one-shot relative arming.
+        unsafe {
+            sys::timer_settime(id, 0, std::ptr::from_ref(&spec), std::ptr::null_mut());
+        }
+    }
+
+    /// Disarm this thread's timer (zero `it_value`). Call immediately after
+    /// `KVM_RUN` so a late expiry doesn't fire into the next, unrelated slice.
+    ///
+    /// v1 accepts two benign races: the signal landing between `arm` and
+    /// `KVM_RUN` (the run returns EINTR at once — a harmlessly short slice), and
+    /// landing after `KVM_RUN` returns but before `disarm` (the no-op handler
+    /// runs, doing nothing). The fully race-free upgrade is
+    /// `KVM_SET_SIGNAL_MASK` — unblock the signal only for the duration of
+    /// `KVM_RUN` — which we deliberately skip for v1.
+    pub fn disarm() {
+        TIMER.with(|slot| {
+            if let Some(id) = slot.get() {
+                let spec = sys::itimerspec::default();
+                // SAFETY: valid timer id; a zero it_value disarms the timer.
+                unsafe {
+                    sys::timer_settime(id, 0, std::ptr::from_ref(&spec), std::ptr::null_mut());
+                }
+            }
+        });
+    }
+}
 
 /// `RFLAGS` for fresh user code: just the always-one bit and IF (interrupts
 /// are never injected, but a clear IF would make a guest `pushf` look odd).
@@ -75,6 +212,12 @@ pub struct KvmVcpu {
     /// Debug: an execute breakpoint (`NIXVM_EBP`); logs `r8`/`rdi` state each
     /// time the address is reached. `None` when unarmed.
     ebp: Option<u64>,
+    /// Wall-clock preemption quantum: a per-thread timer armed around each
+    /// `KVM_RUN` breaks the guest out with `Exit::Interrupted` after this long,
+    /// so a compute-bound guest that never exits still yields the CPU. `None`
+    /// disables it. Cached from `NIXVM_QUANTUM_MS` (see [`preempt`] and
+    /// [`crate::vcpu::preempt_quantum`]).
+    quantum: Option<Duration>,
 }
 
 // The register caches and run page are noise in a debug dump; the fd
@@ -234,6 +377,7 @@ impl KvmVcpu {
             in_syscall: false,
             watchpoint,
             ebp,
+            quantum: crate::vcpu::preempt_quantum(),
         })
     }
 
@@ -255,9 +399,19 @@ impl KvmVcpu {
             self.sregs_dirty = false;
         }
 
+        // Arm this thread's preemption timer so a compute-bound guest that never
+        // exits is broken out after the quantum: the timer signal interrupts
+        // KVM_RUN (EINTR), which becomes Exit::Interrupted below. Disarmed right
+        // after so a late expiry can't fire into an unrelated later slice.
+        if let Some(q) = self.quantum {
+            preempt::arm(q);
+        }
         // SAFETY: `KVM_RUN` takes no argument; the fd is live and not run
         // concurrently (see the `Send` note).
         let ret = unsafe { sys::ioctl(self.fd.0, sys::KVM_RUN, 0) };
+        if self.quantum.is_some() {
+            preempt::disarm();
+        }
         let interrupted = if ret < 0 {
             let err = std::io::Error::last_os_error();
             // EINTR/EAGAIN: a host signal broke us out of the guest.

@@ -28,6 +28,89 @@ unsafe extern "C" {
         offset: i64,
     ) -> *mut c_void;
     pub fn munmap(addr: *mut c_void, len: usize) -> c_int;
+
+    // Per-thread wall-clock preemption (see `vcpu::preempt`): a POSIX timer
+    // whose expiry signal breaks the running thread out of `KVM_RUN` with
+    // EINTR. These live in libc on glibc ≥ 2.34 (the old librt was merged in),
+    // which every current Linux host provides — the same C runtime the ioctls
+    // above already link against.
+    pub fn gettid() -> c_int;
+    pub fn sigaction(signum: c_int, act: *const sigaction, oldact: *mut sigaction) -> c_int;
+    pub fn timer_create(clockid: c_int, sevp: *mut sigevent, timerid: *mut timer_t) -> c_int;
+    pub fn timer_settime(
+        timerid: timer_t,
+        flags: c_int,
+        new_value: *const itimerspec,
+        old_value: *mut itimerspec,
+    ) -> c_int;
+    pub fn timer_delete(timerid: timer_t) -> c_int;
+}
+
+/// Opaque POSIX timer handle (`timer_t`), written by [`timer_create`].
+pub type timer_t = *mut c_void;
+
+/// `CLOCK_MONOTONIC` — the timer counts against a steady clock, unaffected by
+/// wall-clock adjustments.
+pub const CLOCK_MONOTONIC: c_int = 1;
+/// `sigev_notify = SIGEV_THREAD_ID`: deliver the timer signal to one specific
+/// thread (`sigev_notify_thread_id`), not the process — so it lands on whichever
+/// host thread is blocked in `KVM_RUN`.
+pub const SIGEV_THREAD_ID: c_int = 4;
+
+/// `struct sigevent` as the kernel/glibc lay it out (64 bytes). Only the fields
+/// the preemption timer needs are named; the trailing union bytes (unused here)
+/// are padding. `sigev_notify_thread_id` is the first member of the `_sigev_un`
+/// union, so it overlaps the layout at the right offset.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct sigevent {
+    pub sigev_value: usize,
+    pub sigev_signo: c_int,
+    pub sigev_notify: c_int,
+    pub sigev_notify_thread_id: c_int,
+    pub _pad: [c_int; 11],
+}
+
+impl Default for sigevent {
+    fn default() -> Self {
+        // SAFETY: `sigevent` is a plain-old-data struct of integers/pointers;
+        // an all-zero bit pattern is a valid, inert value (SIGEV_SIGNAL, no
+        // signal, no tid) that the caller then fills in.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// `struct timespec` (16 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct timespec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+/// `struct itimerspec` (`timer_settime`): a one-shot when `it_interval` is zero.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct itimerspec {
+    pub it_interval: timespec,
+    pub it_value: timespec,
+}
+
+/// `struct sigaction` in glibc's userspace layout (handler, mask, flags,
+/// restorer). We call libc's `sigaction`, so glibc installs its own SA_RESTORER
+/// trampoline regardless of `sa_restorer`; the fields we set are the no-op
+/// handler and empty mask, with `sa_flags` deliberately lacking `SA_RESTART` so
+/// the delivered signal interrupts `KVM_RUN` (EINTR) instead of restarting it.
+// The `sa_` prefix on every field mirrors the C struct verbatim (as the rest of
+// this module does), so keep it rather than renaming for `struct_field_names`.
+#[allow(clippy::struct_field_names)]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct sigaction {
+    pub sa_handler: usize,
+    pub sa_mask: [u64; 16],
+    pub sa_flags: c_int,
+    pub sa_restorer: usize,
 }
 
 pub const O_RDWR: c_int = 2;

@@ -22,6 +22,33 @@ pub(crate) mod region;
 
 pub use mem::{GuestMemory, MemError, Prot};
 
+/// The wall-clock preemption quantum shared by every backend.
+///
+/// Syscall-count preemption (the scheduler's `slice_cap`) has a hole: a
+/// compute-bound guest thread that issues *no* syscalls — a JIT'd hot loop, a
+/// GC sweep, a crypto kernel — never hands control back, so it monopolizes its
+/// CPU for the whole run. The time quantum closes that hole: after roughly this
+/// long, a running vcpu's [`Vcpu::run`] returns [`Exit::Interrupted`] even mid
+/// computation, and the scheduler resumes the (still-runnable) task on its next
+/// turn. The interpreter polls the wall clock in its instruction loop; the KVM
+/// backend arms a per-thread timer whose signal breaks `KVM_RUN` out.
+///
+/// Configured once by `NIXVM_QUANTUM_MS` (default 10 ms); `0` disables
+/// time-based preemption, leaving only the syscall-count cap. Read and cached on
+/// first use.
+#[must_use]
+pub(crate) fn preempt_quantum() -> Option<std::time::Duration> {
+    use std::sync::OnceLock;
+    static Q: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *Q.get_or_init(|| {
+        let ms = std::env::var("NIXVM_QUANTUM_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(10);
+        (ms > 0).then(|| std::time::Duration::from_millis(ms))
+    })
+}
+
 /// Why [`Vcpu::run`] returned control to the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {

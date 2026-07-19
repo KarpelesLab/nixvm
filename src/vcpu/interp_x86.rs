@@ -72,12 +72,21 @@
 
 use crate::abi::Arch;
 
+use std::time::{Duration, Instant};
+
 use super::softfloat::{self, F80, Round};
 use super::{Backend, Exit, GuestMemory, Vcpu, VcpuError};
 
 /// Upper bound on instructions executed per `run()` call before yielding —
 /// mirrors [`super::interp`]'s guard against a runaway guest loop.
 const MAX_STEPS: u64 = 50_000_000;
+
+/// How often (in instructions) [`X86Interp::run`] polls the wall clock for a
+/// time-quantum expiry. A clock read per instruction would dominate the
+/// interpreter's cost, so we amortize it: a power of two makes the test a cheap
+/// mask. The residual overrun (up to this many instructions past the deadline)
+/// is negligible next to a millisecond quantum.
+const QUANTUM_STRIDE: u64 = 4096;
 
 // ---- x86-64 GPR indices (the standard ModRM/REX numbering) ----
 const RAX: usize = 0;
@@ -957,6 +966,12 @@ struct X86Interp {
     /// reloaded verbatim; this interpreter always computes in the default
     /// round-to-nearest, exceptions-masked mode, so the value only round-trips.
     mxcsr: u32,
+    /// Wall-clock preemption quantum: [`X86Interp::run`] returns
+    /// [`Exit::Interrupted`] once this much time has elapsed since it started,
+    /// so a compute-bound guest that never syscalls still yields the CPU. `None`
+    /// disables it. Cached from `NIXVM_QUANTUM_MS` at construction (see
+    /// [`super::preempt_quantum`]); a `fork` clone inherits it.
+    quantum: Option<Duration>,
 }
 
 impl X86Interp {
@@ -983,6 +998,7 @@ impl X86Interp {
             tsc: 0,
             prng: 0x9E37_79B9_7F4A_7C15, // arbitrary nonzero seed (golden-ratio constant)
             mxcsr: 0x1f80,               // the power-on default (all exceptions masked)
+            quantum: super::preempt_quantum(),
         }
     }
 
@@ -4808,12 +4824,25 @@ impl X86Interp {
 
 impl Vcpu for X86Interp {
     fn run(&mut self, mem: &mut GuestMemory) -> Result<Exit, VcpuError> {
-        for _ in 0..MAX_STEPS {
+        // Time-based preemption deadline, computed once. A compute-bound guest
+        // that never syscalls would otherwise run the whole MAX_STEPS budget and
+        // starve its siblings; expiring the quantum ends the slice as
+        // Interrupted (the scheduler keeps the task runnable and resumes it).
+        let deadline = self.quantum.map(|q| Instant::now() + q);
+        for i in 0..MAX_STEPS {
             match self.exec(mem) {
                 Step::Next | Step::Branched => {}
                 Step::Syscall => return Ok(Exit::Syscall),
                 Step::Illegal => return Ok(Exit::IllegalInstruction { pc: self.rip }),
                 Step::Fault { addr, write } => return Ok(Exit::MemFault { addr, write }),
+            }
+            // Poll the wall clock only every QUANTUM_STRIDE instructions — a read
+            // per instruction would swamp the interpreter's per-op cost.
+            if let Some(deadline) = deadline
+                && i & (QUANTUM_STRIDE - 1) == 0
+                && Instant::now() >= deadline
+            {
+                return Ok(Exit::Interrupted);
             }
         }
         Ok(Exit::Interrupted)
@@ -7087,5 +7116,44 @@ mod tests {
         assert!(matches!(step, Step::Syscall));
         assert_eq!(cpu.gpr[RCX], CODE + 2, "RCX holds the post-syscall RIP");
         assert_eq!(cpu.gpr[R11] & 0x203, 0x203, "R11 = RFLAGS (reserved|IF|CF)");
+    }
+
+    #[test]
+    fn time_quantum_preempts_a_syscall_free_hot_loop() {
+        // A guest that spins forever with no syscall (`jmp $`, the archetypal
+        // JIT hot loop / GC sweep) must still hand the CPU back on the wall-clock
+        // quantum. Without time-based preemption `run` would spin the whole
+        // MAX_STEPS budget (tens of millions of iterations) before yielding.
+        let mut m = mem();
+        m.write_init(CODE, &[0xEB, 0xFE]).unwrap(); // jmp $ (rel8 = -2)
+        let mut cpu = X86Interp::new(CODE, STACK);
+        let quantum = Duration::from_millis(20);
+        cpu.quantum = Some(quantum);
+
+        let started = Instant::now();
+        let exit = cpu.run(&mut m).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(exit, Exit::Interrupted, "the quantum ends the slice");
+        assert_eq!(cpu.rip, CODE, "still parked on the self-loop, resumable");
+        // It ran until (roughly) the quantum, not instantly and not for the
+        // whole MAX_STEPS budget: the upper bound is far below the time tens of
+        // millions of interpreted `jmp`s take, so a broken quantum fails here.
+        assert!(elapsed >= quantum, "slice lasted at least the quantum: {elapsed:?}");
+        assert!(
+            elapsed < quantum * 15,
+            "slice ended near the quantum, not at MAX_STEPS: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn no_quantum_runs_to_max_steps_on_a_hot_loop() {
+        // With time-based preemption disabled the same self-loop still
+        // terminates — via the MAX_STEPS runaway guard — so `run` never hangs.
+        let mut m = mem();
+        m.write_init(CODE, &[0xEB, 0xFE]).unwrap();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.quantum = None;
+        assert_eq!(cpu.run(&mut m).unwrap(), Exit::Interrupted);
     }
 }

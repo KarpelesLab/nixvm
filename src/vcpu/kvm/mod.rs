@@ -252,4 +252,27 @@ mod tests {
             }
         }
     }
+
+    /// Time-based preemption on the hardware path: a guest spinning forever in a
+    /// `jmp $` self-loop makes no syscall and never faults, so without the
+    /// per-thread preemption timer `KVM_RUN` would never return and `run` would
+    /// hang. The armed timer's signal must break it out as `Exit::Interrupted`,
+    /// leaving the guest resumable (rip still on the loop). Uses the default
+    /// `NIXVM_QUANTUM_MS` quantum, so a broken timer hangs the test rather than
+    /// passing.
+    #[test]
+    fn time_quantum_preempts_a_compute_bound_guest() {
+        let Some(backend) = backend_or_skip() else {
+            return;
+        };
+        let base = 0x1_0000u64;
+        let mut mem = GuestMemory::new(base, 64 * 1024);
+        mem.map(base, PAGE_SIZE, Prot::rwx()).unwrap();
+        mem.write_init(base, &[0xEB, 0xFE]).unwrap(); // jmp $ (spin forever)
+
+        let mut v = backend.new_vcpu(base, base + 0x8000).expect("create KVM vcpu");
+        let exit = v.run(&mut mem).expect("KVM run");
+        assert_eq!(exit, Exit::Interrupted, "the quantum timer preempts the guest");
+        assert_eq!(v.pc(), base, "still on the self-loop, resumable");
+    }
 }
