@@ -342,6 +342,140 @@ enum Serviced {
     Ended,
 }
 
+/// What one in-place SMP service step decided about the task's *next* step,
+/// after [`Kernel::smp_service_step`] applied the syscall result to the vcpu.
+/// The worker uses this to keep running the same vcpu (the hot path — no thread
+/// hand-off) or to end its slice and report back to the scheduler.
+enum SliceStep {
+    /// Progress made; keep running the same vcpu.
+    Continue,
+    /// `sched_yield`: the task is still runnable but wants to give siblings a
+    /// turn, so end the slice.
+    Yielded,
+    /// The task blocked (futex/poll/wait4/…); end the slice and park it.
+    Blocked,
+    /// The task became a zombie; end the slice.
+    Ended,
+}
+
+/// Why an SMP worker's slice ended, shipped back to the scheduler main loop so
+/// it can park/re-dispatch/reap the task. Carries the vcpu back so its home
+/// worker keeps it (KVM vcpu→thread affinity).
+enum SliceOutcome {
+    /// The task blocked; `bool` is whether it serviced any syscall before
+    /// blocking (i.e. made progress worth waking other blocked waiters for).
+    Blocked(bool),
+    /// The task became a zombie.
+    Ended,
+    /// The task yielded (still runnable).
+    Yielded,
+    /// The slice hit the syscall-count quantum (`slice_cap`) without blocking;
+    /// the task is still runnable.
+    Preempted,
+    /// A backend error surfaced from `run`/`reconcile`.
+    Err(VcpuError),
+}
+
+/// What the SMP scheduler does when every task is blocked and nothing is in
+/// flight — mirrors the serial scheduler's stall handling.
+enum StallAction {
+    /// A timed wait is pending; sleep the main thread to this absolute deadline
+    /// (ns since the epoch), then force a retry so the waiter re-checks it.
+    SleepUntil(u128),
+    /// No timer, first stall since the last progress: force one retry round to
+    /// catch a lost wake / host I/O / a freshly-reaped child.
+    Retry,
+    /// No timer and the forced retry made no progress: a genuine deadlock.
+    Deadlock,
+}
+
+/// One SMP worker's slice: run the guest lockless (KVM) or under the memory
+/// lock (interpreter) to its next exit, then service that exit **in place** —
+/// acquire the big kernel lock and call [`Kernel::smp_service_step`] — and, as
+/// long as the task stays runnable, loop and run it again on this same thread.
+/// This is the core of the syscall hot path: a guest doing millions of
+/// `clock_gettime`s never leaves its worker thread, paying only an uncontended
+/// lock per syscall instead of a full worker→main→worker hand-off.
+///
+/// Lock order is **memory lock → kernel lock**: the service step takes the
+/// task's `Arc<Mutex<GuestMemory>>` first and the kernel lock second, and the
+/// only other lock sites (a locked interpreter `run`, or a KVM `reconcile`) take
+/// the memory lock alone. So the kernel lock is always the last lock acquired —
+/// a worker never blocks on the memory lock while holding the kernel lock — and
+/// with the service step only ever touching its *own* task's space there is no
+/// lock cycle. (Holding the memory lock across the kernel lock, rather than the
+/// reverse, keeps a long interpreter run in one address space from stalling
+/// syscall servicing for every *other* address space.)
+fn run_slice_smp(
+    kernel: &Mutex<&mut Kernel>,
+    slice_cap: u32,
+    i: usize,
+    mut vcpu: Box<dyn Vcpu>,
+    space: &Arc<Mutex<GuestMemory>>,
+) -> (usize, Box<dyn Vcpu>, SliceOutcome) {
+    let mut count: u32 = 0;
+    let mut progressed = false;
+    loop {
+        // ---- run phase: no kernel lock held ----
+        // Interpreter reads/writes guest memory *through* GuestMemory, so it must
+        // hold the memory lock for the whole run. KVM executes against the mapped
+        // memslot: take the lock only to reconcile the memslot + shadow page
+        // tables, then drop it so KVM_RUN runs in parallel with siblings of the
+        // same address space.
+        let exit = if vcpu.needs_locked_run() {
+            let mut mem = space.lock().unwrap();
+            vcpu.run(&mut mem)
+        } else {
+            let reconciled = {
+                let mut mem = space.lock().unwrap();
+                vcpu.reconcile(&mut mem)
+            };
+            match reconciled {
+                Ok(()) => vcpu.run_bare(),
+                Err(e) => Err(e),
+            }
+        };
+        let exit = match exit {
+            Ok(e) => e,
+            Err(e) => return (i, vcpu, SliceOutcome::Err(e)),
+        };
+        let is_syscall = matches!(exit, Exit::Syscall);
+        // A time-quantum interrupt (mid-compute preemption) ends the slice so
+        // the scheduler regains control: a syscall-free hot loop turns into a
+        // stream of `Exit::Interrupted`s, and without ending the slice here the
+        // worker would run that one task forever — never yielding its home
+        // siblings a turn, and never letting the scheduler observe pid-1 exit or
+        // drain the pool at shutdown.
+        let is_interrupt = matches!(exit, Exit::Interrupted);
+        // ---- service phase: memory lock, then kernel lock (see above) ----
+        let step = {
+            let mut mem = space.lock().unwrap();
+            let mut k = kernel.lock().unwrap();
+            k.smp_service_step(i, exit, vcpu.as_mut(), &mut mem)
+        };
+        match step {
+            SliceStep::Continue => {
+                progressed = true;
+                if is_interrupt {
+                    return (i, vcpu, SliceOutcome::Preempted);
+                }
+                // Only real syscalls count toward the preemption quantum (a COW/
+                // stack-grow fault resume does not), mirroring how `service`
+                // increments `slice_syscalls`.
+                if is_syscall {
+                    count += 1;
+                    if slice_cap != 0 && count >= slice_cap {
+                        return (i, vcpu, SliceOutcome::Preempted);
+                    }
+                }
+            }
+            SliceStep::Yielded => return (i, vcpu, SliceOutcome::Yielded),
+            SliceStep::Blocked => return (i, vcpu, SliceOutcome::Blocked(progressed)),
+            SliceStep::Ended => return (i, vcpu, SliceOutcome::Ended),
+        }
+    }
+}
+
 /// A guest task (process or thread): its vcpu and per-task state. Its address
 /// space lives in [`Kernel::spaces`] at `info.mm`, shared with any sibling
 /// threads created via `CLONE_VM`. `vcpu` is `None` while the task is in
@@ -450,6 +584,17 @@ pub struct Kernel {
     watch_addr: Option<u64>,
     watch_last: u64,
 }
+
+// The SMP scheduler ([`Kernel::schedule_smp`]) shares one `&mut Kernel` across
+// its worker threads behind a single mutex (the "big kernel lock"), so a worker
+// can service its own guest's syscall in place instead of shipping every exit to
+// a central servicer thread. That requires `Kernel: Send` — assert it here so a
+// future field of a non-`Send` type breaks the build at its source rather than
+// deep inside `schedule_smp`'s `thread::scope`.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Kernel>();
+};
 
 impl std::fmt::Debug for Kernel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -980,176 +1125,304 @@ impl Kernel {
     }
 
     /// SMP scheduler: a pool of `ncpus` host worker threads run guest compute
-    /// (`vcpu.run`) in parallel, while this main thread services every syscall
-    /// serially. Only the `Box<dyn Vcpu>` and the task's `Arc<Mutex<GuestMemory>>`
-    /// cross a thread boundary; the `Kernel` (mounts, pipes, process table)
-    /// stays here and needs no locking — scheduling and syscall servicing are
-    /// single-threaded, so the whole design is race-free by construction. This
-    /// is the big-kernel-lock model a KVM/HVF backend will slot into: vCPUs run
-    /// in parallel, exits are serviced on one thread.
-    #[allow(clippy::too_many_lines)] // the worker pool + service loop reads best as one unit
+    /// **and service their own syscalls in place**. Each worker runs its vcpu to
+    /// an exit, then — under a single global "big kernel lock" — services that
+    /// exit ([`run_slice_smp`] → [`Kernel::smp_service_step`]) and, while the
+    /// task stays runnable, keeps running the *same* vcpu on the same thread.
+    /// The scheduler main loop only dispatches slices to their home worker and,
+    /// when a slice ends, parks/reaps/re-dispatches the task.
+    ///
+    /// # The lock model
+    /// The whole `Kernel` (mounts, pipes, process table, scheduler bookkeeping)
+    /// sits behind one `Mutex` — the *kernel lock*, held only while servicing a
+    /// syscall or making a scheduling decision. Because exactly one thread holds
+    /// it at a time, at most one syscall is serviced at once: big-kernel-lock
+    /// semantics are preserved, so global kernel state is never touched
+    /// concurrently and stays race-free. Guest compute runs with the kernel lock
+    /// **not** held (KVM runs with *no* lock; the interpreter holds only the
+    /// per-space memory lock), so vCPUs still execute in parallel.
+    ///
+    /// Two lock classes, always taken **memory lock → kernel lock** (never the
+    /// reverse — see [`run_slice_smp`]): the per-space `Arc<Mutex<GuestMemory>>`
+    /// and the kernel lock. The scheduler main loop only ever takes the kernel
+    /// lock; servicing takes the memory lock first, then the kernel lock; a
+    /// locked interpreter run and a KVM reconcile take the memory lock alone.
+    /// The kernel lock is therefore always the last lock acquired, so no worker
+    /// blocks on the memory lock while holding the kernel lock, and there is no
+    /// lock cycle.
+    ///
+    /// vcpu→thread affinity (task `i` always runs on worker `i % nworkers`) is
+    /// kept from the previous design: KVM penalizes running a vcpu from a
+    /// rotating set of threads (a vcpu-migration cost measured at ~27 ms vs
+    /// ~2 µs same-thread), so a task's vcpu returns to its home worker across
+    /// slices. In-place servicing makes that automatic within a slice.
+    #[allow(clippy::too_many_lines)] // the worker pool + scheduler loop reads best as one unit
     fn schedule_smp(&mut self) -> Result<i32, VcpuError> {
-        // Work handed to a worker: run this vcpu on this address space until it
-        // next exits. `Stop` drains the pool at shutdown.
+        // Work handed to a worker: run a slice for this vcpu on this address
+        // space. `Stop` drains the pool at shutdown.
         enum Work {
             Run(usize, Box<dyn Vcpu>, Arc<Mutex<GuestMemory>>),
             Stop,
         }
-        type Done = (usize, Box<dyn Vcpu>, Result<Exit, VcpuError>);
+        type Done = (usize, Box<dyn Vcpu>, SliceOutcome);
 
-        // One queue per worker, not one shared queue: a vcpu is always dispatched
-        // to the *same* worker thread (its home, `task index % ncpus`). KVM's model
-        // is one host thread per vcpu — running a vcpu from a rotating set of
-        // threads makes each KVM_RUN pay a vcpu-migration cost (measured at ~27 ms
-        // vs sub-millisecond same-thread), which for a single-threaded guest phase
-        // is catastrophic. Home affinity keeps consecutive KVM_RUNs of a vcpu on
-        // one thread while still spreading distinct tasks across the workers for
-        // real parallelism.
         let nworkers = self.ncpus;
+        // `slice_cap` is fixed for the run; snapshot it so workers need no lock
+        // to read it.
+        let slice_cap = self.slice_cap;
+        // One queue per worker (home affinity, see the doc comment).
         let queues: Vec<Arc<(Mutex<VecDeque<Work>>, Condvar)>> = (0..nworkers)
             .map(|_| Arc::new((Mutex::new(VecDeque::new()), Condvar::new())))
             .collect();
         let (done_tx, done_rx) = mpsc::channel::<Done>();
-        let mut workers = Vec::with_capacity(nworkers);
-        for home in &queues {
-            let q = Arc::clone(home);
-            let out = done_tx.clone();
-            workers.push(std::thread::spawn(move || {
-                loop {
-                    let work = {
-                        let (lock, cv) = &*q;
-                        let mut g = lock.lock().unwrap();
-                        loop {
-                            if let Some(w) = g.pop_front() {
-                                break w;
-                            }
-                            g = cv.wait(g).unwrap();
-                        }
-                    };
-                    match work {
-                        Work::Stop => break,
-                        Work::Run(id, mut vcpu, space) => {
-                            // Interpreter reads/writes guest memory *through*
-                            // GuestMemory, so it must hold the lock for the whole
-                            // run. KVM executes against the mapped memslot: take
-                            // the lock only to reconcile the memslot + shadow page
-                            // tables, then drop it so KVM_RUN runs in parallel
-                            // with siblings of the same address space — the guest
-                            // touches the shared backing directly, no Rust borrow.
-                            let exit = if vcpu.needs_locked_run() {
-                                let mut mem = space.lock().unwrap();
-                                vcpu.run(&mut mem)
-                            } else {
-                                let reconciled = {
-                                    let mut mem = space.lock().unwrap();
-                                    vcpu.reconcile(&mut mem)
-                                };
-                                match reconciled {
-                                    Ok(()) => vcpu.run_bare(),
-                                    Err(e) => Err(e),
+
+        // Move `&mut self` behind the kernel lock so worker threads can service
+        // in place. `thread::scope` lets the workers borrow this stack-local
+        // mutex without a `'static` bound; they all join before the scope ends,
+        // so the borrow of `self` is sound.
+        let kernel: Mutex<&mut Kernel> = Mutex::new(self);
+
+        std::thread::scope(|scope| {
+            for home in &queues {
+                let q = Arc::clone(home);
+                let out = done_tx.clone();
+                let kernel = &kernel;
+                scope.spawn(move || {
+                    loop {
+                        let work = {
+                            let (lock, cv) = &*q;
+                            let mut g = lock.lock().unwrap();
+                            loop {
+                                if let Some(w) = g.pop_front() {
+                                    break w;
                                 }
-                            };
-                            if out.send((id, vcpu, exit)).is_err() {
-                                break;
+                                g = cv.wait(g).unwrap();
+                            }
+                        };
+                        match work {
+                            Work::Stop => break,
+                            Work::Run(id, vcpu, space) => {
+                                let done = run_slice_smp(kernel, slice_cap, id, vcpu, &space);
+                                if out.send(done).is_err() {
+                                    break;
+                                }
                             }
                         }
                     }
-                }
-            }));
-        }
-        drop(done_tx);
-
-        // Route a run to its home worker (`task index % nworkers`); broadcast a
-        // Stop to every worker at shutdown.
-        let push_run = |i: usize, vcpu, space| {
-            let (lock, cv) = &*queues[i % nworkers];
-            lock.lock().unwrap().push_back(Work::Run(i, vcpu, space));
-            cv.notify_one();
-        };
-
-        // A task that blocked records the progress epoch at which it did; it is
-        // not re-dispatched until the epoch advances (some other task made real
-        // progress that might satisfy its wait) — avoiding a busy spin.
-        let mut blocked_at: BTreeMap<usize, u64> = BTreeMap::new();
-        let mut epoch: u64 = 0;
-        let mut inflight = 0usize;
-        let outcome = loop {
-            if let Some(code) = self.pid1_code() {
-                break Ok(code);
+                });
             }
-            // Fill idle workers with runnable tasks.
-            while inflight < self.ncpus {
-                let Some(i) = self.pick_smp_runnable(&blocked_at, epoch) else {
-                    break;
+            drop(done_tx);
+
+            // Route a run to its home worker (`task index % nworkers`).
+            let push_run = |i: usize, vcpu, space| {
+                let (lock, cv) = &*queues[i % nworkers];
+                lock.lock().unwrap().push_back(Work::Run(i, vcpu, space));
+                cv.notify_one();
+            };
+
+            // A task that blocked records the progress epoch at which it did; it
+            // is not re-dispatched until the epoch advances (some other slice
+            // made real progress that might satisfy its wait) — avoiding a busy
+            // spin. `stalled` guards the deadlock/timer path: it is cleared by
+            // any real progress and set once we force a no-timer retry round, so
+            // a genuinely deadlocked machine is detected after exactly one
+            // fruitless retry instead of spinning or erroring prematurely.
+            let mut blocked_at: BTreeMap<usize, u64> = BTreeMap::new();
+            let mut epoch: u64 = 0;
+            let mut inflight = 0usize;
+            let mut stalled = false;
+            let outcome = loop {
+                // Fill idle workers with runnable tasks (kernel lock held only
+                // for the dispatch decision, not while awaiting results).
+                let dispatch = {
+                    let mut k = kernel.lock().unwrap();
+                    if let Some(code) = k.pid1_code() {
+                        break Ok(code);
+                    }
+                    let mut batch = Vec::new();
+                    while inflight + batch.len() < nworkers {
+                        let Some(i) = k.pick_smp_runnable(&blocked_at, epoch) else {
+                            break;
+                        };
+                        let mm = k.procs[i].as_ref().unwrap().info.mm;
+                        let space = Arc::clone(&k.spaces[mm]);
+                        let vcpu = k.procs[i].as_mut().unwrap().vcpu.take().unwrap();
+                        batch.push((i, vcpu, space));
+                    }
+                    batch
                 };
-                let mm = self.procs[i].as_ref().unwrap().info.mm;
-                let space = Arc::clone(&self.spaces[mm]);
-                let vcpu = self.procs[i].as_mut().unwrap().vcpu.take().unwrap();
-                push_run(i, vcpu, space);
-                inflight += 1;
+                for (i, vcpu, space) in dispatch {
+                    push_run(i, vcpu, space);
+                    inflight += 1;
+                }
+
+                if inflight == 0 {
+                    // Nothing runnable and nothing in flight. Decide under the
+                    // kernel lock, mirroring the serial scheduler's stall logic.
+                    let action = {
+                        let k = kernel.lock().unwrap();
+                        if !k.any_running() {
+                            break Ok(k.pid1_code().unwrap_or(0));
+                        }
+                        // A pending timed wait (poll/epoll timeout, setTimeout)
+                        // isn't a deadlock — it just needs the wall clock to
+                        // advance. Sleep to the earliest deadline, then force a
+                        // retry so the waiter re-checks its now-passed deadline.
+                        if let Some(dl) = k.earliest_deadline() {
+                            StallAction::SleepUntil(dl)
+                        } else if !stalled {
+                            // No timer: catch a lost futex wake / host-socket
+                            // data / a child that became a zombie with one
+                            // forced retry round before declaring deadlock.
+                            StallAction::Retry
+                        } else {
+                            StallAction::Deadlock
+                        }
+                    };
+                    match action {
+                        StallAction::SleepUntil(dl) => {
+                            let now = poll::now_ns();
+                            if dl > now {
+                                let ns = (dl - now).min(3_600_000_000_000) as u64;
+                                std::thread::sleep(std::time::Duration::from_nanos(ns));
+                            }
+                            stalled = false;
+                            epoch += 1;
+                        }
+                        StallAction::Retry => {
+                            stalled = true;
+                            epoch += 1;
+                        }
+                        StallAction::Deadlock => {
+                            break Err(VcpuError::Backend(
+                                "deadlock: every task is blocked".into(),
+                            ));
+                        }
+                    }
+                    continue;
+                }
+
+                // Await one slice result (kernel lock released while we wait, so
+                // other workers keep servicing).
+                let (i, vcpu, out) = done_rx.recv().expect("workers outlive the scheduler");
+                inflight -= 1;
+                let mut k = kernel.lock().unwrap();
+                // Re-attach the vcpu to its task slot — unless the task was
+                // *reaped while in flight*. A task's own worker services its
+                // `exit` in place, marking it a `Zombie` under the kernel lock
+                // before shipping the vcpu back here; in that window a sibling's
+                // `wait4`/`waitid` (also under the kernel lock) can reap the
+                // zombie and clear its slot to `None`. The orphaned vcpu is then
+                // simply dropped: the task is gone. Only a just-exited task can
+                // hit this (a runnable/blocked task is never a reap target), but
+                // guarding every arm keeps the invariant local.
+                let reattach = |k: &mut Kernel, vcpu| {
+                    if let Some(p) = k.procs[i].as_mut() {
+                        p.vcpu = Some(vcpu);
+                    }
+                };
+                match out {
+                    SliceOutcome::Err(e) => {
+                        reattach(&mut k, vcpu);
+                        break Err(e);
+                    }
+                    SliceOutcome::Blocked(made_progress) => {
+                        reattach(&mut k, vcpu);
+                        if made_progress {
+                            epoch += 1;
+                            stalled = false;
+                        }
+                        // Parked at the (post-progress) epoch: it won't re-run
+                        // until some *later* progress advances the epoch.
+                        blocked_at.insert(i, epoch);
+                    }
+                    SliceOutcome::Ended => {
+                        reattach(&mut k, vcpu);
+                        epoch += 1;
+                        stalled = false;
+                    }
+                    SliceOutcome::Yielded | SliceOutcome::Preempted => {
+                        // Still runnable; make it immediately re-dispatchable.
+                        reattach(&mut k, vcpu);
+                        blocked_at.remove(&i);
+                        epoch += 1;
+                        stalled = false;
+                    }
+                }
+            };
+
+            // Drain any still-in-flight slices so their vcpus are returned and
+            // the workers go idle before we stop them (a slice that errored/
+            // exited may have left siblings running). A drained task may already
+            // have been reaped (see the re-attach note above), so tolerate a
+            // `None` slot.
+            while inflight > 0 {
+                if let Ok((i, vcpu, _)) = done_rx.recv()
+                    && let Some(p) = kernel.lock().unwrap().procs[i].as_mut()
+                {
+                    p.vcpu = Some(vcpu);
+                }
+                inflight -= 1;
             }
-            if inflight == 0 {
-                // Nothing runnable and nothing in flight: either everyone is
-                // blocked (deadlock) or done.
-                break if self.any_running() {
-                    Err(VcpuError::Backend("deadlock: every task is blocked".into()))
+            // One Stop per worker, into its own queue; the scope joins them.
+            for q in &queues {
+                q.0.lock().unwrap().push_back(Work::Stop);
+                q.1.notify_one();
+            }
+            outcome
+        })
+    }
+
+    /// Service one guest exit for task `i` **in place** on an SMP worker: swap
+    /// the task's per-process state into `self.cur` (its slot in `self.procs` is
+    /// `take`n out for the duration, exactly as the serial scheduler does, so
+    /// `fork`/`wait4`/`futex` scans don't see the running task), run the shared
+    /// [`Kernel::service`] logic, then swap it back. Called with the kernel lock
+    /// held, so servicing is serialized across all workers (the big kernel
+    /// lock). Returns what the worker should do next with the same vcpu.
+    fn smp_service_step(
+        &mut self,
+        i: usize,
+        exit: Exit,
+        vcpu: &mut dyn Vcpu,
+        mem: &mut GuestMemory,
+    ) -> SliceStep {
+        let mut proc = self.procs[i].take().expect("dispatched task is in the table");
+        std::mem::swap(&mut self.cur, &mut proc.info);
+        self.check_out_files();
+        // `sched_yield` sets `yield_now`; clear it first so we observe only this
+        // step's value (the serial path resets it in `run_slice`).
+        self.yield_now = false;
+        let flow = self.service(exit, vcpu, mem);
+        self.check_in_files();
+        std::mem::swap(&mut self.cur, &mut proc.info);
+        self.procs[i] = Some(proc);
+        match flow {
+            Serviced::SetRet(ret) => {
+                vcpu.set_syscall_ret(ret as u64);
+                if self.yield_now {
+                    self.yield_now = false;
+                    SliceStep::Yielded
                 } else {
-                    Ok(self.pid1_code().unwrap_or(0))
-                };
-            }
-            let (i, vcpu, exit_res) = done_rx.recv().expect("workers outlive the scheduler");
-            inflight -= 1;
-            let exit = match exit_res {
-                Ok(e) => e,
-                Err(e) => break Err(e),
-            };
-            let mm = self.procs[i].as_ref().unwrap().info.mm;
-            let space = Arc::clone(&self.spaces[mm]);
-            let mut vcpu = vcpu;
-            let flow = {
-                let mut proc = self.procs[i].take().unwrap();
-                std::mem::swap(&mut self.cur, &mut proc.info);
-                self.check_out_files();
-                let flow = {
-                    let mut mem = space.lock().unwrap();
-                    self.service(exit, vcpu.as_mut(), &mut mem)
-                };
-                self.check_in_files();
-                std::mem::swap(&mut self.cur, &mut proc.info);
-                self.procs[i] = Some(proc);
-                flow
-            };
-            match flow {
-                Serviced::SetRet(ret) => {
-                    vcpu.set_syscall_ret(ret as u64);
-                    self.procs[i].as_mut().unwrap().vcpu = Some(vcpu);
-                    epoch += 1; // real progress: wake blocked waiters to retry
-                }
-                Serviced::Resume => {
-                    self.procs[i].as_mut().unwrap().vcpu = Some(vcpu);
-                    epoch += 1;
-                }
-                Serviced::Blocked => {
-                    self.procs[i].as_mut().unwrap().vcpu = Some(vcpu);
-                    blocked_at.insert(i, epoch);
-                }
-                Serviced::Ended => {
-                    // Task became a zombie; keep the (now-idle) vcpu slot empty.
-                    self.procs[i].as_mut().unwrap().vcpu = Some(vcpu);
-                    epoch += 1;
+                    SliceStep::Continue
                 }
             }
-        };
+            Serviced::Resume => SliceStep::Continue,
+            Serviced::Blocked => SliceStep::Blocked,
+            Serviced::Ended => SliceStep::Ended,
+        }
+    }
 
-        // One Stop per worker, into its own queue.
-        for q in &queues {
-            q.0.lock().unwrap().push_back(Work::Stop);
-            q.1.notify_one();
-        }
-        for h in workers {
-            let _ = h.join();
-        }
-        outcome
+    /// The earliest absolute wake deadline (ns since the epoch) held by any live
+    /// task, or `None` if no task holds a timed wait — the SMP twin of
+    /// [`Kernel::wait_for_timer`]'s deadline scan.
+    fn earliest_deadline(&self) -> Option<u128> {
+        self.procs
+            .iter()
+            .flatten()
+            .filter(|p| p.info.run == RunState::Running)
+            .filter_map(|p| p.info.wake_deadline)
+            .min()
     }
 
     /// Pick a runnable task for an SMP worker: `Running`, holding its vcpu (not
@@ -3729,6 +4002,43 @@ mod tests {
         };
         // The same program yields the same pid-1 exit code on 1 and 8 CPUs.
         assert_eq!(run_with(1), run_with(8));
+    }
+
+    #[test]
+    fn smp_in_place_servicing_is_correct_and_deterministic() {
+        // A program that forks several children interleaved with runs of
+        // syscalls, so under the SMP scheduler each worker services many
+        // syscalls *in place* (no per-syscall main-thread hand-off) while the
+        // workers run their tasks concurrently. Exercises the big-kernel-lock
+        // service path, the fork/process-table mutation under the lock, and the
+        // block-free re-dispatch loop. Repeated many times to shake out any
+        // scheduler race, deadlock, or nondeterminism (a race would surface as a
+        // panic, a `deadlock` error from `run().unwrap()`, a hang, or a
+        // mismatched result).
+        let program = [
+            NR_GETPID, NR_CLONE, NR_GETPID, NR_GETPID, NR_CLONE, NR_GETPID,
+            NR_GETPID, NR_GETPID, NR_CLONE, NR_GETPID, NR_GETPID, NR_GETPID,
+        ];
+        // Run to completion and report (pid-1 exit code, number of tasks the
+        // process table ended up holding) — both are deterministic functions of
+        // the (deterministic) fork schedule, independent of CPU count.
+        let run_with = |ncpus: usize| {
+            let mut k = kernel_only();
+            k.set_ncpus(ncpus);
+            let mem = GuestMemory::new(0x1_0000, 16 * PAGE);
+            let code = k.run(ScriptVcpu::boxed(program), mem).unwrap();
+            let tasks = k.procs.iter().flatten().count();
+            (code, tasks)
+        };
+        let expected = run_with(1);
+        assert_eq!(expected.1, 4, "three clones produce four tasks total");
+        for _ in 0..50 {
+            assert_eq!(
+                run_with(4),
+                expected,
+                "SMP in-place servicing agrees with serial on every run"
+            );
+        }
     }
 
     const PAGE: u64 = 4096;

@@ -85,7 +85,7 @@ pub struct DirEntry {
 /// Only `stat`, `read_at`, and `readdir` are required; every mutating method
 /// defaults to `EROFS`, so a read-only backend (like squashfs) implements the
 /// three required methods and nothing else.
-pub trait MountFs: std::fmt::Debug {
+pub trait MountFs: std::fmt::Debug + Send {
     // ---- required (read side) ----
     fn stat(&mut self, rel: &str) -> Option<Attrs>;
     fn read_at(&mut self, rel: &str, off: u64, buf: &mut [u8]) -> io::Result<usize>;
