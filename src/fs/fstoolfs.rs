@@ -34,8 +34,8 @@ use super::{Attrs, DirEntry, MountFs, NodeKind};
 
 /// A mounted real filesystem: an fstool [`Filesystem`] over a block device.
 pub struct FsToolMount {
-    fs: Box<dyn Filesystem>,
-    dev: Box<dyn BlockDevice>,
+    fs: Box<dyn Filesystem + Send>,
+    dev: Box<dyn BlockDevice + Send>,
     read_only: bool,
 }
 
@@ -165,7 +165,7 @@ impl FsToolMount {
     pub fn open_squashfs_bytes(bytes: &[u8]) -> io::Result<Self> {
         let mut mem = MemoryBackend::new(bytes.len() as u64);
         io::Write::write_all(&mut mem, bytes)?;
-        let mut dev: Box<dyn BlockDevice> = Box::new(mem);
+        let mut dev: Box<dyn BlockDevice + Send> = Box::new(mem);
         let fs = squashfs::Squashfs::open(&mut *dev).map_err(to_io)?;
         Ok(Self {
             fs: Box::new(fs),
@@ -186,7 +186,7 @@ impl FsToolMount {
         // A squashfs of a tar is smaller than the tar's uncompressed content;
         // size the device at the tar length plus slack for metadata.
         let cap = tar.len() as u64 + (8 << 20);
-        let mut dev: Box<dyn BlockDevice> = Box::new(MemoryBackend::new(cap));
+        let mut dev: Box<dyn BlockDevice + Send> = Box::new(MemoryBackend::new(cap));
         let opts = squashfs::FormatOpts::default();
         let mut writer = squashfs::Squashfs::format(&mut *dev, &opts).map_err(to_io)?;
         {
