@@ -5,7 +5,7 @@
 //! startup (rlimits, cpu affinity, scheduler class, process name) and mostly
 //! ignores the exact values, so a believable constant answer is enough.
 
-use super::{Kernel, err};
+use super::{Kernel, Shared, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
@@ -13,7 +13,8 @@ impl Kernel {
     /// `prctl(option, ...)` — process-attribute get/set. We model the process
     /// name (`PR_SET_NAME`/`PR_GET_NAME`, stored on the kernel) and treat every
     /// other option as a successful no-op.
-    pub(super) fn sys_prctl(&mut self, args: &[u64; 6], mem: &mut GuestMemory) -> i64 {
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_prctl(&self, sh: &mut Shared, args: &[u64; 6], mem: &mut GuestMemory) -> i64 {
         const PR_SET_NAME: u64 = 15;
         const PR_GET_NAME: u64 = 16;
         match args[0] {
@@ -22,12 +23,12 @@ impl Kernel {
                     let mut buf = [0u8; 16];
                     let n = name.len().min(15);
                     buf[..n].copy_from_slice(&name[..n]);
-                    self.procname = buf;
+                    sh.procname = buf;
                 }
                 0
             }
             PR_GET_NAME => {
-                if mem.write(args[1], &self.procname).is_err() {
+                if mem.write(args[1], &sh.procname).is_err() {
                     return err(Errno::EFAULT);
                 }
                 0
@@ -196,12 +197,12 @@ mod tests {
 
     #[test]
     fn prctl_set_get_name_roundtrips() {
-        let (mut k, mut mem) = setup();
+        let (k, mut mem) = setup();
         let name = 0x1_0000;
         mem.write_init(name, b"myproc\0").unwrap();
-        assert_eq!(k.sys_prctl(&[15, name, 0, 0, 0, 0], &mut mem), 0);
+        assert_eq!(k.sys_prctl(&mut k.shared.lock().unwrap(), &[15, name, 0, 0, 0, 0], &mut mem), 0);
         let out = 0x1_1000;
-        assert_eq!(k.sys_prctl(&[16, out, 0, 0, 0, 0], &mut mem), 0);
+        assert_eq!(k.sys_prctl(&mut k.shared.lock().unwrap(), &[16, out, 0, 0, 0, 0], &mut mem), 0);
         assert_eq!(mem.read_vec(out, 6).unwrap(), b"myproc");
     }
 }

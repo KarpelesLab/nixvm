@@ -14,7 +14,7 @@
 //! is not modeled — and a pending async signal with a real handler is dropped
 //! rather than left to spin the scheduler.
 
-use super::{Kernel, RunState, SA_ONSTACK, SIGSEGV, SS_DISABLE, ServiceCtx, err};
+use super::{Kernel, RunState, SA_ONSTACK, SIGSEGV, SS_DISABLE, ServiceCtx, Shared, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
@@ -34,7 +34,7 @@ impl Kernel {
     /// is rejected with `EINVAL`.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_rt_sigaction(
-        &mut self, cx: &mut ServiceCtx,
+        &self, cx: &mut ServiceCtx,
         sig: u64,
         act: u64,
         oldact: u64,
@@ -79,7 +79,7 @@ impl Kernel {
     /// registered `SA_ONSTACK` runs on. `stack_t` is `{ void *ss_sp; int
     /// ss_flags; size_t ss_size }`.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_sigaltstack(&mut self, cx: &mut ServiceCtx, ss: u64, old_ss: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_sigaltstack(&self, cx: &mut ServiceCtx, ss: u64, old_ss: u64, mem: &mut GuestMemory) -> i64 {
         let (sp, size, flags) = cx.cur.altstack;
         if old_ss != 0 {
             let mut buf = [0u8; 24];
@@ -107,7 +107,7 @@ impl Kernel {
     /// mask. `sigsetsize` is accepted but ignored.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_rt_sigprocmask(
-        &mut self, cx: &mut ServiceCtx,
+        &self, cx: &mut ServiceCtx,
         how: u64,
         set: u64,
         oldset: u64,
@@ -136,7 +136,7 @@ impl Kernel {
 
     /// `rt_sigpending(set, sigsetsize)` — report the pending-signal mask.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_rt_sigpending(&mut self, cx: &mut ServiceCtx, set: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_rt_sigpending(&self, cx: &mut ServiceCtx, set: u64, mem: &mut GuestMemory) -> i64 {
         if set != 0 && mem.write(set, &cx.cur.pending.to_le_bytes()).is_err() {
             return err(Errno::EFAULT);
         }
@@ -145,9 +145,9 @@ impl Kernel {
 
     /// `kill`/`tkill(pid, sig)` — post `sig` to the target process. `sig == 0`
     /// is an existence check. `pid <= 0` or `pid == self` targets the caller.
-    pub(super) fn sys_kill(&mut self, cx: &mut ServiceCtx, pid: i64, sig: u64) -> i64 {
+    pub(super) fn sys_kill(&self, sh: &mut Shared, cx: &mut ServiceCtx, pid: i64, sig: u64) -> i64 {
         if sig == 0 {
-            return if pid <= 0 || self.pid_exists(cx, pid) {
+            return if pid <= 0 || self.pid_exists(sh, cx, pid) {
                 0
             } else {
                 err(Errno::ESRCH)
@@ -161,7 +161,7 @@ impl Kernel {
             cx.cur.pending |= bit;
             return 0;
         }
-        for slot in self.procs.iter_mut().flatten() {
+        for slot in sh.procs.iter_mut().flatten() {
             if i64::from(slot.info.pid) == pid {
                 slot.info.pending |= bit;
                 return 0;
@@ -172,9 +172,10 @@ impl Kernel {
 
     /// Whether a process with `pid` exists (the running process is held in
     /// `self.cur`, out of the table, during its slice).
-    fn pid_exists(&self, cx: &ServiceCtx, pid: i64) -> bool {
+    #[allow(clippy::unused_self)]
+    fn pid_exists(&self, sh: &Shared, cx: &ServiceCtx, pid: i64) -> bool {
         pid == i64::from(cx.cur.pid)
-            || self
+            || sh
                 .procs
                 .iter()
                 .flatten()
@@ -185,7 +186,7 @@ impl Kernel {
     /// current process. Runs once after each serviced syscall; it never loops
     /// waiting for a signal and never invokes a real handler.
     #[allow(clippy::unused_self)]
-    pub(super) fn deliver_pending_signals(&mut self, cx: &mut ServiceCtx) {
+    pub(super) fn deliver_pending_signals(&self, cx: &mut ServiceCtx) {
         if !matches!(cx.cur.run, RunState::Running) {
             return;
         }
@@ -277,7 +278,7 @@ impl Kernel {
     /// all: without it every such trap is a hard crash.
     #[allow(clippy::unused_self)]
     pub(super) fn deliver_fault_signal(
-        &mut self, cx: &mut ServiceCtx,
+        &self, cx: &mut ServiceCtx,
         sig: u64,
         fault_addr: u64,
         vcpu: &mut dyn crate::vcpu::Vcpu,
@@ -387,7 +388,7 @@ impl Kernel {
     /// frame is at `rsp - 8` (the handler's trampoline `ret`'d off `pretcode`),
     /// so `uc_mcontext` is at a fixed offset below the current `rsp`.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_rt_sigreturn(&mut self, cx: &mut ServiceCtx, vcpu: &mut dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
+    pub(super) fn sys_rt_sigreturn(&self, cx: &mut ServiceCtx, vcpu: &mut dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
         // On entry to the restorer, rsp pointed at pretcode; its `ret` popped 8,
         // so uc_mcontext is at rsp + (MCTX_OFF - 8).
         let mctx = vcpu.sp().wrapping_add(MCTX_OFF - 8);
