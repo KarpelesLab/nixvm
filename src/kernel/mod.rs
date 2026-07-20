@@ -2,14 +2,18 @@
 //! and schedules multiple guest processes.
 //!
 //! State is split between **global** kernel state (mount table, pipes, stdio,
-//! process table) and **per-process** state (`ProcInfo`: fds, cwd, brk, mmap
-//! arena, pid). The currently-running process's `ProcInfo` is swapped into
-//! `self.cur` while it runs, so the syscall handlers read/write `self.cur.*`
-//! for per-process state and `self.*` for globals — no per-handler `Process`
-//! threading. The scheduler ([`Kernel::run`]) is a cooperative round-robin over
-//! `Process`es; a syscall that would block re-traps later (we simply don't
-//! advance the guest PC), which the interpreter turns back into the same
-//! syscall on the next slice.
+//! process table) and the **running task's** state ([`ServiceCtx`]: its
+//! `ProcInfo` — fds, cwd, brk, mmap arena, pid — plus the per-syscall `block`/
+//! `yield_now`/`exec_ok` flags). The servicer owns a `ServiceCtx` for the
+//! duration of a slice (built from the task's `ProcInfo`, restored after), and
+//! threads `&mut cx` through the syscall handlers, which read/write `cx.cur.*`
+//! for per-task state and `self.*` for globals. Making that state a passed-in
+//! value rather than a single `Kernel` field is what lets several tasks be
+//! serviced concurrently once the global lock is split (a later phase); today
+//! it is still one servicer at a time. The scheduler ([`Kernel::run`]) is a
+//! cooperative round-robin over `Process`es; a syscall that would block re-traps
+//! later (we simply don't advance the guest PC), which the interpreter turns
+//! back into the same syscall on the next slice.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
