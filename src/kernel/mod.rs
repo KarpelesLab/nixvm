@@ -2114,21 +2114,28 @@ impl Kernel {
         let Some(elf) = self.read_file(abs) else {
             return err(Errno::ENOENT);
         };
-        let (base, size) = (mem.base(), mem.size());
-        let mut new_mem = GuestMemory::new(base, size);
+        // Reject an obviously non-ELF64 image *before* tearing down the current
+        // one, so a bad `execve` leaves the process intact (real semantics) rather
+        // than stranded on an empty address space.
+        if elf.len() < 64 || elf[0..4] != [0x7f, b'E', b'L', b'F'] || elf[4] != 2 {
+            return err(Errno::ENOEXEC);
+        }
         let spec = ProcessSpec { argv, envp };
+        // Replace the image *in place*: tear down the old page tables (returning
+        // their frames to the shared pool) and rebuild within the SAME pool, so
+        // the one KVM memslot stays valid and the process just gets a new cr3.
+        mem.exec_reset();
         let loaded = if let Some(interp) = interp_path(&elf) {
             let Some(interp_elf) = self.read_file(&interp) else {
                 return err(Errno::ENOENT); // interpreter missing
             };
-            load_dynamic(&mut new_mem, &elf, &interp_elf, &spec)
+            load_dynamic(mem, &elf, &interp_elf, &spec)
         } else {
-            load_static(&mut new_mem, &elf, &spec)
+            load_static(mem, &elf, &spec)
         };
         let Ok(img) = loaded else {
             return err(Errno::ENOEXEC);
         };
-        *mem = new_mem;
         vcpu.reset(img.entry, img.stack_pointer);
         let mid = page_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
         self.cur.brk = img.program_break;
@@ -2418,6 +2425,12 @@ impl Kernel {
             for fd in self.cur.fds.drain() {
                 self.bump_pipe(&fd, false);
             }
+        }
+        // Last task of this address space: return its frames to the shared pool
+        // (page tables + private data pages), so a long-lived process tree does
+        // not accumulate dead processes' frames. Threads sharing the mm keep it.
+        if !self.has_cowaiter(mm) {
+            mem.release();
         }
         self.cur.run = RunState::Zombie(code & 0xff);
         0

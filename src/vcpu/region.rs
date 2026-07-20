@@ -80,9 +80,16 @@ impl Region {
 
     /// Copy `buf` into the region starting at byte offset `off`.
     ///
+    /// Takes `&self`: like [`Region::write_u64_atomic`], the store targets the
+    /// separate heap allocation `ptr` owns, not the borrowed struct fields, so it
+    /// mutates nothing reachable through the shared reference. This is what lets a
+    /// shared `Arc<PhysMem>` write to distinct guest frames without a `&mut` — the
+    /// physical-RAM model, where concurrent writes to *different* frames race with
+    /// nothing (the VMM serializes writes to the *same* frame via the kernel lock).
+    ///
     /// # Panics
     /// If `[off, off + buf.len())` is out of range.
-    pub fn write(&mut self, off: usize, buf: &[u8]) {
+    pub fn write(&self, off: usize, buf: &[u8]) {
         assert!(
             off.checked_add(buf.len())
                 .is_some_and(|end| end <= self.len),
@@ -144,9 +151,11 @@ impl Region {
 
     /// Set the `len` bytes at `off` to `val`.
     ///
+    /// Takes `&self` for the same reason as [`Region::write`].
+    ///
     /// # Panics
     /// If `[off, off + len)` is out of range.
-    pub fn fill(&mut self, off: usize, len: usize, val: u8) {
+    pub fn fill(&self, off: usize, len: usize, val: u8) {
         assert!(
             off.checked_add(len).is_some_and(|end| end <= self.len),
             "region fill out of bounds"
@@ -155,11 +164,14 @@ impl Region {
         unsafe { ptr::write_bytes(self.ptr.add(off), val, len) };
     }
 
-    /// Copy `len` bytes at offset `off` from `src` into `self` (for `fork`).
+    /// Copy `len` bytes at offset `off` from `src` into `self`.
+    ///
+    /// Takes `&self` for the same reason as [`Region::write`].
     ///
     /// # Panics
     /// If the range is out of bounds for either region.
-    pub fn copy_from(&mut self, src: &Region, off: usize, len: usize) {
+    #[allow(dead_code)] // exercised by tests; no lib caller since GuestMemory moved to the pool
+    pub fn copy_from(&self, src: &Region, off: usize, len: usize) {
         let end = off.checked_add(len);
         assert!(
             end.is_some_and(|e| e <= self.len && e <= src.len),
@@ -205,7 +217,7 @@ mod tests {
 
     #[test]
     fn write_read_roundtrip_and_fill() {
-        let mut r = Region::new(HOST_PAGE);
+        let r = Region::new(HOST_PAGE);
         r.write(16, &[1, 2, 3, 4]);
         let mut buf = [0u8; 4];
         r.read(16, &mut buf);
@@ -217,9 +229,9 @@ mod tests {
 
     #[test]
     fn copy_from_duplicates_bytes() {
-        let mut a = Region::new(HOST_PAGE);
+        let a = Region::new(HOST_PAGE);
         a.write(0, &[9, 8, 7]);
-        let mut b = Region::new(HOST_PAGE);
+        let b = Region::new(HOST_PAGE);
         b.copy_from(&a, 0, HOST_PAGE);
         let mut buf = [0u8; 3];
         b.read(0, &mut buf);
@@ -229,7 +241,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "out of bounds")]
     fn write_past_end_panics() {
-        let mut r = Region::new(HOST_PAGE);
+        let r = Region::new(HOST_PAGE);
         r.write(HOST_PAGE - 2, &[1, 2, 3, 4]);
     }
 }

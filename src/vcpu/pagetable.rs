@@ -154,7 +154,7 @@ impl AddrSpace {
     /// Create an empty address space: allocate a zeroed PML4 frame. `None` if the
     /// allocator is exhausted.
     #[must_use]
-    pub fn new(fa: &mut FrameAllocator, phys: &mut PhysMem) -> Option<Self> {
+    pub fn new(fa: &mut FrameAllocator, phys: &PhysMem) -> Option<Self> {
         let pml4 = fa.alloc(phys)?; // alloc returns a zeroed frame
         Some(Self { pml4 })
     }
@@ -178,7 +178,7 @@ impl AddrSpace {
         table_pa: u64,
         idx: u64,
         fa: &mut FrameAllocator,
-        phys: &mut PhysMem,
+        phys: &PhysMem,
     ) -> Option<u64> {
         let e = Self::entry(phys, table_pa, idx);
         if e & P != 0 {
@@ -211,7 +211,7 @@ impl AddrSpace {
         prot: Prot,
         supervisor: bool,
         fa: &mut FrameAllocator,
-        phys: &mut PhysMem,
+        phys: &PhysMem,
     ) -> Result<Option<u64>, MapErr> {
         if !vaddr.is_multiple_of(PAGE_SIZE) {
             return Err(MapErr::Misaligned(vaddr));
@@ -265,7 +265,7 @@ impl AddrSpace {
     /// Rewrite the permission bits of an existing leaf (same frame). Returns
     /// whether `vaddr` was mapped. AD bits are dropped in the rewrite, which is
     /// correct — the CPU re-sets them on the next access.
-    pub fn protect(&mut self, vaddr: u64, prot: Prot, supervisor: bool, phys: &mut PhysMem) -> bool {
+    pub fn protect(&mut self, vaddr: u64, prot: Prot, supervisor: bool, phys: &PhysMem) -> bool {
         let Some(leaf_pa) = self.leaf_pte_pa(phys, vaddr) else {
             return false;
         };
@@ -290,7 +290,7 @@ impl AddrSpace {
     /// Any interior table (PT, then PD, then PDPT) that becomes entirely empty as
     /// a result is freed back to `fa` and unlinked from its parent, so an address
     /// space does not accumulate empty tables after churn.
-    pub fn unmap(&mut self, vaddr: u64, fa: &mut FrameAllocator, phys: &mut PhysMem) -> Option<u64> {
+    pub fn unmap(&mut self, vaddr: u64, fa: &mut FrameAllocator, phys: &PhysMem) -> Option<u64> {
         // Resolve the full chain of tables, bailing if any level is absent.
         let pdpt = Self::next(phys, self.pml4, table_index(vaddr, 4))?;
         let pd = Self::next(phys, pdpt, table_index(vaddr, 3))?;
@@ -337,7 +337,7 @@ impl AddrSpace {
     /// `destroy`ed (freeing its interior tables and `decref`ing the frames the
     /// first pass shared, exactly undoing the increfs) and `None` is returned.
     #[must_use]
-    pub fn fork_cow(&mut self, fa: &mut FrameAllocator, phys: &mut PhysMem) -> Option<Self> {
+    pub fn fork_cow(&mut self, fa: &mut FrameAllocator, phys: &PhysMem) -> Option<Self> {
         let child_pml4 = fa.alloc(phys)?;
         let child = Self { pml4: child_pml4 };
         if clone_subtree(PML4_LEVEL, self.pml4, child_pml4, fa, phys).is_err() {
@@ -354,7 +354,7 @@ impl AddrSpace {
     /// Tear down the whole tree: `decref` every mapped data frame and free every
     /// page-table frame (leaves up through the PML4) back to `fa`. Consumes the
     /// `AddrSpace` — see the module docs on why this can't be `Drop`.
-    pub fn destroy(self, fa: &mut FrameAllocator, phys: &mut PhysMem) {
+    pub fn destroy(self, fa: &mut FrameAllocator, phys: &PhysMem) {
         free_subtree(PML4_LEVEL, self.pml4, fa, phys);
         fa.free(self.pml4);
     }
@@ -371,7 +371,7 @@ fn clone_subtree(
     parent_pa: u64,
     child_pa: u64,
     fa: &mut FrameAllocator,
-    phys: &mut PhysMem,
+    phys: &PhysMem,
 ) -> Result<(), ()> {
     for idx in 0..ENTRIES {
         let e = AddrSpace::entry(phys, parent_pa, idx);
@@ -417,7 +417,7 @@ fn clear_leaf_write(level: u32, table_pa: u64, phys: &PhysMem) {
 /// `level`), *excluding* `table_pa` itself (the caller frees that). At the leaf
 /// level each present entry's data frame is `decref`ed; at interior levels each
 /// child table is recursed into and then freed.
-fn free_subtree(level: u32, table_pa: u64, fa: &mut FrameAllocator, phys: &mut PhysMem) {
+fn free_subtree(level: u32, table_pa: u64, fa: &mut FrameAllocator, phys: &PhysMem) {
     for idx in 0..ENTRIES {
         let e = AddrSpace::entry(phys, table_pa, idx);
         if e & P == 0 {

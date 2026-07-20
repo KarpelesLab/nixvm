@@ -218,6 +218,11 @@ pub struct KvmVcpu {
     /// disables it. Cached from `NIXVM_QUANTUM_MS` (see [`preempt`] and
     /// [`crate::vcpu::preempt_quantum`]).
     quantum: Option<Duration>,
+    /// The `CR3` this vcpu's `sregs` currently name, so a context switch (execve
+    /// installs fresh page tables; a forked child runs a different address space)
+    /// is picked up as a single `KVM_SET_SREGS` before the next run. `None` until
+    /// the first run sets it from the guest memory's `cr3()`.
+    cur_cr3: Option<u64>,
 }
 
 // The register caches and run page are noise in a debug dump; the fd
@@ -381,7 +386,20 @@ impl KvmVcpu {
             watchpoint,
             ebp,
             quantum: crate::vcpu::preempt_quantum(),
+            cur_cr3: None,
         })
+    }
+
+    /// Point the vcpu's `sregs.cr3` at `mem`'s address space if it isn't already —
+    /// the per-process page-table switch. One `KVM_SET_SREGS` (deferred via the
+    /// dirty flag) on a change, nothing on the common same-process run.
+    fn sync_cr3(&mut self, mem: &GuestMemory) {
+        let cr3 = mem.cr3();
+        if self.cur_cr3 != Some(cr3) {
+            self.sregs.cr3 = cr3;
+            self.sregs_dirty = true;
+            self.cur_cr3 = Some(cr3);
+        }
     }
 
     /// Flush dirty caches to the vcpu, run it once, and refresh the caches.
@@ -720,9 +738,10 @@ fn init_user_sregs(sregs: &mut sys::kvm_sregs) {
     };
     sregs.cr0 = CR0_LONG;
     sregs.cr2 = 0;
-    // The protection-enforcing page tables (super::paging), not the control
-    // block's old uniformly-RWX identity map. Their PML4 is at the region base.
-    sregs.cr3 = super::paging::PT_AREA_GPA;
+    // cr3 is this process's real PML4, loaded per-run from the guest memory's
+    // `cr3()` (see `sync_cr3`); a placeholder here, overwritten before the first
+    // `KVM_RUN`.
+    sregs.cr3 = 0;
     sregs.cr4 = CR4_LONG;
     sregs.efer = EFER_LONG;
 }
@@ -734,8 +753,10 @@ impl Vcpu for KvmVcpu {
         if self.in_syscall {
             return Ok(Exit::Syscall);
         }
-        // The serial path: reconcile and run under the caller's held memory lock.
-        self.vm.reconcile_guest(mem)?;
+        // Register the pool memslot (once) and point cr3 at this process's page
+        // tables, then run under the caller's held memory lock.
+        self.vm.ensure_memslot(mem)?;
+        self.sync_cr3(mem);
         self.run_loop(Some(mem))
     }
 
@@ -747,31 +768,24 @@ impl Vcpu for KvmVcpu {
 
     fn reconcile(&mut self, mem: &mut GuestMemory) -> Result<(), VcpuError> {
         // Re-delivering a blocked syscall: `run_bare` returns Syscall without a
-        // KVM_RUN, so it never enters the run gate — don't enter it here either.
+        // KVM_RUN, so nothing to prepare.
         if self.in_syscall {
             return Ok(());
         }
-        // Reconcile slot 0 + the shadow page tables and enter the run gate, all
-        // under the memory lock the SMP worker holds around this call.
-        self.vm.begin_lockless_run(mem)
+        // The one memory-touching step before a lockless run: register the pool
+        // memslot (once) and load this process's cr3. With one always-mapped
+        // memslot and real per-process page tables there is nothing else to sync —
+        // sibling vcpus of any address space run concurrently against the same slot.
+        self.vm.ensure_memslot(mem)?;
+        self.sync_cr3(mem);
+        Ok(())
     }
 
     fn run_bare(&mut self) -> Result<Exit, VcpuError> {
         if self.in_syscall {
             return Ok(Exit::Syscall);
         }
-        // `reconcile` entered the run gate; leave it once KVM_RUN is done, whether
-        // it exited cleanly or errored, so a re-point of slot 0 can't stall.
-        let exit = self.run_loop(None);
-        self.vm.end_lockless_run();
-        exit
-    }
-
-    fn shadow_stale(&self, mem: &GuestMemory, addr: u64) -> bool {
-        // A fault on a page mapped in `mem` but not yet in the shadow tables this
-        // vcpu ran with (a sibling changed the mapping mid-run): retriable, not a
-        // real fault. See `Vm::shadow_leaf_stale`.
-        self.vm.shadow_leaf_stale(mem, addr)
+        self.run_loop(None)
     }
 
     fn syscall_nr(&self) -> u64 {
@@ -845,6 +859,9 @@ impl Vcpu for KvmVcpu {
         child.sregs = self.sregs;
         child.sregs_dirty = true;
         child.in_syscall = self.in_syscall;
+        // The child runs the *child's* address space (a different cr3); force a
+        // re-sync on its first run rather than inheriting the parent's cached one.
+        child.cur_cr3 = None;
         // FPU/SSE state is not cached host-side; copy it fd-to-fd.
         let mut fpu = sys::kvm_fpu::default();
         // SAFETY: valid out-pointer; both fds are live vcpus of this VM.
@@ -870,6 +887,9 @@ impl Vcpu for KvmVcpu {
         self.sregs.fs.base = 0;
         self.sregs_dirty = true;
         self.in_syscall = false;
+        // execve installed fresh page tables in the same GuestMemory: its `cr3()`
+        // changed, so drop the cached value and re-sync on the next run.
+        self.cur_cr3 = None;
     }
 }
 

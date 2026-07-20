@@ -20,7 +20,6 @@
 
 mod sys;
 mod vcpu;
-mod paging;
 mod vm;
 
 use crate::abi::Arch;

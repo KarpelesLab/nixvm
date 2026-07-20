@@ -61,6 +61,17 @@ pub struct PhysMem {
     size: usize,
 }
 
+// SAFETY: `PhysMem` is the shared guest physical RAM, held as an `Arc<PhysMem>`
+// by every address space (and the KVM VM). Its only non-`Sync` member is the
+// `Region`'s raw `*mut u8`. Sharing it across threads is exactly the physical-RAM
+// model: two vcpus on different cores read/write distinct frames concurrently
+// (as real RAM allows), and the VMM's big-kernel-lock serializes the host-side
+// writes that could target the *same* frame. The byte methods take `&self` and
+// touch only the owned heap allocation, never the borrowed struct.
+unsafe impl Send for PhysMem {}
+// SAFETY: see the `Send` note above.
+unsafe impl Sync for PhysMem {}
+
 impl PhysMem {
     /// Allocate a zero-filled pool holding `size` bytes of guest-physical RAM.
     /// `size` is rounded up to a whole number of frames (and, via [`Region`], to
@@ -127,9 +138,13 @@ impl PhysMem {
 
     /// Copy `bytes` into the pool starting at physical address `pa`.
     ///
+    /// Takes `&self`: the pool is shared as an `Arc<PhysMem>` and written
+    /// lock-free (the physical-RAM model — see [`Region::write`]); the VMM's
+    /// kernel lock serializes writes that would target the same frame.
+    ///
     /// # Panics
     /// If `[pa, pa + bytes.len())` is out of the pool's bounds.
-    pub fn write(&mut self, pa: u64, bytes: &[u8]) {
+    pub fn write(&self, pa: u64, bytes: &[u8]) {
         assert!(self.in_bounds(pa, bytes.len()), "phys write out of bounds");
         self.region.write(pa as usize, bytes);
     }
@@ -161,7 +176,7 @@ impl PhysMem {
     ///
     /// # Panics
     /// If `pa` is not frame-aligned or its frame lies outside the pool.
-    pub fn zero_frame(&mut self, pa: u64) {
+    pub fn zero_frame(&self, pa: u64) {
         assert!(pa.is_multiple_of(FRAME), "zero_frame: pa not frame-aligned");
         assert!(self.in_bounds(pa, FRAME_SZ), "zero_frame out of bounds");
         self.region.fill(pa as usize, FRAME_SZ, 0);
@@ -173,7 +188,7 @@ impl PhysMem {
     ///
     /// # Panics
     /// If either address is not frame-aligned or lies outside the pool.
-    pub fn copy_frame(&mut self, dst: u64, src: u64) {
+    pub fn copy_frame(&self, dst: u64, src: u64) {
         assert!(
             dst.is_multiple_of(FRAME) && src.is_multiple_of(FRAME),
             "copy_frame: address not frame-aligned"
@@ -263,8 +278,10 @@ impl FrameAllocator {
     /// turns that into `ENOMEM`; the allocator never panics on a full pool.
     ///
     /// `phys` must be the pool this allocator was built for; the frame is zeroed
-    /// there so a fresh mapping reads as zero (`MAP_ANONYMOUS` semantics).
-    pub fn alloc(&mut self, phys: &mut PhysMem) -> Option<u64> {
+    /// there so a fresh mapping reads as zero (`MAP_ANONYMOUS` semantics). `phys`
+    /// is taken by shared reference — the allocator is the sole authority on which
+    /// frame is free, so zeroing it races with no other owner.
+    pub fn alloc(&mut self, phys: &PhysMem) -> Option<u64> {
         let f = self.free_list.pop()?;
         debug_assert_eq!(self.refcount[f as usize], 0, "free-list frame was not free");
         self.refcount[f as usize] = 1;
@@ -401,7 +418,7 @@ mod tests {
 
     #[test]
     fn read_write_roundtrips_and_is_bounds_checked() {
-        let mut phys = PhysMem::new(4 * FRAME_SZ);
+        let phys = PhysMem::new(4 * FRAME_SZ);
         phys.write(0x40, &[1, 2, 3, 4]);
         let mut buf = [0u8; 4];
         phys.read(0x40, &mut buf);
@@ -423,13 +440,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "out of bounds")]
     fn write_past_end_panics() {
-        let mut phys = PhysMem::new(FRAME_SZ);
+        let phys = PhysMem::new(FRAME_SZ);
         phys.write(phys.len() as u64 - 2, &[1, 2, 3, 4]);
     }
 
     #[test]
     fn u64_atomic_store_and_read_roundtrip() {
-        let mut phys = PhysMem::new(2 * FRAME_SZ);
+        let phys = PhysMem::new(2 * FRAME_SZ);
         phys.write_u64_atomic(0x100, 0xdead_beef_cafe_babe);
         assert_eq!(phys.read_u64(0x100), 0xdead_beef_cafe_babe);
         // read_u64 also sees a plain byte write.
@@ -439,7 +456,7 @@ mod tests {
 
     #[test]
     fn zero_and_copy_frame() {
-        let mut phys = PhysMem::new(4 * FRAME_SZ);
+        let phys = PhysMem::new(4 * FRAME_SZ);
         phys.write(FRAME, &[0xAB; 16]); // dirty frame 1
         phys.zero_frame(FRAME);
         let mut buf = [0xFFu8; 16];

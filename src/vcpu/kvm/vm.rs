@@ -1,109 +1,40 @@
-//! The KVM virtual machine: fds, guest-physical layout, and the control block.
+//! The KVM virtual machine: fds, the single guest-RAM memslot, and CPUID.
 //!
 //! One [`Vm`] per [`super::KvmBackend`] (KVM has no per-process VM quota, so —
 //! unlike HVF's process-global VM — each backend owns its own, which keeps
-//! parallel `cargo test` kernels from sharing one guest-physical space). Its
-//! GPA space holds two memory slots:
+//! parallel `cargo test` kernels from sharing one guest-physical space).
 //!
-//! * **slot 0** — the guest's contiguous [`GuestMemory`] region, re-issued
-//!   whenever [`GuestMemory::backing_generation`] changes (fork/execve/context
-//!   switch), mapped at `guest_phys == guest base` so guest VA == GPA.
-//! * **slot 1** — the **control block** at [`CTRL_GPA`]: the identity page
-//!   tables (guest VA == PA over the low [`IDENTITY_TOP`], 2 MiB pages,
-//!   user-accessible),
-//!   the GDT, and the one-instruction-pair syscall trampoline
-//!   (`hlt; sysretq`) that `IA32_LSTAR` points at. x86-64 long mode cannot run
-//!   with paging off (unlike the arm64 MMU-off trick HVF uses), so the flat
-//!   address space the interpreter models is reproduced with these fixed
-//!   tables instead.
+//! Since the Phase-3 MMU refactor the guest-physical space is trivial: **one**
+//! RAM memslot mapping the whole shared physical pool
+//! ([`crate::vcpu::phys::PhysMem`]) at `guest_phys == 0`, registered once (on the
+//! first run) and never re-pointed. Every process has real page tables over that
+//! pool and its own `CR3`; a context switch is just a `KVM_SET_SREGS` of `cr3`,
+//! not a memslot swap. The supervisor scaffold (GDT/IDT/TSS/trampolines) lives in
+//! pinned pool frames mapped into every address space by [`crate::vcpu::ctrl`];
+//! there is no separate control-block slot and no shadow page-table builder.
 //!
-//! A guest `syscall` at CPL3 vectors to the trampoline at CPL0; `hlt` there
-//! exits to the host (`KVM_EXIT_HLT` — with no in-kernel irqchip the exit
-//! comes straight to userspace and `KVM_RUN` resumes after the `hlt`), the
-//! kernel services the syscall, and the resumed `sysretq` drops back to CPL3
-//! at the saved user `rip` (`rcx`) and `rflags` (`r11`).
+//! A guest `syscall` at CPL3 vectors to the `hlt; sysretq` trampoline at CPL0;
+//! `hlt` exits to the host (`KVM_EXIT_HLT`), the kernel services the syscall, and
+//! the resumed `sysretq` drops back to CPL3. A `#PF` vectors (via the IDT's only
+//! gate) to the `#PF` trampoline (`hlt`); the host reads the exception frame the
+//! CPU pushed onto the kernel stack out of the pool.
 
 use super::sys;
 use crate::vcpu::VcpuError;
 use crate::vcpu::mem::GuestMemory;
-use crate::vcpu::region::Region;
+use crate::vcpu::phys::PhysMem;
 use std::ffi::c_int;
-use std::sync::{Condvar, Mutex};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// How much of the guest-physical space the identity map covers (2 MiB pages,
-/// present/writable/user). Everything a guest can architecturally address must
-/// be below this; the control block sits at its top, so this is also the guest
-/// memory ceiling. Page tables are the only cost of raising it — one 4 KiB PD
-/// per GiB mapped (64 GiB ⇒ 256 KiB of tables) — and a real JS engine wants far
-/// more than 4 GiB of address space (JSC reserves multi-hundred-MiB regions up
-/// front), so map generously.
-pub(super) const IDENTITY_TOP: u64 = 64 << 30;
+// Re-export the control-block virtual addresses and selectors the vcpu wires into
+// its sregs/MSRs, so vcpu.rs keeps importing them from `super::vm`.
+pub use crate::vcpu::ctrl::{
+    FAULT_TRAMP_VA, GDT_BASE, GDT_LIMIT, IDT_BASE, LSTAR_VA, SEL_TSS, SEL_UCODE, SEL_UDATA,
+    STAR_VALUE, TSS_BASE,
+};
 
-/// One page directory per GiB of identity map.
-const PD_PAGES: usize = (IDENTITY_TOP >> 30) as usize;
-
-// Byte offsets of the control block's pieces within its region.
-const PML4_OFF: usize = 0x0000;
-const PDPT_OFF: usize = 0x1000;
-const PD_OFF: usize = 0x2000; // PD_PAGES pages, one per GiB mapped
-const GDT_OFF: usize = PD_OFF + PD_PAGES * 0x1000;
-const TRAMP_OFF: usize = GDT_OFF + 0x1000;
-/// The `#PF` (page fault) trampoline: a lone `hlt`. A protection/not-present
-/// fault vectors here at CPL0 (via the IDT); the `hlt` exits to the host, which
-/// reads the exception frame the CPU pushed onto the kernel stack.
-const FAULT_TRAMP_OFF: usize = TRAMP_OFF + 0x1000;
-const IDT_OFF: usize = FAULT_TRAMP_OFF + 0x1000; // 256 × 16-byte gates
-const TSS_OFF: usize = IDT_OFF + 0x1000;
-const KSTACK_OFF: usize = TSS_OFF + 0x1000; // one page; RSP0 = its top
-const CTRL_SIZE: usize = KSTACK_OFF + 0x1000;
-
-/// Guest-physical base of the control block (slot 1) — the top 2 MiB of the
-/// identity-mapped window, above any guest region. Guest memory must end below
-/// it.
-pub(super) const CTRL_GPA: u64 = IDENTITY_TOP - (2 << 20);
-
-/// The virtual address `IA32_LSTAR` points at: the `hlt; sysretq` trampoline
-/// (identity-mapped, so VA == GPA).
-pub const LSTAR_VA: u64 = CTRL_GPA + TRAMP_OFF as u64;
-
-/// Linear address of the GDT (identity-mapped).
-pub const GDT_BASE: u64 = CTRL_GPA + GDT_OFF as u64;
-
-/// The `#PF` trampoline's virtual address (the host recognizes a fault exit by
-/// the vcpu `rip` landing just past it).
-pub(super) const FAULT_TRAMP_VA: u64 = CTRL_GPA + FAULT_TRAMP_OFF as u64;
-/// Linear address of the IDT and of the TSS, and the kernel stack top the TSS
-/// switches to on a CPL3→CPL0 exception (`RSP0`).
-pub(super) const IDT_BASE: u64 = CTRL_GPA + IDT_OFF as u64;
-pub(super) const TSS_BASE: u64 = CTRL_GPA + TSS_OFF as u64;
-pub(super) const KSTACK_TOP: u64 = CTRL_GPA + (KSTACK_OFF + 0x1000) as u64;
-/// GDT selector of the TSS descriptor (a 16-byte descriptor at slots 5–6).
-pub(super) const SEL_TSS: u16 = 0x28;
-
-// GDT layout (selectors). `syscall` loads CS/SS from `STAR[47:32]` (= 0x08,
-// +8 for SS); `sysretq` loads them from `STAR[63:48]` (= 0x13: +16 → CS
-// 0x20|RPL3 = 0x23, +8 → SS 0x18|RPL3 = 0x1B). The GDT entries themselves are
-// the classic flat 64-bit descriptors.
-pub const SEL_KCODE: u16 = 0x08;
-#[allow(dead_code)] // syscall's SS is implicitly SEL_KCODE + 8; named for the GDT map above
-pub const SEL_KDATA: u16 = 0x10;
-pub const SEL_UDATA: u16 = 0x18 | 3;
-pub const SEL_UCODE: u16 = 0x20 | 3;
-/// `IA32_STAR`: `sysretq` base selector in [63:48], `syscall` CS in [47:32].
-pub const STAR_VALUE: u64 =
-    (((SEL_UDATA as u64 & !3) - 8) | 3) << 48 | (SEL_KCODE as u64) << 32;
-
-/// Page-table entry bits: present, writable, user-accessible; PS marks a
-/// 2 MiB leaf in a PD entry.
-const PTE_P_RW_US: u64 = 0b111;
-const PTE_PS: u64 = 1 << 7;
-
-/// The number of GDT bytes in use (5 descriptors), for the GDTR limit.
-pub const GDT_LIMIT: u16 = 7 * 8 - 1; // 5 segment descriptors + a 16-byte TSS descriptor
-
-/// An owned Unix fd that closes on drop (std's `OwnedFd` would work too, but
-/// the raw `c_int` keeps this module symmetric with the hand-rolled FFI).
+/// An owned Unix fd that closes on drop.
 #[derive(Debug)]
 pub struct Fd(pub c_int);
 
@@ -126,67 +57,36 @@ pub fn check(ret: c_int, what: &str) -> Result<c_int, VcpuError> {
     }
 }
 
-/// The state of guest slot 0, guarded so concurrent vcpus (SMP is a later
-/// milestone, but `fork` already means several vcpus share one VM) reconcile
-/// consistently.
-#[derive(Debug, Default)]
-struct GuestSlot {
-    /// `backing_generation` of the [`GuestMemory`] currently mapped.
-    generation: Option<u64>,
-    /// The guest page tables (built on first run, then kept in sync with the
-    /// running address space's protection map). Their memslot is registered
-    /// once, when they are created.
-    page_tables: Option<super::paging::PageTables>,
-    /// How many vcpus are currently inside a *lockless* `KVM_RUN` against the
-    /// backing named by `generation` (the SMP path; see [`Vm::begin_lockless_run`]).
-    /// The single guest memslot (slot 0) can map only one backing at a time, so
-    /// re-pointing it to a different generation — a context switch to a forked
-    /// child or an execve'd image — must wait for this to drain to zero, or it
-    /// would swap guest RAM out from under a running sibling. Zero on the serial
-    /// path (which runs one vcpu at a time and never overlaps a re-point with a
-    /// run).
-    active: usize,
-}
-
-/// One KVM virtual machine. Holds `/dev/kvm`, the VM fd, the control-block
-/// memory, and the supported-CPUID snapshot each vcpu is initialized with.
+/// One KVM virtual machine. Holds `/dev/kvm`, the VM fd, the supported-CPUID
+/// snapshot, and — once the first vcpu runs — a handle on the shared pool whose
+/// single memslot it registered.
 #[derive(Debug)]
 pub struct Vm {
-    /// `/dev/kvm`, retained so the system fd outlives the VM (closed on drop;
-    /// future system ioctls — `KVM_CHECK_EXTENSION` — go through it).
     _sys_fd: Fd,
     fd: Fd,
-    /// Size of the per-vcpu `kvm_run` mmap.
     vcpu_mmap_size: usize,
-    /// Backing for slot 1 (page tables, GDT, trampoline). Owned so it outlives
-    /// the kernel's mapping of it; never written after construction.
-    ctrl: Region,
-    /// `KVM_GET_SUPPORTED_CPUID` snapshot handed to each vcpu.
     cpuid: Box<sys::kvm_cpuid2>,
-    guest_slot: Mutex<GuestSlot>,
-    /// Signalled when [`GuestSlot::active`] reaches zero, so a thread waiting to
-    /// re-point slot 0 to a different backing generation can proceed.
-    slot_drained: Condvar,
+    /// The shared physical pool, registered as the one RAM memslot on the first
+    /// run. `None` until then. Kept so the fault path can read the exception frame
+    /// out of the control block without a `GuestMemory` borrow (the SMP path holds
+    /// none). All address spaces share this pool, so it is registered exactly once.
+    pool: Mutex<Option<std::sync::Arc<PhysMem>>>,
     next_vcpu_id: AtomicU32,
 }
 
-// SAFETY: `Vm` is shared (`Arc`) across the vcpus of one kernel. Its only
-// non-`Sync` member is the `Region` behind `ctrl` (a raw allocation), which is
-// written exclusively during `Vm::new` and only read (its pointer) afterwards;
-// the mutable slot state lives behind a `Mutex` and the fds/ids are ioctl
-// handles the kernel serializes internally.
+// SAFETY: `Vm` is shared (`Arc`) across the vcpus of one kernel. The pool handle
+// lives behind a `Mutex`; the fds/ids are ioctl handles the kernel serializes
+// internally. `PhysMem`'s bytes are the shared physical RAM — concurrent access
+// to distinct frames is the model, serialized where it matters by the kernel lock.
 unsafe impl Send for Vm {}
 // SAFETY: see the `Send` note above.
 unsafe impl Sync for Vm {}
 
 impl Vm {
-    /// Open `/dev/kvm` and build a VM with the control block mapped. Any
-    /// failure (no `/dev/kvm`, no permission, wrong API version) is returned
-    /// as a backend error — which [`crate::vcpu::select`] turns into an
-    /// interpreter fallback.
+    /// Open `/dev/kvm` and build a VM. No memslot is registered yet — the pool
+    /// isn't known until the first `GuestMemory` runs.
     pub fn new() -> Result<Self, VcpuError> {
-        // SAFETY: a NUL-terminated path literal; `open` allocates nothing we
-        // must free besides the fd, which `Fd` owns.
+        // SAFETY: a NUL-terminated path literal; `Fd` owns the returned fd.
         let raw = unsafe { sys::open(c"/dev/kvm".as_ptr(), sys::O_RDWR | sys::O_CLOEXEC) };
         let sys_fd = Fd(check(raw, "open(/dev/kvm)")?);
 
@@ -199,13 +99,11 @@ impl Vm {
             )));
         }
 
-        // SAFETY: `KVM_CREATE_VM` takes the machine type (0 = default); the
-        // returned fd is owned by `Fd`.
+        // SAFETY: `KVM_CREATE_VM` takes the machine type (0 = default).
         let raw = unsafe { sys::ioctl(sys_fd.0, sys::KVM_CREATE_VM, 0) };
         let fd = Fd(check(raw, "KVM_CREATE_VM")?);
 
-        // Intel without "unrestricted guest" needs a TSS window for real-mode
-        // emulation; harmless elsewhere. Failure is non-fatal by design.
+        // Intel without "unrestricted guest" needs a TSS window; harmless else.
         // SAFETY: takes a plain GPA argument; the fd is live.
         unsafe { sys::ioctl(fd.0, sys::KVM_SET_TSS_ADDR, 0xFFFB_D000u64) };
 
@@ -219,8 +117,8 @@ impl Vm {
             nent: sys::CPUID_CAP as u32,
             ..Default::default()
         });
-        // SAFETY: `cpuid` is a live, writable allocation whose `nent` bounds
-        // the entry array; the kernel fills entries and shrinks `nent`.
+        // SAFETY: `cpuid` is a live, writable allocation whose `nent` bounds the
+        // entry array; the kernel fills entries and shrinks `nent`.
         let raw = unsafe {
             sys::ioctl(
                 sys_fd.0,
@@ -230,19 +128,14 @@ impl Vm {
         };
         check(raw, "KVM_GET_SUPPORTED_CPUID")?;
 
-        let ctrl = build_control_block();
-        let vm = Self {
+        Ok(Self {
             _sys_fd: sys_fd,
             fd,
             vcpu_mmap_size,
-            ctrl,
             cpuid,
-            guest_slot: Mutex::new(GuestSlot::default()),
-            slot_drained: Condvar::new(),
+            pool: Mutex::new(None),
             next_vcpu_id: AtomicU32::new(0),
-        };
-        vm.set_slot(1, CTRL_GPA, CTRL_SIZE as u64, vm.ctrl.as_ptr())?;
-        Ok(vm)
+        })
     }
 
     /// Issue `KVM_SET_USER_MEMORY_REGION` for `slot`.
@@ -254,9 +147,8 @@ impl Vm {
             memory_size: size,
             userspace_addr: host as u64,
         };
-        // SAFETY: `region` is a valid struct for the ioctl's duration;
-        // `host` points at a live allocation of at least `size` bytes owned by
-        // the caller for the mapping's lifetime (a `Region`).
+        // SAFETY: `region` is valid for the ioctl's duration; `host` points at a
+        // live allocation of at least `size` bytes owned by the pool for its life.
         let ret = unsafe {
             sys::ioctl(
                 self.fd.0,
@@ -267,143 +159,32 @@ impl Vm {
         check(ret, "KVM_SET_USER_MEMORY_REGION").map(drop)
     }
 
-    /// (Re)issue guest slot 0 if `mem`'s backing changed since the last run —
-    /// the seam that makes fork/execve (a new backing) and a future context
-    /// switch just work. The mapping is `guest_phys == mem.base()`, so the
-    /// guest's flat virtual addresses hit the identity map and land on the
-    /// same bytes the kernel's copy-in/out reads.
-    pub fn reconcile_guest(&self, mem: &mut GuestMemory) -> Result<(), VcpuError> {
-        let generation = mem.backing_generation();
-        let mut slot = self.guest_slot.lock().unwrap();
-        self.ensure_page_tables(&mut slot, mem)?;
-
-        // (Re)map guest RAM when the backing changed (fork/execve/switch). The
-        // serial scheduler runs exactly one vcpu at a time, so re-pointing slot 0
-        // here never overlaps another vcpu's run — no drain is needed (the SMP
-        // path, `begin_lockless_run`, is the one that must quiesce first).
-        if slot.generation != Some(generation) {
-            if slot.generation.is_some() {
-                self.set_slot(0, 0, 0, std::ptr::null_mut())?; // delete stale slot
+    /// Register the shared pool as the one RAM memslot. In production this fires
+    /// exactly once: every address space (fork child, execve image) shares the one
+    /// pool minted for pid 1, so the memslot is never re-pointed. The pool-changed
+    /// branch exists only for tests that drive one backend across several
+    /// independent `GuestMemory::new` pools; a serial run makes re-pointing safe.
+    pub fn ensure_memslot(&self, mem: &GuestMemory) -> Result<(), VcpuError> {
+        let mut pool = self.pool.lock().unwrap();
+        let want = mem.phys_ptr();
+        if pool.as_ref().map(|p| p.as_ptr()) != Some(want) {
+            if pool.is_some() {
+                self.set_slot(0, 0, 0, std::ptr::null_mut())?; // delete the stale slot
             }
-            self.set_slot(0, mem.base(), mem.size(), mem.host_base())?;
-            slot.generation = Some(generation);
-        }
-
-        // Bring the page-table leaves in step with the protection map (full
-        // rebuild on an address-space switch, incremental on mmap/mprotect).
-        slot.page_tables.as_mut().unwrap().sync(mem);
-        Ok(())
-    }
-
-    /// On the VM's first run, build the guest page tables and register their
-    /// (fixed) memslot. A no-op once built.
-    fn ensure_page_tables(
-        &self,
-        slot: &mut GuestSlot,
-        mem: &GuestMemory,
-    ) -> Result<(), VcpuError> {
-        if slot.page_tables.is_none() {
-            let end = mem.base() + mem.size();
-            if end > CTRL_GPA {
-                return Err(VcpuError::Backend(format!(
-                    "guest region [{:#x}, {end:#x}) reaches past the control block at {CTRL_GPA:#x}",
-                    mem.base()
-                )));
-            }
-            let pt = super::paging::PageTables::new(mem.base(), mem.size());
-            self.set_slot(2, pt.gpa(), pt.size(), pt.host_base())?;
-            slot.page_tables = Some(pt);
+            self.set_slot(0, 0, mem.phys_len(), want)?;
+            *pool = Some(mem.phys_arc());
         }
         Ok(())
     }
 
-    /// The SMP scheduler's lockless-run entry: reconcile slot 0 and the shadow
-    /// page tables for `mem`, then register this vcpu as an in-flight runner of
-    /// `mem`'s backing generation. Pair every success with exactly one
-    /// [`Vm::end_lockless_run`]; between them the vcpu may execute `KVM_RUN` with
-    /// the `GuestMemory` lock dropped.
-    ///
-    /// The single guest memslot (slot 0) can map only one backing at a time. When
-    /// this vcpu's backing differs from the one currently mapped — a context
-    /// switch to a forked child or an execve'd image, since one `Vm` is shared by
-    /// every address space (`vcpu.fork()` clones the `Arc<Vm>`) — the re-point
-    /// must wait until every runner of the old backing has left `KVM_RUN`, or it
-    /// would unmap guest RAM out from under one. The wait is bounded by the
-    /// preemption quantum, which forces a compute-bound `KVM_RUN` to return.
-    /// Runners of the *same* backing proceed concurrently: `sync`'s leaf updates
-    /// are atomic 64-bit stores (see `Region::write_u64_atomic`), so a sibling's
-    /// page walk never sees a torn PTE, and a mapping change a sibling has not yet
-    /// picked up surfaces as a retriable stale-shadow fault (`shadow_leaf_stale`).
-    pub fn begin_lockless_run(&self, mem: &mut GuestMemory) -> Result<(), VcpuError> {
-        let generation = mem.backing_generation();
-        let mut slot = self.guest_slot.lock().unwrap();
-        self.ensure_page_tables(&mut slot, mem)?;
-
-        // Re-point slot 0 to this backing if it isn't already, first draining any
-        // runners of the currently-mapped backing. Re-check each wakeup: another
-        // thread may have switched slot 0 (possibly to *our* generation) while we
-        // waited.
-        loop {
-            if slot.generation == Some(generation) {
-                break;
-            }
-            if slot.active == 0 {
-                if slot.generation.is_some() {
-                    self.set_slot(0, 0, 0, std::ptr::null_mut())?; // delete stale slot
-                }
-                self.set_slot(0, mem.base(), mem.size(), mem.host_base())?;
-                slot.generation = Some(generation);
-                break;
-            }
-            slot = self.slot_drained.wait(slot).unwrap();
-        }
-
-        // With slot 0 on our backing, bring the shadow leaves into step (a full
-        // rebuild only on a backing switch — which just drained, so no runner is
-        // executing; incremental atomic updates otherwise, safe alongside running
-        // same-backing siblings).
-        slot.page_tables.as_mut().unwrap().sync(mem);
-        slot.active += 1;
-        Ok(())
-    }
-
-    /// End the lockless run begun by [`Vm::begin_lockless_run`]: drop this vcpu's
-    /// in-flight count and, when it reaches zero, wake any thread waiting to
-    /// re-point slot 0 to a different backing.
-    pub fn end_lockless_run(&self) {
-        let mut slot = self.guest_slot.lock().unwrap();
-        slot.active -= 1;
-        if slot.active == 0 {
-            self.slot_drained.notify_all();
-        }
-    }
-
-    /// Whether the shadow leaf PTE for `addr` is out of step with `mem` — a
-    /// mapping change a sibling made while this address space's tables were synced
-    /// for an earlier dispatch. See [`super::paging::PageTables::leaf_is_stale`].
-    /// If the tables momentarily reflect a different backing than `mem` (a
-    /// concurrent context switch), the comparison mismatches and the caller
-    /// retries — the retry's reconcile brings the tables back to `mem`, so the
-    /// outcome is still correct.
-    #[must_use]
-    pub fn shadow_leaf_stale(&self, mem: &GuestMemory, addr: u64) -> bool {
-        let slot = self.guest_slot.lock().unwrap();
-        slot.page_tables
-            .as_ref()
-            .is_some_and(|pt| pt.leaf_is_stale(mem, addr))
-    }
-
-    /// Create a vcpu: its fd and the shared `kvm_run` page. vcpu ids are never
-    /// reused (KVM keeps a vcpu alive until the VM dies, even after its fd
-    /// closes), so a pathological fork storm eventually hits the kernel's
-    /// max-vcpu cap — an accepted limit of this milestone.
+    /// Create a vcpu: its fd and the shared `kvm_run` page.
     pub fn create_vcpu(&self) -> Result<(Fd, *mut sys::kvm_run), VcpuError> {
         let id = self.next_vcpu_id.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `KVM_CREATE_VCPU` takes the vcpu id; the fd is owned below.
         let raw = unsafe { sys::ioctl(self.fd.0, sys::KVM_CREATE_VCPU, u64::from(id)) };
         let fd = Fd(check(raw, "KVM_CREATE_VCPU")?);
-        // SAFETY: mapping `vcpu_mmap_size` bytes of the vcpu fd as the kernel
-        // documents; the resulting pointer is checked against MAP_FAILED.
+        // SAFETY: mapping `vcpu_mmap_size` bytes of the vcpu fd as documented; the
+        // result is checked against MAP_FAILED.
         let run = unsafe {
             sys::mmap(
                 std::ptr::null_mut(),
@@ -431,94 +212,11 @@ impl Vm {
         &self.cpuid
     }
 
-    /// Read 8 bytes of the control block at guest-physical `gpa` (used to read
-    /// the exception frame the CPU pushed onto the kernel stack), or `None` if
-    /// `gpa` is outside `[CTRL_GPA, CTRL_GPA + CTRL_SIZE)`.
-    pub fn read_ctrl_u64(&self, gpa: u64) -> Option<u64> {
-        let off = gpa.checked_sub(CTRL_GPA)? as usize;
-        if off + 8 > CTRL_SIZE {
-            return None;
-        }
-        let mut b = [0u8; 8];
-        self.ctrl.read(off, &mut b);
-        Some(u64::from_le_bytes(b))
+    /// Read 8 bytes of the control block at control virtual address `va` — the
+    /// exception frame the CPU pushed onto the kernel stack — from the registered
+    /// pool. `None` before the memslot is registered or outside the control block.
+    pub fn read_ctrl_u64(&self, va: u64) -> Option<u64> {
+        let pool = self.pool.lock().unwrap();
+        crate::vcpu::ctrl::read_u64(pool.as_ref()?, va)
     }
-}
-
-/// Build the control block: identity page tables over the low `IDENTITY_TOP` (2 MiB
-/// pages, present/writable/user — per-page W^X is a later milestone, matching
-/// HVF's uniformly-RWX stage 2), the flat GDT, and the syscall trampoline.
-fn build_control_block() -> Region {
-    let mut ctrl = Region::new(CTRL_SIZE);
-
-    // PML4[0] → PDPT.
-    let pml4e = (CTRL_GPA + PDPT_OFF as u64) | PTE_P_RW_US;
-    ctrl.write(PML4_OFF, &pml4e.to_le_bytes());
-
-    // PDPT[0..PD_PAGES] → one PD per GiB.
-    for g in 0..PD_PAGES {
-        let pdpte = (CTRL_GPA + (PD_OFF + g * 0x1000) as u64) | PTE_P_RW_US;
-        ctrl.write(PDPT_OFF + g * 8, &pdpte.to_le_bytes());
-    }
-
-    // PD entries: 2 MiB identity leaves covering [0, IDENTITY_TOP).
-    let mut gpa = 0u64;
-    let mut off = PD_OFF;
-    while gpa < IDENTITY_TOP {
-        let pde = gpa | PTE_P_RW_US | PTE_PS;
-        ctrl.write(off, &pde.to_le_bytes());
-        gpa += 2 << 20;
-        off += 8;
-    }
-
-    // GDT: null, kernel code64, kernel data, user data, user code64 — the
-    // classic flat descriptors, in the order `syscall`/`sysretq` expect.
-    let gdt: [u64; 5] = [
-        0,
-        0x00AF_9A00_0000_FFFF, // 0x08 kernel code (L=1, DPL0)
-        0x00CF_9200_0000_FFFF, // 0x10 kernel data
-        0x00CF_F200_0000_FFFF, // 0x18 user data  (DPL3)
-        0x00AF_FA00_0000_FFFF, // 0x20 user code  (L=1, DPL3)
-    ];
-    for (i, d) in gdt.iter().enumerate() {
-        ctrl.write(GDT_OFF + i * 8, &d.to_le_bytes());
-    }
-
-    // TSS descriptor (16 bytes, GDT slots 5–6): a 64-bit available TSS at
-    // TSS_BASE, limit 0x67. `ltr SEL_TSS` loads it; `RSP0` is where the CPU
-    // switches to on a CPL3→CPL0 exception.
-    let base = TSS_BASE;
-    let limit = 0x67u64;
-    let lo = (limit & 0xFFFF)
-        | ((base & 0xFFFF) << 16)
-        | (((base >> 16) & 0xFF) << 32)
-        | (0x8Bu64 << 40) // present | type 0xB (busy 64-bit TSS, matching sregs.tr)
-        | (((limit >> 16) & 0xF) << 48)
-        | (((base >> 24) & 0xFF) << 56);
-    let hi = (base >> 32) & 0xFFFF_FFFF;
-    ctrl.write(GDT_OFF + 5 * 8, &lo.to_le_bytes());
-    ctrl.write(GDT_OFF + 6 * 8, &hi.to_le_bytes());
-
-    // The 64-bit TSS: only RSP0 (offset 4) matters — the kernel stack the CPU
-    // uses when an exception raises the privilege level.
-    ctrl.write(TSS_OFF + 4, &KSTACK_TOP.to_le_bytes());
-    ctrl.write(TSS_OFF + 102, &0x68u16.to_le_bytes()); // iomap base past the TSS
-
-    // IDT entry 14 (#PF) → the fault trampoline, a 64-bit interrupt gate at
-    // CPL0. Every other vector is absent, so non-#PF exceptions still escalate
-    // to a triple fault (decoded via cr2 / reported as illegal).
-    let off = FAULT_TRAMP_VA;
-    let gate_lo = (off & 0xFFFF)
-        | ((SEL_KCODE as u64) << 16)
-        | (0x8Eu64 << 40) // present | DPL0 | 64-bit interrupt gate
-        | (((off >> 16) & 0xFFFF) << 48);
-    let gate_hi = (off >> 32) & 0xFFFF_FFFF;
-    ctrl.write(IDT_OFF + 14 * 16, &gate_lo.to_le_bytes());
-    ctrl.write(IDT_OFF + 14 * 16 + 8, &gate_hi.to_le_bytes());
-
-    // Trampolines: the syscall one (`IA32_LSTAR`) and the #PF one.
-    ctrl.write(TRAMP_OFF, &[0xF4, 0x48, 0x0F, 0x07]); // hlt ; sysretq
-    ctrl.write(FAULT_TRAMP_OFF, &[0xF4]); // hlt
-
-    ctrl
 }

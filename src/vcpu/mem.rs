@@ -1,45 +1,36 @@
-//! Guest memory.
+//! Guest memory: one process's virtual address space over the shared pool.
 //!
-//! One guest process's flat physical/virtual address space at `[base, base +
-//! size)`, backed by a single contiguous, host-page-aligned [`Region`]. Pages
-//! are tracked (at 4 KiB granularity) as unmapped until `map`ped, each carrying
-//! `PROT_*` bits; reads/writes are bounds- and permission-checked so a bad guest
-//! pointer surfaces as [`MemError`] instead of corrupting host memory.
+//! Phase 3 of the MMU refactor replaced the flat, identity-mapped backing with a
+//! *real* MMU model. Guest RAM is one shared pool of physical frames
+//! ([`super::phys::PhysMem`]) registered as a single KVM memslot; each process
+//! owns a 4-level x86-64 page-table tree ([`super::pagetable::AddrSpace`], its own
+//! `CR3`) over that pool. A [`GuestMemory`] bundles the two together plus the
+//! per-page bookkeeping the kernel and loader need.
 //!
-//! The backing is one contiguous allocation so a hardware backend (HVF/KVM) can
-//! `hv_vm_map` it straight into a guest — the guest then writes through to the
-//! very bytes the kernel's syscall copy-in/out reads via [`GuestMemory::read`]/
-//! [`GuestMemory::write`]. The software interpreter uses the same store.
+//! The public surface is unchanged from the flat model — `read`/`write`/`map`/
+//! `protect`/`unmap`/`fork`/`write_init`/… — so the kernel, loader, and
+//! interpreter call it exactly as before; only the internals now translate every
+//! access through the page tables and copy to/from the pool. Protection is
+//! enforced by the page tables (the same tables the KVM hardware walker uses), so
+//! a write to a read-only page, a fetch from an NX page, or a store to a
+//! copy-on-write page all fault identically under the interpreter and under KVM.
 //!
-//! Copy-on-write: [`GuestMemory::fork`] gives the child its own region and
-//! eagerly copies the parent's *resident* (mapped) pages — correct isolation,
-//! bounded by the working set. The fault-driven COW seam is preserved in the API
-//! ([`GuestMemory::write_trap`], [`GuestMemory::cow_fault`]) so the interpreter
-//! and a hardware backend share one contract; lazy/shared COW over this unified
-//! region (via a shared frame arena + stage-2/`mprotect` faults) is a later
-//! milestone, so today `write_trap` never faults and `cow_fault` never fires.
+//! Copy-on-write: [`GuestMemory::fork`] shares every mapped frame read-only with
+//! the child (via [`AddrSpace::fork_cow`]); the first write on either side
+//! privatizes the frame ([`GuestMemory::cow_fault`], or transparently inside
+//! `write`/`write_init`). Only touched pages ever consume a private frame.
 
-use super::region::{HOST_PAGE, Region};
-use std::sync::atomic::{AtomicU64, Ordering};
+use super::ctrl;
+use super::pagetable::AddrSpace;
+use super::phys::{FrameAllocator, PhysMem};
+use super::region::HOST_PAGE;
+use std::sync::{Arc, Mutex};
 
 /// Guest page size advertised to the guest (`AT_PAGESZ`, `sysconf(_SC_PAGESIZE)`).
 pub const PAGE_SIZE: u64 = 4096;
 
 /// Page size as a `usize`, for indexing metadata.
 const PS: usize = PAGE_SIZE as usize;
-
-/// Backing-allocation identity. Every fresh region ([`GuestMemory::new`],
-/// [`GuestMemory::fork`]) takes a globally-unique generation so a hardware
-/// backend can tell — by comparing [`GuestMemory::backing_generation`] each
-/// `run()` — whether the host mapping it established is still current or must be
-/// re-issued (after a context switch to another process or an `execve` that
-/// replaced the space). A monotonic counter, never reused, avoids the pointer
-/// ABA problem a raw host-address token would have.
-static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-fn next_generation() -> u64 {
-    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
-}
 
 /// Page protection bits (mirrors `PROT_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +58,12 @@ impl Prot {
     pub const fn contains(self, other: Prot) -> bool {
         self.0 & other.0 == other.0
     }
+    /// This protection with `WRITE` removed — the leaf a copy-on-write-shared
+    /// frame carries so the next store faults.
+    #[must_use]
+    const fn read_only(self) -> Prot {
+        Prot(self.0 & !Self::WRITE.0)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -77,16 +74,13 @@ pub enum MemError {
     Unmapped(u64),
     /// The page is mapped but the access violates its protection.
     Protection { addr: u64, needed: Prot },
-    /// Host-side allocation/mapping failure.
+    /// Host-side allocation/mapping failure (e.g. the frame pool is exhausted).
     Host(String),
 }
 
 impl MemError {
     /// The guest address the fault is attributed to. For page-granular faults
-    /// (`Unmapped`, `Protection`) this is the base of the *offending* page, not
-    /// the access base — so a store spanning several pages faults at whichever
-    /// page actually blocked it, which is what a COW retry loop and a real
-    /// hardware fault (FAR) both need to make progress.
+    /// (`Unmapped`, `Protection`) this is the base of the *offending* page.
     #[must_use]
     pub fn fault_addr(&self) -> u64 {
         match self {
@@ -97,90 +91,114 @@ impl MemError {
     }
 }
 
-/// The guest address space for one process. Not `Clone` — use [`GuestMemory::fork`],
-/// which allocates the child its own region.
-#[derive(Debug)]
+/// The guest address space for one process. Not `Clone` — use [`GuestMemory::fork`].
 pub struct GuestMemory {
     base: u64,
     size: u64,
-    /// The one contiguous, host-page-aligned backing allocation.
-    region: Region,
-    /// Per-4 KiB-page protection; meaningful only when `mapped[i]`.
+    /// The shared physical-RAM pool (one KVM memslot). Cloned across `fork`/
+    /// `exec` so every address space and the memslot see the same frames.
+    phys: Arc<PhysMem>,
+    /// The shared frame allocator, locked briefly for map/unmap/fork/CoW.
+    fa: Arc<Mutex<FrameAllocator>>,
+    /// This process's page tables (its `CR3`).
+    space: AddrSpace,
+    /// Per-page *intended* protection (what `map`/`protect` requested), meaningful
+    /// only when `mapped[i]`. The page-table leaf may be more restrictive than
+    /// this — a copy-on-write-shared writable page reads `Prot::rw()` here but is
+    /// installed read-only until privatized — so this is the authority on "was
+    /// this page meant to be writable?" that [`GuestMemory::cow_fault`] needs.
     prot: Vec<Prot>,
     mapped: Vec<bool>,
-    /// Per-page: loaded from a file (an ELF segment), i.e. a `MAP_PRIVATE`
-    /// file-backed page whose bytes are the file's contents. `MADV_DONTNEED`
-    /// must *not* zero these — on real Linux it discards the private copy and a
-    /// later access reloads the file, so for the common (unmodified) case the
-    /// content is unchanged. Cleared when a page is re-`map`ped anonymously.
+    /// Per-page: loaded from a file (an ELF segment). `MADV_DONTNEED` preserves
+    /// these; cleared when a page is re-`map`ped anonymously.
     file_backed: Vec<bool>,
-    generation: u64,
-    /// Bumps on any `map`/`protect`/`unmap`. A hardware backend that mirrors the
-    /// protection map into real page tables watches this to know when to resync.
-    layout_gen: u64,
-    /// Page ranges `(first, last)` whose protection changed since the last
-    /// [`GuestMemory::drain_pt_dirty`], so a backend can update just those page
-    /// tables instead of rebuilding the whole map on every `mmap`.
-    pt_dirty: Vec<(usize, usize)>,
+}
+
+impl std::fmt::Debug for GuestMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuestMemory")
+            .field("base", &self.base)
+            .field("size", &self.size)
+            .field("cr3", &self.space.cr3())
+            .finish_non_exhaustive()
+    }
+}
+
+const fn round_up(v: u64, align: u64) -> u64 {
+    v.div_ceil(align) * align
 }
 
 impl GuestMemory {
-    /// Reserve a flat guest region `[base, base + size)`. `base` must be
-    /// page-aligned; `size` is rounded up to a whole host page (16 KiB) so the
-    /// backing can be mapped by a hardware backend. Mapped-but-unwritten pages
-    /// read as zero.
+    /// Reserve a flat guest region `[base, base + size)` backed by a fresh shared
+    /// pool. `base` must be page-aligned; `size` is rounded up to a whole host
+    /// page. The pool is sized to hold the region's data pages plus the page
+    /// tables and the shared control block, with slack — so `fork`ing and small
+    /// churn never exhaust it. Mapped-but-unwritten pages read as zero.
+    ///
+    /// This is the *only* constructor that mints a pool; every other address
+    /// space in a run comes from [`GuestMemory::fork`] (which shares this pool) or
+    /// [`GuestMemory::exec_reset`] (which rebuilds within it).
     #[must_use]
     pub fn new(base: u64, size: u64) -> Self {
         assert_eq!(base % PAGE_SIZE, 0, "base must be page-aligned");
         let size = size.max(PAGE_SIZE).next_multiple_of(HOST_PAGE as u64);
         let npages = (size / PAGE_SIZE) as usize;
+
+        // Pool budget: one frame per guest page, plus a generous interior-table
+        // allowance (a PT per 512 pages, higher levels above that — /64 is ~8×
+        // the worst case for a single tree and comfortably covers a fork's second
+        // tree), the control block, the null frame, and a fixed slack.
+        let data = npages as u64;
+        let tables = data / 64 + 64;
+        let pool_frames = data + tables + ctrl::CTRL_FRAMES + 128;
+        let phys = Arc::new(PhysMem::new((pool_frames * PAGE_SIZE) as usize));
+
+        let mut fa = FrameAllocator::new(phys.nframes());
+        ctrl::reserve_and_build(&mut fa, &phys);
+        let mut space = AddrSpace::new(&mut fa, &phys).expect("pool too small for a PML4");
+        ctrl::map_into(&mut space, &mut fa, &phys);
+
         Self {
             base,
             size,
-            region: Region::new(size as usize),
+            phys,
+            fa: Arc::new(Mutex::new(fa)),
+            space,
             prot: vec![Prot::NONE; npages],
             mapped: vec![false; npages],
             file_backed: vec![false; npages],
-            generation: next_generation(),
-            layout_gen: next_generation(),
-            pt_dirty: Vec::new(),
         }
     }
 
-    /// Generation of the protection layout; changes on every `map`/`protect`/
-    /// `unmap`. A backend resyncs its page tables when this moves.
+    // ---- KVM/backend hooks (crate-internal) ------------------------------
+
+    /// The `CR3` value (PML4 physical address) for this address space.
     #[must_use]
-    pub fn layout_generation(&self) -> u64 {
-        self.layout_gen
+    pub(crate) fn cr3(&self) -> u64 {
+        self.space.cr3()
     }
 
-    /// The effective protection of the page containing `addr`, or `None` if that
-    /// page is unmapped. For a backend building page-table entries.
+    /// Host pointer to physical address 0 of the shared pool — the single KVM
+    /// memslot's `userspace_addr`.
     #[must_use]
-    pub fn page_prot(&self, addr: u64) -> Option<Prot> {
-        if addr < self.base {
-            return None;
-        }
-        let p = ((addr - self.base) / PAGE_SIZE) as usize;
-        (*self.mapped.get(p)?).then(|| self.prot[p])
+    pub(crate) fn phys_ptr(&self) -> *mut u8 {
+        self.phys.as_ptr()
     }
 
-    /// Take the accumulated dirty page ranges (each `(first_addr, last_addr)`,
-    /// inclusive, page-aligned), clearing the list.
+    /// Size of the shared pool in bytes — the memslot's `memory_size`.
     #[must_use]
-    pub fn drain_pt_dirty(&mut self) -> Vec<(u64, u64)> {
-        self.pt_dirty
-            .drain(..)
-            .map(|(f, l)| (self.base + (f as u64) * PAGE_SIZE, self.base + (l as u64) * PAGE_SIZE))
-            .collect()
+    pub(crate) fn phys_len(&self) -> u64 {
+        self.phys.len() as u64
     }
 
-    /// Record that pages `[first, last]` changed protection, and bump the layout
-    /// generation. Called by `map`/`protect`/`unmap`.
-    fn mark_pt_dirty(&mut self, first: usize, last: usize) {
-        self.layout_gen = next_generation();
-        self.pt_dirty.push((first, last));
+    /// A clone of the shared pool handle, so the KVM VM can read the control block
+    /// out of it on the fault path without a `GuestMemory` borrow.
+    #[must_use]
+    pub(crate) fn phys_arc(&self) -> Arc<PhysMem> {
+        Arc::clone(&self.phys)
     }
+
+    // ---- geometry --------------------------------------------------------
 
     #[must_use]
     pub fn base(&self) -> u64 {
@@ -191,53 +209,59 @@ impl GuestMemory {
         self.size
     }
 
-    /// Raw host pointer to guest `base`, for a hardware backend to `hv_vm_map`.
-    /// Stable for this value's lifetime; changes across `fork`/`execve` (a new
-    /// value with a new [`GuestMemory::backing_generation`]).
-    #[must_use]
-    pub fn host_base(&self) -> *mut u8 {
-        self.region.as_ptr()
-    }
-
-    /// Identity of the current backing allocation (see [`NEXT_GENERATION`]).
-    #[must_use]
-    pub fn backing_generation(&self) -> u64 {
-        self.generation
-    }
-
-    /// Host byte offset for a guest address, or `OutOfBounds`.
-    fn offset(&self, addr: u64) -> Result<usize, MemError> {
-        if addr < self.base || addr >= self.base + self.size {
-            return Err(MemError::OutOfBounds(addr));
-        }
-        Ok((addr - self.base) as usize)
-    }
-
     /// Base guest address of page index `p`.
     fn page_base(&self, p: usize) -> u64 {
         self.base + (p as u64) * PAGE_SIZE
     }
 
+    /// Page index for an in-bounds address.
+    fn page_index(&self, addr: u64) -> Option<usize> {
+        if addr < self.base || addr >= self.base + self.size {
+            return None;
+        }
+        Some(((addr - self.base) / PAGE_SIZE) as usize)
+    }
+
+    /// Bounds-check `addr` (`OutOfBounds` otherwise).
+    fn offset_ok(&self, addr: u64) -> Result<(), MemError> {
+        if addr < self.base || addr >= self.base + self.size {
+            return Err(MemError::OutOfBounds(addr));
+        }
+        Ok(())
+    }
+
     /// Page indices `[first, last]` covering `[addr, addr + len)`.
     fn page_range(&self, addr: u64, len: usize) -> Result<(usize, usize), MemError> {
         if len == 0 {
-            let _ = self.offset(addr)?;
+            self.offset_ok(addr)?;
             let p = ((addr - self.base) / PAGE_SIZE) as usize;
             return Ok((p, p));
         }
         let end = addr
             .checked_add(len as u64 - 1)
             .ok_or(MemError::OutOfBounds(addr))?;
-        let _ = self.offset(addr)?;
-        let _ = self.offset(end)?;
+        self.offset_ok(addr)?;
+        self.offset_ok(end)?;
         let first = ((addr - self.base) / PAGE_SIZE) as usize;
         let last = ((end - self.base) / PAGE_SIZE) as usize;
         Ok((first, last))
     }
 
-    /// Map (or remap) the pages covering `[addr, addr + len)` with `prot`. The
-    /// range is rounded out to page boundaries and zero-filled — a fresh mapping
-    /// reads as zero (`MAP_ANONYMOUS`/`MAP_FIXED` semantics).
+    // ---- mapping ---------------------------------------------------------
+
+    /// The effective leaf protection for page `p` pointing at `frame`: the
+    /// intended protection, but read-only if the frame is copy-on-write-shared
+    /// (so the next store faults and privatizes).
+    fn leaf_prot(&self, p: usize, frame: u64, fa: &FrameAllocator) -> Prot {
+        if self.prot[p].contains(Prot::WRITE) && fa.refcount(frame) > 1 {
+            self.prot[p].read_only()
+        } else {
+            self.prot[p]
+        }
+    }
+
+    /// Map (or remap) the pages covering `[addr, addr + len)` with `prot`: each
+    /// page gets a fresh zeroed frame (`MAP_ANONYMOUS`/`MAP_FIXED` semantics).
     pub fn map(&mut self, addr: u64, len: u64, prot: Prot) -> Result<(), MemError> {
         if len == 0 {
             return Ok(());
@@ -245,19 +269,32 @@ impl GuestMemory {
         let start = addr - addr % PAGE_SIZE;
         let end = round_up(addr + len, PAGE_SIZE);
         let (first, last) = self.page_range(start, (end - start) as usize)?;
+        let mut fa = self.fa.lock().unwrap();
         for p in first..=last {
+            let va = self.page_base(p);
+            let Some(frame) = fa.alloc(&self.phys) else {
+                return Err(MemError::Host("frame pool exhausted".into()));
+            };
+            match self.space.map(va, frame, prot, false, &mut fa, &self.phys) {
+                Ok(old) => {
+                    if let Some(of) = old {
+                        fa.free(of);
+                    }
+                }
+                Err(_) => {
+                    fa.free(frame);
+                    return Err(MemError::Host("map: frame pool exhausted".into()));
+                }
+            }
             self.mapped[p] = true;
             self.prot[p] = prot;
-            self.file_backed[p] = false; // a fresh anonymous mapping
+            self.file_backed[p] = false;
         }
-        self.region.fill(first * PS, (last - first + 1) * PS, 0);
-        self.mark_pt_dirty(first, last);
         Ok(())
     }
 
-    /// Mark `[addr, addr + len)` as file-backed (loaded from an ELF segment):
-    /// `MADV_DONTNEED` will preserve rather than zero these pages. Silently
-    /// ignores pages outside the region.
+    /// Mark `[addr, addr + len)` as file-backed (an ELF segment): `MADV_DONTNEED`
+    /// preserves rather than zeroes these pages. Ignores pages outside the region.
     pub fn mark_file_backed(&mut self, addr: u64, len: u64) {
         if len == 0 || addr < self.base {
             return;
@@ -269,7 +306,7 @@ impl GuestMemory {
         }
     }
 
-    /// Whether the page containing `addr` is file-backed (see `mark_file_backed`).
+    /// Whether the page containing `addr` is file-backed.
     #[must_use]
     pub fn is_file_backed(&self, addr: u64) -> bool {
         if addr < self.base {
@@ -277,6 +314,14 @@ impl GuestMemory {
         }
         let p = ((addr - self.base) / PAGE_SIZE) as usize;
         self.file_backed.get(p).copied().unwrap_or(false)
+    }
+
+    /// The effective (intended) protection of the page containing `addr`, or
+    /// `None` if unmapped.
+    #[must_use]
+    pub fn page_prot(&self, addr: u64) -> Option<Prot> {
+        let p = self.page_index(addr)?;
+        self.mapped[p].then(|| self.prot[p])
     }
 
     /// Change protection on already-mapped pages covering `[addr, addr + len)`.
@@ -287,18 +332,24 @@ impl GuestMemory {
         let start = addr - addr % PAGE_SIZE;
         let end = round_up(addr + len, PAGE_SIZE);
         let (first, last) = self.page_range(start, (end - start) as usize)?;
+        let fa = self.fa.lock().unwrap();
         for p in first..=last {
             if !self.mapped[p] {
                 return Err(MemError::Unmapped(self.page_base(p)));
             }
             self.prot[p] = prot;
+            let va = self.page_base(p);
+            if let Some(t) = self.space.translate(va, &self.phys) {
+                let frame = t.paddr & !(PAGE_SIZE - 1);
+                let lp = self.leaf_prot(p, frame, &fa);
+                self.space.protect(va, lp, false, &self.phys);
+            }
         }
-        self.mark_pt_dirty(first, last);
         Ok(())
     }
 
-    /// Unmap the pages covering `[addr, addr + len)`. The bytes are left intact
-    /// but inaccessible; a later `map` zero-fills before granting access.
+    /// Unmap the pages covering `[addr, addr + len)`, returning their frames to
+    /// the pool.
     pub fn unmap(&mut self, addr: u64, len: u64) -> Result<(), MemError> {
         if len == 0 {
             return Ok(());
@@ -306,18 +357,25 @@ impl GuestMemory {
         let start = addr - addr % PAGE_SIZE;
         let end = round_up(addr + len, PAGE_SIZE);
         let (first, last) = self.page_range(start, (end - start) as usize)?;
+        let mut fa = self.fa.lock().unwrap();
         for p in first..=last {
+            if self.mapped[p] {
+                if let Some(frame) = self.space.unmap(self.page_base(p), &mut fa, &self.phys) {
+                    fa.free(frame);
+                }
+            }
             self.mapped[p] = false;
             self.prot[p] = Prot::NONE;
             self.file_backed[p] = false;
         }
-        self.mark_pt_dirty(first, last);
         Ok(())
     }
 
-    /// Verify `[addr, addr + len)` is mapped and every page grants `need`,
-    /// returning the byte offset of `addr` within the region.
-    fn check(&self, addr: u64, len: usize, need: Prot) -> Result<usize, MemError> {
+    // ---- access ----------------------------------------------------------
+
+    /// Verify `[addr, addr + len)` is mapped and every page grants `need`
+    /// (intended protection).
+    fn check(&self, addr: u64, len: usize, need: Prot) -> Result<(), MemError> {
         let (first, last) = self.page_range(addr, len)?;
         for p in first..=last {
             if !self.mapped[p] {
@@ -330,23 +388,38 @@ impl GuestMemory {
                 });
             }
         }
-        Ok((addr - self.base) as usize)
+        Ok(())
     }
 
-    /// Whether the page at `addr` is mapped and executable — the check an
-    /// instruction fetch makes, so a jump into a writable-only page (a data
-    /// buffer, the stack) faults instead of executing, as `NX` hardware does.
+    /// Whether the page at `addr` is mapped and executable.
     #[must_use]
     pub fn can_exec(&self, addr: u64) -> bool {
         self.check(addr, 1, Prot::EXEC).is_ok()
     }
 
-    /// Read `buf.len()` bytes from guest `addr` (requires `READ`). Unwritten
-    /// pages read as zero.
-    pub fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemError> {
-        let off = self.check(addr, buf.len(), Prot::READ)?;
-        self.region.read(off, buf);
+    /// Copy from the pool at guest `addr` into `buf`, translating per page. The
+    /// caller must have verified access.
+    fn copy_out(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemError> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let cur = addr + done as u64;
+            let page = cur - cur % PAGE_SIZE;
+            let off = (cur - page) as usize;
+            let n = (buf.len() - done).min(PS - off);
+            let t = self
+                .space
+                .translate(cur, &self.phys)
+                .ok_or(MemError::Unmapped(page))?;
+            self.phys.read(t.paddr, &mut buf[done..done + n]);
+            done += n;
+        }
         Ok(())
+    }
+
+    /// Read `buf.len()` bytes from guest `addr` (requires `READ`).
+    pub fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemError> {
+        self.check(addr, buf.len(), Prot::READ)?;
+        self.copy_out(addr, buf)
     }
 
     /// Read `len` bytes into a fresh `Vec` (requires `READ`).
@@ -356,70 +429,100 @@ impl GuestMemory {
         Ok(v)
     }
 
-    /// Write `buf` to guest `addr` (requires `WRITE`). Entry point for
-    /// kernel-side copy-out (syscall results).
-    pub fn write(&mut self, addr: u64, buf: &[u8]) -> Result<(), MemError> {
-        let off = self.check(addr, buf.len(), Prot::WRITE)?;
-        self.region.write(off, buf);
+    /// Ensure the page at `va` (intended protection `prot`) is backed by a private
+    /// (unshared) frame its protection can write, privatizing a copy-on-write
+    /// frame if needed. A no-op on an already-private page beyond restoring its
+    /// leaf write bit. An associated fn over the disjoint `space`/`phys` fields so
+    /// callers can hold the `fa` guard (which borrows the `fa` field) at once.
+    fn make_writable(space: &mut AddrSpace, phys: &PhysMem, prot: Prot, fa: &mut FrameAllocator, va: u64) {
+        let Some(t) = space.translate(va, phys) else {
+            return;
+        };
+        let frame = t.paddr & !(PAGE_SIZE - 1);
+        if fa.refcount(frame) > 1 {
+            // Copy-on-write shared: privatize into a fresh frame.
+            if let Some(new) = fa.alloc(phys) {
+                phys.copy_frame(new, frame);
+                if let Ok(old) = space.map(va, new, prot, false, fa, phys) {
+                    if let Some(of) = old {
+                        fa.decref(of);
+                    }
+                } else {
+                    fa.free(new);
+                }
+            }
+        } else {
+            // Private already: make sure the leaf carries the intended write bit
+            // (a prior fork may have cleared it).
+            space.protect(va, prot, false, phys);
+        }
+    }
+
+    /// Copy `buf` into the pool at guest `addr`, privatizing copy-on-write pages
+    /// first. The caller must have verified the pages are mapped (and, for a guest
+    /// store, writable).
+    fn copy_in(&mut self, addr: u64, buf: &[u8]) -> Result<(), MemError> {
+        let (first, last) = self.page_range(addr, buf.len())?;
+        {
+            let mut fa = self.fa.lock().unwrap();
+            for p in first..=last {
+                let va = self.base + (p as u64) * PAGE_SIZE;
+                Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va);
+            }
+        }
+        let mut done = 0usize;
+        while done < buf.len() {
+            let cur = addr + done as u64;
+            let page = cur - cur % PAGE_SIZE;
+            let off = (cur - page) as usize;
+            let n = (buf.len() - done).min(PS - off);
+            let t = self
+                .space
+                .translate(cur, &self.phys)
+                .ok_or(MemError::Unmapped(page))?;
+            self.phys.write(t.paddr, &buf[done..done + n]);
+            done += n;
+        }
         Ok(())
     }
 
-    /// Write `buf` to guest `addr` on behalf of an executing guest store. Today
-    /// identical to [`GuestMemory::write`]; the name marks the fault-driven COW
-    /// seam (a future shared-page milestone makes this fault on a copy-on-write
-    /// page, reporting the precise page so the vcpu can be resumed after
-    /// [`GuestMemory::cow_fault`] privatizes it).
+    /// Write `buf` to guest `addr` (requires `WRITE`). Kernel copy-out.
+    pub fn write(&mut self, addr: u64, buf: &[u8]) -> Result<(), MemError> {
+        self.check(addr, buf.len(), Prot::WRITE)?;
+        self.copy_in(addr, buf)
+    }
+
+    /// Write `buf` on behalf of an executing guest store. Identical to
+    /// [`GuestMemory::write`]; copy-on-write pages privatize transparently, so the
+    /// interpreter's store to a shared page just succeeds (no kernel round-trip).
     pub fn write_trap(&mut self, addr: u64, buf: &[u8]) -> Result<(), MemError> {
         self.write(addr, buf)
     }
 
-    /// Resolve a copy-on-write fault at `addr`. With eager-copy `fork` there is
-    /// no shared page to privatize, so this always returns `false` — the kernel
-    /// then treats the fault as a genuine `SIGSEGV`. The seam exists for the
-    /// later shared-page COW milestone.
-    #[allow(clippy::unused_self)]
-    pub fn cow_fault(&mut self, _addr: u64, _write: bool) -> bool {
-        false
+    /// Resolve a copy-on-write fault at `addr` (the KVM/hardware path). Privatizes
+    /// the page and returns `true` so the faulting store retries and succeeds;
+    /// returns `false` when the fault is genuine (unmapped, or a write to a page
+    /// that was never meant to be writable), which the kernel turns into a signal.
+    pub fn cow_fault(&mut self, addr: u64, write: bool) -> bool {
+        if !write {
+            return false;
+        }
+        let Some(p) = self.page_index(addr) else {
+            return false;
+        };
+        if !self.mapped[p] || !self.prot[p].contains(Prot::WRITE) {
+            return false;
+        }
+        let va = self.base + (p as u64) * PAGE_SIZE;
+        let mut fa = self.fa.lock().unwrap();
+        Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va);
+        true
     }
 
-    /// Fork this address space for a new process: give the child its own region
-    /// and eagerly copy every *resident* (mapped) page — correct isolation,
-    /// bounded by the working set rather than the whole reservation.
-    #[must_use]
-    pub fn fork(&self) -> Self {
-        let mut region = Region::new(self.size as usize);
-        // Copy only mapped pages; unmapped ones stay zero in the fresh region.
-        let mut p = 0;
-        while p < self.mapped.len() {
-            if !self.mapped[p] {
-                p += 1;
-                continue;
-            }
-            // Extend the run of contiguous mapped pages and copy it in one shot.
-            let start = p;
-            while p < self.mapped.len() && self.mapped[p] {
-                p += 1;
-            }
-            region.copy_from(&self.region, start * PS, (p - start) * PS);
-        }
-        Self {
-            base: self.base,
-            size: self.size,
-            region,
-            prot: self.prot.clone(),
-            mapped: self.mapped.clone(),
-            file_backed: self.file_backed.clone(),
-            generation: next_generation(),
-            // Fresh layout gen with no pending dirty: a backend sees the new
-            // backing generation and rebuilds this child's page tables in full.
-            layout_gen: next_generation(),
-            pt_dirty: Vec::new(),
-        }
-    }
-
-    /// Write `buf` to guest `addr`, bypassing protection but still requiring the
-    /// pages be mapped and in bounds. For host-side initialization (loading ELF
-    /// segments into read-only pages, populating a file-backed `mmap`).
+    /// Write `buf` to guest `addr`, bypassing protection but requiring the pages
+    /// be mapped. For host-side initialization (ELF segments into read-only pages,
+    /// populating a file-backed `mmap`). Privatizes copy-on-write pages so it can
+    /// never corrupt a shared frame.
     pub fn write_init(&mut self, addr: u64, buf: &[u8]) -> Result<(), MemError> {
         let (first, last) = self.page_range(addr, buf.len())?;
         for p in first..=last {
@@ -427,9 +530,104 @@ impl GuestMemory {
                 return Err(MemError::Unmapped(self.page_base(p)));
             }
         }
-        self.region.write((addr - self.base) as usize, buf);
+        // Privatize any copy-on-write pages, then write straight to the frames
+        // (bypassing the leaf's protection — the host write goes to the pool, not
+        // through the guest MMU).
+        {
+            let mut fa = self.fa.lock().unwrap();
+            for p in first..=last {
+                let va = self.base + (p as u64) * PAGE_SIZE;
+                if let Some(t) = self.space.translate(va, &self.phys) {
+                    let frame = t.paddr & !(PAGE_SIZE - 1);
+                    if fa.refcount(frame) > 1 {
+                        Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va);
+                    }
+                }
+            }
+        }
+        let mut done = 0usize;
+        while done < buf.len() {
+            let cur = addr + done as u64;
+            let page = cur - cur % PAGE_SIZE;
+            let off = (cur - page) as usize;
+            let n = (buf.len() - done).min(PS - off);
+            let t = self
+                .space
+                .translate(cur, &self.phys)
+                .ok_or(MemError::Unmapped(page))?;
+            self.phys.write(t.paddr, &buf[done..done + n]);
+            done += n;
+        }
         Ok(())
     }
+
+    // ---- fork / exec / release ------------------------------------------
+
+    /// Fork this address space for a new process: the child shares every mapped
+    /// frame copy-on-write (both sides go read-only; the first store privatizes).
+    /// Only touched pages ever cost a private frame. The child shares the pool.
+    #[must_use]
+    pub fn fork(&mut self) -> Self {
+        let child_space = {
+            let mut fa = self.fa.lock().unwrap();
+            let child = self
+                .space
+                .fork_cow(&mut fa, &self.phys)
+                .expect("fork_cow: frame pool exhausted");
+            // `fork_cow` cleared the write bit on *every* leaf, including the
+            // supervisor control block (whose kstack the CPU writes on a fault).
+            // Restore it, RW-supervisor, on both sides.
+            ctrl::map_into(&mut self.space, &mut fa, &self.phys);
+            let mut child = child;
+            ctrl::map_into(&mut child, &mut fa, &self.phys);
+            child
+        };
+        Self {
+            base: self.base,
+            size: self.size,
+            phys: Arc::clone(&self.phys),
+            fa: Arc::clone(&self.fa),
+            space: child_space,
+            prot: self.prot.clone(),
+            mapped: self.mapped.clone(),
+            file_backed: self.file_backed.clone(),
+        }
+    }
+
+    /// Tear down the current page tables (returning their frames to the pool) and
+    /// install a fresh empty address space in the *same* pool — the `execve` seam.
+    /// The `CR3` changes; a KVM vcpu picks the new value up on its next run. The
+    /// loader then maps the new image into this same `GuestMemory`.
+    pub(crate) fn exec_reset(&mut self) {
+        self.reset_space();
+    }
+
+    /// Release this address space's frames back to the pool on process exit,
+    /// leaving a minimal empty space behind (the task is a zombie and never runs
+    /// again). Keeps the pool from filling with dead processes' frames.
+    pub(crate) fn release(&mut self) {
+        self.reset_space();
+    }
+
+    fn reset_space(&mut self) {
+        let mut fa = self.fa.lock().unwrap();
+        let mut ns = AddrSpace::new(&mut fa, &self.phys).expect("reset: pool exhausted");
+        ctrl::map_into(&mut ns, &mut fa, &self.phys);
+        let old = std::mem::replace(&mut self.space, ns);
+        old.destroy(&mut fa, &self.phys);
+        drop(fa);
+        for x in &mut self.prot {
+            *x = Prot::NONE;
+        }
+        for x in &mut self.mapped {
+            *x = false;
+        }
+        for x in &mut self.file_backed {
+            *x = false;
+        }
+    }
+
+    // ---- fixed-width helpers --------------------------------------------
 
     /// Read a little-endian `u32` (requires `READ`).
     pub fn read_u32(&self, addr: u64) -> Result<u32, MemError> {
@@ -466,16 +664,12 @@ impl GuestMemory {
     }
 }
 
-const fn round_up(v: u64, align: u64) -> u64 {
-    v.div_ceil(align) * align
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn mem() -> GuestMemory {
-        // 64 KiB region at 0x1_0000 (16 KiB-aligned base).
+        // 64 KiB region at 0x1_0000 (page-aligned base).
         GuestMemory::new(0x1_0000, 16 * PAGE_SIZE)
     }
 
@@ -488,14 +682,8 @@ mod tests {
     #[test]
     fn out_of_bounds_faults() {
         let m = mem();
-        assert!(matches!(
-            m.read_u32(0x9_0000),
-            Err(MemError::OutOfBounds(_))
-        ));
-        assert!(matches!(
-            m.read_u32(0x0_0000),
-            Err(MemError::OutOfBounds(_))
-        ));
+        assert!(matches!(m.read_u32(0x9_0000), Err(MemError::OutOfBounds(_))));
+        assert!(matches!(m.read_u32(0x0_0000), Err(MemError::OutOfBounds(_))));
     }
 
     #[test]
@@ -517,7 +705,6 @@ mod tests {
                 needed: Prot::WRITE,
             })
         );
-        // Host-side init bypasses protection.
         m.write_init(0x1_0000, &[1, 2, 3]).unwrap();
         assert_eq!(m.read_vec(0x1_0000, 3).unwrap(), vec![1, 2, 3]);
     }
@@ -525,14 +712,9 @@ mod tests {
     #[test]
     fn cross_page_access_checks_every_page() {
         let mut m = mem();
-        // Map only the first of two pages a 16-byte read at the boundary spans.
         m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
         let boundary = 0x1_0000 + PAGE_SIZE - 8;
-        assert!(matches!(
-            m.read_u64(boundary + 4),
-            Err(MemError::Unmapped(_))
-        ));
-        // Map the second page too; now it succeeds across the boundary.
+        assert!(matches!(m.read_u64(boundary + 4), Err(MemError::Unmapped(_))));
         m.map(0x1_0000 + PAGE_SIZE, PAGE_SIZE, Prot::rw()).unwrap();
         m.write_u64(boundary + 4, 42).unwrap();
         assert_eq!(m.read_u64(boundary + 4).unwrap(), 42);
@@ -567,14 +749,9 @@ mod tests {
     fn spanning_read_write_across_pages() {
         let mut m = mem();
         m.map(0x1_0000, 2 * PAGE_SIZE, Prot::rw()).unwrap();
-        // Write only into the second page near the boundary; read straddles the
-        // zero (unwritten) tail of page 1 and the written head of page 2.
         m.write(0x1_0000 + PAGE_SIZE, &[0xEE]).unwrap();
         let boundary = 0x1_0000 + PAGE_SIZE - 2;
-        assert_eq!(
-            m.read_vec(boundary, 4).unwrap(),
-            vec![0x00, 0x00, 0xEE, 0x00]
-        );
+        assert_eq!(m.read_vec(boundary, 4).unwrap(), vec![0x00, 0x00, 0xEE, 0x00]);
     }
 
     #[test]
@@ -594,9 +771,7 @@ mod tests {
         parent.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
         parent.write(0x1_0000, &[0xAA]).unwrap();
         let mut child = parent.fork();
-        // Child starts as a copy of the parent's resident bytes...
         assert_eq!(child.read_vec(0x1_0000, 1).unwrap(), vec![0xAA]);
-        // ...then each side's writes are independent.
         parent.write(0x1_0000, &[0xBB]).unwrap();
         child.write(0x1_0000, &[0xCC]).unwrap();
         assert_eq!(parent.read_vec(0x1_0000, 1).unwrap(), vec![0xBB]);
@@ -606,7 +781,6 @@ mod tests {
     #[test]
     fn fork_copies_only_mapped_pages() {
         let mut parent = mem();
-        // Map two non-adjacent pages, leaving a gap unmapped.
         parent.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
         parent
             .map(0x1_0000 + 2 * PAGE_SIZE, PAGE_SIZE, Prot::rw())
@@ -615,35 +789,32 @@ mod tests {
         parent.write(0x1_0000 + 2 * PAGE_SIZE, &[2]).unwrap();
         let child = parent.fork();
         assert_eq!(child.read_vec(0x1_0000, 1).unwrap(), vec![1]);
-        assert_eq!(
-            child.read_vec(0x1_0000 + 2 * PAGE_SIZE, 1).unwrap(),
-            vec![2]
-        );
-        // The gap is unmapped in both.
+        assert_eq!(child.read_vec(0x1_0000 + 2 * PAGE_SIZE, 1).unwrap(), vec![2]);
         assert!(child.read_vec(0x1_0000 + PAGE_SIZE, 1).is_err());
     }
 
     #[test]
-    fn fork_and_new_take_distinct_backing_generations() {
-        let a = mem();
-        let b = mem();
-        let c = a.fork();
-        assert_ne!(a.backing_generation(), b.backing_generation());
-        assert_ne!(a.backing_generation(), c.backing_generation());
-        assert_ne!(b.backing_generation(), c.backing_generation());
-        assert!(!a.host_base().is_null());
-    }
-
-    #[test]
-    fn write_trap_matches_write_and_cow_fault_never_fires() {
+    fn write_trap_matches_write_and_cow_fault_privatizes() {
         let mut m = mem();
         m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
         m.write_trap(0x1_0000, &[0x5A]).unwrap();
         assert_eq!(m.read_vec(0x1_0000, 1).unwrap(), vec![0x5A]);
-        // A write to read-only memory faults through write_trap...
+        // A write to genuinely read-only memory is a real fault (not CoW).
         m.protect(0x1_0000, PAGE_SIZE, Prot::READ).unwrap();
         assert!(m.write_trap(0x1_0000, &[0]).is_err());
-        // ...and is a genuine fault (no COW page to privatize).
-        assert!(!m.cow_fault(0x1_0000, true));
+        assert!(!m.cow_fault(0x1_0000, true), "read-only page is a genuine fault");
+    }
+
+    #[test]
+    fn exec_reset_clears_mappings_and_reuses_pool() {
+        let mut m = mem();
+        m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
+        m.write(0x1_0000, &[0x11]).unwrap();
+        let old_cr3 = m.cr3();
+        m.exec_reset();
+        assert_ne!(m.cr3(), old_cr3, "execve installs fresh page tables");
+        assert!(m.read_vec(0x1_0000, 1).is_err(), "old mapping is gone");
+        m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
+        assert_eq!(m.read_vec(0x1_0000, 1).unwrap(), vec![0], "fresh zero page");
     }
 }

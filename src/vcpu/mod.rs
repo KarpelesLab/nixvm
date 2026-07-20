@@ -18,6 +18,7 @@
 use crate::abi::Arch;
 
 pub mod mem;
+pub(crate) mod ctrl;
 pub(crate) mod pagetable;
 pub(crate) mod phys;
 pub(crate) mod region;
