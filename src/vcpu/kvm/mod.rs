@@ -279,6 +279,10 @@ mod tests {
         mem.map(data, PAGE_SIZE, Prot::rw()).unwrap();
         // mov [rsi], eax ; jmp $  — store this vcpu's value to its slot, then spin.
         mem.write_init(code, &[0x89, 0x06, 0xEB, 0xFE]).unwrap();
+        // Demand paging: this test drives vcpus directly (no kernel to service a
+        // fault), so pre-back the data page — write_init faults in its frame — or
+        // the guest's first store would fault instead of spinning.
+        mem.write_init(data, &[0u8; 16]).unwrap();
         let mem = Arc::new(Mutex::new(mem));
 
         // Two vcpus over the one shared VM (backend), each with a distinct value

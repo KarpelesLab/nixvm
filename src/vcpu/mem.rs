@@ -198,6 +198,13 @@ impl GuestMemory {
         Arc::clone(&self.phys)
     }
 
+    /// Number of live (allocated) frames in the shared pool — for leak checks.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn frames_in_use(&self) -> usize {
+        self.fa.lock().unwrap().alloc_count()
+    }
+
     // ---- geometry --------------------------------------------------------
 
     #[must_use]
@@ -260,8 +267,14 @@ impl GuestMemory {
         }
     }
 
-    /// Map (or remap) the pages covering `[addr, addr + len)` with `prot`: each
-    /// page gets a fresh zeroed frame (`MAP_ANONYMOUS`/`MAP_FIXED` semantics).
+    /// Map (or remap) the pages covering `[addr, addr + len)` with `prot`.
+    ///
+    /// Demand-paged: this records the mapping (and drops any old backing so a
+    /// remap reads as zero) but allocates **no** frames — a page's frame is minted
+    /// on first touch (a write, or a fault). This is what lets a runtime reserve
+    /// huge regions cheaply (JSC/Bun reserve multi-hundred-MiB — and `MAP_NORESERVE`
+    /// gigabyte — arenas up front and commit them sparsely); eager allocation would
+    /// exhaust the frame pool on the first such reservation.
     pub fn map(&mut self, addr: u64, len: u64, prot: Prot) -> Result<(), MemError> {
         if len == 0 {
             return Ok(());
@@ -271,19 +284,11 @@ impl GuestMemory {
         let (first, last) = self.page_range(start, (end - start) as usize)?;
         let mut fa = self.fa.lock().unwrap();
         for p in first..=last {
-            let va = self.page_base(p);
-            let Some(frame) = fa.alloc(&self.phys) else {
-                return Err(MemError::Host("frame pool exhausted".into()));
-            };
-            match self.space.map(va, frame, prot, false, &mut fa, &self.phys) {
-                Ok(old) => {
-                    if let Some(of) = old {
-                        fa.free(of);
-                    }
-                }
-                Err(_) => {
+            // Fresh mapping: drop any existing backing so the page reads as zero.
+            if self.mapped[p] {
+                let va = self.base + (p as u64) * PAGE_SIZE;
+                if let Some(frame) = self.space.unmap(va, &mut fa, &self.phys) {
                     fa.free(frame);
-                    return Err(MemError::Host("map: frame pool exhausted".into()));
                 }
             }
             self.mapped[p] = true;
@@ -291,6 +296,49 @@ impl GuestMemory {
             self.file_backed[p] = false;
         }
         Ok(())
+    }
+
+    /// Ensure the page at `va` has a backing frame installed (demand paging): a
+    /// no-op if already backed, otherwise a fresh zeroed frame with `prot`. Returns
+    /// `false` only on pool exhaustion. Associated fn over the disjoint
+    /// `space`/`phys` fields so the caller can hold the `fa` guard at once.
+    fn ensure_backed(
+        space: &mut AddrSpace,
+        phys: &PhysMem,
+        prot: Prot,
+        fa: &mut FrameAllocator,
+        va: u64,
+    ) -> bool {
+        if space.translate(va, phys).is_some() {
+            return true;
+        }
+        let Some(frame) = fa.alloc(phys) else {
+            return false;
+        };
+        match space.map(va, frame, prot, false, fa, phys) {
+            Ok(_) => true,
+            Err(_) => {
+                fa.free(frame);
+                false
+            }
+        }
+    }
+
+    /// Back a demand-paged page on a fault (the KVM `#PF` / not-present path).
+    /// Returns `true` if `addr` was a mapped-but-unbacked page and is now backed,
+    /// so the faulting access retries and succeeds; `false` if the fault is
+    /// something else (unmapped, or an already-backed page — e.g. a copy-on-write
+    /// or protection fault the caller must handle).
+    pub fn demand_fault(&mut self, addr: u64) -> bool {
+        let page = addr - addr % PAGE_SIZE;
+        let Some(p) = self.page_index(page) else {
+            return false;
+        };
+        if !self.mapped[p] || self.space.translate(page, &self.phys).is_some() {
+            return false;
+        }
+        let mut fa = self.fa.lock().unwrap();
+        Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, page)
     }
 
     /// Mark `[addr, addr + len)` as file-backed (an ELF segment): `MADV_DONTNEED`
@@ -398,7 +446,8 @@ impl GuestMemory {
     }
 
     /// Copy from the pool at guest `addr` into `buf`, translating per page. The
-    /// caller must have verified access.
+    /// caller must have verified access. A mapped-but-unbacked page (demand-paged,
+    /// never touched) reads as zero without allocating a frame.
     fn copy_out(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemError> {
         let mut done = 0usize;
         while done < buf.len() {
@@ -406,11 +455,10 @@ impl GuestMemory {
             let page = cur - cur % PAGE_SIZE;
             let off = (cur - page) as usize;
             let n = (buf.len() - done).min(PS - off);
-            let t = self
-                .space
-                .translate(cur, &self.phys)
-                .ok_or(MemError::Unmapped(page))?;
-            self.phys.read(t.paddr, &mut buf[done..done + n]);
+            match self.space.translate(cur, &self.phys) {
+                Some(t) => self.phys.read(t.paddr, &mut buf[done..done + n]),
+                None => buf[done..done + n].fill(0),
+            }
             done += n;
         }
         Ok(())
@@ -467,6 +515,11 @@ impl GuestMemory {
             let mut fa = self.fa.lock().unwrap();
             for p in first..=last {
                 let va = self.base + (p as u64) * PAGE_SIZE;
+                // Demand-back the page (first touch), then privatize if it is a
+                // copy-on-write share.
+                if !Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, va) {
+                    return Err(MemError::Host("frame pool exhausted".into()));
+                }
                 Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va);
             }
         }
@@ -530,19 +583,17 @@ impl GuestMemory {
                 return Err(MemError::Unmapped(self.page_base(p)));
             }
         }
-        // Privatize any copy-on-write pages, then write straight to the frames
-        // (bypassing the leaf's protection — the host write goes to the pool, not
-        // through the guest MMU).
+        // Demand-back each page and privatize any copy-on-write share, then write
+        // straight to the frames (bypassing the leaf's protection — the host write
+        // goes to the pool, not through the guest MMU).
         {
             let mut fa = self.fa.lock().unwrap();
             for p in first..=last {
                 let va = self.base + (p as u64) * PAGE_SIZE;
-                if let Some(t) = self.space.translate(va, &self.phys) {
-                    let frame = t.paddr & !(PAGE_SIZE - 1);
-                    if fa.refcount(frame) > 1 {
-                        Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va);
-                    }
+                if !Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, va) {
+                    return Err(MemError::Host("frame pool exhausted".into()));
                 }
+                Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va);
             }
         }
         let mut done = 0usize;
@@ -803,6 +854,25 @@ mod tests {
         m.protect(0x1_0000, PAGE_SIZE, Prot::READ).unwrap();
         assert!(m.write_trap(0x1_0000, &[0]).is_err());
         assert!(!m.cow_fault(0x1_0000, true), "read-only page is a genuine fault");
+    }
+
+    #[test]
+    fn release_and_exec_reset_return_frames_to_the_pool() {
+        let mut m = mem();
+        let baseline = m.frames_in_use(); // empty space: PML4 + control-block tables
+        // Touch several pages so real data frames are allocated (demand-paged).
+        m.map(0x1_0000, 8 * PAGE_SIZE, Prot::rw()).unwrap();
+        for i in 0..8 {
+            m.write_u64(0x1_0000 + i * PAGE_SIZE, 0xdead).unwrap();
+        }
+        assert!(m.frames_in_use() > baseline, "touched pages consumed frames");
+        // exit / execve must return every data + table frame the process held.
+        m.release();
+        assert_eq!(m.frames_in_use(), baseline, "release returned all frames");
+        m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
+        m.write_u64(0x1_0000, 1).unwrap();
+        m.exec_reset();
+        assert_eq!(m.frames_in_use(), baseline, "exec_reset returned all frames");
     }
 
     #[test]

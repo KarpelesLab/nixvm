@@ -1063,13 +1063,20 @@ impl Kernel {
             }
             Exit::Interrupted => Serviced::Resume,
             Exit::MemFault { addr, write } => {
+                // A fault on a mapped-but-unbacked page is demand paging: mint the
+                // frame and re-run the access (the software mirror of a hardware
+                // MMU faulting in a lazily-committed page). Anonymous reservations
+                // and freshly-`mmap`ped ranges are backed here on first touch.
+                if mem.demand_fault(addr) {
+                    Serviced::Resume
+                }
                 // A write fault on a copy-on-write page is resolved by
                 // privatizing the page and re-running the instruction (the vcpu
                 // left PC on the faulting store). Anything else — a read fault, a
                 // write to read-only/unmapped memory, or an already-private page
                 // — is a genuine segfault. This is the software mirror of a
                 // hardware MMU's page-fault-driven COW.
-                if mem.cow_fault(addr, write) {
+                else if mem.cow_fault(addr, write) {
                     Serviced::Resume
                 } else if self.grow_stack(addr, mem) {
                     // A fault in the reserved stack region grows it (VM_GROWSDOWN)

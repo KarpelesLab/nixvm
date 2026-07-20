@@ -570,19 +570,15 @@ impl KvmVcpu {
                     write: mmio.is_write != 0,
                 })
             }
-            // Triple fault: with an empty IDT every guest exception lands
-            // here. A page fault records the address in cr2; anything else
-            // (e.g. #UD) leaves it clear and is reported as illegal.
-            sys::KVM_EXIT_SHUTDOWN => {
-                if self.sregs.cr2 != 0 {
-                    Ok(Exit::MemFault {
-                        addr: self.sregs.cr2,
-                        write: false,
-                    })
-                } else {
-                    Ok(Exit::IllegalInstruction { pc: self.regs.rip })
-                }
-            }
+            // Triple fault. The IDT has a #PF gate, so genuine page faults are
+            // delivered through the trampoline above and never reach here (the
+            // kstack is a pinned control-block frame, so #PF delivery cannot
+            // itself fault). A SHUTDOWN is therefore an exception we don't handle
+            // — #UD, #GP, #BP, … — reported as an illegal instruction at the
+            // faulting `rip`. (cr2 is deliberately *not* consulted: it is sticky
+            // from the last real #PF, so with demand paging it is almost always
+            // non-zero and would misattribute a #UD as a bogus memory fault.)
+            sys::KVM_EXIT_SHUTDOWN => Ok(Exit::IllegalInstruction { pc: self.regs.rip }),
             sys::KVM_EXIT_INTR => Ok(Exit::Interrupted),
             sys::KVM_EXIT_FAIL_ENTRY => {
                 // SAFETY: as `mmio` — the arm matching the exit reason.
