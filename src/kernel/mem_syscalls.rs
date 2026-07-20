@@ -324,7 +324,7 @@ mod tests {
             Sysno::Munlockall,
             Sysno::Msync,
         ] {
-            assert_eq!(k.dispatch(&mut cx, s, 0, &[0; 6], &mut v, &mut mem, &mut k.shared.lock().unwrap()), 0, "{s:?}");
+            assert_eq!(k.dispatch(&mut cx, s, 0, &[0; 6], &mut v, &mut mem), 0, "{s:?}");
         }
     }
 }

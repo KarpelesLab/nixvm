@@ -874,21 +874,20 @@ mod tests {
 
     fn call(
         k: &Kernel,
-        sh: &mut Shared,
         cx: &mut ServiceCtx,
         mem: &mut GuestMemory,
         v: &mut DummyVcpu,
         s: Sysno,
         a: [u64; 6],
     ) -> i64 {
-        k.dispatch(cx, s, 0, &a, v, mem, sh)
+        k.dispatch(cx, s, 0, &a, v, mem)
     }
 
     #[test]
     fn eventfd_write_then_read_counter() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -902,7 +901,7 @@ mod tests {
         mem.write_init(buf, &3u64.to_le_bytes()).unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -914,7 +913,7 @@ mod tests {
         mem.write_init(buf, &4u64.to_le_bytes()).unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -926,7 +925,7 @@ mod tests {
 
         let out = 0x1_1000;
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
             8
         );
         assert_eq!(mem.read_u64(out).unwrap(), 7);
@@ -934,7 +933,7 @@ mod tests {
         // Drained: read again with count == 0 (non-blocking check via the
         // `block` flag, mirroring the pipe test's convention).
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
             0
         );
         assert!(cx.block);
@@ -945,7 +944,7 @@ mod tests {
         const EFD_SEMAPHORE: u64 = 1;
         let (k, mut mem, mut v, mut cx) = setup();
         let fd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -955,7 +954,7 @@ mod tests {
 
         let out = 0x1_0000;
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
             8
         );
         assert_eq!(mem.read_u64(out).unwrap(), 1);
@@ -965,14 +964,14 @@ mod tests {
     fn poll_reports_pollin_when_pipe_has_data() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_0000;
-        call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
         let rfd = u64::from(mem.read_u32(fds).unwrap());
         let wfd = u64::from(mem.read_u32(fds + 4).unwrap());
 
         let msg = 0x1_1000;
         mem.write_init(msg, b"hi").unwrap();
         call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -989,7 +988,7 @@ mod tests {
         mem.write_init(pollfds + 6, &0u16.to_le_bytes()).unwrap();
 
         let n = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -1004,7 +1003,7 @@ mod tests {
     fn poll_zero_timeout_on_empty_pipe_returns_immediately() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_0000;
-        call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
         let rfd = u64::from(mem.read_u32(fds).unwrap());
 
         let pollfds = 0x1_2000;
@@ -1013,7 +1012,7 @@ mod tests {
         mem.write_init(pollfds + 4, &1u16.to_le_bytes()).unwrap();
 
         let n = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -1028,14 +1027,14 @@ mod tests {
     fn epoll_create_ctl_wait_on_ready_pipe() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_0000;
-        call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
         let rfd = u64::from(mem.read_u32(fds).unwrap());
         let wfd = u64::from(mem.read_u32(fds + 4).unwrap());
 
         let msg = 0x1_1000;
         mem.write_init(msg, b"yo").unwrap();
         call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -1044,7 +1043,7 @@ mod tests {
         );
 
         let epfd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -1060,7 +1059,7 @@ mod tests {
             .unwrap(); // data (aarch64 offset)
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -1072,7 +1071,7 @@ mod tests {
 
         let out = 0x1_3000;
         let n = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -1088,7 +1087,7 @@ mod tests {
     fn timerfd_create_settime_gettime() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -1106,7 +1105,7 @@ mod tests {
         mem.write_init(newval + 24, &0u64.to_le_bytes()).unwrap(); // value nsec
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -1119,7 +1118,7 @@ mod tests {
         let curval = 0x1_1000;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -1138,7 +1137,7 @@ mod tests {
         // expired -> EAGAIN via O_NONBLOCK-equivalent isn't set, so it would
         // normally block; assert it sets the block flag instead of hanging).
         let out = 0x1_2000;
-        let ret = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]);
+        let ret = call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]);
         assert_eq!(ret, 0);
         assert!(cx.block);
     }
@@ -1147,7 +1146,7 @@ mod tests {
     fn timerfd_disarm_with_zero_value() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -1159,7 +1158,7 @@ mod tests {
         mem.write_init(newval, &[0u8; 32]).unwrap(); // all-zero itimerspec disarms
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -1171,7 +1170,7 @@ mod tests {
 
         let curval = 0x1_1000;
         call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,

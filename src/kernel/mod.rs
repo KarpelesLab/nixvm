@@ -451,11 +451,15 @@ fn run_slice_smp(
         // siblings a turn, and never letting the scheduler observe pid-1 exit or
         // drain the pool at shutdown.
         let is_interrupt = matches!(exit, Exit::Interrupted);
-        // ---- service phase: memory lock, then kernel lock (see above) ----
+        // ---- service phase: hold the memory lock across the step (it is
+        // outermost, and it serializes same-address-space siblings' service
+        // phases). `smp_service_step` takes the kernel lock only briefly, for
+        // the checkout/check-in bookkeeping; the syscall itself takes its own
+        // per-handler locks (sh before vfs) while `sh` is *not* held, so other
+        // workers service their syscalls concurrently (step B2). ----
         let step = {
             let mut mem = space.lock().unwrap();
-            let mut sh = kernel.shared.lock().unwrap();
-            kernel.smp_service_step(i, exit, vcpu.as_mut(), &mut mem, &mut sh)
+            kernel.smp_service_step(i, exit, vcpu.as_mut(), &mut mem)
         };
         match step {
             SliceStep::Continue => {
@@ -569,6 +573,14 @@ pub struct Kernel {
     /// lock. Servicing acquires this once per service step and holds it for the
     /// whole step — the behavior-preserving big kernel lock.
     shared: Mutex<Shared>,
+    /// The filesystem (`mounts`), peeled out of [`Shared`] onto its own lock
+    /// (step B2) so a slow fstool/disk read holds only this lock and other
+    /// tasks' non-FS syscalls run concurrently on `shared` instead of stalling
+    /// on the big lock. **Lock order is strict and inviolable: `shared` (sh) is
+    /// ALWAYS acquired BEFORE `vfs`; a `vfs` guard is NEVER held while acquiring
+    /// `shared`.** Two locks in a consistent order ⇒ no deadlock cycle. The
+    /// per-space memory lock stays outermost (memory → sh → vfs).
+    vfs: Mutex<MountTable>,
 }
 
 /// All kernel state mutated while a syscall is serviced, behind [`Kernel`]'s
@@ -576,7 +588,6 @@ pub struct Kernel {
 /// so a field here is reached as `sh.<field>` instead of `self.<field>`.
 #[allow(clippy::struct_excessive_bools)] // independent one-shot flags, not a state enum
 pub(super) struct Shared {
-    mounts: MountTable,
     pipes: Vec<Pipe>,
     net: Net,
     /// `eventfd2` counters, indexed by [`Fd::Eventfd`].
@@ -655,6 +666,11 @@ impl std::fmt::Debug for Kernel {
         if let Ok(sh) = self.shared.try_lock() {
             d.field("procs", &sh.procs.len());
             d.field("unsupported", &sh.unsupported);
+        }
+        // Non-deadlocking (and order-safe): `try_lock` never blocks, so probing
+        // `vfs` here can't violate the sh→vfs order even though sh may be held.
+        if let Ok(vfs) = self.vfs.try_lock() {
+            d.field("mounts", &*vfs);
         }
         d.finish_non_exhaustive()
     }
@@ -801,8 +817,8 @@ impl Kernel {
             seed: ProcInfo::default(),
             ncpus: 1,
             interactive: false,
+            vfs: Mutex::new(mounts),
             shared: Mutex::new(Shared {
-                mounts,
                 pipes: Vec::new(),
                 net: Net::default(),
                 eventfds: Vec::new(),
@@ -957,31 +973,41 @@ impl Kernel {
     /// behavior-identical to the old exclusive `&mut Kernel`, since the serial
     /// path is single-threaded and nothing else contends for it.
     fn serial_sweep(&self) -> Result<bool, VcpuError> {
-        let mut sh = self.shared.lock().unwrap();
         let mut progressed = false;
-        for i in 0..sh.procs.len() {
-            // Run only tasks that are Running *and not parked*: a parked task
-            // blocked last slice and won't make progress until woken.
-            let runnable = matches!(
-                sh.procs.get(i),
-                Some(Some(p)) if p.info.run == RunState::Running && !p.info.parked
-            );
-            if !runnable {
-                continue;
-            }
-            let mut proc = sh.procs[i].take().unwrap();
-            let mm = proc.info.mm;
-            let mut vcpu = proc.vcpu.take().expect("runnable task has a vcpu");
-            let space_arc = Arc::clone(&sh.spaces[mm]);
-            let mut guard = space_arc.lock().unwrap();
-            // Own the task's per-slice servicing state for the duration of the
-            // slice (was swapped into `self.cur`; now a passed-in value).
-            let mut cx = ServiceCtx {
-                cur: std::mem::take(&mut proc.info),
-                ..ServiceCtx::default()
+        let nprocs = self.shared.lock().unwrap().procs.len();
+        for i in 0..nprocs {
+            // Bookkeeping under `sh`: check the task out (its slot goes `None`,
+            // its fd table into `cx`), then RELEASE `sh` before running the
+            // slice, so the slice's syscalls take their own per-handler locks
+            // (dispatch would self-deadlock re-locking a held `sh`). The memory
+            // lock stays held across the slice — memory is outermost, and it
+            // serializes same-address-space siblings' service phases.
+            let (mut proc, mut vcpu, space_arc, mut cx) = {
+                let mut sh = self.shared.lock().unwrap();
+                // Run only tasks that are Running *and not parked*: a parked
+                // task blocked last slice and won't progress until woken.
+                let runnable = matches!(
+                    sh.procs.get(i),
+                    Some(Some(p)) if p.info.run == RunState::Running && !p.info.parked
+                );
+                if !runnable {
+                    continue;
+                }
+                let mut proc = sh.procs[i].take().unwrap();
+                let mm = proc.info.mm;
+                let vcpu = proc.vcpu.take().expect("runnable task has a vcpu");
+                let space_arc = Arc::clone(&sh.spaces[mm]);
+                // Own the task's per-slice servicing state for the duration of
+                // the slice (was swapped into `self.cur`; now a passed-in value).
+                let mut cx = ServiceCtx {
+                    cur: std::mem::take(&mut proc.info),
+                    ..ServiceCtx::default()
+                };
+                sh.check_out_files(&mut cx);
+                (proc, vcpu, space_arc, cx)
             };
-            sh.check_out_files(&mut cx);
-            let made = self.run_slice(&mut cx, &mut vcpu, &mut guard, &mut sh)?;
+            let mut guard = space_arc.lock().unwrap();
+            let made = self.run_slice(&mut cx, &mut vcpu, &mut guard)?;
             if self.schedtrace {
                 let end = if matches!(cx.cur.run, RunState::Zombie(_)) {
                     "ended"
@@ -998,10 +1024,12 @@ impl Kernel {
             // The slice ended either by exiting or by blocking; `cx.block`
             // reflects the last syscall. A blocked task parks until a wake.
             let blocked = cx.block;
+            // Drop the memory lock before re-taking `sh` (memory is outermost).
+            drop(guard);
+            let mut sh = self.shared.lock().unwrap();
             sh.check_in_files(&mut cx);
             proc.info = cx.cur;
             proc.info.parked = blocked && proc.info.run == RunState::Running;
-            drop(guard);
             proc.vcpu = Some(vcpu);
             sh.procs[i] = Some(proc);
             progressed |= made;
@@ -1091,12 +1119,11 @@ impl Kernel {
         &self, cx: &mut ServiceCtx,
         vcpu: &mut Box<dyn Vcpu>,
         mem: &mut GuestMemory,
-        sh: &mut Shared,
     ) -> Result<bool, VcpuError> {
         let mut progressed = false;
         loop {
             let exit = vcpu.run(mem)?;
-            match self.service(cx, exit, vcpu.as_mut(), mem, sh) {
+            match self.service(cx, exit, vcpu.as_mut(), mem) {
                 Serviced::SetRet(ret) => {
                     vcpu.set_syscall_ret(ret as u64);
                     progressed = true;
@@ -1128,7 +1155,7 @@ impl Kernel {
     /// SMP schedulers. Does NOT touch the vcpu's result register — the caller
     /// applies [`Serviced::SetRet`] — so the same logic works whether the vcpu
     /// lives on the main thread or is round-tripping through a worker.
-    fn service(&self, cx: &mut ServiceCtx, exit: Exit, vcpu: &mut dyn Vcpu, mem: &mut GuestMemory, sh: &mut Shared) -> Serviced {
+    fn service(&self, cx: &mut ServiceCtx, exit: Exit, vcpu: &mut dyn Vcpu, mem: &mut GuestMemory) -> Serviced {
         match exit {
             Exit::Syscall => {
                 let raw = vcpu.syscall_nr();
@@ -1137,7 +1164,10 @@ impl Kernel {
                 cx.slice_syscalls = cx.slice_syscalls.saturating_add(1);
                 cx.block = false;
                 cx.exec_ok = false;
-                let ret = self.dispatch(cx, sys, raw, &args, vcpu, mem, sh);
+                // No lock is held here: `dispatch` acquires exactly the lock(s)
+                // each handler needs (sh before vfs). This is what lets other
+                // workers service their own syscalls concurrently (step B2).
+                let ret = self.dispatch(cx, sys, raw, &args, vcpu, mem);
                 // If the syscall edited this address space's page tables in place
                 // (munmap, mprotect, mremap, a copy-on-write copy-in), flush the
                 // running vcpu's TLB so it can't keep using a stale entry for a
@@ -1152,7 +1182,7 @@ impl Kernel {
                 if !cx.block {
                     cx.cur.wake_deadline = None;
                 }
-                self.watch_code(vcpu, mem, sys, sh);
+                self.watch_code(vcpu, mem, sys);
                 if let RunState::Zombie(_) = cx.cur.run {
                     Serviced::Ended
                 } else if cx.block {
@@ -1495,33 +1525,46 @@ impl Kernel {
     }
 
     /// Service one guest exit for task `i` **in place** on an SMP worker: swap
-    /// the task's per-process state into `self.cur` (its slot in `sh.procs` is
+    /// the task's per-process state into a local `cx` (its slot in `sh.procs` is
     /// `take`n out for the duration, exactly as the serial scheduler does, so
     /// `fork`/`wait4`/`futex` scans don't see the running task), run the shared
-    /// [`Kernel::service`] logic, then swap it back. Called with the kernel lock
-    /// held, so servicing is serialized across all workers (the big kernel
-    /// lock). Returns what the worker should do next with the same vcpu.
+    /// [`Kernel::service`] logic, then swap it back.
+    ///
+    /// The kernel lock is taken only for the checkout and the check-in — NOT
+    /// across `service`, which acquires its own per-handler locks (sh before
+    /// vfs) so sibling workers service their syscalls concurrently (step B2).
+    /// The caller holds this address space's memory lock across the whole call,
+    /// which serializes the service phases of tasks that share it (so the fd
+    /// table can never be checked out twice at once). Returns what the worker
+    /// should do next with the same vcpu.
     fn smp_service_step(
         &self,
         i: usize,
         exit: Exit,
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
-        sh: &mut Shared,
     ) -> SliceStep {
-        let mut proc = sh.procs[i].take().expect("dispatched task is in the table");
-        // Own the task's per-step servicing state (was swapped into `self.cur`;
-        // now a passed-in value). `yield_now`/`block`/`exec_ok` start clear so we
-        // observe only this step's value (the serial path resets them likewise).
-        let mut cx = ServiceCtx {
-            cur: std::mem::take(&mut proc.info),
-            ..ServiceCtx::default()
+        // Checkout under `sh`, then release it before servicing.
+        let (mut proc, mut cx) = {
+            let mut sh = self.shared.lock().unwrap();
+            let mut proc = sh.procs[i].take().expect("dispatched task is in the table");
+            // Own the task's per-step servicing state. `yield_now`/`block`/
+            // `exec_ok` start clear so we observe only this step's value (the
+            // serial path resets them likewise).
+            let mut cx = ServiceCtx {
+                cur: std::mem::take(&mut proc.info),
+                ..ServiceCtx::default()
+            };
+            sh.check_out_files(&mut cx);
+            (proc, cx)
         };
-        sh.check_out_files(&mut cx);
-        let flow = self.service(&mut cx, exit, vcpu, mem, sh);
-        sh.check_in_files(&mut cx);
-        proc.info = cx.cur;
-        sh.procs[i] = Some(proc);
+        let flow = self.service(&mut cx, exit, vcpu, mem);
+        {
+            let mut sh = self.shared.lock().unwrap();
+            sh.check_in_files(&mut cx);
+            proc.info = cx.cur;
+            sh.procs[i] = Some(proc);
+        }
         match flow {
             Serviced::SetRet(ret) => {
                 vcpu.set_syscall_ret(ret as u64);
@@ -1546,8 +1589,9 @@ impl Kernel {
     /// Debug: watch a guest address (`NIXVM_WATCHCODE=0xADDR`) for its 8 bytes
     /// changing, printing the syscall/pc window it changed in — for tracking
     /// down a wild write that corrupts a code page real hardware would fault on.
-    #[allow(clippy::unused_self)]
-    fn watch_code(&self, vcpu: &dyn Vcpu, mem: &GuestMemory, after: Sysno, sh: &mut Shared) {
+    fn watch_code(&self, vcpu: &dyn Vcpu, mem: &GuestMemory, after: Sysno) {
+        // Debug-only: acquires `sh` on its own (no other lock is held here).
+        let mut sh = self.shared.lock().unwrap();
         let Some(addr) = sh.watch_addr else {
             return;
         };
@@ -1631,14 +1675,13 @@ impl Kernel {
         args: &[u64; 6],
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
-        sh: &mut Shared,
     ) -> i64 {
         if !self.trace {
-            return self.dispatch_inner(cx, sys, raw, args, vcpu, mem, sh);
+            return self.dispatch_impl(cx, sys, raw, args, vcpu, mem);
         }
         let (pid, pc) = (cx.cur.pid, vcpu.pc());
         eprintln!("[trace] pid={pid} pc={pc:#x} {sys:?} raw={raw} args={args:x?}");
-        let ret = self.dispatch_inner(cx, sys, raw, args, vcpu, mem, sh);
+        let ret = self.dispatch_impl(cx, sys, raw, args, vcpu, mem);
         if (-4095..0).contains(&ret) {
             eprintln!("[trace]   = {ret} (errno {})", -ret);
         } else {
@@ -1647,20 +1690,189 @@ impl Kernel {
         ret
     }
 
-    #[allow(clippy::too_many_lines)] // one arm per syscall; a flat table is clearest.
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_inner(
+    /// Route a syscall to the lock discipline it needs (step B2). No lock is
+    /// pre-held here — each category acquires exactly the lock(s) it touches,
+    /// always in the order `shared` (sh) before `vfs`:
+    /// - **fd-polymorphic** (`read`/`write`/`readv`/`writev`): peek the fd type
+    ///   from `cx` (no lock), then take *one* of sh/vfs (a file op → vfs, every
+    ///   other target → sh) — never both.
+    /// - **both** (`mmap`/`memfd_create`/`sendfile`): take sh then vfs and hold
+    ///   both (they mutate `shared` state *and* the mount table atomically).
+    /// - **vfs-only** (the FS hot path): take only `vfs` via [`Self::dispatch_vfs`].
+    /// - **everything else**: take only `sh` via [`Self::dispatch_shared`] (the
+    ///   unchanged B1 syscall table).
+    #[allow(clippy::too_many_lines)]
+    fn dispatch_impl(
         &self, cx: &mut ServiceCtx,
         sys: Sysno,
         raw: u64,
         args: &[u64; 6],
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
-        sh: &mut Shared,
     ) -> i64 {
         match sys {
-            Sysno::Write => self.sys_write(sh, cx, args[0], args[1], args[2], mem),
-            Sysno::Read => self.sys_read(sh, cx, args[0], args[1], args[2], mem),
+            // fd-polymorphic: exactly one of sh/vfs, chosen from the fd type.
+            Sysno::Write => self.sys_write(cx, args[0], args[1], args[2], mem),
+            Sysno::Read => self.sys_read(cx, args[0], args[1], args[2], mem),
+            Sysno::Readv => self.sys_readv(cx, args[0], args[1], args[2], mem),
+            Sysno::Writev => self.sys_writev(cx, args[0], args[1], args[2], mem),
+            // both: sh THEN vfs, held together for atomicity.
+            Sysno::Mmap => {
+                let mut sh = self.shared.lock().unwrap();
+                let mut vfs = self.vfs.lock().unwrap();
+                self.sys_mmap(&mut sh, &mut vfs, cx, args, mem)
+            }
+            Sysno::MemfdCreate => {
+                let mut sh = self.shared.lock().unwrap();
+                let mut vfs = self.vfs.lock().unwrap();
+                self.sys_memfd_create(&mut sh, &mut vfs, cx, args[0], mem)
+            }
+            Sysno::Sendfile => {
+                let mut sh = self.shared.lock().unwrap();
+                let mut vfs = self.vfs.lock().unwrap();
+                self.sys_sendfile(&mut sh, &mut vfs, cx, args[0], args[1], args[2], args[3], mem)
+            }
+            // vfs-only (the FS hot path): a single `vfs` lock for the whole group.
+            Sysno::Openat
+            | Sysno::Open
+            | Sysno::Creat
+            | Sysno::Lseek
+            | Sysno::Pread64
+            | Sysno::Pwrite64
+            | Sysno::Preadv
+            | Sysno::Pwritev
+            | Sysno::Ftruncate
+            | Sysno::Truncate
+            | Sysno::Fallocate
+            | Sysno::CopyFileRange
+            | Sysno::Link
+            | Sysno::Linkat
+            | Sysno::Statx
+            | Sysno::Fstat
+            | Sysno::Newfstatat
+            | Sysno::Stat
+            | Sysno::Lstat
+            | Sysno::Getdents64
+            | Sysno::Chdir
+            | Sysno::Fchdir
+            | Sysno::Statfs
+            | Sysno::Readlinkat
+            | Sysno::Readlink
+            | Sysno::Symlinkat
+            | Sysno::Symlink
+            | Sysno::Mkdirat
+            | Sysno::Mkdir
+            | Sysno::Unlinkat
+            | Sysno::Unlink
+            | Sysno::Rmdir
+            | Sysno::Renameat
+            | Sysno::Renameat2
+            | Sysno::Rename
+            | Sysno::Faccessat
+            | Sysno::Faccessat2
+            | Sysno::Access
+            | Sysno::Msync => {
+                let mut vfs = self.vfs.lock().unwrap();
+                self.dispatch_vfs(&mut vfs, cx, sys, args, mem)
+            }
+            // everything else: a single `sh` lock, running the B1 syscall table.
+            _ => {
+                let mut sh = self.shared.lock().unwrap();
+                self.dispatch_shared(&mut sh, cx, sys, raw, args, vcpu, mem)
+            }
+        }
+    }
+
+    /// The vfs-only syscalls (the filesystem hot path): called with `vfs` — and
+    /// *only* `vfs` — held, so no `self.shared.lock()` may appear anywhere below
+    /// (that would take sh after vfs and break the lock order). Every arm here
+    /// touches just the mount table (plus per-task `cx`).
+    #[allow(clippy::too_many_lines)]
+    fn dispatch_vfs(
+        &self, vfs: &mut MountTable, cx: &mut ServiceCtx,
+        sys: Sysno,
+        args: &[u64; 6],
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        match sys {
+            Sysno::Openat => self.sys_openat(vfs, cx, args[0] as i64, args[1], args[2], args[3], mem),
+            Sysno::Open => self.sys_openat(vfs, cx, AT_FDCWD, args[0], args[1], args[2], mem),
+            Sysno::Creat => {
+                const O_WRONLY_CREAT_TRUNC: u64 = 0o1101;
+                self.sys_openat(vfs, cx, AT_FDCWD, args[0], O_WRONLY_CREAT_TRUNC, args[1], mem)
+            }
+            Sysno::Lseek => self.sys_lseek(vfs, cx, args[0], args[1] as i64, args[2]),
+            Sysno::Pread64 => self.sys_pread(vfs, cx, args[0], args[1], args[2], args[3], mem),
+            Sysno::Pwrite64 => self.sys_pwrite(vfs, cx, args[0], args[1], args[2], args[3], mem),
+            Sysno::Preadv => self.sys_preadv(vfs, cx, args[0], args[1], args[2], args[3], mem),
+            Sysno::Pwritev => self.sys_pwritev(vfs, cx, args[0], args[1], args[2], args[3], mem),
+            Sysno::Ftruncate => self.sys_ftruncate(vfs, cx, args[0], args[1]),
+            Sysno::Truncate => self.sys_truncate(vfs, cx, args[0], args[1], mem),
+            Sysno::Fallocate => self.sys_fallocate(vfs, cx, args[0], args[2], args[3]),
+            Sysno::CopyFileRange => self.sys_copy_file_range(vfs, cx, args, mem),
+            Sysno::Link => self.sys_linkat(vfs, cx, AT_FDCWD, args[0], AT_FDCWD, args[1], 0, mem),
+            Sysno::Linkat => {
+                self.sys_linkat(vfs, cx, args[0] as i64, args[1], args[2] as i64, args[3], args[4], mem)
+            }
+            Sysno::Statx => self.sys_statx(vfs, cx, args[0] as i64, args[1], args[2], args[4], mem),
+            Sysno::Fstat => self.sys_fstat(vfs, cx, args[0], args[1], mem),
+            Sysno::Newfstatat => {
+                self.sys_newfstatat(vfs, cx, args[0] as i64, args[1], args[2], args[3], mem)
+            }
+            Sysno::Stat => self.sys_newfstatat(vfs, cx, AT_FDCWD, args[0], args[1], 0, mem),
+            Sysno::Lstat => {
+                const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+                self.sys_newfstatat(vfs, cx, AT_FDCWD, args[0], args[1], AT_SYMLINK_NOFOLLOW, mem)
+            }
+            Sysno::Getdents64 => self.sys_getdents64(vfs, cx, args[0], args[1], args[2], mem),
+            Sysno::Chdir => self.sys_chdir(vfs, cx, args[0], mem),
+            Sysno::Fchdir => self.sys_fchdir(vfs, cx, args[0]),
+            Sysno::Statfs => self.sys_statfs(vfs, cx, args[0], args[1], mem),
+            Sysno::Readlinkat => {
+                self.sys_readlinkat(vfs, cx, args[0] as i64, args[1], args[2], args[3], mem)
+            }
+            Sysno::Readlink => self.sys_readlinkat(vfs, cx, AT_FDCWD, args[0], args[1], args[2], mem),
+            Sysno::Symlinkat => self.sys_symlinkat(vfs, cx, args[0], args[1] as i64, args[2], mem),
+            Sysno::Symlink => self.sys_symlinkat(vfs, cx, args[0], AT_FDCWD, args[1], mem),
+            Sysno::Mkdirat => self.sys_mkdirat(vfs, cx, args[0] as i64, args[1], args[2], mem),
+            Sysno::Mkdir => self.sys_mkdirat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
+            Sysno::Unlinkat => self.sys_unlinkat(vfs, cx, args[0] as i64, args[1], args[2], mem),
+            Sysno::Unlink => self.sys_unlinkat(vfs, cx, AT_FDCWD, args[0], 0, mem),
+            Sysno::Rmdir => {
+                const AT_REMOVEDIR: u64 = 0x200;
+                self.sys_unlinkat(vfs, cx, AT_FDCWD, args[0], AT_REMOVEDIR, mem)
+            }
+            Sysno::Renameat | Sysno::Renameat2 => {
+                self.sys_renameat(vfs, cx, args[0] as i64, args[1], args[2] as i64, args[3], mem)
+            }
+            Sysno::Rename => self.sys_renameat(vfs, cx, AT_FDCWD, args[0], AT_FDCWD, args[1], mem),
+            Sysno::Faccessat | Sysno::Faccessat2 => {
+                self.sys_faccessat(vfs, cx, args[0] as i64, args[1], mem)
+            }
+            Sysno::Access => self.sys_faccessat(vfs, cx, AT_FDCWD, args[0], mem),
+            Sysno::Msync => self.sys_msync(vfs, cx, args[0], args[1], mem),
+            // Unreachable: `dispatch_impl` only routes the syscalls above here.
+            _ => unreachable!("dispatch_vfs: {sys:?} is not a vfs-only syscall"),
+        }
+    }
+
+    /// The B1 syscall table: every syscall that touches `shared` (and nothing in
+    /// the mount table), run with `sh` held. Unchanged from B1 except that the
+    /// FS / fd-polymorphic / mmap-family arms moved to [`Self::dispatch_impl`]/
+    /// [`Self::dispatch_vfs`]. A handler here that *also* needs the mount table
+    /// (`execve`, `exit`, `munmap`, …) acquires `vfs` internally — always after
+    /// `sh`, never before.
+    #[allow(clippy::too_many_lines)] // one arm per syscall; a flat table is clearest.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_shared(
+        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        sys: Sysno,
+        raw: u64,
+        args: &[u64; 6],
+        vcpu: &mut dyn Vcpu,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        match sys {
             // sendto/recvfrom carry an optional peer address (UDP) beyond
             // write/read; the address-aware path lives in net.rs.
             Sysno::Sendto => {
@@ -1678,9 +1890,7 @@ impl Kernel {
                 0
             }
             Sysno::Brk => self.sys_brk(cx, args[0], mem),
-            Sysno::Mmap => self.sys_mmap(sh, cx, args, mem),
             Sysno::Munmap => self.sys_munmap(sh, cx, args[0], args[1], mem),
-            Sysno::Msync => self.sys_msync(sh, cx, args[0], args[1], mem),
             Sysno::Mprotect => self.sys_mprotect(args[0], args[1], args[2], mem),
             Sysno::Mremap => {
                 self.sys_mremap(sh, cx, args[0], args[1], args[2], args[3], args[4], mem)
@@ -1697,29 +1907,8 @@ impl Kernel {
             // The guest does not own the host clock: refuse to set it. ptrace
             // is refused too (no debugging surface).
             Sysno::Settimeofday | Sysno::ClockSettime | Sysno::Ptrace => err(Errno::EPERM),
-            Sysno::Openat => self.sys_openat(sh, cx, args[0] as i64, args[1], args[2], args[3], mem),
             Sysno::Close => self.sys_close(sh, cx, args[0] as i32),
             Sysno::CloseRange => self.sys_close_range(sh, cx, args[0], args[1]),
-            Sysno::Lseek => self.sys_lseek(sh, cx, args[0], args[1] as i64, args[2]),
-            // Positioned & vectored I/O.
-            Sysno::Pread64 => self.sys_pread(sh, cx, args[0], args[1], args[2], args[3], mem),
-            Sysno::Pwrite64 => self.sys_pwrite(sh, cx, args[0], args[1], args[2], args[3], mem),
-            Sysno::Preadv => self.sys_preadv(sh, cx, args[0], args[1], args[2], args[3], mem),
-            Sysno::Pwritev => self.sys_pwritev(sh, cx, args[0], args[1], args[2], args[3], mem),
-            // File size / sync. The sync family has no durable backing store to
-            // flush (everything is in-memory or host-passthrough), so they just
-            // succeed; `readahead`/`fadvise64`/`sync_file_range` are advisory.
-            Sysno::Ftruncate => self.sys_ftruncate(sh, cx, args[0], args[1]),
-            Sysno::Truncate => self.sys_truncate(sh, cx, args[0], args[1], mem),
-            Sysno::Fallocate => self.sys_fallocate(sh, cx, args[0], args[2], args[3]),
-            // File copy / link.
-            Sysno::Sendfile => self.sys_sendfile(sh, cx, args[0], args[1], args[2], args[3], mem),
-            Sysno::CopyFileRange => self.sys_copy_file_range(sh, cx, args, mem),
-            Sysno::Link => self.sys_linkat(sh, cx, AT_FDCWD, args[0], AT_FDCWD, args[1], 0, mem),
-            Sysno::Linkat => {
-                self.sys_linkat(sh, cx, args[0] as i64, args[1], args[2] as i64, args[3], args[4], mem)
-            }
-            Sysno::Statx => self.sys_statx(sh, cx, args[0] as i64, args[1], args[2], args[4], mem),
             // Credentials: this VM runs as root and models no multi-user
             // policy, so the setters all succeed and the getters report root.
             Sysno::Getresuid | Sysno::Getresgid => {
@@ -1745,7 +1934,6 @@ impl Kernel {
             // Anonymous / notification fds. inotify/signalfd get an fd that
             // never becomes readable (no events/signals delivered — a safe
             // degradation for optional watching).
-            Sysno::MemfdCreate => self.sys_memfd_create(sh, cx, args[0], mem),
             Sysno::InotifyInit1 | Sysno::Signalfd4 => self.sys_inotify_init1(sh, cx),
             // A watch descriptor the guest can pass to inotify_rm_watch (which
             // is a no-op in the always-succeed group below).
@@ -1758,34 +1946,11 @@ impl Kernel {
                 cx.block = true;
                 0
             }
-            Sysno::Fstat => self.sys_fstat(sh, cx, args[0], args[1], mem),
-            Sysno::Newfstatat => {
-                self.sys_newfstatat(sh, cx, args[0] as i64, args[1], args[2], args[3], mem)
-            }
-            Sysno::Getdents64 => self.sys_getdents64(sh, cx, args[0], args[1], args[2], mem),
             Sysno::Getcwd => self.sys_getcwd(cx, args[0], args[1], mem),
-            Sysno::Chdir => self.sys_chdir(sh, cx, args[0], mem),
-            Sysno::Fchdir => self.sys_fchdir(sh, cx, args[0]),
-            Sysno::Statfs => self.sys_statfs(sh, cx, args[0], args[1], mem),
             Sysno::Fstatfs => self.sys_fstatfs(cx, args[0], args[1], mem),
-            Sysno::Readlinkat => {
-                self.sys_readlinkat(sh, cx, args[0] as i64, args[1], args[2], args[3], mem)
-            }
-            Sysno::Symlinkat => self.sys_symlinkat(sh, cx, args[0], args[1] as i64, args[2], mem),
-            Sysno::Mkdirat => self.sys_mkdirat(sh, cx, args[0] as i64, args[1], args[2], mem),
-            Sysno::Unlinkat => self.sys_unlinkat(sh, cx, args[0] as i64, args[1], args[2], mem),
-            Sysno::Renameat | Sysno::Renameat2 => {
-                self.sys_renameat(sh, cx, args[0] as i64, args[1], args[2] as i64, args[3], mem)
-            }
-            Sysno::Faccessat | Sysno::Faccessat2 => {
-                self.sys_faccessat(sh, cx, args[0] as i64, args[1], mem)
-            }
-            Sysno::Access => self.sys_faccessat(sh, cx, AT_FDCWD, args[0], mem),
             Sysno::Umask => self.sys_umask(sh, args[0]),
             // No extended attributes: report "no such attribute".
             Sysno::Getxattr | Sysno::Lgetxattr | Sysno::Fgetxattr => err(Errno::ENODATA),
-            Sysno::Readv => self.sys_readv(sh, cx, args[0], args[1], args[2], mem),
-            Sysno::Writev => self.sys_writev(sh, cx, args[0], args[1], args[2], mem),
             Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], mem),
             Sysno::Ioctl => err(Errno::ENOTTY),
             Sysno::Fcntl => self.sys_fcntl(sh, cx, args[0], args[1]),
@@ -1834,28 +1999,6 @@ impl Kernel {
             // SIGCHLD, ...)` — aarch64 never had either as its own syscall.
             Sysno::Fork => self.sys_clone(sh, cx, &[0x11, 0, 0, 0, 0, 0], vcpu, mem),
             Sysno::Vfork => self.sys_clone(sh, cx, &[0x4111, 0, 0, 0, 0, 0], vcpu, mem),
-            // x86-64's legacy path-based stat family, in terms of newfstatat.
-            Sysno::Stat => self.sys_newfstatat(sh, cx, AT_FDCWD, args[0], args[1], 0, mem),
-            Sysno::Lstat => {
-                const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
-                self.sys_newfstatat(sh, cx, AT_FDCWD, args[0], args[1], AT_SYMLINK_NOFOLLOW, mem)
-            }
-            // x86-64's legacy path-based file syscalls, each the `AT_FDCWD`
-            // special case of its `*at` successor.
-            Sysno::Open => self.sys_openat(sh, cx, AT_FDCWD, args[0], args[1], args[2], mem),
-            Sysno::Creat => {
-                const O_WRONLY_CREAT_TRUNC: u64 = 0o1101;
-                self.sys_openat(sh, cx, AT_FDCWD, args[0], O_WRONLY_CREAT_TRUNC, args[1], mem)
-            }
-            Sysno::Mkdir => self.sys_mkdirat(sh, cx, AT_FDCWD, args[0], args[1], mem),
-            Sysno::Rmdir => {
-                const AT_REMOVEDIR: u64 = 0x200;
-                self.sys_unlinkat(sh, cx, AT_FDCWD, args[0], AT_REMOVEDIR, mem)
-            }
-            Sysno::Unlink => self.sys_unlinkat(sh, cx, AT_FDCWD, args[0], 0, mem),
-            Sysno::Rename => self.sys_renameat(sh, cx, AT_FDCWD, args[0], AT_FDCWD, args[1], mem),
-            Sysno::Symlink => self.sys_symlinkat(sh, cx, args[0], AT_FDCWD, args[1], mem),
-            Sysno::Readlink => self.sys_readlinkat(sh, cx, AT_FDCWD, args[0], args[1], args[2], mem),
             Sysno::Execve => self.sys_execve(sh, cx, args[0], args[1], args[2], vcpu, mem),
             Sysno::Wait4 => self.sys_wait4(sh, cx, args[0] as i64, args[1], args[2], mem),
             Sysno::Exit => self.sys_exit(sh, cx, args[0] as i32, mem),
@@ -2174,12 +2317,15 @@ impl Kernel {
         let Some(rel) = read_path(mem, path_ptr) else {
             return err(Errno::EFAULT);
         };
-        let Some(abs) = self.resolve_exec(sh, cx, &rel) else {
+        // `sh` is already held (this handler runs under `dispatch_shared`);
+        // acquiring `vfs` here keeps the mandated sh→vfs order.
+        let mut vfs = self.vfs.lock().unwrap();
+        let Some(abs) = self.resolve_exec(&mut vfs, cx, &rel) else {
             return err(Errno::ENOENT);
         };
         let argv = read_string_array(mem, argv_ptr);
         let envp = read_string_array(mem, envp_ptr);
-        self.exec_image(sh, cx, &abs, argv, envp, vcpu, mem)
+        self.exec_image(sh, &mut vfs, cx, &abs, argv, envp, vcpu, mem)
     }
 
     /// `execveat(dirfd, path, argv, envp, flags)` — like `execve` but resolves
@@ -2210,22 +2356,25 @@ impl Kernel {
         };
         let argv = read_string_array(mem, argv_ptr);
         let envp = read_string_array(mem, envp_ptr);
-        self.exec_image(sh, cx, &abs, argv, envp, vcpu, mem)
+        // sh held (dispatch_shared) → acquire vfs in the mandated order.
+        let mut vfs = self.vfs.lock().unwrap();
+        self.exec_image(sh, &mut vfs, cx, &abs, argv, envp, vcpu, mem)
     }
 
     /// Load `abs` (following `PT_INTERP` for dynamic executables) into a fresh
     /// address space and reset the vcpu onto it — the shared core of
-    /// `execve`/`execveat`.
+    /// `execve`/`execveat`. Reads the image from `vfs` and resets the arena in
+    /// `sh`, so its caller holds both (sh→vfs).
     #[allow(clippy::too_many_arguments)]
     fn exec_image(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, sh: &mut Shared, vfs: &mut MountTable, cx: &mut ServiceCtx,
         abs: &str,
         argv: Vec<String>,
         envp: Vec<String>,
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
     ) -> i64 {
-        let Some(elf) = self.read_file(sh, abs) else {
+        let Some(elf) = self.read_file(vfs, abs) else {
             return err(Errno::ENOENT);
         };
         // Reject an obviously non-ELF64 image *before* tearing down the current
@@ -2240,7 +2389,7 @@ impl Kernel {
         // the one KVM memslot stays valid and the process just gets a new cr3.
         mem.exec_reset();
         let loaded = if let Some(interp) = interp_path(&elf) {
-            let Some(interp_elf) = self.read_file(sh, &interp) else {
+            let Some(interp_elf) = self.read_file(vfs, &interp) else {
                 return err(Errno::ENOENT); // interpreter missing
             };
             load_dynamic(mem, &elf, &interp_elf, &spec)
@@ -2464,7 +2613,7 @@ impl Kernel {
     /// `statx(dirfd, path, flags, mask, buf)` — the modern `stat`. Fills the
     /// basic-stats fields of `struct statx` from the resolved node's [`Attrs`].
     #[allow(clippy::too_many_arguments)]
-    fn sys_statx(&self, sh: &mut Shared, cx: &mut ServiceCtx, dirfd: i64, path_ptr: u64, flags: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
+    fn sys_statx(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, dirfd: i64, path_ptr: u64, flags: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
         const AT_EMPTY_PATH: u64 = 0x1000;
         let Some(rel) = read_path(mem, path_ptr) else {
             return err(Errno::EFAULT);
@@ -2472,14 +2621,14 @@ impl Kernel {
         let attrs = if rel.is_empty() && flags & AT_EMPTY_PATH != 0 {
             match cx.cur.fds.get(dirfd as i32) {
                 Some(Fd::File { path, .. } | Fd::Dir { path, .. }) => {
-                    sh.mounts.stat(&path.clone())
+                    vfs.stat(&path.clone())
                 }
                 Some(Fd::Stdin | Fd::Stdout | Fd::Stderr) => Some(stat::char_device_attrs()),
                 _ => None,
             }
         } else {
             let abs = self.resolve_path(cx, dirfd, &rel);
-            sh.mounts.stat(&abs)
+            vfs.stat(&abs)
         };
         let Some(a) = attrs else {
             return err(Errno::ENOENT);
@@ -2496,7 +2645,7 @@ impl Kernel {
     /// the read/write/`ftruncate`/`mmap` behavior programs expect from a memfd
     /// (the "not linked into any directory" nuance is not modeled).
     #[allow(clippy::unused_self)]
-    fn sys_memfd_create(&self, sh: &mut Shared, cx: &mut ServiceCtx, name_ptr: u64, mem: &GuestMemory) -> i64 {
+    fn sys_memfd_create(&self, sh: &mut Shared, vfs: &mut MountTable, cx: &mut ServiceCtx, name_ptr: u64, mem: &GuestMemory) -> i64 {
         let name = read_path(mem, name_ptr).unwrap_or_default();
         let short: String = name.chars().take(64).filter(|c| *c != '/').collect();
         sh.memfd_seq += 1;
@@ -2504,7 +2653,7 @@ impl Kernel {
         // stays out of ordinary `ls` output — the root is a tmpfs/overlay in
         // every configuration, so this doesn't depend on `/tmp` existing.
         let path = format!("/.memfd.{short}.{}", sh.memfd_seq);
-        if sh.mounts.create(&path, 0o600).is_err() {
+        if vfs.create(&path, 0o600).is_err() {
             return err(Errno::ENOSPC);
         }
         i64::from(cx.cur.fds.alloc(Fd::File { path, offset: 0 }))
@@ -2524,9 +2673,12 @@ impl Kernel {
     /// notification (so a joiner wakes), close its fds (so pipe peers see EOF),
     /// and become a zombie until reaped.
     fn sys_exit(&self, sh: &mut Shared, cx: &mut ServiceCtx, code: i32, mem: &mut GuestMemory) -> i64 {
-        // Flush any un-munmap'd writable shared file mappings first.
+        // Flush any un-munmap'd writable shared file mappings first. `sh` is
+        // held; scope `vfs` to just the flush (sh→vfs order), dropping it before
+        // the rest of teardown.
         if !cx.cur.shared_maps.is_empty() {
-            self.flush_shared_maps(sh, cx, 0, 0, mem);
+            let mut vfs = self.vfs.lock().unwrap();
+            self.flush_shared_maps(&mut vfs, cx, 0, 0, mem);
         }
         let ctid = cx.cur.clear_child_tid;
         let mm = cx.cur.mm;
@@ -2563,9 +2715,11 @@ impl Kernel {
     /// sibling sharing our `tgid`. Each dying task closes its fds; the running
     /// task also runs its `CLONE_CHILD_CLEARTID` notification.
     fn sys_exit_group(&self, sh: &mut Shared, cx: &mut ServiceCtx, code: i32, mem: &mut GuestMemory) -> i64 {
-        // Flush any un-munmap'd writable shared file mappings first.
+        // Flush any un-munmap'd writable shared file mappings first (sh→vfs,
+        // scoped so the tail `sys_exit` can re-acquire vfs without a re-lock).
         if !cx.cur.shared_maps.is_empty() {
-            self.flush_shared_maps(sh, cx, 0, 0, mem);
+            let mut vfs = self.vfs.lock().unwrap();
+            self.flush_shared_maps(&mut vfs, cx, 0, 0, mem);
         }
         let tgid = cx.cur.tgid;
         let status = code & 0xff;
@@ -2757,7 +2911,45 @@ impl Kernel {
     // ---- files & fds ------------------------------------------------------
 
     /// `write(fd, buf, count)` — stdio sinks (fd 1/2), files, and pipes.
-    fn sys_write(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &GuestMemory) -> i64 {
+    /// `write(fd, buf, count)`. **fd-polymorphic**: a file write touches only
+    /// the mount table (holds just `vfs`); every other target (stdout/stderr/
+    /// pipe/socket/eventfd) lives in `shared` (holds just `sh`). The fd type is
+    /// read from `cx` *without a lock*, then exactly one of the two locks is
+    /// taken — never both — so a file write and another task's non-FS syscall
+    /// run concurrently.
+    fn sys_write(&self, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &GuestMemory) -> i64 {
+        if let Some(Fd::File { .. }) = cx.cur.fds.get(fd as i32) {
+            let mut vfs = self.vfs.lock().unwrap();
+            return self.write_file_fd(&mut vfs, cx, fd, buf, count, mem);
+        }
+        let mut sh = self.shared.lock().unwrap();
+        self.write_shared_fd(&mut sh, cx, fd, buf, count, mem)
+    }
+
+    /// The `Fd::File` arm of [`Self::sys_write`]: write `count` bytes at the
+    /// fd's offset and advance it. `vfs`-only.
+    #[allow(clippy::unused_self)]
+    fn write_file_fd(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &GuestMemory) -> i64 {
+        let Some(Fd::File { path, offset }) = cx.cur.fds.get(fd as i32).cloned() else {
+            return err(Errno::EBADF);
+        };
+        let Ok(data) = mem.read_vec(buf, count as usize) else {
+            return err(Errno::EFAULT);
+        };
+        match vfs.write_at(&path, offset, &data) {
+            Ok(n) => {
+                if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32) {
+                    *offset += n as u64;
+                }
+                n as i64
+            }
+            Err(e) => io_errno(&e),
+        }
+    }
+
+    /// The non-`File` arms of [`Self::sys_write`] (stdout/stderr/pipe/socket/
+    /// eventfd), all backed by `shared`.
+    fn write_shared_fd(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &GuestMemory) -> i64 {
         let Ok(data) = mem.read_vec(buf, count as usize) else {
             return err(Errno::EFAULT);
         };
@@ -2771,15 +2963,6 @@ impl Kernel {
                 Ok(()) => count as i64,
                 Err(_) => err(Errno::EIO),
             },
-            Some(Fd::File { path, offset }) => match sh.mounts.write_at(&path, offset, &data) {
-                Ok(n) => {
-                    if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32) {
-                        *offset += n as u64;
-                    }
-                    n as i64
-                }
-                Err(e) => io_errno(&e),
-            },
             Some(Fd::PipeWrite(i)) => self.write_pipe(sh, i, &data),
             Some(Fd::Socket { sock, end }) => self.write_socket(sh, cx, sock, end, &data),
             Some(Fd::Eventfd(i)) => self.write_eventfd(sh, cx, i, &data),
@@ -2787,8 +2970,43 @@ impl Kernel {
         }
     }
 
-    /// `read(fd, buf, count)` — stdin, files, and pipes.
-    fn sys_read(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+    /// `read(fd, buf, count)` — stdin, files, and pipes. **fd-polymorphic**,
+    /// exactly like [`Self::sys_write`]: a file read holds only `vfs`, every
+    /// other source holds only `sh`.
+    fn sys_read(&self, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+        if let Some(Fd::File { .. }) = cx.cur.fds.get(fd as i32) {
+            let mut vfs = self.vfs.lock().unwrap();
+            return self.read_file_fd(&mut vfs, cx, fd, buf, count, mem);
+        }
+        let mut sh = self.shared.lock().unwrap();
+        self.read_shared_fd(&mut sh, cx, fd, buf, count, mem)
+    }
+
+    /// The `Fd::File` arm of [`Self::sys_read`]: read at the fd's offset and
+    /// advance it. `vfs`-only.
+    #[allow(clippy::unused_self)]
+    fn read_file_fd(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+        let Some(Fd::File { path, offset }) = cx.cur.fds.get(fd as i32).cloned() else {
+            return err(Errno::EBADF);
+        };
+        let mut tmp = vec![0u8; count as usize];
+        match vfs.read_at(&path, offset, &mut tmp) {
+            Ok(n) => {
+                if mem.write(buf, &tmp[..n]).is_err() {
+                    return err(Errno::EFAULT);
+                }
+                if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32) {
+                    *offset += n as u64;
+                }
+                n as i64
+            }
+            Err(e) => io_errno(&e),
+        }
+    }
+
+    /// The non-`File` arms of [`Self::sys_read`] (stdin/pipe/socket/eventfd/
+    /// timerfd), all backed by `shared`.
+    fn read_shared_fd(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
         match cx.cur.fds.get(fd as i32).cloned() {
             Some(Fd::Stdin) if self.interactive => {
                 // Draw from the buffered terminal input; block (re-trap) when it
@@ -2823,21 +3041,6 @@ impl Kernel {
             Some(Fd::Socket { sock, end }) => self.read_socket(sh, cx, sock, end, buf, count, mem),
             Some(Fd::Eventfd(i)) => self.read_eventfd(sh, cx, i, buf, count, mem),
             Some(Fd::Timerfd(i)) => self.read_timerfd(sh, cx, i, buf, count, mem),
-            Some(Fd::File { path, offset }) => {
-                let mut tmp = vec![0u8; count as usize];
-                match sh.mounts.read_at(&path, offset, &mut tmp) {
-                    Ok(n) => {
-                        if mem.write(buf, &tmp[..n]).is_err() {
-                            return err(Errno::EFAULT);
-                        }
-                        if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32) {
-                            *offset += n as u64;
-                        }
-                        n as i64
-                    }
-                    Err(e) => io_errno(&e),
-                }
-            }
             _ => err(Errno::EBADF),
         }
     }
@@ -2873,12 +3076,12 @@ impl Kernel {
     /// `pread64(fd, buf, count, offset)` — read at `offset` without moving the
     /// fd's position. Files only (a pipe/socket has no position → `ESPIPE`).
     #[allow(clippy::too_many_arguments, clippy::unused_self)]
-    fn sys_pread(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, offset: u64, mem: &mut GuestMemory) -> i64 {
+    fn sys_pread(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, offset: u64, mem: &mut GuestMemory) -> i64 {
         let Some(Fd::File { path, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::ESPIPE);
         };
         let mut tmp = vec![0u8; count as usize];
-        match sh.mounts.read_at(&path, offset, &mut tmp) {
+        match vfs.read_at(&path, offset, &mut tmp) {
             Ok(n) => {
                 if mem.write(buf, &tmp[..n]).is_err() {
                     return err(Errno::EFAULT);
@@ -2892,14 +3095,14 @@ impl Kernel {
     /// `pwrite64(fd, buf, count, offset)` — write at `offset` without moving
     /// the fd's position.
     #[allow(clippy::too_many_arguments, clippy::unused_self)]
-    fn sys_pwrite(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, offset: u64, mem: &GuestMemory) -> i64 {
+    fn sys_pwrite(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, offset: u64, mem: &GuestMemory) -> i64 {
         let Some(Fd::File { path, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::ESPIPE);
         };
         let Ok(data) = mem.read_vec(buf, count as usize) else {
             return err(Errno::EFAULT);
         };
-        match sh.mounts.write_at(&path, offset, &data) {
+        match vfs.write_at(&path, offset, &data) {
             Ok(n) => n as i64,
             Err(e) => io_errno(&e),
         }
@@ -2909,7 +3112,7 @@ impl Kernel {
     /// iovecs. `offset` is `pos_l` (`pos_h`, the 32-bit-compat high word, is 0
     /// for 64-bit callers).
     #[allow(clippy::too_many_arguments)]
-    fn sys_preadv(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, iov: u64, iovcnt: u64, offset: u64, mem: &mut GuestMemory) -> i64 {
+    fn sys_preadv(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, iov: u64, iovcnt: u64, offset: u64, mem: &mut GuestMemory) -> i64 {
         let mut cur = offset;
         let mut total = 0i64;
         for i in 0..iovcnt {
@@ -2920,7 +3123,7 @@ impl Kernel {
             if len == 0 {
                 continue;
             }
-            let r = self.sys_pread(sh, cx, fd, base, len, cur, mem);
+            let r = self.sys_pread(vfs, cx, fd, base, len, cur, mem);
             if r < 0 {
                 return if total > 0 { total } else { r };
             }
@@ -2935,7 +3138,7 @@ impl Kernel {
 
     /// `pwritev(fd, iov, iovcnt, offset)` — gather a positioned write.
     #[allow(clippy::too_many_arguments)]
-    fn sys_pwritev(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, iov: u64, iovcnt: u64, offset: u64, mem: &GuestMemory) -> i64 {
+    fn sys_pwritev(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, iov: u64, iovcnt: u64, offset: u64, mem: &GuestMemory) -> i64 {
         let mut cur = offset;
         let mut total = 0i64;
         for i in 0..iovcnt {
@@ -2946,7 +3149,7 @@ impl Kernel {
             if len == 0 {
                 continue;
             }
-            let r = self.sys_pwrite(sh, cx, fd, base, len, cur, mem);
+            let r = self.sys_pwrite(vfs, cx, fd, base, len, cur, mem);
             if r < 0 {
                 return if total > 0 { total } else { r };
             }
@@ -2961,23 +3164,23 @@ impl Kernel {
 
     /// `ftruncate(fd, len)` — resize the file the fd refers to.
     #[allow(clippy::unused_self)]
-    fn sys_ftruncate(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, len: u64) -> i64 {
+    fn sys_ftruncate(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, len: u64) -> i64 {
         let Some(Fd::File { path, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
-        match sh.mounts.truncate(&path, len) {
+        match vfs.truncate(&path, len) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
         }
     }
 
     /// `truncate(path, len)` — resize by path.
-    fn sys_truncate(&self, sh: &mut Shared, cx: &mut ServiceCtx, pathptr: u64, len: u64, mem: &GuestMemory) -> i64 {
+    fn sys_truncate(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, pathptr: u64, len: u64, mem: &GuestMemory) -> i64 {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(cx, AT_FDCWD, &rel);
-        match sh.mounts.truncate(&abs, len) {
+        match vfs.truncate(&abs, len) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
         }
@@ -2987,14 +3190,14 @@ impl Kernel {
     /// mode, grow the file to at least `offset + len`; other modes (punch
     /// hole, and so on) are accepted as no-ops.
     #[allow(clippy::unused_self)]
-    fn sys_fallocate(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, offset: u64, len: u64) -> i64 {
+    fn sys_fallocate(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, offset: u64, len: u64) -> i64 {
         let Some(Fd::File { path, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
         let want = offset.saturating_add(len);
-        let cur = sh.mounts.stat(&path).map_or(0, |a| a.size);
+        let cur = vfs.stat(&path).map_or(0, |a| a.size);
         if want > cur {
-            match sh.mounts.truncate(&path, want) {
+            match vfs.truncate(&path, want) {
                 Ok(()) => 0,
                 Err(e) => io_errno(&e),
             }
@@ -3008,7 +3211,7 @@ impl Kernel {
     /// offset in `in_fd` (and is advanced), and `in_fd`'s own position is left
     /// alone; otherwise `in_fd`'s position is used and advanced.
     #[allow(clippy::too_many_arguments)]
-    fn sys_sendfile(&self, sh: &mut Shared, cx: &mut ServiceCtx, out_fd: u64, in_fd: u64, offset_ptr: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+    fn sys_sendfile(&self, sh: &mut Shared, vfs: &mut MountTable, cx: &mut ServiceCtx, out_fd: u64, in_fd: u64, offset_ptr: u64, count: u64, mem: &mut GuestMemory) -> i64 {
         // Resolve the source position.
         let use_ptr = offset_ptr != 0;
         let start = if use_ptr {
@@ -3026,14 +3229,14 @@ impl Kernel {
             return err(Errno::EINVAL);
         };
         let mut buf = vec![0u8; count as usize];
-        let n = match sh.mounts.read_at(&path, start, &mut buf) {
+        let n = match vfs.read_at(&path, start, &mut buf) {
             Ok(n) => n,
             Err(e) => return io_errno(&e),
         };
         buf.truncate(n);
         // Write it out through the normal write path (files, pipes, sockets).
         let written = match cx.cur.fds.get(out_fd as i32).cloned() {
-            Some(Fd::File { path, offset }) => match sh.mounts.write_at(&path, offset, &buf) {
+            Some(Fd::File { path, offset }) => match vfs.write_at(&path, offset, &buf) {
                 Ok(w) => {
                     if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(out_fd as i32) {
                         *offset += w as u64;
@@ -3063,7 +3266,7 @@ impl Kernel {
     /// `copy_file_range(fd_in, off_in, fd_out, off_out, len, flags)` — copy
     /// between two files, honoring the optional in/out offset pointers.
     #[allow(clippy::unused_self)]
-    fn sys_copy_file_range(&self, sh: &mut Shared, cx: &mut ServiceCtx, a: &[u64; 6], mem: &mut GuestMemory) -> i64 {
+    fn sys_copy_file_range(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, a: &[u64; 6], mem: &mut GuestMemory) -> i64 {
         let (fd_in, off_in_p, fd_out, off_out_p, len) = (a[0], a[1], a[2], a[3], a[4]);
         let Some(Fd::File { path: in_path, offset: in_pos }) = cx.cur.fds.get(fd_in as i32).cloned() else {
             return err(Errno::EBADF);
@@ -3074,7 +3277,7 @@ impl Kernel {
             in_pos
         };
         let mut buf = vec![0u8; len as usize];
-        let n = match sh.mounts.read_at(&in_path, in_off, &mut buf) {
+        let n = match vfs.read_at(&in_path, in_off, &mut buf) {
             Ok(n) => n,
             Err(e) => return io_errno(&e),
         };
@@ -3087,7 +3290,7 @@ impl Kernel {
         } else {
             out_pos
         };
-        let w = match sh.mounts.write_at(&out_path, out_off, &buf) {
+        let w = match vfs.write_at(&out_path, out_off, &buf) {
             Ok(w) => w,
             Err(e) => return io_errno(&e),
         };
@@ -3110,13 +3313,13 @@ impl Kernel {
     /// file's contents to the new path (correct for the overwhelmingly common
     /// use — same-content at a second name; the shared-inode nuance is lost).
     #[allow(clippy::too_many_arguments)]
-    fn sys_linkat(&self, sh: &mut Shared, cx: &mut ServiceCtx, olddirfd: i64, oldp: u64, newdirfd: i64, newp: u64, _flags: u64, mem: &GuestMemory) -> i64 {
+    fn sys_linkat(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, olddirfd: i64, oldp: u64, newdirfd: i64, newp: u64, _flags: u64, mem: &GuestMemory) -> i64 {
         let (Some(orel), Some(nrel)) = (read_path(mem, oldp), read_path(mem, newp)) else {
             return err(Errno::EFAULT);
         };
         let old_abs = self.resolve_path(cx, olddirfd, &orel);
         let new_abs = self.resolve_path(cx, newdirfd, &nrel);
-        let Some(attrs) = sh.mounts.stat(&old_abs) else {
+        let Some(attrs) = vfs.stat(&old_abs) else {
             return err(Errno::ENOENT);
         };
         if attrs.kind == NodeKind::Dir {
@@ -3124,13 +3327,13 @@ impl Kernel {
         }
         // Read the whole source, create the target, copy.
         let mut data = vec![0u8; attrs.size as usize];
-        if sh.mounts.read_at(&old_abs, 0, &mut data).is_err() {
+        if vfs.read_at(&old_abs, 0, &mut data).is_err() {
             return err(Errno::EIO);
         }
-        if let Err(e) = sh.mounts.create(&new_abs, attrs.mode & 0o7777) {
+        if let Err(e) = vfs.create(&new_abs, attrs.mode & 0o7777) {
             return io_errno(&e);
         }
-        match sh.mounts.write_at(&new_abs, 0, &data) {
+        match vfs.write_at(&new_abs, 0, &data) {
             Ok(_) => 0,
             Err(e) => io_errno(&e),
         }
@@ -3139,7 +3342,33 @@ impl Kernel {
     /// `readv(fd, iov, iovcnt)` — scatter a read across `struct iovec` entries.
     /// A short read (or a blocking fd) stops after the first partially-filled
     /// iovec, like the real syscall.
-    fn sys_readv(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, iov: u64, iovcnt: u64, mem: &mut GuestMemory) -> i64 {
+    fn sys_readv(&self, cx: &mut ServiceCtx, fd: u64, iov: u64, iovcnt: u64, mem: &mut GuestMemory) -> i64 {
+        // fd-polymorphic, and atomic across iovecs: peek the fd type once (no
+        // lock), then hold a single lock for the whole scatter — a file readv
+        // holds only `vfs`, every other source only `sh`.
+        if let Some(Fd::File { .. }) = cx.cur.fds.get(fd as i32) {
+            let mut vfs = self.vfs.lock().unwrap();
+            let mut total = 0i64;
+            for i in 0..iovcnt {
+                let ent = iov + i * 16;
+                let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
+                    return if total > 0 { total } else { err(Errno::EFAULT) };
+                };
+                if len == 0 {
+                    continue;
+                }
+                let r = self.read_file_fd(&mut vfs, cx, fd, base, len, mem);
+                if r < 0 {
+                    return if total > 0 { total } else { r };
+                }
+                total += r;
+                if (r as u64) < len {
+                    break; // short read: don't touch the remaining iovecs
+                }
+            }
+            return total;
+        }
+        let mut sh = self.shared.lock().unwrap();
         let mut total = 0i64;
         for i in 0..iovcnt {
             let ent = iov + i * 16;
@@ -3149,20 +3378,44 @@ impl Kernel {
             if len == 0 {
                 continue;
             }
-            let r = self.sys_read(sh, cx, fd, base, len, mem);
+            let r = self.read_shared_fd(&mut sh, cx, fd, base, len, mem);
             if r < 0 {
                 return if total > 0 { total } else { r };
             }
             total += r;
             if (r as u64) < len {
-                break; // short read: don't touch the remaining iovecs
+                break;
             }
         }
         total
     }
 
     /// `writev(fd, iov, iovcnt)` — gather `struct iovec { base; len }` entries.
-    fn sys_writev(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, iov: u64, iovcnt: u64, mem: &GuestMemory) -> i64 {
+    /// fd-polymorphic and atomic across iovecs, exactly like [`Self::sys_readv`].
+    fn sys_writev(&self, cx: &mut ServiceCtx, fd: u64, iov: u64, iovcnt: u64, mem: &GuestMemory) -> i64 {
+        if let Some(Fd::File { .. }) = cx.cur.fds.get(fd as i32) {
+            let mut vfs = self.vfs.lock().unwrap();
+            let mut total = 0i64;
+            for i in 0..iovcnt {
+                let ent = iov + i * 16;
+                let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
+                    return if total > 0 { total } else { err(Errno::EFAULT) };
+                };
+                if len == 0 {
+                    continue;
+                }
+                let r = self.write_file_fd(&mut vfs, cx, fd, base, len, mem);
+                if r < 0 {
+                    return if total > 0 { total } else { r };
+                }
+                total += r;
+                if (r as u64) < len {
+                    break;
+                }
+            }
+            return total;
+        }
+        let mut sh = self.shared.lock().unwrap();
         let mut total = 0i64;
         for i in 0..iovcnt {
             let ent = iov + i * 16;
@@ -3172,7 +3425,7 @@ impl Kernel {
             if len == 0 {
                 continue;
             }
-            let r = self.sys_write(sh, cx, fd, base, len, mem);
+            let r = self.write_shared_fd(&mut sh, cx, fd, base, len, mem);
             if r < 0 {
                 return if total > 0 { total } else { r };
             }
@@ -3252,7 +3505,7 @@ impl Kernel {
     /// `openat(dirfd, path, flags, mode)` against the mount table.
     #[allow(clippy::too_many_arguments)]
     fn sys_openat(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, vfs: &mut MountTable, cx: &mut ServiceCtx,
         dirfd: i64,
         pathptr: u64,
         flags: u64,
@@ -3266,24 +3519,24 @@ impl Kernel {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(cx, dirfd, &rel);
-        let abs = self.follow_symlinks(sh, &abs).unwrap_or(abs);
+        let abs = self.follow_symlinks(vfs, &abs).unwrap_or(abs);
         if self.trace {
             eprintln!("[open] pid={} {abs:?}", cx.cur.pid);
         }
 
-        if sh.mounts.stat(&abs).is_none() {
+        if vfs.stat(&abs).is_none() {
             if flags & O_CREAT != 0 {
-                if let Err(e) = sh.mounts.create(&abs, (mode & 0o777) as u32) {
+                if let Err(e) = vfs.create(&abs, (mode & 0o777) as u32) {
                     return io_errno(&e);
                 }
             } else {
                 return err(Errno::ENOENT);
             }
         } else if flags & O_TRUNC != 0 {
-            let _ = sh.mounts.truncate(&abs, 0);
+            let _ = vfs.truncate(&abs, 0);
         }
 
-        let Some(attrs) = sh.mounts.stat(&abs) else {
+        let Some(attrs) = vfs.stat(&abs) else {
             return err(Errno::ENOENT);
         };
         let fd = if attrs.kind == NodeKind::Dir {
@@ -3372,12 +3625,12 @@ impl Kernel {
 
     /// `lseek(fd, offset, whence)`.
     #[allow(clippy::unused_self)]
-    fn sys_lseek(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, offset: i64, whence: u64) -> i64 {
+    fn sys_lseek(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, offset: i64, whence: u64) -> i64 {
         let (cur, path) = match cx.cur.fds.get(fd as i32) {
             Some(Fd::File { path, offset }) => (*offset, path.clone()),
             _ => return err(Errno::ESPIPE),
         };
-        let size = sh.mounts.stat(&path).map_or(0, |a| a.size);
+        let size = vfs.stat(&path).map_or(0, |a| a.size);
         let base = match whence {
             0 => 0i64,
             1 => cur as i64,
@@ -3395,11 +3648,11 @@ impl Kernel {
     }
 
     /// `fstat(fd, statbuf)`.
-    fn sys_fstat(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, statbuf: u64, mem: &mut GuestMemory) -> i64 {
+    fn sys_fstat(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, statbuf: u64, mem: &mut GuestMemory) -> i64 {
         let attrs = match cx.cur.fds.get(fd as i32) {
             Some(Fd::File { path, .. } | Fd::Dir { path, .. }) => {
                 let path = path.clone();
-                match sh.mounts.stat(&path) {
+                match vfs.stat(&path) {
                     Some(a) => a,
                     None => return err(Errno::ENOENT),
                 }
@@ -3423,7 +3676,7 @@ impl Kernel {
     /// `newfstatat(dirfd, path, statbuf, flags)`.
     #[allow(clippy::too_many_arguments)]
     fn sys_newfstatat(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, vfs: &mut MountTable, cx: &mut ServiceCtx,
         dirfd: i64,
         pathptr: u64,
         statbuf: u64,
@@ -3436,9 +3689,9 @@ impl Kernel {
         };
         let mut abs = self.resolve_path(cx, dirfd, &rel);
         if flags & AT_SYMLINK_NOFOLLOW == 0 {
-            abs = self.follow_symlinks(sh, &abs).unwrap_or(abs);
+            abs = self.follow_symlinks(vfs, &abs).unwrap_or(abs);
         }
-        let Some(attrs) = sh.mounts.stat(&abs) else {
+        let Some(attrs) = vfs.stat(&abs) else {
             return err(Errno::ENOENT);
         };
         write_stat_or_fault(mem, statbuf, &attrs, self.arch)
@@ -3446,12 +3699,12 @@ impl Kernel {
 
     /// `getdents64(fd, buf, count)`.
     #[allow(clippy::unused_self)]
-    fn sys_getdents64(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+    fn sys_getdents64(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
         let (path, pos) = match cx.cur.fds.get(fd as i32) {
             Some(Fd::Dir { path, pos }) => (path.clone(), *pos),
             _ => return err(Errno::ENOTDIR),
         };
-        let entries = match sh.mounts.readdir(&path) {
+        let entries = match vfs.readdir(&path) {
             Ok(e) => e,
             Err(e) => return io_errno(&e),
         };
@@ -3489,12 +3742,12 @@ impl Kernel {
     }
 
     /// `chdir(path)`.
-    fn sys_chdir(&self, sh: &mut Shared, cx: &mut ServiceCtx, pathptr: u64, mem: &GuestMemory) -> i64 {
+    fn sys_chdir(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, pathptr: u64, mem: &GuestMemory) -> i64 {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(cx, AT_FDCWD, &rel);
-        match sh.mounts.stat(&abs) {
+        match vfs.stat(&abs) {
             Some(a) if a.kind == NodeKind::Dir => {
                 cx.cur.cwd = abs;
                 0
@@ -3507,13 +3760,13 @@ impl Kernel {
     /// `fchdir(fd)` — change cwd to the directory `fd` refers to. apk's
     /// busybox post-install triggers `fchdir` back to a saved dir fd.
     #[allow(clippy::unused_self)]
-    fn sys_fchdir(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64) -> i64 {
+    fn sys_fchdir(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64) -> i64 {
         let path = match cx.cur.fds.get(fd as i32) {
             Some(Fd::Dir { path, .. }) => path.clone(),
             Some(_) => return err(Errno::ENOTDIR),
             None => return err(Errno::EBADF),
         };
-        match sh.mounts.stat(&path) {
+        match vfs.stat(&path) {
             Some(a) if a.kind == NodeKind::Dir => {
                 cx.cur.cwd = path;
                 0
@@ -3541,12 +3794,12 @@ impl Kernel {
 
     /// Follow the final-component symlink chain (bounded), returning the target.
     #[allow(clippy::unused_self)]
-    fn follow_symlinks(&self, sh: &mut Shared, path: &str) -> Option<String> {
+    fn follow_symlinks(&self, vfs: &mut MountTable, path: &str) -> Option<String> {
         let mut p = path.to_string();
         for _ in 0..SYMLINK_MAX {
-            match sh.mounts.stat(&p) {
+            match vfs.stat(&p) {
                 Some(a) if a.kind == NodeKind::Symlink => {
-                    let target = sh.mounts.readlink(&p).ok()?;
+                    let target = vfs.readlink(&p).ok()?;
                     p = if target.starts_with('/') {
                         path::normalize(&target)
                     } else {
@@ -3561,19 +3814,19 @@ impl Kernel {
     }
 
     /// Resolve an `execve` target: absolute-ize, then follow symlinks.
-    fn resolve_exec(&self, sh: &mut Shared, cx: &mut ServiceCtx, p: &str) -> Option<String> {
+    fn resolve_exec(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, p: &str) -> Option<String> {
         let abs = self.resolve_path(cx, AT_FDCWD, p);
-        self.follow_symlinks(sh, &abs)
+        self.follow_symlinks(vfs, &abs)
     }
 
     /// Read an entire file from the mount table.
     #[allow(clippy::unused_self)]
-    fn read_file(&self, sh: &mut Shared, path: &str) -> Option<Vec<u8>> {
-        let size = sh.mounts.stat(path)?.size as usize;
+    fn read_file(&self, vfs: &mut MountTable, path: &str) -> Option<Vec<u8>> {
+        let size = vfs.stat(path)?.size as usize;
         let mut buf = vec![0u8; size];
         let mut off = 0;
         while off < size {
-            match sh.mounts.read_at(path, off as u64, &mut buf[off..]) {
+            match vfs.read_at(path, off as u64, &mut buf[off..]) {
                 Ok(0) => break,
                 Ok(n) => off += n,
                 Err(_) => return None,
@@ -3626,7 +3879,7 @@ impl Kernel {
     /// flushed back to the backing file (documented limitation), which is
     /// correct for the read-only/executable maps loaders create.
     #[allow(clippy::unused_self)]
-    fn sys_mmap(&self, sh: &mut Shared, cx: &mut ServiceCtx, a: &[u64; 6], mem: &mut GuestMemory) -> i64 {
+    fn sys_mmap(&self, sh: &mut Shared, vfs: &mut MountTable, cx: &mut ServiceCtx, a: &[u64; 6], mem: &mut GuestMemory) -> i64 {
         const MAP_SHARED: u64 = 0x01;
         const MAP_FIXED: u64 = 0x10;
         const MAP_ANONYMOUS: u64 = 0x20;
@@ -3670,10 +3923,7 @@ impl Kernel {
             let mut data = vec![0u8; len as usize];
             let mut got = 0usize;
             while got < data.len() {
-                match sh
-                    .mounts
-                    .read_at(&path, offset + got as u64, &mut data[got..])
-                {
+                match vfs.read_at(&path, offset + got as u64, &mut data[got..]) {
                     Ok(n) if n > 0 => got += n,
                     _ => break, // EOF or read error: leave the rest zero-filled
                 }
@@ -3701,7 +3951,7 @@ impl Kernel {
     /// len)` back to their backing files (their guest memory is the source of
     /// truth). `len == 0` flushes every shared mapping (process teardown).
     #[allow(clippy::unused_self)]
-    fn flush_shared_maps(&self, sh: &mut Shared, cx: &mut ServiceCtx, addr: u64, len: u64, mem: &GuestMemory) {
+    fn flush_shared_maps(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, addr: u64, len: u64, mem: &GuestMemory) {
         let hit_all = len == 0;
         let (lo, hi) = (addr, addr.saturating_add(len));
         // Take the list out to avoid borrowing `self` twice; retained maps go back.
@@ -3713,13 +3963,13 @@ impl Kernel {
             }
             // Don't grow the file past its real size (the mapping is page-
             // rounded, but the file was `ftruncate`d to the exact length).
-            let file_size = sh.mounts.stat(&m.path).map_or(m.len, |a| a.size);
+            let file_size = vfs.stat(&m.path).map_or(m.len, |a| a.size);
             let writable = file_size.saturating_sub(m.offset).min(m.len);
             if writable == 0 {
                 continue;
             }
             if let Ok(bytes) = mem.read_vec(m.base, writable as usize) {
-                let _ = sh.mounts.write_at(&m.path, m.offset, &bytes);
+                let _ = vfs.write_at(&m.path, m.offset, &bytes);
             }
         }
         // A partial munmap keeps mappings it didn't cover; a full flush drops all.
@@ -3749,8 +3999,10 @@ impl Kernel {
         let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
         let base = addr - addr % PAGE_SIZE;
         // Flush any writable shared file mapping before the pages go away.
+        // `sh` is held (dispatch_shared) → acquire `vfs` in the mandated order.
         if !cx.cur.shared_maps.is_empty() {
-            self.flush_shared_maps(sh, cx, base, len, mem);
+            let mut vfs = self.vfs.lock().unwrap();
+            self.flush_shared_maps(&mut vfs, cx, base, len, mem);
         }
         let _ = mem.unmap(base, len);
         // Give the range back to the arena so it can be handed out again — a
@@ -3762,12 +4014,12 @@ impl Kernel {
 
     /// `msync(addr, len, flags)` — flush a writable shared file mapping to its
     /// file without unmapping it.
-    fn sys_msync(&self, sh: &mut Shared, cx: &mut ServiceCtx, addr: u64, len: u64, mem: &GuestMemory) -> i64 {
+    fn sys_msync(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, addr: u64, len: u64, mem: &GuestMemory) -> i64 {
         if !cx.cur.shared_maps.is_empty() {
             let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
             // msync flushes but keeps the mapping — re-add after the flush.
             let saved = cx.cur.shared_maps.clone();
-            self.flush_shared_maps(sh, cx, addr - addr % PAGE_SIZE, len.max(PAGE_SIZE), mem);
+            self.flush_shared_maps(vfs, cx, addr - addr % PAGE_SIZE, len.max(PAGE_SIZE), mem);
             cx.cur.shared_maps = saved;
         }
         0
@@ -4079,7 +4331,7 @@ mod tests {
         // Empty buffer, not closed: the read parks (blocks).
         cx.block = false;
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]),
             0
         );
         assert!(cx.block, "read of empty interactive stdin blocks");
@@ -4088,7 +4340,7 @@ mod tests {
         k.feed_stdin(b"hi\n");
         cx.block = false;
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]),
             3
         );
         assert_eq!(&mem.read_vec(buf, 3).unwrap(), b"hi\n");
@@ -4098,7 +4350,7 @@ mod tests {
         k.close_stdin();
         cx.block = false;
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [0, buf, 16, 0, 0, 0]),
             0
         );
         assert!(!cx.block, "EOF does not block");
@@ -4230,14 +4482,15 @@ mod tests {
 
     fn call(
         k: &Kernel,
-        sh: &mut Shared,
         cx: &mut ServiceCtx,
         mem: &mut GuestMemory,
         v: &mut DummyVcpu,
         s: Sysno,
         a: [u64; 6],
     ) -> i64 {
-        k.dispatch(cx, s, 0, &a, v, mem, sh)
+        // `dispatch` now takes its own per-handler locks; the caller must NOT
+        // pre-hold `sh` (that would self-deadlock on the non-reentrant Mutex).
+        k.dispatch(cx, s, 0, &a, v, mem)
     }
 
     #[test]
@@ -4250,7 +4503,7 @@ mod tests {
         mem.write_init(msg, b"Hi").unwrap();
 
         let fd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4262,7 +4515,7 @@ mod tests {
 
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4272,11 +4525,11 @@ mod tests {
             2
         );
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]),
             0
         );
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [fd, buf, 2, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, buf, 2, 0, 0, 0]),
             2
         );
         assert_eq!(mem.read_vec(buf, 2).unwrap(), b"Hi");
@@ -4284,7 +4537,7 @@ mod tests {
         let stbuf = 0x1_3000;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4296,7 +4549,7 @@ mod tests {
         assert_eq!(mem.read_u64(stbuf + 48).unwrap(), 2);
 
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Close, [fd, 0, 0, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Close, [fd, 0, 0, 0, 0, 0]),
             0
         );
     }
@@ -4330,7 +4583,7 @@ mod tests {
 
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4347,7 +4600,7 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_0000;
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]),
             0
         );
         let rfd = u64::from(mem.read_u32(fds).unwrap());
@@ -4358,7 +4611,7 @@ mod tests {
         mem.write_init(msg, b"pipe!").unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4368,12 +4621,12 @@ mod tests {
             5
         );
 
-        let dfd = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Dup, [rfd, 0, 0, 0, 0, 0]);
+        let dfd = call(&k, &mut cx, &mut mem, &mut v, Sysno::Dup, [rfd, 0, 0, 0, 0, 0]);
         assert!(dfd >= 3);
         let buf = 0x1_2000;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4387,7 +4640,7 @@ mod tests {
         // drained + writer still open -> blocks (returns 0 with the block flag)
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4405,7 +4658,7 @@ mod tests {
         k.set_stdin(Box::new(std::io::Cursor::new(b"piped".to_vec())));
         let buf = 0x1_0000;
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [0, buf, 5, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [0, buf, 5, 0, 0, 0]),
             5
         );
         assert_eq!(mem.read_vec(buf, 5).unwrap(), b"piped");
@@ -4417,7 +4670,7 @@ mod tests {
         let buf = 0x1_0000;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4434,7 +4687,7 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         // clone(flags=0, stack=0, ...) -> child pid
         let child = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4447,7 +4700,7 @@ mod tests {
         // no zombie yet -> wait4 blocks
         let ws = 0x1_0000;
         call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4464,7 +4717,7 @@ mod tests {
             p.info.run = RunState::Zombie(7);
         }
         let reaped = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4494,7 +4747,7 @@ mod tests {
         cx.cur.mm = 0;
 
         let child = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4514,7 +4767,7 @@ mod tests {
         );
 
         let thread = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4555,8 +4808,8 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         cx.cur.pid = 7; // a thread's tid
         cx.cur.tgid = 1; // its process
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Getpid, [0; 6]), 1);
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Gettid, [0; 6]), 7);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Getpid, [0; 6]), 1);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Gettid, [0; 6]), 7);
     }
 
     #[test]
@@ -4565,7 +4818,7 @@ mod tests {
         // CLONE_VM | CLONE_THREAD | CLONE_SETTLS
         let flags = 0x0000_0100 | 0x0001_0000 | 0x0008_0000;
         let tid = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4600,7 +4853,7 @@ mod tests {
         let before = k.shared.lock().unwrap().spaces.len();
         // flags = SIGCHLD only (a plain fork), no CLONE_VM.
         let child = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4625,7 +4878,7 @@ mod tests {
         k.shared.lock().unwrap().procs.push(Some(make_proc(4, 4, 1, false)));
 
         call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4669,7 +4922,7 @@ mod tests {
 
         // FUTEX_WAKE(uaddr, op=1, val=1) wakes exactly one waiter.
         let woken = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4690,7 +4943,7 @@ mod tests {
         // Value matches and no other task could wake us: report a spurious wake
         // rather than parking (which would be a false deadlock).
         let r = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4701,7 +4954,7 @@ mod tests {
         assert!(!cx.block, "lone waiter is not parked");
         // A mismatched value is EAGAIN.
         let r = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4719,7 +4972,7 @@ mod tests {
         // A runnable sibling exists, so a matching wait parks the caller.
         k.shared.lock().unwrap().procs.push(Some(make_proc(2, 1, 0, true)));
         let r = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4743,7 +4996,7 @@ mod tests {
 
         // Create /lib and write four bytes to it.
         let fd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4753,7 +5006,7 @@ mod tests {
         assert_eq!(fd, 3);
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4766,7 +5019,7 @@ mod tests {
         // Map it read-only at a fixed address; the file bytes appear there.
         let addr = 0x1_5000u64;
         let ret = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4788,7 +5041,7 @@ mod tests {
         // Pre-dirty the target page so we can prove the tail is zeroed.
         mem.write(0x1_3000, &[0xFF; 8]).unwrap();
         let fd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4796,7 +5049,7 @@ mod tests {
             [AT_CWD, path, 0o102, 0o644, 0, 0],
         );
         call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4805,7 +5058,7 @@ mod tests {
         );
         let addr = 0x1_3000u64;
         call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4824,7 +5077,7 @@ mod tests {
         // No such fd -> EBADF.
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4836,7 +5089,7 @@ mod tests {
         // fd 1 is stdout, not a file -> EACCES.
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4869,7 +5122,7 @@ mod tests {
         let path = 0x1_0000;
         mem.write_init(path, b"/work/probe\0").unwrap();
         let fd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4880,7 +5133,7 @@ mod tests {
         let buf = 0x1_1000;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4902,7 +5155,7 @@ mod tests {
         // gettimeofday writes a nonzero tv_sec.
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4917,7 +5170,7 @@ mod tests {
         let res = 0x1_1000;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4938,7 +5191,7 @@ mod tests {
         mem.write_init(rem + 8, &7u64.to_le_bytes()).unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4955,7 +5208,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -4972,7 +5225,7 @@ mod tests {
         let path = 0x1_0000;
         mem.write_init(path, b"/a\0").unwrap();
         call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4983,7 +5236,7 @@ mod tests {
         let root = 0x1_1000;
         mem.write_init(root, b"/\0").unwrap();
         let dirfd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -4992,7 +5245,7 @@ mod tests {
         );
         let buf = 0x1_2000;
         let n = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -5003,7 +5256,7 @@ mod tests {
 
         let cbuf = 0x1_3000;
         let len = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -5070,7 +5323,7 @@ mod tests {
         mem.write_init(act, &0xdeadu64.to_le_bytes()).unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -5085,7 +5338,7 @@ mod tests {
         mem.write_init(act, &0xbeefu64.to_le_bytes()).unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -5106,7 +5359,7 @@ mod tests {
         // SIGKILL (9) and SIGSTOP (19) dispositions cannot change.
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -5117,7 +5370,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -5138,7 +5391,7 @@ mod tests {
         // SIG_SETMASK (2) replaces the mask.
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -5152,7 +5405,7 @@ mod tests {
         // Read it back through oldset (set == 0 leaves the mask unchanged).
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -5169,7 +5422,7 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         // kill(pid 1 == self, SIGTERM=15) sets the pending bit.
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Kill, [1, 15, 0, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [1, 15, 0, 0, 0, 0]),
             0
         );
         assert_eq!(cx.cur.pending, 1 << 14);
@@ -5183,7 +5436,7 @@ mod tests {
     fn kill_nonexistent_pid_is_esrch() {
         let (k, mut mem, mut v, mut cx) = setup();
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Kill, [999, 15, 0, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [999, 15, 0, 0, 0, 0]),
             -3
         );
     }
@@ -5192,10 +5445,10 @@ mod tests {
     fn open_seeded(k: &mut Kernel, cx: &mut ServiceCtx, mem: &mut GuestMemory, v: &mut DummyVcpu, content: &[u8]) -> u64 {
         let path = 0x1_0000;
         mem.write_init(path, b"/f\0").unwrap();
-        let fd = call(k, &mut k.shared.lock().unwrap(), cx, mem, v, Sysno::Openat, [AT_CWD, path, 0o102, 0o644, 0, 0]) as u64;
+        let fd = call(k, cx, mem, v, Sysno::Openat, [AT_CWD, path, 0o102, 0o644, 0, 0]) as u64;
         let src = 0x1_3000;
         mem.write_init(src, content).unwrap();
-        call(k, &mut k.shared.lock().unwrap(), cx, mem, v, Sysno::Write, [fd, src, content.len() as u64, 0, 0, 0]);
+        call(k, cx, mem, v, Sysno::Write, [fd, src, content.len() as u64, 0, 0, 0]);
         fd
     }
 
@@ -5204,21 +5457,21 @@ mod tests {
         let (mut k, mut mem, mut v, mut cx) = setup();
         let fd = open_seeded(&mut k, &mut cx, &mut mem, &mut v, b"0123456789");
         // Read the fd position back to 0 via lseek, then pread at offset 4.
-        call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]);
         let buf = 0x1_2000;
-        let n = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Pread64, [fd, buf, 3, 4, 0, 0]);
+        let n = call(&k, &mut cx, &mut mem, &mut v, Sysno::Pread64, [fd, buf, 3, 4, 0, 0]);
         assert_eq!(n, 3);
         assert_eq!(mem.read_vec(buf, 3).unwrap(), b"456");
         // The fd position is still 0, so a plain read starts at the beginning.
-        let n = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [fd, buf, 2, 0, 0, 0]);
+        let n = call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, buf, 2, 0, 0, 0]);
         assert_eq!(n, 2);
         assert_eq!(mem.read_vec(buf, 2).unwrap(), b"01");
         // pwrite at offset 4 overwrites in place, again without moving the pos.
         let src = 0x1_1000;
         mem.write_init(src, b"XY").unwrap();
-        call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Pwrite64, [fd, src, 2, 4, 0, 0]);
-        call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]);
-        call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [fd, buf, 10, 0, 0, 0]);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Pwrite64, [fd, src, 2, 4, 0, 0]);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, buf, 10, 0, 0, 0]);
         assert_eq!(mem.read_vec(buf, 10).unwrap(), b"0123XY6789");
     }
 
@@ -5226,12 +5479,12 @@ mod tests {
     fn ftruncate_and_truncate_resize() {
         let (mut k, mut mem, mut v, mut cx) = setup();
         let fd = open_seeded(&mut k, &mut cx, &mut mem, &mut v, b"abcdef");
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Ftruncate, [fd, 3, 0, 0, 0, 0]), 0);
-        assert_eq!(k.shared.lock().unwrap().mounts.stat("/f").unwrap().size, 3);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Ftruncate, [fd, 3, 0, 0, 0, 0]), 0);
+        assert_eq!(k.vfs.lock().unwrap().stat("/f").unwrap().size, 3);
         // truncate by path can also grow (zero-extend).
         let path = 0x1_0000;
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Truncate, [path, 8, 0, 0, 0, 0]), 0);
-        assert_eq!(k.shared.lock().unwrap().mounts.stat("/f").unwrap().size, 8);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Truncate, [path, 8, 0, 0, 0, 0]), 0);
+        assert_eq!(k.vfs.lock().unwrap().stat("/f").unwrap().size, 8);
     }
 
     #[test]
@@ -5241,7 +5494,7 @@ mod tests {
         let path = 0x1_0000;
         let buf = 0x1_2000;
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Statx, [AT_CWD, path, 0, 0x7ff, buf, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Statx, [AT_CWD, path, 0, 0x7ff, buf, 0]),
             0
         );
         // stx_size @40, stx_mode @28.
@@ -5254,17 +5507,17 @@ mod tests {
     fn sendfile_copies_between_files() {
         let (mut k, mut mem, mut v, mut cx) = setup();
         let infd = open_seeded(&mut k, &mut cx, &mut mem, &mut v, b"payload!");
-        call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Lseek, [infd, 0, 0, 0, 0, 0]);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Lseek, [infd, 0, 0, 0, 0, 0]);
         // A second file as the destination.
         let path2 = 0x1_1000;
         mem.write_init(path2, b"/g\0").unwrap();
-        let outfd = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Openat, [AT_CWD, path2, 0o102, 0o644, 0, 0]) as u64;
-        let n = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Sendfile, [outfd, infd, 0, 8, 0, 0]);
+        let outfd = call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, [AT_CWD, path2, 0o102, 0o644, 0, 0]) as u64;
+        let n = call(&k, &mut cx, &mut mem, &mut v, Sysno::Sendfile, [outfd, infd, 0, 8, 0, 0]);
         assert_eq!(n, 8);
-        assert_eq!(k.shared.lock().unwrap().mounts.stat("/g").unwrap().size, 8);
+        assert_eq!(k.vfs.lock().unwrap().stat("/g").unwrap().size, 8);
         let buf = 0x1_2000;
-        call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Lseek, [outfd, 0, 0, 0, 0, 0]);
-        call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [outfd, buf, 8, 0, 0, 0]);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Lseek, [outfd, 0, 0, 0, 0, 0]);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [outfd, buf, 8, 0, 0, 0]);
         assert_eq!(mem.read_vec(buf, 8).unwrap(), b"payload!");
     }
 
@@ -5273,15 +5526,15 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         cx.cur.pid = 5;
         // getpgid(0) defaults to the pid.
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Getpgid, [0; 6]), 5);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Getpgid, [0; 6]), 5);
         // setpgid(0, 42) sets it.
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Setpgid, [0, 42, 0, 0, 0, 0]), 0);
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Getpgid, [0; 6]), 42);
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Getpgrp, [0; 6]), 42);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Setpgid, [0, 42, 0, 0, 0, 0]), 0);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Getpgid, [0; 6]), 42);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Getpgrp, [0; 6]), 42);
         // setsid starts a new session: sid = pgid = pid.
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Setsid, [0; 6]), 5);
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Getsid, [0; 6]), 5);
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Getpgid, [0; 6]), 5);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Setsid, [0; 6]), 5);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Getsid, [0; 6]), 5);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Getpgid, [0; 6]), 5);
     }
 
     #[test]
@@ -5289,15 +5542,15 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         let name = 0x1_0000;
         mem.write_init(name, b"scratch\0").unwrap();
-        let fd = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::MemfdCreate, [name, 0, 0, 0, 0, 0]);
+        let fd = call(&k, &mut cx, &mut mem, &mut v, Sysno::MemfdCreate, [name, 0, 0, 0, 0, 0]);
         assert!(fd >= 3, "a real fd");
         let fd = fd as u64;
         let src = 0x1_2000;
         mem.write_init(src, b"data").unwrap();
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Write, [fd, src, 4, 0, 0, 0]), 4);
-        call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Write, [fd, src, 4, 0, 0, 0]), 4);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]);
         let buf = 0x1_3000;
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [fd, buf, 4, 0, 0, 0]), 4);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, buf, 4, 0, 0, 0]), 4);
         assert_eq!(mem.read_vec(buf, 4).unwrap(), b"data");
     }
 
@@ -5307,9 +5560,9 @@ mod tests {
         let fd = open_seeded(&mut k, &mut cx, &mut mem, &mut v, b"x");
         assert!(fd >= 3);
         // Close everything from `fd` up; a subsequent op on it is EBADF.
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::CloseRange, [fd, u64::from(u32::MAX), 0, 0, 0, 0]), 0);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::CloseRange, [fd, u64::from(u32::MAX), 0, 0, 0, 0]), 0);
         let buf = 0x1_2000;
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [fd, buf, 1, 0, 0, 0]), -9); // EBADF
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, buf, 1, 0, 0, 0]), -9); // EBADF
     }
 
     #[test]
@@ -5321,19 +5574,19 @@ mod tests {
         let (mut k, mut mem, mut v, mut cx) = setup();
         // A small mmap arena inside the 16-page test region.
         let fd = open_seeded(&mut k, &mut cx, &mut mem, &mut v, b"");
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Ftruncate, [fd, 6, 0, 0, 0, 0]), 0);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Ftruncate, [fd, 6, 0, 0, 0, 0]), 0);
         // mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0).
-        let base = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Mmap, [0, 4096, 0x3, 0x1, fd, 0]);
+        let base = call(&k, &mut cx, &mut mem, &mut v, Sysno::Mmap, [0, 4096, 0x3, 0x1, fd, 0]);
         assert!(base > 0, "mmap returned {base}");
         let base = base as u64;
         // Store "hello!" into the mapping (as a guest memcpy would).
         mem.write(base, b"hello!").unwrap();
         // munmap flushes it back to the file.
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Munmap, [base, 4096, 0, 0, 0, 0]), 0);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Munmap, [base, 4096, 0, 0, 0, 0]), 0);
         // Read the file: it now holds the mapped bytes, not zeros.
-        call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Lseek, [fd, 0, 0, 0, 0, 0]);
         let buf = 0x1_2000;
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [fd, buf, 6, 0, 0, 0]), 6);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, buf, 6, 0, 0, 0]), 6);
         assert_eq!(mem.read_vec(buf, 6).unwrap(), b"hello!");
     }
 
@@ -5348,8 +5601,8 @@ mod tests {
         cx.cur.mm = 0;
 
 
-        let a = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Mmap, [0, 4096, 0x3, 0x22, u64::MAX, 0]);
-        let b = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Mmap, [0, 4096, 0x3, 0x22, u64::MAX, 0]);
+        let a = call(&k, &mut cx, &mut mem, &mut v, Sysno::Mmap, [0, 4096, 0x3, 0x22, u64::MAX, 0]);
+        let b = call(&k, &mut cx, &mut mem, &mut v, Sysno::Mmap, [0, 4096, 0x3, 0x22, u64::MAX, 0]);
         assert!(a > 0 && b > 0, "mmaps returned {a}, {b}");
         let (a, b) = (a as u64, b as u64);
         assert!(a.abs_diff(b) >= 4096, "sibling mmaps overlap: A={a:#x} B={b:#x}");
@@ -5367,28 +5620,28 @@ mod tests {
 
         let anon = [0u64, 4096, 0x3, 0x22, u64::MAX, 0];
 
-        let a = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Mmap, anon);
-        let b = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Mmap, anon);
-        let c = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Mmap, anon);
+        let a = call(&k, &mut cx, &mut mem, &mut v, Sysno::Mmap, anon);
+        let b = call(&k, &mut cx, &mut mem, &mut v, Sysno::Mmap, anon);
+        let c = call(&k, &mut cx, &mut mem, &mut v, Sysno::Mmap, anon);
         assert!(a > 0 && b > 0 && c > 0);
         // Arena is now full: a fourth fails.
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Mmap, anon), -12); // ENOMEM
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Mmap, anon), -12); // ENOMEM
 
         // Free the middle one and the next mmap must reuse exactly that page,
         // rather than reporting the arena exhausted.
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Munmap, [b as u64, 4096, 0, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Munmap, [b as u64, 4096, 0, 0, 0, 0]),
             0
         );
-        let reused = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Mmap, anon);
+        let reused = call(&k, &mut cx, &mut mem, &mut v, Sysno::Mmap, anon);
         assert_eq!(reused, b, "munmap'd page must be handed out again");
 
         // Freeing all three coalesces back into one contiguous run, so a
         // 3-page mmap fits again.
         for p in [a, b, c] {
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Munmap, [p as u64, 4096, 0, 0, 0, 0]);
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Munmap, [p as u64, 4096, 0, 0, 0, 0]);
         }
-        let big = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Mmap, [0, 3 * 4096, 0x3, 0x22, u64::MAX, 0]);
+        let big = call(&k, &mut cx, &mut mem, &mut v, Sysno::Mmap, [0, 3 * 4096, 0x3, 0x22, u64::MAX, 0]);
         assert!(big > 0, "coalesced free space must satisfy a 3-page mmap, got {big}");
     }
 
@@ -5398,7 +5651,7 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         let buf = 0x1_2000;
         // getrlimit reports the default (1024, 4096).
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Getrlimit, [NOFILE, buf, 0, 0, 0, 0]), 0);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Getrlimit, [NOFILE, buf, 0, 0, 0, 0]), 0);
         assert_eq!(mem.read_u64(buf).unwrap(), 1024);
         assert_eq!(mem.read_u64(buf + 8).unwrap(), 4096);
         // Try to raise both soft and hard to a million (node/V8's binary
@@ -5407,9 +5660,9 @@ mod tests {
         mem.write(newl, &1_048_576u64.to_le_bytes()).unwrap();
         mem.write(newl + 8, &1_048_576u64.to_le_bytes()).unwrap();
         // prlimit64(pid=0, NOFILE, new_limit, old_limit=0)
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Prlimit64, [0, NOFILE, newl, 0, 0, 0]), 0);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Prlimit64, [0, NOFILE, newl, 0, 0, 0]), 0);
         // getrlimit now reports the capped values, not a million.
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Getrlimit, [NOFILE, buf, 0, 0, 0, 0]), 0);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Getrlimit, [NOFILE, buf, 0, 0, 0, 0]), 0);
         assert_eq!(mem.read_u64(buf).unwrap(), 4096, "soft clamped to the hard cap");
         assert_eq!(mem.read_u64(buf + 8).unwrap(), 4096, "hard capped");
     }
@@ -5419,18 +5672,18 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         // F_SETFD (2) on an unopened fd must fail — else a "cloexec every fd
         // until EBADF" loop never terminates.
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Fcntl, [99, 2, 1, 0, 0, 0]), -9);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Fcntl, [99, 2, 1, 0, 0, 0]), -9);
     }
 
     #[test]
     fn credential_setters_succeed_as_root() {
         let (k, mut mem, mut v, mut cx) = setup();
         for s in [Sysno::Setuid, Sysno::Setgid, Sysno::Setresuid, Sysno::Setgroups] {
-            assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, s, [0; 6]), 0, "{s:?}");
+            assert_eq!(call(&k, &mut cx, &mut mem, &mut v, s, [0; 6]), 0, "{s:?}");
         }
         // getresuid writes (0,0,0).
         let (a, b, c) = (0x1_2000, 0x1_2010, 0x1_2020);
-        assert_eq!(call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Getresuid, [a, b, c, 0, 0, 0]), 0);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Getresuid, [a, b, c, 0, 0, 0]), 0);
         assert_eq!(mem.read_u32(a).unwrap(), 0);
     }
 }

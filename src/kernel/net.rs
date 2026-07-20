@@ -2299,14 +2299,13 @@ mod tests {
 
     fn call(
         k: &Kernel,
-        sh: &mut Shared,
         cx: &mut ServiceCtx,
         mem: &mut GuestMemory,
         v: &mut DummyVcpu,
         s: Sysno,
         a: [u64; 6],
     ) -> i64 {
-        k.dispatch(cx, s, 0, &a, v, mem, sh)
+        k.dispatch(cx, s, 0, &a, v, mem)
     }
 
     /// Write a `struct sockaddr_in` (AF_INET) at `ptr`.
@@ -2339,7 +2338,7 @@ mod tests {
         let sv = 0x1_0000;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2356,18 +2355,18 @@ mod tests {
         let out = 0x1_2000;
         mem.write_init(msg, b"hi").unwrap();
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Write, [a, msg, 2, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Write, [a, msg, 2, 0, 0, 0]),
             2
         );
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [b, out, 2, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [b, out, 2, 0, 0, 0]),
             2
         );
         assert_eq!(mem.read_vec(out, 2).unwrap(), b"hi");
 
         // The other direction is empty with the peer still open -> blocks.
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [a, out, 2, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [a, out, 2, 0, 0, 0]),
             0
         );
         assert!(cx.block);
@@ -2381,10 +2380,10 @@ mod tests {
         mem.write_init(addr + 2, b"/s\0").unwrap();
         let alen = 5u64;
 
-        let srv = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
+        let srv = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2395,7 +2394,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2405,10 +2404,10 @@ mod tests {
             0
         );
 
-        let cli = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
+        let cli = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2418,7 +2417,7 @@ mod tests {
             0
         );
         let acc = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -2434,7 +2433,7 @@ mod tests {
         mem.write_init(msg, b"ping").unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2445,7 +2444,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2459,7 +2458,7 @@ mod tests {
         mem.write_init(msg, b"pong").unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2470,7 +2469,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2488,9 +2487,9 @@ mod tests {
         let addr = 0x1_1000;
         mem.write_init(addr, &1u16.to_le_bytes()).unwrap();
         mem.write_init(addr + 2, b"/nope\0").unwrap();
-        let cli = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
+        let cli = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
         let ret = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -2506,7 +2505,7 @@ mod tests {
         let sv = 0x1_0000;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2520,7 +2519,7 @@ mod tests {
 
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2532,7 +2531,7 @@ mod tests {
         let msg = 0x1_1000;
         mem.write_init(msg, b"x").unwrap();
         let ret = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -2547,7 +2546,7 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         let sv = 0x1_0000;
         call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -2557,7 +2556,7 @@ mod tests {
         let a = u64::from(mem.read_u32(sv).unwrap());
         let st = 0x1_2000;
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Fstat, [a, st, 0, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Fstat, [a, st, 0, 0, 0, 0]),
             0
         );
         let mode = mem.read_u32(st + 16).unwrap();
@@ -2572,10 +2571,10 @@ mod tests {
         write_sockaddr_in(&mut mem, addr, [127, 0, 0, 1], 9000);
         let alen = 16u64;
 
-        let srv = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
+        let srv = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2586,7 +2585,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2596,10 +2595,10 @@ mod tests {
             0
         );
 
-        let cli = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
+        let cli = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2609,7 +2608,7 @@ mod tests {
             0
         );
         let acc = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -2624,7 +2623,7 @@ mod tests {
         mem.write_init(msg, b"ping").unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2635,7 +2634,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2648,7 +2647,7 @@ mod tests {
         mem.write_init(msg, b"pong").unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2659,7 +2658,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2677,7 +2676,7 @@ mod tests {
         mem.write_init(peerlen, &16u32.to_le_bytes()).unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2692,7 +2691,7 @@ mod tests {
         mem.write_init(peerlen, &16u32.to_le_bytes()).unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2713,10 +2712,10 @@ mod tests {
         write_sockaddr_in6(&mut mem, addr, ip, 9700);
         let alen = 28u64;
 
-        let srv = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [10, 1, 0, 0, 0, 0]) as u64;
+        let srv = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [10, 1, 0, 0, 0, 0]) as u64;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2727,7 +2726,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2737,10 +2736,10 @@ mod tests {
             0
         );
 
-        let cli = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [10, 1, 0, 0, 0, 0]) as u64;
+        let cli = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [10, 1, 0, 0, 0, 0]) as u64;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2750,7 +2749,7 @@ mod tests {
             0
         );
         let acc = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -2765,7 +2764,7 @@ mod tests {
         mem.write_init(msg, b"v6ok").unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2776,7 +2775,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2793,10 +2792,10 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         let addr = 0x1_1000;
         write_sockaddr_in(&mut mem, addr, [127, 0, 0, 1], 0); // port 0: auto-assign
-        let s = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
+        let s = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2811,7 +2810,7 @@ mod tests {
         mem.write_init(namelen, &16u32.to_le_bytes()).unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2831,11 +2830,11 @@ mod tests {
         let b_addr = 0x1_1100;
         write_sockaddr_in(&mut mem, b_addr, [127, 0, 0, 1], 9400);
 
-        let a = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 2, 0, 0, 0, 0]) as u64;
-        let b = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 2, 0, 0, 0, 0]) as u64;
+        let a = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 2, 0, 0, 0, 0]) as u64;
+        let b = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 2, 0, 0, 0, 0]) as u64;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2846,7 +2845,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2857,7 +2856,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2868,7 +2867,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2882,11 +2881,11 @@ mod tests {
         let out = 0x1_1300;
         mem.write_init(msg, b"hi").unwrap();
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Write, [a, msg, 2, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Write, [a, msg, 2, 0, 0, 0]),
             2
         );
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [b, out, 2, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [b, out, 2, 0, 0, 0]),
             2
         );
         assert_eq!(mem.read_vec(out, 2).unwrap(), b"hi");
@@ -2948,7 +2947,7 @@ mod tests {
         let addr = 0x1_1000;
         write_sockaddr_in(&mut mem, addr, [127, 0, 0, 1], 9600);
         let srv = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -2957,7 +2956,7 @@ mod tests {
         ) as u64;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2968,7 +2967,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -2978,7 +2977,7 @@ mod tests {
             0
         );
         let ret = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -3028,10 +3027,10 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         let addr = 0x1_1000;
         write_sockaddr_in(&mut mem, addr, [127, 0, 0, 1], 9800);
-        let srv = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
+        let srv = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3052,7 +3051,7 @@ mod tests {
 
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3076,7 +3075,7 @@ mod tests {
         let sv = 0x1_0000;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3091,7 +3090,7 @@ mod tests {
         let msg = 0x1_1000;
         mem.write_init(msg, b"peekme").unwrap();
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Write, [a, msg, 6, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Write, [a, msg, 6, 0, 0, 0]),
             6
         );
 
@@ -3104,13 +3103,13 @@ mod tests {
 
         // A real (non-peek) read now drains it...
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [b, out, 6, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [b, out, 6, 0, 0, 0]),
             6
         );
         assert_eq!(mem.read_vec(out, 6).unwrap(), b"peekme");
         // ...so a further read blocks (the peer end is still open).
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [b, out, 6, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [b, out, 6, 0, 0, 0]),
             0
         );
         assert!(cx.block);
@@ -3125,10 +3124,10 @@ mod tests {
         mem.write_init(addr + 2, b"\0nixvm").unwrap();
         let alen = 2 + 6;
 
-        let srv = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
+        let srv = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3139,7 +3138,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3149,10 +3148,10 @@ mod tests {
             0
         );
 
-        let cli = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
+        let cli = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3162,7 +3161,7 @@ mod tests {
             0
         );
         let acc = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -3177,7 +3176,7 @@ mod tests {
         mem.write_init(msg, b"hi").unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3188,7 +3187,7 @@ mod tests {
         );
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3207,7 +3206,7 @@ mod tests {
         let sv = 0x1_0000;
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3221,7 +3220,7 @@ mod tests {
 
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3235,7 +3234,7 @@ mod tests {
         // still open (only its write side was shut down).
         let out = 0x1_1000;
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Read, [b, out, 4, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [b, out, 4, 0, 0, 0]),
             0
         );
         assert!(!cx.block);
@@ -3243,19 +3242,19 @@ mod tests {
         // a itself can no longer write.
         let msg = 0x1_2000;
         mem.write_init(msg, b"x").unwrap();
-        let ret = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Write, [a, msg, 1, 0, 0, 0]);
+        let ret = call(&k, &mut cx, &mut mem, &mut v, Sysno::Write, [a, msg, 1, 0, 0, 0]);
         assert_eq!(ret, -i64::from(Errno::EPIPE.0));
     }
 
     #[test]
     fn getpeername_on_unconnected_returns_enotconn() {
         let (k, mut mem, mut v, mut cx) = setup();
-        let s = call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
+        let s = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
         let peer = 0x1_1000;
         let peerlen = 0x1_1100;
         mem.write_init(peerlen, &16u32.to_le_bytes()).unwrap();
         let ret = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -3323,7 +3322,7 @@ mod tests {
     fn netlink_getlink_dump_reports_lo() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -3343,7 +3342,7 @@ mod tests {
         write_nlmsghdr(&mut mem, req, RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 42);
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3355,7 +3354,7 @@ mod tests {
 
         let out = 0x1_2000;
         let n = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -3382,7 +3381,7 @@ mod tests {
     fn netlink_getaddr_dump_reports_127_0_0_1() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -3401,7 +3400,7 @@ mod tests {
         write_nlmsghdr(&mut mem, req, RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 7);
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3413,7 +3412,7 @@ mod tests {
 
         let out = 0x1_2000;
         let n = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -3437,7 +3436,7 @@ mod tests {
     fn netlink_unknown_type_yields_nlmsg_error() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -3456,7 +3455,7 @@ mod tests {
         write_nlmsghdr(&mut mem, req, 0xffff, NLM_F_REQUEST, 99);
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3468,7 +3467,7 @@ mod tests {
 
         let out = 0x1_2000;
         let n = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -3490,7 +3489,7 @@ mod tests {
     fn netlink_bind_and_getsockname_roundtrip_pid() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -3512,7 +3511,7 @@ mod tests {
         mem.write_init(addr, &b).unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3527,7 +3526,7 @@ mod tests {
         mem.write_init(namelen, &12u32.to_le_bytes()).unwrap();
         assert_eq!(
             call(
-                &k, &mut k.shared.lock().unwrap(),
+                &k,
                 &mut cx,
                 &mut mem,
                 &mut v,
@@ -3549,7 +3548,7 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_1000;
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, fds, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, fds, 0, 0]),
             0
         );
         let a = u64::from(mem.read_u32(fds).unwrap());
@@ -3568,7 +3567,7 @@ mod tests {
         mem.write_init(msg_out + 16, &iov_out.to_le_bytes()).unwrap();
         mem.write_init(msg_out + 24, &2u64.to_le_bytes()).unwrap();
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Sendmsg, [a, msg_out, 0, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Sendmsg, [a, msg_out, 0, 0, 0, 0]),
             5,
             "sendmsg gathers both iovecs"
         );
@@ -3584,7 +3583,7 @@ mod tests {
         mem.write_init(msg_in + 16, &iov_in.to_le_bytes()).unwrap();
         mem.write_init(msg_in + 24, &2u64.to_le_bytes()).unwrap();
         assert_eq!(
-            call(&k, &mut k.shared.lock().unwrap(), &mut cx, &mut mem, &mut v, Sysno::Recvmsg, [b, msg_in, 0, 0, 0, 0]),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Recvmsg, [b, msg_in, 0, 0, 0, 0]),
             5,
             "recvmsg returns the full message"
         );
@@ -3596,7 +3595,7 @@ mod tests {
     fn netlink_nonblocking_recv_with_empty_queue_is_eagain() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fd = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
@@ -3612,7 +3611,7 @@ mod tests {
         ) as u64;
         let out = 0x1_1000;
         let ret = call(
-            &k, &mut k.shared.lock().unwrap(),
+            &k,
             &mut cx,
             &mut mem,
             &mut v,
