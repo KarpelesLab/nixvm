@@ -1043,6 +1043,13 @@ impl Kernel {
                 self.block = false;
                 self.exec_ok = false;
                 let ret = self.dispatch(sys, raw, &args, vcpu, mem);
+                // If the syscall edited this address space's page tables in place
+                // (munmap, mprotect, mremap, a copy-on-write copy-in), flush the
+                // running vcpu's TLB so it can't keep using a stale entry for a
+                // now-unmapped or replaced page. No-op for the interpreter.
+                if mem.take_tlb_dirty() {
+                    vcpu.flush_tlb();
+                }
                 self.deliver_pending_signals();
                 // A syscall that returns (didn't re-block) has consumed any
                 // timed-wait deadline it set; the next blocking syscall starts
@@ -1067,7 +1074,15 @@ impl Kernel {
                 // frame and re-run the access (the software mirror of a hardware
                 // MMU faulting in a lazily-committed page). Anonymous reservations
                 // and freshly-`mmap`ped ranges are backed here on first touch.
+                // Each of these resolutions edits this address space's page tables
+                // in place (from the host, behind the running vcpu), so the vcpu's
+                // TLB is flushed before it retries — otherwise a stale
+                // write-protected (copy-on-write) entry would keep faulting or a
+                // stale mapping would be used. `flush_tlb` is a no-op for the
+                // interpreter (no TLB) and a not-present demand fault leaves no
+                // stale entry, but flushing uniformly keeps the seam simple.
                 if mem.demand_fault(addr) {
+                    vcpu.flush_tlb();
                     Serviced::Resume
                 }
                 // A write fault on a copy-on-write page is resolved by
@@ -1077,10 +1092,12 @@ impl Kernel {
                 // — is a genuine segfault. This is the software mirror of a
                 // hardware MMU's page-fault-driven COW.
                 else if mem.cow_fault(addr, write) {
+                    vcpu.flush_tlb();
                     Serviced::Resume
                 } else if self.grow_stack(addr, mem) {
                     // A fault in the reserved stack region grows it (VM_GROWSDOWN)
                     // and re-runs the faulting instruction.
+                    vcpu.flush_tlb();
                     Serviced::Resume
                 } else if vcpu.shadow_stale(mem, addr) {
                     // SMP/KVM only: a sibling mapped or re-protected this page
@@ -2046,6 +2063,12 @@ impl Kernel {
             child_vcpu.set_tls(tls);
         }
         child_vcpu.set_syscall_ret(0); // child returns 0 and advances past the svc
+        // A copy-on-write fork (`mem.fork()`) downgraded *this* (parent) address
+        // space's pages to read-only behind the running parent vcpu's back. Flush
+        // its TLB so the parent's next store faults into `cow_fault` instead of
+        // writing through a stale writable entry into the now-shared frame. (Free
+        // for a `CLONE_VM` thread, which shares the mm and downgraded nothing.)
+        vcpu.flush_tlb();
         self.procs.push(Some(Process {
             vcpu: Some(child_vcpu),
             info,

@@ -210,6 +210,15 @@ pub trait Vcpu: Send {
     /// Reset every register for `execve`: clear general/SIMD registers, flags,
     /// and TLS, then set the entry PC and initial SP for the new image.
     fn reset(&mut self, entry: u64, sp: u64);
+
+    /// Flush this vcpu's TLB before its next run, because the host modified the
+    /// page tables of the address space it is running *without* the guest issuing
+    /// an `invlpg`/`mov cr3`. The canonical case is `fork`: making the parent's
+    /// pages copy-on-write read-only would otherwise be masked by stale writable
+    /// TLB entries, letting the parent write straight through a shared frame.
+    /// A no-op for the interpreter, which re-walks the page tables on every access
+    /// and so has no TLB to invalidate.
+    fn flush_tlb(&mut self) {}
 }
 
 /// Constructs [`Vcpu`]s that share one guest address space.

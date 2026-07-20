@@ -223,6 +223,10 @@ pub struct KvmVcpu {
     /// is picked up as a single `KVM_SET_SREGS` before the next run. `None` until
     /// the first run sets it from the guest memory's `cr3()`.
     cur_cr3: Option<u64>,
+    /// Set by [`Vcpu::flush_tlb`]: force a guest-TLB flush before the next run
+    /// because the host edited this address space's page tables in place (a fork's
+    /// copy-on-write downgrade of the parent) without the guest reloading cr3.
+    tlb_flush_pending: bool,
 }
 
 // The register caches and run page are noise in a debug dump; the fd
@@ -387,6 +391,7 @@ impl KvmVcpu {
             ebp,
             quantum: crate::vcpu::preempt_quantum(),
             cur_cr3: None,
+            tlb_flush_pending: false,
         })
     }
 
@@ -410,6 +415,24 @@ impl KvmVcpu {
                 unsafe { sys::ioctl(self.fd.0, sys::KVM_SET_REGS, std::ptr::from_ref(&self.regs)) };
             check(ret, "KVM_SET_REGS")?;
             self.regs_dirty = false;
+        }
+        if self.tlb_flush_pending {
+            // Force the guest TLB to be flushed before this run. KVM skips the
+            // flush when `KVM_SET_SREGS` leaves cr3 unchanged, so first push a cr3
+            // that differs only in an ignored bit (PCD, bit 4 — CR4.PCIDE is off,
+            // so it does not select a page table), which KVM treats as a pgd
+            // switch and flushes. The real cr3 is restored by the `sregs_dirty`
+            // write below (also a change → flushed), and the run uses it.
+            let real = self.sregs.cr3;
+            self.sregs.cr3 = real ^ (1 << 4);
+            // SAFETY: valid struct pointer; the fd is live.
+            let ret = unsafe {
+                sys::ioctl(self.fd.0, sys::KVM_SET_SREGS, std::ptr::from_ref(&self.sregs))
+            };
+            check(ret, "KVM_SET_SREGS")?;
+            self.sregs.cr3 = real;
+            self.sregs_dirty = true;
+            self.tlb_flush_pending = false;
         }
         if self.sregs_dirty {
             // SAFETY: valid struct pointer; the fd is live.
@@ -886,6 +909,13 @@ impl Vcpu for KvmVcpu {
         // execve installed fresh page tables in the same GuestMemory: its `cr3()`
         // changed, so drop the cached value and re-sync on the next run.
         self.cur_cr3 = None;
+    }
+
+    fn flush_tlb(&mut self) {
+        // Arm the cr3-reload dance in `run_once` (a plain same-cr3 `KVM_SET_SREGS`
+        // does not flush), so a host-side page-table change (fork's parent CoW
+        // downgrade) is seen by the vcpu instead of shadowed by a stale TLB entry.
+        self.tlb_flush_pending = true;
     }
 }
 

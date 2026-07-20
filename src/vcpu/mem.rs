@@ -112,6 +112,12 @@ pub struct GuestMemory {
     /// Per-page: loaded from a file (an ELF segment). `MADV_DONTNEED` preserves
     /// these; cleared when a page is re-`map`ped anonymously.
     file_backed: Vec<bool>,
+    /// Set whenever a *present* page-table leaf is cleared or changed from the
+    /// host (unmap, protect, copy-on-write privatize). A KVM vcpu running this
+    /// address space must flush its TLB before its next run, or a stale entry
+    /// would keep serving the old (now-unmapped or reused) frame. Consumed by
+    /// [`GuestMemory::take_tlb_dirty`]; irrelevant to the interpreter (no TLB).
+    tlb_dirty: bool,
 }
 
 impl std::fmt::Debug for GuestMemory {
@@ -167,6 +173,7 @@ impl GuestMemory {
             prot: vec![Prot::NONE; npages],
             mapped: vec![false; npages],
             file_backed: vec![false; npages],
+            tlb_dirty: false,
         }
     }
 
@@ -196,6 +203,14 @@ impl GuestMemory {
     #[must_use]
     pub(crate) fn phys_arc(&self) -> Arc<PhysMem> {
         Arc::clone(&self.phys)
+    }
+
+    /// Take and clear the "page tables changed" flag: whether a present leaf was
+    /// unmapped, re-protected, or copy-on-write-privatized since the last check.
+    /// The scheduler flushes the running KVM vcpu's TLB when this is set, so a
+    /// stale entry never serves an unmapped or replaced frame.
+    pub(crate) fn take_tlb_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.tlb_dirty)
     }
 
     /// Number of live (allocated) frames in the shared pool — for leak checks.
@@ -390,7 +405,9 @@ impl GuestMemory {
             if let Some(t) = self.space.translate(va, &self.phys) {
                 let frame = t.paddr & !(PAGE_SIZE - 1);
                 let lp = self.leaf_prot(p, frame, &fa);
-                self.space.protect(va, lp, false, &self.phys);
+                if self.space.protect(va, lp, false, &self.phys) {
+                    self.tlb_dirty = true; // a present leaf's permissions changed
+                }
             }
         }
         Ok(())
@@ -410,6 +427,7 @@ impl GuestMemory {
             if self.mapped[p] {
                 if let Some(frame) = self.space.unmap(self.page_base(p), &mut fa, &self.phys) {
                     fa.free(frame);
+                    self.tlb_dirty = true; // a present leaf was cleared
                 }
             }
             self.mapped[p] = false;
@@ -482,9 +500,10 @@ impl GuestMemory {
     /// frame if needed. A no-op on an already-private page beyond restoring its
     /// leaf write bit. An associated fn over the disjoint `space`/`phys` fields so
     /// callers can hold the `fa` guard (which borrows the `fa` field) at once.
-    fn make_writable(space: &mut AddrSpace, phys: &PhysMem, prot: Prot, fa: &mut FrameAllocator, va: u64) {
+    /// Returns whether it changed a present leaf (so the caller flags the TLB).
+    fn make_writable(space: &mut AddrSpace, phys: &PhysMem, prot: Prot, fa: &mut FrameAllocator, va: u64) -> bool {
         let Some(t) = space.translate(va, phys) else {
-            return;
+            return false;
         };
         let frame = t.paddr & !(PAGE_SIZE - 1);
         if fa.refcount(frame) > 1 {
@@ -499,10 +518,11 @@ impl GuestMemory {
                     fa.free(new);
                 }
             }
+            true
         } else {
             // Private already: make sure the leaf carries the intended write bit
             // (a prior fork may have cleared it).
-            space.protect(va, prot, false, phys);
+            space.protect(va, prot, false, phys)
         }
     }
 
@@ -513,6 +533,7 @@ impl GuestMemory {
         let (first, last) = self.page_range(addr, buf.len())?;
         {
             let mut fa = self.fa.lock().unwrap();
+            let mut changed = false;
             for p in first..=last {
                 let va = self.base + (p as u64) * PAGE_SIZE;
                 // Demand-back the page (first touch), then privatize if it is a
@@ -520,8 +541,9 @@ impl GuestMemory {
                 if !Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, va) {
                     return Err(MemError::Host("frame pool exhausted".into()));
                 }
-                Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va);
+                changed |= Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va);
             }
+            self.tlb_dirty |= changed;
         }
         let mut done = 0usize;
         while done < buf.len() {
@@ -588,13 +610,15 @@ impl GuestMemory {
         // goes to the pool, not through the guest MMU).
         {
             let mut fa = self.fa.lock().unwrap();
+            let mut changed = false;
             for p in first..=last {
                 let va = self.base + (p as u64) * PAGE_SIZE;
                 if !Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, va) {
                     return Err(MemError::Host("frame pool exhausted".into()));
                 }
-                Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va);
+                changed |= Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va);
             }
+            self.tlb_dirty |= changed;
         }
         let mut done = 0usize;
         while done < buf.len() {
@@ -642,6 +666,7 @@ impl GuestMemory {
             prot: self.prot.clone(),
             mapped: self.mapped.clone(),
             file_backed: self.file_backed.clone(),
+            tlb_dirty: false,
         }
     }
 
