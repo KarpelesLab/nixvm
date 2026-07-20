@@ -55,6 +55,18 @@ pub const IDT_BASE: u64 = CTRL_GPA + IDT_OFF;
 pub const TSS_BASE: u64 = CTRL_GPA + TSS_OFF;
 /// Kernel stack top the TSS switches to on a CPL3→CPL0 exception (`RSP0`).
 pub const KSTACK_TOP: u64 = CTRL_GPA + KSTACK_OFF + 0x1000;
+/// Virtual base of the kernel-stack page. Unlike the rest of the control block
+/// this page is **per address space** — each process maps its own frame here
+/// (see [`map_kstack`]) so that under SMP two vcpus in *different* address spaces
+/// taking a `#PF` at once push their CPU exception frames onto different physical
+/// pages instead of clobbering one shared kstack (which corrupted the recovered
+/// user state — demand paging makes faults frequent, so collisions were common).
+///
+/// This isolates distinct processes (the overwhelmingly common concurrent case).
+/// `CLONE_THREAD` siblings that share one address space still share this frame;
+/// making the kstack fully per-vcpu (a per-vcpu `RSP0`/TSS) is the follow-up for
+/// heavily-threaded SMP guests.
+pub const KSTACK_PAGE_VA: u64 = CTRL_GPA + KSTACK_OFF;
 
 /// GDT selector of the TSS descriptor (a 16-byte descriptor at slots 5–6).
 pub const SEL_TSS: u16 = 0x28;
@@ -73,9 +85,10 @@ pub const GDT_LIMIT: u16 = 7 * 8 - 1;
 /// allocatable frame after the pinned null frame. Held out of circulation by
 /// [`reserve_and_build`].
 pub const CTRL_PHYS_BASE: u64 = PAGE_SIZE;
-/// Number of control-block pages (GDT, syscall trampoline, `#PF` trampoline,
-/// IDT, TSS, kernel stack).
-pub const CTRL_FRAMES: u64 = 6;
+/// Number of *shared* control-block pages (GDT, syscall trampoline, `#PF`
+/// trampoline, IDT, TSS). The kernel stack is **not** here — it is per address
+/// space (see [`KSTACK_PAGE_VA`] / [`map_kstack`]).
+pub const CTRL_FRAMES: u64 = 5;
 /// Bytes the control block reserves in the pool.
 pub const CTRL_SIZE: u64 = CTRL_FRAMES * PAGE_SIZE;
 
@@ -86,14 +99,13 @@ struct Page {
     prot: Prot,
 }
 
-/// The six pages, in physical order starting at [`CTRL_PHYS_BASE`].
-const PAGES: [Page; 6] = [
+/// The five shared pages, in physical order starting at [`CTRL_PHYS_BASE`].
+const PAGES: [Page; 5] = [
     Page { voff: GDT_OFF, prot: Prot::rw() },
     Page { voff: TRAMP_OFF, prot: Prot::rx() },
     Page { voff: FAULT_TRAMP_OFF, prot: Prot::rx() },
     Page { voff: IDT_OFF, prot: Prot::rw() },
     Page { voff: TSS_OFF, prot: Prot::rw() },
-    Page { voff: KSTACK_OFF, prot: Prot::rw() },
 ];
 
 /// Physical address of the control-block page at physical index `i`.
@@ -157,27 +169,31 @@ pub fn reserve_and_build(fa: &mut FrameAllocator, phys: &PhysMem) {
     phys.write(fault_pa, &[0xF4]); // hlt
 }
 
-/// Map the control block, supervisor-only, at its fixed virtual addresses into
-/// `space`. Idempotent: mapping over an existing (e.g. CoW-cleared) leaf simply
-/// republishes the correct supervisor entry, and the reserved frames are pinned
-/// so the returned old-frame is never freed. Call after creating or forking an
-/// address space.
+/// Map the shared control block, supervisor-only, at its fixed virtual addresses
+/// into `space`. Idempotent: mapping over an existing (e.g. CoW-cleared) leaf
+/// simply republishes the correct supervisor entry, and the reserved frames are
+/// pinned so the returned old-frame is never freed. Does **not** map the kernel
+/// stack — that is per address space (see [`map_kstack`]). Call after creating or
+/// forking an address space.
 pub fn map_into(space: &mut AddrSpace, fa: &mut FrameAllocator, phys: &PhysMem) {
     for (i, p) in PAGES.iter().enumerate() {
         let _ = space.map(CTRL_GPA + p.voff, frame_pa(i), p.prot, true, fa, phys);
     }
 }
 
-/// Resolve a control-block virtual address to its pool physical address and read
-/// a little-endian `u64` — the primitive for reading the exception frame the CPU
-/// pushed onto the kernel stack. `None` if `va` is not within a control page.
-#[must_use]
-pub fn read_u64(phys: &PhysMem, va: u64) -> Option<u64> {
-    let voff = va.checked_sub(CTRL_GPA)?;
-    let page_off = voff & !(PAGE_SIZE - 1);
-    let idx = PAGES.iter().position(|p| p.voff == page_off)?;
-    let pa = frame_pa(idx) + (va & (PAGE_SIZE - 1));
-    // The read may straddle into the next byte-region; the control pages are
-    // physically contiguous, so an 8-byte read within a page is safe.
-    Some(phys.read_u64(pa))
+/// Map a private kernel-stack `frame` at [`KSTACK_PAGE_VA`] into `space`,
+/// supervisor-RW. Each address space owns its own kstack frame so concurrent
+/// `#PF`s on sibling vcpus never share (and clobber) one CPU exception-frame
+/// page. Returns the frame this replaced (a CoW-shared kstack from `fork`, say),
+/// for the caller to release.
+pub fn map_kstack(
+    space: &mut AddrSpace,
+    fa: &mut FrameAllocator,
+    phys: &PhysMem,
+    frame: u64,
+) -> Option<u64> {
+    space
+        .map(KSTACK_PAGE_VA, frame, Prot::rw(), true, fa, phys)
+        .ok()
+        .flatten()
 }

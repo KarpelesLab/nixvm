@@ -211,12 +211,4 @@ impl Vm {
     pub fn cpuid(&self) -> &sys::kvm_cpuid2 {
         &self.cpuid
     }
-
-    /// Read 8 bytes of the control block at control virtual address `va` — the
-    /// exception frame the CPU pushed onto the kernel stack — from the registered
-    /// pool. `None` before the memslot is registered or outside the control block.
-    pub fn read_ctrl_u64(&self, va: u64) -> Option<u64> {
-        let pool = self.pool.lock().unwrap();
-        crate::vcpu::ctrl::read_u64(pool.as_ref()?, va)
-    }
 }

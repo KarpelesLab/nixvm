@@ -118,6 +118,12 @@ pub struct GuestMemory {
     /// would keep serving the old (now-unmapped or reused) frame. Consumed by
     /// [`GuestMemory::take_tlb_dirty`]; irrelevant to the interpreter (no TLB).
     tlb_dirty: bool,
+    /// Physical address of this address space's private kernel-stack frame (the
+    /// page mapped at [`ctrl::KSTACK_PAGE_VA`]). The CPU pushes the `#PF`
+    /// exception frame here at CPL0; a KVM vcpu reads it back from this frame
+    /// (not a shared control page) so concurrent faults on sibling vcpus never
+    /// clobber one another. See [`GuestMemory::kstack_pa`].
+    kstack_pa: u64,
 }
 
 impl std::fmt::Debug for GuestMemory {
@@ -132,6 +138,19 @@ impl std::fmt::Debug for GuestMemory {
 
 const fn round_up(v: u64, align: u64) -> u64 {
     v.div_ceil(align) * align
+}
+
+/// Allocate a fresh private kernel-stack frame and map it into `space` at
+/// [`ctrl::KSTACK_PAGE_VA`], releasing any frame the mapping replaced (a
+/// CoW-shared kstack inherited from `fork_cow`). Returns the new frame's physical
+/// address. Every address space gets its own so concurrent `#PF`s under SMP push
+/// their exception frames onto distinct pages.
+fn install_kstack(space: &mut AddrSpace, fa: &mut FrameAllocator, phys: &PhysMem) -> u64 {
+    let frame = fa.alloc(phys).expect("kstack: frame pool exhausted");
+    if let Some(old) = ctrl::map_kstack(space, fa, phys, frame) {
+        fa.free(old);
+    }
+    frame
 }
 
 impl GuestMemory {
@@ -163,6 +182,7 @@ impl GuestMemory {
         ctrl::reserve_and_build(&mut fa, &phys);
         let mut space = AddrSpace::new(&mut fa, &phys).expect("pool too small for a PML4");
         ctrl::map_into(&mut space, &mut fa, &phys);
+        let kstack_pa = install_kstack(&mut space, &mut fa, &phys);
 
         Self {
             base,
@@ -174,6 +194,7 @@ impl GuestMemory {
             mapped: vec![false; npages],
             file_backed: vec![false; npages],
             tlb_dirty: false,
+            kstack_pa,
         }
     }
 
@@ -203,6 +224,14 @@ impl GuestMemory {
     #[must_use]
     pub(crate) fn phys_arc(&self) -> Arc<PhysMem> {
         Arc::clone(&self.phys)
+    }
+
+    /// Physical address of this address space's private kernel-stack frame, so a
+    /// KVM vcpu can read the pushed `#PF` exception frame lock-free (no
+    /// `GuestMemory` borrow) on the SMP path. Changes on `fork`/`exec_reset`.
+    #[must_use]
+    pub(crate) fn kstack_pa(&self) -> u64 {
+        self.kstack_pa
     }
 
     /// Take and clear the "page tables changed" flag: whether a present leaf was
@@ -643,20 +672,26 @@ impl GuestMemory {
     /// Only touched pages ever cost a private frame. The child shares the pool.
     #[must_use]
     pub fn fork(&mut self) -> Self {
-        let child_space = {
+        let (child_space, parent_kstack, child_kstack) = {
             let mut fa = self.fa.lock().unwrap();
-            let child = self
+            let mut child = self
                 .space
                 .fork_cow(&mut fa, &self.phys)
                 .expect("fork_cow: frame pool exhausted");
             // `fork_cow` cleared the write bit on *every* leaf, including the
-            // supervisor control block (whose kstack the CPU writes on a fault).
-            // Restore it, RW-supervisor, on both sides.
+            // shared supervisor control block. Restore it, RW-supervisor, on both
+            // sides.
             ctrl::map_into(&mut self.space, &mut fa, &self.phys);
-            let mut child = child;
             ctrl::map_into(&mut child, &mut fa, &self.phys);
-            child
+            // The kernel stack must be private per address space, not CoW-shared:
+            // give the parent and child each a fresh frame (each `install_kstack`
+            // releases the CoW-shared kstack `fork_cow` handed it). Its contents
+            // are transient supervisor scratch, so nothing is lost by not copying.
+            let parent_kstack = install_kstack(&mut self.space, &mut fa, &self.phys);
+            let child_kstack = install_kstack(&mut child, &mut fa, &self.phys);
+            (child, parent_kstack, child_kstack)
         };
+        self.kstack_pa = parent_kstack;
         Self {
             base: self.base,
             size: self.size,
@@ -667,6 +702,7 @@ impl GuestMemory {
             mapped: self.mapped.clone(),
             file_backed: self.file_backed.clone(),
             tlb_dirty: false,
+            kstack_pa: child_kstack,
         }
     }
 
@@ -689,8 +725,13 @@ impl GuestMemory {
         let mut fa = self.fa.lock().unwrap();
         let mut ns = AddrSpace::new(&mut fa, &self.phys).expect("reset: pool exhausted");
         ctrl::map_into(&mut ns, &mut fa, &self.phys);
+        let kstack_pa = install_kstack(&mut ns, &mut fa, &self.phys);
         let old = std::mem::replace(&mut self.space, ns);
+        // The old space's private kstack frame is an ordinary (non-pinned) leaf,
+        // so `destroy` frees it along with the rest; the shared control frames it
+        // also references are pinned and survive.
         old.destroy(&mut fa, &self.phys);
+        self.kstack_pa = kstack_pa;
         drop(fa);
         for x in &mut self.prot {
             *x = Prot::NONE;

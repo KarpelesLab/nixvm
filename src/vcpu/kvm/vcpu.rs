@@ -27,6 +27,8 @@ use super::sys;
 use super::vm::{
     FAULT_TRAMP_VA, GDT_BASE, GDT_LIMIT, LSTAR_VA, SEL_UCODE, SEL_UDATA, STAR_VALUE, Vm, check,
 };
+use crate::vcpu::mem::PAGE_SIZE;
+use crate::vcpu::phys::PhysMem;
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -227,6 +229,15 @@ pub struct KvmVcpu {
     /// because the host edited this address space's page tables in place (a fork's
     /// copy-on-write downgrade of the parent) without the guest reloading cr3.
     tlb_flush_pending: bool,
+    /// The shared physical pool, cached from the running `GuestMemory` so the
+    /// fault path can read the pushed `#PF` exception frame lock-free (no
+    /// `GuestMemory` borrow — the SMP path holds none). Set on the first run.
+    phys: Option<Arc<PhysMem>>,
+    /// Physical address of the running address space's private kernel-stack frame
+    /// (see [`GuestMemory::kstack_pa`]): where this vcpu reads the exception frame
+    /// the CPU pushed, so sibling vcpus faulting at once never read each other's.
+    /// Refreshed from `mem` on every reconcile (it changes on execve/fork).
+    kstack_pa: u64,
 }
 
 // The register caches and run page are noise in a debug dump; the fd
@@ -392,6 +403,8 @@ impl KvmVcpu {
             quantum: crate::vcpu::preempt_quantum(),
             cur_cr3: None,
             tlb_flush_pending: false,
+            phys: None,
+            kstack_pa: 0,
         })
     }
 
@@ -405,6 +418,13 @@ impl KvmVcpu {
             self.sregs_dirty = true;
             self.cur_cr3 = Some(cr3);
         }
+        // Cache the pool handle (once) and this address space's private kstack
+        // frame so the fault path reads the pushed exception frame from *this*
+        // vcpu's kstack — never a sibling's — without a `GuestMemory` borrow.
+        if self.phys.is_none() {
+            self.phys = Some(mem.phys_arc());
+        }
+        self.kstack_pa = mem.kstack_pa();
     }
 
     /// Flush dirty caches to the vcpu, run it once, and refresh the caches.
@@ -551,14 +571,13 @@ impl KvmVcpu {
                 // (now `rsp`). Recover the faulting user state so accessors and
                 // signal delivery see it, and report the fault at cr2.
                 let ksp = self.regs.rsp;
-                let frame = (|| {
-                    Some((
-                        self.vm.read_ctrl_u64(ksp)?,
-                        self.vm.read_ctrl_u64(ksp + 8)?,
-                        self.vm.read_ctrl_u64(ksp + 24)?,
-                        self.vm.read_ctrl_u64(ksp + 32)?,
-                    ))
-                })();
+                // The frame sits in this address space's private kstack page; read
+                // it from that frame's pool physical address (cached in `sync_cr3`)
+                // so concurrent sibling faults never read one another's frame.
+                let frame = self.phys.as_ref().map(|ph| {
+                    let at = |va: u64| ph.read_u64(self.kstack_pa + (va & (PAGE_SIZE - 1)));
+                    (at(ksp), at(ksp + 8), at(ksp + 24), at(ksp + 32))
+                });
                 if let Some((err, fault_rip, fault_rflags, fault_rsp)) = frame {
                     self.regs.rip = fault_rip;
                     self.regs.rsp = fault_rsp;
