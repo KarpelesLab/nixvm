@@ -14,7 +14,7 @@
 //! is not modeled — and a pending async signal with a real handler is dropped
 //! rather than left to spin the scheduler.
 
-use super::{Kernel, RunState, SA_ONSTACK, SIGSEGV, SS_DISABLE, err};
+use super::{Kernel, RunState, SA_ONSTACK, SIGSEGV, SS_DISABLE, ServiceCtx, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
@@ -32,8 +32,9 @@ impl Kernel {
     /// `rt_sigaction(sig, act, oldact, sigsetsize)` — store the disposition for
     /// `sig`. `sigsetsize` is accepted but ignored. Changing `SIGKILL`/`SIGSTOP`
     /// is rejected with `EINVAL`.
+    #[allow(clippy::unused_self)]
     pub(super) fn sys_rt_sigaction(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         sig: u64,
         act: u64,
         oldact: u64,
@@ -48,7 +49,7 @@ impl Kernel {
         let idx = sig as usize;
         if oldact != 0 {
             // struct sigaction: handler u64, flags u64, restorer u64, mask u64.
-            let old = self.cur.handlers[idx];
+            let old = cx.cur.handlers[idx];
             let mut buf = [0u8; 32];
             buf[0..8].copy_from_slice(&old.handler.to_le_bytes());
             buf[8..16].copy_from_slice(&old.flags.to_le_bytes());
@@ -64,7 +65,7 @@ impl Kernel {
                 return err(Errno::EFAULT);
             }
             let word = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
-            self.cur.handlers[idx] = super::SigAction {
+            cx.cur.handlers[idx] = super::SigAction {
                 handler: word(0),
                 flags: word(8),
                 restorer: word(16),
@@ -77,8 +78,9 @@ impl Kernel {
     /// `sigaltstack(ss, old_ss)` — get/set the alternate signal stack a handler
     /// registered `SA_ONSTACK` runs on. `stack_t` is `{ void *ss_sp; int
     /// ss_flags; size_t ss_size }`.
-    pub(super) fn sys_sigaltstack(&mut self, ss: u64, old_ss: u64, mem: &mut GuestMemory) -> i64 {
-        let (sp, size, flags) = self.cur.altstack;
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_sigaltstack(&mut self, cx: &mut ServiceCtx, ss: u64, old_ss: u64, mem: &mut GuestMemory) -> i64 {
+        let (sp, size, flags) = cx.cur.altstack;
         if old_ss != 0 {
             let mut buf = [0u8; 24];
             buf[0..8].copy_from_slice(&sp.to_le_bytes());
@@ -96,15 +98,16 @@ impl Kernel {
             let new_sp = u64::from_le_bytes(buf[0..8].try_into().unwrap());
             let new_flags = u64::from(u32::from_le_bytes(buf[8..12].try_into().unwrap()));
             let new_size = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-            self.cur.altstack = (new_sp, new_size, new_flags);
+            cx.cur.altstack = (new_sp, new_size, new_flags);
         }
         0
     }
 
     /// `rt_sigprocmask(how, set, oldset, sigsetsize)` — read/modify the blocked
     /// mask. `sigsetsize` is accepted but ignored.
+    #[allow(clippy::unused_self)]
     pub(super) fn sys_rt_sigprocmask(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         how: u64,
         set: u64,
         oldset: u64,
@@ -114,7 +117,7 @@ impl Kernel {
         const SIG_UNBLOCK: u64 = 1;
         const SIG_SETMASK: u64 = 2;
 
-        if oldset != 0 && mem.write(oldset, &self.cur.blocked.to_le_bytes()).is_err() {
+        if oldset != 0 && mem.write(oldset, &cx.cur.blocked.to_le_bytes()).is_err() {
             return err(Errno::EFAULT);
         }
         if set != 0 {
@@ -122,9 +125,9 @@ impl Kernel {
                 return err(Errno::EFAULT);
             };
             match how {
-                SIG_BLOCK => self.cur.blocked |= mask,
-                SIG_UNBLOCK => self.cur.blocked &= !mask,
-                SIG_SETMASK => self.cur.blocked = mask,
+                SIG_BLOCK => cx.cur.blocked |= mask,
+                SIG_UNBLOCK => cx.cur.blocked &= !mask,
+                SIG_SETMASK => cx.cur.blocked = mask,
                 _ => return err(Errno::EINVAL),
             }
         }
@@ -132,8 +135,9 @@ impl Kernel {
     }
 
     /// `rt_sigpending(set, sigsetsize)` — report the pending-signal mask.
-    pub(super) fn sys_rt_sigpending(&mut self, set: u64, mem: &mut GuestMemory) -> i64 {
-        if set != 0 && mem.write(set, &self.cur.pending.to_le_bytes()).is_err() {
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_rt_sigpending(&mut self, cx: &mut ServiceCtx, set: u64, mem: &mut GuestMemory) -> i64 {
+        if set != 0 && mem.write(set, &cx.cur.pending.to_le_bytes()).is_err() {
             return err(Errno::EFAULT);
         }
         0
@@ -141,9 +145,9 @@ impl Kernel {
 
     /// `kill`/`tkill(pid, sig)` — post `sig` to the target process. `sig == 0`
     /// is an existence check. `pid <= 0` or `pid == self` targets the caller.
-    pub(super) fn sys_kill(&mut self, pid: i64, sig: u64) -> i64 {
+    pub(super) fn sys_kill(&mut self, cx: &mut ServiceCtx, pid: i64, sig: u64) -> i64 {
         if sig == 0 {
-            return if pid <= 0 || self.pid_exists(pid) {
+            return if pid <= 0 || self.pid_exists(cx, pid) {
                 0
             } else {
                 err(Errno::ESRCH)
@@ -153,8 +157,8 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         let bit = 1u64 << (sig - 1);
-        if pid <= 0 || pid == i64::from(self.cur.pid) {
-            self.cur.pending |= bit;
+        if pid <= 0 || pid == i64::from(cx.cur.pid) {
+            cx.cur.pending |= bit;
             return 0;
         }
         for slot in self.procs.iter_mut().flatten() {
@@ -168,8 +172,8 @@ impl Kernel {
 
     /// Whether a process with `pid` exists (the running process is held in
     /// `self.cur`, out of the table, during its slice).
-    fn pid_exists(&self, pid: i64) -> bool {
-        pid == i64::from(self.cur.pid)
+    fn pid_exists(&self, cx: &ServiceCtx, pid: i64) -> bool {
+        pid == i64::from(cx.cur.pid)
             || self
                 .procs
                 .iter()
@@ -180,11 +184,12 @@ impl Kernel {
     /// Apply the DEFAULT disposition of every deliverable pending signal for the
     /// current process. Runs once after each serviced syscall; it never loops
     /// waiting for a signal and never invokes a real handler.
-    pub(super) fn deliver_pending_signals(&mut self) {
-        if !matches!(self.cur.run, RunState::Running) {
+    #[allow(clippy::unused_self)]
+    pub(super) fn deliver_pending_signals(&mut self, cx: &mut ServiceCtx) {
+        if !matches!(cx.cur.run, RunState::Running) {
             return;
         }
-        let deliverable = self.cur.pending & !self.cur.blocked;
+        let deliverable = cx.cur.pending & !cx.cur.blocked;
         if deliverable == 0 {
             return;
         }
@@ -194,8 +199,8 @@ impl Kernel {
                 continue;
             }
             // We are about to act on this signal in every branch below.
-            self.cur.pending &= !bit;
-            match self.cur.handlers[sig as usize].handler {
+            cx.cur.pending &= !bit;
+            match cx.cur.handlers[sig as usize].handler {
                 SIG_IGN => {}
                 // An asynchronously-posted signal (kill/tgkill) with a real
                 // handler: delivering it would need to interrupt the guest at an
@@ -206,7 +211,7 @@ impl Kernel {
                 // SIG_DFL: ignore the "ignored-by-default" set, else terminate.
                 _ if is_default_ignored(sig) => {}
                 _ => {
-                    self.cur.run = RunState::Zombie(128 + sig as i32);
+                    cx.cur.run = RunState::Zombie(128 + sig as i32);
                     return;
                 }
             }
@@ -270,8 +275,9 @@ impl Kernel {
     /// This is what lets a JIT that deliberately faults — JSC/V8 use `SIGSEGV`
     /// for stack-limit and null checks and to poll for VM interrupts — run at
     /// all: without it every such trap is a hard crash.
+    #[allow(clippy::unused_self)]
     pub(super) fn deliver_fault_signal(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         sig: u64,
         fault_addr: u64,
         vcpu: &mut dyn crate::vcpu::Vcpu,
@@ -283,7 +289,7 @@ impl Kernel {
         if std::env::var_os("NIXVM_NOSIG").is_some() {
             return false;
         }
-        let act = self.cur.handlers[sig as usize];
+        let act = cx.cur.handlers[sig as usize];
         // Only a real, non-default, non-ignore handler is deliverable.
         if act.handler == SIG_DFL || act.handler == SIG_IGN {
             return false;
@@ -292,7 +298,7 @@ impl Kernel {
         // fault *inside* the handler — is unrecoverable; Linux forces the
         // default action (terminate). This also stops an infinite deliver→
         // fault→deliver cascade when the handler itself faults.
-        if self.cur.blocked & (1u64 << (sig - 1)) != 0 {
+        if cx.cur.blocked & (1u64 << (sig - 1)) != 0 {
             return false;
         }
 
@@ -300,7 +306,7 @@ impl Kernel {
         // one is configured, else just below the current rsp (with the ABI red
         // zone skipped).
         let cur_sp = vcpu.sp();
-        let (alt_sp, alt_size, alt_flags) = self.cur.altstack;
+        let (alt_sp, alt_size, alt_flags) = cx.cur.altstack;
         let base = if act.flags & SA_ONSTACK != 0 && alt_flags & SS_DISABLE == 0 && alt_size != 0 {
             alt_sp + alt_size
         } else {
@@ -342,7 +348,7 @@ impl Kernel {
         // uc_mcontext.fpstate pointer: none saved (0) — handlers that only
         // inspect the fault don't touch it.
         put(MCTX_OFF + (GREG_COUNT as u64) * 8, 0);
-        put(UC_OFF + 296, self.cur.blocked); // uc_sigmask (kernel 8-byte)
+        put(UC_OFF + 296, cx.cur.blocked); // uc_sigmask (kernel 8-byte)
 
         // siginfo: si_signo, si_errno, si_code, then si_addr for SIGSEGV/SIGILL.
         let si = frame + UC_OFF + UCONTEXT_SIZE;
@@ -373,14 +379,15 @@ impl Kernel {
         vcpu.set_sp(frame);
         vcpu.set_pc(act.handler);
         // Block this signal (unless SA_NODEFER) plus the handler's mask.
-        self.cur.blocked |= act.mask | (1u64 << (sig - 1));
+        cx.cur.blocked |= act.mask | (1u64 << (sig - 1));
         true
     }
 
     /// `rt_sigreturn` — restore the context the handler was entered with. The
     /// frame is at `rsp - 8` (the handler's trampoline `ret`'d off `pretcode`),
     /// so `uc_mcontext` is at a fixed offset below the current `rsp`.
-    pub(super) fn sys_rt_sigreturn(&mut self, vcpu: &mut dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_rt_sigreturn(&mut self, cx: &mut ServiceCtx, vcpu: &mut dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
         // On entry to the restorer, rsp pointed at pretcode; its `ret` popped 8,
         // so uc_mcontext is at rsp + (MCTX_OFF - 8).
         let mctx = vcpu.sp().wrapping_add(MCTX_OFF - 8);
@@ -397,7 +404,7 @@ impl Kernel {
         // Restore the signal mask the handler ran under (uc_sigmask).
         let uc = mctx.wrapping_sub(MCTX_OFF - UC_OFF);
         if let Ok(mask) = mem.read_u64(uc + 296) {
-            self.cur.blocked = mask;
+            cx.cur.blocked = mask;
         }
     }
 }

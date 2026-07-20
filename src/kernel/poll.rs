@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{Fd, Kernel, err};
+use super::{Fd, Kernel, ServiceCtx, err};
 use crate::abi::Arch;
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
@@ -149,8 +149,8 @@ fn write_fdset(mem: &mut GuestMemory, ptr: u64, nfds: u64, bits: &[bool]) -> boo
 impl Kernel {
     /// The readiness mask (`POLLIN`/`POLLOUT`/`POLLERR`/`POLLHUP`/`POLLNVAL`)
     /// of guest fd `fd_num` right now. `POLLNVAL` if the fd is not open.
-    fn fd_ready(&mut self, fd_num: i32) -> u32 {
-        let Some(fd) = self.cur.fds.get(fd_num).cloned() else {
+    fn fd_ready(&mut self, cx: &mut ServiceCtx, fd_num: i32) -> u32 {
+        let Some(fd) = cx.cur.fds.get(fd_num).cloned() else {
             return POLLNVAL;
         };
         match fd {
@@ -210,27 +210,28 @@ impl Kernel {
     /// call and re-checked on every re-trap of the same blocking syscall (the
     /// guest PC never advanced past the `svc`). [`Kernel::service`] clears it
     /// once the syscall finally completes.
-    fn block_or_timeout(&mut self, timeout_ms: i64) -> bool {
+    #[allow(clippy::unused_self)]
+    fn block_or_timeout(&mut self, cx: &mut ServiceCtx, timeout_ms: i64) -> bool {
         if timeout_ms == 0 {
             return true;
         }
         if timeout_ms < 0 {
-            self.block = true;
+            cx.block = true;
             return false;
         }
         let now = now_ns();
-        match self.cur.wake_deadline {
+        match cx.cur.wake_deadline {
             Some(dl) if now >= dl => {
-                self.cur.wake_deadline = None;
+                cx.cur.wake_deadline = None;
                 true
             }
             Some(_) => {
-                self.block = true;
+                cx.block = true;
                 false
             }
             None => {
-                self.cur.wake_deadline = Some(now + (timeout_ms as u128) * 1_000_000);
-                self.block = true;
+                cx.cur.wake_deadline = Some(now + (timeout_ms as u128) * 1_000_000);
+                cx.block = true;
                 false
             }
         }
@@ -240,7 +241,7 @@ impl Kernel {
 
     /// `poll(fds, nfds, timeout_ms)`.
     pub(super) fn sys_poll(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         fds_ptr: u64,
         nfds: u64,
         timeout_ms: i64,
@@ -264,7 +265,7 @@ impl Kernel {
             let revents = if fd < 0 {
                 0
             } else {
-                self.fd_ready(fd) & (u32::from(events) | POLLERR | POLLHUP | POLLNVAL)
+                self.fd_ready(cx, fd) & (u32::from(events) | POLLERR | POLLHUP | POLLNVAL)
             };
             if !write_u16(mem, addr + 6, revents as u16) {
                 return err(Errno::EFAULT);
@@ -277,15 +278,16 @@ impl Kernel {
         if ready_count > 0 {
             return ready_count;
         }
-        self.block_or_timeout(timeout_ms);
+        self.block_or_timeout(cx, timeout_ms);
         0
     }
 
     /// `ppoll(fds, nfds, timeout, sigmask, sigsetsize)`. The sigmask is
     /// accepted but not honored (no signal-frame delivery exists to restore
     /// into).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_ppoll(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         fds_ptr: u64,
         nfds: u64,
         timeout_ts: u64,
@@ -301,7 +303,7 @@ impl Kernel {
             };
             timespec_to_ms(sec, nsec)
         };
-        self.sys_poll(fds_ptr, nfds, timeout_ms, mem)
+        self.sys_poll(cx, fds_ptr, nfds, timeout_ms, mem)
     }
 
     // ---- select / pselect6 ---------------------------------------------
@@ -309,8 +311,9 @@ impl Kernel {
     /// Shared `select`/`pselect6` body: compute readiness for every fd named
     /// in `r`/`w`/`e`, write the ready subsets back, and return the total
     /// count set across all three sets. `immediate` is the zero-timeout case.
+    #[allow(clippy::too_many_arguments)]
     fn sys_select_core(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         nfds: u64,
         r: u64,
         w: u64,
@@ -336,7 +339,7 @@ impl Kernel {
             if !rbits[fd] && !wbits[fd] && !ebits[fd] {
                 continue;
             }
-            let ready = self.fd_ready(fd as i32);
+            let ready = self.fd_ready(cx, fd as i32);
             if rbits[fd] && ready & (POLLIN | POLLHUP) != 0 {
                 rout[fd] = true;
                 total += 1;
@@ -360,7 +363,7 @@ impl Kernel {
             }
             return total;
         }
-        self.block = true;
+        cx.block = true;
         0
     }
 
@@ -368,7 +371,7 @@ impl Kernel {
     /// sigmask argument is accepted but not honored.
     #[allow(clippy::too_many_arguments)] // one parameter per syscall argument
     pub(super) fn sys_pselect6(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         nfds: u64,
         r: u64,
         w: u64,
@@ -385,13 +388,14 @@ impl Kernel {
             };
             sec == 0 && nsec == 0
         };
-        self.sys_select_core(nfds, r, w, e, immediate, mem)
+        self.sys_select_core(cx, nfds, r, w, e, immediate, mem)
     }
 
     /// The legacy `select(nfds, readfds, writefds, exceptfds, timeout)`
     /// (x86-64 only); `timeout` is a `struct timeval { i64 sec; i64 usec; }`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_select(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         nfds: u64,
         r: u64,
         w: u64,
@@ -408,7 +412,7 @@ impl Kernel {
             };
             sec == 0 && usec == 0
         };
-        self.sys_select_core(nfds, r, w, e, immediate, mem)
+        self.sys_select_core(cx, nfds, r, w, e, immediate, mem)
     }
 
     // ---- epoll ------------------------------------------------------------
@@ -438,15 +442,15 @@ impl Kernel {
     }
 
     /// `epoll_create`/`epoll_create1(flags)` — a fresh, empty interest set.
-    pub(super) fn sys_epoll_create1(&mut self, _flags: u64) -> i64 {
+    pub(super) fn sys_epoll_create1(&mut self, cx: &mut ServiceCtx, _flags: u64) -> i64 {
         let idx = self.epolls.len();
         self.epolls.push(EpollInst::default());
-        i64::from(self.cur.fds.alloc(Fd::Epoll(idx)))
+        i64::from(cx.cur.fds.alloc(Fd::Epoll(idx)))
     }
 
     /// `epoll_ctl(epfd, op, fd, event)`.
     pub(super) fn sys_epoll_ctl(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         epfd: u64,
         op: u64,
         fd: u64,
@@ -457,10 +461,10 @@ impl Kernel {
         const EPOLL_CTL_DEL: u64 = 2;
         const EPOLL_CTL_MOD: u64 = 3;
 
-        let Some(Fd::Epoll(idx)) = self.cur.fds.get(epfd as i32).cloned() else {
+        let Some(Fd::Epoll(idx)) = cx.cur.fds.get(epfd as i32).cloned() else {
             return err(Errno::EBADF);
         };
-        if self.cur.fds.get(fd as i32).is_none() {
+        if cx.cur.fds.get(fd as i32).is_none() {
             return err(Errno::EBADF);
         }
         let target = fd as i32;
@@ -502,14 +506,14 @@ impl Kernel {
     /// `epoll_wait`/`epoll_pwait(epfd, events, maxevents, timeout_ms, ...)`.
     /// The `epoll_pwait` sigmask argument is accepted but not honored.
     pub(super) fn sys_epoll_wait(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         epfd: u64,
         events_ptr: u64,
         maxevents: u64,
         timeout_ms: i64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        let Some(Fd::Epoll(idx)) = self.cur.fds.get(epfd as i32).cloned() else {
+        let Some(Fd::Epoll(idx)) = cx.cur.fds.get(epfd as i32).cloned() else {
             return err(Errno::EBADF);
         };
         if maxevents == 0 {
@@ -528,7 +532,7 @@ impl Kernel {
             if n >= maxevents {
                 break;
             }
-            let ready = self.fd_ready(fd) & (w.events | POLLERR | POLLHUP);
+            let ready = self.fd_ready(cx, fd) & (w.events | POLLERR | POLLHUP);
             if ready == 0 {
                 continue;
             }
@@ -542,14 +546,14 @@ impl Kernel {
         if n > 0 {
             return n as i64;
         }
-        self.block_or_timeout(timeout_ms);
+        self.block_or_timeout(cx, timeout_ms);
         0
     }
 
     /// `epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)` —
     /// like `epoll_pwait` but the timeout is a `struct timespec*`.
     pub(super) fn sys_epoll_pwait2(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         epfd: u64,
         events_ptr: u64,
         maxevents: u64,
@@ -564,13 +568,13 @@ impl Kernel {
             };
             timespec_to_ms(sec, nsec)
         };
-        self.sys_epoll_wait(epfd, events_ptr, maxevents, timeout_ms, mem)
+        self.sys_epoll_wait(cx, epfd, events_ptr, maxevents, timeout_ms, mem)
     }
 
     // ---- eventfd ------------------------------------------------------------
 
     /// `eventfd`/`eventfd2(initval, flags)`.
-    pub(super) fn sys_eventfd2(&mut self, initval: u64, flags: u64) -> i64 {
+    pub(super) fn sys_eventfd2(&mut self, cx: &mut ServiceCtx, initval: u64, flags: u64) -> i64 {
         const EFD_SEMAPHORE: u64 = 1;
         const EFD_NONBLOCK: u64 = 0o4000;
         let idx = self.eventfds.len();
@@ -579,13 +583,13 @@ impl Kernel {
             semaphore: flags & EFD_SEMAPHORE != 0,
             nonblock: flags & EFD_NONBLOCK != 0,
         });
-        i64::from(self.cur.fds.alloc(Fd::Eventfd(idx)))
+        i64::from(cx.cur.fds.alloc(Fd::Eventfd(idx)))
     }
 
     /// `read(eventfd_fd, buf, count)` — drain the counter (called from
     /// [`Kernel::sys_read`](super::Kernel)).
     pub(super) fn read_eventfd(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         i: usize,
         buf: u64,
         count: u64,
@@ -598,7 +602,7 @@ impl Kernel {
             if self.eventfds[i].nonblock {
                 return err(Errno::EAGAIN);
             }
-            self.block = true;
+            cx.block = true;
             return 0;
         }
         let value = if self.eventfds[i].semaphore {
@@ -615,7 +619,7 @@ impl Kernel {
 
     /// `write(eventfd_fd, buf, count)` — add to the counter (called from
     /// [`Kernel::sys_write`](super::Kernel)).
-    pub(super) fn write_eventfd(&mut self, i: usize, data: &[u8]) -> i64 {
+    pub(super) fn write_eventfd(&mut self, cx: &mut ServiceCtx, i: usize, data: &[u8]) -> i64 {
         if data.len() < 8 {
             return err(Errno::EINVAL);
         }
@@ -633,7 +637,7 @@ impl Kernel {
             }
             _ if self.eventfds[i].nonblock => err(Errno::EAGAIN),
             _ => {
-                self.block = true;
+                cx.block = true;
                 0
             }
         }
@@ -643,7 +647,7 @@ impl Kernel {
 
     /// `timerfd_create(clockid, flags)` — `clockid` is accepted but ignored
     /// (there is only the one host wall clock).
-    pub(super) fn sys_timerfd_create(&mut self, _clockid: u64, flags: u64) -> i64 {
+    pub(super) fn sys_timerfd_create(&mut self, cx: &mut ServiceCtx, _clockid: u64, flags: u64) -> i64 {
         const TFD_NONBLOCK: u64 = 0o4000;
         let idx = self.timerfds.len();
         self.timerfds.push(TimerFdInst {
@@ -652,7 +656,7 @@ impl Kernel {
             expirations: 0,
             nonblock: flags & TFD_NONBLOCK != 0,
         });
-        i64::from(self.cur.fds.alloc(Fd::Timerfd(idx)))
+        i64::from(cx.cur.fds.alloc(Fd::Timerfd(idx)))
     }
 
     /// Advance timer `i` to the current time: if its deadline has passed,
@@ -700,7 +704,7 @@ impl Kernel {
 
     /// `timerfd_settime(fd, flags, new_value, old_value)`.
     pub(super) fn sys_timerfd_settime(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         fd: u64,
         flags: u64,
         new_value: u64,
@@ -709,7 +713,7 @@ impl Kernel {
     ) -> i64 {
         const TFD_TIMER_ABSTIME: u64 = 1;
 
-        let Some(Fd::Timerfd(i)) = self.cur.fds.get(fd as i32).cloned() else {
+        let Some(Fd::Timerfd(i)) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
         let Some((int_sec, int_nsec)) = read_timespec(mem, new_value) else {
@@ -752,12 +756,12 @@ impl Kernel {
 
     /// `timerfd_gettime(fd, curr_value)`.
     pub(super) fn sys_timerfd_gettime(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         fd: u64,
         curr_value: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        let Some(Fd::Timerfd(i)) = self.cur.fds.get(fd as i32).cloned() else {
+        let Some(Fd::Timerfd(i)) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
         let interval_ns = self.timerfds[i].interval_ns;
@@ -777,7 +781,7 @@ impl Kernel {
     /// `read(timerfd_fd, buf, count)` — drain the accumulated expiration
     /// count (called from [`Kernel::sys_read`](super::Kernel)).
     pub(super) fn read_timerfd(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         i: usize,
         buf: u64,
         count: u64,
@@ -791,7 +795,7 @@ impl Kernel {
             if self.timerfds[i].nonblock {
                 return err(Errno::EAGAIN);
             }
-            self.block = true;
+            cx.block = true;
             return 0;
         }
         let val = self.timerfds[i].expirations;
@@ -847,31 +851,34 @@ mod tests {
 
     const PAGE: u64 = 4096;
 
-    fn setup() -> (Kernel, GuestMemory, DummyVcpu) {
+    fn setup() -> (Kernel, GuestMemory, DummyVcpu, ServiceCtx) {
         let mut mounts = MountTable::new();
         mounts.mount("/", Box::new(TmpFs::new()));
-        let mut kernel = Kernel::new(Arch::Aarch64, mounts);
-        kernel.cur.pid = 1;
+        let kernel = Kernel::new(Arch::Aarch64, mounts);
+        let mut cx = ServiceCtx::default();
+        cx.cur.pid = 1;
         let mut mem = GuestMemory::new(0x1_0000, 16 * PAGE);
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
-        (kernel, mem, DummyVcpu)
+        (kernel, mem, DummyVcpu, cx)
     }
 
     fn call(
         k: &mut Kernel,
+        cx: &mut ServiceCtx,
         mem: &mut GuestMemory,
         v: &mut DummyVcpu,
         s: Sysno,
         a: [u64; 6],
     ) -> i64 {
-        k.dispatch(s, 0, &a, v, mem)
+        k.dispatch(cx, s, 0, &a, v, mem)
     }
 
     #[test]
     fn eventfd_write_then_read_counter() {
-        let (mut k, mut mem, mut v) = setup();
+        let (mut k, mut mem, mut v, mut cx) = setup();
         let fd = call(
             &mut k,
+            &mut cx,
             &mut mem,
             &mut v,
             Sysno::Eventfd2,
@@ -885,6 +892,7 @@ mod tests {
         assert_eq!(
             call(
                 &mut k,
+                &mut cx,
                 &mut mem,
                 &mut v,
                 Sysno::Write,
@@ -896,6 +904,7 @@ mod tests {
         assert_eq!(
             call(
                 &mut k,
+                &mut cx,
                 &mut mem,
                 &mut v,
                 Sysno::Write,
@@ -906,7 +915,7 @@ mod tests {
 
         let out = 0x1_1000;
         assert_eq!(
-            call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
+            call(&mut k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
             8
         );
         assert_eq!(mem.read_u64(out).unwrap(), 7);
@@ -914,18 +923,19 @@ mod tests {
         // Drained: read again with count == 0 (non-blocking check via the
         // `block` flag, mirroring the pipe test's convention).
         assert_eq!(
-            call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
+            call(&mut k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
             0
         );
-        assert!(k.block);
+        assert!(cx.block);
     }
 
     #[test]
     fn eventfd_semaphore_mode_decrements_by_one() {
         const EFD_SEMAPHORE: u64 = 1;
-        let (mut k, mut mem, mut v) = setup();
+        let (mut k, mut mem, mut v, mut cx) = setup();
         let fd = call(
             &mut k,
+            &mut cx,
             &mut mem,
             &mut v,
             Sysno::Eventfd2,
@@ -934,7 +944,7 @@ mod tests {
 
         let out = 0x1_0000;
         assert_eq!(
-            call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
+            call(&mut k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
             8
         );
         assert_eq!(mem.read_u64(out).unwrap(), 1);
@@ -942,9 +952,9 @@ mod tests {
 
     #[test]
     fn poll_reports_pollin_when_pipe_has_data() {
-        let (mut k, mut mem, mut v) = setup();
+        let (mut k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_0000;
-        call(&mut k, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
+        call(&mut k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
         let rfd = u64::from(mem.read_u32(fds).unwrap());
         let wfd = u64::from(mem.read_u32(fds + 4).unwrap());
 
@@ -952,6 +962,7 @@ mod tests {
         mem.write_init(msg, b"hi").unwrap();
         call(
             &mut k,
+            &mut cx,
             &mut mem,
             &mut v,
             Sysno::Write,
@@ -968,6 +979,7 @@ mod tests {
 
         let n = call(
             &mut k,
+            &mut cx,
             &mut mem,
             &mut v,
             Sysno::Poll,
@@ -979,9 +991,9 @@ mod tests {
 
     #[test]
     fn poll_zero_timeout_on_empty_pipe_returns_immediately() {
-        let (mut k, mut mem, mut v) = setup();
+        let (mut k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_0000;
-        call(&mut k, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
+        call(&mut k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
         let rfd = u64::from(mem.read_u32(fds).unwrap());
 
         let pollfds = 0x1_2000;
@@ -991,20 +1003,21 @@ mod tests {
 
         let n = call(
             &mut k,
+            &mut cx,
             &mut mem,
             &mut v,
             Sysno::Poll,
             [pollfds, 1, 0, 0, 0, 0],
         );
         assert_eq!(n, 0, "no data and writer still open, but timeout=0");
-        assert!(!k.block, "zero timeout must not block");
+        assert!(!cx.block, "zero timeout must not block");
     }
 
     #[test]
     fn epoll_create_ctl_wait_on_ready_pipe() {
-        let (mut k, mut mem, mut v) = setup();
+        let (mut k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_0000;
-        call(&mut k, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
+        call(&mut k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
         let rfd = u64::from(mem.read_u32(fds).unwrap());
         let wfd = u64::from(mem.read_u32(fds + 4).unwrap());
 
@@ -1012,6 +1025,7 @@ mod tests {
         mem.write_init(msg, b"yo").unwrap();
         call(
             &mut k,
+            &mut cx,
             &mut mem,
             &mut v,
             Sysno::Write,
@@ -1020,6 +1034,7 @@ mod tests {
 
         let epfd = call(
             &mut k,
+            &mut cx,
             &mut mem,
             &mut v,
             Sysno::EpollCreate1,
@@ -1035,6 +1050,7 @@ mod tests {
         assert_eq!(
             call(
                 &mut k,
+                &mut cx,
                 &mut mem,
                 &mut v,
                 Sysno::EpollCtl,
@@ -1046,6 +1062,7 @@ mod tests {
         let out = 0x1_3000;
         let n = call(
             &mut k,
+            &mut cx,
             &mut mem,
             &mut v,
             Sysno::EpollPwait,
@@ -1058,9 +1075,10 @@ mod tests {
 
     #[test]
     fn timerfd_create_settime_gettime() {
-        let (mut k, mut mem, mut v) = setup();
+        let (mut k, mut mem, mut v, mut cx) = setup();
         let fd = call(
             &mut k,
+            &mut cx,
             &mut mem,
             &mut v,
             Sysno::TimerfdCreate,
@@ -1078,6 +1096,7 @@ mod tests {
         assert_eq!(
             call(
                 &mut k,
+                &mut cx,
                 &mut mem,
                 &mut v,
                 Sysno::TimerfdSettime,
@@ -1090,6 +1109,7 @@ mod tests {
         assert_eq!(
             call(
                 &mut k,
+                &mut cx,
                 &mut mem,
                 &mut v,
                 Sysno::TimerfdGettime,
@@ -1107,16 +1127,17 @@ mod tests {
         // expired -> EAGAIN via O_NONBLOCK-equivalent isn't set, so it would
         // normally block; assert it sets the block flag instead of hanging).
         let out = 0x1_2000;
-        let ret = call(&mut k, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]);
+        let ret = call(&mut k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]);
         assert_eq!(ret, 0);
-        assert!(k.block);
+        assert!(cx.block);
     }
 
     #[test]
     fn timerfd_disarm_with_zero_value() {
-        let (mut k, mut mem, mut v) = setup();
+        let (mut k, mut mem, mut v, mut cx) = setup();
         let fd = call(
             &mut k,
+            &mut cx,
             &mut mem,
             &mut v,
             Sysno::TimerfdCreate,
@@ -1128,6 +1149,7 @@ mod tests {
         assert_eq!(
             call(
                 &mut k,
+                &mut cx,
                 &mut mem,
                 &mut v,
                 Sysno::TimerfdSettime,
@@ -1139,6 +1161,7 @@ mod tests {
         let curval = 0x1_1000;
         call(
             &mut k,
+            &mut cx,
             &mut mem,
             &mut v,
             Sysno::TimerfdGettime,

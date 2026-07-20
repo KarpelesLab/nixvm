@@ -11,7 +11,7 @@
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
-use super::{AT_FDCWD, Fd, Kernel, err, io_errno, read_path, stat};
+use super::{AT_FDCWD, Fd, Kernel, ServiceCtx, err, io_errno, read_path, stat};
 
 /// `unlinkat` flag: remove a directory, like `rmdir(2)`.
 const AT_REMOVEDIR: u64 = 0x200;
@@ -19,11 +19,11 @@ const AT_REMOVEDIR: u64 = 0x200;
 impl Kernel {
     /// `statfs(path, buf)` — write a plausible `struct statfs` for the
     /// filesystem containing `path`.
-    pub(super) fn sys_statfs(&mut self, pathptr: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_statfs(&mut self, cx: &mut ServiceCtx, pathptr: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
-        let abs = self.resolve_path(AT_FDCWD, &rel);
+        let abs = self.resolve_path(cx, AT_FDCWD, &rel);
         let abs = self.follow_symlinks(&abs).unwrap_or(abs);
         if self.mounts.stat(&abs).is_none() {
             return err(Errno::ENOENT);
@@ -32,8 +32,9 @@ impl Kernel {
     }
 
     /// `fstatfs(fd, buf)` — as `statfs`, keyed by an open fd.
-    pub(super) fn sys_fstatfs(&mut self, fd: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
-        if self.cur.fds.get(fd as i32).is_none() {
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_fstatfs(&mut self, cx: &mut ServiceCtx, fd: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
+        if cx.cur.fds.get(fd as i32).is_none() {
             return err(Errno::EBADF);
         }
         write_statfs_or_fault(mem, buf)
@@ -45,14 +46,15 @@ impl Kernel {
     /// symlink target for descriptor `n` from the running task's live fd table
     /// (the path for a file/dir, an `anon_inode:`/`pipe:`/`socket:` name
     /// otherwise). `None` if the path isn't such a link or the fd is closed.
-    fn proc_fd_link(&self, abs: &str) -> Option<String> {
+    #[allow(clippy::unused_self)]
+    fn proc_fd_link(&self, cx: &ServiceCtx, abs: &str) -> Option<String> {
         let rest = abs.strip_prefix("/proc/")?;
         let (who, tail) = rest.split_once("/fd/")?;
-        if who != "self" && who != self.cur.pid.to_string() {
+        if who != "self" && who != cx.cur.pid.to_string() {
             return None;
         }
         let n: i32 = tail.parse().ok()?;
-        Some(match self.cur.fds.get(n)? {
+        Some(match cx.cur.fds.get(n)? {
             Fd::File { path, .. } | Fd::Dir { path, .. } => path.clone(),
             Fd::Stdin | Fd::Stdout | Fd::Stderr => "/dev/null".to_string(),
             Fd::PipeRead(i) | Fd::PipeWrite(i) => format!("pipe:[{i}]"),
@@ -64,7 +66,7 @@ impl Kernel {
     }
 
     pub(super) fn sys_readlinkat(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         dirfd: i64,
         pathptr: u64,
         buf: u64,
@@ -74,11 +76,11 @@ impl Kernel {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
-        let abs = self.resolve_path(dirfd, &rel);
+        let abs = self.resolve_path(cx, dirfd, &rel);
         // /proc/self/fd/<n> (and /proc/<pid>/fd/<n> for this task) must resolve
         // against the *live* fd table, not procfs's static snapshot — programs
         // canonicalize a path by opening it and reading this link (realpath).
-        let target = if let Some(t) = self.proc_fd_link(&abs) {
+        let target = if let Some(t) = self.proc_fd_link(cx, &abs) {
             t
         } else {
             match self.mounts.readlink(&abs) {
@@ -96,7 +98,7 @@ impl Kernel {
 
     /// `symlinkat(target, newdirfd, linkpath)` — the target is stored verbatim.
     pub(super) fn sys_symlinkat(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         targetptr: u64,
         newdirfd: i64,
         linkptr: u64,
@@ -106,7 +108,7 @@ impl Kernel {
         else {
             return err(Errno::EFAULT);
         };
-        let abs = self.resolve_path(newdirfd, &link);
+        let abs = self.resolve_path(cx, newdirfd, &link);
         match self.mounts.symlink(&target, &abs) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
@@ -115,7 +117,7 @@ impl Kernel {
 
     /// `mkdirat(dirfd, path, mode)`.
     pub(super) fn sys_mkdirat(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         dirfd: i64,
         pathptr: u64,
         mode: u64,
@@ -124,7 +126,7 @@ impl Kernel {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
-        let abs = self.resolve_path(dirfd, &rel);
+        let abs = self.resolve_path(cx, dirfd, &rel);
         match self.mounts.mkdir(&abs, (mode & 0o777) as u32) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
@@ -134,7 +136,7 @@ impl Kernel {
     /// `unlinkat(dirfd, path, flags)` — `rmdir` when `AT_REMOVEDIR` is set,
     /// otherwise `unlink`.
     pub(super) fn sys_unlinkat(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         dirfd: i64,
         pathptr: u64,
         flags: u64,
@@ -143,7 +145,7 @@ impl Kernel {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
-        let abs = self.resolve_path(dirfd, &rel);
+        let abs = self.resolve_path(cx, dirfd, &rel);
         let r = if flags & AT_REMOVEDIR != 0 {
             self.mounts.rmdir(&abs)
         } else {
@@ -158,7 +160,7 @@ impl Kernel {
     /// `renameat(olddirfd, old, newdirfd, new)` / `renameat2(..., flags)` — the
     /// flags argument is accepted but not honored.
     pub(super) fn sys_renameat(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         olddirfd: i64,
         oldptr: u64,
         newdirfd: i64,
@@ -168,8 +170,8 @@ impl Kernel {
         let (Some(old), Some(new)) = (read_path(mem, oldptr), read_path(mem, newptr)) else {
             return err(Errno::EFAULT);
         };
-        let from = self.resolve_path(olddirfd, &old);
-        let to = self.resolve_path(newdirfd, &new);
+        let from = self.resolve_path(cx, olddirfd, &old);
+        let to = self.resolve_path(cx, newdirfd, &new);
         match self.mounts.rename(&from, &to) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
@@ -178,11 +180,11 @@ impl Kernel {
 
     /// `faccessat(dirfd, path, ...)` / `access(path, ...)` — existence check
     /// only; there is no permission model yet.
-    pub(super) fn sys_faccessat(&mut self, dirfd: i64, pathptr: u64, mem: &GuestMemory) -> i64 {
+    pub(super) fn sys_faccessat(&mut self, cx: &mut ServiceCtx, dirfd: i64, pathptr: u64, mem: &GuestMemory) -> i64 {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
-        let abs = self.resolve_path(dirfd, &rel);
+        let abs = self.resolve_path(cx, dirfd, &rel);
         let abs = self.follow_symlinks(&abs).unwrap_or(abs);
         if self.mounts.stat(&abs).is_some() {
             0
@@ -219,62 +221,63 @@ mod tests {
 
     const PAGE: u64 = 4096;
 
-    fn setup() -> (Kernel, GuestMemory) {
+    fn setup() -> (Kernel, GuestMemory, ServiceCtx) {
         let mut mounts = MountTable::new();
         mounts.mount("/", Box::new(TmpFs::new()));
-        let mut kernel = Kernel::new(Arch::Aarch64, mounts);
-        kernel.cur.pid = 1;
+        let kernel = Kernel::new(Arch::Aarch64, mounts);
+        let mut cx = ServiceCtx::default();
+        cx.cur.pid = 1;
         let mut mem = GuestMemory::new(0x1_0000, 16 * PAGE);
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
-        (kernel, mem)
+        (kernel, mem, cx)
     }
 
     #[test]
     fn mkdirat_then_faccessat_and_stat() {
-        let (mut k, mut mem) = setup();
+        let (mut k, mut mem, mut cx) = setup();
         let path = 0x1_0000;
         mem.write_init(path, b"/d\0").unwrap();
-        assert_eq!(k.sys_mkdirat(AT_FDCWD, path, 0o755, &mem), 0);
-        assert_eq!(k.sys_faccessat(AT_FDCWD, path, &mem), 0);
+        assert_eq!(k.sys_mkdirat(&mut cx, AT_FDCWD, path, 0o755, &mem), 0);
+        assert_eq!(k.sys_faccessat(&mut cx, AT_FDCWD, path, &mem), 0);
         assert_eq!(k.mounts.stat("/d").unwrap().kind, NodeKind::Dir);
     }
 
     #[test]
     fn symlinkat_then_readlinkat() {
-        let (mut k, mut mem) = setup();
+        let (mut k, mut mem, mut cx) = setup();
         let target = 0x1_0000;
         let link = 0x1_0100;
         let buf = 0x1_1000;
         mem.write_init(target, b"/target\0").unwrap();
         mem.write_init(link, b"/l\0").unwrap();
-        assert_eq!(k.sys_symlinkat(target, AT_FDCWD, link, &mem), 0);
-        assert_eq!(k.sys_readlinkat(AT_FDCWD, link, buf, 64, &mut mem), 7);
+        assert_eq!(k.sys_symlinkat(&mut cx, target, AT_FDCWD, link, &mem), 0);
+        assert_eq!(k.sys_readlinkat(&mut cx, AT_FDCWD, link, buf, 64, &mut mem), 7);
         assert_eq!(mem.read_vec(buf, 7).unwrap(), b"/target");
     }
 
     #[test]
     fn statfs_writes_bsize() {
-        let (mut k, mut mem) = setup();
+        let (mut k, mut mem, mut cx) = setup();
         let path = 0x1_0000;
         let buf = 0x1_1000;
         mem.write_init(path, b"/\0").unwrap();
-        assert_eq!(k.sys_statfs(path, buf, &mut mem), 0);
+        assert_eq!(k.sys_statfs(&mut cx, path, buf, &mut mem), 0);
         assert_eq!(mem.read_u64(buf + 8).unwrap(), 4096); // f_bsize
     }
 
     #[test]
     fn unlinkat_removes_file() {
-        let (mut k, mut mem) = setup();
+        let (mut k, mut mem, mut cx) = setup();
         k.mounts.create("/f", 0o644).unwrap();
         let path = 0x1_0000;
         mem.write_init(path, b"/f\0").unwrap();
-        assert_eq!(k.sys_unlinkat(AT_FDCWD, path, 0, &mem), 0);
+        assert_eq!(k.sys_unlinkat(&mut cx, AT_FDCWD, path, 0, &mem), 0);
         assert!(k.mounts.stat("/f").is_none());
     }
 
     #[test]
     fn umask_returns_previous() {
-        let (mut k, _mem) = setup();
+        let (mut k, _mem, _cx) = setup();
         assert_eq!(k.sys_umask(0o077), 0o022);
         assert_eq!(k.sys_umask(0o022), 0o077);
     }

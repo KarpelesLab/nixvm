@@ -7,7 +7,7 @@
 //! arena cursor via [`Kernel::alloc_mmap`]; they never alter fork/COW semantics
 //! and never service file-backed mappings.
 
-use super::{Kernel, err};
+use super::{Kernel, ServiceCtx, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 use crate::vcpu::mem::{MemError, PAGE_SIZE, Prot};
@@ -62,8 +62,9 @@ impl Kernel {
     /// address. When that is not possible and `MREMAP_MAYMOVE` is set, a fresh
     /// region is taken from the `mmap` arena, the old bytes are copied over, and
     /// the old range is unmapped (best-effort relocate).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_mremap(
-        &mut self,
+        &mut self, cx: &mut ServiceCtx,
         old_addr: u64,
         old_size: u64,
         new_size: u64,
@@ -95,7 +96,7 @@ impl Kernel {
             let tail = old_addr + new_size;
             let freed = old_size - new_size;
             let _ = mem.unmap(tail, freed);
-            self.arena().free_range(tail, freed);
+            self.arena(cx).free_range(tail, freed);
             return old_addr as i64;
         }
 
@@ -112,7 +113,7 @@ impl Kernel {
         if flags & MREMAP_MAYMOVE == 0 {
             return err(Errno::ENOMEM);
         }
-        let Some(base) = self.alloc_mmap(new_size) else {
+        let Some(base) = self.alloc_mmap(cx, new_size) else {
             return err(Errno::ENOMEM);
         };
         if mem.map(base, new_size, Prot::rw()).is_err() {
@@ -127,7 +128,7 @@ impl Kernel {
         // leaks its source and the arena runs out (Bun resizes buffers by the
         // thousand, which exhausted it and turned every later allocation into a
         // NULL the guest promptly dereferenced).
-        self.arena().free_range(old_addr, old_size);
+        self.arena(cx).free_range(old_addr, old_size);
         base as i64
     }
 
@@ -227,27 +228,28 @@ mod tests {
         fn reset(&mut self, _e: u64, _s: u64) {}
     }
 
-    fn setup() -> (Kernel, GuestMemory) {
+    fn setup() -> (Kernel, GuestMemory, ServiceCtx) {
         let mut mounts = MountTable::new();
         mounts.mount("/", Box::new(TmpFs::new()));
         let mut kernel = Kernel::new(Arch::Aarch64, mounts);
-        kernel.cur.pid = 1;
+        let mut cx = ServiceCtx::default();
+        cx.cur.pid = 1;
         // These tests drive the handlers directly (no boot/run), so mm 0 needs
         // its mmap arena set up here.
-        kernel.cur.mm = 0;
+        cx.cur.mm = 0;
         kernel.set_mmap_area(0x1_0000 + 16 * PAGE, 0x1_0000);
         kernel.mmap_areas.push(crate::kernel::Arena::new(0x1_0000 + 16 * PAGE, 0x1_0000));
         let mem = GuestMemory::new(0x1_0000, 16 * PAGE);
-        (kernel, mem)
+        (kernel, mem, cx)
     }
 
     #[test]
     fn mremap_grow_in_place_keeps_address_and_new_pages_work() {
-        let (mut k, mut mem) = setup();
+        let (mut k, mut mem, mut cx) = setup();
         // A 2-page mapping with 2 free pages after it.
         mem.map(0x1_0000, 2 * PAGE, Prot::rw()).unwrap();
 
-        let ret = k.sys_mremap(0x1_0000, 2 * PAGE, 4 * PAGE, 0, 0, &mut mem);
+        let ret = k.sys_mremap(&mut cx, 0x1_0000, 2 * PAGE, 4 * PAGE, 0, 0, &mut mem);
         assert_eq!(ret, 0x1_0000, "grow-in-place returns the same address");
 
         // The freshly grown page is usable.
@@ -258,10 +260,10 @@ mod tests {
 
     #[test]
     fn mremap_shrink_unmaps_tail() {
-        let (mut k, mut mem) = setup();
+        let (mut k, mut mem, mut cx) = setup();
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
 
-        let ret = k.sys_mremap(0x1_0000, 4 * PAGE, 2 * PAGE, 0, 0, &mut mem);
+        let ret = k.sys_mremap(&mut cx, 0x1_0000, 4 * PAGE, 2 * PAGE, 0, 0, &mut mem);
         assert_eq!(ret, 0x1_0000, "shrink returns the old address");
 
         // The tail is gone: an access there now faults.
@@ -274,7 +276,7 @@ mod tests {
 
     #[test]
     fn mremap_maymove_relocates_when_blocked() {
-        let (mut k, mut mem) = setup();
+        let (mut k, mut mem, mut cx) = setup();
         k.set_mmap_area(0x1_0000 + 16 * PAGE, 0x1_0000);
         // 1-page mapping immediately followed by an occupied page, so an
         // in-place grow is impossible.
@@ -282,7 +284,7 @@ mod tests {
         mem.map(0x1_1000, PAGE, Prot::rw()).unwrap();
         mem.write_u64(0x1_0000, 0x1122_3344).unwrap();
 
-        let ret = k.sys_mremap(0x1_0000, PAGE, 2 * PAGE, MREMAP_MAYMOVE, 0, &mut mem);
+        let ret = k.sys_mremap(&mut cx, 0x1_0000, PAGE, 2 * PAGE, MREMAP_MAYMOVE, 0, &mut mem);
         assert_ne!(ret, 0x1_0000, "MAYMOVE relocated the mapping");
         assert!(ret >= 0);
         // Old bytes were copied to the new region.
@@ -293,7 +295,7 @@ mod tests {
 
     #[test]
     fn madvise_dontneed_zeros_pages() {
-        let (mut k, mut mem) = setup();
+        let (mut k, mut mem, _cx) = setup();
         mem.map(0x1_0000, PAGE, Prot::rw()).unwrap();
         mem.write_u64(0x1_0010, 0xdead_beef).unwrap();
 
@@ -303,7 +305,7 @@ mod tests {
 
     #[test]
     fn mincore_reports_resident() {
-        let (mut k, mut mem) = setup();
+        let (mut k, mut mem, _cx) = setup();
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
         let vec = 0x1_0000;
         assert_eq!(k.sys_mincore(0x1_1000, 2 * PAGE, vec, &mut mem), 0);
@@ -312,7 +314,7 @@ mod tests {
 
     #[test]
     fn mlock_family_are_noops() {
-        let (mut k, mut mem) = setup();
+        let (mut k, mut mem, mut cx) = setup();
         let mut v = DummyVcpu;
         for s in [
             Sysno::Mlock,
@@ -322,7 +324,7 @@ mod tests {
             Sysno::Munlockall,
             Sysno::Msync,
         ] {
-            assert_eq!(k.dispatch(s, 0, &[0; 6], &mut v, &mut mem), 0, "{s:?}");
+            assert_eq!(k.dispatch(&mut cx, s, 0, &[0; 6], &mut v, &mut mem), 0, "{s:?}");
         }
     }
 }
