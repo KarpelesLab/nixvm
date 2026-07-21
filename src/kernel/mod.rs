@@ -41,7 +41,7 @@ mod time;
 
 pub use fd::{Fd, FdTable};
 use net::Net;
-use poll::{EpollInst, EventFdInst, TimerFdInst};
+use poll::{EventFdInst, PollFds};
 
 /// `dirfd` value meaning "resolve relative to the current working directory".
 const AT_FDCWD: i64 = -100;
@@ -598,6 +598,18 @@ pub struct Kernel {
     /// `net`.** Handlers that need pipes plus others acquire in order
     /// sh → (vfs) → net → pipes.
     pipes: Mutex<Vec<Pipe>>,
+    /// The poll/event subsystem (`eventfds`/`timerfds`/`epolls`), peeled out of
+    /// the coarse [`Shared`] lock onto its own sibling lock (step B5) so the
+    /// event-fd / epoll syscalls hold only this lock and other tasks' unrelated
+    /// syscalls run concurrently on `shared` instead of stalling on the big
+    /// lock. **`pollfds` is now the innermost/LAST lock: the order is strict and
+    /// inviolable — memory → sh → vfs → net → pipes → pollfds. A `pollfds` guard
+    /// is NEVER held while acquiring `shared`, `vfs`, `net`, or `pipes`.**
+    /// Handlers that need pollfds plus others acquire in order
+    /// sh → (vfs) → net → pipes → pollfds. The three tables are grouped behind
+    /// one lock because the poll/select/epoll readiness scan touches them as a
+    /// unit (see [`PollFds`]).
+    pollfds: Mutex<PollFds>,
 }
 
 /// All kernel state mutated while a syscall is serviced, behind [`Kernel`]'s
@@ -605,12 +617,6 @@ pub struct Kernel {
 /// so a field here is reached as `sh.<field>` instead of `self.<field>`.
 #[allow(clippy::struct_excessive_bools)] // independent one-shot flags, not a state enum
 pub(super) struct Shared {
-    /// `eventfd2` counters, indexed by [`Fd::Eventfd`].
-    eventfds: Vec<EventFdInst>,
-    /// `timerfd_create` timers, indexed by [`Fd::Timerfd`].
-    timerfds: Vec<TimerFdInst>,
-    /// `epoll_create1` instances, indexed by [`Fd::Epoll`].
-    epolls: Vec<EpollInst>,
     stdin: Box<dyn Read + Send>,
     stdout: Box<dyn Write + Send>,
     stderr: Box<dyn Write + Send>,
@@ -835,10 +841,8 @@ impl Kernel {
             vfs: Mutex::new(mounts),
             net: Mutex::new(Net::default()),
             pipes: Mutex::new(Vec::new()),
+            pollfds: Mutex::new(PollFds::default()),
             shared: Mutex::new(Shared {
-                eventfds: Vec::new(),
-                timerfds: Vec::new(),
-                epolls: Vec::new(),
                 stdin: Box::new(std::io::stdin()),
                 stdout: Box::new(std::io::stdout()),
                 stderr: Box::new(std::io::stderr()),
@@ -1705,24 +1709,27 @@ impl Kernel {
         ret
     }
 
-    /// Route a syscall to the lock discipline it needs (steps B2/B3/B4). No lock
-    /// is pre-held here — each category acquires exactly the lock(s) it touches,
-    /// always in the strict order `shared` (sh) → `vfs` → `net` → `pipes`
-    /// (`pipes` is last):
+    /// Route a syscall to the lock discipline it needs (steps B2/B3/B4/B5). No
+    /// lock is pre-held here — each category acquires exactly the lock(s) it
+    /// touches, always in the strict order `shared` (sh) → `vfs` → `net` →
+    /// `pipes` → `pollfds` (`pollfds` is last):
     /// - **net-only** (the pure socket syscalls): take only `net` via
     ///   [`Self::dispatch_net`] — no sh, no vfs.
     /// - **pipes-only** (`pipe2`): take only `pipes` — no sh, no vfs, no net.
+    /// - **pollfds-only** (`eventfd`/`timerfd_*`/`epoll_create`/`epoll_ctl`/
+    ///   `inotify_init1`/`signalfd4`): take only `pollfds` via
+    ///   [`Self::dispatch_pollfds`] — no sh, vfs, net, or pipes.
     /// - **fd-polymorphic** (`read`/`write`/`readv`/`writev`): peek the fd type
-    ///   from `cx` (no lock), then take *one* of sh/vfs/net/pipes (a file op →
-    ///   vfs, a socket → net, a pipe → pipes, every other target → sh) — never
-    ///   more than one.
+    ///   from `cx` (no lock), then take *one* of sh/vfs/net/pipes/pollfds (a file
+    ///   op → vfs, a socket → net, a pipe → pipes, an eventfd/timerfd → pollfds,
+    ///   every other target → sh) — never more than one.
     /// - **both** (`mmap`/`memfd_create`): take sh then vfs and hold both (they
     ///   mutate `shared` state *and* the mount table atomically). `sendfile`
     ///   takes sh → vfs, and net (socket dst) or pipes (pipe dst) too, last.
     /// - **vfs-only** (the FS hot path): take only `vfs` via [`Self::dispatch_vfs`].
     /// - **everything else**: take only `sh` via [`Self::dispatch_shared`] (the
-    ///   B1 table; poll/select/epoll additionally take `net` then `pipes` —
-    ///   after sh — for the socket/pipe-readiness scan).
+    ///   B1 table; poll/select/epoll_wait additionally take `net` then `pipes`
+    ///   then `pollfds` — after sh — for the readiness scan).
     #[allow(clippy::too_many_lines)]
     fn dispatch_impl(
         &self, cx: &mut ServiceCtx,
@@ -1826,6 +1833,22 @@ impl Kernel {
                 let mut pipes = self.pipes.lock().unwrap();
                 self.sys_pipe2(&mut pipes, cx, args[0], mem)
             }
+            // pollfds-only: the pure eventfd/timerfd/epoll-setup syscalls, holding
+            // ONLY `pollfds` (the innermost/last lock) via `dispatch_pollfds` —
+            // no sh, no vfs, no net, no pipes may be taken below it.
+            Sysno::Eventfd
+            | Sysno::Eventfd2
+            | Sysno::TimerfdCreate
+            | Sysno::TimerfdSettime
+            | Sysno::TimerfdGettime
+            | Sysno::EpollCreate
+            | Sysno::EpollCreate1
+            | Sysno::EpollCtl
+            | Sysno::InotifyInit1
+            | Sysno::Signalfd4 => {
+                let mut pf = self.pollfds.lock().unwrap();
+                self.dispatch_pollfds(&mut pf, cx, sys, args, mem)
+            }
             // everything else: a single `sh` lock, running the B1 syscall table.
             _ => {
                 let mut sh = self.shared.lock().unwrap();
@@ -1878,6 +1901,38 @@ impl Kernel {
             Sysno::Recvmmsg => self.sys_recvmmsg(net, cx, args[0], args[1], args[2], args[3], mem),
             // Unreachable: `dispatch_impl` only routes the syscalls above here.
             _ => unreachable!("dispatch_net: {sys:?} is not a net-only syscall"),
+        }
+    }
+
+    /// The pollfds-only syscalls (the pure eventfd/timerfd/epoll-setup path):
+    /// called with `pollfds` — and *only* `pollfds` — held. `pollfds` is the
+    /// innermost/last lock, so **no `self.shared.lock()`, `self.vfs.lock()`,
+    /// `self.net.lock()`, or `self.pipes.lock()` may appear anywhere below
+    /// this** (that would take an outer lock after pollfds and invert the
+    /// order). Every arm here touches just the event/timer/epoll tables (plus
+    /// per-task `cx`).
+    fn dispatch_pollfds(
+        &self, pf: &mut PollFds, cx: &mut ServiceCtx,
+        sys: Sysno,
+        args: &[u64; 6],
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        match sys {
+            Sysno::Eventfd => self.sys_eventfd2(pf, cx, args[0], 0),
+            Sysno::Eventfd2 => self.sys_eventfd2(pf, cx, args[0], args[1]),
+            Sysno::TimerfdCreate => self.sys_timerfd_create(pf, cx, args[0], args[1]),
+            Sysno::TimerfdSettime => {
+                self.sys_timerfd_settime(pf, cx, args[0], args[1], args[2], args[3], mem)
+            }
+            Sysno::TimerfdGettime => self.sys_timerfd_gettime(pf, cx, args[0], args[1], mem),
+            Sysno::EpollCreate | Sysno::EpollCreate1 => self.sys_epoll_create1(pf, cx, args[0]),
+            Sysno::EpollCtl => self.sys_epoll_ctl(pf, cx, args[0], args[1], args[2], args[3], mem),
+            // inotify/signalfd get an eventfd-backed descriptor that never
+            // becomes readable (no events/signals delivered — a safe
+            // degradation for optional watching).
+            Sysno::InotifyInit1 | Sysno::Signalfd4 => self.sys_inotify_init1(pf, cx),
+            // Unreachable: `dispatch_impl` only routes the syscalls above here.
+            _ => unreachable!("dispatch_pollfds: {sys:?} is not a pollfds-only syscall"),
         }
     }
 
@@ -2017,10 +2072,6 @@ impl Kernel {
             Sysno::Execveat => {
                 self.sys_execveat(sh, cx, args[0] as i64, args[1], args[2], args[3], args[4], vcpu, mem)
             }
-            // Anonymous / notification fds. inotify/signalfd get an fd that
-            // never becomes readable (no events/signals delivered — a safe
-            // degradation for optional watching).
-            Sysno::InotifyInit1 | Sysno::Signalfd4 => self.sys_inotify_init1(sh, cx),
             // A watch descriptor the guest can pass to inotify_rm_watch (which
             // is a no-op in the always-succeed group below).
             Sysno::InotifyAddWatch => 1,
@@ -2041,26 +2092,22 @@ impl Kernel {
             Sysno::Ioctl => err(Errno::ENOTTY),
             Sysno::Fcntl => self.sys_fcntl(cx, args[0], args[1]),
             Sysno::Futex => self.sys_futex(sh, cx, args, mem),
-            // Event-notification / readiness syscalls.
-            Sysno::Poll => self.sys_poll(sh, cx, args[0], args[1], args[2] as i64, mem),
-            Sysno::Ppoll => self.sys_ppoll(sh, cx, args[0], args[1], args[2], args[3], args[4], mem),
-            Sysno::Select => self.sys_select(sh, cx, args[0], args[1], args[2], args[3], args[4], mem),
+            // Event-notification / readiness scans. `sh` stays held (outermost)
+            // by this dispatcher; each scan additionally acquires
+            // net → pipes → pollfds internally (order sh → net → pipes →
+            // pollfds), so it takes no `sh` param. The pure eventfd/timerfd/
+            // epoll-setup syscalls are pollfds-only and routed via
+            // `dispatch_pollfds` in `dispatch_impl` (they never touch `sh`).
+            Sysno::Poll => self.sys_poll(cx, args[0], args[1], args[2] as i64, mem),
+            Sysno::Ppoll => self.sys_ppoll(cx, args[0], args[1], args[2], args[3], args[4], mem),
+            Sysno::Select => self.sys_select(cx, args[0], args[1], args[2], args[3], args[4], mem),
             Sysno::Pselect6 => {
-                self.sys_pselect6(sh, cx, args[0], args[1], args[2], args[3], args[4], args[5], mem)
+                self.sys_pselect6(cx, args[0], args[1], args[2], args[3], args[4], args[5], mem)
             }
-            Sysno::EpollCreate | Sysno::EpollCreate1 => self.sys_epoll_create1(sh, cx, args[0]),
-            Sysno::EpollCtl => self.sys_epoll_ctl(sh, cx, args[0], args[1], args[2], args[3], mem),
             Sysno::EpollWait | Sysno::EpollPwait => {
-                self.sys_epoll_wait(sh, cx, args[0], args[1], args[2], args[3] as i64, mem)
+                self.sys_epoll_wait(cx, args[0], args[1], args[2], args[3] as i64, mem)
             }
-            Sysno::EpollPwait2 => self.sys_epoll_pwait2(sh, cx, args[0], args[1], args[2], args[3], mem),
-            Sysno::Eventfd => self.sys_eventfd2(sh, cx, args[0], 0),
-            Sysno::Eventfd2 => self.sys_eventfd2(sh, cx, args[0], args[1]),
-            Sysno::TimerfdCreate => self.sys_timerfd_create(sh, cx, args[0], args[1]),
-            Sysno::TimerfdSettime => {
-                self.sys_timerfd_settime(sh, cx, args[0], args[1], args[2], args[3], mem)
-            }
-            Sysno::TimerfdGettime => self.sys_timerfd_gettime(sh, cx, args[0], args[1], mem),
+            Sysno::EpollPwait2 => self.sys_epoll_pwait2(cx, args[0], args[1], args[2], args[3], mem),
             Sysno::Dup => self.sys_dup(cx, args[0]),
             Sysno::Dup2 | Sysno::Dup3 => self.sys_dup2(cx, args[0], args[1]),
             Sysno::Clone => self.sys_clone(sh, cx, args, vcpu, mem),
@@ -2746,9 +2793,9 @@ impl Kernel {
     /// (never becomes readable). Programs get a valid fd and simply never see
     /// events/signals, which is a safe degradation for optional watching.
     #[allow(clippy::unused_self)]
-    fn sys_inotify_init1(&self, sh: &mut Shared, cx: &mut ServiceCtx) -> i64 {
-        let idx = sh.eventfds.len();
-        sh.eventfds.push(EventFdInst::default());
+    fn sys_inotify_init1(&self, pf: &mut PollFds, cx: &mut ServiceCtx) -> i64 {
+        let idx = pf.eventfds.len();
+        pf.eventfds.push(EventFdInst::default());
         i64::from(cx.cur.fds.alloc(Fd::Eventfd(idx)))
     }
 
@@ -3017,11 +3064,29 @@ impl Kernel {
                 let mut pipes = self.pipes.lock().unwrap();
                 self.write_pipe_fd(&mut pipes, cx, fd, buf, count, mem)
             }
+            Some(Fd::Eventfd(..)) => {
+                let mut pf = self.pollfds.lock().unwrap();
+                self.write_pollfd_fd(&mut pf, cx, fd, buf, count, mem)
+            }
             _ => {
                 let mut sh = self.shared.lock().unwrap();
                 self.write_shared_fd(&mut sh, cx, fd, buf, count, mem)
             }
         }
+    }
+
+    /// The `Fd::Eventfd` arm of [`Self::sys_write`]/[`Self::sys_writev`]: add to
+    /// the eventfd counter. `pollfds`-only (the innermost lock). A full counter
+    /// on a blocking eventfd sets the block flag and returns 0 (the caller drops
+    /// the lock and re-traps) — it never blocks in place holding the lock.
+    fn write_pollfd_fd(&self, pf: &mut PollFds, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &GuestMemory) -> i64 {
+        let Some(Fd::Eventfd(i)) = cx.cur.fds.get(fd as i32).cloned() else {
+            return err(Errno::EBADF);
+        };
+        let Ok(data) = mem.read_vec(buf, count as usize) else {
+            return err(Errno::EFAULT);
+        };
+        self.write_eventfd(pf, cx, i, &data)
     }
 
     /// The `Fd::Socket` arm of [`Self::sys_write`]/[`Self::sys_writev`]: send
@@ -3069,10 +3134,12 @@ impl Kernel {
         }
     }
 
-    /// The non-`File`, non-`Socket`, non-`PipeWrite` arms of [`Self::sys_write`]
-    /// (stdout/stderr/eventfd), all backed by `shared`. Sockets go through
-    /// [`Self::write_socket_fd`] under `net`; pipes through
-    /// [`Self::write_pipe_fd`] under `pipes`.
+    /// The non-`File`, non-`Socket`, non-`PipeWrite`, non-`Eventfd` arms of
+    /// [`Self::sys_write`] (stdout/stderr), backed by `shared`. Sockets go
+    /// through [`Self::write_socket_fd`] under `net`; pipes through
+    /// [`Self::write_pipe_fd`] under `pipes`; eventfds through
+    /// [`Self::write_pollfd_fd`] under `pollfds`.
+    #[allow(clippy::unused_self)]
     fn write_shared_fd(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &GuestMemory) -> i64 {
         let Ok(data) = mem.read_vec(buf, count as usize) else {
             return err(Errno::EFAULT);
@@ -3087,7 +3154,6 @@ impl Kernel {
                 Ok(()) => count as i64,
                 Err(_) => err(Errno::EIO),
             },
-            Some(Fd::Eventfd(i)) => self.write_eventfd(sh, cx, i, &data),
             _ => err(Errno::EBADF),
         }
     }
@@ -3109,10 +3175,27 @@ impl Kernel {
                 let mut pipes = self.pipes.lock().unwrap();
                 self.read_pipe_fd(&mut pipes, cx, fd, buf, count, mem)
             }
+            Some(Fd::Eventfd(..) | Fd::Timerfd(..)) => {
+                let mut pf = self.pollfds.lock().unwrap();
+                self.read_pollfd_fd(&mut pf, cx, fd, buf, count, mem)
+            }
             _ => {
                 let mut sh = self.shared.lock().unwrap();
                 self.read_shared_fd(&mut sh, cx, fd, buf, count, mem)
             }
+        }
+    }
+
+    /// The `Fd::Eventfd`/`Fd::Timerfd` arm of [`Self::sys_read`]/
+    /// [`Self::sys_readv`]: drain the eventfd counter or the timerfd expiration
+    /// count. `pollfds`-only (the innermost lock). An empty counter on a
+    /// blocking fd sets the block flag and returns 0 (the caller drops the lock
+    /// and re-traps) — it never blocks in place holding the lock.
+    fn read_pollfd_fd(&self, pf: &mut PollFds, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+        match cx.cur.fds.get(fd as i32).cloned() {
+            Some(Fd::Eventfd(i)) => self.read_eventfd(pf, cx, i, buf, count, mem),
+            Some(Fd::Timerfd(i)) => self.read_timerfd(pf, cx, i, buf, count, mem),
+            _ => err(Errno::EBADF),
         }
     }
 
@@ -3158,10 +3241,11 @@ impl Kernel {
         }
     }
 
-    /// The non-`File`, non-`Socket`, non-`PipeRead` arms of [`Self::sys_read`]
-    /// (stdin/eventfd/timerfd), all backed by `shared`. Sockets go through
-    /// [`Self::read_socket_fd`] under `net`; pipes through
-    /// [`Self::read_pipe_fd`] under `pipes`.
+    /// The non-`File`, non-`Socket`, non-`PipeRead`, non-`Eventfd`/`Timerfd`
+    /// arms of [`Self::sys_read`] (stdin), backed by `shared`. Sockets go
+    /// through [`Self::read_socket_fd`] under `net`; pipes through
+    /// [`Self::read_pipe_fd`] under `pipes`; eventfds/timerfds through
+    /// [`Self::read_pollfd_fd`] under `pollfds`.
     fn read_shared_fd(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
         match cx.cur.fds.get(fd as i32).cloned() {
             Some(Fd::Stdin) if self.interactive => {
@@ -3193,8 +3277,6 @@ impl Kernel {
                     Err(_) => err(Errno::EIO),
                 }
             }
-            Some(Fd::Eventfd(i)) => self.read_eventfd(sh, cx, i, buf, count, mem),
-            Some(Fd::Timerfd(i)) => self.read_timerfd(sh, cx, i, buf, count, mem),
             _ => err(Errno::EBADF),
         }
     }
@@ -3502,6 +3584,7 @@ impl Kernel {
     /// `readv(fd, iov, iovcnt)` — scatter a read across `struct iovec` entries.
     /// A short read (or a blocking fd) stops after the first partially-filled
     /// iovec, like the real syscall.
+    #[allow(clippy::too_many_lines)] // one repetitive scatter block per fd-lock kind
     fn sys_readv(&self, cx: &mut ServiceCtx, fd: u64, iov: u64, iovcnt: u64, mem: &mut GuestMemory) -> i64 {
         // fd-polymorphic, and atomic across iovecs: peek the fd type once (no
         // lock), then hold a single lock for the whole scatter — a file readv
@@ -3573,6 +3656,28 @@ impl Kernel {
             }
             return total;
         }
+        if let Some(Fd::Eventfd(..) | Fd::Timerfd(..)) = cx.cur.fds.get(fd as i32) {
+            let mut pf = self.pollfds.lock().unwrap();
+            let mut total = 0i64;
+            for i in 0..iovcnt {
+                let ent = iov + i * 16;
+                let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
+                    return if total > 0 { total } else { err(Errno::EFAULT) };
+                };
+                if len == 0 {
+                    continue;
+                }
+                let r = self.read_pollfd_fd(&mut pf, cx, fd, base, len, mem);
+                if r < 0 {
+                    return if total > 0 { total } else { r };
+                }
+                total += r;
+                if (r as u64) < len {
+                    break; // short read (or empty counter): stop scattering
+                }
+            }
+            return total;
+        }
         let mut sh = self.shared.lock().unwrap();
         let mut total = 0i64;
         for i in 0..iovcnt {
@@ -3597,6 +3702,7 @@ impl Kernel {
 
     /// `writev(fd, iov, iovcnt)` — gather `struct iovec { base; len }` entries.
     /// fd-polymorphic and atomic across iovecs, exactly like [`Self::sys_readv`].
+    #[allow(clippy::too_many_lines)] // one repetitive gather block per fd-lock kind
     fn sys_writev(&self, cx: &mut ServiceCtx, fd: u64, iov: u64, iovcnt: u64, mem: &GuestMemory) -> i64 {
         if let Some(Fd::File { .. }) = cx.cur.fds.get(fd as i32) {
             let mut vfs = self.vfs.lock().unwrap();
@@ -3654,6 +3760,28 @@ impl Kernel {
                     continue;
                 }
                 let r = self.write_pipe_fd(&mut pipes, cx, fd, base, len, mem);
+                if r < 0 {
+                    return if total > 0 { total } else { r };
+                }
+                total += r;
+                if (r as u64) < len {
+                    break;
+                }
+            }
+            return total;
+        }
+        if let Some(Fd::Eventfd(..)) = cx.cur.fds.get(fd as i32) {
+            let mut pf = self.pollfds.lock().unwrap();
+            let mut total = 0i64;
+            for i in 0..iovcnt {
+                let ent = iov + i * 16;
+                let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
+                    return if total > 0 { total } else { err(Errno::EFAULT) };
+                };
+                if len == 0 {
+                    continue;
+                }
+                let r = self.write_pollfd_fd(&mut pf, cx, fd, base, len, mem);
                 if r < 0 {
                     return if total > 0 { total } else { r };
                 }

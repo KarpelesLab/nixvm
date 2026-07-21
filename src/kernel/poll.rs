@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 
 use super::net::Net;
-use super::{Fd, Kernel, Pipe, ServiceCtx, Shared, err};
+use super::{Fd, Kernel, Pipe, ServiceCtx, err};
 use crate::abi::Arch;
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
@@ -31,6 +31,23 @@ const POLLOUT: u32 = 0x0004;
 const POLLERR: u32 = 0x0008;
 const POLLHUP: u32 = 0x0010;
 const POLLNVAL: u32 = 0x0020;
+
+/// The poll/event subsystem (step B5), peeled out of the coarse
+/// [`Shared`](super::Shared) lock onto its own sibling lock
+/// [`Kernel::pollfds`](super::Kernel). The three
+/// tables are grouped behind ONE lock because the poll/select/epoll readiness
+/// scan and `epoll_wait` touch all of them as a unit — three separate locks
+/// would only add intra-scan ordering for no benefit. `pollfds` is the
+/// innermost/LAST lock in the order memory → sh → vfs → net → pipes → pollfds.
+#[derive(Debug, Default)]
+pub(super) struct PollFds {
+    /// `eventfd2` counters, indexed by [`Fd::Eventfd`].
+    pub(super) eventfds: Vec<EventFdInst>,
+    /// `timerfd_create` timers, indexed by [`Fd::Timerfd`].
+    pub(super) timerfds: Vec<TimerFdInst>,
+    /// `epoll_create1` instances, indexed by [`Fd::Epoll`].
+    pub(super) epolls: Vec<EpollInst>,
+}
 
 /// One `eventfd2` counter.
 #[derive(Debug, Default)]
@@ -151,11 +168,13 @@ impl Kernel {
     /// The readiness mask (`POLLIN`/`POLLOUT`/`POLLERR`/`POLLHUP`/`POLLNVAL`)
     /// of guest fd `fd_num` right now. `POLLNVAL` if the fd is not open.
     ///
-    /// Takes `sh`, `net`, and `pipes`: socket readiness lives in `net`, pipe
-    /// readiness in `pipes`, everything else (eventfds/timerfds) in `sh`.
-    /// Callers acquire `net` then `pipes` once around the whole scan — always
-    /// *after* `sh` (strict order sh → net → pipes) — and pass all three in.
-    fn fd_ready(&self, sh: &mut Shared, net: &mut Net, pipes: &[Pipe], cx: &mut ServiceCtx, fd_num: i32) -> u32 {
+    /// Takes `net`, `pipes`, and `pf`: socket readiness lives in `net`, pipe
+    /// readiness in `pipes`, eventfd/timerfd readiness in `pf` (the peeled
+    /// pollfds subsystem). Callers acquire `net` then `pipes` then `pollfds`
+    /// once around the whole scan — always *after* `sh` (strict order
+    /// sh → net → pipes → pollfds) — and pass all three in. `pf` is the
+    /// innermost lock, so nothing is acquired below it here.
+    fn fd_ready(&self, net: &mut Net, pipes: &[Pipe], pf: &mut PollFds, cx: &mut ServiceCtx, fd_num: i32) -> u32 {
         let Some(fd) = cx.cur.fds.get(fd_num).cloned() else {
             return POLLNVAL;
         };
@@ -188,14 +207,14 @@ impl Kernel {
             }
             Fd::Eventfd(i) => {
                 let mut m = POLLOUT;
-                if sh.eventfds[i].count > 0 {
+                if pf.eventfds[i].count > 0 {
                     m |= POLLIN;
                 }
                 m
             }
             Fd::Timerfd(i) => {
-                self.update_timerfd(sh, i);
-                if sh.timerfds[i].expirations > 0 {
+                self.update_timerfd(pf, i);
+                if pf.timerfds[i].expirations > 0 {
                     POLLIN
                 } else {
                     0
@@ -247,7 +266,7 @@ impl Kernel {
 
     /// `poll(fds, nfds, timeout_ms)`.
     pub(super) fn sys_poll(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, cx: &mut ServiceCtx,
         fds_ptr: u64,
         nfds: u64,
         timeout_ms: i64,
@@ -266,17 +285,19 @@ impl Kernel {
             entries.push((addr, fd_raw as i32, events));
         }
 
-        // Socket readiness lives in `net`, pipe readiness in `pipes`: take both
-        // once for the whole scan, after `sh` and in order (sh → net → pipes),
-        // and drop them when the loop ends.
+        // Readiness lives in `net` (sockets), `pipes` (pipes), and `pollfds`
+        // (eventfds/timerfds): take all three once for the whole scan, after
+        // `sh` (held by `dispatch_shared`) and in strict order
+        // (sh → net → pipes → pollfds), and drop them when the loop ends.
         let mut net = self.net.lock().unwrap();
         let pipes = self.pipes.lock().unwrap();
+        let mut pf = self.pollfds.lock().unwrap();
         let mut ready_count = 0i64;
         for (addr, fd, events) in entries {
             let revents = if fd < 0 {
                 0
             } else {
-                self.fd_ready(sh, &mut net, &pipes, cx, fd) & (u32::from(events) | POLLERR | POLLHUP | POLLNVAL)
+                self.fd_ready(&mut net, &pipes, &mut pf, cx, fd) & (u32::from(events) | POLLERR | POLLHUP | POLLNVAL)
             };
             if !write_u16(mem, addr + 6, revents as u16) {
                 return err(Errno::EFAULT);
@@ -298,7 +319,7 @@ impl Kernel {
     /// into).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_ppoll(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, cx: &mut ServiceCtx,
         fds_ptr: u64,
         nfds: u64,
         timeout_ts: u64,
@@ -314,7 +335,7 @@ impl Kernel {
             };
             timespec_to_ms(sec, nsec)
         };
-        self.sys_poll(sh, cx, fds_ptr, nfds, timeout_ms, mem)
+        self.sys_poll(cx, fds_ptr, nfds, timeout_ms, mem)
     }
 
     // ---- select / pselect6 ---------------------------------------------
@@ -324,7 +345,7 @@ impl Kernel {
     /// count set across all three sets. `immediate` is the zero-timeout case.
     #[allow(clippy::too_many_arguments)]
     fn sys_select_core(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, cx: &mut ServiceCtx,
         nfds: u64,
         r: u64,
         w: u64,
@@ -346,16 +367,18 @@ impl Kernel {
         let mut wout = vec![false; nfds as usize];
         let mut eout = vec![false; nfds as usize];
         let mut total = 0i64;
-        // Socket readiness lives in `net`, pipe readiness in `pipes`: take both
-        // once for the whole scan, after `sh` and in order (sh → net → pipes),
-        // and drop them when the loop ends.
+        // Readiness lives in `net` (sockets), `pipes` (pipes), and `pollfds`
+        // (eventfds/timerfds): take all three once for the whole scan, after
+        // `sh` (held by `dispatch_shared`) and in strict order
+        // (sh → net → pipes → pollfds), and drop them when the loop ends.
         let mut net = self.net.lock().unwrap();
         let pipes = self.pipes.lock().unwrap();
+        let mut pf = self.pollfds.lock().unwrap();
         for fd in 0..nfds as usize {
             if !rbits[fd] && !wbits[fd] && !ebits[fd] {
                 continue;
             }
-            let ready = self.fd_ready(sh, &mut net, &pipes, cx, fd as i32);
+            let ready = self.fd_ready(&mut net, &pipes, &mut pf, cx, fd as i32);
             if rbits[fd] && ready & (POLLIN | POLLHUP) != 0 {
                 rout[fd] = true;
                 total += 1;
@@ -387,7 +410,7 @@ impl Kernel {
     /// sigmask argument is accepted but not honored.
     #[allow(clippy::too_many_arguments)] // one parameter per syscall argument
     pub(super) fn sys_pselect6(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, cx: &mut ServiceCtx,
         nfds: u64,
         r: u64,
         w: u64,
@@ -404,14 +427,14 @@ impl Kernel {
             };
             sec == 0 && nsec == 0
         };
-        self.sys_select_core(sh, cx, nfds, r, w, e, immediate, mem)
+        self.sys_select_core(cx, nfds, r, w, e, immediate, mem)
     }
 
     /// The legacy `select(nfds, readfds, writefds, exceptfds, timeout)`
     /// (x86-64 only); `timeout` is a `struct timeval { i64 sec; i64 usec; }`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_select(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, cx: &mut ServiceCtx,
         nfds: u64,
         r: u64,
         w: u64,
@@ -428,7 +451,7 @@ impl Kernel {
             };
             sec == 0 && usec == 0
         };
-        self.sys_select_core(sh, cx, nfds, r, w, e, immediate, mem)
+        self.sys_select_core(cx, nfds, r, w, e, immediate, mem)
     }
 
     // ---- epoll ------------------------------------------------------------
@@ -459,16 +482,16 @@ impl Kernel {
 
     /// `epoll_create`/`epoll_create1(flags)` — a fresh, empty interest set.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_epoll_create1(&self, sh: &mut Shared, cx: &mut ServiceCtx, _flags: u64) -> i64 {
-        let idx = sh.epolls.len();
-        sh.epolls.push(EpollInst::default());
+    pub(super) fn sys_epoll_create1(&self, pf: &mut PollFds, cx: &mut ServiceCtx, _flags: u64) -> i64 {
+        let idx = pf.epolls.len();
+        pf.epolls.push(EpollInst::default());
         i64::from(cx.cur.fds.alloc(Fd::Epoll(idx)))
     }
 
     /// `epoll_ctl(epfd, op, fd, event)`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_epoll_ctl(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, pf: &mut PollFds, cx: &mut ServiceCtx,
         epfd: u64,
         op: u64,
         fd: u64,
@@ -488,31 +511,31 @@ impl Kernel {
         let target = fd as i32;
         match op {
             EPOLL_CTL_ADD => {
-                if sh.epolls[idx].interest.contains_key(&target) {
+                if pf.epolls[idx].interest.contains_key(&target) {
                     return err(Errno::EEXIST);
                 }
                 let Some((events, data)) = self.read_epoll_event(mem, event_ptr) else {
                     return err(Errno::EFAULT);
                 };
-                sh.epolls[idx]
+                pf.epolls[idx]
                     .interest
                     .insert(target, EpollWatch { events, data });
                 0
             }
             EPOLL_CTL_MOD => {
-                if !sh.epolls[idx].interest.contains_key(&target) {
+                if !pf.epolls[idx].interest.contains_key(&target) {
                     return err(Errno::ENOENT);
                 }
                 let Some((events, data)) = self.read_epoll_event(mem, event_ptr) else {
                     return err(Errno::EFAULT);
                 };
-                sh.epolls[idx]
+                pf.epolls[idx]
                     .interest
                     .insert(target, EpollWatch { events, data });
                 0
             }
             EPOLL_CTL_DEL => {
-                if sh.epolls[idx].interest.remove(&target).is_none() {
+                if pf.epolls[idx].interest.remove(&target).is_none() {
                     return err(Errno::ENOENT);
                 }
                 0
@@ -525,7 +548,7 @@ impl Kernel {
     /// The `epoll_pwait` sigmask argument is accepted but not honored.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_epoll_wait(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, cx: &mut ServiceCtx,
         epfd: u64,
         events_ptr: u64,
         maxevents: u64,
@@ -539,24 +562,26 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
 
-        let watches: Vec<(i32, EpollWatch)> = sh.epolls[idx]
+        let (_, stride) = self.epoll_event_layout();
+        let mut n = 0u64;
+        // Readiness lives in `net` (sockets), `pipes` (pipes), and `pollfds`
+        // (the interest set itself plus eventfd/timerfd readiness): take all
+        // three once for the whole scan, after `sh` (held by `dispatch_shared`)
+        // and in strict order (sh → net → pipes → pollfds), and drop them when
+        // the loop ends.
+        let mut net = self.net.lock().unwrap();
+        let pipes = self.pipes.lock().unwrap();
+        let mut pf = self.pollfds.lock().unwrap();
+        let watches: Vec<(i32, EpollWatch)> = pf.epolls[idx]
             .interest
             .iter()
             .map(|(&fd, &w)| (fd, w))
             .collect();
-
-        let (_, stride) = self.epoll_event_layout();
-        let mut n = 0u64;
-        // Socket readiness lives in `net`, pipe readiness in `pipes`: take both
-        // once for the whole scan, after `sh` and in order (sh → net → pipes),
-        // and drop them when the loop ends.
-        let mut net = self.net.lock().unwrap();
-        let pipes = self.pipes.lock().unwrap();
         for (fd, w) in watches {
             if n >= maxevents {
                 break;
             }
-            let ready = self.fd_ready(sh, &mut net, &pipes, cx, fd) & (w.events | POLLERR | POLLHUP);
+            let ready = self.fd_ready(&mut net, &pipes, &mut pf, cx, fd) & (w.events | POLLERR | POLLHUP);
             if ready == 0 {
                 continue;
             }
@@ -578,7 +603,7 @@ impl Kernel {
     /// like `epoll_pwait` but the timeout is a `struct timespec*`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_epoll_pwait2(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, cx: &mut ServiceCtx,
         epfd: u64,
         events_ptr: u64,
         maxevents: u64,
@@ -593,18 +618,18 @@ impl Kernel {
             };
             timespec_to_ms(sec, nsec)
         };
-        self.sys_epoll_wait(sh, cx, epfd, events_ptr, maxevents, timeout_ms, mem)
+        self.sys_epoll_wait(cx, epfd, events_ptr, maxevents, timeout_ms, mem)
     }
 
     // ---- eventfd ------------------------------------------------------------
 
     /// `eventfd`/`eventfd2(initval, flags)`.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_eventfd2(&self, sh: &mut Shared, cx: &mut ServiceCtx, initval: u64, flags: u64) -> i64 {
+    pub(super) fn sys_eventfd2(&self, pf: &mut PollFds, cx: &mut ServiceCtx, initval: u64, flags: u64) -> i64 {
         const EFD_SEMAPHORE: u64 = 1;
         const EFD_NONBLOCK: u64 = 0o4000;
-        let idx = sh.eventfds.len();
-        sh.eventfds.push(EventFdInst {
+        let idx = pf.eventfds.len();
+        pf.eventfds.push(EventFdInst {
             count: initval,
             semaphore: flags & EFD_SEMAPHORE != 0,
             nonblock: flags & EFD_NONBLOCK != 0,
@@ -616,7 +641,7 @@ impl Kernel {
     /// [`Kernel::sys_read`](super::Kernel)).
     #[allow(clippy::unused_self)]
     pub(super) fn read_eventfd(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, pf: &mut PollFds, cx: &mut ServiceCtx,
         i: usize,
         buf: u64,
         count: u64,
@@ -625,18 +650,18 @@ impl Kernel {
         if count < 8 {
             return err(Errno::EINVAL);
         }
-        if sh.eventfds[i].count == 0 {
-            if sh.eventfds[i].nonblock {
+        if pf.eventfds[i].count == 0 {
+            if pf.eventfds[i].nonblock {
                 return err(Errno::EAGAIN);
             }
             cx.block = true;
             return 0;
         }
-        let value = if sh.eventfds[i].semaphore {
-            sh.eventfds[i].count -= 1;
+        let value = if pf.eventfds[i].semaphore {
+            pf.eventfds[i].count -= 1;
             1u64
         } else {
-            std::mem::replace(&mut sh.eventfds[i].count, 0)
+            std::mem::replace(&mut pf.eventfds[i].count, 0)
         };
         if mem.write(buf, &value.to_le_bytes()).is_err() {
             return err(Errno::EFAULT);
@@ -647,7 +672,7 @@ impl Kernel {
     /// `write(eventfd_fd, buf, count)` — add to the counter (called from
     /// [`Kernel::sys_write`](super::Kernel)).
     #[allow(clippy::unused_self)]
-    pub(super) fn write_eventfd(&self, sh: &mut Shared, cx: &mut ServiceCtx, i: usize, data: &[u8]) -> i64 {
+    pub(super) fn write_eventfd(&self, pf: &mut PollFds, cx: &mut ServiceCtx, i: usize, data: &[u8]) -> i64 {
         if data.len() < 8 {
             return err(Errno::EINVAL);
         }
@@ -657,13 +682,13 @@ impl Kernel {
         if value == u64::MAX {
             return err(Errno::EINVAL);
         }
-        let cur = sh.eventfds[i].count;
+        let cur = pf.eventfds[i].count;
         match cur.checked_add(value) {
             Some(sum) if sum < u64::MAX => {
-                sh.eventfds[i].count = sum;
+                pf.eventfds[i].count = sum;
                 8
             }
-            _ if sh.eventfds[i].nonblock => err(Errno::EAGAIN),
+            _ if pf.eventfds[i].nonblock => err(Errno::EAGAIN),
             _ => {
                 cx.block = true;
                 0
@@ -676,10 +701,10 @@ impl Kernel {
     /// `timerfd_create(clockid, flags)` — `clockid` is accepted but ignored
     /// (there is only the one host wall clock).
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_timerfd_create(&self, sh: &mut Shared, cx: &mut ServiceCtx, _clockid: u64, flags: u64) -> i64 {
+    pub(super) fn sys_timerfd_create(&self, pf: &mut PollFds, cx: &mut ServiceCtx, _clockid: u64, flags: u64) -> i64 {
         const TFD_NONBLOCK: u64 = 0o4000;
-        let idx = sh.timerfds.len();
-        sh.timerfds.push(TimerFdInst {
+        let idx = pf.timerfds.len();
+        pf.timerfds.push(TimerFdInst {
             expiry_ns: None,
             interval_ns: 0,
             expirations: 0,
@@ -692,34 +717,34 @@ impl Kernel {
     /// accumulate the elapsed expiration count and (for a periodic timer)
     /// rearm the deadline, or (for a one-shot) disarm it.
     #[allow(clippy::unused_self)]
-    fn update_timerfd(&self, sh: &mut Shared, i: usize) {
-        let Some(expiry) = sh.timerfds[i].expiry_ns else {
+    fn update_timerfd(&self, pf: &mut PollFds, i: usize) {
+        let Some(expiry) = pf.timerfds[i].expiry_ns else {
             return;
         };
         let now = now_ns();
         if now < expiry {
             return;
         }
-        let interval = sh.timerfds[i].interval_ns;
+        let interval = pf.timerfds[i].interval_ns;
         if let Some(periods) = (now - expiry).checked_div(interval) {
             // Periodic: rearm `elapsed` periods past the missed deadline.
             let elapsed = periods + 1;
-            sh.timerfds[i].expirations = sh.timerfds[i]
+            pf.timerfds[i].expirations = pf.timerfds[i]
                 .expirations
                 .saturating_add(u64::try_from(elapsed).unwrap_or(u64::MAX));
-            sh.timerfds[i].expiry_ns = Some(expiry + elapsed * interval);
+            pf.timerfds[i].expiry_ns = Some(expiry + elapsed * interval);
         } else {
             // `interval == 0`: a one-shot timer, disarmed after firing once.
-            sh.timerfds[i].expirations = sh.timerfds[i].expirations.saturating_add(1);
-            sh.timerfds[i].expiry_ns = None;
+            pf.timerfds[i].expirations = pf.timerfds[i].expirations.saturating_add(1);
+            pf.timerfds[i].expiry_ns = None;
         }
     }
 
     /// The `(sec, nsec)` remaining until timer `i`'s next expiration (after
     /// bringing its state up to date), or `(0, 0)` while disarmed.
-    fn timerfd_remaining(&self, sh: &mut Shared, i: usize) -> (u64, u64) {
-        self.update_timerfd(sh, i);
-        match sh.timerfds[i].expiry_ns {
+    fn timerfd_remaining(&self, pf: &mut PollFds, i: usize) -> (u64, u64) {
+        self.update_timerfd(pf, i);
+        match pf.timerfds[i].expiry_ns {
             None => (0, 0),
             Some(exp) => {
                 let now = now_ns();
@@ -735,7 +760,7 @@ impl Kernel {
     /// `timerfd_settime(fd, flags, new_value, old_value)`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_timerfd_settime(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, pf: &mut PollFds, cx: &mut ServiceCtx,
         fd: u64,
         flags: u64,
         new_value: u64,
@@ -758,8 +783,8 @@ impl Kernel {
         }
 
         if old_value != 0 {
-            let interval_ns = sh.timerfds[i].interval_ns;
-            let (rem_sec, rem_nsec) = self.timerfd_remaining(sh, i);
+            let interval_ns = pf.timerfds[i].interval_ns;
+            let (rem_sec, rem_nsec) = self.timerfd_remaining(pf, i);
             if !write_timespec(
                 mem,
                 old_value,
@@ -773,21 +798,21 @@ impl Kernel {
 
         let interval_ns = u128::from(int_sec) * 1_000_000_000 + u128::from(int_nsec);
         let value_ns = u128::from(val_sec) * 1_000_000_000 + u128::from(val_nsec);
-        sh.timerfds[i].expiry_ns = if value_ns == 0 {
+        pf.timerfds[i].expiry_ns = if value_ns == 0 {
             None
         } else if flags & TFD_TIMER_ABSTIME != 0 {
             Some(value_ns)
         } else {
             Some(now_ns() + value_ns)
         };
-        sh.timerfds[i].interval_ns = interval_ns;
-        sh.timerfds[i].expirations = 0;
+        pf.timerfds[i].interval_ns = interval_ns;
+        pf.timerfds[i].expirations = 0;
         0
     }
 
     /// `timerfd_gettime(fd, curr_value)`.
     pub(super) fn sys_timerfd_gettime(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, pf: &mut PollFds, cx: &mut ServiceCtx,
         fd: u64,
         curr_value: u64,
         mem: &mut GuestMemory,
@@ -795,8 +820,8 @@ impl Kernel {
         let Some(Fd::Timerfd(i)) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
-        let interval_ns = sh.timerfds[i].interval_ns;
-        let (sec, nsec) = self.timerfd_remaining(sh, i);
+        let interval_ns = pf.timerfds[i].interval_ns;
+        let (sec, nsec) = self.timerfd_remaining(pf, i);
         if !write_timespec(
             mem,
             curr_value,
@@ -812,7 +837,7 @@ impl Kernel {
     /// `read(timerfd_fd, buf, count)` — drain the accumulated expiration
     /// count (called from [`Kernel::sys_read`](super::Kernel)).
     pub(super) fn read_timerfd(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, pf: &mut PollFds, cx: &mut ServiceCtx,
         i: usize,
         buf: u64,
         count: u64,
@@ -821,16 +846,16 @@ impl Kernel {
         if count < 8 {
             return err(Errno::EINVAL);
         }
-        self.update_timerfd(sh, i);
-        if sh.timerfds[i].expirations == 0 {
-            if sh.timerfds[i].nonblock {
+        self.update_timerfd(pf, i);
+        if pf.timerfds[i].expirations == 0 {
+            if pf.timerfds[i].nonblock {
                 return err(Errno::EAGAIN);
             }
             cx.block = true;
             return 0;
         }
-        let val = sh.timerfds[i].expirations;
-        sh.timerfds[i].expirations = 0;
+        let val = pf.timerfds[i].expirations;
+        pf.timerfds[i].expirations = 0;
         if mem.write(buf, &val.to_le_bytes()).is_err() {
             return err(Errno::EFAULT);
         }
