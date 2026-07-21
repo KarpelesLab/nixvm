@@ -394,6 +394,12 @@ enum SliceOutcome {
     Err(VcpuError),
 }
 
+/// Poll interval while every task is parked but a host connection is live: the
+/// scheduler sleeps this long, then retries a round that re-checks host-socket
+/// readiness. Short enough that an arriving HTTP response is picked up promptly,
+/// long enough that the idle poll isn't a busy spin.
+const HOST_IO_POLL_NS: u128 = 1_000_000; // 1 ms
+
 /// What the SMP scheduler does when every task is blocked and nothing is in
 /// flight — mirrors the serial scheduler's stall handling.
 enum StallAction {
@@ -999,6 +1005,14 @@ impl Kernel {
                 if self.shared.lock().unwrap().wait_for_timer() {
                     continue;
                 }
+                // A live host connection may still deliver data asynchronously;
+                // poll for it (short sleep + re-sweep) rather than declaring a
+                // deadlock. Only a machine with no timer and no host I/O pending
+                // is genuinely stuck.
+                if self.net.lock().unwrap().has_pending_host_io() {
+                    std::thread::sleep(std::time::Duration::from_nanos(HOST_IO_POLL_NS as u64));
+                    continue;
+                }
                 return Err(VcpuError::Backend(
                     "deadlock: every process is blocked".into(),
                 ));
@@ -1489,10 +1503,18 @@ impl Kernel {
                         // retry so the waiter re-checks its now-passed deadline.
                         if let Some(dl) = sh.earliest_deadline() {
                             StallAction::SleepUntil(dl)
+                        } else if self.net.lock().unwrap().has_pending_host_io() {
+                            // A live host connection may still deliver data
+                            // asynchronously (an in-flight HTTP response). There
+                            // is no host-side wakeup into this cooperative loop,
+                            // so poll for it — a short sleep, then a retry round
+                            // that re-checks socket readiness — rather than
+                            // mistaking the wait for a deadlock.
+                            StallAction::SleepUntil(poll::now_ns() + HOST_IO_POLL_NS)
                         } else if !stalled {
-                            // No timer: catch a lost futex wake / host-socket
-                            // data / a child that became a zombie with one
-                            // forced retry round before declaring deadlock.
+                            // No timer: catch a lost futex wake / a child that
+                            // became a zombie with one forced retry round before
+                            // declaring deadlock.
                             StallAction::Retry
                         } else {
                             StallAction::Deadlock

@@ -31,6 +31,21 @@ impl Net {
     pub(super) fn set_egress(&mut self, egress: Box<dyn Egress>) {
         self.egress = Some(egress);
     }
+
+    /// Whether any live host-bridged connection exists: a TCP egress socket, or
+    /// a UDP socket with a host peer. While one is open the guest may be blocked
+    /// awaiting network data that arrives asynchronously, so an otherwise all-
+    /// parked machine is not a deadlock — the scheduler polls for host readiness
+    /// rather than erroring out (there is no host-side wakeup into the
+    /// cooperative loop, so it must look for itself).
+    pub(super) fn has_pending_host_io(&self) -> bool {
+        self.socks.iter().any(|s| {
+            matches!(
+                &s.kind,
+                Kind::Host(_) | Kind::Dgram(Dgram { host: Some(_), .. })
+            )
+        })
+    }
 }
 
 impl Errno {
