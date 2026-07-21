@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 
+use super::net::Net;
 use super::{Fd, Kernel, ServiceCtx, Shared, err};
 use crate::abi::Arch;
 use crate::abi::errno::Errno;
@@ -149,7 +150,11 @@ fn write_fdset(mem: &mut GuestMemory, ptr: u64, nfds: u64, bits: &[bool]) -> boo
 impl Kernel {
     /// The readiness mask (`POLLIN`/`POLLOUT`/`POLLERR`/`POLLHUP`/`POLLNVAL`)
     /// of guest fd `fd_num` right now. `POLLNVAL` if the fd is not open.
-    fn fd_ready(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd_num: i32) -> u32 {
+    ///
+    /// Takes both `sh` and `net`: socket readiness lives in `net`, everything
+    /// else (pipes/eventfds/timerfds) in `sh`. Callers acquire `net` once around
+    /// the whole scan — always *after* `sh` (sh → net order) — and pass both in.
+    fn fd_ready(&self, sh: &mut Shared, net: &mut Net, cx: &mut ServiceCtx, fd_num: i32) -> u32 {
         let Some(fd) = cx.cur.fds.get(fd_num).cloned() else {
             return POLLNVAL;
         };
@@ -162,7 +167,7 @@ impl Kernel {
             // A host-bridged socket gets a precise readable answer (a peek);
             // in-VM loopback sockets stay best-effort always-ready, since
             // their queues aren't observable from here.
-            Fd::Socket { sock, .. } => self.host_socket_readiness(sh, sock).unwrap_or(POLLIN | POLLOUT),
+            Fd::Socket { sock, .. } => self.host_socket_readiness(net, sock).unwrap_or(POLLIN | POLLOUT),
             Fd::PipeRead(i) => {
                 let p = &sh.pipes[i];
                 if !p.buf.is_empty() {
@@ -260,12 +265,15 @@ impl Kernel {
             entries.push((addr, fd_raw as i32, events));
         }
 
+        // Socket readiness lives in `net`: take it once for the whole scan,
+        // after `sh` (sh → net order), and drop it when the loop ends.
+        let mut net = self.net.lock().unwrap();
         let mut ready_count = 0i64;
         for (addr, fd, events) in entries {
             let revents = if fd < 0 {
                 0
             } else {
-                self.fd_ready(sh, cx, fd) & (u32::from(events) | POLLERR | POLLHUP | POLLNVAL)
+                self.fd_ready(sh, &mut net, cx, fd) & (u32::from(events) | POLLERR | POLLHUP | POLLNVAL)
             };
             if !write_u16(mem, addr + 6, revents as u16) {
                 return err(Errno::EFAULT);
@@ -335,11 +343,14 @@ impl Kernel {
         let mut wout = vec![false; nfds as usize];
         let mut eout = vec![false; nfds as usize];
         let mut total = 0i64;
+        // Socket readiness lives in `net`: take it once for the whole scan,
+        // after `sh` (sh → net order), and drop it when the loop ends.
+        let mut net = self.net.lock().unwrap();
         for fd in 0..nfds as usize {
             if !rbits[fd] && !wbits[fd] && !ebits[fd] {
                 continue;
             }
-            let ready = self.fd_ready(sh, cx, fd as i32);
+            let ready = self.fd_ready(sh, &mut net, cx, fd as i32);
             if rbits[fd] && ready & (POLLIN | POLLHUP) != 0 {
                 rout[fd] = true;
                 total += 1;
@@ -531,11 +542,14 @@ impl Kernel {
 
         let (_, stride) = self.epoll_event_layout();
         let mut n = 0u64;
+        // Socket readiness lives in `net`: take it once for the whole scan,
+        // after `sh` (sh → net order), and drop it when the loop ends.
+        let mut net = self.net.lock().unwrap();
         for (fd, w) in watches {
             if n >= maxevents {
                 break;
             }
-            let ready = self.fd_ready(sh, cx, fd) & (w.events | POLLERR | POLLHUP);
+            let ready = self.fd_ready(sh, &mut net, cx, fd) & (w.events | POLLERR | POLLHUP);
             if ready == 0 {
                 continue;
             }

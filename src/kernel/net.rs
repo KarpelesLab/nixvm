@@ -25,7 +25,7 @@ use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
 use super::egress::{Egress, HostConn, HostDgram};
-use super::{Fd, Kernel, ServiceCtx, Shared, err};
+use super::{Fd, Kernel, ServiceCtx, err};
 
 impl Net {
     pub(super) fn set_egress(&mut self, egress: Box<dyn Egress>) {
@@ -495,29 +495,29 @@ impl Kernel {
     /// loopback one if it was never `bind`-ed — mirroring the implicit local
     /// address Linux assigns to an unbound socket on first send.
     #[allow(clippy::unused_self)]
-    fn ensure_dgram_bound(&self, sh: &mut Shared, sock: usize) -> InetAddr {
-        if let Kind::Dgram(d) = &sh.net.socks[sock].kind
+    fn ensure_dgram_bound(&self, net: &mut Net, sock: usize) -> InetAddr {
+        if let Kind::Dgram(d) = &net.socks[sock].kind
             && let Some(local) = d.local
         {
             return local;
         }
-        let v6 = sh.net.socks[sock].domain == AF_INET6;
-        let port = sh.net.ephemeral_port("udp", v6);
+        let v6 = net.socks[sock].domain == AF_INET6;
+        let port = net.ephemeral_port("udp", v6);
         let local = InetAddr {
             v6,
             port,
             ip: loopback_ip(v6),
         };
-        if let Kind::Dgram(d) = &mut sh.net.socks[sock].kind {
+        if let Kind::Dgram(d) = &mut net.socks[sock].kind {
             d.local = Some(local);
         }
-        sh.net.dgram_ports.insert(route_key("udp", local), sock);
+        net.dgram_ports.insert(route_key("udp", local), sock);
         local
     }
 
     /// `socket(domain, type, protocol)` — an unbound, unconnected endpoint.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_socket(&self, sh: &mut Shared, cx: &mut ServiceCtx, domain: u64, sotype: u64, protocol: u64) -> i64 {
+    pub(super) fn sys_socket(&self, net: &mut Net, cx: &mut ServiceCtx, domain: u64, sotype: u64, protocol: u64) -> i64 {
         let domain = domain as u16;
         if domain == AF_NETLINK {
             let base_type = sotype & 0xf;
@@ -532,8 +532,8 @@ impl Kernel {
                 sotype: base_type,
                 ..Netlink::default()
             });
-            let idx = sh.net.socks.len();
-            sh.net.socks.push(Sock {
+            let idx = net.socks.len();
+            net.socks.push(Sock {
                 domain,
                 kind,
                 nonblock,
@@ -554,8 +554,8 @@ impl Kernel {
         } else {
             Kind::Idle { bound: None }
         };
-        let idx = sh.net.socks.len();
-        sh.net.socks.push(Sock {
+        let idx = net.socks.len();
+        net.socks.push(Sock {
             domain,
             kind,
             nonblock,
@@ -568,7 +568,7 @@ impl Kernel {
     /// two fds are written to `sv[0]`/`sv[1]`.
     #[allow(clippy::too_many_arguments, clippy::unused_self)]
     pub(super) fn sys_socketpair(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         domain: u64,
         sotype: u64,
         _protocol: u64,
@@ -584,8 +584,8 @@ impl Kernel {
         let nonblock = sotype & SOCK_NONBLOCK != 0;
         let mut pair = Pair::new();
         pair.nonblock = [nonblock, nonblock];
-        let idx = sh.net.socks.len();
-        sh.net.socks.push(Sock {
+        let idx = net.socks.len();
+        net.socks.push(Sock {
             domain: AF_UNIX,
             kind: Kind::Pair(pair),
             nonblock,
@@ -606,22 +606,22 @@ impl Kernel {
     /// (stream) or unbound (datagram) socket. For `AF_INET`/`AF_INET6`, port
     /// `0` auto-assigns an ephemeral port, and only the wildcard/loopback
     /// address is accepted (no host networking).
-    pub(super) fn sys_bind(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, addr: u64, addrlen: u64, mem: &GuestMemory) -> i64 {
+    pub(super) fn sys_bind(&self, net: &mut Net, cx: &mut ServiceCtx, fd: u64, addr: u64, addrlen: u64, mem: &GuestMemory) -> i64 {
         let Some((sock, _)) = self.sock_of(cx, fd) else {
             return err(Errno::ENOTSOCK);
         };
-        if sh.net.socks[sock].domain == AF_NETLINK {
-            return self.bind_netlink(sh, sock, addr, addrlen, mem);
+        if net.socks[sock].domain == AF_NETLINK {
+            return self.bind_netlink(net, sock, addr, addrlen, mem);
         }
         let Some(parsed) = read_sockaddr(mem, addr, addrlen) else {
             return err(Errno::EINVAL);
         };
         match parsed {
             Addr::Unix(_) => {
-                if sh.net.socks[sock].domain != AF_UNIX {
+                if net.socks[sock].domain != AF_UNIX {
                     return err(Errno::EINVAL);
                 }
-                match &mut sh.net.socks[sock].kind {
+                match &mut net.socks[sock].kind {
                     Kind::Idle { bound } => {
                         *bound = Some(parsed);
                         0
@@ -630,32 +630,32 @@ impl Kernel {
                 }
             }
             Addr::Inet(mut a) => {
-                let domain = sh.net.socks[sock].domain;
+                let domain = net.socks[sock].domain;
                 if (a.v6 && domain != AF_INET6) || (!a.v6 && domain != AF_INET) {
                     return err(Errno::EINVAL);
                 }
                 if !a.valid_bind() {
                     return err(Errno::EINVAL); // real errno: EADDRNOTAVAIL
                 }
-                let proto = match &sh.net.socks[sock].kind {
+                let proto = match &net.socks[sock].kind {
                     Kind::Idle { .. } => "tcp",
                     Kind::Dgram(_) => "udp",
                     _ => return err(Errno::EINVAL),
                 };
                 if a.port == 0 {
-                    a.port = sh.net.ephemeral_port(proto, a.v6);
-                } else if !sh.net.socks[sock].opts.reuseaddr
-                    && sh.net.addr_in_use(proto, a, sock)
+                    a.port = net.ephemeral_port(proto, a.v6);
+                } else if !net.socks[sock].opts.reuseaddr
+                    && net.addr_in_use(proto, a, sock)
                 {
                     return err(Errno::EINVAL); // real errno: EADDRINUSE
                 }
-                match &mut sh.net.socks[sock].kind {
+                match &mut net.socks[sock].kind {
                     Kind::Idle { bound } => *bound = Some(Addr::Inet(a)),
                     Kind::Dgram(d) => d.local = Some(a),
                     _ => return err(Errno::EINVAL),
                 }
                 if proto == "udp" {
-                    sh.net.dgram_ports.insert(route_key("udp", a), sock);
+                    net.dgram_ports.insert(route_key("udp", a), sock);
                 }
                 0
             }
@@ -665,19 +665,19 @@ impl Kernel {
     /// `listen(fd, backlog)` — mark a bound socket as accepting connections.
     /// Auto-binds an ephemeral wildcard address first if `bind` was skipped
     /// (matching real Linux).
-    pub(super) fn sys_listen(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64) -> i64 {
+    pub(super) fn sys_listen(&self, net: &mut Net, cx: &mut ServiceCtx, fd: u64) -> i64 {
         let Some((sock, _)) = self.sock_of(cx, fd) else {
             return err(Errno::ENOTSOCK);
         };
-        let domain = sh.net.socks[sock].domain;
-        let mut bound = match &sh.net.socks[sock].kind {
+        let domain = net.socks[sock].domain;
+        let mut bound = match &net.socks[sock].kind {
             Kind::Idle { bound } => bound.clone(),
             Kind::Listener { .. } => return 0,
             _ => return err(Errno::EINVAL),
         };
         if bound.is_none() && domain != AF_UNIX {
             let v6 = domain == AF_INET6;
-            let port = sh.net.ephemeral_port("tcp", v6);
+            let port = net.ephemeral_port("tcp", v6);
             bound = Some(Addr::Inet(InetAddr {
                 v6,
                 port,
@@ -689,12 +689,12 @@ impl Kernel {
             Some(Addr::Inet(a)) => Some(route_key("tcp", *a)),
             None => None,
         };
-        sh.net.socks[sock].kind = Kind::Listener {
+        net.socks[sock].kind = Kind::Listener {
             addr: bound,
             backlog: VecDeque::new(),
         };
         if let Some(k) = key {
-            sh.net.listeners.insert(k, sock);
+            net.listeners.insert(k, sock);
         }
         0
     }
@@ -704,7 +704,7 @@ impl Kernel {
     /// pair and queuing it on the listener for `accept4`; for a datagram
     /// socket, just record the peer (no handshake, per UDP semantics).
     pub(super) fn sys_connect(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         fd: u64,
         addr: u64,
         addrlen: u64,
@@ -716,7 +716,7 @@ impl Kernel {
         let Some(target) = read_sockaddr(mem, addr, addrlen) else {
             return err(Errno::EINVAL);
         };
-        let domain = sh.net.socks[sock].domain;
+        let domain = net.socks[sock].domain;
         let mismatched = match (&target, domain) {
             (Addr::Unix(_), AF_UNIX) => false,
             (Addr::Inet(a), AF_INET) => a.v6,
@@ -734,27 +734,27 @@ impl Kernel {
             let Addr::Inet(dest) = target else {
                 unreachable!("routable implies Inet")
             };
-            if matches!(sh.net.socks[sock].kind, Kind::Dgram(_)) {
+            if matches!(net.socks[sock].kind, Kind::Dgram(_)) {
                 // UDP: remember the routable peer; the host socket is opened
                 // lazily on first send (see `send_bytes`/`write_socket`).
-                if sh.net.egress.is_none() {
+                if net.egress.is_none() {
                     return err(Errno::ENETUNREACH);
                 }
-                self.ensure_dgram_bound(sh, sock);
-                if let Kind::Dgram(d) = &mut sh.net.socks[sock].kind {
+                self.ensure_dgram_bound(net, sock);
+                if let Kind::Dgram(d) = &mut net.socks[sock].kind {
                     d.peer = Some(dest);
                 }
                 return 0;
             }
-            return self.connect_host(sh, sock, end, dest);
+            return self.connect_host(net, sock, end, dest);
         }
 
-        if matches!(sh.net.socks[sock].kind, Kind::Dgram(_)) {
+        if matches!(net.socks[sock].kind, Kind::Dgram(_)) {
             let Addr::Inet(peer) = target else {
                 unreachable!("validated above")
             };
-            self.ensure_dgram_bound(sh, sock);
-            if let Kind::Dgram(d) = &mut sh.net.socks[sock].kind {
+            self.ensure_dgram_bound(net, sock);
+            if let Kind::Dgram(d) = &mut net.socks[sock].kind {
                 d.peer = Some(peer);
             }
             return 0;
@@ -762,24 +762,24 @@ impl Kernel {
 
         // An idle client end 0; anything else (already connected, a listener,
         // or the wrong end) is invalid.
-        if !matches!(&sh.net.socks[sock].kind, Kind::Idle { .. } if end == 0) {
+        if !matches!(&net.socks[sock].kind, Kind::Idle { .. } if end == 0) {
             return err(Errno::EINVAL);
         }
         let key = match &target {
             Addr::Unix(p) => p.clone(),
             Addr::Inet(a) => route_key("tcp", *a),
         };
-        let Some(&lidx) = sh.net.listeners.get(&key) else {
+        let Some(&lidx) = net.listeners.get(&key) else {
             return err(Errno::ECONNREFUSED);
         };
-        let listener_addr = match &sh.net.socks[lidx].kind {
+        let listener_addr = match &net.socks[lidx].kind {
             Kind::Listener { addr, .. } => addr.clone(),
             _ => return err(Errno::ECONNREFUSED),
         };
         // Repurpose the client's idle slot as the connected pair, then queue its
         // index (the server-side end 1) on the listener's backlog.
         let mut pair = Pair::new();
-        pair.nonblock[0] = sh.net.socks[sock].nonblock;
+        pair.nonblock[0] = net.socks[sock].nonblock;
         if domain != AF_UNIX {
             let v6 = domain == AF_INET6;
             let mut peer_addr = match listener_addr {
@@ -794,11 +794,11 @@ impl Kernel {
                 // Report the concrete loopback even if the server bound ANY.
                 peer_addr.ip = loopback_ip(v6);
             }
-            pair.addrs[0] = Some(sh.net.fresh_local(v6));
+            pair.addrs[0] = Some(net.fresh_local(v6));
             pair.addrs[1] = Some(peer_addr);
         }
-        sh.net.socks[sock].kind = Kind::Pair(pair);
-        if let Kind::Listener { backlog, .. } = &mut sh.net.socks[lidx].kind {
+        net.socks[sock].kind = Kind::Pair(pair);
+        if let Kind::Listener { backlog, .. } = &mut net.socks[lidx].kind {
             backlog.push_back(sock);
         }
         0
@@ -809,17 +809,17 @@ impl Kernel {
     /// completed connection (the host `connect` is synchronous here), else a
     /// negative errno.
     #[allow(clippy::unused_self)]
-    fn connect_host(&self, sh: &mut Shared, sock: usize, end: usize, dest: InetAddr) -> i64 {
-        if !matches!(&sh.net.socks[sock].kind, Kind::Idle { .. } if end == 0) {
+    fn connect_host(&self, net: &mut Net, sock: usize, end: usize, dest: InetAddr) -> i64 {
+        if !matches!(&net.socks[sock].kind, Kind::Idle { .. } if end == 0) {
             return err(Errno::EINVAL);
         }
-        let Some(egress) = &sh.net.egress else {
+        let Some(egress) = &net.egress else {
             return err(Errno::ENETUNREACH);
         };
         match egress.connect_tcp(dest.ip, dest.v6, dest.port) {
             Ok(conn) => {
-                let nonblock = sh.net.socks[sock].nonblock;
-                sh.net.socks[sock].kind = Kind::Host(HostSock {
+                let nonblock = net.socks[sock].nonblock;
+                net.socks[sock].kind = Kind::Host(HostSock {
                     conn,
                     peer: dest,
                     wr_shut: false,
@@ -841,7 +841,7 @@ impl Kernel {
     /// the listening socket is not `O_NONBLOCK`).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_accept4(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         fd: u64,
         addr: u64,
         addrlen: u64,
@@ -851,8 +851,8 @@ impl Kernel {
         let Some((sock, _)) = self.sock_of(cx, fd) else {
             return err(Errno::ENOTSOCK);
         };
-        let nonblock = sh.net.socks[sock].nonblock;
-        let pending = match &mut sh.net.socks[sock].kind {
+        let nonblock = net.socks[sock].nonblock;
+        let pending = match &mut net.socks[sock].kind {
             Kind::Listener { backlog, .. } => backlog.pop_front(),
             _ => return err(Errno::EINVAL),
         };
@@ -863,13 +863,13 @@ impl Kernel {
             cx.block = true; // no pending connection yet — re-trap later
             return 0;
         };
-        let domain = sh.net.socks[sock].domain;
-        let peer = match &sh.net.socks[pidx].kind {
+        let domain = net.socks[sock].domain;
+        let peer = match &net.socks[pidx].kind {
             Kind::Pair(p) => p.addrs[0].map(Addr::Inet),
             _ => None,
         };
         write_sockaddr(mem, addr, addrlen, domain, peer.as_ref());
-        if let Kind::Pair(p) = &mut sh.net.socks[pidx].kind {
+        if let Kind::Pair(p) = &mut net.socks[pidx].kind {
             p.nonblock[1] = flags & SOCK_NONBLOCK != 0;
         }
         i64::from(cx.cur.fds.alloc(Fd::Socket { sock: pidx, end: 1 }))
@@ -884,7 +884,7 @@ impl Kernel {
     /// when the guest asks for `0` ("let the kernel pick"), exactly like a
     /// real `AF_NETLINK` autobind.
     #[allow(clippy::unused_self)]
-    fn bind_netlink(&self, sh: &mut Shared, sock: usize, addr: u64, addrlen: u64, mem: &GuestMemory) -> i64 {
+    fn bind_netlink(&self, net: &mut Net, sock: usize, addr: u64, addrlen: u64, mem: &GuestMemory) -> i64 {
         if addrlen < 8 {
             return err(Errno::EINVAL);
         }
@@ -900,7 +900,7 @@ impl Kernel {
         } else {
             requested
         };
-        let Kind::Netlink(nl) = &mut sh.net.socks[sock].kind else {
+        let Kind::Netlink(nl) = &mut net.socks[sock].kind else {
             return err(Errno::EINVAL);
         };
         nl.pid = pid;
@@ -909,7 +909,7 @@ impl Kernel {
 
     /// `getsockname(fd, addr, addrlen)` — the local address (best-effort).
     pub(super) fn sys_getsockname(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         fd: u64,
         addr: u64,
         addrlen: u64,
@@ -918,15 +918,15 @@ impl Kernel {
         let Some((sock, end)) = self.sock_of(cx, fd) else {
             return err(Errno::ENOTSOCK);
         };
-        let domain = sh.net.socks[sock].domain;
+        let domain = net.socks[sock].domain;
         if domain == AF_NETLINK {
-            let pid = match &sh.net.socks[sock].kind {
+            let pid = match &net.socks[sock].kind {
                 Kind::Netlink(nl) => nl.pid,
                 _ => 0,
             };
             return write_netlink_sockaddr(mem, addr, addrlen, pid);
         }
-        let resolved = match &sh.net.socks[sock].kind {
+        let resolved = match &net.socks[sock].kind {
             Kind::Idle { bound } => bound.clone(),
             Kind::Listener { addr, .. } => addr.clone(),
             Kind::Pair(p) => p.addrs[end].map(Addr::Inet),
@@ -940,7 +940,7 @@ impl Kernel {
 
     /// `getpeername(fd, addr, addrlen)` — the peer address (best-effort).
     pub(super) fn sys_getpeername(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         fd: u64,
         addr: u64,
         addrlen: u64,
@@ -949,8 +949,8 @@ impl Kernel {
         let Some((sock, end)) = self.sock_of(cx, fd) else {
             return err(Errno::ENOTSOCK);
         };
-        let domain = sh.net.socks[sock].domain;
-        match &sh.net.socks[sock].kind {
+        let domain = net.socks[sock].domain;
+        match &net.socks[sock].kind {
             Kind::Pair(p) => write_sockaddr(
                 mem,
                 addr,
@@ -974,14 +974,14 @@ impl Kernel {
     /// queued); `SHUT_WR` (1) marks the write side closed (further writes
     /// return `EPIPE`, and the peer sees EOF on read once it drains what's
     /// already queued); `SHUT_RDWR` (2) does both.
-    pub(super) fn sys_shutdown(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, how: u64) -> i64 {
+    pub(super) fn sys_shutdown(&self, net: &mut Net, cx: &mut ServiceCtx, fd: u64, how: u64) -> i64 {
         const SHUT_RD: u64 = 0;
         const SHUT_WR: u64 = 1;
         const SHUT_RDWR: u64 = 2;
         let Some((sock, end)) = self.sock_of(cx, fd) else {
             return err(Errno::ENOTSOCK);
         };
-        match &mut sh.net.socks[sock].kind {
+        match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
                 match how {
                     SHUT_RD => p.shut_rd[end] = true,
@@ -1015,7 +1015,7 @@ impl Kernel {
     /// calls guest code makes speculatively.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_setsockopt(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         fd: u64,
         level: u64,
         optname: u64,
@@ -1026,7 +1026,7 @@ impl Kernel {
         let Some((sock, _)) = self.sock_of(cx, fd) else {
             return err(Errno::ENOTSOCK);
         };
-        let opts = &mut sh.net.socks[sock].opts;
+        let opts = &mut net.socks[sock].opts;
         if level == SOL_SOCKET {
             match optname {
                 SO_REUSEADDR if optlen >= 4 => {
@@ -1105,7 +1105,7 @@ impl Kernel {
     /// anything else.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) fn sys_getsockopt(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         fd: u64,
         level: u64,
         optname: u64,
@@ -1119,14 +1119,14 @@ impl Kernel {
         // SO_LINGER and the timeval-shaped options are wider than the u32
         // fast path below, so they're handled (and returned) up front.
         if level == SOL_SOCKET && optname == SO_LINGER {
-            let opts = &sh.net.socks[sock].opts;
+            let opts = &net.socks[sock].opts;
             let mut b = [0u8; 8];
             b[0..4].copy_from_slice(&i32::from(opts.linger_on).to_le_bytes());
             b[4..8].copy_from_slice(&opts.linger_secs.to_le_bytes());
             return write_optval(mem, optval, optlen_ptr, &b);
         }
         if level == SOL_SOCKET && (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO) {
-            let opts = &sh.net.socks[sock].opts;
+            let opts = &net.socks[sock].opts;
             let b = if optname == SO_RCVTIMEO {
                 opts.rcvtimeo
             } else {
@@ -1136,27 +1136,27 @@ impl Kernel {
         }
         let value: u32 = if level == SOL_SOCKET {
             match optname {
-                SO_TYPE => match &sh.net.socks[sock].kind {
+                SO_TYPE => match &net.socks[sock].kind {
                     Kind::Dgram(_) => SOCK_DGRAM as u32,
                     Kind::Netlink(nl) => nl.sotype as u32,
                     _ => SOCK_STREAM as u32,
                 },
                 SO_ERROR => {
-                    let e = sh.net.socks[sock].opts.error;
-                    sh.net.socks[sock].opts.error = 0; // read-and-cleared
+                    let e = net.socks[sock].opts.error;
+                    net.socks[sock].opts.error = 0; // read-and-cleared
                     e as u32
                 }
-                SO_REUSEADDR => u32::from(sh.net.socks[sock].opts.reuseaddr),
-                SO_REUSEPORT => u32::from(sh.net.socks[sock].opts.reuseport),
-                SO_KEEPALIVE => u32::from(sh.net.socks[sock].opts.keepalive),
-                SO_BROADCAST => u32::from(sh.net.socks[sock].opts.broadcast),
-                SO_RCVBUF => sh.net.socks[sock].opts.rcvbuf,
-                SO_SNDBUF => sh.net.socks[sock].opts.sndbuf,
+                SO_REUSEADDR => u32::from(net.socks[sock].opts.reuseaddr),
+                SO_REUSEPORT => u32::from(net.socks[sock].opts.reuseport),
+                SO_KEEPALIVE => u32::from(net.socks[sock].opts.keepalive),
+                SO_BROADCAST => u32::from(net.socks[sock].opts.broadcast),
+                SO_RCVBUF => net.socks[sock].opts.rcvbuf,
+                SO_SNDBUF => net.socks[sock].opts.sndbuf,
                 SO_ACCEPTCONN => {
-                    u32::from(matches!(sh.net.socks[sock].kind, Kind::Listener { .. }))
+                    u32::from(matches!(net.socks[sock].kind, Kind::Listener { .. }))
                 }
-                SO_DOMAIN => u32::from(sh.net.socks[sock].domain),
-                SO_PROTOCOL => match (&sh.net.socks[sock].kind, sh.net.socks[sock].domain) {
+                SO_DOMAIN => u32::from(net.socks[sock].domain),
+                SO_PROTOCOL => match (&net.socks[sock].kind, net.socks[sock].domain) {
                     (Kind::Dgram(_), _) => 17,                      // IPPROTO_UDP
                     (_, d) if d == AF_UNIX || d == AF_NETLINK => 0, // NETLINK_ROUTE == 0
                     _ => 6,                                         // IPPROTO_TCP
@@ -1164,11 +1164,11 @@ impl Kernel {
                 _ => 0,
             }
         } else if level == IPPROTO_TCP && optname == TCP_NODELAY {
-            u32::from(sh.net.socks[sock].opts.nodelay)
+            u32::from(net.socks[sock].opts.nodelay)
         } else if level == IPPROTO_IPV6 && optname == IPV6_V6ONLY {
-            u32::from(sh.net.socks[sock].opts.v6only)
+            u32::from(net.socks[sock].opts.v6only)
         } else if level == IPPROTO_IP && optname == IP_TOS {
-            sh.net.socks[sock].opts.tos
+            net.socks[sock].opts.tos
         } else {
             0
         };
@@ -1184,7 +1184,7 @@ impl Kernel {
     /// blocks and never raises `SIGPIPE` in the first place.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_sendto(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         fd: u64,
         buf: u64,
         len: u64,
@@ -1196,7 +1196,7 @@ impl Kernel {
         let Ok(data) = mem.read_vec(buf, len as usize) else {
             return err(Errno::EFAULT);
         };
-        self.send_bytes(sh, cx, fd, &data, dest_addr, dest_addrlen, mem)
+        self.send_bytes(net, cx, fd, &data, dest_addr, dest_addrlen, mem)
     }
 
     /// The shared core of `sendto`/`sendmsg`: send an already-gathered `data`
@@ -1204,7 +1204,7 @@ impl Kernel {
     /// `dest_addrlen` bytes; `0` = no address, e.g. a connected socket).
     #[allow(clippy::too_many_arguments)]
     fn send_bytes(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         fd: u64,
         data: &[u8],
         dest_addr: u64,
@@ -1214,31 +1214,31 @@ impl Kernel {
         let Some((sock, end)) = self.sock_of(cx, fd) else {
             return err(Errno::ENOTSOCK);
         };
-        if dest_addr == 0 || sh.net.socks[sock].domain == AF_NETLINK {
+        if dest_addr == 0 || net.socks[sock].domain == AF_NETLINK {
             // An `AF_NETLINK` socket only ever has one valid peer (the
             // kernel), so a `dest_addr` sockaddr_nl, if given at all, carries
             // no information this module needs — it's the same request path
             // as a plain `write`.
-            return self.write_socket(sh, cx, sock, end, data);
+            return self.write_socket(net, cx, sock, end, data);
         }
         let Some(Addr::Inet(dest)) = read_sockaddr(mem, dest_addr, dest_addrlen) else {
             return err(Errno::EINVAL);
         };
-        if !matches!(sh.net.socks[sock].kind, Kind::Dgram(_)) {
+        if !matches!(net.socks[sock].kind, Kind::Dgram(_)) {
             return err(Errno::EINVAL); // real errno: EOPNOTSUPP/EISCONN
         }
         // A routable destination (DNS, chiefly) goes out through a real host
         // UDP socket when egress is enabled; without egress it's unreachable.
         if !dest.valid_bind() {
-            if sh.net.egress.is_none() {
+            if net.egress.is_none() {
                 return err(Errno::ENETUNREACH);
             }
-            return self.host_udp_send(sh, sock, data, dest);
+            return self.host_udp_send(net, sock, data, dest);
         }
-        let src = self.ensure_dgram_bound(sh, sock);
+        let src = self.ensure_dgram_bound(net, sock);
         let key = route_key("udp", dest);
-        if let Some(&tgt) = sh.net.dgram_ports.get(&key)
-            && let Kind::Dgram(td) = &mut sh.net.socks[tgt].kind
+        if let Some(&tgt) = net.dgram_ports.get(&key)
+            && let Kind::Dgram(td) = &mut net.socks[tgt].kind
         {
             td.queue.push_back((src, data.to_vec()));
         }
@@ -1249,22 +1249,22 @@ impl Kernel {
     /// for a non-host socket (which uses the generic best-effort answer). Only
     /// host sockets get a precise readable answer (via a peek), so a guest that
     /// trusts `poll` (apk's http client) doesn't spin on spurious readiness.
-    pub(super) fn host_socket_readiness(&self, sh: &mut Shared, sock: usize) -> Option<u32> {
+    pub(super) fn host_socket_readiness(&self, net: &mut Net, sock: usize) -> Option<u32> {
         const POLLIN: u32 = 0x1;
         const POLLOUT: u32 = 0x4;
         if !matches!(
-            sh.net.socks.get(sock).map(|s| &s.kind),
+            net.socks.get(sock).map(|s| &s.kind),
             Some(Kind::Host(_) | Kind::Dgram(Dgram { host: Some(_), .. }))
         ) {
             return None;
         }
-        if let Kind::Dgram(_) = &sh.net.socks[sock].kind {
-            self.host_udp_drain(sh, sock);
+        if let Kind::Dgram(_) = &net.socks[sock].kind {
+            self.host_udp_drain(net, sock);
             let readable =
-                matches!(&sh.net.socks[sock].kind, Kind::Dgram(d) if !d.queue.is_empty());
+                matches!(&net.socks[sock].kind, Kind::Dgram(d) if !d.queue.is_empty());
             return Some(POLLOUT | if readable { POLLIN } else { 0 });
         }
-        let Kind::Host(h) = &mut sh.net.socks[sock].kind else {
+        let Kind::Host(h) = &mut net.socks[sock].kind else {
             return None;
         };
         let mut mask = if h.wr_shut { 0 } else { POLLOUT };
@@ -1277,20 +1277,20 @@ impl Kernel {
     /// Send a datagram out through this socket's host UDP socket (opening it
     /// lazily on first use), for egress to a routable address.
     #[allow(clippy::unused_self)]
-    fn host_udp_send(&self, sh: &mut Shared, sock: usize, data: &[u8], dest: InetAddr) -> i64 {
-        if let Kind::Dgram(d) = &sh.net.socks[sock].kind
+    fn host_udp_send(&self, net: &mut Net, sock: usize, data: &[u8], dest: InetAddr) -> i64 {
+        if let Kind::Dgram(d) = &net.socks[sock].kind
             && d.host.is_none()
         {
-            match sh.net.egress.as_ref().map(|e| e.open_udp()) {
+            match net.egress.as_ref().map(|e| e.open_udp()) {
                 Some(Ok(h)) => {
-                    if let Kind::Dgram(d) = &mut sh.net.socks[sock].kind {
+                    if let Kind::Dgram(d) = &mut net.socks[sock].kind {
                         d.host = Some(h);
                     }
                 }
                 _ => return err(Errno::ENETUNREACH),
             }
         }
-        let Kind::Dgram(d) = &mut sh.net.socks[sock].kind else {
+        let Kind::Dgram(d) = &mut net.socks[sock].kind else {
             return err(Errno::EINVAL);
         };
         let Some(host) = d.host.as_mut() else {
@@ -1306,8 +1306,8 @@ impl Kernel {
     /// inbound queue, so a following `recvfrom`/`recvmsg` sees them. No-op for
     /// a non-host datagram socket.
     #[allow(clippy::unused_self)]
-    fn host_udp_drain(&self, sh: &mut Shared, sock: usize) {
-        let Kind::Dgram(d) = &mut sh.net.socks[sock].kind else {
+    fn host_udp_drain(&self, net: &mut Net, sock: usize) {
+        let Kind::Dgram(d) = &mut net.socks[sock].kind else {
             return;
         };
         let Some(host) = d.host.as_mut() else {
@@ -1324,7 +1324,7 @@ impl Kernel {
                 _ => break,
             }
         }
-        if let Kind::Dgram(d) = &mut sh.net.socks[sock].kind {
+        if let Kind::Dgram(d) = &mut net.socks[sock].kind {
             d.queue.extend(arrived);
         }
     }
@@ -1339,7 +1339,7 @@ impl Kernel {
     /// `recv` — this flag only changes what the *return value* reports).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_recvfrom(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         fd: u64,
         buf: u64,
         len: u64,
@@ -1351,9 +1351,9 @@ impl Kernel {
         let Some((sock, end)) = self.sock_of(cx, fd) else {
             return err(Errno::ENOTSOCK);
         };
-        if matches!(sh.net.socks[sock].kind, Kind::Netlink(_)) {
-            let nonblock = sh.net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
-            let Some(data) = self.drain_netlink(sh, sock, len as usize) else {
+        if matches!(net.socks[sock].kind, Kind::Netlink(_)) {
+            let nonblock = net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
+            let Some(data) = self.drain_netlink(net, sock, len as usize) else {
                 if nonblock {
                     return err(Errno::EAGAIN);
                 }
@@ -1368,11 +1368,11 @@ impl Kernel {
             }
             return n as i64;
         }
-        if !matches!(sh.net.socks[sock].kind, Kind::Dgram(_)) {
-            let n = self.recv_stream(sh, cx, sock, end, buf, len, mem, flags);
+        if !matches!(net.socks[sock].kind, Kind::Dgram(_)) {
+            let n = self.recv_stream(net, cx, sock, end, buf, len, mem, flags);
             if n > 0 {
-                let domain = sh.net.socks[sock].domain;
-                let peer = match &sh.net.socks[sock].kind {
+                let domain = net.socks[sock].domain;
+                let peer = match &net.socks[sock].kind {
                     Kind::Pair(p) => p.addrs[1 - end].map(Addr::Inet),
                     _ => None,
                 };
@@ -1380,15 +1380,15 @@ impl Kernel {
             }
             return n;
         }
-        let nonblock = sh.net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
-        let Some((from, data)) = self.recv_dgram_msg(sh, sock, flags) else {
+        let nonblock = net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
+        let Some((from, data)) = self.recv_dgram_msg(net, sock, flags) else {
             if nonblock {
                 return err(Errno::EAGAIN);
             }
             cx.block = true;
             return 0;
         };
-        let domain = sh.net.socks[sock].domain;
+        let domain = net.socks[sock].domain;
         write_sockaddr(mem, src_addr, src_addrlen, domain, Some(&Addr::Inet(from)));
         let n = (len as usize).min(data.len());
         if mem.write(buf, &data[..n]).is_err() {
@@ -1405,7 +1405,7 @@ impl Kernel {
     /// into one buffer and send it, honoring `msg_name` as the destination
     /// (the datagram case). apk's HTTP/TLS client and musl's resolver use
     /// `sendmsg` rather than `sendto`.
-    pub(super) fn sys_sendmsg(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, msg: u64, flags: u64, mem: &GuestMemory) -> i64 {
+    pub(super) fn sys_sendmsg(&self, net: &mut Net, cx: &mut ServiceCtx, fd: u64, msg: u64, flags: u64, mem: &GuestMemory) -> i64 {
         let Some(hdr) = MsgHdr::read(mem, msg) else {
             return err(Errno::EFAULT);
         };
@@ -1421,17 +1421,17 @@ impl Kernel {
             }
         }
         let _ = flags;
-        self.send_bytes(sh, cx, fd, &data, hdr.name, u64::from(hdr.namelen), mem)
+        self.send_bytes(net, cx, fd, &data, hdr.name, u64::from(hdr.namelen), mem)
     }
 
     /// `sendmmsg(fd, msgvec, vlen, flags)` — send an array of `struct mmsghdr`
     /// `{ msghdr msg_hdr; u32 msg_len }` (64 bytes each), writing each sent
     /// byte count back into `msg_len`. Returns the number of messages sent.
-    pub(super) fn sys_sendmmsg(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, msgvec: u64, vlen: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_sendmmsg(&self, net: &mut Net, cx: &mut ServiceCtx, fd: u64, msgvec: u64, vlen: u64, mem: &mut GuestMemory) -> i64 {
         let mut sent = 0i64;
         for i in 0..vlen {
             let ent = msgvec + i * 64;
-            let r = self.sys_sendmsg(sh, cx, fd, ent, 0, mem);
+            let r = self.sys_sendmsg(net, cx, fd, ent, 0, mem);
             if r < 0 {
                 return if sent > 0 { sent } else { r };
             }
@@ -1446,11 +1446,11 @@ impl Kernel {
     /// Returns the number of messages received (stops at the first that would
     /// block, like the real syscall).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn sys_recvmmsg(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, msgvec: u64, vlen: u64, flags: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_recvmmsg(&self, net: &mut Net, cx: &mut ServiceCtx, fd: u64, msgvec: u64, vlen: u64, flags: u64, mem: &mut GuestMemory) -> i64 {
         let mut got = 0i64;
         for i in 0..vlen {
             let ent = msgvec + i * 64;
-            let r = self.sys_recvmsg(sh, cx, fd, ent, flags, mem);
+            let r = self.sys_recvmsg(net, cx, fd, ent, flags, mem);
             if r < 0 {
                 // EAGAIN after at least one message is a normal stop, not an error.
                 if got > 0 { return got; }
@@ -1468,7 +1468,7 @@ impl Kernel {
     /// `msg_name`/`msg_namelen` (source address) and `msg_flags`. Control data
     /// is not modeled: `msg_controllen` is cleared.
     pub(super) fn sys_recvmsg(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         fd: u64,
         msg: u64,
         flags: u64,
@@ -1499,7 +1499,7 @@ impl Kernel {
         // Instead gather into a host Vec by receiving into the largest single
         // iovec repeatedly is also wrong for datagrams. So: receive once into
         // a host buffer via a dedicated helper.
-        let (src, mut got, msg_flags) = match self.recv_message(sh, cx, fd, total, flags) {
+        let (src, mut got, msg_flags) = match self.recv_message(net, cx, fd, total, flags) {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -1523,7 +1523,7 @@ impl Kernel {
         if hdr.name != 0 && hdr.namelen > 0 {
             let domain = self
                 .sock_of(cx, fd)
-                .map_or(AF_INET, |(s, _)| sh.net.socks[s].domain);
+                .map_or(AF_INET, |(s, _)| net.socks[s].domain);
             write_sockaddr(mem, hdr.name, msg + 8, domain, src.as_ref());
         }
         // msg_controllen := 0 (offset 40), msg_flags := msg_flags (offset 48).
@@ -1537,7 +1537,7 @@ impl Kernel {
     /// shared core of `recvmsg`, factored out of `recvfrom` so both can drive
     /// the netlink / stream / datagram paths without a guest bounce buffer.
     fn recv_message(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         fd: u64,
         cap: u64,
         flags: u64,
@@ -1545,10 +1545,10 @@ impl Kernel {
         let Some((sock, end)) = self.sock_of(cx, fd) else {
             return Err(err(Errno::ENOTSOCK));
         };
-        match &sh.net.socks[sock].kind {
+        match &net.socks[sock].kind {
             Kind::Netlink(_) => {
-                let nonblock = sh.net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
-                match self.drain_netlink(sh, sock, cap as usize) {
+                let nonblock = net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
+                match self.drain_netlink(net, sock, cap as usize) {
                     Some(data) => Ok((None, data, 0)),
                     None => {
                         if nonblock {
@@ -1561,8 +1561,8 @@ impl Kernel {
                 }
             }
             Kind::Dgram(_) => {
-                let nonblock = sh.net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
-                match self.recv_dgram_msg(sh, sock, flags) {
+                let nonblock = net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
+                match self.recv_dgram_msg(net, sock, flags) {
                     Some((from, mut data)) => {
                         let truncated = data.len() as u64 > cap;
                         data.truncate(cap as usize);
@@ -1580,8 +1580,8 @@ impl Kernel {
                 }
             }
             Kind::Host(_) => {
-                let bytes = self.host_recv(sh, cx, sock, cap as usize, flags & MSG_DONTWAIT != 0)?;
-                let peer = match &sh.net.socks[sock].kind {
+                let bytes = self.host_recv(net, cx, sock, cap as usize, flags & MSG_DONTWAIT != 0)?;
+                let peer = match &net.socks[sock].kind {
                     Kind::Host(h) => Some(Addr::Inet(h.peer)),
                     _ => None,
                 };
@@ -1591,10 +1591,10 @@ impl Kernel {
                 // Stream: pull bytes directly out of the inbound queue (the
                 // flag-aware `recv_stream` writes to guest memory, so replicate
                 // its dequeue here against a host buffer instead).
-                let data = self.recv_stream_bytes(sh, cx, sock, end, cap, flags);
+                let data = self.recv_stream_bytes(net, cx, sock, end, cap, flags);
                 match data {
                     Ok(bytes) => {
-                        let peer = match &sh.net.socks[sock].kind {
+                        let peer = match &net.socks[sock].kind {
                             Kind::Pair(p) => p.addrs[1 - end].map(Addr::Inet),
                             _ => None,
                         };
@@ -1609,12 +1609,12 @@ impl Kernel {
     /// Pop (or, for `MSG_PEEK`, peek at) datagram socket `sock`'s next queued
     /// inbound `(source, payload)`. A pure query: the caller decides the
     /// block/`EAGAIN` behavior when this returns `None` (an empty queue).
-    fn recv_dgram_msg(&self, sh: &mut Shared, sock: usize, flags: u64) -> Option<(InetAddr, Vec<u8>)> {
+    fn recv_dgram_msg(&self, net: &mut Net, sock: usize, flags: u64) -> Option<(InetAddr, Vec<u8>)> {
         // Pull any host-arrived datagrams (egress replies, e.g. DNS) into the
         // queue first, so they're visible to this dequeue.
-        self.host_udp_drain(sh, sock);
+        self.host_udp_drain(net, sock);
         let peek = flags & MSG_PEEK != 0;
-        match &mut sh.net.socks[sock].kind {
+        match &mut net.socks[sock].kind {
             Kind::Dgram(d) if peek => d.queue.front().cloned(),
             Kind::Dgram(d) => d.queue.pop_front(),
             _ => unreachable!("checked by caller"),
@@ -1631,16 +1631,16 @@ impl Kernel {
     /// and [`Self::recv_dgram_msg`] instead, which are flag-aware.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn read_socket(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         sock: usize,
         end: usize,
         buf: u64,
         count: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        if matches!(sh.net.socks[sock].kind, Kind::Dgram(_)) {
-            let nonblock = sh.net.socks[sock].nonblock;
-            let Some((_, data)) = self.recv_dgram_msg(sh, sock, 0) else {
+        if matches!(net.socks[sock].kind, Kind::Dgram(_)) {
+            let nonblock = net.socks[sock].nonblock;
+            let Some((_, data)) = self.recv_dgram_msg(net, sock, 0) else {
                 if nonblock {
                     return err(Errno::EAGAIN);
                 }
@@ -1653,9 +1653,9 @@ impl Kernel {
             }
             return n as i64;
         }
-        if matches!(sh.net.socks[sock].kind, Kind::Netlink(_)) {
-            let nonblock = sh.net.socks[sock].nonblock;
-            let Some(data) = self.drain_netlink(sh, sock, count as usize) else {
+        if matches!(net.socks[sock].kind, Kind::Netlink(_)) {
+            let nonblock = net.socks[sock].nonblock;
+            let Some(data) = self.drain_netlink(net, sock, count as usize) else {
                 if nonblock {
                     return err(Errno::EAGAIN);
                 }
@@ -1667,8 +1667,8 @@ impl Kernel {
             }
             return data.len() as i64;
         }
-        if matches!(sh.net.socks[sock].kind, Kind::Host(_)) {
-            return match self.host_recv(sh, cx, sock, count as usize, false) {
+        if matches!(net.socks[sock].kind, Kind::Host(_)) {
+            return match self.host_recv(net, cx, sock, count as usize, false) {
                 Ok(data) => {
                     if mem.write(buf, &data).is_err() {
                         return err(Errno::EFAULT);
@@ -1678,7 +1678,7 @@ impl Kernel {
                 Err(e) => e,
             };
         }
-        self.recv_stream(sh, cx, sock, end, buf, count, mem, 0)
+        self.recv_stream(net, cx, sock, end, buf, count, mem, 0)
     }
 
     /// Read up to `cap` bytes from a host-bridged stream socket. `Ok(bytes)`
@@ -1686,8 +1686,8 @@ impl Kernel {
     /// side has no data yet and the socket is blocking, sets `self.block` and
     /// returns `Ok(empty)` so the caller returns 0 and the guest re-traps.
     #[allow(clippy::unused_self)]
-    fn host_recv(&self, sh: &mut Shared, cx: &mut ServiceCtx, sock: usize, cap: usize, force_nonblock: bool) -> Result<Vec<u8>, i64> {
-        let Kind::Host(h) = &mut sh.net.socks[sock].kind else {
+    fn host_recv(&self, net: &mut Net, cx: &mut ServiceCtx, sock: usize, cap: usize, force_nonblock: bool) -> Result<Vec<u8>, i64> {
+        let Kind::Host(h) = &mut net.socks[sock].kind else {
             return Err(err(Errno::EINVAL));
         };
         let nonblock = h.nonblock || force_nonblock;
@@ -1719,8 +1719,8 @@ impl Kernel {
     /// truncated to `want` bytes and dropped from the queue (datagram
     /// semantics: an oversized read is truncated, not left partially queued).
     #[allow(clippy::unused_self)]
-    fn drain_netlink(&self, sh: &mut Shared, sock: usize, want: usize) -> Option<Vec<u8>> {
-        let Kind::Netlink(nl) = &mut sh.net.socks[sock].kind else {
+    fn drain_netlink(&self, net: &mut Net, sock: usize, want: usize) -> Option<Vec<u8>> {
+        let Kind::Netlink(nl) = &mut net.socks[sock].kind else {
             unreachable!("checked by caller")
         };
         if nl.queue.is_empty() {
@@ -1753,7 +1753,7 @@ impl Kernel {
     /// empty + peer open -> block (or `EAGAIN`); empty + peer closed -> EOF.
     #[allow(clippy::too_many_arguments)]
     fn recv_stream(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         sock: usize,
         end: usize,
         buf: u64,
@@ -1761,8 +1761,8 @@ impl Kernel {
         mem: &mut GuestMemory,
         flags: u64,
     ) -> i64 {
-        if matches!(sh.net.socks[sock].kind, Kind::Host(_)) {
-            return match self.host_recv(sh, cx, sock, count as usize, flags & MSG_DONTWAIT != 0) {
+        if matches!(net.socks[sock].kind, Kind::Host(_)) {
+            return match self.host_recv(net, cx, sock, count as usize, flags & MSG_DONTWAIT != 0) {
                 Ok(data) => {
                     if mem.write(buf, &data).is_err() {
                         return err(Errno::EFAULT);
@@ -1772,7 +1772,7 @@ impl Kernel {
                 Err(e) => e,
             };
         }
-        let (shut_rd, avail, peer_open, nonblock) = match &sh.net.socks[sock].kind {
+        let (shut_rd, avail, peer_open, nonblock) = match &net.socks[sock].kind {
             Kind::Pair(p) => (
                 p.shut_rd[end],
                 p.to[end].len(),
@@ -1799,7 +1799,7 @@ impl Kernel {
             return 0;
         }
         let peek = flags & MSG_PEEK != 0;
-        let data: Vec<u8> = match &mut sh.net.socks[sock].kind {
+        let data: Vec<u8> = match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
                 let n = (count as usize).min(p.to[end].len());
                 if peek {
@@ -1821,13 +1821,13 @@ impl Kernel {
     /// than writing one guest region). Same block/`EAGAIN`/EOF semantics.
     #[allow(clippy::unused_self)]
     fn recv_stream_bytes(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self, net: &mut Net, cx: &mut ServiceCtx,
         sock: usize,
         end: usize,
         count: u64,
         flags: u64,
     ) -> Result<Vec<u8>, i64> {
-        let (shut_rd, avail, peer_open, nonblock) = match &sh.net.socks[sock].kind {
+        let (shut_rd, avail, peer_open, nonblock) = match &net.socks[sock].kind {
             Kind::Pair(p) => (
                 p.shut_rd[end],
                 p.to[end].len(),
@@ -1849,7 +1849,7 @@ impl Kernel {
             return Ok(Vec::new());
         }
         let peek = flags & MSG_PEEK != 0;
-        match &mut sh.net.socks[sock].kind {
+        match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
                 let n = (count as usize).min(p.to[end].len());
                 Ok(if peek {
@@ -1868,28 +1868,28 @@ impl Kernel {
     /// requires a `connect`-ed peer, else `ENOTCONN`) and delivers
     /// fire-and-forget, like real UDP: no error if nothing is bound at the
     /// peer's port. Mirrors `write_pipe`.
-    pub(super) fn write_socket(&self, sh: &mut Shared, cx: &mut ServiceCtx, sock: usize, end: usize, data: &[u8]) -> i64 {
-        if matches!(sh.net.socks[sock].kind, Kind::Netlink(_)) {
-            return self.handle_netlink_request(sh, sock, data);
+    pub(super) fn write_socket(&self, net: &mut Net, cx: &mut ServiceCtx, sock: usize, end: usize, data: &[u8]) -> i64 {
+        if matches!(net.socks[sock].kind, Kind::Netlink(_)) {
+            return self.handle_netlink_request(net, sock, data);
         }
-        if matches!(sh.net.socks[sock].kind, Kind::Dgram(_)) {
-            let peer = match &sh.net.socks[sock].kind {
+        if matches!(net.socks[sock].kind, Kind::Dgram(_)) {
+            let peer = match &net.socks[sock].kind {
                 Kind::Dgram(d) => d.peer,
                 _ => unreachable!("checked above"),
             };
             let Some(peer) = peer else {
                 return err(Errno::ENOTCONN);
             };
-            let src = self.ensure_dgram_bound(sh, sock);
+            let src = self.ensure_dgram_bound(net, sock);
             let key = route_key("udp", peer);
-            if let Some(&tgt) = sh.net.dgram_ports.get(&key)
-                && let Kind::Dgram(td) = &mut sh.net.socks[tgt].kind
+            if let Some(&tgt) = net.dgram_ports.get(&key)
+                && let Kind::Dgram(td) = &mut net.socks[tgt].kind
             {
                 td.queue.push_back((src, data.to_vec()));
             }
             return data.len() as i64;
         }
-        if let Kind::Host(h) = &mut sh.net.socks[sock].kind {
+        if let Kind::Host(h) = &mut net.socks[sock].kind {
             if h.wr_shut {
                 return err(Errno::EPIPE);
             }
@@ -1907,7 +1907,7 @@ impl Kernel {
                 Err(_) => err(Errno::ECONNRESET),
             };
         }
-        match &mut sh.net.socks[sock].kind {
+        match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
                 if p.shut_wr[end] || p.refs[1 - end] == 0 {
                     return err(Errno::EPIPE);
@@ -1926,8 +1926,8 @@ impl Kernel {
     /// queue for a later `recv` to drain. Returns `data.len()` (the whole
     /// request was consumed), matching a real `write`/`send`.
     #[allow(clippy::unused_self)]
-    fn handle_netlink_request(&self, sh: &mut Shared, sock: usize, data: &[u8]) -> i64 {
-        let pid = match &sh.net.socks[sock].kind {
+    fn handle_netlink_request(&self, net: &mut Net, sock: usize, data: &[u8]) -> i64 {
+        let pid = match &net.socks[sock].kind {
             Kind::Netlink(nl) => nl.pid,
             _ => 0,
         };
@@ -1976,7 +1976,7 @@ impl Kernel {
                     pid,
                 )]
             };
-            if let Kind::Netlink(nl) = &mut sh.net.socks[sock].kind {
+            if let Kind::Netlink(nl) = &mut net.socks[sock].kind {
                 nl.queue.extend(replies);
             }
             offset += nlmsg_align(nlmsg_len);
@@ -2899,20 +2899,20 @@ mod tests {
         let b_addr = 0x1_1100;
         write_sockaddr_in(&mut mem, b_addr, [127, 0, 0, 1], 9200);
 
-        let a = k.sys_socket(&mut k.shared.lock().unwrap(), &mut cx, 2, 2, 0) as u64; // AF_INET, SOCK_DGRAM
-        let b = k.sys_socket(&mut k.shared.lock().unwrap(), &mut cx, 2, 2, 0) as u64;
-        assert_eq!(k.sys_bind(&mut k.shared.lock().unwrap(), &mut cx, a, a_addr, 16, &mem), 0);
-        assert_eq!(k.sys_bind(&mut k.shared.lock().unwrap(), &mut cx, b, b_addr, 16, &mem), 0);
+        let a = k.sys_socket(&mut k.net.lock().unwrap(), &mut cx, 2, 2, 0) as u64; // AF_INET, SOCK_DGRAM
+        let b = k.sys_socket(&mut k.net.lock().unwrap(), &mut cx, 2, 2, 0) as u64;
+        assert_eq!(k.sys_bind(&mut k.net.lock().unwrap(), &mut cx, a, a_addr, 16, &mem), 0);
+        assert_eq!(k.sys_bind(&mut k.net.lock().unwrap(), &mut cx, b, b_addr, 16, &mem), 0);
 
         let msg = 0x1_1200;
         mem.write_init(msg, b"hello").unwrap();
-        assert_eq!(k.sys_sendto(&mut k.shared.lock().unwrap(), &mut cx, a, msg, 5, 0, b_addr, 16, &mem), 5);
+        assert_eq!(k.sys_sendto(&mut k.net.lock().unwrap(), &mut cx, a, msg, 5, 0, b_addr, 16, &mem), 5);
 
         let out = 0x1_1300;
         let src = 0x1_1400;
         let srclen = 0x1_1500;
         mem.write_init(srclen, &16u32.to_le_bytes()).unwrap();
-        assert_eq!(k.sys_recvfrom(&mut k.shared.lock().unwrap(), &mut cx, b, out, 5, 0, src, srclen, &mut mem), 5);
+        assert_eq!(k.sys_recvfrom(&mut k.net.lock().unwrap(), &mut cx, b, out, 5, 0, src, srclen, &mut mem), 5);
         assert_eq!(mem.read_vec(out, 5).unwrap(), b"hello");
         assert_eq!(read_port(&mem, src), 9100); // source is A's bound port
         assert_eq!(mem.read_vec(src, 8).unwrap()[4..8], [127, 0, 0, 1]);
@@ -2924,21 +2924,21 @@ mod tests {
         let addr = 0x1_1000;
         write_sockaddr_in(&mut mem, addr, [127, 0, 0, 1], 9500);
 
-        let a = k.sys_socket(&mut k.shared.lock().unwrap(), &mut cx, 2, 1, 0) as u64;
-        assert_eq!(k.sys_bind(&mut k.shared.lock().unwrap(), &mut cx, a, addr, 16, &mem), 0);
+        let a = k.sys_socket(&mut k.net.lock().unwrap(), &mut cx, 2, 1, 0) as u64;
+        assert_eq!(k.sys_bind(&mut k.net.lock().unwrap(), &mut cx, a, addr, 16, &mem), 0);
 
-        let b = k.sys_socket(&mut k.shared.lock().unwrap(), &mut cx, 2, 1, 0) as u64;
+        let b = k.sys_socket(&mut k.net.lock().unwrap(), &mut cx, 2, 1, 0) as u64;
         // Without SO_REUSEADDR, binding the same port fails.
-        assert_eq!(k.sys_bind(&mut k.shared.lock().unwrap(), &mut cx, b, addr, 16, &mem), -i64::from(Errno::EINVAL.0));
+        assert_eq!(k.sys_bind(&mut k.net.lock().unwrap(), &mut cx, b, addr, 16, &mem), -i64::from(Errno::EINVAL.0));
 
         // Setting SO_REUSEADDR=1 on b lets the rebind through.
         let optval = 0x1_1600;
         mem.write_init(optval, &1u32.to_le_bytes()).unwrap();
         assert_eq!(
-            k.sys_setsockopt(&mut k.shared.lock().unwrap(), &mut cx, b, SOL_SOCKET, SO_REUSEADDR, optval, 4, &mem),
+            k.sys_setsockopt(&mut k.net.lock().unwrap(), &mut cx, b, SOL_SOCKET, SO_REUSEADDR, optval, 4, &mem),
             0
         );
-        assert_eq!(k.sys_bind(&mut k.shared.lock().unwrap(), &mut cx, b, addr, 16, &mem), 0);
+        assert_eq!(k.sys_bind(&mut k.net.lock().unwrap(), &mut cx, b, addr, 16, &mem), 0);
     }
 
     #[test]
@@ -2991,17 +2991,17 @@ mod tests {
     #[test]
     fn setsockopt_getsockopt_rcvbuf_and_reuseaddr_roundtrip() {
         let (k, mut mem, _v, mut cx) = setup();
-        let s = k.sys_socket(&mut k.shared.lock().unwrap(), &mut cx, 2, 1, 0) as u64; // AF_INET, SOCK_STREAM
+        let s = k.sys_socket(&mut k.net.lock().unwrap(), &mut cx, 2, 1, 0) as u64; // AF_INET, SOCK_STREAM
 
         let optval = 0x1_1000;
         mem.write_init(optval, &65_536u32.to_le_bytes()).unwrap();
         assert_eq!(
-            k.sys_setsockopt(&mut k.shared.lock().unwrap(), &mut cx, s, SOL_SOCKET, SO_RCVBUF, optval, 4, &mem),
+            k.sys_setsockopt(&mut k.net.lock().unwrap(), &mut cx, s, SOL_SOCKET, SO_RCVBUF, optval, 4, &mem),
             0
         );
         mem.write_init(optval, &1u32.to_le_bytes()).unwrap();
         assert_eq!(
-            k.sys_setsockopt(&mut k.shared.lock().unwrap(), &mut cx, s, SOL_SOCKET, SO_REUSEADDR, optval, 4, &mem),
+            k.sys_setsockopt(&mut k.net.lock().unwrap(), &mut cx, s, SOL_SOCKET, SO_REUSEADDR, optval, 4, &mem),
             0
         );
 
@@ -3009,14 +3009,14 @@ mod tests {
         let outlen = 0x1_1200;
         mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
         assert_eq!(
-            k.sys_getsockopt(&mut k.shared.lock().unwrap(), &mut cx, s, SOL_SOCKET, SO_RCVBUF, out, outlen, &mut mem),
+            k.sys_getsockopt(&mut k.net.lock().unwrap(), &mut cx, s, SOL_SOCKET, SO_RCVBUF, out, outlen, &mut mem),
             0
         );
         assert_eq!(mem.read_u32(out).unwrap(), 65_536);
 
         mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
         assert_eq!(
-            k.sys_getsockopt(&mut k.shared.lock().unwrap(), &mut cx, s, SOL_SOCKET, SO_REUSEADDR, out, outlen, &mut mem),
+            k.sys_getsockopt(&mut k.net.lock().unwrap(), &mut cx, s, SOL_SOCKET, SO_REUSEADDR, out, outlen, &mut mem),
             0
         );
         assert_eq!(mem.read_u32(out).unwrap(), 1);
@@ -3044,7 +3044,7 @@ mod tests {
         let outlen = 0x1_1200;
         mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
         assert_eq!(
-            k.sys_getsockopt(&mut k.shared.lock().unwrap(), &mut cx, srv, SOL_SOCKET, SO_ACCEPTCONN, out, outlen, &mut mem),
+            k.sys_getsockopt(&mut k.net.lock().unwrap(), &mut cx, srv, SOL_SOCKET, SO_ACCEPTCONN, out, outlen, &mut mem),
             0
         );
         assert_eq!(mem.read_u32(out).unwrap(), 0, "not listening yet");
@@ -3063,7 +3063,7 @@ mod tests {
 
         mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
         assert_eq!(
-            k.sys_getsockopt(&mut k.shared.lock().unwrap(), &mut cx, srv, SOL_SOCKET, SO_ACCEPTCONN, out, outlen, &mut mem),
+            k.sys_getsockopt(&mut k.net.lock().unwrap(), &mut cx, srv, SOL_SOCKET, SO_ACCEPTCONN, out, outlen, &mut mem),
             0
         );
         assert_eq!(mem.read_u32(out).unwrap(), 1, "listening");
@@ -3096,9 +3096,9 @@ mod tests {
 
         let out = 0x1_2000;
         // Two MSG_PEEK reads in a row see the same bytes: nothing is consumed.
-        assert_eq!(k.sys_recvfrom(&mut k.shared.lock().unwrap(), &mut cx, b, out, 6, MSG_PEEK, 0, 0, &mut mem), 6);
+        assert_eq!(k.sys_recvfrom(&mut k.net.lock().unwrap(), &mut cx, b, out, 6, MSG_PEEK, 0, 0, &mut mem), 6);
         assert_eq!(mem.read_vec(out, 6).unwrap(), b"peekme");
-        assert_eq!(k.sys_recvfrom(&mut k.shared.lock().unwrap(), &mut cx, b, out, 6, MSG_PEEK, 0, 0, &mut mem), 6);
+        assert_eq!(k.sys_recvfrom(&mut k.net.lock().unwrap(), &mut cx, b, out, 6, MSG_PEEK, 0, 0, &mut mem), 6);
         assert_eq!(mem.read_vec(out, 6).unwrap(), b"peekme");
 
         // A real (non-peek) read now drains it...
