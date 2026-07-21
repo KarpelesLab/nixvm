@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 
 use super::net::Net;
-use super::{Fd, Kernel, ServiceCtx, Shared, err};
+use super::{Fd, Kernel, Pipe, ServiceCtx, Shared, err};
 use crate::abi::Arch;
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
@@ -151,10 +151,11 @@ impl Kernel {
     /// The readiness mask (`POLLIN`/`POLLOUT`/`POLLERR`/`POLLHUP`/`POLLNVAL`)
     /// of guest fd `fd_num` right now. `POLLNVAL` if the fd is not open.
     ///
-    /// Takes both `sh` and `net`: socket readiness lives in `net`, everything
-    /// else (pipes/eventfds/timerfds) in `sh`. Callers acquire `net` once around
-    /// the whole scan — always *after* `sh` (sh → net order) — and pass both in.
-    fn fd_ready(&self, sh: &mut Shared, net: &mut Net, cx: &mut ServiceCtx, fd_num: i32) -> u32 {
+    /// Takes `sh`, `net`, and `pipes`: socket readiness lives in `net`, pipe
+    /// readiness in `pipes`, everything else (eventfds/timerfds) in `sh`.
+    /// Callers acquire `net` then `pipes` once around the whole scan — always
+    /// *after* `sh` (strict order sh → net → pipes) — and pass all three in.
+    fn fd_ready(&self, sh: &mut Shared, net: &mut Net, pipes: &[Pipe], cx: &mut ServiceCtx, fd_num: i32) -> u32 {
         let Some(fd) = cx.cur.fds.get(fd_num).cloned() else {
             return POLLNVAL;
         };
@@ -169,7 +170,7 @@ impl Kernel {
             // their queues aren't observable from here.
             Fd::Socket { sock, .. } => self.host_socket_readiness(net, sock).unwrap_or(POLLIN | POLLOUT),
             Fd::PipeRead(i) => {
-                let p = &sh.pipes[i];
+                let p = &pipes[i];
                 if !p.buf.is_empty() {
                     POLLIN
                 } else if p.writers == 0 {
@@ -179,7 +180,7 @@ impl Kernel {
                 }
             }
             Fd::PipeWrite(i) => {
-                if sh.pipes[i].readers == 0 {
+                if pipes[i].readers == 0 {
                     POLLERR
                 } else {
                     POLLOUT
@@ -265,15 +266,17 @@ impl Kernel {
             entries.push((addr, fd_raw as i32, events));
         }
 
-        // Socket readiness lives in `net`: take it once for the whole scan,
-        // after `sh` (sh → net order), and drop it when the loop ends.
+        // Socket readiness lives in `net`, pipe readiness in `pipes`: take both
+        // once for the whole scan, after `sh` and in order (sh → net → pipes),
+        // and drop them when the loop ends.
         let mut net = self.net.lock().unwrap();
+        let pipes = self.pipes.lock().unwrap();
         let mut ready_count = 0i64;
         for (addr, fd, events) in entries {
             let revents = if fd < 0 {
                 0
             } else {
-                self.fd_ready(sh, &mut net, cx, fd) & (u32::from(events) | POLLERR | POLLHUP | POLLNVAL)
+                self.fd_ready(sh, &mut net, &pipes, cx, fd) & (u32::from(events) | POLLERR | POLLHUP | POLLNVAL)
             };
             if !write_u16(mem, addr + 6, revents as u16) {
                 return err(Errno::EFAULT);
@@ -343,14 +346,16 @@ impl Kernel {
         let mut wout = vec![false; nfds as usize];
         let mut eout = vec![false; nfds as usize];
         let mut total = 0i64;
-        // Socket readiness lives in `net`: take it once for the whole scan,
-        // after `sh` (sh → net order), and drop it when the loop ends.
+        // Socket readiness lives in `net`, pipe readiness in `pipes`: take both
+        // once for the whole scan, after `sh` and in order (sh → net → pipes),
+        // and drop them when the loop ends.
         let mut net = self.net.lock().unwrap();
+        let pipes = self.pipes.lock().unwrap();
         for fd in 0..nfds as usize {
             if !rbits[fd] && !wbits[fd] && !ebits[fd] {
                 continue;
             }
-            let ready = self.fd_ready(sh, &mut net, cx, fd as i32);
+            let ready = self.fd_ready(sh, &mut net, &pipes, cx, fd as i32);
             if rbits[fd] && ready & (POLLIN | POLLHUP) != 0 {
                 rout[fd] = true;
                 total += 1;
@@ -542,14 +547,16 @@ impl Kernel {
 
         let (_, stride) = self.epoll_event_layout();
         let mut n = 0u64;
-        // Socket readiness lives in `net`: take it once for the whole scan,
-        // after `sh` (sh → net order), and drop it when the loop ends.
+        // Socket readiness lives in `net`, pipe readiness in `pipes`: take both
+        // once for the whole scan, after `sh` and in order (sh → net → pipes),
+        // and drop them when the loop ends.
         let mut net = self.net.lock().unwrap();
+        let pipes = self.pipes.lock().unwrap();
         for (fd, w) in watches {
             if n >= maxevents {
                 break;
             }
-            let ready = self.fd_ready(sh, &mut net, cx, fd) & (w.events | POLLERR | POLLHUP);
+            let ready = self.fd_ready(sh, &mut net, &pipes, cx, fd) & (w.events | POLLERR | POLLHUP);
             if ready == 0 {
                 continue;
             }

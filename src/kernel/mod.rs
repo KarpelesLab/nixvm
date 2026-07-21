@@ -579,16 +579,25 @@ pub struct Kernel {
     /// on the big lock. **Lock order is strict and inviolable: `shared` (sh) is
     /// ALWAYS acquired BEFORE `vfs`; a `vfs` guard is NEVER held while acquiring
     /// `shared`.** Two locks in a consistent order ⇒ no deadlock cycle. The
-    /// per-space memory lock stays outermost (memory → sh → vfs → net).
+    /// per-space memory lock stays outermost (memory → sh → vfs → net → pipes).
     vfs: Mutex<MountTable>,
     /// The network subsystem (`net`), peeled out of the coarse [`Shared`] lock
     /// onto its own sibling lock (step B3) so socket I/O holds only this lock
     /// and other tasks' non-socket syscalls run concurrently on `shared`
-    /// instead of stalling on the big lock. **`net` is the innermost/last lock:
-    /// the order is strict and inviolable — memory → sh → vfs → net. A `net`
-    /// guard is NEVER held while acquiring `shared` or `vfs`.** Handlers that
-    /// need net plus others acquire in order sh → vfs → net.
+    /// instead of stalling on the big lock. **The order is strict and
+    /// inviolable — memory → sh → vfs → net → pipes. A `net` guard is NEVER held
+    /// while acquiring `shared` or `vfs`.** Handlers that need net plus others
+    /// acquire in order sh → vfs → net.
     net: Mutex<Net>,
+    /// The pipe subsystem (`pipes`), peeled out of the coarse [`Shared`] lock
+    /// onto its own sibling lock (step B4) so a pipe read/write holds only this
+    /// lock and other tasks' non-pipe syscalls run concurrently on `shared`
+    /// instead of stalling on the big lock. **`pipes` is the innermost/LAST
+    /// lock: the order is strict and inviolable — memory → sh → vfs → net →
+    /// pipes. A `pipes` guard is NEVER held while acquiring `shared`, `vfs`, or
+    /// `net`.** Handlers that need pipes plus others acquire in order
+    /// sh → (vfs) → net → pipes.
+    pipes: Mutex<Vec<Pipe>>,
 }
 
 /// All kernel state mutated while a syscall is serviced, behind [`Kernel`]'s
@@ -596,7 +605,6 @@ pub struct Kernel {
 /// so a field here is reached as `sh.<field>` instead of `self.<field>`.
 #[allow(clippy::struct_excessive_bools)] // independent one-shot flags, not a state enum
 pub(super) struct Shared {
-    pipes: Vec<Pipe>,
     /// `eventfd2` counters, indexed by [`Fd::Eventfd`].
     eventfds: Vec<EventFdInst>,
     /// `timerfd_create` timers, indexed by [`Fd::Timerfd`].
@@ -826,8 +834,8 @@ impl Kernel {
             interactive: false,
             vfs: Mutex::new(mounts),
             net: Mutex::new(Net::default()),
+            pipes: Mutex::new(Vec::new()),
             shared: Mutex::new(Shared {
-                pipes: Vec::new(),
                 eventfds: Vec::new(),
                 timerfds: Vec::new(),
                 epolls: Vec::new(),
@@ -1697,21 +1705,24 @@ impl Kernel {
         ret
     }
 
-    /// Route a syscall to the lock discipline it needs (steps B2/B3). No lock
+    /// Route a syscall to the lock discipline it needs (steps B2/B3/B4). No lock
     /// is pre-held here — each category acquires exactly the lock(s) it touches,
-    /// always in the strict order `shared` (sh) → `vfs` → `net` (net is last):
+    /// always in the strict order `shared` (sh) → `vfs` → `net` → `pipes`
+    /// (`pipes` is last):
     /// - **net-only** (the pure socket syscalls): take only `net` via
     ///   [`Self::dispatch_net`] — no sh, no vfs.
+    /// - **pipes-only** (`pipe2`): take only `pipes` — no sh, no vfs, no net.
     /// - **fd-polymorphic** (`read`/`write`/`readv`/`writev`): peek the fd type
-    ///   from `cx` (no lock), then take *one* of sh/vfs/net (a file op → vfs, a
-    ///   socket → net, every other target → sh) — never more than one.
+    ///   from `cx` (no lock), then take *one* of sh/vfs/net/pipes (a file op →
+    ///   vfs, a socket → net, a pipe → pipes, every other target → sh) — never
+    ///   more than one.
     /// - **both** (`mmap`/`memfd_create`): take sh then vfs and hold both (they
     ///   mutate `shared` state *and* the mount table atomically). `sendfile`
-    ///   takes sh → vfs, and net too when its destination is a socket.
+    ///   takes sh → vfs, and net (socket dst) or pipes (pipe dst) too, last.
     /// - **vfs-only** (the FS hot path): take only `vfs` via [`Self::dispatch_vfs`].
     /// - **everything else**: take only `sh` via [`Self::dispatch_shared`] (the
-    ///   B1 table; poll/select/epoll additionally take `net` — after sh — for
-    ///   the socket-readiness scan).
+    ///   B1 table; poll/select/epoll additionally take `net` then `pipes` —
+    ///   after sh — for the socket/pipe-readiness scan).
     #[allow(clippy::too_many_lines)]
     fn dispatch_impl(
         &self, cx: &mut ServiceCtx,
@@ -1808,6 +1819,12 @@ impl Kernel {
             | Sysno::Recvmmsg => {
                 let mut net = self.net.lock().unwrap();
                 self.dispatch_net(&mut net, cx, sys, args, mem)
+            }
+            // pipes-only: `pipe2` just allocates a fresh pipe, holding ONLY
+            // `pipes` (the innermost/last lock) — no sh, no vfs, no net.
+            Sysno::Pipe2 => {
+                let mut pipes = self.pipes.lock().unwrap();
+                self.sys_pipe2(&mut pipes, cx, args[0], mem)
             }
             // everything else: a single `sh` lock, running the B1 syscall table.
             _ => {
@@ -1942,9 +1959,10 @@ impl Kernel {
     /// FS / fd-polymorphic / mmap-family arms moved to [`Self::dispatch_impl`]/
     /// [`Self::dispatch_vfs`]. A handler here that *also* needs the mount table
     /// (`execve`, `exit`, `munmap`, …) acquires `vfs` internally — always after
-    /// `sh`, never before. Handlers that also touch `net` (the poll/select/epoll
-    /// readiness scans, `bump_pipe`/`clone`'s socket-refcount bumps) acquire
-    /// `net` internally — always after `sh` (sh → net), never before.
+    /// `sh`, never before. Handlers that also touch `net`/`pipes` (the
+    /// poll/select/epoll readiness scans, `bump_pipe`/`clone`'s pipe- and
+    /// socket-refcount bumps) acquire them internally — always after `sh`
+    /// (sh → net → pipes), never before.
     #[allow(clippy::too_many_lines)] // one arm per syscall; a flat table is clearest.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_shared(
@@ -1980,8 +1998,8 @@ impl Kernel {
             // The guest does not own the host clock: refuse to set it. ptrace
             // is refused too (no debugging surface).
             Sysno::Settimeofday | Sysno::ClockSettime | Sysno::Ptrace => err(Errno::EPERM),
-            Sysno::Close => self.sys_close(sh, cx, args[0] as i32),
-            Sysno::CloseRange => self.sys_close_range(sh, cx, args[0], args[1]),
+            Sysno::Close => self.sys_close(cx, args[0] as i32),
+            Sysno::CloseRange => self.sys_close_range(cx, args[0], args[1]),
             // Credentials: this VM runs as root and models no multi-user
             // policy, so the setters all succeed and the getters report root.
             Sysno::Getresuid | Sysno::Getresgid => {
@@ -2021,9 +2039,8 @@ impl Kernel {
             Sysno::Getxattr | Sysno::Lgetxattr | Sysno::Fgetxattr => err(Errno::ENODATA),
             Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], mem),
             Sysno::Ioctl => err(Errno::ENOTTY),
-            Sysno::Fcntl => self.sys_fcntl(sh, cx, args[0], args[1]),
+            Sysno::Fcntl => self.sys_fcntl(cx, args[0], args[1]),
             Sysno::Futex => self.sys_futex(sh, cx, args, mem),
-            Sysno::Pipe2 => self.sys_pipe2(sh, cx, args[0], mem),
             // Event-notification / readiness syscalls.
             Sysno::Poll => self.sys_poll(sh, cx, args[0], args[1], args[2] as i64, mem),
             Sysno::Ppoll => self.sys_ppoll(sh, cx, args[0], args[1], args[2], args[3], args[4], mem),
@@ -2044,8 +2061,8 @@ impl Kernel {
                 self.sys_timerfd_settime(sh, cx, args[0], args[1], args[2], args[3], mem)
             }
             Sysno::TimerfdGettime => self.sys_timerfd_gettime(sh, cx, args[0], args[1], mem),
-            Sysno::Dup => self.sys_dup(sh, cx, args[0]),
-            Sysno::Dup2 | Sysno::Dup3 => self.sys_dup2(sh, cx, args[0], args[1]),
+            Sysno::Dup => self.sys_dup(cx, args[0]),
+            Sysno::Dup2 | Sysno::Dup3 => self.sys_dup2(cx, args[0], args[1]),
             Sysno::Clone => self.sys_clone(sh, cx, args, vcpu, mem),
             // x86-64's legacy spellings of clone: `fork` is
             // `clone(SIGCHLD, ...)`, `vfork` is `clone(CLONE_VM|CLONE_VFORK|
@@ -2314,18 +2331,23 @@ impl Kernel {
                     _ => {}
                 }
             }
-            for i in r {
-                sh.pipes[i].readers += 1;
-            }
-            for i in w {
-                sh.pipes[i].writers += 1;
-            }
-            // Socket refcounts live in `net`: bump them all under one `net`
-            // guard, acquired *after* `sh` (sh → net order) and released here.
+            // Socket refcounts live in `net`, pipe refcounts in `pipes`: bump
+            // each set under one guard, acquired *after* `sh` and in the strict
+            // order sh → net → pipes (net first, then pipes — the innermost),
+            // each acquired once around its loop and released here.
             if !socks.is_empty() {
                 let mut net = self.net.lock().unwrap();
                 for fd in &socks {
                     net.bump(fd, true);
+                }
+            }
+            if !r.is_empty() || !w.is_empty() {
+                let mut pipes = self.pipes.lock().unwrap();
+                for i in r {
+                    pipes[i].readers += 1;
+                }
+                for i in w {
+                    pipes[i].writers += 1;
                 }
             }
             info.files = sh.file_tables.len();
@@ -2603,10 +2625,10 @@ impl Kernel {
     /// `close_range(first, last, flags)` — close every open fd in `[first,
     /// last]`. `flags` (e.g. `CLOSE_RANGE_CLOEXEC`) is ignored beyond the
     /// close itself.
-    fn sys_close_range(&self, sh: &mut Shared, cx: &mut ServiceCtx, first: u64, last: u64) -> i64 {
+    fn sys_close_range(&self, cx: &mut ServiceCtx, first: u64, last: u64) -> i64 {
         let last = last.min(4095); // bound the sweep to a sane fd ceiling
         for fd in first..=last {
-            let _ = self.sys_close(sh, cx, fd as i32);
+            let _ = self.sys_close(cx, fd as i32);
         }
         0
     }
@@ -2759,7 +2781,7 @@ impl Kernel {
             .any(|p| p.info.files == files && !matches!(p.info.run, RunState::Zombie(_)));
         if !others_share {
             for fd in cx.cur.fds.drain() {
-                self.bump_pipe(sh, &fd, false);
+                self.bump_pipe(&fd, false);
             }
         }
         // Last task of this address space: return its frames to the shared pool
@@ -2798,9 +2820,10 @@ impl Kernel {
             }
             p.info.run = RunState::Zombie(status);
         }
-        // Close each distinct table's fds (`bump_pipe` touches `sh.pipes` and,
-        // for sockets, briefly `net`, so it can't run while borrowing
-        // `sh.procs`). The current task's table
+        // Close each distinct table's fds (`bump_pipe` briefly takes `pipes`
+        // for a pipe fd or `net` for a socket fd — after `sh`, which this holds
+        // — so the fds are collected first, then bumped after the `sh.procs`
+        // borrow ends). The current task's table
         // is checked out into `cur.fds` (its slot is `None`), so it's skipped
         // here and closed by the `sys_exit` tail call.
         let mut to_close: Vec<Fd> = Vec::new();
@@ -2810,7 +2833,7 @@ impl Kernel {
             }
         }
         for fd in to_close {
-            self.bump_pipe(sh, &fd, false);
+            self.bump_pipe(&fd, false);
         }
         // `cx.cur` is this task, taken out of the table for its slice.
         self.sys_exit(sh, cx, code, mem)
@@ -2974,11 +2997,12 @@ impl Kernel {
 
     /// `write(fd, buf, count)` — stdio sinks (fd 1/2), files, and pipes.
     /// `write(fd, buf, count)`. **fd-polymorphic**: a file write touches only
-    /// the mount table (holds just `vfs`); a socket write holds just `net`;
-    /// every other target (stdout/stderr/pipe/eventfd) lives in `shared` (holds
-    /// just `sh`). The fd type is read from `cx` *without a lock*, then exactly
-    /// one of the three locks is taken — never more than one — so a file write
-    /// and another task's non-FS syscall run concurrently.
+    /// the mount table (holds just `vfs`); a socket write holds just `net`; a
+    /// pipe write holds just `pipes`; every other target (stdout/stderr/eventfd)
+    /// lives in `shared` (holds just `sh`). The fd type is read from `cx`
+    /// *without a lock*, then exactly one of the four locks is taken — never
+    /// more than one — so a file write and another task's non-FS syscall run
+    /// concurrently.
     fn sys_write(&self, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &GuestMemory) -> i64 {
         match cx.cur.fds.get(fd as i32) {
             Some(Fd::File { .. }) => {
@@ -2988,6 +3012,10 @@ impl Kernel {
             Some(Fd::Socket { .. }) => {
                 let mut net = self.net.lock().unwrap();
                 self.write_socket_fd(&mut net, cx, fd, buf, count, mem)
+            }
+            Some(Fd::PipeWrite(..)) => {
+                let mut pipes = self.pipes.lock().unwrap();
+                self.write_pipe_fd(&mut pipes, cx, fd, buf, count, mem)
             }
             _ => {
                 let mut sh = self.shared.lock().unwrap();
@@ -3006,6 +3034,18 @@ impl Kernel {
             return err(Errno::EFAULT);
         };
         self.write_socket(net, cx, sock, end, &data)
+    }
+
+    /// The `Fd::PipeWrite` arm of [`Self::sys_write`]/[`Self::sys_writev`]:
+    /// append `count` bytes to the pipe. `pipes`-only.
+    fn write_pipe_fd(&self, pipes: &mut [Pipe], cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &GuestMemory) -> i64 {
+        let Some(Fd::PipeWrite(i)) = cx.cur.fds.get(fd as i32).cloned() else {
+            return err(Errno::EBADF);
+        };
+        let Ok(data) = mem.read_vec(buf, count as usize) else {
+            return err(Errno::EFAULT);
+        };
+        self.write_pipe(pipes, i, &data)
     }
 
     /// The `Fd::File` arm of [`Self::sys_write`]: write `count` bytes at the
@@ -3029,9 +3069,10 @@ impl Kernel {
         }
     }
 
-    /// The non-`File`, non-`Socket` arms of [`Self::sys_write`] (stdout/stderr/
-    /// pipe/eventfd), all backed by `shared`. Sockets go through
-    /// [`Self::write_socket_fd`] under `net`.
+    /// The non-`File`, non-`Socket`, non-`PipeWrite` arms of [`Self::sys_write`]
+    /// (stdout/stderr/eventfd), all backed by `shared`. Sockets go through
+    /// [`Self::write_socket_fd`] under `net`; pipes through
+    /// [`Self::write_pipe_fd`] under `pipes`.
     fn write_shared_fd(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &GuestMemory) -> i64 {
         let Ok(data) = mem.read_vec(buf, count as usize) else {
             return err(Errno::EFAULT);
@@ -3046,15 +3087,14 @@ impl Kernel {
                 Ok(()) => count as i64,
                 Err(_) => err(Errno::EIO),
             },
-            Some(Fd::PipeWrite(i)) => self.write_pipe(sh, i, &data),
             Some(Fd::Eventfd(i)) => self.write_eventfd(sh, cx, i, &data),
             _ => err(Errno::EBADF),
         }
     }
 
     /// `read(fd, buf, count)` — stdin, files, and pipes. **fd-polymorphic**,
-    /// exactly like [`Self::sys_write`]: a file read holds only `vfs`, every
-    /// other source holds only `sh`.
+    /// exactly like [`Self::sys_write`]: a file read holds only `vfs`, a socket
+    /// read only `net`, a pipe read only `pipes`, every other source only `sh`.
     fn sys_read(&self, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
         match cx.cur.fds.get(fd as i32) {
             Some(Fd::File { .. }) => {
@@ -3064,6 +3104,10 @@ impl Kernel {
             Some(Fd::Socket { .. }) => {
                 let mut net = self.net.lock().unwrap();
                 self.read_socket_fd(&mut net, cx, fd, buf, count, mem)
+            }
+            Some(Fd::PipeRead(..)) => {
+                let mut pipes = self.pipes.lock().unwrap();
+                self.read_pipe_fd(&mut pipes, cx, fd, buf, count, mem)
             }
             _ => {
                 let mut sh = self.shared.lock().unwrap();
@@ -3079,6 +3123,17 @@ impl Kernel {
             return err(Errno::EBADF);
         };
         self.read_socket(net, cx, sock, end, buf, count, mem)
+    }
+
+    /// The `Fd::PipeRead` arm of [`Self::sys_read`]/[`Self::sys_readv`]: drain
+    /// up to `count` bytes from the pipe. `pipes`-only. An empty pipe with
+    /// writers still open sets the block flag and returns 0 (the caller drops
+    /// the lock and re-traps) — it never blocks in place holding the lock.
+    fn read_pipe_fd(&self, pipes: &mut [Pipe], cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+        let Some(Fd::PipeRead(i)) = cx.cur.fds.get(fd as i32).cloned() else {
+            return err(Errno::EBADF);
+        };
+        self.read_pipe(pipes, cx, i, buf, count, mem)
     }
 
     /// The `Fd::File` arm of [`Self::sys_read`]: read at the fd's offset and
@@ -3103,9 +3158,10 @@ impl Kernel {
         }
     }
 
-    /// The non-`File`, non-`Socket` arms of [`Self::sys_read`] (stdin/pipe/
-    /// eventfd/timerfd), all backed by `shared`. Sockets go through
-    /// [`Self::read_socket_fd`] under `net`.
+    /// The non-`File`, non-`Socket`, non-`PipeRead` arms of [`Self::sys_read`]
+    /// (stdin/eventfd/timerfd), all backed by `shared`. Sockets go through
+    /// [`Self::read_socket_fd`] under `net`; pipes through
+    /// [`Self::read_pipe_fd`] under `pipes`.
     fn read_shared_fd(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
         match cx.cur.fds.get(fd as i32).cloned() {
             Some(Fd::Stdin) if self.interactive => {
@@ -3137,7 +3193,6 @@ impl Kernel {
                     Err(_) => err(Errno::EIO),
                 }
             }
-            Some(Fd::PipeRead(i)) => self.read_pipe(sh, cx, i, buf, count, mem),
             Some(Fd::Eventfd(i)) => self.read_eventfd(sh, cx, i, buf, count, mem),
             Some(Fd::Timerfd(i)) => self.read_timerfd(sh, cx, i, buf, count, mem),
             _ => err(Errno::EBADF),
@@ -3147,15 +3202,15 @@ impl Kernel {
     /// Read from pipe `i`. Empty with writers still open -> block; empty with no
     /// writers -> EOF (0).
     #[allow(clippy::unused_self)]
-    fn read_pipe(&self, sh: &mut Shared, cx: &mut ServiceCtx, i: usize, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
-        if sh.pipes[i].buf.is_empty() {
-            if sh.pipes[i].writers > 0 {
+    fn read_pipe(&self, pipes: &mut [Pipe], cx: &mut ServiceCtx, i: usize, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+        if pipes[i].buf.is_empty() {
+            if pipes[i].writers > 0 {
                 cx.block = true;
             }
             return 0;
         }
-        let n = count.min(sh.pipes[i].buf.len() as u64) as usize;
-        let data: Vec<u8> = sh.pipes[i].buf.drain(..n).collect();
+        let n = count.min(pipes[i].buf.len() as u64) as usize;
+        let data: Vec<u8> = pipes[i].buf.drain(..n).collect();
         if mem.write(buf, &data).is_err() {
             return err(Errno::EFAULT);
         }
@@ -3164,11 +3219,11 @@ impl Kernel {
 
     /// Write to pipe `i` (`EPIPE` if all readers are gone).
     #[allow(clippy::unused_self)]
-    fn write_pipe(&self, sh: &mut Shared, i: usize, data: &[u8]) -> i64 {
-        if sh.pipes[i].readers == 0 {
+    fn write_pipe(&self, pipes: &mut [Pipe], i: usize, data: &[u8]) -> i64 {
+        if pipes[i].readers == 0 {
             return err(Errno::EPIPE);
         }
-        sh.pipes[i].buf.extend(data.iter().copied());
+        pipes[i].buf.extend(data.iter().copied());
         data.len() as i64
     }
 
@@ -3346,7 +3401,9 @@ impl Kernel {
             },
             Some(Fd::Stdout) => sh.stdout.write_all(&buf).map_or(err(Errno::EIO), |()| buf.len() as i64),
             Some(Fd::Stderr) => sh.stderr.write_all(&buf).map_or(err(Errno::EIO), |()| buf.len() as i64),
-            Some(Fd::PipeWrite(i)) => self.write_pipe(sh, i, &buf),
+            // Destination is a pipe: its buffer lives in `pipes`, taken *after*
+            // sh, vfs (and it never coexists with `net` here) — pipes is last.
+            Some(Fd::PipeWrite(i)) => self.write_pipe(&mut self.pipes.lock().unwrap(), i, &buf),
             // Destination is a socket: its state lives in `net`, taken *after*
             // sh and vfs (sh → vfs → net order) and released with the arm.
             Some(Fd::Socket { sock, end }) => {
@@ -3448,7 +3505,8 @@ impl Kernel {
     fn sys_readv(&self, cx: &mut ServiceCtx, fd: u64, iov: u64, iovcnt: u64, mem: &mut GuestMemory) -> i64 {
         // fd-polymorphic, and atomic across iovecs: peek the fd type once (no
         // lock), then hold a single lock for the whole scatter — a file readv
-        // holds only `vfs`, a socket readv only `net`, every other source `sh`.
+        // holds only `vfs`, a socket readv only `net`, a pipe readv only
+        // `pipes`, every other source `sh`.
         if let Some(Fd::File { .. }) = cx.cur.fds.get(fd as i32) {
             let mut vfs = self.vfs.lock().unwrap();
             let mut total = 0i64;
@@ -3489,6 +3547,28 @@ impl Kernel {
                 total += r;
                 if (r as u64) < len {
                     break; // short read: don't touch the remaining iovecs
+                }
+            }
+            return total;
+        }
+        if let Some(Fd::PipeRead(..)) = cx.cur.fds.get(fd as i32) {
+            let mut pipes = self.pipes.lock().unwrap();
+            let mut total = 0i64;
+            for i in 0..iovcnt {
+                let ent = iov + i * 16;
+                let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
+                    return if total > 0 { total } else { err(Errno::EFAULT) };
+                };
+                if len == 0 {
+                    continue;
+                }
+                let r = self.read_pipe_fd(&mut pipes, cx, fd, base, len, mem);
+                if r < 0 {
+                    return if total > 0 { total } else { r };
+                }
+                total += r;
+                if (r as u64) < len {
+                    break; // short read (or empty pipe): stop scattering
                 }
             }
             return total;
@@ -3562,6 +3642,28 @@ impl Kernel {
             }
             return total;
         }
+        if let Some(Fd::PipeWrite(..)) = cx.cur.fds.get(fd as i32) {
+            let mut pipes = self.pipes.lock().unwrap();
+            let mut total = 0i64;
+            for i in 0..iovcnt {
+                let ent = iov + i * 16;
+                let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
+                    return if total > 0 { total } else { err(Errno::EFAULT) };
+                };
+                if len == 0 {
+                    continue;
+                }
+                let r = self.write_pipe_fd(&mut pipes, cx, fd, base, len, mem);
+                if r < 0 {
+                    return if total > 0 { total } else { r };
+                }
+                total += r;
+                if (r as u64) < len {
+                    break;
+                }
+            }
+            return total;
+        }
         let mut sh = self.shared.lock().unwrap();
         let mut total = 0i64;
         for i in 0..iovcnt {
@@ -3625,7 +3727,7 @@ impl Kernel {
     }
 
     /// `fcntl(fd, cmd, ...)` — the subset real programs need at startup.
-    fn sys_fcntl(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: u64, cmd: u64) -> i64 {
+    fn sys_fcntl(&self, cx: &mut ServiceCtx, fd: u64, cmd: u64) -> i64 {
         const F_DUPFD: u64 = 0;
         const F_GETFL: u64 = 3;
         const F_DUPFD_CLOEXEC: u64 = 1030;
@@ -3639,7 +3741,7 @@ impl Kernel {
         match cmd {
             F_DUPFD | F_DUPFD_CLOEXEC => match cx.cur.fds.get(fd as i32).cloned() {
                 Some(f) => {
-                    self.bump_pipe(sh, &f, true);
+                    self.bump_pipe(&f, true);
                     i64::from(cx.cur.fds.alloc(f))
                 }
                 None => err(Errno::EBADF),
@@ -3698,21 +3800,21 @@ impl Kernel {
     }
 
     /// `close(fd)`.
-    fn sys_close(&self, sh: &mut Shared, cx: &mut ServiceCtx, fd: i32) -> i64 {
+    fn sys_close(&self, cx: &mut ServiceCtx, fd: i32) -> i64 {
         match cx.cur.fds.close(fd) {
             Some(f) => {
-                self.bump_pipe(sh, &f, false);
+                self.bump_pipe(&f, false);
                 0
             }
             None => err(Errno::EBADF),
         }
     }
 
-    /// `pipe2(fds, flags)` — create an anonymous pipe.
+    /// `pipe2(fds, flags)` — create an anonymous pipe. **pipes-only**.
     #[allow(clippy::unused_self)]
-    fn sys_pipe2(&self, sh: &mut Shared, cx: &mut ServiceCtx, fds_ptr: u64, mem: &mut GuestMemory) -> i64 {
-        let idx = sh.pipes.len();
-        sh.pipes.push(Pipe {
+    fn sys_pipe2(&self, pipes: &mut Vec<Pipe>, cx: &mut ServiceCtx, fds_ptr: u64, mem: &mut GuestMemory) -> i64 {
+        let idx = pipes.len();
+        pipes.push(Pipe {
             buf: VecDeque::new(),
             readers: 1,
             writers: 1,
@@ -3729,16 +3831,16 @@ impl Kernel {
     }
 
     /// `dup(oldfd)`.
-    fn sys_dup(&self, sh: &mut Shared, cx: &mut ServiceCtx, oldfd: u64) -> i64 {
+    fn sys_dup(&self, cx: &mut ServiceCtx, oldfd: u64) -> i64 {
         let Some(fd) = cx.cur.fds.get(oldfd as i32).cloned() else {
             return err(Errno::EBADF);
         };
-        self.bump_pipe(sh, &fd, true);
+        self.bump_pipe(&fd, true);
         i64::from(cx.cur.fds.alloc(fd))
     }
 
     /// `dup2`/`dup3(oldfd, newfd)`.
-    fn sys_dup2(&self, sh: &mut Shared, cx: &mut ServiceCtx, oldfd: u64, newfd: u64) -> i64 {
+    fn sys_dup2(&self, cx: &mut ServiceCtx, oldfd: u64, newfd: u64) -> i64 {
         let Some(fd) = cx.cur.fds.get(oldfd as i32).cloned() else {
             return err(Errno::EBADF);
         };
@@ -3746,18 +3848,20 @@ impl Kernel {
             return newfd as i64;
         }
         if let Some(old) = cx.cur.fds.close(newfd as i32) {
-            self.bump_pipe(sh, &old, false);
+            self.bump_pipe(&old, false);
         }
-        self.bump_pipe(sh, &fd, true);
+        self.bump_pipe(&fd, true);
         cx.cur.fds.insert(newfd as i32, fd);
         newfd as i64
     }
 
     /// Adjust the reader/writer refcount of the pipe (or socket) a fd refers to.
-    /// Called with `sh` held; a socket fd's refcount lives in `net`, so this
-    /// briefly takes `self.net` — always *after* `sh` (sh → net order), and no
-    /// other lock is taken under it, so the discipline holds.
-    fn bump_pipe(&self, sh: &mut Shared, fd: &Fd, inc: bool) {
+    /// A pipe fd's refcount lives in `pipes`, a socket fd's in `net`. Called
+    /// with `sh` held by every caller (close/dup/fcntl/clone/exit), so the one
+    /// lock this briefly takes — `pipes` or `net`, never both in a single call
+    /// — is always acquired *after* `sh` (sh → net/pipes order) and released
+    /// here; no other lock is taken under it, so the discipline holds.
+    fn bump_pipe(&self, fd: &Fd, inc: bool) {
         let apply = |n: &mut usize| {
             if inc {
                 *n += 1;
@@ -3766,8 +3870,8 @@ impl Kernel {
             }
         };
         match fd {
-            Fd::PipeRead(i) => apply(&mut sh.pipes[*i].readers),
-            Fd::PipeWrite(i) => apply(&mut sh.pipes[*i].writers),
+            Fd::PipeRead(i) => apply(&mut self.pipes.lock().unwrap()[*i].readers),
+            Fd::PipeWrite(i) => apply(&mut self.pipes.lock().unwrap()[*i].writers),
             Fd::Socket { .. } => self.net.lock().unwrap().bump(fd, inc),
             // Non-refcounted fds (files, stdio, eventfds, …): nothing to adjust.
             _ => {}
