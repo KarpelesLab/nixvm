@@ -74,13 +74,6 @@ pub(super) struct TimerFdInst {
 struct EpollWatch {
     events: u32,
     data: u64,
-    /// For edge-triggered interest (`EPOLLET`): the readiness mask last seen for
-    /// this fd, so `epoll_wait` reports it only on a *rising* edge (a bit that
-    /// was not ready last scan) rather than re-reporting a persistently-ready fd
-    /// on every call — which would busy-spin a guest (e.g. libuv's async
-    /// eventfd) that registered `EPOLLET` and won't re-drain an edge it handled.
-    /// Unused for level-triggered interest.
-    last_ready: u32,
 }
 
 /// One `epoll_create1` instance: fd -> interest, keyed by the watched fd
@@ -526,7 +519,7 @@ impl Kernel {
                 };
                 pf.epolls[idx]
                     .interest
-                    .insert(target, EpollWatch { events, data, last_ready: 0 });
+                    .insert(target, EpollWatch { events, data });
                 0
             }
             EPOLL_CTL_MOD => {
@@ -538,7 +531,7 @@ impl Kernel {
                 };
                 pf.epolls[idx]
                     .interest
-                    .insert(target, EpollWatch { events, data, last_ready: 0 });
+                    .insert(target, EpollWatch { events, data });
                 0
             }
             EPOLL_CTL_DEL => {
@@ -579,39 +572,17 @@ impl Kernel {
         let mut net = self.net.lock().unwrap();
         let pipes = self.pipes.lock().unwrap();
         let mut pf = self.pollfds.lock().unwrap();
-        const EPOLLET: u32 = 0x8000_0000;
         let watches: Vec<(i32, EpollWatch)> = pf.epolls[idx]
             .interest
             .iter()
             .map(|(&fd, &w)| (fd, w))
             .collect();
-        // Compute readiness for every watched fd first: `fd_ready` needs `&mut pf`
-        // (it advances timerfds), so it can't run while an `&mut` into the same
-        // `pf.epolls[idx].interest` is held for the edge-trigger bookkeeping below.
-        let mut computed: Vec<(i32, EpollWatch, u32)> = Vec::with_capacity(watches.len());
         for (fd, w) in watches {
-            let ready = self.fd_ready(&mut net, &pipes, &mut pf, cx, fd) & (w.events | POLLERR | POLLHUP);
-            computed.push((fd, w, ready));
-        }
-        for (fd, w, ready) in computed {
             if n >= maxevents {
                 break;
             }
-            // Edge-triggered (`EPOLLET`): remember the readiness level and report
-            // only a *rising* edge (a bit not ready last scan), so a persistently
-            // ready fd isn't re-reported every wait. When readiness falls (the
-            // guest drained it), the remembered level falls too, re-arming the
-            // next rise. Level-triggered fds report whenever currently ready.
-            let deliver = if w.events & EPOLLET != 0 {
-                let fresh = ready & !w.last_ready;
-                if let Some(e) = pf.epolls[idx].interest.get_mut(&fd) {
-                    e.last_ready = ready;
-                }
-                fresh != 0
-            } else {
-                ready != 0
-            };
-            if !deliver {
+            let ready = self.fd_ready(&mut net, &pipes, &mut pf, cx, fd) & (w.events | POLLERR | POLLHUP);
+            if ready == 0 {
                 continue;
             }
             let addr = events_ptr + n * stride;
