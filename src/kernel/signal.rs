@@ -380,6 +380,11 @@ impl Kernel {
         // A sigsuspend restores its pre-call mask when the handler returns; take
         // it so it isn't double-restored by `deliver_pending_signals`.
         let restore = cx.cur.sigsuspend_prev.take().unwrap_or(cx.cur.blocked);
+        // Async delivery happens at a syscall boundary: the (KVM) vcpu is parked
+        // at CPL0 on the return trampoline. Collapse that to the logical user
+        // state first, so the frame saves the real user rip/rflags (not the
+        // trampoline's `sysretq`) and the handler runs at CPL3, not supervisor.
+        vcpu.settle_syscall_return();
         self.push_sigframe(cx, sig, 0, 0 /* SI_USER */, 0, restore, vcpu, mem)
     }
 
@@ -487,6 +492,12 @@ impl Kernel {
     /// so `uc_mcontext` is at a fixed offset below the current `rsp`.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_rt_sigreturn(&self, cx: &mut ServiceCtx, vcpu: &mut dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
+        // `rt_sigreturn` arrives as a syscall: the (KVM) vcpu is parked at CPL0 on
+        // the return trampoline. Collapse it to CPL3 user mode now; the explicit
+        // rip/sp/rflags restores below then overwrite the rip/rflags this set from
+        // `rcx`/`r11` with the handler's saved context, leaving the guest resuming
+        // the interrupted user code at user privilege rather than supervisor.
+        vcpu.settle_syscall_return();
         // On entry to the restorer, rsp pointed at pretcode; its `ret` popped 8,
         // so uc_mcontext is at rsp + (MCTX_OFF - 8).
         let mctx = vcpu.sp().wrapping_add(MCTX_OFF - 8);

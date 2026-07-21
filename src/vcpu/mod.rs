@@ -211,6 +211,20 @@ pub trait Vcpu: Send {
     /// and TLS, then set the entry PC and initial SP for the new image.
     fn reset(&mut self, entry: u64, sp: u64);
 
+    /// Collapse the syscall-return trampoline into the logical user state — a
+    /// software `sysretq`. A KVM guest servicing a syscall is parked at CPL0 on
+    /// the trampoline's `sysretq` (rip on the trampoline, the user return in
+    /// `rcx` and user flags in `r11`); the host normally lets the guest execute
+    /// that `sysretq` to drop back to CPL3. When the host instead redirects the
+    /// guest elsewhere — into a signal handler, or back out of `rt_sigreturn` —
+    /// `sysretq` never runs, so the vcpu would keep executing user code at CPL0
+    /// (supervisor). This adopts the user context (rip←`rcx`, rflags←`r11`) and
+    /// switches the segments to flat CPL3, exactly as `sysretq` would, so the
+    /// subsequent redirect lands at user privilege. TLS (`fs.base`) is untouched.
+    /// A no-op for the interpreter, which has no trampoline — its pc already sits
+    /// on the post-syscall user instruction at no privilege level.
+    fn settle_syscall_return(&mut self) {}
+
     /// Flush this vcpu's TLB before its next run, because the host modified the
     /// page tables of the address space it is running *without* the guest issuing
     /// an `invlpg`/`mov cr3`. The canonical case is `fork`: making the parent's

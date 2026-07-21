@@ -1213,13 +1213,6 @@ impl Kernel {
                 // each handler needs (sh before vfs). This is what lets other
                 // workers service their own syscalls concurrently (step B2).
                 let ret = self.dispatch(cx, sys, raw, &args, vcpu, mem);
-                // If the syscall edited this address space's page tables in place
-                // (munmap, mprotect, mremap, a copy-on-write copy-in), flush the
-                // running vcpu's TLB so it can't keep using a stale entry for a
-                // now-unmapped or replaced page. No-op for the interpreter.
-                if mem.take_tlb_dirty() {
-                    vcpu.flush_tlb();
-                }
                 // Land the syscall's result in the vcpu *before* delivering any
                 // pending signal: if this syscall is interrupted by a handler
                 // (e.g. `sigsuspend` → `-EINTR`), the `rt_sigframe` must capture
@@ -1231,6 +1224,21 @@ impl Kernel {
                     vcpu.set_syscall_ret(ret as u64);
                 }
                 let delivered = self.deliver_pending_signals(cx, vcpu, mem);
+                // Flush the running vcpu's TLB if the page tables were edited in
+                // place — so it can't keep serving a stale entry for a now-
+                // unmapped, re-protected, or CoW-replaced page. This MUST run
+                // AFTER `deliver_pending_signals`, not before: delivering a signal
+                // writes the handler's `rt_sigframe` onto the guest stack, which
+                // privatizes a copy-on-write-shared stack page (a fresh frame,
+                // remapped). Flushing before delivery would miss that, and the
+                // handler would then run with a stale TLB entry pointing at the
+                // old (still-shared) frame — corrupting memory shared with a
+                // concurrent sibling thread or a not-yet-exec'd forked child (only
+                // visible under SMP, where such a sibling runs at the same time).
+                // No-op for the interpreter (no TLB).
+                if mem.take_tlb_dirty() {
+                    vcpu.flush_tlb();
+                }
                 // A syscall that returns (didn't re-block) has consumed any
                 // timed-wait deadline it set; the next blocking syscall starts
                 // a fresh one.

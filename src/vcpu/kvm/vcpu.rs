@@ -930,6 +930,24 @@ impl Vcpu for KvmVcpu {
         self.cur_cr3 = None;
     }
 
+    fn settle_syscall_return(&mut self) {
+        // Software `sysretq`: what the trampoline's `sysretq` would have done to
+        // return the guest from CPL0 to CPL3 — rip←rcx, rflags←r11, and the flat
+        // user segments. Called when the host is about to redirect the guest away
+        // from that pending `sysretq` (signal delivery / `rt_sigreturn`), so the
+        // handler and the resumed user code run at CPL3 rather than supervisor.
+        self.regs.rip = self.regs.rcx;
+        self.regs.rflags = self.regs.r11;
+        self.regs_dirty = true;
+        self.sregs.cs = user_cs();
+        self.sregs.ss = user_ss();
+        self.sregs.ds = user_ss();
+        self.sregs.es = user_ss();
+        self.sregs_dirty = true;
+        // The trampoline `sysretq` will not run; the syscall is logically done.
+        self.in_syscall = false;
+    }
+
     fn flush_tlb(&mut self) {
         // Arm the cr3-reload dance in `run_once` (a plain same-cr3 `KVM_SET_SREGS`
         // does not flush), so a host-side page-table change (fork's parent CoW
