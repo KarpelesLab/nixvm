@@ -557,12 +557,11 @@ mod tests {
         assert_eq!(space.translate(v2, &phys).unwrap().paddr, f2);
         assert_eq!(space.translate(v3, &phys).unwrap().paddr, f3);
 
+        // `map` transferred each freshly-allocated data frame's single reference
+        // to the page table (it does not incref), so `destroy` frees the four data
+        // frames along with every interior table and the PML4 — nothing is left,
+        // and the test must not free the data frames again.
         space.destroy(&mut fa, &mut phys);
-        // decref the four data frames the test owns (destroy dropped the tree's
-        // reference to them; the test still holds one each).
-        for f in [f0, f1, f2, f3] {
-            fa.free(f);
-        }
         assert_eq!(fa.alloc_count(), 0, "no frames leaked");
     }
 
@@ -773,7 +772,8 @@ mod tests {
         for f in drained {
             fa.free(f);
         }
-        fa.free(d0);
+        // `d0`'s single reference was transferred to the parent's page table by
+        // `map`; `destroy` releases it, so the test must not free it again.
         parent.destroy(&mut fa, &mut phys);
     }
 }
