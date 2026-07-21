@@ -226,7 +226,7 @@ fn detect_arch(elf: &[u8]) -> Option<Arch> {
 /// (native only — the browser has no raw sockets, so this is always `false` on
 /// wasm regardless of the env var; a WebSocket/pktkit transport will hook in
 /// here later).
-fn egress_enabled() -> bool {
+pub(crate) fn egress_enabled() -> bool {
     #[cfg(not(target_arch = "wasm32"))]
     {
         std::env::var_os("NIXVM_NET").is_some_and(|v| v == "host")
@@ -238,7 +238,7 @@ fn egress_enabled() -> bool {
 }
 
 /// Install the host egress backend on `kernel` when [`egress_enabled`].
-fn install_egress(kernel: &mut Kernel) {
+pub(crate) fn install_egress(kernel: &mut Kernel) {
     #[cfg(not(target_arch = "wasm32"))]
     if egress_enabled() {
         kernel.set_egress(Box::new(crate::kernel::egress::HostEgress));

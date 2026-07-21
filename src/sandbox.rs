@@ -349,6 +349,10 @@ impl Sandbox {
         });
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
+        // Bridge guest sockets to the real internet when `NIXVM_NET=host`
+        // (otherwise the VM is loopback-only and routable connects get
+        // ENETUNREACH). No-op unless the env var is set.
+        crate::vm::install_egress(&mut kernel);
         Ok(kernel.run(vcpu, mem)?)
     }
 
@@ -443,6 +447,7 @@ impl Sandbox {
         kernel.set_cwd("/work");
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
+        crate::vm::install_egress(&mut kernel);
         Ok(kernel.run(vcpu, mem)?)
     }
 
@@ -546,13 +551,21 @@ fn open_squashfs(path: &Path) -> Result<Option<Box<dyn MountFs>>, Error> {
 fn preconfigure(mounts: &mut MountTable) {
     let _ = mounts.mkdir("/etc", 0o755);
     let _ = mounts.mkdir("/root", 0o700);
+    // With host egress the guest resolver must reach a real (routable)
+    // nameserver; the loopback-only default (Docker's embedded 127.0.0.11) would
+    // get ENETUNREACH. A root that ships its own resolv.conf is never clobbered.
+    let resolv = if crate::vm::egress_enabled() {
+        "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+    } else {
+        "nameserver 127.0.0.11\n"
+    };
     let files: &[(&str, &str)] = &[
         ("/etc/hostname", "nixvm\n"),
         (
             "/etc/hosts",
             "127.0.0.1\tlocalhost nixvm\n::1\tlocalhost ip6-localhost\n",
         ),
-        ("/etc/resolv.conf", "nameserver 127.0.0.11\n"),
+        ("/etc/resolv.conf", resolv),
         (
             "/etc/os-release",
             "NAME=nixvm\nID=nixvm\nPRETTY_NAME=\"nixvm sandbox\"\nVERSION_ID=0\n",
