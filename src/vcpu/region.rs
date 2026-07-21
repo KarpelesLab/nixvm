@@ -20,7 +20,6 @@
 //! model), so only one actor touches a region at a time — which is what makes
 //! the `Send` impl below sound.
 
-use std::alloc::{self, Layout};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -30,9 +29,46 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const HOST_PAGE: usize = 16384;
 
 /// A raw, zero-filled, `HOST_PAGE`-aligned allocation owning `len` bytes.
+///
+/// On unix the backing is a lazily-committed `mmap(MAP_ANON | MAP_NORESERVE)`, so
+/// a large pool (the guest's physical RAM ceiling — tens of GiB) costs almost
+/// nothing until pages are actually touched: demand paging then faults in one
+/// 4 KiB host page per committed guest frame. An eager `alloc_zeroed` would
+/// `memset` (commit) the whole ceiling up front — gigabytes of resident RAM for
+/// a process that touches a few MiB — so the mmap path is what makes a generous
+/// default pool affordable. (`MADV_NOHUGEPAGE` keeps a sparsely-touched region
+/// from being inflated into 2 MiB THP pages.)
 pub struct Region {
     ptr: *mut u8,
     len: usize,
+    /// On unix, the base and length of the whole `mmap` (which may be larger than
+    /// `[ptr, ptr+len)` to carve out a `HOST_PAGE`-aligned `ptr`); `munmap`ed on
+    /// drop. Unused on the `alloc_zeroed` fallback path.
+    #[cfg(unix)]
+    map: (*mut u8, usize),
+}
+
+#[cfg(unix)]
+mod sys {
+    use std::ffi::c_void;
+    unsafe extern "C" {
+        pub fn mmap(
+            addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64,
+        ) -> *mut c_void;
+        pub fn munmap(addr: *mut c_void, len: usize) -> i32;
+        pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+    }
+    pub const PROT_RW: i32 = 0x1 | 0x2; // PROT_READ | PROT_WRITE
+    pub const MAP_PRIVATE: i32 = 0x2;
+    pub const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
+    #[cfg(target_os = "linux")]
+    pub const MAP_ANON_NORESERVE: i32 = 0x20 | 0x4000; // MAP_ANONYMOUS | MAP_NORESERVE
+    #[cfg(target_os = "linux")]
+    pub const MADV_NOHUGEPAGE: i32 = 18;
+    #[cfg(not(target_os = "linux"))]
+    pub const MAP_ANON_NORESERVE: i32 = 0x1000 | 0x40; // macOS MAP_ANON | MAP_NORESERVE
+    #[cfg(not(target_os = "linux"))]
+    pub const MADV_NOHUGEPAGE: i32 = 0; // no-op advice off Linux
 }
 
 // SAFETY: `Region` owns its allocation uniquely; the raw pointer is never
@@ -43,14 +79,48 @@ unsafe impl Send for Region {}
 
 impl Region {
     /// Allocate `len` bytes — rounded up to a whole number of [`HOST_PAGE`]s and
-    /// never zero — zero-filled and `HOST_PAGE`-aligned.
+    /// never zero — zero-filled and `HOST_PAGE`-aligned. On unix the backing is a
+    /// lazily-committed `mmap` (see the type doc); elsewhere an eager
+    /// `alloc_zeroed`.
+    #[cfg(unix)]
     #[must_use]
     pub fn new(len: usize) -> Self {
+        use std::ffi::c_void;
+        let len = len.next_multiple_of(HOST_PAGE).max(HOST_PAGE);
+        // Over-map by one HOST_PAGE so a HOST_PAGE-aligned base can be carved out
+        // regardless of the page granularity `mmap` aligns to. The slack stays
+        // mapped but untouched — with MAP_NORESERVE it costs no committed memory.
+        let map_len = len + HOST_PAGE;
+        // SAFETY: a fresh anonymous mapping; args are a valid mmap request. The
+        // result is checked against MAP_FAILED before use.
+        let raw = unsafe {
+            sys::mmap(
+                ptr::null_mut(),
+                map_len,
+                sys::PROT_RW,
+                sys::MAP_PRIVATE | sys::MAP_ANON_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert!(raw != sys::MAP_FAILED, "mmap {map_len} bytes of guest RAM failed");
+        let base = (raw as usize).next_multiple_of(HOST_PAGE) as *mut u8;
+        // Best-effort: keep a sparsely-touched pool from being backed by 2 MiB THP
+        // pages (which would commit far more than the guest actually touches).
+        // SAFETY: `[base, base+len)` is within the fresh mapping.
+        unsafe { sys::madvise(base.cast::<c_void>(), len, sys::MADV_NOHUGEPAGE) };
+        Self { ptr: base, len, map: (raw.cast::<u8>(), map_len) }
+    }
+
+    /// Non-unix fallback: an eager, zero-filled, aligned allocation.
+    #[cfg(not(unix))]
+    #[must_use]
+    pub fn new(len: usize) -> Self {
+        use std::alloc::{self, Layout};
         let len = len.next_multiple_of(HOST_PAGE).max(HOST_PAGE);
         let layout = Layout::from_size_align(len, HOST_PAGE).expect("region layout");
-        // SAFETY: `layout` has non-zero size. `alloc_zeroed` returns either a
-        // valid zeroed allocation for `layout` or null, which we route to the
-        // allocator's error handler (abort) rather than dereference.
+        // SAFETY: `layout` has non-zero size; null is routed to the allocator's
+        // error handler rather than dereferenced.
         let ptr = unsafe { alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
             alloc::handle_alloc_error(layout);
@@ -184,7 +254,16 @@ impl Region {
 }
 
 impl Drop for Region {
+    #[cfg(unix)]
     fn drop(&mut self) {
+        // SAFETY: `map` is the exact base/len returned by `mmap` in `new`,
+        // unmapped exactly once here.
+        unsafe { sys::munmap(self.map.0.cast::<std::ffi::c_void>(), self.map.1) };
+    }
+
+    #[cfg(not(unix))]
+    fn drop(&mut self) {
+        use std::alloc::{self, Layout};
         let layout = Layout::from_size_align(self.len, HOST_PAGE).expect("region layout");
         // SAFETY: `ptr` was returned by `alloc_zeroed` with exactly `layout` and
         // is freed exactly once (here, on drop).

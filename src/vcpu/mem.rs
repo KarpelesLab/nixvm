@@ -165,17 +165,34 @@ impl GuestMemory {
     /// [`GuestMemory::exec_reset`] (which rebuilds within it).
     #[must_use]
     pub fn new(base: u64, size: u64) -> Self {
+        // The tied form (virtual bound == physical pool), used by tests.
+        Self::new_split(base, size, size)
+    }
+
+    /// Reserve a guest address space whose *virtual* extent (`[base, base+vsize)`)
+    /// is decoupled from the *physical* RAM pool (`phys_bytes`). A real MMU with
+    /// demand paging needs this: a JS engine (JSC/V8) reserves tens of GiB of
+    /// `MAP_NORESERVE` virtual address space up front but commits (touches) only a
+    /// small working set, so the virtual bound must be large (else the mmap arena
+    /// exhausts and a plain 128 MiB `mmap` fails with `ENOMEM`, which the engine
+    /// treats as unreachable and traps) while the physical pool stays modest and
+    /// is filled on first touch. `vsize` also sizes the per-page metadata vectors
+    /// (~3 bytes/page — 48 MiB for a 64 GiB virtual space), so it is generous, not
+    /// unbounded; the pool bounds the actual committed working set.
+    #[must_use]
+    pub fn new_split(base: u64, vsize: u64, phys_bytes: u64) -> Self {
         assert_eq!(base % PAGE_SIZE, 0, "base must be page-aligned");
-        let size = size.max(PAGE_SIZE).next_multiple_of(HOST_PAGE as u64);
+        let size = vsize.max(PAGE_SIZE).next_multiple_of(HOST_PAGE as u64);
         let npages = (size / PAGE_SIZE) as usize;
 
-        // Pool budget: one frame per guest page, plus a generous interior-table
-        // allowance (a PT per 512 pages, higher levels above that — /64 is ~8×
-        // the worst case for a single tree and comfortably covers a fork's second
-        // tree), the control block, the null frame, and a fixed slack.
-        let data = npages as u64;
-        let tables = data / 64 + 64;
-        let pool_frames = data + tables + ctrl::CTRL_FRAMES + 128;
+        // Pool budget: the physical RAM (`phys_bytes`) holds the committed working
+        // set — one frame per *touched* page — plus interior page tables (a PT per
+        // 512 touched pages; the /16 allowance is generous headroom for sparse
+        // mappings and a fork's second tree), the control block, the null frame,
+        // and slack. This is bounded by physical RAM, NOT the (much larger)
+        // virtual extent — untouched `MAP_NORESERVE` reservations cost no frame.
+        let phys_pages = phys_bytes.next_multiple_of(HOST_PAGE as u64) / PAGE_SIZE;
+        let pool_frames = phys_pages + phys_pages / 16 + ctrl::CTRL_FRAMES + 128;
         let phys = Arc::new(PhysMem::new((pool_frames * PAGE_SIZE) as usize));
 
         let mut fa = FrameAllocator::new(phys.nframes());

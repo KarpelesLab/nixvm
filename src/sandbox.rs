@@ -60,9 +60,17 @@ pub enum RootSource {
 }
 
 /// Default guest RAM ceiling: 512 MiB.
-const DEFAULT_MEM_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_MEM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Guest base address for the flat process address space (Phase 2 refines this).
 const GUEST_BASE: u64 = 0x1_0000;
+/// Virtual extent of the guest address space, decoupled from the physical RAM
+/// pool (`mem_bytes`). A JS engine (JSC/V8, i.e. Bun/Node) reserves tens of GiB
+/// of `MAP_NORESERVE` virtual address space at startup but commits only a small
+/// working set; if the virtual arena is too small a plain `mmap` fails with
+/// `ENOMEM` and the engine traps. 32 GiB comfortably fits that (Bun/JSC needs
+/// >8 GiB), costs only ~24 MiB of per-page metadata, and the pool (physical RAM,
+/// demand-paged, lazily host-committed) bounds the actual footprint.
+const GUEST_VSIZE: u64 = 32 * 1024 * 1024 * 1024;
 
 /// A fully-specified sandbox run.
 #[derive(Debug, Clone)]
@@ -309,7 +317,7 @@ impl Sandbox {
         })?;
 
         let arch = self.config.arch;
-        let mut mem = GuestMemory::new(GUEST_BASE, round_up_page(self.config.mem_bytes));
+        let mut mem = GuestMemory::new_split(GUEST_BASE, GUEST_VSIZE, round_up_page(self.config.mem_bytes));
         let spec = ProcessSpec {
             argv,
             envp: self.env(),
@@ -409,7 +417,7 @@ impl Sandbox {
     /// and embeddable ahead of that.
     pub fn exec_elf(&self, elf: &[u8]) -> Result<i32, Error> {
         let arch = self.config.arch;
-        let mut mem = GuestMemory::new(GUEST_BASE, round_up_page(self.config.mem_bytes));
+        let mut mem = GuestMemory::new_split(GUEST_BASE, GUEST_VSIZE, round_up_page(self.config.mem_bytes));
 
         let argv = if self.config.command.is_empty() {
             vec!["prog".to_string()]
