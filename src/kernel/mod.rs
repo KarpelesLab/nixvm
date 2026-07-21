@@ -106,6 +106,12 @@ struct ProcInfo {
     blocked: u64,
     /// Pending-signal mask (bit `sig-1` set = pending).
     pending: u64,
+    /// While a `sigsuspend` is in progress, the signal mask to restore when it
+    /// returns (POSIX: `sigsuspend` installs a temporary mask, then restores the
+    /// pre-call mask once a signal is delivered). `None` when no `sigsuspend` is
+    /// active. Taken by the delivered handler (used as its `uc_sigmask`) or, if
+    /// the wake was on an ignored signal, restored by `deliver_pending_signals`.
+    sigsuspend_prev: Option<u64>,
     /// Process-group id (`setpgid`/`getpgid`/`getpgrp`). `0` means "not set
     /// yet — defaults to `pid`". Inherited across `fork`.
     pgid: i32,
@@ -167,6 +173,7 @@ impl Default for ProcInfo {
             altstack: (0, 0, SS_DISABLE),
             blocked: 0,
             pending: 0,
+            sigsuspend_prev: None,
             pgid: 0,
             sid: 0,
             parked: false,
@@ -212,6 +219,9 @@ const SA_ONSTACK: u64 = 0x0800_0000;
 /// The synchronous fault signals this kernel can deliver to a handler.
 const SIGILL: u64 = 4;
 const SIGSEGV: u64 = 11;
+/// Sent to a process's parent when a child terminates (so a blocked `wait`
+/// wakes to reap it).
+const SIGCHLD: u64 = 17;
 
 /// One signal's disposition, as `rt_sigaction` records it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1194,7 +1204,17 @@ impl Kernel {
                 if mem.take_tlb_dirty() {
                     vcpu.flush_tlb();
                 }
-                self.deliver_pending_signals(cx);
+                // Land the syscall's result in the vcpu *before* delivering any
+                // pending signal: if this syscall is interrupted by a handler
+                // (e.g. `sigsuspend` → `-EINTR`), the `rt_sigframe` must capture
+                // the real result so `rt_sigreturn` restores it — otherwise the
+                // interrupted syscall would resume with a stale return register.
+                // Skipped when the task re-blocks (re-traps the same syscall) or
+                // exec'd a new image (resumes at its entry, no return value).
+                if !cx.block && !cx.exec_ok {
+                    vcpu.set_syscall_ret(ret as u64);
+                }
+                let delivered = self.deliver_pending_signals(cx, vcpu, mem);
                 // A syscall that returns (didn't re-block) has consumed any
                 // timed-wait deadline it set; the next blocking syscall starts
                 // a fresh one.
@@ -1208,6 +1228,11 @@ impl Kernel {
                     Serviced::Blocked
                 } else if cx.exec_ok {
                     Serviced::Resume // resume the new image at its entry
+                } else if delivered {
+                    // A handler was set up (pc/sp/regs redirected, and the return
+                    // value already written above so its sigframe captured it):
+                    // resume into the handler rather than re-applying the ret.
+                    Serviced::Resume
                 } else {
                     Serviced::SetRet(ret)
                 }
@@ -2130,6 +2155,7 @@ impl Kernel {
                 0
             }
             Sysno::RtSigprocmask => self.sys_rt_sigprocmask(cx, args[0], args[1], args[2], mem),
+            Sysno::RtSigsuspend => self.sys_rt_sigsuspend(cx, args[0], mem),
             Sysno::RtSigpending => self.sys_rt_sigpending(cx, args[0], mem),
             Sysno::RtSigtimedwait => err(Errno::EAGAIN),
             Sysno::Kill | Sysno::Tkill => self.sys_kill(sh, cx, args[0] as i64, args[1]),
@@ -2179,7 +2205,6 @@ impl Kernel {
             | Sysno::Geteuid
             | Sysno::Getgid
             | Sysno::Getegid
-            | Sysno::RtSigsuspend
             | Sysno::SetRobustList
             | Sysno::Fchmodat
             | Sysno::Fchmod
@@ -2838,6 +2863,21 @@ impl Kernel {
             mem.release();
         }
         cx.cur.run = RunState::Zombie(code & 0xff);
+        // Notify the parent: post SIGCHLD and unpark it so a `wait`/`sigsuspend`
+        // blocked for it re-checks and reaps this zombie. A parent that left
+        // SIGCHLD at its default disposition just ignores it (SIGCHLD is in the
+        // default-ignored set); a parent with a handler (the shell) gets it
+        // delivered. `exit_group` funnels through here for the current task, so
+        // this covers both exit paths. (Sibling zombies share our `ppid`, so one
+        // SIGCHLD to the parent is enough to wake its `wait` loop.)
+        let ppid = cx.cur.ppid;
+        for slot in sh.procs.iter_mut().flatten() {
+            if slot.info.pid == ppid {
+                slot.info.pending |= 1u64 << (SIGCHLD - 1);
+                slot.info.parked = false;
+                break;
+            }
+        }
         0
     }
 
@@ -5811,7 +5851,7 @@ mod tests {
         assert_eq!(cx.cur.pending, 1 << 14);
 
         // Default disposition of SIGTERM is TERMINATE -> exit code 128 + 15.
-        k.deliver_pending_signals(&mut cx);
+        k.deliver_pending_signals(&mut cx, &mut v, &mut mem);
         assert!(matches!(cx.cur.run, RunState::Zombie(143)));
     }
 

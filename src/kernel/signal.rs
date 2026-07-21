@@ -9,10 +9,13 @@
 //! saved context when it returns. This is what lets a JIT that faults on purpose
 //! (JSC/V8 use `SIGSEGV` for stack-limit and null checks) run.
 //!
-//! *Asynchronous* signals (from `kill`/`tgkill`) still only take their default
-//! action — interrupting the guest at an arbitrary instruction to run a handler
-//! is not modeled — and a pending async signal with a real handler is dropped
-//! rather than left to spin the scheduler.
+//! *Asynchronous* signals (from `kill`/`tgkill`/on-exit SIGCHLD) are now also
+//! delivered to a real handler: [`Kernel::deliver_pending_signals`] runs at each
+//! syscall boundary and, for the first deliverable pending signal with a
+//! handler, calls [`Kernel::deliver_async_signal`] (which shares the frame
+//! builder with the fault path). This is what lets a shell's `wait` — blocked in
+//! [`Kernel::sys_rt_sigsuspend`] for SIGCHLD — wake, run its handler, and reap.
+//! A signal left at its default disposition still takes the default action.
 
 use super::{Kernel, RunState, SA_ONSTACK, SIGSEGV, SS_DISABLE, ServiceCtx, Shared, err};
 use crate::abi::errno::Errno;
@@ -143,6 +146,40 @@ impl Kernel {
         0
     }
 
+    /// `rt_sigsuspend(mask)` — atomically install `mask` as the blocked set and
+    /// suspend until a signal not in it is delivered, then restore the pre-call
+    /// mask and return `-EINTR`. This is how a shell's `wait` sleeps for SIGCHLD.
+    ///
+    /// We record the pre-call mask in `sigsuspend_prev` (first entry only — a
+    /// parked suspend re-traps the same syscall), install the temporary mask, and
+    /// either park (`cx.block`) when nothing is deliverable, or return `-EINTR`
+    /// when a deliverable signal is already pending. On the `-EINTR` return the
+    /// post-dispatch `deliver_pending_signals` delivers that signal: a real
+    /// handler consumes `sigsuspend_prev` (restoring the pre-call mask as its
+    /// `uc_sigmask`); an ignored one is cleaned up by that fn's post-loop restore.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_rt_sigsuspend(&self, cx: &mut ServiceCtx, mask_ptr: u64, mem: &GuestMemory) -> i64 {
+        let Ok(new_mask) = mem.read_u64(mask_ptr) else {
+            return err(Errno::EFAULT);
+        };
+        // First entry only: a parked suspend re-traps this same syscall, and its
+        // pre-call mask was already saved — don't overwrite it with the temp mask.
+        if cx.cur.sigsuspend_prev.is_none() {
+            cx.cur.sigsuspend_prev = Some(cx.cur.blocked);
+        }
+        cx.cur.blocked = new_mask; // temporary mask for the suspend
+        let deliverable = cx.cur.pending & !cx.cur.blocked;
+        if deliverable == 0 {
+            // Nothing to deliver: park. The re-trap after an unpark (e.g. the
+            // child posting SIGCHLD) finds `deliverable != 0` and falls through.
+            cx.block = true;
+            return 0;
+        }
+        // A signal is deliverable — return -EINTR; the post-dispatch
+        // `deliver_pending_signals` delivers it.
+        err(Errno::EINTR)
+    }
+
     /// `kill`/`tkill(pid, sig)` — post `sig` to the target process. `sig == 0`
     /// is an existence check. `pid <= 0` or `pid == self` targets the caller.
     pub(super) fn sys_kill(&self, sh: &mut Shared, cx: &mut ServiceCtx, pid: i64, sig: u64) -> i64 {
@@ -182,41 +219,56 @@ impl Kernel {
                 .any(|p| i64::from(p.info.pid) == pid)
     }
 
-    /// Apply the DEFAULT disposition of every deliverable pending signal for the
-    /// current process. Runs once after each serviced syscall; it never loops
-    /// waiting for a signal and never invokes a real handler.
-    #[allow(clippy::unused_self)]
-    pub(super) fn deliver_pending_signals(&self, cx: &mut ServiceCtx) {
+    /// Act on the first deliverable pending signal for the current process. Runs
+    /// once after each serviced syscall. Unlike before, a signal with a real
+    /// handler is now *delivered* (an `rt_sigframe` is pushed and the vcpu points
+    /// at the handler) — so `kill`/`tgkill`/on-exit-SIGCHLD reach their handler,
+    /// which is what lets a shell's `wait` (blocked in `sigsuspend` for SIGCHLD)
+    /// wake and reap. At most one handler is entered per call: the guest must run
+    /// it (and `rt_sigreturn`) before the next pending signal is considered, so
+    /// any others deliver at the following syscall boundary.
+    pub(super) fn deliver_pending_signals(
+        &self, cx: &mut ServiceCtx,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &mut GuestMemory,
+    ) -> bool {
         if !matches!(cx.cur.run, RunState::Running) {
-            return;
+            return false;
         }
         let deliverable = cx.cur.pending & !cx.cur.blocked;
-        if deliverable == 0 {
-            return;
-        }
         for sig in 1..=NSIG {
             let bit = 1u64 << (sig - 1);
             if deliverable & bit == 0 {
                 continue;
             }
-            // We are about to act on this signal in every branch below.
+            // Clear the pending bit: every branch below acts on this signal.
             cx.cur.pending &= !bit;
             match cx.cur.handlers[sig as usize].handler {
+                // Ignored explicitly: drop it and keep scanning.
                 SIG_IGN => {}
-                // An asynchronously-posted signal (kill/tgkill) with a real
-                // handler: delivering it would need to interrupt the guest at an
-                // arbitrary point, which this kernel doesn't do — only
-                // *synchronous* (fault) signals are delivered to handlers, via
-                // `deliver_fault_signal`. Drop it rather than deadlock.
-                h if h != SIG_DFL => {}
+                // A real handler: push the frame + redirect the vcpu, then STOP —
+                // the guest runs the handler now; any remaining pendings deliver
+                // at the next syscall boundary. Returns whether the frame built.
+                h if h != SIG_DFL => {
+                    return self.deliver_async_signal(cx, sig, vcpu, mem);
+                }
                 // SIG_DFL: ignore the "ignored-by-default" set, else terminate.
                 _ if is_default_ignored(sig) => {}
                 _ => {
                     cx.cur.run = RunState::Zombie(128 + sig as i32);
-                    return;
+                    return false;
                 }
             }
         }
+        // No handler was entered and we didn't zombie. If a `sigsuspend` woke on
+        // an ignored signal, its temporary mask is still installed and its
+        // pre-call mask un-restored — restore it now (when a handler WAS entered,
+        // `deliver_async_signal` already took `sigsuspend_prev` as the restore
+        // mask, so this is skipped).
+        if let Some(prev) = cx.cur.sigsuspend_prev.take() {
+            cx.cur.blocked = prev;
+        }
+        false
     }
 }
 
@@ -276,7 +328,6 @@ impl Kernel {
     /// This is what lets a JIT that deliberately faults — JSC/V8 use `SIGSEGV`
     /// for stack-limit and null checks and to poll for VM interrupts — run at
     /// all: without it every such trap is a hard crash.
-    #[allow(clippy::unused_self)]
     pub(super) fn deliver_fault_signal(
         &self, cx: &mut ServiceCtx,
         sig: u64,
@@ -302,7 +353,54 @@ impl Kernel {
         if cx.cur.blocked & (1u64 << (sig - 1)) != 0 {
             return false;
         }
+        // trapno #PF(14)/#UD(6), si_code SEGV_MAPERR(1), si_addr = fault_addr,
+        // and the handler's uc_sigmask is the *current* blocked mask (restored
+        // by rt_sigreturn) — the fault path's original behavior, unchanged.
+        self.push_sigframe(cx, sig, if sig == SIGSEGV { 14 } else { 6 }, 1, fault_addr, cx.cur.blocked, vcpu, mem)
+    }
 
+    /// Deliver an *asynchronous* signal (posted by `kill`/`tgkill`/on-exit
+    /// SIGCHLD) to the guest's handler. Returns `false` when there is no real
+    /// handler (SIG_DFL/SIG_IGN) so the caller falls back to the default action.
+    ///
+    /// Unlike a fault, an async signal carries no faulting address; `trapno`,
+    /// `si_code` (SI_USER = 0), and `si_addr` are all 0. When a `sigsuspend` is
+    /// in progress its saved pre-call mask is the mask to restore on
+    /// `rt_sigreturn`; otherwise the current blocked mask is restored.
+    pub(super) fn deliver_async_signal(
+        &self, cx: &mut ServiceCtx,
+        sig: u64,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &mut GuestMemory,
+    ) -> bool {
+        let act = cx.cur.handlers[sig as usize];
+        if act.handler == SIG_DFL || act.handler == SIG_IGN {
+            return false;
+        }
+        // A sigsuspend restores its pre-call mask when the handler returns; take
+        // it so it isn't double-restored by `deliver_pending_signals`.
+        let restore = cx.cur.sigsuspend_prev.take().unwrap_or(cx.cur.blocked);
+        self.push_sigframe(cx, sig, 0, 0 /* SI_USER */, 0, restore, vcpu, mem)
+    }
+
+    /// Build the x86-64 `rt_sigframe` for `sig` on the (alternate or interrupted)
+    /// stack, block the handler's mask, and point the vcpu at the handler. Shared
+    /// by fault and async delivery; the two differ only in `trapno`/`si_code`/
+    /// `si_addr` (the `uc_mcontext` #PF fields and siginfo) and in `restore_mask`
+    /// (the `uc_sigmask` a later `rt_sigreturn` restores). Returns `true` when the
+    /// frame was built and the vcpu redirected.
+    #[allow(clippy::unused_self, clippy::too_many_arguments)]
+    fn push_sigframe(
+        &self, cx: &mut ServiceCtx,
+        sig: u64,
+        trapno: u64,
+        si_code: u64,
+        si_addr: u64,
+        restore_mask: u64,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &mut GuestMemory,
+    ) -> bool {
+        let act = cx.cur.handlers[sig as usize];
         // Choose the stack: the alternate stack if the handler asked for it and
         // one is configured, else just below the current rsp (with the ABI red
         // zone skipped).
@@ -339,9 +437,9 @@ impl Kernel {
                 REG_EFL => vcpu.rflags(),
                 REG_CSGSFS => 0x0033, // CS=0x33 (user code); gs/fs 0
                 19 => 0,              // err
-                20 => if sig == SIGSEGV { 14 } else { 6 }, // trapno (#PF / #UD)
+                20 => trapno,         // trapno (#PF / #UD; 0 for async)
                 21 => 0,              // oldmask
-                22 => fault_addr,     // cr2 — the faulting address
+                22 => si_addr,        // cr2 — the faulting address (0 for async)
                 _ => vcpu.reg(gpr),
             };
             put(MCTX_OFF + (i as u64) * 8, v);
@@ -349,13 +447,13 @@ impl Kernel {
         // uc_mcontext.fpstate pointer: none saved (0) — handlers that only
         // inspect the fault don't touch it.
         put(MCTX_OFF + (GREG_COUNT as u64) * 8, 0);
-        put(UC_OFF + 296, cx.cur.blocked); // uc_sigmask (kernel 8-byte)
+        put(UC_OFF + 296, restore_mask); // uc_sigmask (kernel 8-byte)
 
         // siginfo: si_signo, si_errno, si_code, then si_addr for SIGSEGV/SIGILL.
         let si = frame + UC_OFF + UCONTEXT_SIZE;
         put(si - frame, sig & 0xffff_ffff); // si_signo (si_errno = 0)
-        put(si - frame + 8, 1); // si_code = SI_KERNEL(0x80)? use 1 (SEGV_MAPERR)
-        put(si - frame + 16, fault_addr); // si_addr
+        put(si - frame + 8, si_code); // si_code (SEGV_MAPERR=1 fault / SI_USER=0 async)
+        put(si - frame + 16, si_addr); // si_addr
 
         if !wrote_ok {
             return false; // couldn't build the frame (guest stack unusable)
@@ -364,7 +462,7 @@ impl Kernel {
         if std::env::var_os("NIXVM_SIGTRACE").is_some() {
             let hb = mem.read_vec(act.handler, 8).unwrap_or_default();
             eprintln!(
-                "[sig] deliver sig={sig} fault={fault_addr:#x} pc={:#x} -> handler={:#x} restorer={:#x} frame={frame:#x} onstack={} handler_bytes={:02x?}",
+                "[sig] deliver sig={sig} fault={si_addr:#x} pc={:#x} -> handler={:#x} restorer={:#x} frame={frame:#x} onstack={} handler_bytes={:02x?}",
                 vcpu.pc(),
                 act.handler,
                 act.restorer,

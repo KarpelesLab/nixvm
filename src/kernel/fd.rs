@@ -57,9 +57,13 @@ impl FdTable {
         Self { map }
     }
 
-    /// Insert `fd` at the lowest available descriptor >= 3.
+    /// Insert `fd` at the lowest available descriptor, as POSIX `open` requires.
+    /// This is normally 3 (0/1/2 hold stdio), but a program that closes one of
+    /// the standard streams and reopens gets it back at that number — busybox
+    /// ash relies on exactly this for background jobs: it does `close(0);
+    /// open("/dev/null")` and *dies* unless the reopen lands on fd 0.
     pub fn alloc(&mut self, fd: Fd) -> i32 {
-        let mut n = 3;
+        let mut n = 0;
         while self.map.contains_key(&n) {
             n += 1;
         }
@@ -109,5 +113,15 @@ mod tests {
         assert_eq!(t.alloc(Fd::Stdin), 4);
         t.close(3);
         assert_eq!(t.alloc(Fd::Stdin), 3);
+    }
+
+    #[test]
+    fn alloc_reuses_a_closed_standard_stream() {
+        // POSIX `open` returns the lowest free fd — including 0/1/2 once closed.
+        // busybox ash's background-job setup (`close(0); open("/dev/null")`)
+        // dies unless the reopen lands back on fd 0.
+        let mut t = FdTable::with_standard_streams();
+        t.close(0);
+        assert_eq!(t.alloc(Fd::Stdin), 0);
     }
 }
