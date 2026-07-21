@@ -345,8 +345,12 @@ impl Arena {
 }
 
 enum Serviced {
-    /// Syscall done; write this value into the vcpu's result register, resume.
-    SetRet(i64),
+    /// Syscall done. `service` has already written the result into the vcpu (it
+    /// does so before delivering any pending signal, so an interrupted syscall's
+    /// signal frame captures the real return value); the caller just resumes,
+    /// honoring `yield_now`. It must NOT re-write the result — the interpreter's
+    /// `set_syscall_ret` advances the pc past `syscall`, so a second call drifts.
+    SetRet,
     /// Resume compute without touching the result register (interrupt / execve
     /// replaced the image).
     Resume,
@@ -1161,12 +1165,16 @@ impl Kernel {
         loop {
             let exit = vcpu.run(mem)?;
             match self.service(cx, exit, vcpu.as_mut(), mem) {
-                Serviced::SetRet(ret) => {
-                    vcpu.set_syscall_ret(ret as u64);
+                Serviced::SetRet => {
+                    // The result was already written to the vcpu inside `service`
+                    // (before signal delivery, so an interrupted syscall's frame
+                    // captures it). Re-writing it here would call the backend's
+                    // `set_syscall_ret` twice — harmless for KVM but a double pc
+                    // advance for the interpreter (it steps past the 2-byte
+                    // `syscall`), drifting into the middle of the next instruction.
                     progressed = true;
-                    // `sched_yield`: the call succeeded (its return value is
-                    // written above), but end the slice so siblings run. The
-                    // task is *not* parked — `cx.block` stays clear.
+                    // `sched_yield`: the call succeeded but ends the slice so
+                    // siblings run. The task is *not* parked — `cx.block` stays clear.
                     if cx.yield_now {
                         cx.yield_now = false;
                         return Ok(true);
@@ -1242,7 +1250,7 @@ impl Kernel {
                     // resume into the handler rather than re-applying the ret.
                     Serviced::Resume
                 } else {
-                    Serviced::SetRet(ret)
+                    Serviced::SetRet
                 }
             }
             Exit::Interrupted => Serviced::Resume,
@@ -1618,8 +1626,9 @@ impl Kernel {
             sh.procs[i] = Some(proc);
         }
         match flow {
-            Serviced::SetRet(ret) => {
-                vcpu.set_syscall_ret(ret as u64);
+            Serviced::SetRet => {
+                // Result already written in `service` (see the serial path); do
+                // NOT re-write it — that double-advances the interpreter's pc.
                 if cx.yield_now {
                     SliceStep::Yielded
                 } else {
