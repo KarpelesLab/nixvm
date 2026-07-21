@@ -124,6 +124,16 @@ pub struct GuestMemory {
     /// (not a shared control page) so concurrent faults on sibling vcpus never
     /// clobber one another. See [`GuestMemory::kstack_pa`].
     kstack_pa: u64,
+    /// True once a second task shares this address space (`CLONE_VM`/`CLONE_THREAD`
+    /// — a pthread). Concurrent threads of one address space can't run KVM in
+    /// parallel: they share one page-table tree and one kstack frame, so
+    /// simultaneous `#PF`s corrupt each other's exception frame and one thread's
+    /// page-table edit leaves siblings' TLBs stale. The SMP scheduler therefore
+    /// runs a shared space *serialized* (holding the per-space memory lock across
+    /// the run, like the interpreter) instead of lockless. Distinct processes have
+    /// distinct spaces/locks, so cross-process parallelism is unaffected. Sticky:
+    /// stays set after a thread exits (harmless — just keeps that space serial).
+    shared: bool,
 }
 
 impl std::fmt::Debug for GuestMemory {
@@ -212,6 +222,7 @@ impl GuestMemory {
             file_backed: vec![false; npages],
             tlb_dirty: false,
             kstack_pa,
+            shared: false,
         }
     }
 
@@ -249,6 +260,19 @@ impl GuestMemory {
     #[must_use]
     pub(crate) fn kstack_pa(&self) -> u64 {
         self.kstack_pa
+    }
+
+    /// Whether a second task shares this address space (a `CLONE_VM` thread) — the
+    /// SMP scheduler must run such a space serialized, not lockless. See [`shared`].
+    #[must_use]
+    pub(crate) fn is_shared(&self) -> bool {
+        self.shared
+    }
+
+    /// Mark this address space as shared by more than one task (called when a
+    /// `CLONE_VM`/`CLONE_THREAD` task is created against it). Sticky.
+    pub(crate) fn mark_shared(&mut self) {
+        self.shared = true;
     }
 
     /// Take and clear the "page tables changed" flag: whether a present leaf was
@@ -720,6 +744,7 @@ impl GuestMemory {
             file_backed: self.file_backed.clone(),
             tlb_dirty: false,
             kstack_pa: child_kstack,
+            shared: self.shared,
         }
     }
 

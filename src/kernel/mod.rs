@@ -436,17 +436,25 @@ fn run_slice_smp(
         // memslot: take the lock only to reconcile the memslot + shadow page
         // tables, then drop it so KVM_RUN runs in parallel with siblings of the
         // same address space.
-        let exit = if vcpu.needs_locked_run() {
+        // A *shared* address space (CLONE_VM threads) must run serialized: hold the
+        // per-space memory lock across the whole run so only one of its threads is
+        // in KVM_RUN at a time. They share one page-table tree and one kstack
+        // frame, so running them lockless-in-parallel corrupts each other's `#PF`
+        // exception frame and races on page-table edits. Distinct processes have
+        // distinct spaces (and locks), so this never serializes across processes.
+        // The lock is dropped at the end of this block — before the service phase
+        // re-acquires it — so a locked run never self-deadlocks.
+        let exit = {
             let mut mem = space.lock().unwrap();
-            vcpu.run(&mut mem)
-        } else {
-            let reconciled = {
-                let mut mem = space.lock().unwrap();
-                vcpu.reconcile(&mut mem)
-            };
-            match reconciled {
-                Ok(()) => vcpu.run_bare(),
-                Err(e) => Err(e),
+            if vcpu.needs_locked_run() || mem.is_shared() {
+                vcpu.run(&mut mem)
+            } else {
+                let reconciled = vcpu.reconcile(&mut mem);
+                drop(mem);
+                match reconciled {
+                    Ok(()) => vcpu.run_bare(),
+                    Err(e) => Err(e),
+                }
             }
         };
         let exit = match exit {
@@ -2354,6 +2362,12 @@ impl Kernel {
         // read-on-write until the first store privatizes a page).
         let mut child_mem = if share_vm { None } else { Some(mem.fork()) };
         info.mm = if share_vm {
+            // A thread shares this address space: mark it so the SMP scheduler
+            // runs its tasks serialized (one page-table tree + one kstack frame
+            // can't be run concurrently without corruption). `mem` IS the shared
+            // space (checked out from `sh.spaces[cx.cur.mm]`), so the child, which
+            // shares the same `Arc<Mutex<GuestMemory>>`, sees the flag too.
+            mem.mark_shared();
             cx.cur.mm
         } else {
             sh.spaces.len()
