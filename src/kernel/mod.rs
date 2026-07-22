@@ -1921,6 +1921,16 @@ impl Kernel {
                 let mut pf = self.pollfds.lock().unwrap();
                 self.dispatch_pollfds(&mut pf, cx, sys, args, mem)
             }
+            // Pure clock/time reads: they touch no shared kernel state (only the
+            // host wall clock and the caller's buffer), so they take NO lock.
+            // These dominate the syscall stream of clock-polling runtimes
+            // (Bun/JSC issues ~89% `clock_gettime`), where routing each through
+            // the big `sh` lock cost an acquire/release on the hot path and
+            // needless cross-thread contention under SMP.
+            Sysno::ClockGettime => sys_clock_gettime(args[1], mem),
+            Sysno::Gettimeofday => time::sys_gettimeofday(args[0], mem),
+            Sysno::ClockGetres => time::sys_clock_getres(args[1], mem),
+            Sysno::Time => time::sys_time(args[0], mem),
             // everything else: a single `sh` lock, running the B1 syscall table.
             _ => {
                 let mut sh = self.shared.lock().unwrap();
