@@ -2162,7 +2162,7 @@ impl Kernel {
             Sysno::Getxattr | Sysno::Lgetxattr | Sysno::Fgetxattr => err(Errno::ENODATA),
             Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], mem),
             Sysno::Ioctl => err(Errno::ENOTTY),
-            Sysno::Fcntl => self.sys_fcntl(cx, args[0], args[1]),
+            Sysno::Fcntl => self.sys_fcntl(cx, args[0], args[1], args[2]),
             Sysno::Futex => self.sys_futex(sh, cx, args, mem),
             // Event-notification / readiness scans. `sh` stays held (outermost)
             // by this dispatcher; each scan additionally acquires
@@ -3948,27 +3948,58 @@ impl Kernel {
     }
 
     /// `fcntl(fd, cmd, ...)` — the subset real programs need at startup.
-    fn sys_fcntl(&self, cx: &mut ServiceCtx, fd: u64, cmd: u64) -> i64 {
+    fn sys_fcntl(&self, cx: &mut ServiceCtx, fd: u64, cmd: u64, arg: u64) -> i64 {
         const F_DUPFD: u64 = 0;
         const F_GETFL: u64 = 3;
+        const F_SETFL: u64 = 4;
         const F_DUPFD_CLOEXEC: u64 = 1030;
+        const O_NONBLOCK: u64 = 0o4000;
+        const O_RDWR: u64 = 2;
         // Every fcntl command operates on an open fd. Returning success for a
         // closed fd breaks the common "mark every fd from 3 up cloexec until
         // EBADF" loop (node/libuv do this at startup) into an unbounded spin —
         // it must see EBADF to stop.
-        if cx.cur.fds.get(fd as i32).is_none() {
+        let Some(f) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
-        }
+        };
         match cmd {
-            F_DUPFD | F_DUPFD_CLOEXEC => match cx.cur.fds.get(fd as i32).cloned() {
-                Some(f) => {
-                    self.bump_pipe(&f, true);
-                    i64::from(cx.cur.fds.alloc(f))
-                }
-                None => err(Errno::EBADF),
-            },
-            F_GETFL => 2,
+            F_DUPFD | F_DUPFD_CLOEXEC => {
+                self.bump_pipe(&f, true);
+                i64::from(cx.cur.fds.alloc(f))
+            }
+            // `F_SETFL` only `O_NONBLOCK` matters here (the access mode and
+            // `O_APPEND`/`O_DIRECT` are fixed or irrelevant). Wiring it is
+            // essential: libuv/c-ares create a socket, then set it non-blocking
+            // via `fcntl` — without this the socket stays blocking and a
+            // `recvfrom` on it (e.g. the DNS reply) parks the whole event-loop
+            // thread instead of returning `EAGAIN`.
+            F_SETFL => {
+                self.fd_set_nonblock(&f, arg & O_NONBLOCK != 0);
+                0
+            }
+            F_GETFL => O_RDWR as i64 | if self.fd_is_nonblock(&f) { O_NONBLOCK as i64 } else { 0 },
             _ => 0,
+        }
+    }
+
+    /// Apply an `fcntl(F_SETFL)` `O_NONBLOCK` change to whichever subsystem owns
+    /// the fd (socket / eventfd / timerfd). Other fd kinds have no blocking mode
+    /// to set. Acquires only the one relevant lock (order-safe: `sh` is held by
+    /// the caller and both `net` and `pollfds` sort after it).
+    fn fd_set_nonblock(&self, f: &Fd, nb: bool) {
+        match f {
+            Fd::Socket { sock, end } => self.net.lock().unwrap().set_nonblock(*sock, *end, nb),
+            Fd::Eventfd(_) | Fd::Timerfd(_) => self.pollfds.lock().unwrap().set_nonblock(f, nb),
+            _ => {}
+        }
+    }
+
+    /// The `O_NONBLOCK` state an `fcntl(F_GETFL)` should report.
+    fn fd_is_nonblock(&self, f: &Fd) -> bool {
+        match f {
+            Fd::Socket { sock, end } => self.net.lock().unwrap().is_nonblock(*sock, *end),
+            Fd::Eventfd(_) | Fd::Timerfd(_) => self.pollfds.lock().unwrap().is_nonblock(f),
+            _ => false,
         }
     }
 

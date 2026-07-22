@@ -84,6 +84,34 @@ pub(super) struct EpollInst {
     interest: BTreeMap<i32, EpollWatch>,
 }
 
+impl PollFds {
+    /// `fcntl(F_SETFL, O_NONBLOCK)` on an eventfd/timerfd.
+    pub(super) fn set_nonblock(&mut self, fd: &super::Fd, nb: bool) {
+        match fd {
+            super::Fd::Eventfd(i) => {
+                if let Some(e) = self.eventfds.get_mut(*i) {
+                    e.nonblock = nb;
+                }
+            }
+            super::Fd::Timerfd(i) => {
+                if let Some(t) = self.timerfds.get_mut(*i) {
+                    t.nonblock = nb;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `fcntl(F_GETFL)` on an eventfd/timerfd.
+    pub(super) fn is_nonblock(&self, fd: &super::Fd) -> bool {
+        match fd {
+            super::Fd::Eventfd(i) => self.eventfds.get(*i).is_some_and(|e| e.nonblock),
+            super::Fd::Timerfd(i) => self.timerfds.get(*i).is_some_and(|t| t.nonblock),
+            _ => false,
+        }
+    }
+}
+
 /// Nanoseconds since the UNIX epoch on the host wall clock.
 pub(super) fn now_ns() -> u128 {
     std::time::SystemTime::now()

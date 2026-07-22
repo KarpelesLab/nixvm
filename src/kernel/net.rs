@@ -32,6 +32,31 @@ impl Net {
         self.egress = Some(egress);
     }
 
+    /// Set the `O_NONBLOCK` state of socket `sock` (end `end`) — the `fcntl`
+    /// `F_SETFL` path. Updates the socket-level flag plus the per-end flag of a
+    /// connected pair and a bridged host connection, so every `recv`/`send`
+    /// path (dgram, pair, host) observes it. Silently ignores a stale index.
+    pub(super) fn set_nonblock(&mut self, sock: usize, end: usize, nb: bool) {
+        if let Some(s) = self.socks.get_mut(sock) {
+            s.nonblock = nb;
+            match &mut s.kind {
+                Kind::Pair(p) => p.nonblock[end.min(1)] = nb,
+                Kind::Host(h) => h.nonblock = nb,
+                _ => {}
+            }
+        }
+    }
+
+    /// Current `O_NONBLOCK` state of socket `sock` (end `end`) — the `fcntl`
+    /// `F_GETFL` path — reading the same per-kind flag the I/O paths consult.
+    pub(super) fn is_nonblock(&self, sock: usize, end: usize) -> bool {
+        self.socks.get(sock).is_some_and(|s| match &s.kind {
+            Kind::Pair(p) => p.nonblock[end.min(1)],
+            Kind::Host(h) => h.nonblock,
+            _ => s.nonblock,
+        })
+    }
+
     /// Whether any live host-bridged connection exists: a TCP egress socket, or
     /// a UDP socket with a host peer. While one is open the guest may be blocked
     /// awaiting network data that arrives asynchronously, so an otherwise all-
