@@ -74,6 +74,14 @@ pub(super) struct TimerFdInst {
 struct EpollWatch {
     events: u32,
     data: u64,
+    /// Edge-trigger (`EPOLLET`) memory: the fd's "level" at the previous scan, so
+    /// `epoll_wait` re-fires only when it *changes*. For a counter fd
+    /// (eventfd/timerfd) the level is the count — this is deliberately finer than
+    /// the readiness mask, so every new post wakes a guest that leaves the fd
+    /// signalled without draining it (libuv's async eventfd), instead of either
+    /// spinning (level-triggered) or hanging (mask-edge, no new rise). For other
+    /// fds the level is the readiness mask. Unused for level-triggered interest.
+    last_level: u64,
 }
 
 /// One `epoll_create1` instance: fd -> interest, keyed by the watched fd
@@ -547,7 +555,7 @@ impl Kernel {
                 };
                 pf.epolls[idx]
                     .interest
-                    .insert(target, EpollWatch { events, data });
+                    .insert(target, EpollWatch { events, data, last_level: 0 });
                 0
             }
             EPOLL_CTL_MOD => {
@@ -559,7 +567,7 @@ impl Kernel {
                 };
                 pf.epolls[idx]
                     .interest
-                    .insert(target, EpollWatch { events, data });
+                    .insert(target, EpollWatch { events, data, last_level: 0 });
                 0
             }
             EPOLL_CTL_DEL => {
@@ -600,17 +608,47 @@ impl Kernel {
         let mut net = self.net.lock().unwrap();
         let pipes = self.pipes.lock().unwrap();
         let mut pf = self.pollfds.lock().unwrap();
+        const EPOLLET: u32 = 0x8000_0000;
         let watches: Vec<(i32, EpollWatch)> = pf.epolls[idx]
             .interest
             .iter()
             .map(|(&fd, &w)| (fd, w))
             .collect();
+        // Compute readiness (and, for edge-triggering, the fd's "level") first —
+        // `fd_ready` needs `&mut pf` (it advances timerfds), so it can't run while
+        // an `&mut` into the same `pf.epolls[idx].interest` is held for the
+        // edge-trigger bookkeeping below.
+        let mut computed: Vec<(i32, EpollWatch, u32, u64)> = Vec::with_capacity(watches.len());
         for (fd, w) in watches {
+            let ready = self.fd_ready(&mut net, &pipes, &mut pf, cx, fd) & (w.events | POLLERR | POLLHUP);
+            // Edge level: a counter fd's count (so a fresh post is a new edge even
+            // when it stays signalled); the readiness mask for everything else.
+            let level = match cx.cur.fds.get(fd) {
+                Some(Fd::Eventfd(i)) => pf.eventfds.get(*i).map_or(0, |e| e.count),
+                Some(Fd::Timerfd(i)) => pf.timerfds.get(*i).map_or(0, |t| t.expirations),
+                _ => u64::from(ready),
+            };
+            computed.push((fd, w, ready, level));
+        }
+        for (fd, w, ready, level) in computed {
             if n >= maxevents {
                 break;
             }
-            let ready = self.fd_ready(&mut net, &pipes, &mut pf, cx, fd) & (w.events | POLLERR | POLLHUP);
-            if ready == 0 {
+            // Edge-triggered (`EPOLLET`): report only when the fd's level *changed*
+            // since the previous scan, not on the raw level. A persistently-ready
+            // fd (libuv's async eventfd, left signalled) otherwise re-fires on
+            // every wait, so `epoll_pwait2` never blocks and the loop spins; the
+            // level comparison still catches each new post. Always record the
+            // level (even when not ready) so a drain-then-post re-arms.
+            let deliver = if w.events & EPOLLET != 0 {
+                if let Some(e) = pf.epolls[idx].interest.get_mut(&fd) {
+                    e.last_level = level;
+                }
+                ready != 0 && level != w.last_level
+            } else {
+                ready != 0
+            };
+            if !deliver {
                 continue;
             }
             let addr = events_ptr + n * stride;
