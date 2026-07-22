@@ -2171,7 +2171,7 @@ impl Kernel {
             // No extended attributes: report "no such attribute".
             Sysno::Getxattr | Sysno::Lgetxattr | Sysno::Fgetxattr => err(Errno::ENODATA),
             Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], mem),
-            Sysno::Ioctl => err(Errno::ENOTTY),
+            Sysno::Ioctl => self.sys_ioctl(cx, args[0], args[1], args[2], mem),
             Sysno::Fcntl => self.sys_fcntl(cx, args[0], args[1], args[2]),
             Sysno::Futex => self.sys_futex(sh, cx, args, mem),
             // Event-notification / readiness scans. `sh` stays held (outermost)
@@ -3955,6 +3955,36 @@ impl Kernel {
     fn sys_getrlimit(&self, sh: &mut Shared, resource: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
         let (cur, max) = self.rlimit_pair(sh, resource);
         sys_misc::write_rlimit(mem, buf, cur, max)
+    }
+
+    /// `ioctl(fd, request, arg)` — only the fd-flag requests that work on any fd
+    /// are honored; genuine terminal requests (`TCGETS`, `TIOCGWINSZ`, …) return
+    /// `ENOTTY`, which is the correct answer for the pipe/file/socket fds nixvm
+    /// hands out (there is no pty). The important one is `FIONBIO`: it is the
+    /// ioctl spelling of `fcntl(F_SETFL, O_NONBLOCK)`, so a client that sets its
+    /// socket non-blocking this way must not be silently left blocking (that
+    /// strands an event loop, exactly like the `F_SETFL` gap did).
+    fn sys_ioctl(&self, cx: &mut ServiceCtx, fd: u64, request: u64, arg: u64, mem: &GuestMemory) -> i64 {
+        const FIONBIO: u64 = 0x5421;
+        const FIOCLEX: u64 = 0x5451;
+        const FIONCLEX: u64 = 0x5450;
+        let Some(f) = cx.cur.fds.get(fd as i32).cloned() else {
+            return err(Errno::EBADF);
+        };
+        // ioctl requests are 32-bit; some (`_IOR`-encoded) reach us sign-extended.
+        match request & 0xffff_ffff {
+            // `arg` points at an `int`: nonzero sets `O_NONBLOCK`, zero clears it.
+            FIONBIO => {
+                let on = mem.read_u32(arg).is_ok_and(|v| v != 0);
+                self.fd_set_nonblock(&f, on);
+                0
+            }
+            // Set/clear close-on-exec. nixvm does not track the flag separately
+            // (as `fcntl(F_SETFD)` doesn't either), so this is an accepted no-op.
+            FIOCLEX | FIONCLEX => 0,
+            // Terminal and unrecognized requests: not a tty.
+            _ => err(Errno::ENOTTY),
+        }
     }
 
     /// `fcntl(fd, cmd, ...)` — the subset real programs need at startup.
@@ -6190,6 +6220,18 @@ mod tests {
         // F_SETFD (2) on an unopened fd must fail — else a "cloexec every fd
         // until EBADF" loop never terminates.
         assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Fcntl, [99, 2, 1, 0, 0, 0]), -9);
+    }
+
+    #[test]
+    fn ioctl_fd_flag_requests_and_tty_fallback() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        // A closed fd is EBADF (-9), so a "FIOCLEX every fd until EBADF" loop
+        // terminates — the blanket ENOTTY stub used to spin such loops.
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Ioctl, [99, 0x5451, 0, 0, 0, 0]), -9);
+        // FIOCLEX (0x5451) on an open fd (stdin) succeeds as an accepted no-op.
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Ioctl, [0, 0x5451, 0, 0, 0, 0]), 0);
+        // A terminal request (TIOCGWINSZ 0x5413) on a non-tty fd is ENOTTY (-25).
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Ioctl, [0, 0x5413, 0x1_2000, 0, 0, 0]), -25);
     }
 
     #[test]
