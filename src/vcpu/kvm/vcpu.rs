@@ -930,6 +930,44 @@ impl Vcpu for KvmVcpu {
         self.cur_cr3 = None;
     }
 
+    fn vdso_calibration(&self) -> Option<crate::vcpu::VdsoCal> {
+        // Guest TSC frequency (kHz) — the ioctl returns it directly.
+        // SAFETY: `KVM_GET_TSC_KHZ` takes no argument; the fd is a live vcpu.
+        let khz = unsafe { sys::ioctl(self.fd.0, sys::KVM_GET_TSC_KHZ, 0) };
+        let tsc_khz = u64::try_from(khz).ok().filter(|&k| k > 0)?;
+        // ns ≈ tsc_delta * 1e6 / tsc_khz. As a fixed-point multiply-shift with
+        // shift = 32: mult = round(1e6 * 2^32 / tsc_khz). For 1–5 GHz this is
+        // ~1.7e9 down to ~8.6e8, comfortably within u64, and the vDSO's 128-bit
+        // `mul` + `shrd` keeps full precision.
+        let shift: u64 = 32;
+        let mult = ((1_000_000u128 << shift) / u128::from(tsc_khz)) as u64;
+
+        // Read the guest TSC (IA32_TSC) and the host wall clock as close together
+        // as possible so the vDSO's TSC-derived time matches the syscall clock
+        // (which reads the same host wall clock). nixvm returns wall time for
+        // every clock id, so mono and wall share the base.
+        let mut msrs = sys::kvm_msrs {
+            nmsrs: 1,
+            pad: 0,
+            entries: [sys::kvm_msr_entry::default(); sys::MSRS_CAP],
+        };
+        msrs.entries[0].index = 0x10; // IA32_TSC
+        // SAFETY: valid struct; `nmsrs = 1` bounds the entries read/written.
+        let got = unsafe { sys::ioctl(self.fd.0, sys::KVM_GET_MSRS, std::ptr::from_mut(&mut msrs)) };
+        if got != 1 {
+            return None;
+        }
+        let base_tsc = msrs.entries[0].data;
+        let now = crate::clock::now_unix().as_nanos() as u64;
+        Some(crate::vcpu::VdsoCal {
+            mult,
+            shift,
+            base_tsc,
+            base_mono_ns: now,
+            base_wall_ns: now,
+        })
+    }
+
     fn settle_syscall_return(&mut self) {
         // Software `sysretq`: what the trampoline's `sysretq` would have done to
         // return the guest from CPL0 to CPL3 — rip←rcx, rflags←r11, and the flat

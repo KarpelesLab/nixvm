@@ -140,6 +140,10 @@ pub const KVM_SET_REGS: c_ulong = 0x4090_AE82;
 pub const KVM_GET_SREGS: c_ulong = 0x8138_AE83;
 pub const KVM_SET_SREGS: c_ulong = 0x4138_AE84;
 pub const KVM_SET_MSRS: c_ulong = 0x4008_AE89;
+pub const KVM_GET_MSRS: c_ulong = 0xC008_AE88;
+/// `_IO(KVMIO, 0xa3)` — returns the guest TSC frequency in kHz as the ioctl
+/// return value (used to calibrate the vDSO's `rdtsc` → nanoseconds scaling).
+pub const KVM_GET_TSC_KHZ: c_ulong = 0xAEA3;
 pub const KVM_GET_FPU: c_ulong = 0x81A0_AE8C;
 pub const KVM_SET_FPU: c_ulong = 0x41A0_AE8D;
 pub const KVM_SET_CPUID2: c_ulong = 0x4008_AE90;

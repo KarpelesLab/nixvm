@@ -750,7 +750,19 @@ fn build_stack(
     let platform_addr = str_base + platform_off;
     let random_bytes = deterministic_random16(&blob);
 
-    let auxv: [(u64, u64); 19] = [
+    // Advertise the vDSO (x86-64 only — it is part of that arch's control block)
+    // via AT_SYSINFO_EHDR so musl uses `__vdso_clock_gettime` instead of the
+    // syscall. AT_IGNORE elsewhere. The vDSO self-disables (falls back to the
+    // syscall) until the host writes its TSC calibration, so this is always safe.
+    const AT_SYSINFO_EHDR: u64 = 33;
+    const AT_IGNORE: u64 = 1;
+    let (sysinfo_tag, sysinfo_val) = if ehdr.machine == EM_X86_64 {
+        (AT_SYSINFO_EHDR, crate::vcpu::ctrl::VDSO_VA)
+    } else {
+        (AT_IGNORE, 0)
+    };
+    let auxv: [(u64, u64); 20] = [
+        (sysinfo_tag, sysinfo_val),
         (AT_PHDR, phdr_vaddr.unwrap_or(0)),
         (AT_PHENT, PHDR_LEN as u64),
         (AT_PHNUM, u64::from(ehdr.phnum)),

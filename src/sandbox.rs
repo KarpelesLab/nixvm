@@ -353,6 +353,7 @@ impl Sandbox {
         // (otherwise the VM is loopback-only and routable connects get
         // ENETUNREACH). No-op unless the env var is set.
         crate::vm::install_egress(&mut kernel);
+        calibrate_vdso(vcpu.as_ref(), &mem);
         Ok(kernel.run(vcpu, mem)?)
     }
 
@@ -448,6 +449,7 @@ impl Sandbox {
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
         crate::vm::install_egress(&mut kernel);
+        calibrate_vdso(vcpu.as_ref(), &mem);
         Ok(kernel.run(vcpu, mem)?)
     }
 
@@ -548,6 +550,23 @@ fn open_squashfs(path: &Path) -> Result<Option<Box<dyn MountFs>>, Error> {
 /// expects, and create `/root`. Existing files (from a real root image) are
 /// never clobbered — this only fills gaps. This is the host-side stand-in for
 /// boot-time service configuration until in-guest init can run.
+/// Calibrate the guest's clock vDSO (TSC → nanoseconds) once, before the guest
+/// runs, and write it to the shared vvar page. A no-op for backends that can't
+/// calibrate (the interpreter) or when the TSC is unavailable — the vDSO then
+/// stays disabled and the guest uses the `clock_gettime` syscall.
+fn calibrate_vdso(vcpu: &dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
+    if let Some(c) = vcpu.vdso_calibration() {
+        crate::vcpu::ctrl::write_vvar(
+            &mem.phys_arc(),
+            c.mult,
+            c.shift,
+            c.base_tsc,
+            c.base_mono_ns,
+            c.base_wall_ns,
+        );
+    }
+}
+
 fn preconfigure(mounts: &mut MountTable) {
     let _ = mounts.mkdir("/etc", 0o755);
     let _ = mounts.mkdir("/root", 0o700);

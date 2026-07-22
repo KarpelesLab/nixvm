@@ -42,6 +42,8 @@ const FAULT_TRAMP_OFF: u64 = 0x44000;
 const IDT_OFF: u64 = 0x45000;
 const TSS_OFF: u64 = 0x46000;
 const KSTACK_OFF: u64 = 0x47000;
+const VDSO_OFF: u64 = 0x48000;
+const VVAR_OFF: u64 = 0x49000;
 
 /// The virtual address `IA32_LSTAR` points at: the `hlt; sysretq` trampoline.
 pub const LSTAR_VA: u64 = CTRL_GPA + TRAMP_OFF;
@@ -68,6 +70,14 @@ pub const KSTACK_TOP: u64 = CTRL_GPA + KSTACK_OFF + 0x1000;
 /// heavily-threaded SMP guests.
 pub const KSTACK_PAGE_VA: u64 = CTRL_GPA + KSTACK_OFF;
 
+/// Virtual base of the vDSO ELF image (user-readable/executable) — the value the
+/// loader advertises as `AT_SYSINFO_EHDR`. See [`super::vdso`].
+pub const VDSO_VA: u64 = CTRL_GPA + VDSO_OFF;
+/// Virtual base of the vDSO's "vvar" data page (user-readable): the host writes
+/// the `rdtsc` → nanoseconds calibration here (see [`write_vvar`]) and the vDSO
+/// code reads it.
+pub const VVAR_VA: u64 = CTRL_GPA + VVAR_OFF;
+
 /// GDT selector of the TSS descriptor (a 16-byte descriptor at slots 5–6).
 pub const SEL_TSS: u16 = 0x28;
 pub const SEL_KCODE: u16 = 0x08;
@@ -85,10 +95,14 @@ pub const GDT_LIMIT: u16 = 7 * 8 - 1;
 /// allocatable frame after the pinned null frame. Held out of circulation by
 /// [`reserve_and_build`].
 pub const CTRL_PHYS_BASE: u64 = PAGE_SIZE;
-/// Number of *shared* control-block pages (GDT, syscall trampoline, `#PF`
-/// trampoline, IDT, TSS). The kernel stack is **not** here — it is per address
-/// space (see [`KSTACK_PAGE_VA`] / [`map_kstack`]).
-pub const CTRL_FRAMES: u64 = 5;
+/// Number of *shared* control-block pages: GDT, syscall trampoline, `#PF`
+/// trampoline, IDT, TSS, then the vDSO code page and its vvar data page. The
+/// kernel stack is **not** here — it is per address space (see
+/// [`KSTACK_PAGE_VA`] / [`map_kstack`]).
+pub const CTRL_FRAMES: u64 = 7;
+/// Physical-run index of the vDSO code frame and the vvar frame.
+const VDSO_FIDX: usize = 5;
+const VVAR_FIDX: usize = 6;
 /// Bytes the control block reserves in the pool.
 pub const CTRL_SIZE: u64 = CTRL_FRAMES * PAGE_SIZE;
 
@@ -167,6 +181,25 @@ pub fn reserve_and_build(fa: &mut FrameAllocator, phys: &PhysMem) {
     // Trampolines: the syscall one (`IA32_LSTAR`) and the #PF one.
     phys.write(tramp_pa, &[0xF4, 0x48, 0x0F, 0x07]); // hlt ; sysretq
     phys.write(fault_pa, &[0xF4]); // hlt
+
+    // vDSO ELF image (its clock code reads the vvar page at VVAR_VA). The vvar
+    // frame is left zeroed — `mult == 0` makes the vDSO fall back to the syscall
+    // until [`write_vvar`] fills in the TSC calibration after the vcpu exists.
+    phys.write(frame_pa(VDSO_FIDX), &super::vdso::build_image(VVAR_VA));
+}
+
+/// Write the vDSO's vvar calibration (TSC → nanoseconds) into the shared vvar
+/// frame. Called once after the vcpu is created and the TSC is read, before the
+/// guest runs. A non-zero `mult` also arms the vDSO fast path (it treats
+/// `mult == 0` as "not calibrated" and uses the syscall instead).
+pub fn write_vvar(phys: &PhysMem, mult: u64, shift: u64, base_tsc: u64, base_mono_ns: u64, base_wall_ns: u64) {
+    use super::vdso::vvar;
+    let pa = frame_pa(VVAR_FIDX);
+    phys.write(pa + vvar::MULT, &mult.to_le_bytes());
+    phys.write(pa + vvar::SHIFT, &shift.to_le_bytes());
+    phys.write(pa + vvar::BASE_TSC, &base_tsc.to_le_bytes());
+    phys.write(pa + vvar::BASE_MONO_NS, &base_mono_ns.to_le_bytes());
+    phys.write(pa + vvar::BASE_WALL_NS, &base_wall_ns.to_le_bytes());
 }
 
 /// Map the shared control block, supervisor-only, at its fixed virtual addresses
@@ -179,6 +212,11 @@ pub fn map_into(space: &mut AddrSpace, fa: &mut FrameAllocator, phys: &PhysMem) 
     for (i, p) in PAGES.iter().enumerate() {
         let _ = space.map(CTRL_GPA + p.voff, frame_pa(i), p.prot, true, fa, phys);
     }
+    // The vDSO code (user read/execute) and its vvar data (user read-only) —
+    // mapped `supervisor = false` so the guest can call the clock code at CPL3.
+    // These are the only user-accessible control-block pages.
+    let _ = space.map(VDSO_VA, frame_pa(VDSO_FIDX), Prot::rx(), false, fa, phys);
+    let _ = space.map(VVAR_VA, frame_pa(VVAR_FIDX), Prot::READ, false, fa, phys);
 }
 
 /// Map a private kernel-stack `frame` at [`KSTACK_PAGE_VA`] into `space`,

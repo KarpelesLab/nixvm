@@ -20,6 +20,7 @@ use crate::abi::Arch;
 pub mod mem;
 pub(crate) mod ctrl;
 pub(crate) mod pagetable;
+pub(crate) mod vdso;
 pub(crate) mod phys;
 pub(crate) mod region;
 
@@ -106,6 +107,19 @@ impl From<MemError> for VcpuError {
     fn from(e: MemError) -> Self {
         Self::Mem(e)
     }
+}
+
+/// vDSO clock calibration produced by [`Vcpu::vdso_calibration`] and written to
+/// the guest's vvar page by [`ctrl::write_vvar`]. The guest's
+/// `__vdso_clock_gettime` computes `base_*_ns + ((rdtsc() - base_tsc) * mult) >>
+/// shift`.
+#[derive(Clone, Copy, Debug)]
+pub struct VdsoCal {
+    pub mult: u64,
+    pub shift: u64,
+    pub base_tsc: u64,
+    pub base_mono_ns: u64,
+    pub base_wall_ns: u64,
 }
 
 /// A single virtual CPU executing one guest thread.
@@ -224,6 +238,16 @@ pub trait Vcpu: Send {
     /// A no-op for the interpreter, which has no trampoline — its pc already sits
     /// on the post-syscall user instruction at no privilege level.
     fn settle_syscall_return(&mut self) {}
+
+    /// One-time vDSO clock calibration: read the guest TSC frequency and its
+    /// current value and correlate it with the host wall clock, so the guest's
+    /// [`vdso`] can compute `clock_gettime` from `rdtsc` with no syscall. `None`
+    /// when the backend can't (the interpreter — no real TSC) or calibration
+    /// failed; the caller then leaves the vvar page zeroed and the vDSO falls
+    /// back to the syscall. Read once, before the guest runs.
+    fn vdso_calibration(&self) -> Option<VdsoCal> {
+        None
+    }
 
     /// Flush this vcpu's TLB before its next run, because the host modified the
     /// page tables of the address space it is running *without* the guest issuing
