@@ -268,6 +268,10 @@ impl Kernel {
             }
             // Nested epoll readiness is not modeled.
             Fd::Epoll(_) => 0,
+            // Pseudo-terminal ends — `ptys` is the innermost lock (after
+            // pollfds), so acquiring it here keeps the order consistent.
+            Fd::PtyMaster(i) => self.ptys.lock().unwrap().master_ready(i),
+            Fd::PtySlave(i) => self.ptys.lock().unwrap().slave_ready(i),
         }
     }
 

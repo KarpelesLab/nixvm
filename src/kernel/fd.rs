@@ -38,6 +38,10 @@ pub enum Fd {
     Timerfd(usize),
     /// An `epoll_create1` instance: index into the kernel's epoll table.
     Epoll(usize),
+    /// The master end of pseudo-terminal `index` (`/dev/ptmx`).
+    PtyMaster(usize),
+    /// A slave end of pseudo-terminal `index` (`/dev/pts/index`).
+    PtySlave(usize),
 }
 
 /// Maps small integer descriptors to [`Fd`]s, allocating the lowest free number.

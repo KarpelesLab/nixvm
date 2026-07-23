@@ -34,6 +34,7 @@ mod mem_syscalls;
 mod net;
 mod path;
 mod poll;
+mod pty;
 mod signal;
 mod stat;
 mod sys_misc;
@@ -644,6 +645,9 @@ pub struct Kernel {
     /// one lock because the poll/select/epoll readiness scan touches them as a
     /// unit (see [`PollFds`]).
     pollfds: Mutex<PollFds>,
+    /// Pseudo-terminals (/dev/ptmx + /dev/pts/N). Innermost data lock like
+    /// `pipes`; opened/read/written/polled independently of `sh`.
+    ptys: Mutex<pty::Ptys>,
 }
 
 /// All kernel state mutated while a syscall is serviced, behind [`Kernel`]'s
@@ -877,6 +881,7 @@ impl Kernel {
             net: Mutex::new(Net::default()),
             pipes: Mutex::new(Vec::new()),
             pollfds: Mutex::new(PollFds::default()),
+            ptys: Mutex::new(pty::Ptys::default()),
             shared: Mutex::new(Shared {
                 stdin: Box::new(std::io::stdin()),
                 stdout: Box::new(std::io::stdout()),
@@ -3185,11 +3190,29 @@ impl Kernel {
                 let mut pf = self.pollfds.lock().unwrap();
                 self.write_pollfd_fd(&mut pf, cx, fd, buf, count, mem)
             }
+            Some(Fd::PtyMaster(..) | Fd::PtySlave(..)) => self.write_pty_fd(cx, fd, buf, count, mem),
             _ => {
                 let mut sh = self.shared.lock().unwrap();
                 self.write_shared_fd(&mut sh, cx, fd, buf, count, mem)
             }
         }
+    }
+
+    /// `write` to a pty end: master writes are terminal *input* (line
+    /// discipline), slave writes are terminal *output* (post-processing). All
+    /// bytes are accepted (nixvm's pty buffers are unbounded).
+    fn write_pty_fd(&self, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &GuestMemory) -> i64 {
+        let f = cx.cur.fds.get(fd as i32).cloned();
+        let Ok(data) = mem.read_vec(buf, count as usize) else {
+            return err(Errno::EFAULT);
+        };
+        let mut ptys = self.ptys.lock().unwrap();
+        match f {
+            Some(Fd::PtyMaster(n)) => ptys.master_write(n, &data),
+            Some(Fd::PtySlave(n)) => ptys.slave_write(n, &data),
+            _ => return err(Errno::EBADF),
+        }
+        data.len() as i64
     }
 
     /// The `Fd::Eventfd` arm of [`Self::sys_write`]/[`Self::sys_writev`]: add to
@@ -3296,9 +3319,42 @@ impl Kernel {
                 let mut pf = self.pollfds.lock().unwrap();
                 self.read_pollfd_fd(&mut pf, cx, fd, buf, count, mem)
             }
+            Some(Fd::PtyMaster(..) | Fd::PtySlave(..)) => self.read_pty_fd(cx, fd, buf, count, mem),
             _ => {
                 let mut sh = self.shared.lock().unwrap();
                 self.read_shared_fd(&mut sh, cx, fd, buf, count, mem)
+            }
+        }
+    }
+
+    /// `read` from a pty end: master reads terminal output, slave reads terminal
+    /// input (whole canonical lines when `ICANON`). Empty with the other end
+    /// still open blocks (or `EAGAIN` if `O_NONBLOCK`); empty with it closed is
+    /// EOF (0).
+    fn read_pty_fd(&self, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+        let f = cx.cur.fds.get(fd as i32).cloned();
+        let (res, nonblock) = {
+            let mut ptys = self.ptys.lock().unwrap();
+            match f {
+                Some(Fd::PtyMaster(n)) => (ptys.master_read(n, count as usize), ptys.is_nonblock(n, true)),
+                Some(Fd::PtySlave(n)) => (ptys.slave_read(n, count as usize), ptys.is_nonblock(n, false)),
+                _ => return err(Errno::EBADF),
+            }
+        };
+        match res {
+            None => {
+                if nonblock {
+                    return err(Errno::EAGAIN);
+                }
+                cx.block = true;
+                0
+            }
+            Some(data) if data.is_empty() => 0, // EOF
+            Some(data) => {
+                if mem.write(buf, &data).is_err() {
+                    return err(Errno::EFAULT);
+                }
+                data.len() as i64
             }
         }
     }
@@ -3795,6 +3851,27 @@ impl Kernel {
             }
             return total;
         }
+        if let Some(Fd::PtyMaster(..) | Fd::PtySlave(..)) = cx.cur.fds.get(fd as i32) {
+            let mut total = 0i64;
+            for i in 0..iovcnt {
+                let ent = iov + i * 16;
+                let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
+                    return if total > 0 { total } else { err(Errno::EFAULT) };
+                };
+                if len == 0 {
+                    continue;
+                }
+                let r = self.read_pty_fd(cx, fd, base, len, mem);
+                if r < 0 {
+                    return if total > 0 { total } else { r };
+                }
+                total += r;
+                if (r as u64) < len {
+                    break;
+                }
+            }
+            return total;
+        }
         let mut sh = self.shared.lock().unwrap();
         let mut total = 0i64;
         for i in 0..iovcnt {
@@ -3919,6 +3996,14 @@ impl Kernel {
             if len == 0 {
                 continue;
             }
+            if let Some(Fd::PtyMaster(..) | Fd::PtySlave(..)) = cx.cur.fds.get(fd as i32) {
+                let r = self.write_pty_fd(cx, fd, base, len, mem);
+                if r < 0 {
+                    return if total > 0 { total } else { r };
+                }
+                total += r;
+                continue;
+            }
             let r = self.write_shared_fd(&mut sh, cx, fd, base, len, mem);
             if r < 0 {
                 return if total > 0 { total } else { r };
@@ -3989,6 +4074,11 @@ impl Kernel {
         };
         // ioctl requests are 32-bit; some (`_IOR`-encoded) reach us sign-extended.
         let req = (request & 0xffff_ffff) as u32;
+        // Pty ends answer their own termios/winsize/TIOCGPTN/TIOCSPTLCK/FIONREAD/
+        // FIONBIO against the in-VM pty, never the host tty.
+        if let Fd::PtyMaster(n) | Fd::PtySlave(n) = f {
+            return self.pty_ioctl(n, matches!(f, Fd::PtyMaster(_)), req, arg, mem);
+        }
         // Terminal-attribute ioctls on the guest's stdio: forward to the real
         // host tty when the guest's stdio is the host's own (the CLI path), so
         // the guest gets a working virtual terminal (size, raw mode, echo). The
@@ -4050,6 +4140,71 @@ impl Kernel {
         }
     }
 
+    /// ioctls on a pty end: `TCGETS`/`TCSETS`(`W`/`F`) and `TIOCGWINSZ`/
+    /// `TIOCSWINSZ` against the pty's own termios/winsize, plus the master-only
+    /// `TIOCGPTN` (slave number) and `TIOCSPTLCK` (unlock), and `FIONREAD`/
+    /// `FIONBIO`. A successful `TCGETS` is also what makes `isatty()` true.
+    fn pty_ioctl(&self, n: usize, is_master: bool, req: u32, arg: u64, mem: &mut GuestMemory) -> i64 {
+        const TCGETS: u32 = 0x5401;
+        const TCSETS: u32 = 0x5402;
+        const TCSETSW: u32 = 0x5403;
+        const TCSETSF: u32 = 0x5404;
+        const TIOCGWINSZ: u32 = 0x5413;
+        const TIOCSWINSZ: u32 = 0x5414;
+        const TIOCGPTN: u32 = 0x8004_5430;
+        const TIOCSPTLCK: u32 = 0x4004_5431;
+        const FIONREAD: u32 = 0x541B;
+        const FIONBIO: u32 = 0x5421;
+        let mut ptys = self.ptys.lock().unwrap();
+        match req {
+            TCGETS => match ptys.get_termios(n) {
+                Some(t) if mem.write(arg, &t).is_ok() => 0,
+                Some(_) => err(Errno::EFAULT),
+                None => err(Errno::EBADF),
+            },
+            TCSETS | TCSETSW | TCSETSF => match mem.read_vec(arg, pty::TERMIOS_LEN) {
+                Ok(v) => {
+                    let mut t = [0u8; pty::TERMIOS_LEN];
+                    t.copy_from_slice(&v);
+                    ptys.set_termios(n, t);
+                    0
+                }
+                Err(_) => err(Errno::EFAULT),
+            },
+            TIOCGWINSZ => match ptys.get_winsize(n) {
+                Some(w) if mem.write(arg, &w).is_ok() => 0,
+                Some(_) => err(Errno::EFAULT),
+                None => err(Errno::EBADF),
+            },
+            TIOCSWINSZ => match mem.read_vec(arg, pty::WINSIZE_LEN) {
+                Ok(v) => {
+                    let mut w = [0u8; pty::WINSIZE_LEN];
+                    w.copy_from_slice(&v);
+                    ptys.set_winsize(n, w);
+                    0
+                }
+                Err(_) => err(Errno::EFAULT),
+            },
+            TIOCGPTN if is_master => {
+                if mem.write(arg, &(n as u32).to_le_bytes()).is_ok() { 0 } else { err(Errno::EFAULT) }
+            }
+            TIOCSPTLCK if is_master => {
+                ptys.set_lock(n, mem.read_u32(arg).is_ok_and(|v| v != 0));
+                0
+            }
+            FIONREAD => {
+                let bytes = if is_master { ptys.master_avail(n) } else { ptys.slave_avail(n) };
+                let v = u32::try_from(bytes).unwrap_or(u32::MAX);
+                if mem.write(arg, &v.to_le_bytes()).is_ok() { 0 } else { err(Errno::EFAULT) }
+            }
+            FIONBIO => {
+                ptys.set_nonblock(n, is_master, mem.read_u32(arg).is_ok_and(|v| v != 0));
+                0
+            }
+            _ => err(Errno::ENOTTY),
+        }
+    }
+
     /// `fcntl(fd, cmd, ...)` — the subset real programs need at startup.
     fn sys_fcntl(&self, cx: &mut ServiceCtx, fd: u64, cmd: u64, arg: u64) -> i64 {
         const F_DUPFD: u64 = 0;
@@ -4093,6 +4248,8 @@ impl Kernel {
         match f {
             Fd::Socket { sock, end } => self.net.lock().unwrap().set_nonblock(*sock, *end, nb),
             Fd::Eventfd(_) | Fd::Timerfd(_) => self.pollfds.lock().unwrap().set_nonblock(f, nb),
+            Fd::PtyMaster(n) => self.ptys.lock().unwrap().set_nonblock(*n, true, nb),
+            Fd::PtySlave(n) => self.ptys.lock().unwrap().set_nonblock(*n, false, nb),
             _ => {}
         }
     }
@@ -4102,6 +4259,8 @@ impl Kernel {
         match f {
             Fd::Socket { sock, end } => self.net.lock().unwrap().is_nonblock(*sock, *end),
             Fd::Eventfd(_) | Fd::Timerfd(_) => self.pollfds.lock().unwrap().is_nonblock(f),
+            Fd::PtyMaster(n) => self.ptys.lock().unwrap().is_nonblock(*n, true),
+            Fd::PtySlave(n) => self.ptys.lock().unwrap().is_nonblock(*n, false),
             _ => false,
         }
     }
@@ -4126,6 +4285,23 @@ impl Kernel {
         let abs = self.follow_symlinks(vfs, &abs).unwrap_or(abs);
         if self.trace {
             eprintln!("[open] pid={} {abs:?}", cx.cur.pid);
+        }
+
+        // Pseudo-terminals: `/dev/ptmx` allocates a fresh pty and returns its
+        // master; `/dev/pts/N` opens the matching slave once unlocked.
+        if abs == "/dev/ptmx" {
+            let n = self.ptys.lock().unwrap().alloc();
+            return i64::from(cx.cur.fds.alloc(Fd::PtyMaster(n)));
+        }
+        if let Some(rest) = abs.strip_prefix("/dev/pts/")
+            && let Ok(n) = rest.parse::<usize>()
+        {
+            let mut ptys = self.ptys.lock().unwrap();
+            if !ptys.slave_openable(n) {
+                return err(Errno::ENXIO);
+            }
+            ptys.open_slave(n);
+            return i64::from(cx.cur.fds.alloc(Fd::PtySlave(n)));
         }
 
         if vfs.stat(&abs).is_none() {
@@ -4159,6 +4335,11 @@ impl Kernel {
         match cx.cur.fds.close(fd) {
             Some(f) => {
                 self.bump_pipe(&f, false);
+                match f {
+                    Fd::PtyMaster(n) => self.ptys.lock().unwrap().close_master(n),
+                    Fd::PtySlave(n) => self.ptys.lock().unwrap().close_slave(n),
+                    _ => {}
+                }
                 0
             }
             None => err(Errno::EBADF),
@@ -4267,14 +4448,17 @@ impl Kernel {
                     None => return err(Errno::ENOENT),
                 }
             }
-            // eventfd/timerfd/epoll are anonymous-inode char-device-like fds.
+            // eventfd/timerfd/epoll are anonymous-inode char-device-like fds;
+            // pty ends are genuine tty char devices.
             Some(
                 Fd::Stdin
                 | Fd::Stdout
                 | Fd::Stderr
                 | Fd::Eventfd(_)
                 | Fd::Timerfd(_)
-                | Fd::Epoll(_),
+                | Fd::Epoll(_)
+                | Fd::PtyMaster(_)
+                | Fd::PtySlave(_),
             ) => stat::char_device_attrs(),
             Some(Fd::PipeRead(_) | Fd::PipeWrite(_)) => stat::fifo_attrs(),
             Some(Fd::Socket { .. }) => stat::socket_attrs(),
