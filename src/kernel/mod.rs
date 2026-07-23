@@ -577,6 +577,12 @@ pub struct Kernel {
     /// `Shared::stdin_buf` and *block* (re-trap) when it is empty rather than
     /// hitting the host `stdin`, so the embedder can pump input in between runs.
     interactive: bool,
+    /// When set, the guest's stdio (fds 0/1/2) is the host process's own stdio,
+    /// so terminal ioctls (`TCGETS`, `TIOCGWINSZ`, …) are forwarded to the real
+    /// host tty — giving the guest an accurate virtual terminal (size, raw mode,
+    /// echo). Cleared for paths that redirect stdio into a capture sink, where
+    /// the host tty is unrelated to where the guest's output actually goes.
+    host_tty: bool,
     trace: bool,
     /// Debug (`NIXVM_SCHEDTRACE`): log every scheduler slice (pid, syscalls run,
     /// how it ended) to see how threads interleave.
@@ -866,6 +872,7 @@ impl Kernel {
             seed: ProcInfo::default(),
             ncpus: 1,
             interactive: false,
+            host_tty: false,
             vfs: Mutex::new(mounts),
             net: Mutex::new(Net::default()),
             pipes: Mutex::new(Vec::new()),
@@ -1096,6 +1103,13 @@ impl Kernel {
 
     /// Enable interactive mode: guest reads of fd 0 draw from the buffer fed via
     /// [`Kernel::feed_stdin`] and block when empty, instead of the host stdin.
+    /// Mark the guest's stdio as the host process's own, so terminal ioctls are
+    /// forwarded to the real host tty (see [`Kernel::host_tty`]). The `nixvm run`
+    /// CLI sets this; capture/redirect paths leave it clear.
+    pub fn set_host_tty(&mut self, yes: bool) {
+        self.host_tty = yes;
+    }
+
     pub fn set_interactive(&mut self, yes: bool) {
         self.interactive = yes;
     }
@@ -3975,6 +3989,22 @@ impl Kernel {
         };
         // ioctl requests are 32-bit; some (`_IOR`-encoded) reach us sign-extended.
         let req = (request & 0xffff_ffff) as u32;
+        // Terminal-attribute ioctls on the guest's stdio: forward to the real
+        // host tty when the guest's stdio is the host's own (the CLI path), so
+        // the guest gets a working virtual terminal (size, raw mode, echo). The
+        // host ioctl itself returns ENOTTY when the fd isn't actually a tty
+        // (output piped), so isatty() stays honest.
+        if self.host_tty && is_tty_ioctl(req) {
+            let host_fd = match f {
+                Fd::Stdin => Some(0),
+                Fd::Stdout => Some(1),
+                Fd::Stderr => Some(2),
+                _ => None,
+            };
+            if let Some(hfd) = host_fd {
+                return host_tty_ioctl(hfd, req, arg, mem);
+            }
+        }
         // Interface queries (`SIOCGIF*`) operate on any socket fd.
         if net::is_iface_ioctl(req) {
             return if matches!(f, Fd::Socket { .. }) {
@@ -4674,6 +4704,58 @@ impl Kernel {
     pub fn unsupported(&self) -> BTreeMap<u64, u64> {
         self.shared.lock().unwrap().unsupported.clone()
     }
+}
+
+/// Terminal-attribute ioctls forwarded to the host tty: `TCGETS`/`TCSETS`(`W`/
+/// `F`) and `TIOCGWINSZ`/`TIOCSWINSZ`. Job-control ioctls (`TIOC[GS]PGRP`,
+/// `TIOCSCTTY`) are deliberately excluded — forwarding them would drive the
+/// *host's* terminal session with guest pids.
+fn is_tty_ioctl(req: u32) -> bool {
+    matches!(req, 0x5401 | 0x5402 | 0x5403 | 0x5404 | 0x5413 | 0x5414)
+}
+
+/// Forward a terminal ioctl to the host tty backing guest fd `host_fd` (0/1/2).
+/// Guest and host are both x86-64 Linux, so `struct termios` (36 bytes) and
+/// `struct winsize` (8 bytes) are byte-identical — copy the fixed-size struct
+/// across. A host failure (notably `ENOTTY` when stdio is a pipe) maps straight
+/// back to the guest as that negative errno, keeping `isatty()` honest.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+fn host_tty_ioctl(host_fd: i32, req: u32, arg: u64, mem: &mut GuestMemory) -> i64 {
+    use core::ffi::{c_ulong, c_void};
+    // Variadic to match the C prototype (and the vcpu crate's declaration).
+    unsafe extern "C" {
+        fn ioctl(fd: i32, request: c_ulong, ...) -> i32;
+    }
+    let (size, write) = match req {
+        0x5401 => (36usize, false),          // TCGETS
+        0x5402 | 0x5403 | 0x5404 => (36, true), // TCSETS/TCSETSW/TCSETSF
+        0x5413 => (8, false),                // TIOCGWINSZ
+        _ => (8, true),                      // TIOCSWINSZ
+    };
+    let mut buf = if write {
+        match mem.read_vec(arg, size) {
+            Ok(b) => b,
+            Err(_) => return err(Errno::EFAULT),
+        }
+    } else {
+        vec![0u8; size]
+    };
+    // SAFETY: `host_fd` is one of this process's own std streams; `buf` is
+    // exactly the `size` bytes the request reads or writes.
+    let r = unsafe { ioctl(host_fd, c_ulong::from(req), buf.as_mut_ptr().cast::<c_void>()) };
+    if r < 0 {
+        return -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(25));
+    }
+    if !write && mem.write(arg, &buf).is_err() {
+        return err(Errno::EFAULT);
+    }
+    0
+}
+
+/// No host tty to forward to (wasm / non-unix): every terminal ioctl is ENOTTY.
+#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+fn host_tty_ioctl(_host_fd: i32, _req: u32, _arg: u64, _mem: &mut GuestMemory) -> i64 {
+    err(Errno::ENOTTY)
 }
 
 /// `clock_gettime(clk_id, timespec)`.

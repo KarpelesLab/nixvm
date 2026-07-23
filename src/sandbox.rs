@@ -342,6 +342,7 @@ impl Sandbox {
 
         let mut kernel = Kernel::new(arch, mounts);
         kernel.set_ncpus(self.config.ncpus);
+        kernel.set_host_tty(true);
         kernel.set_cwd(if self.config.mode == RunMode::Booted {
             "/"
         } else {
@@ -445,6 +446,7 @@ impl Sandbox {
 
         let mut kernel = Kernel::new(arch, self.build_mounts()?);
         kernel.set_ncpus(self.config.ncpus);
+        kernel.set_host_tty(true);
         kernel.set_cwd("/work");
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
