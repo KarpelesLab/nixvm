@@ -3964,15 +3964,26 @@ impl Kernel {
     /// ioctl spelling of `fcntl(F_SETFL, O_NONBLOCK)`, so a client that sets its
     /// socket non-blocking this way must not be silently left blocking (that
     /// strands an event loop, exactly like the `F_SETFL` gap did).
-    fn sys_ioctl(&self, cx: &mut ServiceCtx, fd: u64, request: u64, arg: u64, mem: &GuestMemory) -> i64 {
-        const FIONBIO: u64 = 0x5421;
-        const FIOCLEX: u64 = 0x5451;
-        const FIONCLEX: u64 = 0x5450;
+    fn sys_ioctl(&self, cx: &mut ServiceCtx, fd: u64, request: u64, arg: u64, mem: &mut GuestMemory) -> i64 {
+        const FIONBIO: u32 = 0x5421;
+        const FIOCLEX: u32 = 0x5451;
+        const FIONCLEX: u32 = 0x5450;
+        const FIONREAD: u32 = 0x541B; // == SIOCINQ
+        const SIOCOUTQ: u32 = 0x5411;
         let Some(f) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
         // ioctl requests are 32-bit; some (`_IOR`-encoded) reach us sign-extended.
-        match request & 0xffff_ffff {
+        let req = (request & 0xffff_ffff) as u32;
+        // Interface queries (`SIOCGIF*`) operate on any socket fd.
+        if net::is_iface_ioctl(req) {
+            return if matches!(f, Fd::Socket { .. }) {
+                net::iface_ioctl(req, arg, mem)
+            } else {
+                err(Errno::ENOTTY)
+            };
+        }
+        match req {
             // `arg` points at an `int`: nonzero sets `O_NONBLOCK`, zero clears it.
             FIONBIO => {
                 let on = mem.read_u32(arg).is_ok_and(|v| v != 0);
@@ -3982,6 +3993,28 @@ impl Kernel {
             // Set/clear close-on-exec. nixvm does not track the flag separately
             // (as `fcntl(F_SETFD)` doesn't either), so this is an accepted no-op.
             FIOCLEX | FIONCLEX => 0,
+            // Bytes available to read, written as an `int` at `arg`.
+            FIONREAD => {
+                let bytes = match &f {
+                    Fd::PipeRead(i) => {
+                        self.pipes.lock().unwrap().get(*i).map_or(0, |p| p.buf.len() as u64)
+                    }
+                    Fd::Eventfd(_) | Fd::Timerfd(_) => self.pollfds.lock().unwrap().readable_bytes(&f),
+                    Fd::Socket { sock, end } => {
+                        let mut net = self.net.lock().unwrap();
+                        self.socket_readable_bytes(&mut net, *sock, *end)
+                    }
+                    Fd::Stdin => 0, // host stdin count is not tracked
+                    _ => 0,
+                };
+                let v = u32::try_from(bytes).unwrap_or(u32::MAX);
+                if mem.write(arg, &v.to_le_bytes()).is_ok() { 0 } else { err(Errno::EFAULT) }
+            }
+            // Bytes queued to send: nixvm flushes sockets straight to the host /
+            // peer, so nothing is ever queued.
+            SIOCOUTQ if matches!(f, Fd::Socket { .. }) => {
+                if mem.write(arg, &0u32.to_le_bytes()).is_ok() { 0 } else { err(Errno::EFAULT) }
+            }
             // Terminal and unrecognized requests: not a tty.
             _ => err(Errno::ENOTTY),
         }

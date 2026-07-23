@@ -1289,6 +1289,22 @@ impl Kernel {
     /// for a non-host socket (which uses the generic best-effort answer). Only
     /// host sockets get a precise readable answer (via a peek), so a guest that
     /// trusts `poll` (apk's http client) doesn't spin on spurious readiness.
+    /// Bytes available to read on socket `sock` (end `end`) right now — for
+    /// `ioctl(FIONREAD/SIOCINQ)`. A bridged host stream peeks the real count; an
+    /// in-VM pair reports its inbound queue; a datagram socket reports the next
+    /// datagram's length (after draining the host UDP socket).
+    pub(super) fn socket_readable_bytes(&self, net: &mut Net, sock: usize, end: usize) -> u64 {
+        if matches!(net.socks.get(sock).map(|s| &s.kind), Some(Kind::Dgram(_))) {
+            self.host_udp_drain(net, sock);
+        }
+        match net.socks.get_mut(sock).map(|s| &mut s.kind) {
+            Some(Kind::Host(h)) => h.conn.readable_len() as u64,
+            Some(Kind::Pair(p)) => p.to[end.min(1)].len() as u64,
+            Some(Kind::Dgram(d)) => d.queue.front().map_or(0, |(_, payload)| payload.len() as u64),
+            _ => 0,
+        }
+    }
+
     pub(super) fn host_socket_readiness(&self, net: &mut Net, sock: usize) -> Option<u32> {
         const POLLIN: u32 = 0x1;
         const POLLOUT: u32 = 0x4;
@@ -2260,6 +2276,103 @@ fn build_rtm_newaddr_v6(seq: u32, pid: u32) -> Vec<u8> {
     payload.extend(encode_rtattr(IFA_LOCAL, &ip));
     payload.extend(encode_rtattr(IFA_LABEL, b"lo\0"));
     encode_nlmsg(RTM_NEWADDR, 0, seq, pid, &payload)
+}
+
+/// Interface-query ioctls (`SIOCGIF*`) for nixvm's single loopback interface —
+/// the same `lo` (index 1, `IFF_UP|LOOPBACK|RUNNING`, MTU 65536, `127.0.0.1`)
+/// the netlink dump reports. They operate on a `struct ifreq` (a 16-byte name
+/// then a 24-byte union) at `arg`, except `SIOCGIFCONF` which uses `struct
+/// ifconf`. A name-keyed query for anything but `lo` is `ENODEV`. Returns 0 on
+/// success or a negative errno; the caller has already checked `arg`'s fd is a
+/// socket.
+pub(super) fn iface_ioctl(req: u32, arg: u64, mem: &mut GuestMemory) -> i64 {
+    const SIOCGIFNAME: u32 = 0x8910;
+    const SIOCGIFCONF: u32 = 0x8912;
+    const SIOCGIFFLAGS: u32 = 0x8913;
+    const SIOCGIFADDR: u32 = 0x8915;
+    const SIOCGIFBRDADDR: u32 = 0x8919;
+    const SIOCGIFNETMASK: u32 = 0x891b;
+    const SIOCGIFMTU: u32 = 0x8921;
+    const SIOCGIFHWADDR: u32 = 0x8927;
+    const SIOCGIFINDEX: u32 = 0x8933;
+    const IFR_UNION: u64 = 16; // offset of the union after `char ifr_name[16]`
+    const IFREQ_SZ: u32 = 40;
+
+    // Write a `struct sockaddr_in { family, port=0, addr, 8 pad }` into the union.
+    let put_sin = |mem: &mut GuestMemory, ip: [u8; 4]| -> bool {
+        let mut sa = [0u8; 16];
+        sa[0..2].copy_from_slice(&AF_INET.to_le_bytes());
+        sa[4..8].copy_from_slice(&ip);
+        mem.write(arg + IFR_UNION, &sa).is_ok()
+    };
+
+    if req == SIOCGIFCONF {
+        // struct ifconf { int ifc_len; /*4 pad*/ char* ifc_buf; }
+        let (Ok(len), Ok(buf)) = (mem.read_u32(arg), mem.read_u64(arg + 8)) else {
+            return err(Errno::EFAULT);
+        };
+        if buf == 0 || len < IFREQ_SZ {
+            // Report the buffer size one `lo` ifreq needs.
+            let _ = mem.write(arg, &IFREQ_SZ.to_le_bytes());
+            return 0;
+        }
+        let mut e = [0u8; IFREQ_SZ as usize];
+        e[0..2].copy_from_slice(b"lo");
+        e[16..18].copy_from_slice(&AF_INET.to_le_bytes());
+        e[20..24].copy_from_slice(&[127, 0, 0, 1]);
+        if mem.write(buf, &e).is_err() {
+            return err(Errno::EFAULT);
+        }
+        let _ = mem.write(arg, &IFREQ_SZ.to_le_bytes());
+        return 0;
+    }
+    if req == SIOCGIFNAME {
+        // Keyed by ifr_ifindex; only index 1 (`lo`) exists.
+        let Ok(idx) = mem.read_u32(arg + IFR_UNION) else {
+            return err(Errno::EFAULT);
+        };
+        if idx != LOOPBACK_IFINDEX as u32 {
+            return err(Errno::ENODEV);
+        }
+        let mut name = [0u8; 16];
+        name[0..2].copy_from_slice(b"lo");
+        return if mem.write(arg, &name).is_ok() { 0 } else { err(Errno::EFAULT) };
+    }
+    // The remaining queries are keyed by ifr_name, which must be `lo`.
+    let Ok(name) = mem.read_vec(arg, 16) else {
+        return err(Errno::EFAULT);
+    };
+    let end = name.iter().position(|&c| c == 0).unwrap_or(16);
+    if &name[..end] != b"lo" {
+        return err(Errno::ENODEV);
+    }
+    let ok = match req {
+        SIOCGIFINDEX => mem.write(arg + IFR_UNION, &LOOPBACK_IFINDEX.to_le_bytes()).is_ok(),
+        SIOCGIFFLAGS => {
+            let flags = (IFF_UP | IFF_LOOPBACK | IFF_RUNNING) as u16;
+            mem.write(arg + IFR_UNION, &flags.to_le_bytes()).is_ok()
+        }
+        SIOCGIFMTU => mem.write(arg + IFR_UNION, &65_536u32.to_le_bytes()).is_ok(),
+        SIOCGIFADDR => put_sin(mem, [127, 0, 0, 1]),
+        SIOCGIFNETMASK => put_sin(mem, [255, 0, 0, 0]),
+        SIOCGIFBRDADDR => put_sin(mem, [0, 0, 0, 0]),
+        SIOCGIFHWADDR => {
+            // sockaddr with sa_family = ARPHRD_LOOPBACK and a 6-byte zero MAC.
+            let mut sa = [0u8; 16];
+            sa[0..2].copy_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
+            mem.write(arg + IFR_UNION, &sa).is_ok()
+        }
+        _ => return err(Errno::ENOTTY),
+    };
+    if ok { 0 } else { err(Errno::EFAULT) }
+}
+
+/// Whether `req` is an interface-query ioctl handled by [`iface_ioctl`].
+pub(super) fn is_iface_ioctl(req: u32) -> bool {
+    matches!(
+        req,
+        0x8910 | 0x8912 | 0x8913 | 0x8915 | 0x8919 | 0x891b | 0x8921 | 0x8927 | 0x8933
+    )
 }
 
 /// Write a `struct sockaddr_nl` (`nl_family`, 2 bytes pad, `nl_pid`,

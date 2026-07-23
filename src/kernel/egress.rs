@@ -38,6 +38,13 @@ pub trait HostConn: Send + Debug {
     /// peek). Drives `poll`/`select` readiness so a guest that trusts `poll`
     /// (apk's http client) doesn't see a spurious "ready" then `EAGAIN`.
     fn poll_readable(&mut self) -> bool;
+    /// Bytes available to read right now, for `ioctl(FIONREAD)`. The default is
+    /// coarse (1 if any data, else 0); a transport that can peek the real count
+    /// (native sockets) should override it so a client sizing a read buffer from
+    /// `FIONREAD` doesn't under-read.
+    fn readable_len(&mut self) -> usize {
+        usize::from(self.poll_readable())
+    }
 }
 
 /// One received datagram: `(source ip, v6, source port, payload)`.
@@ -138,6 +145,13 @@ mod native {
                 Ok(_) => true,
                 Err(e) => e.kind() != io::ErrorKind::WouldBlock,
             }
+        }
+        fn readable_len(&mut self) -> usize {
+            // Peek into a page-sized buffer for the queued byte count. Capped at
+            // the buffer — enough to size a read; a client re-checks after
+            // draining. `WouldBlock`/errors report 0 (nothing to read now).
+            let mut b = [0u8; 4096];
+            self.0.peek(&mut b).unwrap_or(0)
         }
     }
 

@@ -110,6 +110,16 @@ impl PollFds {
         }
     }
 
+    /// Bytes an `ioctl(FIONREAD)` reports for an eventfd/timerfd: a full 8-byte
+    /// counter word when it is signalled (its `read` returns 8 bytes), else 0.
+    pub(super) fn readable_bytes(&self, fd: &super::Fd) -> u64 {
+        match fd {
+            super::Fd::Eventfd(i) => u64::from(self.eventfds.get(*i).is_some_and(|e| e.count > 0)) * 8,
+            super::Fd::Timerfd(i) => u64::from(self.timerfds.get(*i).is_some_and(|t| t.expirations > 0)) * 8,
+            _ => 0,
+        }
+    }
+
     /// `fcntl(F_GETFL)` on an eventfd/timerfd.
     pub(super) fn is_nonblock(&self, fd: &super::Fd) -> bool {
         match fd {
