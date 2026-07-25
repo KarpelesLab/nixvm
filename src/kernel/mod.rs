@@ -3206,13 +3206,48 @@ impl Kernel {
         let Ok(data) = mem.read_vec(buf, count as usize) else {
             return err(Errno::EFAULT);
         };
-        let mut ptys = self.ptys.lock().unwrap();
-        match f {
-            Some(Fd::PtyMaster(n)) => ptys.master_write(n, &data),
-            Some(Fd::PtySlave(n)) => ptys.slave_write(n, &data),
-            _ => return err(Errno::EBADF),
+        // Run the line discipline under the `ptys` lock, then release it before
+        // taking `sh` to deliver any `ISIG`-generated signals (sh sorts *before*
+        // ptys, so it must never be acquired while ptys is held).
+        let signals = {
+            let mut ptys = self.ptys.lock().unwrap();
+            match f {
+                Some(Fd::PtyMaster(n)) => ptys.master_write(n, &data),
+                Some(Fd::PtySlave(n)) => {
+                    ptys.slave_write(n, &data);
+                    (Vec::new(), 0)
+                }
+                _ => return err(Errno::EBADF),
+            }
+        };
+        let (sigs, pgrp) = signals;
+        if !sigs.is_empty() && pgrp != 0 {
+            let mut sh = self.shared.lock().unwrap();
+            for sig in sigs {
+                self.signal_pgrp(&mut sh, cx, pgrp, sig);
+            }
         }
         data.len() as i64
+    }
+
+    /// Post signal `sig` to every task in process group `pgrp` (the pty
+    /// foreground-group `^C`/`^\`/`^Z` path) and un-park them so a blocked
+    /// `read`/`wait` re-checks. The signalling task's own `cur` is out of
+    /// `sh.procs` during its slice, so it is handled separately.
+    fn signal_pgrp(&self, sh: &mut Shared, cx: &mut ServiceCtx, pgrp: i32, sig: u32) {
+        if sig == 0 || u64::from(sig) > signal::NSIG {
+            return;
+        }
+        let bit = 1u64 << (sig - 1);
+        if pgid_of(&cx.cur) == pgrp {
+            cx.cur.pending |= bit;
+        }
+        for slot in sh.procs.iter_mut().flatten() {
+            if pgid_of(&slot.info) == pgrp {
+                slot.info.pending |= bit;
+                slot.info.parked = false;
+            }
+        }
     }
 
     /// The `Fd::Eventfd` arm of [`Self::sys_write`]/[`Self::sys_writev`]: add to
@@ -3345,6 +3380,13 @@ impl Kernel {
             None => {
                 if nonblock {
                     return err(Errno::EAGAIN);
+                }
+                // A caught signal is pending (e.g. `^C` → SIGINT just posted to
+                // this fg process group): interrupt the read with `-EINTR` so the
+                // post-dispatch `deliver_pending_signals` runs the handler, rather
+                // than re-parking and swallowing the wake.
+                if cx.cur.pending & !cx.cur.blocked != 0 {
+                    return err(Errno::EINTR);
                 }
                 cx.block = true;
                 0
@@ -4153,6 +4195,8 @@ impl Kernel {
         const TIOCSWINSZ: u32 = 0x5414;
         const TIOCGPTN: u32 = 0x8004_5430;
         const TIOCSPTLCK: u32 = 0x4004_5431;
+        const TIOCGPGRP: u32 = 0x540F;
+        const TIOCSPGRP: u32 = 0x5410;
         const FIONREAD: u32 = 0x541B;
         const FIONBIO: u32 = 0x5421;
         let mut ptys = self.ptys.lock().unwrap();
@@ -4192,6 +4236,19 @@ impl Kernel {
                 ptys.set_lock(n, mem.read_u32(arg).is_ok_and(|v| v != 0));
                 0
             }
+            // `tcgetpgrp`/`tcsetpgrp`: the foreground process group, the target
+            // of `ISIG`-generated signals. Both ends share one value.
+            TIOCGPGRP => {
+                let pgrp = ptys.fg_pgrp(n);
+                if mem.write(arg, &pgrp.to_le_bytes()).is_ok() { 0 } else { err(Errno::EFAULT) }
+            }
+            TIOCSPGRP => match mem.read_u32(arg) {
+                Ok(v) => {
+                    ptys.set_fg_pgrp(n, v as i32);
+                    0
+                }
+                Err(_) => err(Errno::EFAULT),
+            },
             FIONREAD => {
                 let bytes = if is_master { ptys.master_avail(n) } else { ptys.slave_avail(n) };
                 let v = u32::try_from(bytes).unwrap_or(u32::MAX);
@@ -4300,7 +4357,7 @@ impl Kernel {
             if !ptys.slave_openable(n) {
                 return err(Errno::ENXIO);
             }
-            ptys.open_slave(n);
+            ptys.open_slave(n, pgid_of(&cx.cur));
             return i64::from(cx.cur.fds.alloc(Fd::PtySlave(n)));
         }
 

@@ -27,7 +27,7 @@ const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
 
 /// Highest supported signal number (`_NSIG - 1` on Linux).
-const NSIG: u64 = 64;
+pub(super) const NSIG: u64 = 64;
 const SIGKILL: u64 = 9;
 const SIGSTOP: u64 = 19;
 
