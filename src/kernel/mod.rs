@@ -217,6 +217,9 @@ const STACK_GUARD_GAP: u64 = 256 * PAGE_SIZE;
 const SS_DISABLE: u64 = 2;
 /// `sigaction` flag: run the handler on the alternate signal stack.
 const SA_ONSTACK: u64 = 0x0800_0000;
+/// `sigaction` flag: restart an interruptible syscall after the handler returns
+/// (rather than failing it with `EINTR`).
+const SA_RESTART: u64 = 0x1000_0000;
 /// The synchronous fault signals this kernel can deliver to a handler.
 const SIGILL: u64 = 4;
 const SIGSEGV: u64 = 11;
@@ -556,6 +559,16 @@ pub(super) struct ServiceCtx {
     /// Set by `execve`/`rt_sigreturn` when it replaced the process image (resume
     /// at the new PC without setting a syscall return). (Was `Kernel::exec_ok`.)
     exec_ok: bool,
+    /// Whether a syscall that sets `block` may be *restarted* (re-executed after a
+    /// signal handler runs, per `SA_RESTART`). Defaults to `true` — the common
+    /// case (`read`/`write`/`wait`/`accept`/`recv`/`futex`/…). The syscalls Linux
+    /// never restarts (`poll`/`select`/`epoll_wait`/`pause`) clear it, so an
+    /// interrupting handler makes them fail with `EINTR` regardless of `SA_RESTART`.
+    restartable: bool,
+    /// Set by the syscall-interruption path when a blocking syscall is being
+    /// restarted (an `SA_RESTART` handler interrupted it): [`Kernel::deliver_async_signal`]
+    /// rewinds the guest PC to re-execute the `syscall` after the handler returns.
+    restart_syscall: bool,
     /// Syscalls serviced in the current slice (preemption quantum counter). (Was
     /// `Kernel::slice_syscalls`.)
     slice_syscalls: u32,
@@ -1242,18 +1255,47 @@ impl Kernel {
                 cx.slice_syscalls = cx.slice_syscalls.saturating_add(1);
                 cx.block = false;
                 cx.exec_ok = false;
+                cx.restartable = true; // syscalls are restartable unless they opt out
+                cx.restart_syscall = false;
                 // No lock is held here: `dispatch` acquires exactly the lock(s)
                 // each handler needs (sh before vfs). This is what lets other
                 // workers service their own syscalls concurrently (step B2).
-                let ret = self.dispatch(cx, sys, raw, &args, vcpu, mem);
+                let mut ret = self.dispatch(cx, sys, raw, &args, vcpu, mem);
+                // A syscall that wants to block but has a signal with a real
+                // handler pending must not park — POSIX requires it to either
+                // restart after the handler (`SA_RESTART`) or fail with `-EINTR`,
+                // and the handler must run now. (A default-*terminate* signal is
+                // handled by the `Zombie` check below, which wins over `block`;
+                // `SIG_IGN`/default-ignored signals correctly leave it blocked.)
+                if cx.block {
+                    if let Some(sig) = self.first_handled_signal(cx) {
+                        cx.block = false;
+                        if cx.cur.handlers[sig].flags & SA_RESTART != 0 && cx.restartable {
+                            // Re-run the `syscall` once the handler returns; the
+                            // re-run re-establishes any wait bookkeeping (e.g. a
+                            // futex's), so leave it in place.
+                            cx.restart_syscall = true;
+                        } else {
+                            ret = err(Errno::EINTR);
+                            // Abandoning the syscall (not restarting): drop the
+                            // futex-wait bookkeeping so a later FUTEX_WAKE on the
+                            // old address can't spuriously flag this now-running
+                            // task. (`wake_deadline` is cleared below since the
+                            // syscall no longer blocks.)
+                            cx.cur.futex_wait = None;
+                            cx.cur.futex_woken = false;
+                        }
+                    }
+                }
                 // Land the syscall's result in the vcpu *before* delivering any
                 // pending signal: if this syscall is interrupted by a handler
                 // (e.g. `sigsuspend` → `-EINTR`), the `rt_sigframe` must capture
                 // the real result so `rt_sigreturn` restores it — otherwise the
                 // interrupted syscall would resume with a stale return register.
-                // Skipped when the task re-blocks (re-traps the same syscall) or
-                // exec'd a new image (resumes at its entry, no return value).
-                if !cx.block && !cx.exec_ok {
+                // Skipped when the task re-blocks (re-traps the same syscall), is
+                // being restarted (RAX must keep the syscall number), or exec'd a
+                // new image (resumes at its entry, no return value).
+                if !cx.block && !cx.exec_ok && !cx.restart_syscall {
                     vcpu.set_syscall_ret(ret as u64);
                 }
                 let delivered = self.deliver_pending_signals(cx, vcpu, mem);
@@ -2182,6 +2224,7 @@ impl Kernel {
             // it simply parks (the guest re-traps).
             Sysno::Pause => {
                 cx.block = true;
+                cx.restartable = false; // pause() always returns -EINTR when caught
                 0
             }
             Sysno::Getcwd => self.sys_getcwd(cx, args[0], args[1], mem),
@@ -3381,13 +3424,8 @@ impl Kernel {
                 if nonblock {
                     return err(Errno::EAGAIN);
                 }
-                // A caught signal is pending (e.g. `^C` → SIGINT just posted to
-                // this fg process group): interrupt the read with `-EINTR` so the
-                // post-dispatch `deliver_pending_signals` runs the handler, rather
-                // than re-parking and swallowing the wake.
-                if cx.cur.pending & !cx.cur.blocked != 0 {
-                    return err(Errno::EINTR);
-                }
+                // Block; the dispatcher interrupts this with EINTR / SA_RESTART if
+                // a caught signal (e.g. `^C` → SIGINT) is pending for this task.
                 cx.block = true;
                 0
             }
@@ -5836,6 +5874,45 @@ mod tests {
         let sh = k.shared.lock().unwrap();
         let w = sh.procs.iter().flatten().find(|p| p.info.pid == 2).unwrap();
         assert!(w.info.futex_woken, "waiter flagged for release");
+    }
+
+    #[test]
+    fn first_handled_signal_classifies_pending_signals() {
+        let (k, _mem, _v, mut cx) = setup();
+        let handler = SigAction { handler: 0x4000, flags: 0, restorer: 0, mask: 0 };
+        let bit = |sig: u32| 1u64 << (sig - 1);
+
+        // Nothing pending → nothing to interrupt.
+        assert_eq!(k.first_handled_signal(&cx), None);
+
+        // A real handler for a pending signal interrupts.
+        cx.cur.pending = bit(2); // SIGINT
+        cx.cur.handlers[2] = handler;
+        assert_eq!(k.first_handled_signal(&cx), Some(2));
+
+        // …but not while that signal is blocked.
+        cx.cur.blocked = bit(2);
+        assert_eq!(k.first_handled_signal(&cx), None);
+        cx.cur.blocked = 0;
+
+        // SIG_IGN does not interrupt.
+        cx.cur.handlers[2] = SigAction { handler: 1, ..handler };
+        assert_eq!(k.first_handled_signal(&cx), None);
+
+        // A default-terminate signal (SIG_DFL) returns None: the caller lets the
+        // Zombie path end the task rather than interrupting the syscall.
+        cx.cur.handlers[2] = SigAction::default();
+        cx.cur.pending = bit(15); // SIGTERM, no handler
+        assert_eq!(k.first_handled_signal(&cx), None);
+
+        // A default-ignored signal (SIGCHLD) does not interrupt.
+        cx.cur.pending = bit(17);
+        assert_eq!(k.first_handled_signal(&cx), None);
+
+        // Alongside a default-ignored signal, the lowest *handled* one wins.
+        cx.cur.pending = bit(17) | bit(10);
+        cx.cur.handlers[10] = handler;
+        assert_eq!(k.first_handled_signal(&cx), Some(10));
     }
 
     #[test]

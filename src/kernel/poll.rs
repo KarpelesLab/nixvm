@@ -290,6 +290,10 @@ impl Kernel {
         if timeout_ms == 0 {
             return true;
         }
+        // poll/ppoll/epoll_wait are never restarted after a signal (Linux returns
+        // EINTR regardless of SA_RESTART) — a restart would silently reset the
+        // remaining timeout.
+        cx.restartable = false;
         if timeout_ms < 0 {
             cx.block = true;
             return false;
@@ -453,6 +457,7 @@ impl Kernel {
             return total;
         }
         cx.block = true;
+        cx.restartable = false; // select(2), like poll, always fails with EINTR
         0
     }
 

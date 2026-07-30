@@ -219,6 +219,30 @@ impl Kernel {
                 .any(|p| i64::from(p.info.pid) == pid)
     }
 
+    /// The signal (`1..=NSIG`) whose *real handler* [`Self::deliver_pending_signals`]
+    /// will run at this syscall boundary, or `None` when the first actionable
+    /// pending signal isn't a caught one. Used by the syscall dispatcher to decide
+    /// whether a blocking syscall must be interrupted (a handler exists to run) and
+    /// how (`SA_RESTART` restart vs `EINTR`). The scan mirrors `deliver_pending_signals`
+    /// exactly: `SIG_IGN` and default-ignored signals are skipped (they don't
+    /// interrupt), and a default-*terminate* signal returns `None` (the process is
+    /// about to die — the dispatcher's `Zombie` check handles it, not the block path).
+    pub(super) fn first_handled_signal(&self, cx: &ServiceCtx) -> Option<usize> {
+        let deliverable = cx.cur.pending & !cx.cur.blocked;
+        for sig in 1..=NSIG {
+            if deliverable & (1u64 << (sig - 1)) == 0 {
+                continue;
+            }
+            match cx.cur.handlers[sig as usize].handler {
+                SIG_IGN => {}                              // dropped — no interrupt
+                h if h != SIG_DFL => return Some(sig as usize), // real handler runs
+                _ if is_default_ignored(sig) => {}         // dropped — no interrupt
+                _ => return None,                          // default terminate/stop
+            }
+        }
+        None
+    }
+
     /// Act on the first deliverable pending signal for the current process. Runs
     /// once after each serviced syscall. Unlike before, a signal with a real
     /// handler is now *delivered* (an `rt_sigframe` is pushed and the vcpu points
@@ -385,6 +409,17 @@ impl Kernel {
         // state first, so the frame saves the real user rip/rflags (not the
         // trampoline's `sysretq`) and the handler runs at CPL3, not supervisor.
         vcpu.settle_syscall_return();
+        // Restarting an `SA_RESTART`-interrupted blocking syscall: rewind the saved
+        // rip to the 2-byte `syscall` instruction so the handler's `rt_sigreturn`
+        // re-executes it. `rcx` holds the syscall's return address on both x86-64
+        // backends (KVM's `settle` set rip←rcx just above; the interpreter set rcx
+        // at `syscall` entry), so the instruction is at `rcx − 2`. RAX still holds
+        // the syscall number — a restarted syscall skips `set_syscall_ret`. (This,
+        // like the whole `rt_sigframe` path, is x86-64-specific.)
+        if cx.restart_syscall {
+            let syscall_pc = vcpu.reg(1).wrapping_sub(2); // rcx − len(`syscall`)
+            vcpu.set_pc(syscall_pc);
+        }
         self.push_sigframe(cx, sig, 0, 0 /* SI_USER */, 0, restore, vcpu, mem)
     }
 
