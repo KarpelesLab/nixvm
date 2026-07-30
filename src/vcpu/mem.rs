@@ -511,7 +511,22 @@ impl GuestMemory {
 
     /// Verify `[addr, addr + len)` is mapped and every page grants `need`
     /// (intended protection).
+    ///
+    /// Ordinary guest memory lives in the flat `[base, base+size)` extent tracked
+    /// by the per-page `prot`/`mapped` vectors. But some legitimately-mapped pages
+    /// sit *above* that extent — the user-accessible control-block pages (the vDSO
+    /// and its vvar, which the loader advertises to libc via `AT_SYSINFO_EHDR`).
+    /// KVM reaches those through the hardware page-table walk; the interpreter
+    /// reaches all memory through this method, so an out-of-extent address is
+    /// validated against the page tables instead (which is also what [`Self::copy_out`]
+    /// already translates through). Access is granted only to *user* (non-supervisor)
+    /// leaves — exactly what a CPL3 guest could touch — so the supervisor control
+    /// pages (GDT/IDT/kstack) stay unreadable.
     fn check(&self, addr: u64, len: usize, need: Prot) -> Result<(), MemError> {
+        let end = addr.checked_add(len as u64).ok_or(MemError::OutOfBounds(addr))?;
+        if addr < self.base || end > self.base + self.size {
+            return self.check_paged(addr, len, need);
+        }
         let (first, last) = self.page_range(addr, len)?;
         for p in first..=last {
             if !self.mapped[p] {
@@ -523,6 +538,25 @@ impl GuestMemory {
                     needed: need,
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// [`Self::check`] for an address outside the flat extent: validate every page
+    /// against the page tables, granting access only to present, user-accessible
+    /// leaves that carry `need`. An address the tables don't map is genuinely out
+    /// of bounds (there is no per-page slot for it), preserving the historical
+    /// `OutOfBounds` fault for addresses beyond the guest's extent.
+    fn check_paged(&self, addr: u64, len: usize, need: Prot) -> Result<(), MemError> {
+        let mut cur = addr - addr % PAGE_SIZE;
+        let end = addr.saturating_add(len.max(1) as u64);
+        while cur < end {
+            match self.space.translate(cur, &self.phys) {
+                Some(t) if !t.supervisor && t.prot.contains(need) => {}
+                Some(_) => return Err(MemError::Protection { addr: cur, needed: need }),
+                None => return Err(MemError::OutOfBounds(addr)),
+            }
+            cur += PAGE_SIZE;
         }
         Ok(())
     }
@@ -843,6 +877,21 @@ mod tests {
         let m = mem();
         assert!(matches!(m.read_u32(0x9_0000), Err(MemError::OutOfBounds(_))));
         assert!(matches!(m.read_u32(0x0_0000), Err(MemError::OutOfBounds(_))));
+    }
+
+    #[test]
+    fn vdso_is_reachable_but_supervisor_control_pages_are_not() {
+        // The vDSO/vvar sit in the control block *above* the flat extent (the
+        // loader hands their address to libc via AT_SYSINFO_EHDR). A software
+        // backend reaches memory through `check`, so those user pages must be
+        // readable — the ELF header the guest parses starts with "\x7fELF".
+        let m = mem();
+        let ehdr = m.read_vec(ctrl::VDSO_VA, 4).expect("vDSO must be readable");
+        assert_eq!(&ehdr, b"\x7fELF", "vDSO ELF magic at AT_SYSINFO_EHDR");
+        assert!(m.can_exec(ctrl::VDSO_VA), "vDSO code page is executable");
+        assert!(m.read_vec(ctrl::VVAR_VA, 8).is_ok(), "vvar page is readable");
+        // Supervisor-only control pages (GDT) stay unreachable from the guest.
+        assert!(m.read_u32(ctrl::GDT_BASE).is_err(), "GDT is supervisor-only");
     }
 
     #[test]
