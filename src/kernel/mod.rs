@@ -1988,7 +1988,7 @@ impl Kernel {
             // (Bun/JSC issues ~89% `clock_gettime`), where routing each through
             // the big `sh` lock cost an acquire/release on the hot path and
             // needless cross-thread contention under SMP.
-            Sysno::ClockGettime => sys_clock_gettime(args[1], mem),
+            Sysno::ClockGettime => sys_clock_gettime(args[0], args[1], mem),
             Sysno::Gettimeofday => time::sys_gettimeofday(args[0], mem),
             Sysno::ClockGetres => time::sys_clock_getres(args[1], mem),
             Sysno::Time => time::sys_time(args[0], mem),
@@ -2187,7 +2187,7 @@ impl Kernel {
             Sysno::Madvise => self.sys_madvise(args[0], args[1], args[2], mem),
             Sysno::Mincore => self.sys_mincore(args[0], args[1], args[2], mem),
             Sysno::Uname => self.sys_uname(args[0], mem),
-            Sysno::ClockGettime => sys_clock_gettime(args[1], mem),
+            Sysno::ClockGettime => sys_clock_gettime(args[0], args[1], mem),
             Sysno::Gettimeofday => time::sys_gettimeofday(args[0], mem),
             Sysno::ClockGetres => time::sys_clock_getres(args[1], mem),
             Sysno::Nanosleep => time::sys_nanosleep(args[0], args[1], mem),
@@ -5037,9 +5037,25 @@ fn host_tty_ioctl(_host_fd: i32, _req: u32, _arg: u64, _mem: &mut GuestMemory) -
     err(Errno::ENOTTY)
 }
 
-/// `clock_gettime(clk_id, timespec)`.
-fn sys_clock_gettime(ts: u64, mem: &mut GuestMemory) -> i64 {
-    let now = crate::clock::now_unix();
+/// `clock_gettime(clk_id, timespec)`. Each Linux clock id is served from the
+/// matching host source so the guest sees genuine wall / monotonic / CPU time —
+/// not wall time for all of them. This must agree with the vDSO fast path, which
+/// bases `CLOCK_MONOTONIC` on [`crate::clock::now_monotonic`] too (see
+/// [`crate::vcpu::vdso`]); the CPU-time clocks the vDSO never fast-paths land
+/// here. An unrecognized id falls back to the wall clock rather than failing.
+fn sys_clock_gettime(clk_id: u64, ts: u64, mem: &mut GuestMemory) -> i64 {
+    const MONOTONIC: u64 = 1;
+    const PROCESS_CPUTIME: u64 = 2;
+    const THREAD_CPUTIME: u64 = 3;
+    const MONOTONIC_RAW: u64 = 4;
+    const MONOTONIC_COARSE: u64 = 6;
+    const BOOTTIME: u64 = 7;
+    let now = match clk_id {
+        MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE | BOOTTIME => crate::clock::now_monotonic(),
+        PROCESS_CPUTIME => crate::clock::now_cpu_process(),
+        THREAD_CPUTIME => crate::clock::now_cpu_thread(),
+        _ => crate::clock::now_unix(), // REALTIME(0)/REALTIME_COARSE(5)/TAI(11)/…
+    };
     let mut b = [0u8; 16];
     b[0..8].copy_from_slice(&(now.as_secs()).to_le_bytes());
     b[8..16].copy_from_slice(&u64::from(now.subsec_nanos()).to_le_bytes());
@@ -5874,6 +5890,28 @@ mod tests {
         let sh = k.shared.lock().unwrap();
         let w = sh.procs.iter().flatten().find(|p| p.info.pid == 2).unwrap();
         assert!(w.info.futex_woken, "waiter flagged for release");
+    }
+
+    #[test]
+    fn clock_gettime_reads_each_clock_from_its_own_domain() {
+        let (_k, mut mem, _v, _cx) = setup();
+        let buf = 0x1_0000; // mapped rw by `setup`
+        mem.map(buf, PAGE, Prot::rw()).unwrap();
+        let mut secs = |clk: u64| -> i64 {
+            assert_eq!(sys_clock_gettime(clk, buf, &mut mem), 0);
+            let b = mem.read_vec(buf, 16).unwrap();
+            i64::from_le_bytes(b[0..8].try_into().unwrap())
+        };
+        let realtime = secs(0); // CLOCK_REALTIME  -> wall seconds (post-2020)
+        let monotonic = secs(1); // CLOCK_MONOTONIC -> since boot/start
+        let proc_cpu = secs(2); // CLOCK_PROCESS_CPUTIME_ID -> CPU seconds
+        let thr_cpu = secs(3); // CLOCK_THREAD_CPUTIME_ID
+        assert!(realtime > 1_600_000_000, "realtime is a real wall time");
+        // The monotonic and CPU clocks must NOT read as the wall epoch — the old
+        // bug returned wall time for every id.
+        assert!(monotonic < realtime, "monotonic is not the wall epoch");
+        assert!((0..realtime).contains(&proc_cpu), "process-cpu is not the wall epoch");
+        assert!((0..realtime).contains(&thr_cpu), "thread-cpu is not the wall epoch");
     }
 
     #[test]

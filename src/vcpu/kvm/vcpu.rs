@@ -942,10 +942,11 @@ impl Vcpu for KvmVcpu {
         let shift: u64 = 32;
         let mult = ((1_000_000u128 << shift) / u128::from(tsc_khz)) as u64;
 
-        // Read the guest TSC (IA32_TSC) and the host wall clock as close together
-        // as possible so the vDSO's TSC-derived time matches the syscall clock
-        // (which reads the same host wall clock). nixvm returns wall time for
-        // every clock id, so mono and wall share the base.
+        // Read the guest TSC (IA32_TSC) and the host clocks as close together as
+        // possible so the vDSO's TSC-derived time matches the syscall clock (which
+        // reads the same host sources). `CLOCK_MONOTONIC` and `CLOCK_REALTIME`
+        // have distinct bases: the vDSO adds the scaled TSC delta to whichever the
+        // guest asked for, exactly as the clock-aware `sys_clock_gettime` does.
         let mut msrs = sys::kvm_msrs {
             nmsrs: 1,
             pad: 0,
@@ -958,13 +959,12 @@ impl Vcpu for KvmVcpu {
             return None;
         }
         let base_tsc = msrs.entries[0].data;
-        let now = crate::clock::now_unix().as_nanos() as u64;
         Some(crate::vcpu::VdsoCal {
             mult,
             shift,
             base_tsc,
-            base_mono_ns: now,
-            base_wall_ns: now,
+            base_mono_ns: crate::clock::now_monotonic().as_nanos() as u64,
+            base_wall_ns: crate::clock::now_unix().as_nanos() as u64,
         })
     }
 
