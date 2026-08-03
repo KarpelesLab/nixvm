@@ -40,6 +40,8 @@ pub enum Sysno {
     Readv,
     Writev,
     Setitimer,
+    Getitimer,
+    Alarm,
     Uname,
     Getpid,
     Getppid,

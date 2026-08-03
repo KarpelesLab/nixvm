@@ -33,6 +33,7 @@ pub fn decode(nr: u64) -> Sysno {
         65 => Sysno::Readv,
         66 => Sysno::Writev,
         103 => Sysno::Setitimer,
+        102 => Sysno::Getitimer,
         160 => Sysno::Uname,
         172 => Sysno::Getpid,
         173 => Sysno::Getppid,

@@ -148,6 +148,14 @@ struct ProcInfo {
     /// CPU time (ns) of this task's *reaped* children, accumulated on `wait4`/
     /// `waitid` — Linux's `ru_utime` for `RUSAGE_CHILDREN` and `tms_cutime`.
     child_cpu_ns: u128,
+    /// `ITIMER_REAL` (`alarm`/`setitimer`): absolute wall-clock deadline (ns since
+    /// the epoch) at which `SIGALRM` is posted, or `None` when disarmed. The
+    /// scheduler wakes a parked task at this deadline (like [`Self::wake_deadline`])
+    /// so a real-time timer can interrupt a blocking syscall.
+    alarm_deadline: Option<u128>,
+    /// `ITIMER_REAL` reload interval (ns); `0` for a one-shot `alarm`. When the
+    /// timer fires, `alarm_deadline` advances by this if non-zero, else disarms.
+    alarm_interval_ns: u128,
 }
 
 /// A writable file-backed `MAP_SHARED` region awaiting flush-back.
@@ -192,6 +200,8 @@ impl Default for ProcInfo {
             wake_deadline: None,
             cpu_ns: 0,
             child_cpu_ns: 0,
+            alarm_deadline: None,
+            alarm_interval_ns: 0,
         }
     }
 }
@@ -235,6 +245,8 @@ const SA_RESTART: u64 = 0x1000_0000;
 /// The synchronous fault signals this kernel can deliver to a handler.
 const SIGILL: u64 = 4;
 const SIGSEGV: u64 = 11;
+/// Posted when an `ITIMER_REAL` (`alarm`/`setitimer`) deadline passes.
+const SIGALRM: u64 = 14;
 /// Sent to a process's parent when a child terminates (so a blocked `wait`
 /// wakes to reap it).
 const SIGCHLD: u64 = 17;
@@ -791,7 +803,8 @@ impl Shared {
             .iter()
             .flatten()
             .filter(|p| p.info.run == RunState::Running)
-            .filter_map(|p| p.info.wake_deadline)
+            .flat_map(|p| [p.info.wake_deadline, p.info.alarm_deadline])
+            .flatten()
             .min()
         else {
             return false;
@@ -843,7 +856,8 @@ impl Shared {
             .iter()
             .flatten()
             .filter(|p| p.info.run == RunState::Running)
-            .filter_map(|p| p.info.wake_deadline)
+            .flat_map(|p| [p.info.wake_deadline, p.info.alarm_deadline])
+            .flatten()
             .min()
     }
 
@@ -1228,6 +1242,11 @@ impl Kernel {
             // stops accruing, so this tracks CPU rather than wall time.
             let step_start = crate::clock::now_monotonic().as_nanos();
             let exit = vcpu.run(mem)?;
+            // Fire a due ITIMER_REAL before servicing, so a blocking syscall this
+            // step sees SIGALRM pending and is interrupted.
+            if cx.cur.alarm_deadline.is_some() {
+                fire_alarm_if_due(&mut cx.cur, poll::now_ns());
+            }
             let flow = self.service(cx, exit, vcpu.as_mut(), mem);
             cx.cur.cpu_ns = cx
                 .cur
@@ -1733,6 +1752,9 @@ impl Kernel {
             sh.check_out_files(&mut cx);
             (proc, cx)
         };
+        if cx.cur.alarm_deadline.is_some() {
+            fire_alarm_if_due(&mut cx.cur, poll::now_ns());
+        }
         let flow = self.service(&mut cx, exit, vcpu, mem);
         // Charge this step's wall time (run + service) to the task's CPU total.
         cx.cur.cpu_ns = cx
@@ -2220,6 +2242,10 @@ impl Kernel {
             // `dispatch_impl` table (they never reach here). nanosleep's interval
             // is relative (no clock/flags); clock_nanosleep carries a clock id and
             // flags (TIMER_ABSTIME).
+            // Real-time timers (ITIMER_REAL) → SIGALRM.
+            Sysno::Alarm => self.sys_alarm(cx, args[0]),
+            Sysno::Setitimer => self.sys_setitimer(cx, args[0], args[1], args[2], mem),
+            Sysno::Getitimer => self.sys_getitimer(cx, args[0], args[1], mem),
             Sysno::Nanosleep => self.sys_nanosleep(cx, 0, 0, args[0], args[1], mem),
             Sysno::ClockNanosleep => self.sys_nanosleep(cx, args[0], args[1], args[2], args[3], mem),
             // The guest does not own the host clock: refuse to set it. ptrace
@@ -2393,10 +2419,6 @@ impl Kernel {
             // files, so granting every request immediately is safe — apk
             // locks its database this way.
             | Sysno::Flock
-            // setitimer: wget/curl set an interval timer for request timeouts.
-            // Not modeled (no SIGALRM delivery yet) — a no-op just means the
-            // timeout never fires.
-            | Sysno::Setitimer
             // Sync family: nothing is durably backed (in-memory / host
             // passthrough), so there's nothing to flush.
             | Sysno::Fsync
@@ -5136,6 +5158,77 @@ impl Kernel {
         }
     }
 
+    /// `alarm(seconds)` — arm a one-shot `ITIMER_REAL` that posts `SIGALRM` after
+    /// `seconds`, returning the whole seconds left on any previous alarm (0 if
+    /// none). `alarm(0)` cancels.
+    #[allow(clippy::unused_self)]
+    fn sys_alarm(&self, cx: &mut ServiceCtx, seconds: u64) -> i64 {
+        let now = poll::now_ns();
+        let remaining = cx.cur.alarm_deadline.map_or(0, |dl| dl.saturating_sub(now).div_ceil(1_000_000_000));
+        cx.cur.alarm_interval_ns = 0;
+        cx.cur.alarm_deadline = if seconds == 0 {
+            None
+        } else {
+            Some(now + u128::from(seconds) * 1_000_000_000)
+        };
+        i64::try_from(remaining).unwrap_or(i64::MAX)
+    }
+
+    /// `setitimer(which, new, old)` / `getitimer(which, old)` — only `ITIMER_REAL`
+    /// (which 0) is modeled (it posts `SIGALRM`); the CPU-time timers (`ITIMER_
+    /// VIRTUAL`/`PROF`) are accepted as no-ops. `struct itimerval` is two
+    /// `timeval`s: `it_interval` then `it_value`, each `{ i64 tv_sec; i64 tv_usec }`.
+    fn sys_setitimer(&self, cx: &mut ServiceCtx, which: u64, new: u64, old: u64, mem: &mut GuestMemory) -> i64 {
+        const ITIMER_REAL: u64 = 0;
+        let now = poll::now_ns();
+        // Report the previous ITIMER_REAL into `old` if requested.
+        if old != 0 && self.write_itimer(cx, old, now, mem).is_err() {
+            return err(Errno::EFAULT);
+        }
+        if which != ITIMER_REAL {
+            return 0; // VIRTUAL/PROF not modeled
+        }
+        if new == 0 {
+            return 0; // query only
+        }
+        let (Ok(int_s), Ok(int_us), Ok(val_s), Ok(val_us)) = (
+            mem.read_u64(new),
+            mem.read_u64(new + 8),
+            mem.read_u64(new + 16),
+            mem.read_u64(new + 24),
+        ) else {
+            return err(Errno::EFAULT);
+        };
+        let interval = u128::from(int_s) * 1_000_000_000 + u128::from(int_us) * 1_000;
+        let value = u128::from(val_s) * 1_000_000_000 + u128::from(val_us) * 1_000;
+        cx.cur.alarm_interval_ns = interval;
+        cx.cur.alarm_deadline = if value == 0 { None } else { Some(now + value) };
+        0
+    }
+
+    /// Shared helper: write the current `ITIMER_REAL` state as a `struct itimerval`
+    /// at `dst` (`it_interval`, then remaining `it_value`).
+    #[allow(clippy::unused_self)]
+    fn write_itimer(&self, cx: &ServiceCtx, dst: u64, now: u128, mem: &mut GuestMemory) -> Result<(), ()> {
+        let remaining = cx.cur.alarm_deadline.map_or(0, |dl| dl.saturating_sub(now));
+        let mut b = [0u8; 32];
+        let put = |b: &mut [u8; 32], off: usize, ns: u128| {
+            b[off..off + 8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_le_bytes());
+            b[off + 8..off + 16].copy_from_slice(&((ns % 1_000_000_000 / 1_000) as i64).to_le_bytes());
+        };
+        put(&mut b, 0, cx.cur.alarm_interval_ns); // it_interval
+        put(&mut b, 16, remaining); // it_value
+        mem.write(dst, &b).map_err(|_| ())
+    }
+
+    /// `getitimer(which, curr)` — write the current timer to `curr`.
+    fn sys_getitimer(&self, cx: &ServiceCtx, _which: u64, curr: u64, mem: &mut GuestMemory) -> i64 {
+        if curr != 0 && self.write_itimer(cx, curr, poll::now_ns(), mem).is_err() {
+            return err(Errno::EFAULT);
+        }
+        0
+    }
+
     /// `nanosleep`/`clock_nanosleep` — genuinely suspend the caller until the
     /// deadline, using the scheduler's timed wait ([`ProcInfo::wake_deadline`]),
     /// instead of returning instantly. The absolute wall-clock deadline is seeded
@@ -5229,6 +5322,32 @@ fn process_cpu_ns(sh: &Shared, cx: &ServiceCtx) -> u128 {
             .filter(|p| p.info.tgid == tgid)
             .map(|p| p.info.cpu_ns)
             .sum::<u128>()
+}
+
+/// Post `SIGALRM` to `info` if its `ITIMER_REAL` deadline has passed at `now`
+/// (wall ns), re-arming a periodic timer or disarming a one-shot. Un-parks the
+/// task so a blocking syscall wakes to take the signal. Returns whether it fired.
+fn fire_alarm_if_due(info: &mut ProcInfo, now: u128) -> bool {
+    let Some(dl) = info.alarm_deadline else {
+        return false;
+    };
+    if now < dl {
+        return false;
+    }
+    info.pending |= 1u64 << (SIGALRM - 1);
+    info.parked = false;
+    info.alarm_deadline = if info.alarm_interval_ns > 0 {
+        // Advance past any deadlines missed while descheduled (no signal coalescing
+        // beyond one pending bit, as on Linux).
+        let mut next = dl + info.alarm_interval_ns;
+        while next <= now {
+            next += info.alarm_interval_ns;
+        }
+        Some(next)
+    } else {
+        None
+    };
+    true
 }
 
 /// Build a `struct rusage` (144 bytes) whose `ru_utime` carries `cpu_ns` of CPU
@@ -6661,6 +6780,33 @@ mod tests {
             call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [999, 15, 0, 0, 0, 0]),
             -3
         );
+    }
+
+    #[test]
+    fn alarm_arms_a_timer_that_posts_sigalrm() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        // alarm(0) with nothing armed returns 0 and stays disarmed.
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Alarm, [0; 6]), 0);
+        assert_eq!(cx.cur.alarm_deadline, None);
+        // alarm(5) arms a one-shot ~5s out; a re-arm returns the ~5s remaining.
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Alarm, [5, 0, 0, 0, 0, 0]), 0);
+        assert!(cx.cur.alarm_deadline.is_some());
+        let r = call(&k, &mut cx, &mut mem, &mut v, Sysno::Alarm, [10, 0, 0, 0, 0, 0]);
+        assert!((4..=5).contains(&r), "prior alarm had ~5s left, got {r}");
+
+        // Firing at/after the deadline posts SIGALRM and disarms the one-shot.
+        let dl = cx.cur.alarm_deadline.unwrap();
+        assert!(!fire_alarm_if_due(&mut cx.cur, dl - 1), "not yet due");
+        assert!(fire_alarm_if_due(&mut cx.cur, dl), "due → fires");
+        assert_eq!(cx.cur.pending & (1 << (SIGALRM - 1)), 1 << (SIGALRM - 1));
+        assert_eq!(cx.cur.alarm_deadline, None, "one-shot disarms");
+
+        // A periodic timer re-arms to the next interval when it fires.
+        cx.cur.pending = 0;
+        cx.cur.alarm_interval_ns = 1_000_000_000; // 1s
+        cx.cur.alarm_deadline = Some(1000);
+        assert!(fire_alarm_if_due(&mut cx.cur, 1000));
+        assert_eq!(cx.cur.alarm_deadline, Some(1000 + 1_000_000_000), "periodic re-arms");
     }
 
     #[test]
