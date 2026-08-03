@@ -2293,7 +2293,7 @@ impl Kernel {
                 sys_misc::sys_sched_getaffinity(args[1], args[2], mem)
             }
             Sysno::SchedGetparam => sys_misc::sys_sched_getparam(args[1], mem),
-            Sysno::Getrusage => sys_misc::sys_getrusage(args[1], mem),
+            Sysno::Getrusage => sys_misc::sys_getrusage(args[0], args[1], mem),
             Sysno::Sysinfo => sys_misc::sys_sysinfo(args[0], mem),
             Sysno::Times => sys_misc::sys_times(args[0], mem),
             Sysno::Getcpu => sys_misc::sys_getcpu(args[0], args[1], mem),
@@ -5912,6 +5912,28 @@ mod tests {
         assert!(monotonic < realtime, "monotonic is not the wall epoch");
         assert!((0..realtime).contains(&proc_cpu), "process-cpu is not the wall epoch");
         assert!((0..realtime).contains(&thr_cpu), "thread-cpu is not the wall epoch");
+    }
+
+    #[test]
+    fn getrusage_and_times_report_cpu_time_not_zero_or_wall() {
+        let (_k, mut mem, _v, _cx) = setup();
+        let buf = 0x1_0000;
+        mem.map(buf, PAGE, Prot::rw()).unwrap();
+        // getrusage(RUSAGE_SELF): ru_utime holds a plausible CPU time (seconds
+        // well below the wall epoch, microseconds normalized) — not the old
+        // all-zeros, and not wall time.
+        assert_eq!(sys_misc::sys_getrusage(0, buf, &mut mem), 0);
+        let ru = mem.read_vec(buf, 144).unwrap();
+        let sec = i64::from_le_bytes(ru[0..8].try_into().unwrap());
+        let usec = i64::from_le_bytes(ru[8..16].try_into().unwrap());
+        assert!(sec >= 0 && sec < 1_600_000_000, "ru_utime is CPU time, not wall");
+        assert!((0..1_000_000).contains(&usec), "tv_usec normalized");
+        // times(): tms_utime is non-negative and the return (real elapsed ticks)
+        // is non-negative.
+        let ret = sys_misc::sys_times(buf, &mut mem);
+        assert!(ret >= 0, "times returns elapsed ticks");
+        let tms = mem.read_vec(buf, 32).unwrap();
+        assert!(i64::from_le_bytes(tms[0..8].try_into().unwrap()) >= 0, "tms_utime");
     }
 
     #[test]
