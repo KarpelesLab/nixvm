@@ -130,6 +130,27 @@ impl PollFds {
     }
 }
 
+/// Install the `p`-variant poll sigmask (`ppoll`/`pselect6`/`epoll_pwait`): for
+/// the duration of the wait the caller's signal mask is replaced with `*mask_ptr`,
+/// then restored — atomically, so a signal the caller blocked to avoid a race can
+/// interrupt only during the poll. Reuses the `sigsuspend_prev` temp-mask slot
+/// (they are mutually exclusive): the mask is re-installed on each re-trap and the
+/// original is restored by `deliver_pending_signals` when the wait ends (or taken
+/// as the delivered handler's `uc_sigmask` on interruption). A null `mask_ptr` is
+/// a no-op (plain poll/select/epoll_wait).
+pub(super) fn install_poll_sigmask(cx: &mut ServiceCtx, mask_ptr: u64, mem: &GuestMemory) {
+    if mask_ptr == 0 {
+        return;
+    }
+    let Ok(mask) = mem.read_u64(mask_ptr) else {
+        return;
+    };
+    if cx.cur.sigsuspend_prev.is_none() {
+        cx.cur.sigsuspend_prev = Some(cx.cur.blocked);
+    }
+    cx.cur.blocked = mask;
+}
+
 /// Nanoseconds since the UNIX epoch on the host wall clock.
 pub(super) fn now_ns() -> u128 {
     std::time::SystemTime::now()
@@ -368,16 +389,15 @@ impl Kernel {
         0
     }
 
-    /// `ppoll(fds, nfds, timeout, sigmask, sigsetsize)`. The sigmask is
-    /// accepted but not honored (no signal-frame delivery exists to restore
-    /// into).
+    /// `ppoll(fds, nfds, timeout, sigmask, sigsetsize)`. The sigmask, if given, is
+    /// installed for the duration of the wait (see [`install_poll_sigmask`]).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_ppoll(
         &self, cx: &mut ServiceCtx,
         fds_ptr: u64,
         nfds: u64,
         timeout_ts: u64,
-        _sigmask: u64,
+        sigmask: u64,
         _sigsetsize: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
@@ -389,6 +409,7 @@ impl Kernel {
             };
             timespec_to_ms(sec, nsec)
         };
+        install_poll_sigmask(cx, sigmask, mem);
         self.sys_poll(cx, fds_ptr, nfds, timeout_ms, mem)
     }
 
@@ -461,8 +482,10 @@ impl Kernel {
         0
     }
 
-    /// `pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)`. The
-    /// sigmask argument is accepted but not honored.
+    /// `pselect6(nfds, readfds, writefds, exceptfds, timeout, sigmask)`. Its 6th
+    /// argument is *indirect* — a pointer to `{ const sigset_t *ss; size_t ss_len }`
+    /// (the syscall's 7th logical arg packed behind a pointer) — so it is
+    /// dereferenced to reach the mask, then installed for the wait.
     #[allow(clippy::too_many_arguments)] // one parameter per syscall argument
     pub(super) fn sys_pselect6(
         &self, cx: &mut ServiceCtx,
@@ -471,7 +494,7 @@ impl Kernel {
         w: u64,
         e: u64,
         timeout_ts: u64,
-        _sigmask: u64,
+        sigmask: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
         let immediate = if timeout_ts == 0 {
@@ -482,6 +505,12 @@ impl Kernel {
             };
             sec == 0 && nsec == 0
         };
+        // Deref the argpack: `ss` is the sigset pointer at offset 0.
+        if sigmask != 0 {
+            if let Ok(ss) = mem.read_u64(sigmask) {
+                install_poll_sigmask(cx, ss, mem);
+            }
+        }
         self.sys_select_core(cx, nfds, r, w, e, immediate, mem)
     }
 

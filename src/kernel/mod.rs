@@ -2277,10 +2277,17 @@ impl Kernel {
             Sysno::Pselect6 => {
                 self.sys_pselect6(cx, args[0], args[1], args[2], args[3], args[4], args[5], mem)
             }
-            Sysno::EpollWait | Sysno::EpollPwait => {
+            Sysno::EpollWait => self.sys_epoll_wait(cx, args[0], args[1], args[2], args[3] as i64, mem),
+            // epoll_pwait/pwait2 carry a sigmask (arg 4, a direct sigset pointer)
+            // installed for the wait, exactly like ppoll.
+            Sysno::EpollPwait => {
+                poll::install_poll_sigmask(cx, args[4], mem);
                 self.sys_epoll_wait(cx, args[0], args[1], args[2], args[3] as i64, mem)
             }
-            Sysno::EpollPwait2 => self.sys_epoll_pwait2(cx, args[0], args[1], args[2], args[3], mem),
+            Sysno::EpollPwait2 => {
+                poll::install_poll_sigmask(cx, args[4], mem);
+                self.sys_epoll_pwait2(cx, args[0], args[1], args[2], args[3], mem)
+            }
             Sysno::Dup => self.sys_dup(cx, args[0]),
             Sysno::Dup2 | Sysno::Dup3 => self.sys_dup2(cx, args[0], args[1]),
             Sysno::Clone => self.sys_clone(sh, cx, args, vcpu, mem),
