@@ -138,6 +138,13 @@ struct ProcInfo {
     /// of re-parking. This is what makes `setTimeout` fire — libuv sleeps in
     /// `epoll_pwait(timeout)` until the next timer is due.
     wake_deadline: Option<u128>,
+    /// CPU time consumed by this task, in nanoseconds: the wall time it has spent
+    /// actually executing (each dispatched step's run + service), accumulated by
+    /// the schedulers. A parked/blocked task doesn't advance it — which is what
+    /// makes `CLOCK_THREAD_CPUTIME_ID` (this field) and `CLOCK_PROCESS_CPUTIME_ID`
+    /// (the thread-group sum) measure CPU rather than wall time, per task rather
+    /// than per host process.
+    cpu_ns: u128,
 }
 
 /// A writable file-backed `MAP_SHARED` region awaiting flush-back.
@@ -180,6 +187,7 @@ impl Default for ProcInfo {
             parked: false,
             shared_maps: Vec::new(),
             wake_deadline: None,
+            cpu_ns: 0,
         }
     }
 }
@@ -444,6 +452,8 @@ fn run_slice_smp(
     let mut count: u32 = 0;
     let mut progressed = false;
     loop {
+        // Step start, for CPU-time accounting (charged in `smp_service_step`).
+        let step_start = crate::clock::now_monotonic().as_nanos();
         // ---- run phase: no kernel lock held ----
         // Interpreter reads/writes guest memory *through* GuestMemory, so it must
         // hold the memory lock for the whole run. KVM executes against the mapped
@@ -491,7 +501,7 @@ fn run_slice_smp(
         // workers service their syscalls concurrently (step B2). ----
         let step = {
             let mut mem = space.lock().unwrap();
-            kernel.smp_service_step(i, exit, vcpu.as_mut(), &mut mem)
+            kernel.smp_service_step(i, exit, vcpu.as_mut(), &mut mem, step_start)
         };
         match step {
             SliceStep::Continue => {
@@ -1209,8 +1219,17 @@ impl Kernel {
     ) -> Result<bool, VcpuError> {
         let mut progressed = false;
         loop {
+            // Charge this step's wall time (guest execution + syscall servicing)
+            // to the task's CPU total — a blocked task ends its slice here and
+            // stops accruing, so this tracks CPU rather than wall time.
+            let step_start = crate::clock::now_monotonic().as_nanos();
             let exit = vcpu.run(mem)?;
-            match self.service(cx, exit, vcpu.as_mut(), mem) {
+            let flow = self.service(cx, exit, vcpu.as_mut(), mem);
+            cx.cur.cpu_ns = cx
+                .cur
+                .cpu_ns
+                .saturating_add(crate::clock::now_monotonic().as_nanos().saturating_sub(step_start));
+            match flow {
                 Serviced::SetRet => {
                     // The result was already written to the vcpu inside `service`
                     // (before signal delivery, so an interrupted syscall's frame
@@ -1694,6 +1713,7 @@ impl Kernel {
         exit: Exit,
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
+        step_start: u128,
     ) -> SliceStep {
         // Checkout under `sh`, then release it before servicing.
         let (mut proc, mut cx) = {
@@ -1710,6 +1730,11 @@ impl Kernel {
             (proc, cx)
         };
         let flow = self.service(&mut cx, exit, vcpu, mem);
+        // Charge this step's wall time (run + service) to the task's CPU total.
+        cx.cur.cpu_ns = cx
+            .cur
+            .cpu_ns
+            .saturating_add(crate::clock::now_monotonic().as_nanos().saturating_sub(step_start));
         {
             let mut sh = self.shared.lock().unwrap();
             sh.check_in_files(&mut cx);
@@ -1988,7 +2013,7 @@ impl Kernel {
             // (Bun/JSC issues ~89% `clock_gettime`), where routing each through
             // the big `sh` lock cost an acquire/release on the hot path and
             // needless cross-thread contention under SMP.
-            Sysno::ClockGettime => sys_clock_gettime(args[0], args[1], mem),
+            Sysno::ClockGettime => self.sys_clock_gettime(cx, args[0], args[1], mem),
             Sysno::Gettimeofday => time::sys_gettimeofday(args[0], mem),
             Sysno::ClockGetres => time::sys_clock_getres(args[1], mem),
             Sysno::Time => time::sys_time(args[0], mem),
@@ -2187,12 +2212,12 @@ impl Kernel {
             Sysno::Madvise => self.sys_madvise(args[0], args[1], args[2], mem),
             Sysno::Mincore => self.sys_mincore(args[0], args[1], args[2], mem),
             Sysno::Uname => self.sys_uname(args[0], mem),
-            Sysno::ClockGettime => sys_clock_gettime(args[0], args[1], mem),
-            Sysno::Gettimeofday => time::sys_gettimeofday(args[0], mem),
-            Sysno::ClockGetres => time::sys_clock_getres(args[1], mem),
-            Sysno::Nanosleep => time::sys_nanosleep(args[0], args[1], mem),
-            Sysno::ClockNanosleep => time::sys_nanosleep(args[2], args[3], mem),
-            Sysno::Time => time::sys_time(args[0], mem),
+            // ClockGettime/Gettimeofday/ClockGetres/Time are handled in the fast
+            // `dispatch_impl` table (they never reach here). nanosleep's interval
+            // is relative (no clock/flags); clock_nanosleep carries a clock id and
+            // flags (TIMER_ABSTIME).
+            Sysno::Nanosleep => self.sys_nanosleep(cx, 0, 0, args[0], args[1], mem),
+            Sysno::ClockNanosleep => self.sys_nanosleep(cx, args[0], args[1], args[2], args[3], mem),
             // The guest does not own the host clock: refuse to set it. ptrace
             // is refused too (no debugging surface).
             Sysno::Settimeofday | Sysno::ClockSettime | Sysno::Ptrace => err(Errno::EPERM),
@@ -2293,9 +2318,9 @@ impl Kernel {
                 sys_misc::sys_sched_getaffinity(args[1], args[2], mem)
             }
             Sysno::SchedGetparam => sys_misc::sys_sched_getparam(args[1], mem),
-            Sysno::Getrusage => sys_misc::sys_getrusage(args[0], args[1], mem),
+            Sysno::Getrusage => self.sys_getrusage(sh, cx, args[0], args[1], mem),
             Sysno::Sysinfo => sys_misc::sys_sysinfo(args[0], mem),
-            Sysno::Times => sys_misc::sys_times(args[0], mem),
+            Sysno::Times => self.sys_times(sh, cx, args[0], mem),
             Sysno::Getcpu => sys_misc::sys_getcpu(args[0], args[1], mem),
             Sysno::Capget => sys_misc::sys_capget(args[1], mem),
             Sysno::Prlimit64 => self.sys_prlimit64(sh, args[1], args[2], args[3], mem),
@@ -5037,32 +5062,134 @@ fn host_tty_ioctl(_host_fd: i32, _req: u32, _arg: u64, _mem: &mut GuestMemory) -
     err(Errno::ENOTTY)
 }
 
-/// `clock_gettime(clk_id, timespec)`. Each Linux clock id is served from the
-/// matching host source so the guest sees genuine wall / monotonic / CPU time —
-/// not wall time for all of them. This must agree with the vDSO fast path, which
-/// bases `CLOCK_MONOTONIC` on [`crate::clock::now_monotonic`] too (see
-/// [`crate::vcpu::vdso`]); the CPU-time clocks the vDSO never fast-paths land
-/// here. An unrecognized id falls back to the wall clock rather than failing.
-fn sys_clock_gettime(clk_id: u64, ts: u64, mem: &mut GuestMemory) -> i64 {
-    const MONOTONIC: u64 = 1;
-    const PROCESS_CPUTIME: u64 = 2;
-    const THREAD_CPUTIME: u64 = 3;
-    const MONOTONIC_RAW: u64 = 4;
-    const MONOTONIC_COARSE: u64 = 6;
-    const BOOTTIME: u64 = 7;
-    let now = match clk_id {
-        MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE | BOOTTIME => crate::clock::now_monotonic(),
-        PROCESS_CPUTIME => crate::clock::now_cpu_process(),
-        THREAD_CPUTIME => crate::clock::now_cpu_thread(),
-        _ => crate::clock::now_unix(), // REALTIME(0)/REALTIME_COARSE(5)/TAI(11)/…
-    };
-    let mut b = [0u8; 16];
-    b[0..8].copy_from_slice(&(now.as_secs()).to_le_bytes());
-    b[8..16].copy_from_slice(&u64::from(now.subsec_nanos()).to_le_bytes());
-    match mem.write(ts, &b) {
-        Ok(()) => 0,
-        Err(_) => err(Errno::EFAULT),
+impl Kernel {
+    /// `clock_gettime(clk_id, timespec)`. Each Linux clock id is served from the
+    /// matching source so the guest sees genuine wall / monotonic / CPU time — not
+    /// wall time for all of them. `CLOCK_MONOTONIC` agrees with the vDSO fast path
+    /// (both use [`crate::clock::now_monotonic`]); the CPU-time clocks the vDSO
+    /// never fast-paths land here and read the scheduler's per-task accounting
+    /// ([`ProcInfo::cpu_ns`]) — `CLOCK_THREAD_CPUTIME_ID` is this task, and
+    /// `CLOCK_PROCESS_CPUTIME_ID` sums its whole thread group — so each guest
+    /// process sees only its own CPU, not the host's. An unrecognized id falls
+    /// back to the wall clock rather than failing.
+    fn sys_clock_gettime(&self, cx: &ServiceCtx, clk_id: u64, ts: u64, mem: &mut GuestMemory) -> i64 {
+        const MONOTONIC: u64 = 1;
+        const PROCESS_CPUTIME: u64 = 2;
+        const THREAD_CPUTIME: u64 = 3;
+        const MONOTONIC_RAW: u64 = 4;
+        const MONOTONIC_COARSE: u64 = 6;
+        const BOOTTIME: u64 = 7;
+        let cpu = |ns: u128| std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX));
+        let now = match clk_id {
+            MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE | BOOTTIME => crate::clock::now_monotonic(),
+            THREAD_CPUTIME => cpu(cx.cur.cpu_ns),
+            // Sum the thread group. No `sh` is held on this call path (the fast
+            // dispatch table reaches here without it), so lock it here.
+            PROCESS_CPUTIME => cpu(process_cpu_ns(&self.shared.lock().unwrap(), cx)),
+            _ => crate::clock::now_unix(), // REALTIME(0)/REALTIME_COARSE(5)/TAI(11)/…
+        };
+        let mut b = [0u8; 16];
+        b[0..8].copy_from_slice(&(now.as_secs()).to_le_bytes());
+        b[8..16].copy_from_slice(&u64::from(now.subsec_nanos()).to_le_bytes());
+        match mem.write(ts, &b) {
+            Ok(()) => 0,
+            Err(_) => err(Errno::EFAULT),
+        }
     }
+
+    /// `nanosleep`/`clock_nanosleep` — genuinely suspend the caller until the
+    /// deadline, using the scheduler's timed wait ([`ProcInfo::wake_deadline`]),
+    /// instead of returning instantly. The absolute wall-clock deadline is seeded
+    /// on the first entry and reused on every re-trap (the guest PC never advanced
+    /// past the syscall), so a relative sleep converges instead of resetting.
+    ///
+    /// `clock_id`/`flags` come from `clock_nanosleep`; plain `nanosleep` passes a
+    /// relative interval (`flags == 0`). `TIMER_ABSTIME` targets an absolute time
+    /// in `clock_id`'s domain. A caught signal interrupts the sleep with `-EINTR`,
+    /// writing the time remaining to `rem` (relative sleeps only), exactly as
+    /// Linux does.
+    fn sys_nanosleep(&self, cx: &mut ServiceCtx, clock_id: u64, flags: u64, req: u64, rem: u64, mem: &mut GuestMemory) -> i64 {
+        const TIMER_ABSTIME: u64 = 1;
+        const CLOCK_REALTIME: u64 = 0;
+        let abstime = flags & TIMER_ABSTIME != 0;
+
+        // Seed the absolute wall-clock deadline once; re-traps reuse it.
+        let deadline = match cx.cur.wake_deadline {
+            Some(dl) => dl,
+            None => {
+                let (Ok(sec), Ok(nsec)) = (mem.read_u64(req), mem.read_u64(req + 8)) else {
+                    return err(Errno::EFAULT);
+                };
+                if nsec >= 1_000_000_000 || (sec as i64) < 0 {
+                    return err(Errno::EINVAL);
+                }
+                let want = u128::from(sec) * 1_000_000_000 + u128::from(nsec);
+                let now_wall = poll::now_ns();
+                let dl = if abstime {
+                    // `want` is an absolute time on `clock_id`; convert to how long
+                    // remains, then to a wall-clock deadline the scheduler tracks.
+                    let clock_now = if clock_id == CLOCK_REALTIME {
+                        crate::clock::now_unix()
+                    } else {
+                        crate::clock::now_monotonic()
+                    }
+                    .as_nanos();
+                    if want <= clock_now {
+                        return 0; // the absolute deadline already passed
+                    }
+                    now_wall + (want - clock_now)
+                } else {
+                    now_wall + want
+                };
+                cx.cur.wake_deadline = Some(dl);
+                dl
+            }
+        };
+
+        let now = poll::now_ns();
+        if now >= deadline {
+            cx.cur.wake_deadline = None;
+            if !abstime && rem != 0 {
+                let _ = mem.write(rem, &[0u8; 16]); // slept the full interval
+            }
+            return 0;
+        }
+        // A caught signal cuts the sleep short: report the remaining time (a
+        // relative sleep only) and fail with EINTR. Handled here (not by the
+        // generic block-interrupt path) so `rem` is written correctly.
+        if self.first_handled_signal(cx).is_some() {
+            cx.cur.wake_deadline = None;
+            if !abstime && rem != 0 {
+                let left = deadline - now;
+                let mut b = [0u8; 16];
+                b[0..8].copy_from_slice(&((left / 1_000_000_000) as u64).to_le_bytes());
+                b[8..16].copy_from_slice(&((left % 1_000_000_000) as u64).to_le_bytes());
+                let _ = mem.write(rem, &b);
+            }
+            return err(Errno::EINTR);
+        }
+        // Not there yet, no signal: park until the deadline (or an earlier wake).
+        // Not auto-restarted on SA_RESTART — Linux uses a restart-block that
+        // re-computes the remaining time; we report EINTR instead.
+        cx.block = true;
+        cx.restartable = false;
+        0
+    }
+}
+
+/// CPU time (ns) of `cx`'s whole thread group — this task plus its checked-in
+/// siblings sharing its `tgid`. `cx.cur` is out of `sh.procs` during its slice,
+/// so it is added explicitly. Shared by `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`,
+/// `getrusage`, and `times` so all three agree.
+fn process_cpu_ns(sh: &Shared, cx: &ServiceCtx) -> u128 {
+    let tgid = cx.cur.tgid;
+    cx.cur.cpu_ns
+        + sh.procs
+            .iter()
+            .flatten()
+            .filter(|p| p.info.tgid == tgid)
+            .map(|p| p.info.cpu_ns)
+            .sum::<u128>()
 }
 
 /// Encode an errno as a negative syscall return.
@@ -5894,11 +6021,11 @@ mod tests {
 
     #[test]
     fn clock_gettime_reads_each_clock_from_its_own_domain() {
-        let (_k, mut mem, _v, _cx) = setup();
+        let (k, mut mem, _v, cx) = setup();
         let buf = 0x1_0000; // mapped rw by `setup`
         mem.map(buf, PAGE, Prot::rw()).unwrap();
         let mut secs = |clk: u64| -> i64 {
-            assert_eq!(sys_clock_gettime(clk, buf, &mut mem), 0);
+            assert_eq!(k.sys_clock_gettime(&cx, clk, buf, &mut mem), 0);
             let b = mem.read_vec(buf, 16).unwrap();
             i64::from_le_bytes(b[0..8].try_into().unwrap())
         };
@@ -5916,24 +6043,26 @@ mod tests {
 
     #[test]
     fn getrusage_and_times_report_cpu_time_not_zero_or_wall() {
-        let (_k, mut mem, _v, _cx) = setup();
+        let (k, mut mem, _v, mut cx) = setup();
         let buf = 0x1_0000;
         mem.map(buf, PAGE, Prot::rw()).unwrap();
-        // getrusage(RUSAGE_SELF): ru_utime holds a plausible CPU time (seconds
-        // well below the wall epoch, microseconds normalized) — not the old
-        // all-zeros, and not wall time.
-        assert_eq!(sys_misc::sys_getrusage(0, buf, &mut mem), 0);
+        // Give the task some accounted CPU so getrusage/times report it.
+        cx.cur.cpu_ns = 250_000_000; // 250 ms
+        let sh = k.shared.lock().unwrap();
+        // getrusage(RUSAGE_SELF): ru_utime carries the CPU time (not the old
+        // all-zeros, not wall time).
+        assert_eq!(k.sys_getrusage(&sh, &cx, 0, buf, &mut mem), 0);
         let ru = mem.read_vec(buf, 144).unwrap();
         let sec = i64::from_le_bytes(ru[0..8].try_into().unwrap());
         let usec = i64::from_le_bytes(ru[8..16].try_into().unwrap());
-        assert!(sec >= 0 && sec < 1_600_000_000, "ru_utime is CPU time, not wall");
-        assert!((0..1_000_000).contains(&usec), "tv_usec normalized");
-        // times(): tms_utime is non-negative and the return (real elapsed ticks)
-        // is non-negative.
-        let ret = sys_misc::sys_times(buf, &mut mem);
+        assert_eq!(sec, 0, "250 ms is 0 whole seconds");
+        assert_eq!(usec, 250_000, "ru_utime microseconds reflect cpu_ns");
+        // times(): tms_utime carries the CPU time in ticks (250 ms = 25 ticks),
+        // the return (real elapsed ticks) is non-negative.
+        let ret = k.sys_times(&sh, &cx, buf, &mut mem);
         assert!(ret >= 0, "times returns elapsed ticks");
         let tms = mem.read_vec(buf, 32).unwrap();
-        assert!(i64::from_le_bytes(tms[0..8].try_into().unwrap()) >= 0, "tms_utime");
+        assert_eq!(i64::from_le_bytes(tms[0..8].try_into().unwrap()), 25, "tms_utime ticks");
     }
 
     #[test]
@@ -6222,39 +6351,42 @@ mod tests {
         assert_eq!(mem.read_u64(res).unwrap(), 0);
         assert_eq!(mem.read_u64(res + 8).unwrap(), 1);
 
-        // nanosleep with a valid req returns 0 and writes rem = {0, 0}.
+        // nanosleep now genuinely suspends the caller: the first entry seeds the
+        // deadline and parks (`cx.block`); a re-trap after it elapses completes,
+        // writing rem = {0, 0}.
         let req = 0x1_2000;
         let rem = 0x1_2100;
         mem.write_init(req, &0u64.to_le_bytes()).unwrap();
-        mem.write_init(req + 8, &500u64.to_le_bytes()).unwrap();
+        mem.write_init(req + 8, &500u64.to_le_bytes()).unwrap(); // 500 ns
         mem.write_init(rem, &7u64.to_le_bytes()).unwrap();
         mem.write_init(rem + 8, &7u64.to_le_bytes()).unwrap();
+        cx.block = false;
+        cx.cur.wake_deadline = None;
         assert_eq!(
-            call(
-                &k,
-                &mut cx,
-                &mut mem,
-                &mut v,
-                Sysno::Nanosleep,
-                [req, rem, 0, 0, 0, 0]
-            ),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Nanosleep, [req, rem, 0, 0, 0, 0]),
             0
         );
+        assert!(cx.block, "nanosleep parks the caller until its deadline");
+        assert!(cx.cur.wake_deadline.is_some());
+        // Let the (500 ns) deadline pass, then re-trap: it completes.
+        std::thread::sleep(std::time::Duration::from_micros(50));
+        cx.block = false;
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Nanosleep, [req, rem, 0, 0, 0, 0]),
+            0
+        );
+        assert!(!cx.block, "nanosleep completes once the deadline passes");
+        assert_eq!(cx.cur.wake_deadline, None);
         assert_eq!(mem.read_u64(rem).unwrap(), 0);
         assert_eq!(mem.read_u64(rem + 8).unwrap(), 0);
 
         // nanosleep with tv_nsec >= 1e9 returns -EINVAL.
+        cx.block = false;
+        cx.cur.wake_deadline = None;
         mem.write_init(req + 8, &1_000_000_000u64.to_le_bytes())
             .unwrap();
         assert_eq!(
-            call(
-                &k,
-                &mut cx,
-                &mut mem,
-                &mut v,
-                Sysno::Nanosleep,
-                [req, 0, 0, 0, 0, 0]
-            ),
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Nanosleep, [req, 0, 0, 0, 0, 0]),
             err(Errno::EINVAL)
         );
     }

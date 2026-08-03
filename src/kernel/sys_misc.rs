@@ -5,7 +5,7 @@
 //! startup (rlimits, cpu affinity, scheduler class, process name) and mostly
 //! ignores the exact values, so a believable constant answer is enough.
 
-use super::{Kernel, Shared, err};
+use super::{Kernel, ServiceCtx, Shared, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
@@ -62,45 +62,48 @@ pub(super) fn sys_sched_getparam(param: u64, mem: &mut GuestMemory) -> i64 {
     0
 }
 
-/// `getrusage(who, buf)` — report the CPU time consumed so far in a `struct
-/// rusage` (144 bytes). The CPU time comes from the same host source as
-/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)` so the two agree; it lands in
-/// `ru_utime` (we don't split guest user vs. system time), and the remaining
-/// counters (maxrss, faults, context switches) stay zero. `RUSAGE_CHILDREN`
-/// reports nothing (child accounting isn't tracked).
-pub(super) fn sys_getrusage(who: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
-    const RUSAGE_THREAD: u64 = 1; // as an i32: 1
-    let cpu = if who == RUSAGE_THREAD {
-        crate::clock::now_cpu_thread()
-    } else if who as i64 == -1 {
-        std::time::Duration::ZERO // RUSAGE_CHILDREN: untracked
-    } else {
-        crate::clock::now_cpu_process() // RUSAGE_SELF (0) and anything else
-    };
-    let mut ru = [0u8; 144];
-    // ru_utime: struct timeval { i64 tv_sec; i64 tv_usec } at offset 0.
-    ru[0..8].copy_from_slice(&(cpu.as_secs() as i64).to_le_bytes());
-    ru[8..16].copy_from_slice(&i64::from(cpu.subsec_micros()).to_le_bytes());
-    if mem.write(buf, &ru).is_err() {
-        return err(Errno::EFAULT);
+impl Kernel {
+    /// `getrusage(who, buf)` — report the CPU time consumed so far in a `struct
+    /// rusage` (144 bytes). The CPU time comes from the scheduler's per-task
+    /// accounting — the *same* source as `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`
+    /// so the two agree — landing in `ru_utime` (we don't split guest user vs.
+    /// system time); the remaining counters (maxrss, faults, context switches)
+    /// stay zero. `RUSAGE_CHILDREN` reports nothing (child accounting isn't
+    /// tracked). Called with `sh` held (the B1 dispatch table).
+    pub(super) fn sys_getrusage(&self, sh: &Shared, cx: &ServiceCtx, who: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
+        const RUSAGE_THREAD: u64 = 1;
+        let cpu_ns = if who == RUSAGE_THREAD {
+            cx.cur.cpu_ns
+        } else if who as i64 == -1 {
+            0 // RUSAGE_CHILDREN: untracked
+        } else {
+            super::process_cpu_ns(sh, cx) // RUSAGE_SELF (0) and anything else
+        };
+        let mut ru = [0u8; 144];
+        // ru_utime: struct timeval { i64 tv_sec; i64 tv_usec } at offset 0.
+        ru[0..8].copy_from_slice(&((cpu_ns / 1_000_000_000) as i64).to_le_bytes());
+        ru[8..16].copy_from_slice(&((cpu_ns % 1_000_000_000 / 1_000) as i64).to_le_bytes());
+        if mem.write(buf, &ru).is_err() {
+            return err(Errno::EFAULT);
+        }
+        0
     }
-    0
-}
 
-/// `times(buf)` — report process CPU time in a `struct tms` (4 × i64 clock ticks)
-/// and return elapsed real time in ticks. Ticks are `USER_HZ` = 100 Hz (10 ms),
-/// as on Linux. `tms_utime` carries the CPU time (consistent with `getrusage`/
-/// `clock_gettime`); system and children fields are zero.
-pub(super) fn sys_times(buf: u64, mem: &mut GuestMemory) -> i64 {
-    const TICK_NS: u128 = 10_000_000; // 1 tick = 10 ms (USER_HZ = 100)
-    let ticks = |d: std::time::Duration| (d.as_nanos() / TICK_NS) as i64;
-    let mut tms = [0u8; 32];
-    tms[0..8].copy_from_slice(&ticks(crate::clock::now_cpu_process()).to_le_bytes()); // tms_utime
-    // tms_stime / tms_cutime / tms_cstime stay zero.
-    if mem.write(buf, &tms).is_err() {
-        return err(Errno::EFAULT);
+    /// `times(buf)` — report process CPU time in a `struct tms` (4 × i64 clock
+    /// ticks) and return elapsed real time in ticks. Ticks are `USER_HZ` = 100 Hz
+    /// (10 ms), as on Linux. `tms_utime` carries the process CPU time (the same
+    /// per-task accounting as `getrusage`/`clock_gettime`); system and children
+    /// fields are zero. Called with `sh` held.
+    pub(super) fn sys_times(&self, sh: &Shared, cx: &ServiceCtx, buf: u64, mem: &mut GuestMemory) -> i64 {
+        const TICK_NS: u128 = 10_000_000; // 1 tick = 10 ms (USER_HZ = 100)
+        let mut tms = [0u8; 32];
+        tms[0..8].copy_from_slice(&((super::process_cpu_ns(sh, cx) / TICK_NS) as i64).to_le_bytes());
+        // tms_stime / tms_cutime / tms_cstime stay zero.
+        if mem.write(buf, &tms).is_err() {
+            return err(Errno::EFAULT);
+        }
+        (crate::clock::now_monotonic().as_nanos() / TICK_NS) as i64 // real elapsed ticks
     }
-    ticks(crate::clock::now_monotonic()) // real elapsed time, in ticks
 }
 
 /// `sysinfo(buf)` — write a `struct sysinfo` with 2 GiB total RAM, one process,

@@ -48,22 +48,9 @@ pub(super) fn sys_clock_getres(res: u64, mem: &mut GuestMemory) -> i64 {
     }
 }
 
-/// The shared body of `nanosleep`/`clock_nanosleep`: read and validate the
-/// requested `timespec` at `req`, then treat the sleep as already elapsed and
-/// return 0 immediately (cooperative model — the host thread never blocks). If
-/// `rem` is non-null, write a zero remaining `timespec`.
-pub(super) fn sys_nanosleep(req: u64, rem: u64, mem: &mut GuestMemory) -> i64 {
-    let (Ok(_sec), Ok(nsec)) = (mem.read_u64(req), mem.read_u64(req + 8)) else {
-        return err(Errno::EFAULT);
-    };
-    if nsec >= 1_000_000_000 {
-        return err(Errno::EINVAL);
-    }
-    if rem != 0 && mem.write(rem, &[0u8; 16]).is_err() {
-        return err(Errno::EFAULT);
-    }
-    0
-}
+// `nanosleep`/`clock_nanosleep` live in the kernel module ([`Kernel::sys_nanosleep`]):
+// unlike the pure time getters here, they suspend the caller on the scheduler's
+// timed-wait, so they need the task context.
 
 /// `time(tloc)` — return host unix seconds; if `tloc` is non-null also write it
 /// there as an 8-byte value.
