@@ -2314,7 +2314,7 @@ impl Kernel {
             Sysno::RtSigprocmask => self.sys_rt_sigprocmask(cx, args[0], args[1], args[2], mem),
             Sysno::RtSigsuspend => self.sys_rt_sigsuspend(cx, args[0], mem),
             Sysno::RtSigpending => self.sys_rt_sigpending(cx, args[0], mem),
-            Sysno::RtSigtimedwait => err(Errno::EAGAIN),
+            Sysno::RtSigtimedwait => self.sys_rt_sigtimedwait(cx, args[0], args[1], args[2], mem),
             // `pid`/`tid` is a 32-bit int: `as i32 as i64` recovers a negative
             // `kill(-pgrp)` the guest passed zero-extended as `0xFFFF_FFFF`.
             Sysno::Kill | Sysno::Tkill => self.sys_kill(sh, cx, args[0] as i32 as i64, args[1]),
@@ -6661,6 +6661,26 @@ mod tests {
             call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [999, 15, 0, 0, 0, 0]),
             -3
         );
+    }
+
+    #[test]
+    fn rt_sigtimedwait_dequeues_pending_or_times_out() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let (set, timeout) = (0x1_0000, 0x1_0100);
+        mem.write_init(set, &(1u64 << 9).to_le_bytes()).unwrap(); // wait for SIGUSR1(10)
+        mem.write_init(timeout, &[0u8; 16]).unwrap(); // {0,0}: non-blocking poll
+        // Nothing pending → EAGAIN.
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::RtSigtimedwait, [set, 0, timeout, 8, 0, 0]),
+            err(Errno::EAGAIN)
+        );
+        // SIGUSR1 pending → returns 10 and dequeues it.
+        cx.cur.pending = 1u64 << 9;
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::RtSigtimedwait, [set, 0, timeout, 8, 0, 0]),
+            10
+        );
+        assert_eq!(cx.cur.pending, 0, "the accepted signal is dequeued");
     }
 
     #[test]

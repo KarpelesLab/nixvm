@@ -180,6 +180,63 @@ impl Kernel {
         err(Errno::EINTR)
     }
 
+    /// `rt_sigtimedwait(set, info, timeout, sigsetsize)` — synchronously accept a
+    /// pending signal in `set` *without* running its handler, the primitive behind
+    /// `sigwait`/`sigwaitinfo`/`sigtimedwait`. The caller is expected to have
+    /// blocked the signals in `set` (else they'd reach a handler first, staying out
+    /// of `pending`); a blocked pending signal in `set` is dequeued and its number
+    /// returned. With none pending it waits — until one arrives (re-trap after an
+    /// unpark), until `timeout` elapses (`EAGAIN`), or until an unblocked caught
+    /// signal interrupts it (`EINTR`, via the dispatcher). A zero `timeout` polls.
+    pub(super) fn sys_rt_sigtimedwait(&self, cx: &mut ServiceCtx, set_ptr: u64, info: u64, timeout: u64, mem: &mut GuestMemory) -> i64 {
+        let Ok(set) = mem.read_u64(set_ptr) else {
+            return err(Errno::EFAULT);
+        };
+        // SIGKILL/SIGSTOP can't be waited for.
+        let waitable = set & !((1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1)));
+        // Dequeue the lowest pending signal in the set.
+        let ready = cx.cur.pending & waitable;
+        if ready != 0 {
+            let sig = u64::from(ready.trailing_zeros()) + 1;
+            cx.cur.pending &= !(1u64 << (sig - 1));
+            cx.cur.wake_deadline = None;
+            if info != 0 {
+                let mut si = [0u8; 128];
+                si[0..4].copy_from_slice(&(sig as i32).to_le_bytes()); // si_signo
+                let _ = mem.write(info, &si);
+            }
+            return sig as i64;
+        }
+        // Nothing pending: honor a finite/zero timeout via the scheduler's timed
+        // wait (seeded once, reused across re-traps — like nanosleep).
+        if timeout != 0 {
+            let deadline = match cx.cur.wake_deadline {
+                Some(dl) => dl,
+                None => {
+                    let (Ok(sec), Ok(nsec)) = (mem.read_u64(timeout), mem.read_u64(timeout + 8)) else {
+                        return err(Errno::EFAULT);
+                    };
+                    if nsec >= 1_000_000_000 {
+                        return err(Errno::EINVAL);
+                    }
+                    if sec == 0 && nsec == 0 {
+                        return err(Errno::EAGAIN); // {0,0}: a non-blocking poll
+                    }
+                    let dl = super::poll::now_ns() + u128::from(sec) * 1_000_000_000 + u128::from(nsec);
+                    cx.cur.wake_deadline = Some(dl);
+                    dl
+                }
+            };
+            if super::poll::now_ns() >= deadline {
+                cx.cur.wake_deadline = None;
+                return err(Errno::EAGAIN); // timed out
+            }
+        }
+        cx.block = true;
+        cx.restartable = false; // sigtimedwait is not restarted on SA_RESTART
+        0
+    }
+
     /// `kill(pid, sig)` — post `sig` to the target(s), with POSIX targeting:
     /// `pid > 0` a single process, `pid == 0` the caller's process group,
     /// `pid == -1` every process (sparing init), `pid < -1` process group `-pid`.
