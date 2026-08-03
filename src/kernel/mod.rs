@@ -5181,8 +5181,9 @@ impl Kernel {
     fn sys_setitimer(&self, cx: &mut ServiceCtx, which: u64, new: u64, old: u64, mem: &mut GuestMemory) -> i64 {
         const ITIMER_REAL: u64 = 0;
         let now = poll::now_ns();
-        // Report the previous ITIMER_REAL into `old` if requested.
-        if old != 0 && self.write_itimer(cx, old, now, mem).is_err() {
+        // Report the previous timer into `old` if requested (only ITIMER_REAL is
+        // modeled; VIRTUAL/PROF read back as disarmed).
+        if old != 0 && self.write_itimer(cx, old, now, which == ITIMER_REAL, mem).is_err() {
             return err(Errno::EFAULT);
         }
         if which != ITIMER_REAL {
@@ -5209,21 +5210,25 @@ impl Kernel {
     /// Shared helper: write the current `ITIMER_REAL` state as a `struct itimerval`
     /// at `dst` (`it_interval`, then remaining `it_value`).
     #[allow(clippy::unused_self)]
-    fn write_itimer(&self, cx: &ServiceCtx, dst: u64, now: u128, mem: &mut GuestMemory) -> Result<(), ()> {
-        let remaining = cx.cur.alarm_deadline.map_or(0, |dl| dl.saturating_sub(now));
+    fn write_itimer(&self, cx: &ServiceCtx, dst: u64, now: u128, is_real: bool, mem: &mut GuestMemory) -> Result<(), ()> {
         let mut b = [0u8; 32];
-        let put = |b: &mut [u8; 32], off: usize, ns: u128| {
-            b[off..off + 8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_le_bytes());
-            b[off + 8..off + 16].copy_from_slice(&((ns % 1_000_000_000 / 1_000) as i64).to_le_bytes());
-        };
-        put(&mut b, 0, cx.cur.alarm_interval_ns); // it_interval
-        put(&mut b, 16, remaining); // it_value
+        // Only ITIMER_REAL is modeled; the CPU-time timers read back as disarmed.
+        if is_real {
+            let remaining = cx.cur.alarm_deadline.map_or(0, |dl| dl.saturating_sub(now));
+            let put = |b: &mut [u8; 32], off: usize, ns: u128| {
+                b[off..off + 8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_le_bytes());
+                b[off + 8..off + 16].copy_from_slice(&((ns % 1_000_000_000 / 1_000) as i64).to_le_bytes());
+            };
+            put(&mut b, 0, cx.cur.alarm_interval_ns); // it_interval
+            put(&mut b, 16, remaining); // it_value
+        }
         mem.write(dst, &b).map_err(|_| ())
     }
 
     /// `getitimer(which, curr)` — write the current timer to `curr`.
-    fn sys_getitimer(&self, cx: &ServiceCtx, _which: u64, curr: u64, mem: &mut GuestMemory) -> i64 {
-        if curr != 0 && self.write_itimer(cx, curr, poll::now_ns(), mem).is_err() {
+    fn sys_getitimer(&self, cx: &ServiceCtx, which: u64, curr: u64, mem: &mut GuestMemory) -> i64 {
+        const ITIMER_REAL: u64 = 0;
+        if curr != 0 && self.write_itimer(cx, curr, poll::now_ns(), which == ITIMER_REAL, mem).is_err() {
             return err(Errno::EFAULT);
         }
         0
