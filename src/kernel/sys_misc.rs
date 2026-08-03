@@ -71,19 +71,15 @@ impl Kernel {
     /// stay zero. `RUSAGE_CHILDREN` reports nothing (child accounting isn't
     /// tracked). Called with `sh` held (the B1 dispatch table).
     pub(super) fn sys_getrusage(&self, sh: &Shared, cx: &ServiceCtx, who: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
-        const RUSAGE_THREAD: u64 = 1;
-        let cpu_ns = if who == RUSAGE_THREAD {
-            cx.cur.cpu_ns
-        } else if who as i64 == -1 {
-            0 // RUSAGE_CHILDREN: untracked
-        } else {
-            super::process_cpu_ns(sh, cx) // RUSAGE_SELF (0) and anything else
+        // `who` is a 32-bit `int`: RUSAGE_SELF(0), RUSAGE_CHILDREN(-1),
+        // RUSAGE_THREAD(1). Read it via `as i32` so a `-1` the guest passed as a
+        // zero-extended `0xFFFF_FFFF` is recognized.
+        let cpu_ns = match who as i32 {
+            1 => cx.cur.cpu_ns,             // RUSAGE_THREAD
+            -1 => cx.cur.child_cpu_ns,      // RUSAGE_CHILDREN: reaped children's CPU
+            _ => super::process_cpu_ns(sh, cx), // RUSAGE_SELF (0) and anything else
         };
-        let mut ru = [0u8; 144];
-        // ru_utime: struct timeval { i64 tv_sec; i64 tv_usec } at offset 0.
-        ru[0..8].copy_from_slice(&((cpu_ns / 1_000_000_000) as i64).to_le_bytes());
-        ru[8..16].copy_from_slice(&((cpu_ns % 1_000_000_000 / 1_000) as i64).to_le_bytes());
-        if mem.write(buf, &ru).is_err() {
+        if mem.write(buf, &super::rusage_bytes(cpu_ns)).is_err() {
             return err(Errno::EFAULT);
         }
         0
@@ -97,8 +93,10 @@ impl Kernel {
     pub(super) fn sys_times(&self, sh: &Shared, cx: &ServiceCtx, buf: u64, mem: &mut GuestMemory) -> i64 {
         const TICK_NS: u128 = 10_000_000; // 1 tick = 10 ms (USER_HZ = 100)
         let mut tms = [0u8; 32];
-        tms[0..8].copy_from_slice(&((super::process_cpu_ns(sh, cx) / TICK_NS) as i64).to_le_bytes());
-        // tms_stime / tms_cutime / tms_cstime stay zero.
+        tms[0..8].copy_from_slice(&((super::process_cpu_ns(sh, cx) / TICK_NS) as i64).to_le_bytes()); // tms_utime
+        // tms_stime stays zero; tms_cutime carries reaped children's CPU.
+        tms[16..24].copy_from_slice(&((cx.cur.child_cpu_ns / TICK_NS) as i64).to_le_bytes()); // tms_cutime
+        // tms_cstime stays zero.
         if mem.write(buf, &tms).is_err() {
             return err(Errno::EFAULT);
         }

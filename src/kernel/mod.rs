@@ -145,6 +145,9 @@ struct ProcInfo {
     /// (the thread-group sum) measure CPU rather than wall time, per task rather
     /// than per host process.
     cpu_ns: u128,
+    /// CPU time (ns) of this task's *reaped* children, accumulated on `wait4`/
+    /// `waitid` — Linux's `ru_utime` for `RUSAGE_CHILDREN` and `tms_cutime`.
+    child_cpu_ns: u128,
 }
 
 /// A writable file-backed `MAP_SHARED` region awaiting flush-back.
@@ -188,6 +191,7 @@ impl Default for ProcInfo {
             shared_maps: Vec::new(),
             wake_deadline: None,
             cpu_ns: 0,
+            child_cpu_ns: 0,
         }
     }
 }
@@ -2235,7 +2239,7 @@ impl Kernel {
             Sysno::Setsid => self.sys_setsid(cx),
             Sysno::Getsid => self.sys_getsid(sh, cx, args[0] as i32),
             // Process lifecycle.
-            Sysno::Waitid => self.sys_waitid(sh, cx, args[0], args[1] as i64, args[2], args[3], mem),
+            Sysno::Waitid => self.sys_waitid(sh, cx, args[0], args[1] as i32 as i64, args[2], args[3], args[4], mem),
             Sysno::Clone3 => self.sys_clone3(sh, cx, args[0], args[1], vcpu, mem),
             Sysno::Execveat => {
                 self.sys_execveat(sh, cx, args[0] as i64, args[1], args[2], args[3], args[4], vcpu, mem)
@@ -2286,7 +2290,9 @@ impl Kernel {
             Sysno::Fork => self.sys_clone(sh, cx, &[0x11, 0, 0, 0, 0, 0], vcpu, mem),
             Sysno::Vfork => self.sys_clone(sh, cx, &[0x4111, 0, 0, 0, 0, 0], vcpu, mem),
             Sysno::Execve => self.sys_execve(sh, cx, args[0], args[1], args[2], vcpu, mem),
-            Sysno::Wait4 => self.sys_wait4(sh, cx, args[0] as i64, args[1], args[2], mem),
+            // `pid` is a 32-bit int: `as i32 as i64` sign-extends a `-1` the guest
+            // passed as a zero-extended `0xFFFF_FFFF` (else `waitpid(-1)` breaks).
+            Sysno::Wait4 => self.sys_wait4(sh, cx, args[0] as i32 as i64, args[1], args[2], args[3], mem),
             Sysno::Exit => self.sys_exit(sh, cx, args[0] as i32, mem),
             Sysno::ExitGroup => self.sys_exit_group(sh, cx, args[0] as i32, mem),
             Sysno::RtSigaction => self.sys_rt_sigaction(cx, args[0], args[1], args[2], mem),
@@ -2721,28 +2727,46 @@ impl Kernel {
         0
     }
 
-    /// `wait4(pid, wstatus, options, rusage)` — reap a zombie child.
-    #[allow(clippy::unused_self)]
-    fn sys_wait4(&self, sh: &mut Shared, cx: &mut ServiceCtx, _pid: i64, wstatus: u64, options: u64, mem: &mut GuestMemory) -> i64 {
+    /// `wait4(pid, wstatus, options, rusage)` — reap a zombie child, honoring the
+    /// `pid` filter (`>0` a specific child, `-1` any, `0` the caller's group,
+    /// `<-1` group `-pid`) and filling `rusage` with the child's CPU time.
+    fn sys_wait4(&self, sh: &mut Shared, cx: &mut ServiceCtx, pid: i64, wstatus: u64, options: u64, rusage: u64, mem: &mut GuestMemory) -> i64 {
         const WNOHANG: u64 = 1;
         let cur = cx.cur.pid;
+        let cur_pgid = pgid_of(&cx.cur);
+        // Threads (CLONE_THREAD) are not reaped by wait4; only child processes
+        // matching the `pid` filter.
+        let wanted = |p: &ProcInfo| -> bool {
+            if p.ppid != cur || p.is_thread {
+                return false;
+            }
+            match pid {
+                p_ if p_ > 0 => i64::from(p.pid) == pid,
+                -1 => true,
+                0 => pgid_of(p) == cur_pgid,
+                _ => i64::from(pgid_of(p)) == -pid, // pid < -1: group -pid
+            }
+        };
         let mut zombie = None;
         let mut has_child = false;
         for p in sh.procs.iter().flatten() {
-            // Threads (CLONE_THREAD) are not reaped by wait4; only child procs.
-            if p.info.ppid == cur && !p.info.is_thread {
+            if wanted(&p.info) {
                 has_child = true;
                 if let RunState::Zombie(code) = p.info.run {
-                    zombie = Some((p.info.pid, code));
+                    zombie = Some((p.info.pid, code, p.info.cpu_ns));
                     break;
                 }
             }
         }
-        if let Some((child, code)) = zombie {
+        if let Some((child, code, child_cpu)) = zombie {
             if wstatus != 0 {
                 let status = ((code & 0xff) as u32) << 8; // WIFEXITED status
                 let _ = mem.write(wstatus, &status.to_le_bytes());
             }
+            if rusage != 0 {
+                let _ = mem.write(rusage, &rusage_bytes(child_cpu));
+            }
+            cx.cur.child_cpu_ns = cx.cur.child_cpu_ns.saturating_add(child_cpu);
             for slot in &mut sh.procs {
                 if slot.as_ref().is_some_and(|p| p.info.pid == child) {
                     *slot = None;
@@ -2765,7 +2789,7 @@ impl Kernel {
     /// Reaps a zombie child (or, with `WNOWAIT`, reports without reaping) and
     /// fills a `siginfo_t` instead of `wait4`'s status word.
     #[allow(clippy::too_many_arguments, clippy::unused_self)]
-    fn sys_waitid(&self, sh: &mut Shared, cx: &mut ServiceCtx, idtype: u64, id: i64, infop: u64, options: u64, mem: &mut GuestMemory) -> i64 {
+    fn sys_waitid(&self, sh: &mut Shared, cx: &mut ServiceCtx, idtype: u64, id: i64, infop: u64, options: u64, rusage: u64, mem: &mut GuestMemory) -> i64 {
         const P_ALL: u64 = 0;
         const P_PID: u64 = 1;
         const P_PGID: u64 = 2;
@@ -2785,12 +2809,12 @@ impl Kernel {
             if p.info.ppid == cur && !p.info.is_thread && matches_id(&p.info) {
                 has_child = true;
                 if let RunState::Zombie(code) = p.info.run {
-                    zombie = Some((p.info.pid, code));
+                    zombie = Some((p.info.pid, code, p.info.cpu_ns));
                     break;
                 }
             }
         }
-        if let Some((child, code)) = zombie {
+        if let Some((child, code, child_cpu)) = zombie {
             if infop != 0 {
                 // siginfo_t: si_signo(0)=SIGCHLD(17), si_errno(4)=0,
                 // si_code(8)=CLD_EXITED, si_pid(16), si_uid(20), si_status(24).
@@ -2801,7 +2825,13 @@ impl Kernel {
                 si[24..28].copy_from_slice(&(code & 0xff).to_le_bytes());
                 let _ = mem.write(infop, &si);
             }
+            if rusage != 0 {
+                let _ = mem.write(rusage, &rusage_bytes(child_cpu));
+            }
+            // WNOWAIT reports without reaping — so it also doesn't collect the
+            // child's CPU into the parent (that happens when it's actually reaped).
             if options & WNOWAIT == 0 {
+                cx.cur.child_cpu_ns = cx.cur.child_cpu_ns.saturating_add(child_cpu);
                 for slot in &mut sh.procs {
                     if slot.as_ref().is_some_and(|p| p.info.pid == child) {
                         *slot = None;
@@ -5190,6 +5220,17 @@ fn process_cpu_ns(sh: &Shared, cx: &ServiceCtx) -> u128 {
             .filter(|p| p.info.tgid == tgid)
             .map(|p| p.info.cpu_ns)
             .sum::<u128>()
+}
+
+/// Build a `struct rusage` (144 bytes) whose `ru_utime` carries `cpu_ns` of CPU
+/// time (seconds + microseconds); every other counter is zero. Shared by
+/// `getrusage` and `wait4`/`waitid` (the child-usage argument).
+fn rusage_bytes(cpu_ns: u128) -> [u8; 144] {
+    let mut ru = [0u8; 144];
+    // ru_utime: struct timeval { i64 tv_sec; i64 tv_usec } at offset 0.
+    ru[0..8].copy_from_slice(&((cpu_ns / 1_000_000_000) as i64).to_le_bytes());
+    ru[8..16].copy_from_slice(&((cpu_ns % 1_000_000_000 / 1_000) as i64).to_le_bytes());
+    ru
 }
 
 /// Encode an errno as a negative syscall return.
