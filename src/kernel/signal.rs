@@ -17,7 +17,7 @@
 //! [`Kernel::sys_rt_sigsuspend`] for SIGCHLD — wake, run its handler, and reap.
 //! A signal left at its default disposition still takes the default action.
 
-use super::{Kernel, RunState, SA_ONSTACK, SIGSEGV, SS_DISABLE, ServiceCtx, Shared, err};
+use super::{Kernel, RunState, SA_ONSTACK, SIGSEGV, SS_DISABLE, ServiceCtx, Shared, err, pgid_of};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
@@ -180,43 +180,61 @@ impl Kernel {
         err(Errno::EINTR)
     }
 
-    /// `kill`/`tkill(pid, sig)` — post `sig` to the target process. `sig == 0`
-    /// is an existence check. `pid <= 0` or `pid == self` targets the caller.
+    /// `kill(pid, sig)` — post `sig` to the target(s), with POSIX targeting:
+    /// `pid > 0` a single process, `pid == 0` the caller's process group,
+    /// `pid == -1` every process (sparing init), `pid < -1` process group `-pid`.
+    /// `sig == 0` sends nothing but still reports `ESRCH` when no target exists.
+    /// (`tkill`/`tgkill` reach here too — they always pass a positive tid, so only
+    /// the single-target branch fires.)
     pub(super) fn sys_kill(&self, sh: &mut Shared, cx: &mut ServiceCtx, pid: i64, sig: u64) -> i64 {
-        if sig == 0 {
-            return if pid <= 0 || self.pid_exists(sh, cx, pid) {
-                0
-            } else {
-                err(Errno::ESRCH)
-            };
-        }
         if sig > NSIG {
             return err(Errno::EINVAL);
         }
-        let bit = 1u64 << (sig - 1);
-        if pid <= 0 || pid == i64::from(cx.cur.pid) {
-            cx.cur.pending |= bit;
-            return 0;
-        }
-        for slot in sh.procs.iter_mut().flatten() {
-            if i64::from(slot.info.pid) == pid {
-                slot.info.pending |= bit;
+        let deliver = sig != 0; // sig == 0 is an existence/permission probe
+        let bit = if deliver { 1u64 << (sig - 1) } else { 0 };
+        let cur_pid = i64::from(cx.cur.pid);
+
+        // Single process (or a tkill/tgkill tid): the common path.
+        if pid > 0 {
+            if pid == cur_pid {
+                cx.cur.pending |= bit;
                 return 0;
             }
+            for slot in sh.procs.iter_mut().flatten() {
+                if i64::from(slot.info.pid) == pid {
+                    slot.info.pending |= bit;
+                    slot.info.parked = false;
+                    return 0;
+                }
+            }
+            return err(Errno::ESRCH);
         }
-        err(Errno::ESRCH)
-    }
 
-    /// Whether a process with `pid` exists (the running process is held in
-    /// `self.cur`, out of the table, during its slice).
-    #[allow(clippy::unused_self)]
-    fn pid_exists(&self, sh: &Shared, cx: &ServiceCtx, pid: i64) -> bool {
-        pid == i64::from(cx.cur.pid)
-            || sh
-                .procs
-                .iter()
-                .flatten()
-                .any(|p| i64::from(p.info.pid) == pid)
+        // Group / broadcast. `None` = broadcast (pid == -1); otherwise the target
+        // process group. The caller is out of `sh.procs` for its slice, so test it
+        // separately.
+        let target_pgrp = match pid {
+            0 => Some(pgid_of(&cx.cur)), // the caller's own group
+            -1 => None,                  // every process
+            _ => Some((-pid) as i32),    // group -pid
+        };
+        let mut hit = false;
+        if target_pgrp.is_none_or(|pg| pgid_of(&cx.cur) == pg) {
+            cx.cur.pending |= bit;
+            hit = true;
+        }
+        for slot in sh.procs.iter_mut().flatten() {
+            let is_target = match target_pgrp {
+                None => slot.info.pid != 1, // broadcast spares init (pid 1)
+                Some(pg) => pgid_of(&slot.info) == pg,
+            };
+            if is_target {
+                slot.info.pending |= bit;
+                slot.info.parked = false;
+                hit = true;
+            }
+        }
+        if hit { 0 } else { err(Errno::ESRCH) }
     }
 
     /// The signal (`1..=NSIG`) whose *real handler* [`Self::deliver_pending_signals`]

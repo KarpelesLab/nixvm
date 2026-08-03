@@ -2308,8 +2308,10 @@ impl Kernel {
             Sysno::RtSigsuspend => self.sys_rt_sigsuspend(cx, args[0], mem),
             Sysno::RtSigpending => self.sys_rt_sigpending(cx, args[0], mem),
             Sysno::RtSigtimedwait => err(Errno::EAGAIN),
-            Sysno::Kill | Sysno::Tkill => self.sys_kill(sh, cx, args[0] as i64, args[1]),
-            Sysno::Tgkill => self.sys_kill(sh, cx, args[1] as i64, args[2]),
+            // `pid`/`tid` is a 32-bit int: `as i32 as i64` recovers a negative
+            // `kill(-pgrp)` the guest passed zero-extended as `0xFFFF_FFFF`.
+            Sysno::Kill | Sysno::Tkill => self.sys_kill(sh, cx, args[0] as i32 as i64, args[1]),
+            Sysno::Tgkill => self.sys_kill(sh, cx, args[1] as i32 as i64, args[2]),
             // getpid = thread-group id; gettid = this task's id.
             Sysno::Getpid => i64::from(cx.cur.tgid),
             Sysno::Gettid => i64::from(cx.cur.pid),
@@ -6652,6 +6654,34 @@ mod tests {
             call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [999, 15, 0, 0, 0, 0]),
             -3
         );
+    }
+
+    #[test]
+    fn kill_targets_process_groups() {
+        let (k, mut mem, mut v, mut cx) = setup(); // caller pid 1, pgid 0 → group 1
+        {
+            let mut sh = k.shared.lock().unwrap();
+            for (pid, pgid) in [(2, 7), (3, 7), (4, 9)] {
+                let mut p = make_proc(pid, pid, 0, false);
+                p.info.pgid = pgid;
+                sh.procs.push(Some(p));
+            }
+        }
+        let bit = 1u64 << 9; // SIGUSR1 = 10
+        let pending = |pid: i32| {
+            k.shared.lock().unwrap().procs.iter().flatten().find(|p| p.info.pid == pid).unwrap().info.pending
+        };
+        // kill(-7, SIGUSR1): both group-7 members, not group 9.
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [(-7i64) as u64, 10, 0, 0, 0, 0]), 0);
+        assert_eq!(pending(2) & bit, bit);
+        assert_eq!(pending(3) & bit, bit);
+        assert_eq!(pending(4) & bit, 0, "a different group is untouched");
+        // kill(-99): no such group → ESRCH.
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [(-99i64) as u64, 10, 0, 0, 0, 0]), err(Errno::ESRCH));
+        // kill(0): the caller's own group (pgid 1) — the caller gets it.
+        cx.cur.pending = 0;
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [0, 10, 0, 0, 0, 0]), 0);
+        assert_eq!(cx.cur.pending & bit, bit);
     }
 
     /// Open a file, seed it, and return its fd — for the I/O syscall tests.
