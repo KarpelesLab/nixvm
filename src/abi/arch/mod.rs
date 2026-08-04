@@ -73,6 +73,8 @@ pub enum Sysno {
     RtSigpending,
     RtSigsuspend,
     RtSigtimedwait,
+    RtSigqueueinfo,
+    RtTgsigqueueinfo,
     RtSigreturn,
     Sigaltstack,
     Kill,

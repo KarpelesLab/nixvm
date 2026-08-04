@@ -63,6 +63,8 @@ pub fn decode(nr: u64) -> Sysno {
         135 => Sysno::RtSigprocmask,
         136 => Sysno::RtSigpending,
         137 => Sysno::RtSigtimedwait,
+        138 => Sysno::RtSigqueueinfo,
+        240 => Sysno::RtTgsigqueueinfo,
         139 => Sysno::RtSigreturn,
         133 => Sysno::RtSigsuspend,
         132 => Sysno::Sigaltstack,

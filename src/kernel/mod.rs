@@ -2368,6 +2368,11 @@ impl Kernel {
             // `kill(-pgrp)` the guest passed zero-extended as `0xFFFF_FFFF`.
             Sysno::Kill | Sysno::Tkill => self.sys_kill(sh, cx, args[0] as i32 as i64, args[1]),
             Sysno::Tgkill => self.sys_kill(sh, cx, args[1] as i32 as i64, args[2]),
+            // sigqueue/pthread_sigqueue: deliver the signal (the accompanying
+            // sival value isn't carried — the pending model is a bitmask, not a
+            // queue — but delivering beats failing). tgsigqueueinfo targets a tid.
+            Sysno::RtSigqueueinfo => self.sys_kill(sh, cx, args[0] as i32 as i64, args[1]),
+            Sysno::RtTgsigqueueinfo => self.sys_kill(sh, cx, args[1] as i32 as i64, args[2]),
             // getpid = thread-group id; gettid = this task's id.
             Sysno::Getpid => i64::from(cx.cur.tgid),
             Sysno::Gettid => i64::from(cx.cur.pid),
