@@ -54,6 +54,8 @@ pub struct FdTable {
     /// `F_DUPFD_CLOEXEC`/`fcntl(F_SETFD)`): closed on `execve`, inherited on
     /// `fork` (the whole table is cloned).
     cloexec: BTreeSet<i32>,
+    /// Descriptors opened `O_APPEND`: every write seeks to end-of-file first.
+    append: BTreeSet<i32>,
 }
 
 impl FdTable {
@@ -67,6 +69,7 @@ impl FdTable {
         Self {
             map,
             cloexec: BTreeSet::new(),
+            append: BTreeSet::new(),
         }
     }
 
@@ -115,6 +118,23 @@ impl FdTable {
         self.cloexec.contains(&n)
     }
 
+    /// Mark `n` as `O_APPEND` (a no-op if not open).
+    pub fn set_append(&mut self, n: i32, on: bool) {
+        if !self.map.contains_key(&n) {
+            return;
+        }
+        if on {
+            self.append.insert(n);
+        } else {
+            self.append.remove(&n);
+        }
+    }
+
+    #[must_use]
+    pub fn is_append(&self, n: i32) -> bool {
+        self.append.contains(&n)
+    }
+
     /// Close every `FD_CLOEXEC` descriptor, returning the removed [`Fd`]s so the
     /// caller can drop backing refcounts (pipes/sockets). Runs on `execve`.
     pub fn close_cloexec(&mut self) -> Vec<Fd> {
@@ -133,6 +153,7 @@ impl FdTable {
 
     pub fn close(&mut self, fd: i32) -> Option<Fd> {
         self.cloexec.remove(&fd);
+        self.append.remove(&fd);
         self.map.remove(&fd)
     }
 
@@ -145,6 +166,7 @@ impl FdTable {
     /// Remove every descriptor, returning them (used on process exit).
     pub fn drain(&mut self) -> Vec<Fd> {
         self.cloexec.clear();
+        self.append.clear();
         std::mem::take(&mut self.map).into_values().collect()
     }
 }

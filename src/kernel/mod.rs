@@ -3455,10 +3455,17 @@ impl Kernel {
         let Ok(data) = mem.read_vec(buf, count as usize) else {
             return err(Errno::EFAULT);
         };
-        match vfs.write_at(&path, offset, &data) {
+        // O_APPEND: every write goes to (the current) end of file, ignoring the
+        // fd offset, then the offset lands past what was written.
+        let write_off = if cx.cur.fds.is_append(fd as i32) {
+            vfs.stat(&path).map_or(offset, |a| a.size)
+        } else {
+            offset
+        };
+        match vfs.write_at(&path, write_off, &data) {
             Ok(n) => {
                 if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32) {
-                    *offset += n as u64;
+                    *offset = write_off + n as u64;
                 }
                 n as i64
             }
@@ -4455,10 +4462,17 @@ impl Kernel {
             // `recvfrom` on it (e.g. the DNS reply) parks the whole event-loop
             // thread instead of returning `EAGAIN`.
             F_SETFL => {
+                const O_APPEND: u64 = 0o2000;
                 self.fd_set_nonblock(&f, arg & O_NONBLOCK != 0);
+                cx.cur.fds.set_append(fd as i32, arg & O_APPEND != 0);
                 0
             }
-            F_GETFL => O_RDWR as i64 | if self.fd_is_nonblock(&f) { O_NONBLOCK as i64 } else { 0 },
+            F_GETFL => {
+                const O_APPEND: u64 = 0o2000;
+                O_RDWR as i64
+                    | if self.fd_is_nonblock(&f) { O_NONBLOCK as i64 } else { 0 }
+                    | if cx.cur.fds.is_append(fd as i32) { O_APPEND as i64 } else { 0 }
+            }
             _ => 0,
         }
     }
@@ -4551,7 +4565,9 @@ impl Kernel {
             })
         };
         const O_CLOEXEC: u64 = 0o2000000;
+        const O_APPEND: u64 = 0o2000;
         cx.cur.fds.set_cloexec(fd, flags & O_CLOEXEC != 0);
+        cx.cur.fds.set_append(fd, flags & O_APPEND != 0);
         i64::from(fd)
     }
 
