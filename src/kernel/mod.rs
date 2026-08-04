@@ -2210,10 +2210,10 @@ impl Kernel {
                 const AT_REMOVEDIR: u64 = 0x200;
                 self.sys_unlinkat(vfs, cx, AT_FDCWD, args[0], AT_REMOVEDIR, mem)
             }
-            Sysno::Renameat | Sysno::Renameat2 => {
-                self.sys_renameat(vfs, cx, args[0] as i64, args[1], args[2] as i64, args[3], mem)
-            }
-            Sysno::Rename => self.sys_renameat(vfs, cx, AT_FDCWD, args[0], AT_FDCWD, args[1], mem),
+            // renameat has no flags; renameat2's flags are arg 4.
+            Sysno::Renameat => self.sys_renameat(vfs, cx, args[0] as i64, args[1], args[2] as i64, args[3], 0, mem),
+            Sysno::Renameat2 => self.sys_renameat(vfs, cx, args[0] as i64, args[1], args[2] as i64, args[3], args[4], mem),
+            Sysno::Rename => self.sys_renameat(vfs, cx, AT_FDCWD, args[0], AT_FDCWD, args[1], 0, mem),
             Sysno::Faccessat | Sysno::Faccessat2 => {
                 self.sys_faccessat(vfs, cx, args[0] as i64, args[1], args[2], mem)
             }
@@ -4430,6 +4430,8 @@ impl Kernel {
         const F_GETFL: u64 = 3;
         const F_SETFL: u64 = 4;
         const F_DUPFD_CLOEXEC: u64 = 1030;
+        const F_SETPIPE_SZ: u64 = 1031;
+        const F_GETPIPE_SZ: u64 = 1032;
         const FD_CLOEXEC: u64 = 1;
         const O_NONBLOCK: u64 = 0o4000;
         const O_RDWR: u64 = 2;
@@ -4449,6 +4451,10 @@ impl Kernel {
                 cx.cur.fds.set_cloexec(n, cmd == F_DUPFD_CLOEXEC);
                 i64::from(n)
             }
+            // Pipe capacity: nixvm's pipes are unbounded, so report/accept the
+            // Linux default (64 KiB) rather than the misleading 0.
+            F_GETPIPE_SZ => 65536,
+            F_SETPIPE_SZ => 65536,
             // The close-on-exec flag (`FD_CLOEXEC`) — the only `F_*FD` bit.
             F_GETFD => i64::from(cx.cur.fds.is_cloexec(fd as i32)),
             F_SETFD => {
@@ -4514,6 +4520,15 @@ impl Kernel {
     ) -> i64 {
         const O_CREAT: u64 = 0o100;
         const O_TRUNC: u64 = 0o1000;
+        const O_TMPFILE: u64 = 0o20000000; // the __O_TMPFILE bit
+
+        // Anonymous temp files (O_TMPFILE) need inode-based fds; nixvm's are
+        // path-based, so a real backing file would be lost. Report "unsupported"
+        // (as a filesystem without O_TMPFILE support does) so libc/programs fall
+        // back to mkstemp+unlink rather than getting a silently broken fd.
+        if flags & O_TMPFILE != 0 {
+            return err(Errno::EOPNOTSUPP);
+        }
 
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);

@@ -252,8 +252,9 @@ impl Kernel {
         }
     }
 
-    /// `renameat(olddirfd, old, newdirfd, new)` / `renameat2(..., flags)` — the
-    /// flags argument is accepted but not honored.
+    /// `renameat(olddirfd, old, newdirfd, new)` / `renameat2(..., flags)`.
+    /// `RENAME_NOREPLACE` fails with `EEXIST` if the target exists (atomic
+    /// create-if-absent); `RENAME_EXCHANGE` atomically swaps the two paths.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_renameat(
         &self, vfs: &mut MountTable, cx: &mut ServiceCtx,
@@ -261,13 +262,34 @@ impl Kernel {
         oldptr: u64,
         newdirfd: i64,
         newptr: u64,
+        flags: u64,
         mem: &GuestMemory,
     ) -> i64 {
+        const RENAME_NOREPLACE: u64 = 1;
+        const RENAME_EXCHANGE: u64 = 2;
         let (Some(old), Some(new)) = (read_path(mem, oldptr), read_path(mem, newptr)) else {
             return err(Errno::EFAULT);
         };
         let from = self.resolve_path(cx, olddirfd, &old);
         let to = self.resolve_path(cx, newdirfd, &new);
+        if flags & RENAME_NOREPLACE != 0 && vfs.stat(&to).is_some() {
+            return err(Errno::EEXIST);
+        }
+        if flags & RENAME_EXCHANGE != 0 {
+            // Both must exist; swap via a temporary name (in-memory, single-
+            // threaded per syscall, so the temp path is safe to reuse).
+            if vfs.stat(&from).is_none() || vfs.stat(&to).is_none() {
+                return err(Errno::ENOENT);
+            }
+            let tmp = format!("{to}.__nixvm_xchg__");
+            if vfs.rename(&from, &tmp).is_err()
+                || vfs.rename(&to, &from).is_err()
+                || vfs.rename(&tmp, &to).is_err()
+            {
+                return err(Errno::EIO);
+            }
+            return 0;
+        }
         match vfs.rename(&from, &to) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
@@ -332,6 +354,37 @@ mod tests {
         let mut mem = GuestMemory::new(0x1_0000, 16 * PAGE);
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
         (kernel, mem, cx)
+    }
+
+    #[test]
+    fn renameat2_noreplace_and_exchange() {
+        let (k, mut mem, mut cx) = setup();
+        let (pa, pb) = (0x1_0000, 0x1_0010);
+        mem.write_init(pa, b"/a\0").unwrap();
+        mem.write_init(pb, b"/b\0").unwrap();
+        {
+            let mut vfs = k.vfs.lock().unwrap();
+            vfs.create("/a", 0o644).unwrap();
+            vfs.write_at("/a", 0, b"AAA").unwrap();
+            vfs.create("/b", 0o644).unwrap();
+            vfs.write_at("/b", 0, b"BBB").unwrap();
+        }
+        // RENAME_NOREPLACE onto an existing target → EEXIST, both untouched.
+        assert_eq!(
+            k.sys_renameat(&mut k.vfs.lock().unwrap(), &mut cx, AT_FDCWD, pa, AT_FDCWD, pb, 1, &mem),
+            err(Errno::EEXIST)
+        );
+        assert!(k.vfs.lock().unwrap().stat("/a").is_some());
+        // RENAME_EXCHANGE swaps the two files' contents.
+        assert_eq!(
+            k.sys_renameat(&mut k.vfs.lock().unwrap(), &mut cx, AT_FDCWD, pa, AT_FDCWD, pb, 2, &mem),
+            0
+        );
+        let mut buf = [0u8; 3];
+        k.vfs.lock().unwrap().read_at("/a", 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"BBB", "/a now holds what /b had");
+        k.vfs.lock().unwrap().read_at("/b", 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"AAA");
     }
 
     #[test]
