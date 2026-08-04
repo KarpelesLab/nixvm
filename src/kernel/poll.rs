@@ -595,10 +595,12 @@ impl Kernel {
 
     /// `epoll_create`/`epoll_create1(flags)` — a fresh, empty interest set.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_epoll_create1(&self, pf: &mut PollFds, cx: &mut ServiceCtx, _flags: u64) -> i64 {
+    pub(super) fn sys_epoll_create1(&self, pf: &mut PollFds, cx: &mut ServiceCtx, flags: u64) -> i64 {
         let idx = pf.epolls.len();
         pf.epolls.push(EpollInst::default());
-        i64::from(cx.cur.fds.alloc(Fd::Epoll(idx)))
+        let fd = cx.cur.fds.alloc(Fd::Epoll(idx));
+        cx.cur.fds.set_cloexec(fd, flags & 0o2000000 != 0); // EPOLL_CLOEXEC
+        i64::from(fd)
     }
 
     /// `epoll_ctl(epfd, op, fd, event)`.
@@ -780,7 +782,9 @@ impl Kernel {
         if fd == -1 {
             let idx = pf.signalfds.len();
             pf.signalfds.push(SignalFdInst { mask, nonblock });
-            return i64::from(cx.cur.fds.alloc(Fd::Signalfd(idx)));
+            let nfd = cx.cur.fds.alloc(Fd::Signalfd(idx));
+            cx.cur.fds.set_cloexec(nfd, flags & 0o2000000 != 0); // SFD_CLOEXEC
+            return i64::from(nfd);
         }
         // Re-target an existing signalfd (same fd, new mask).
         if let Some(Fd::Signalfd(i)) = cx.cur.fds.get(fd as i32).cloned() {
@@ -840,7 +844,9 @@ impl Kernel {
             semaphore: flags & EFD_SEMAPHORE != 0,
             nonblock: flags & EFD_NONBLOCK != 0,
         });
-        i64::from(cx.cur.fds.alloc(Fd::Eventfd(idx)))
+        let fd = cx.cur.fds.alloc(Fd::Eventfd(idx));
+        cx.cur.fds.set_cloexec(fd, flags & 0o2000000 != 0); // EFD_CLOEXEC
+        i64::from(fd)
     }
 
     /// `read(eventfd_fd, buf, count)` — drain the counter (called from
@@ -916,7 +922,9 @@ impl Kernel {
             expirations: 0,
             nonblock: flags & TFD_NONBLOCK != 0,
         });
-        i64::from(cx.cur.fds.alloc(Fd::Timerfd(idx)))
+        let fd = cx.cur.fds.alloc(Fd::Timerfd(idx));
+        cx.cur.fds.set_cloexec(fd, flags & 0o2000000 != 0); // TFD_CLOEXEC
+        i64::from(fd)
     }
 
     /// Advance timer `i` to the current time: if its deadline has passed,

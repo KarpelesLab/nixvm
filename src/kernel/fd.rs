@@ -1,6 +1,6 @@
 //! The per-process file-descriptor table.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What a guest file descriptor points at.
 ///
@@ -50,6 +50,10 @@ pub enum Fd {
 #[derive(Debug, Clone, Default)]
 pub struct FdTable {
     map: BTreeMap<i32, Fd>,
+    /// Descriptors with `FD_CLOEXEC` set (`O_CLOEXEC`/`SOCK_CLOEXEC`/
+    /// `F_DUPFD_CLOEXEC`/`fcntl(F_SETFD)`): closed on `execve`, inherited on
+    /// `fork` (the whole table is cloned).
+    cloexec: BTreeSet<i32>,
 }
 
 impl FdTable {
@@ -60,7 +64,10 @@ impl FdTable {
         map.insert(0, Fd::Stdin);
         map.insert(1, Fd::Stdout);
         map.insert(2, Fd::Stderr);
-        Self { map }
+        Self {
+            map,
+            cloexec: BTreeSet::new(),
+        }
     }
 
     /// Insert `fd` at the lowest available descriptor, as POSIX `open` requires.
@@ -69,7 +76,13 @@ impl FdTable {
     /// ash relies on exactly this for background jobs: it does `close(0);
     /// open("/dev/null")` and *dies* unless the reopen lands on fd 0.
     pub fn alloc(&mut self, fd: Fd) -> i32 {
-        let mut n = 0;
+        self.alloc_from(fd, 0)
+    }
+
+    /// Allocate the lowest free descriptor `>= min` — POSIX `dup`/`fcntl(F_DUPFD)`
+    /// semantics (also the base of [`Self::alloc`], with `min == 0`).
+    pub fn alloc_from(&mut self, fd: Fd, min: i32) -> i32 {
+        let mut n = min.max(0);
         while self.map.contains_key(&n) {
             n += 1;
         }
@@ -78,9 +91,35 @@ impl FdTable {
     }
 
     /// Place `fd` at a specific descriptor number, replacing any existing entry
-    /// (which is returned). Used by `dup2`/`dup3`.
+    /// (which is returned). Used by `dup2`/`dup3`. The new descriptor starts
+    /// without `FD_CLOEXEC` (dup2 clears it; dup3 sets it afterward if asked).
     pub fn insert(&mut self, n: i32, fd: Fd) -> Option<Fd> {
+        self.cloexec.remove(&n);
         self.map.insert(n, fd)
+    }
+
+    /// Set or clear `FD_CLOEXEC` on `n` (a no-op if `n` isn't open).
+    pub fn set_cloexec(&mut self, n: i32, on: bool) {
+        if !self.map.contains_key(&n) {
+            return;
+        }
+        if on {
+            self.cloexec.insert(n);
+        } else {
+            self.cloexec.remove(&n);
+        }
+    }
+
+    #[must_use]
+    pub fn is_cloexec(&self, n: i32) -> bool {
+        self.cloexec.contains(&n)
+    }
+
+    /// Close every `FD_CLOEXEC` descriptor, returning the removed [`Fd`]s so the
+    /// caller can drop backing refcounts (pipes/sockets). Runs on `execve`.
+    pub fn close_cloexec(&mut self) -> Vec<Fd> {
+        let fds: Vec<i32> = std::mem::take(&mut self.cloexec).into_iter().collect();
+        fds.into_iter().filter_map(|n| self.map.remove(&n)).collect()
     }
 
     #[must_use]
@@ -93,6 +132,7 @@ impl FdTable {
     }
 
     pub fn close(&mut self, fd: i32) -> Option<Fd> {
+        self.cloexec.remove(&fd);
         self.map.remove(&fd)
     }
 
@@ -104,6 +144,7 @@ impl FdTable {
 
     /// Remove every descriptor, returning them (used on process exit).
     pub fn drain(&mut self) -> Vec<Fd> {
+        self.cloexec.clear();
         std::mem::take(&mut self.map).into_values().collect()
     }
 }
@@ -129,5 +170,30 @@ mod tests {
         let mut t = FdTable::with_standard_streams();
         t.close(0);
         assert_eq!(t.alloc(Fd::Stdin), 0);
+    }
+
+    #[test]
+    fn alloc_from_honors_the_minimum() {
+        let mut t = FdTable::with_standard_streams();
+        assert_eq!(t.alloc_from(Fd::Stdin, 10), 10, "lowest free >= 10");
+        assert_eq!(t.alloc_from(Fd::Stdin, 10), 11, "then the next free");
+    }
+
+    #[test]
+    fn cloexec_tracked_inherited_and_closed_on_exec() {
+        let mut t = FdTable::with_standard_streams();
+        let c = t.alloc(Fd::Stdin);
+        let keep = t.alloc(Fd::Stdout);
+        t.set_cloexec(c, true);
+        assert!(t.is_cloexec(c) && !t.is_cloexec(keep));
+        // fork inherits the flag (the whole table is cloned).
+        let forked = t.clone();
+        assert!(forked.is_cloexec(c));
+        // execve closes the cloexec fd, keeps the rest.
+        let closed = t.close_cloexec();
+        assert_eq!(closed.len(), 1);
+        assert!(t.get(c).is_none(), "cloexec fd closed on exec");
+        assert!(t.get(keep).is_some(), "plain fd survives exec");
+        assert!(!t.is_cloexec(c));
     }
 }

@@ -2016,7 +2016,7 @@ impl Kernel {
             // `pipes` (the innermost/last lock) — no sh, no vfs, no net.
             Sysno::Pipe2 => {
                 let mut pipes = self.pipes.lock().unwrap();
-                self.sys_pipe2(&mut pipes, cx, args[0], mem)
+                self.sys_pipe2(&mut pipes, cx, args[0], args[1], mem)
             }
             // pollfds-only: the pure eventfd/timerfd/epoll-setup syscalls, holding
             // ONLY `pollfds` (the innermost/last lock) via `dispatch_pollfds` —
@@ -2319,7 +2319,9 @@ impl Kernel {
                 self.sys_epoll_pwait2(cx, args[0], args[1], args[2], args[3], mem)
             }
             Sysno::Dup => self.sys_dup(cx, args[0]),
-            Sysno::Dup2 | Sysno::Dup3 => self.sys_dup2(cx, args[0], args[1]),
+            // dup2 has no flags (pass 0); dup3's 3rd arg is O_CLOEXEC.
+            Sysno::Dup2 => self.sys_dup2(cx, args[0], args[1], 0),
+            Sysno::Dup3 => self.sys_dup2(cx, args[0], args[1], args[2]),
             Sysno::Clone => self.sys_clone(sh, cx, args, vcpu, mem),
             // x86-64's legacy spellings of clone: `fork` is
             // `clone(SIGCHLD, ...)`, `vfork` is `clone(CLONE_VM|CLONE_VFORK|
@@ -2729,6 +2731,12 @@ impl Kernel {
             return err(Errno::ENOEXEC);
         }
         let spec = ProcessSpec { argv, envp };
+        // Point of no return. Close every `FD_CLOEXEC` descriptor (dropping its
+        // pipe/socket backing) — this is what execve is *for*, so a process
+        // doesn't leak private fds into the program it launches.
+        for fd in cx.cur.fds.close_cloexec() {
+            self.bump_pipe(&fd, false);
+        }
         // Replace the image *in place*: tear down the old page tables (returning
         // their frames to the shared pool) and rebuild within the SAME pool, so
         // the one KVM memslot stays valid and the process just gets a new cr3.
@@ -4393,9 +4401,12 @@ impl Kernel {
     /// `fcntl(fd, cmd, ...)` — the subset real programs need at startup.
     fn sys_fcntl(&self, cx: &mut ServiceCtx, fd: u64, cmd: u64, arg: u64) -> i64 {
         const F_DUPFD: u64 = 0;
+        const F_GETFD: u64 = 1;
+        const F_SETFD: u64 = 2;
         const F_GETFL: u64 = 3;
         const F_SETFL: u64 = 4;
         const F_DUPFD_CLOEXEC: u64 = 1030;
+        const FD_CLOEXEC: u64 = 1;
         const O_NONBLOCK: u64 = 0o4000;
         const O_RDWR: u64 = 2;
         // Every fcntl command operates on an open fd. Returning success for a
@@ -4406,9 +4417,19 @@ impl Kernel {
             return err(Errno::EBADF);
         };
         match cmd {
+            // Duplicate to the lowest free fd `>= arg` (the minimum), optionally
+            // close-on-exec.
             F_DUPFD | F_DUPFD_CLOEXEC => {
                 self.bump_pipe(&f, true);
-                i64::from(cx.cur.fds.alloc(f))
+                let n = cx.cur.fds.alloc_from(f, arg as i32);
+                cx.cur.fds.set_cloexec(n, cmd == F_DUPFD_CLOEXEC);
+                i64::from(n)
+            }
+            // The close-on-exec flag (`FD_CLOEXEC`) — the only `F_*FD` bit.
+            F_GETFD => i64::from(cx.cur.fds.is_cloexec(fd as i32)),
+            F_SETFD => {
+                cx.cur.fds.set_cloexec(fd as i32, arg & FD_CLOEXEC != 0);
+                0
             }
             // `F_SETFL` only `O_NONBLOCK` matters here (the access mode and
             // `O_APPEND`/`O_DIRECT` are fixed or irrelevant). Wiring it is
@@ -4512,6 +4533,8 @@ impl Kernel {
                 offset: 0,
             })
         };
+        const O_CLOEXEC: u64 = 0o2000000;
+        cx.cur.fds.set_cloexec(fd, flags & O_CLOEXEC != 0);
         i64::from(fd)
     }
 
@@ -4533,7 +4556,8 @@ impl Kernel {
 
     /// `pipe2(fds, flags)` — create an anonymous pipe. **pipes-only**.
     #[allow(clippy::unused_self)]
-    fn sys_pipe2(&self, pipes: &mut Vec<Pipe>, cx: &mut ServiceCtx, fds_ptr: u64, mem: &mut GuestMemory) -> i64 {
+    fn sys_pipe2(&self, pipes: &mut Vec<Pipe>, cx: &mut ServiceCtx, fds_ptr: u64, flags: u64, mem: &mut GuestMemory) -> i64 {
+        const O_CLOEXEC: u64 = 0o2000000;
         let idx = pipes.len();
         pipes.push(Pipe {
             buf: VecDeque::new(),
@@ -4542,6 +4566,9 @@ impl Kernel {
         });
         let rfd = cx.cur.fds.alloc(Fd::PipeRead(idx));
         let wfd = cx.cur.fds.alloc(Fd::PipeWrite(idx));
+        let cloexec = flags & O_CLOEXEC != 0;
+        cx.cur.fds.set_cloexec(rfd, cloexec);
+        cx.cur.fds.set_cloexec(wfd, cloexec);
         let mut b = [0u8; 8];
         b[0..4].copy_from_slice(&rfd.to_le_bytes());
         b[4..8].copy_from_slice(&wfd.to_le_bytes());
@@ -4560,8 +4587,10 @@ impl Kernel {
         i64::from(cx.cur.fds.alloc(fd))
     }
 
-    /// `dup2`/`dup3(oldfd, newfd)`.
-    fn sys_dup2(&self, cx: &mut ServiceCtx, oldfd: u64, newfd: u64) -> i64 {
+    /// `dup2`/`dup3(oldfd, newfd, flags)`. `dup3` sets `FD_CLOEXEC` from
+    /// `O_CLOEXEC`; `dup2` always clears it (via `insert`).
+    fn sys_dup2(&self, cx: &mut ServiceCtx, oldfd: u64, newfd: u64, flags: u64) -> i64 {
+        const O_CLOEXEC: u64 = 0o2000000;
         let Some(fd) = cx.cur.fds.get(oldfd as i32).cloned() else {
             return err(Errno::EBADF);
         };
@@ -4573,6 +4602,7 @@ impl Kernel {
         }
         self.bump_pipe(&fd, true);
         cx.cur.fds.insert(newfd as i32, fd);
+        cx.cur.fds.set_cloexec(newfd as i32, flags & O_CLOEXEC != 0);
         newfd as i64
     }
 

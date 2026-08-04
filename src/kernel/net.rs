@@ -97,6 +97,8 @@ const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
 const SOCK_RAW: u64 = 3;
 const SOCK_NONBLOCK: u64 = 0o4000;
+/// `SOCK_CLOEXEC` in a `socket`/`socketpair`/`accept4` type/flags argument.
+pub(super) const SOCK_CLOEXEC: u64 = 0o2000000;
 const NETLINK_ROUTE: u64 = 0;
 
 const SOL_SOCKET: u64 = 1;
@@ -579,7 +581,9 @@ impl Kernel {
                 nonblock,
                 opts: SockOpts::default(),
             });
-            return i64::from(cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 }));
+            let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
+            cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
+            return i64::from(fd);
         }
         if domain != AF_UNIX && domain != AF_INET && domain != AF_INET6 {
             return err(Errno::EAFNOSUPPORT);
@@ -601,7 +605,9 @@ impl Kernel {
             nonblock,
             opts: SockOpts::default(),
         });
-        i64::from(cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 }))
+        let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
+        cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
+        i64::from(fd)
     }
 
     /// `socketpair(domain, type, protocol, sv)` — a connected AF_UNIX pair whose
@@ -633,6 +639,9 @@ impl Kernel {
         });
         let fd0 = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
         let fd1 = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 1 });
+        let cloexec = sotype & SOCK_CLOEXEC != 0;
+        cx.cur.fds.set_cloexec(fd0, cloexec);
+        cx.cur.fds.set_cloexec(fd1, cloexec);
         let mut b = [0u8; 8];
         b[0..4].copy_from_slice(&fd0.to_le_bytes());
         b[4..8].copy_from_slice(&fd1.to_le_bytes());
@@ -912,7 +921,9 @@ impl Kernel {
         if let Kind::Pair(p) = &mut net.socks[pidx].kind {
             p.nonblock[1] = flags & SOCK_NONBLOCK != 0;
         }
-        i64::from(cx.cur.fds.alloc(Fd::Socket { sock: pidx, end: 1 }))
+        let fd = cx.cur.fds.alloc(Fd::Socket { sock: pidx, end: 1 });
+        cx.cur.fds.set_cloexec(fd, flags & SOCK_CLOEXEC != 0);
+        i64::from(fd)
     }
 
     /// `bind(fd, addr, addrlen)` for an `AF_NETLINK` socket: parse a
