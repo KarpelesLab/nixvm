@@ -93,6 +93,9 @@ struct EpollWatch {
     /// spinning (level-triggered) or hanging (mask-edge, no new rise). For other
     /// fds the level is the readiness mask. Unused for level-triggered interest.
     last_level: u64,
+    /// `EPOLLONESHOT`: once an event is reported the watch is disabled until
+    /// re-armed by `EPOLL_CTL_MOD`, so a fd is handed to exactly one waiter.
+    disarmed: bool,
 }
 
 /// One `epoll_create1` instance: fd -> interest, keyed by the watched fd
@@ -634,7 +637,7 @@ impl Kernel {
                 };
                 pf.epolls[idx]
                     .interest
-                    .insert(target, EpollWatch { events, data, last_level: 0 });
+                    .insert(target, EpollWatch { events, data, last_level: 0, disarmed: false });
                 0
             }
             EPOLL_CTL_MOD => {
@@ -646,7 +649,7 @@ impl Kernel {
                 };
                 pf.epolls[idx]
                     .interest
-                    .insert(target, EpollWatch { events, data, last_level: 0 });
+                    .insert(target, EpollWatch { events, data, last_level: 0, disarmed: false });
                 0
             }
             EPOLL_CTL_DEL => {
@@ -688,9 +691,11 @@ impl Kernel {
         let pipes = self.pipes.lock().unwrap();
         let mut pf = self.pollfds.lock().unwrap();
         const EPOLLET: u32 = 0x8000_0000;
+        const EPOLLONESHOT: u32 = 0x4000_0000;
         let watches: Vec<(i32, EpollWatch)> = pf.epolls[idx]
             .interest
             .iter()
+            .filter(|(_, w)| !w.disarmed) // an EPOLLONESHOT watch that already fired
             .map(|(&fd, &w)| (fd, w))
             .collect();
         // Compute readiness (and, for edge-triggering, the fd's "level") first —
@@ -735,6 +740,12 @@ impl Kernel {
                 return err(Errno::EFAULT);
             }
             n += 1;
+            // EPOLLONESHOT: disable the watch until EPOLL_CTL_MOD re-arms it.
+            if w.events & EPOLLONESHOT != 0 {
+                if let Some(e) = pf.epolls[idx].interest.get_mut(&fd) {
+                    e.disarmed = true;
+                }
+            }
         }
 
         if n > 0 {
