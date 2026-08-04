@@ -296,6 +296,21 @@ impl MountFs for TmpFs {
         }
     }
 
+    fn set_mtime(&mut self, rel: &str, mtime: Option<i64>) -> io::Result<()> {
+        match self.nodes.get_mut(rel) {
+            // `None` (UTIME_OMIT / atime-only) leaves the stored mtime alone.
+            Some(Node::File { mtime: m, .. }) => {
+                if let Some(t) = mtime {
+                    *m = t;
+                }
+                Ok(())
+            }
+            // Dirs/symlinks don't track an mtime in this fs — accept the call.
+            Some(_) => Ok(()),
+            None => Err(enoent()),
+        }
+    }
+
     fn symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {
         self.require_parent(linkpath)?;
         if self.nodes.contains_key(linkpath) {
@@ -546,6 +561,20 @@ mod tests {
         fs.write_at("f", 0, b"x").unwrap();
         let after = fs.stat("f").unwrap().mtime;
         assert!(after >= before);
+    }
+
+    #[test]
+    fn set_mtime_sets_or_omits() {
+        let mut fs = TmpFs::new();
+        fs.create("f", 0o644).unwrap();
+        // Explicit mtime is stored.
+        fs.set_mtime("f", Some(1_234_567_890)).unwrap();
+        assert_eq!(fs.stat("f").unwrap().mtime, 1_234_567_890);
+        // `None` (UTIME_OMIT) leaves it unchanged.
+        fs.set_mtime("f", None).unwrap();
+        assert_eq!(fs.stat("f").unwrap().mtime, 1_234_567_890);
+        // A missing node is ENOENT.
+        assert!(fs.set_mtime("nope", Some(1)).is_err());
     }
 
     #[test]

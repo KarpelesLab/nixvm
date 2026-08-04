@@ -161,6 +161,61 @@ impl Kernel {
         }
     }
 
+    /// `utimensat(dirfd, path, times, flags)` — set a node's modification time.
+    /// `times` is `[atime, mtime]`; nixvm models only mtime (there is no atime
+    /// field), so atime is accepted but not stored. A NULL `times` or a `tv_nsec`
+    /// of `UTIME_NOW` uses the current time; `UTIME_OMIT` leaves mtime unchanged.
+    /// A NULL `path` targets `dirfd` itself (`futimens`); `AT_SYMLINK_NOFOLLOW`
+    /// acts on the link rather than its target.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn sys_utimensat(
+        &self, vfs: &mut MountTable, cx: &mut ServiceCtx,
+        dirfd: i64,
+        pathptr: u64,
+        times: u64,
+        flags: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        const UTIME_NOW: u64 = 0x3fff_ffff;
+        const UTIME_OMIT: u64 = 0x3fff_fffe;
+        const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+        let now = crate::clock::now_unix().as_secs() as i64;
+        // mtime is the second timespec (offset 16): { tv_sec@16, tv_nsec@24 }.
+        let mtime = if times == 0 {
+            Some(now)
+        } else {
+            let (Ok(sec), Ok(nsec)) = (mem.read_u64(times + 16), mem.read_u64(times + 24)) else {
+                return err(Errno::EFAULT);
+            };
+            match nsec {
+                UTIME_OMIT => None,
+                UTIME_NOW => Some(now),
+                _ => Some(sec as i64),
+            }
+        };
+        // A NULL path means dirfd *is* the file (futimens); otherwise resolve.
+        let abs = if pathptr == 0 {
+            match cx.cur.fds.get(dirfd as i32) {
+                Some(Fd::File { path, .. }) => path.clone(),
+                _ => return err(Errno::EBADF),
+            }
+        } else {
+            let Some(rel) = read_path(mem, pathptr) else {
+                return err(Errno::EFAULT);
+            };
+            let abs = self.resolve_path(cx, dirfd, &rel);
+            if flags & AT_SYMLINK_NOFOLLOW == 0 {
+                self.follow_symlinks(vfs, &abs).unwrap_or(abs)
+            } else {
+                abs
+            }
+        };
+        match vfs.set_mtime(&abs, mtime) {
+            Ok(()) => 0,
+            Err(e) => io_errno(&e),
+        }
+    }
+
     /// `renameat(olddirfd, old, newdirfd, new)` / `renameat2(..., flags)` — the
     /// flags argument is accepted but not honored.
     #[allow(clippy::too_many_arguments)]

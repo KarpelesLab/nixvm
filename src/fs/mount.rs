@@ -136,6 +136,11 @@ impl MountTable {
         fs.truncate(&rel, len)
     }
 
+    pub fn set_mtime(&mut self, abs_path: &str, mtime: Option<i64>) -> io::Result<()> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.set_mtime(&rel, mtime)
+    }
+
     pub fn readlink(&mut self, abs_path: &str) -> io::Result<String> {
         let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
         fs.readlink(&rel)

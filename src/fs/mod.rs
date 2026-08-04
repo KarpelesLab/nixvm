@@ -113,6 +113,13 @@ pub trait MountFs: std::fmt::Debug + Send {
     fn truncate(&mut self, _rel: &str, _len: u64) -> io::Result<()> {
         Err(erofs())
     }
+    /// Set the node's modification time (`utimensat`). `None` leaves it unchanged
+    /// (`UTIME_OMIT` / atime-only). The default accepts the call without storing
+    /// anything, so a backend that doesn't model per-node mtime (procfs/sysfs)
+    /// doesn't fail a `touch`; a writable backend overrides to actually store it.
+    fn set_mtime(&mut self, _rel: &str, _mtime: Option<i64>) -> io::Result<()> {
+        Ok(())
+    }
     fn symlink(&mut self, _target: &str, _linkpath: &str) -> io::Result<()> {
         Err(erofs())
     }

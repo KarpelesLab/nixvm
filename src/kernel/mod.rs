@@ -1977,6 +1977,7 @@ impl Kernel {
             | Sysno::Mkdir
             | Sysno::Unlinkat
             | Sysno::Unlink
+            | Sysno::Utimensat
             | Sysno::Rmdir
             | Sysno::Renameat
             | Sysno::Renameat2
@@ -2184,6 +2185,7 @@ impl Kernel {
             Sysno::Mkdirat => self.sys_mkdirat(vfs, cx, args[0] as i64, args[1], args[2], mem),
             Sysno::Mkdir => self.sys_mkdirat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
             Sysno::Unlinkat => self.sys_unlinkat(vfs, cx, args[0] as i64, args[1], args[2], mem),
+            Sysno::Utimensat => self.sys_utimensat(vfs, cx, args[0] as i64, args[1], args[2], args[3], mem),
             Sysno::Unlink => self.sys_unlinkat(vfs, cx, AT_FDCWD, args[0], 0, mem),
             Sysno::Rmdir => {
                 const AT_REMOVEDIR: u64 = 0x200;
@@ -2395,7 +2397,6 @@ impl Kernel {
             | Sysno::Fchmod
             | Sysno::Fchownat
             | Sysno::Fchown
-            | Sysno::Utimensat
             // Locking/sync + scheduling/process-attr setters: all no-ops.
             | Sysno::Mlock
             | Sysno::Mlock2
