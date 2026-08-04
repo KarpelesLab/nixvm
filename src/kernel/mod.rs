@@ -2208,9 +2208,9 @@ impl Kernel {
             }
             Sysno::Rename => self.sys_renameat(vfs, cx, AT_FDCWD, args[0], AT_FDCWD, args[1], mem),
             Sysno::Faccessat | Sysno::Faccessat2 => {
-                self.sys_faccessat(vfs, cx, args[0] as i64, args[1], mem)
+                self.sys_faccessat(vfs, cx, args[0] as i64, args[1], args[2], mem)
             }
-            Sysno::Access => self.sys_faccessat(vfs, cx, AT_FDCWD, args[0], mem),
+            Sysno::Access => self.sys_faccessat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
             Sysno::Msync => self.sys_msync(vfs, cx, args[0], args[1], mem),
             // Unreachable: `dispatch_impl` only routes the syscalls above here.
             _ => unreachable!("dispatch_vfs: {sys:?} is not a vfs-only syscall"),
@@ -4649,6 +4649,20 @@ impl Kernel {
             _ => return err(Errno::ESPIPE),
         };
         let size = vfs.stat(&path).map_or(0, |a| a.size);
+        // SEEK_DATA(3)/SEEK_HOLE(4): files here are non-sparse, so all data lies
+        // in `[0, size)` with a single hole at EOF. `offset >= size` is ENXIO.
+        const SEEK_DATA: u64 = 3;
+        const SEEK_HOLE: u64 = 4;
+        if whence == SEEK_DATA || whence == SEEK_HOLE {
+            if offset < 0 || offset as u64 >= size {
+                return err(Errno::ENXIO);
+            }
+            let pos = if whence == SEEK_DATA { offset as u64 } else { size };
+            if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32) {
+                *offset = pos;
+            }
+            return pos as i64;
+        }
         let base = match whence {
             0 => 0i64,
             1 => cur as i64,

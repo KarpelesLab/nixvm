@@ -249,17 +249,22 @@ impl Kernel {
 
     /// `faccessat(dirfd, path, ...)` / `access(path, ...)` — existence check
     /// only; there is no permission model yet.
-    pub(super) fn sys_faccessat(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, dirfd: i64, pathptr: u64, mem: &GuestMemory) -> i64 {
+    pub(super) fn sys_faccessat(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, dirfd: i64, pathptr: u64, mode: u64, mem: &GuestMemory) -> i64 {
+        const X_OK: u64 = 1;
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(cx, dirfd, &rel);
         let abs = self.follow_symlinks(vfs, &abs).unwrap_or(abs);
-        if vfs.stat(&abs).is_some() {
-            0
-        } else {
-            err(Errno::ENOENT)
+        let Some(attrs) = vfs.stat(&abs) else {
+            return err(Errno::ENOENT);
+        };
+        // The VM runs as root, so read/write are always granted; execute still
+        // requires at least one execute bit (even root can't exec a plain file).
+        if mode & X_OK != 0 && attrs.mode & 0o111 == 0 {
+            return err(Errno::EACCES);
         }
+        0
     }
 
     /// `umask(mask)` — set the file-creation mask, returning the previous one.
@@ -308,7 +313,8 @@ mod tests {
         let path = 0x1_0000;
         mem.write_init(path, b"/d\0").unwrap();
         assert_eq!(k.sys_mkdirat(&mut k.vfs.lock().unwrap(), &mut cx, AT_FDCWD, path, 0o755, &mem), 0);
-        assert_eq!(k.sys_faccessat(&mut k.vfs.lock().unwrap(), &mut cx, AT_FDCWD, path, &mem), 0);
+        // A directory (0o755) is searchable (X_OK).
+        assert_eq!(k.sys_faccessat(&mut k.vfs.lock().unwrap(), &mut cx, AT_FDCWD, path, 1, &mem), 0);
         assert_eq!(k.vfs.lock().unwrap().stat("/d").unwrap().kind, NodeKind::Dir);
     }
 
