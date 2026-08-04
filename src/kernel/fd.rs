@@ -34,6 +34,8 @@ pub enum Fd {
     },
     /// An `eventfd2` counter: index into the kernel's eventfd table.
     Eventfd(usize),
+    /// A `signalfd4`: index into the kernel's signalfd table.
+    Signalfd(usize),
     /// A `timerfd_create` timer: index into the kernel's timerfd table.
     Timerfd(usize),
     /// An `epoll_create1` instance: index into the kernel's epoll table.

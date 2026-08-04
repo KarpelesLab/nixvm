@@ -61,6 +61,7 @@ impl Kernel {
             Fd::PipeRead(i) | Fd::PipeWrite(i) => format!("pipe:[{i}]"),
             Fd::Socket { sock, .. } => format!("socket:[{sock}]"),
             Fd::Eventfd(_) => "anon_inode:[eventfd]".to_string(),
+            Fd::Signalfd(_) => "anon_inode:[signalfd]".to_string(),
             Fd::Timerfd(_) => "anon_inode:[timerfd]".to_string(),
             Fd::Epoll(_) => "anon_inode:[eventpoll]".to_string(),
             Fd::PtyMaster(_) => "/dev/ptmx".to_string(),

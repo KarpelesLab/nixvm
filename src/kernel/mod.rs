@@ -2122,10 +2122,12 @@ impl Kernel {
             Sysno::TimerfdGettime => self.sys_timerfd_gettime(pf, cx, args[0], args[1], mem),
             Sysno::EpollCreate | Sysno::EpollCreate1 => self.sys_epoll_create1(pf, cx, args[0]),
             Sysno::EpollCtl => self.sys_epoll_ctl(pf, cx, args[0], args[1], args[2], args[3], mem),
-            // inotify/signalfd get an eventfd-backed descriptor that never
-            // becomes readable (no events/signals delivered — a safe
-            // degradation for optional watching).
-            Sysno::InotifyInit1 | Sysno::Signalfd4 => self.sys_inotify_init1(pf, cx),
+            // inotify gets an eventfd-backed descriptor that never becomes
+            // readable (no filesystem events delivered — a safe degradation).
+            Sysno::InotifyInit1 => self.sys_inotify_init1(pf, cx),
+            // signalfd4(fd, mask, sizemask, flags): a real signal-reading fd. The
+            // `fd` is a 32-bit int (`-1` = create), read via `as i32`.
+            Sysno::Signalfd4 => self.sys_signalfd4(pf, cx, args[0] as i32 as i64, args[1], args[3], mem),
             // Unreachable: `dispatch_impl` only routes the syscalls above here.
             _ => unreachable!("dispatch_pollfds: {sys:?} is not a pollfds-only syscall"),
         }
@@ -3480,7 +3482,7 @@ impl Kernel {
                 let mut pipes = self.pipes.lock().unwrap();
                 self.read_pipe_fd(&mut pipes, cx, fd, buf, count, mem)
             }
-            Some(Fd::Eventfd(..) | Fd::Timerfd(..)) => {
+            Some(Fd::Eventfd(..) | Fd::Timerfd(..) | Fd::Signalfd(..)) => {
                 let mut pf = self.pollfds.lock().unwrap();
                 self.read_pollfd_fd(&mut pf, cx, fd, buf, count, mem)
             }
@@ -3535,6 +3537,7 @@ impl Kernel {
         match cx.cur.fds.get(fd as i32).cloned() {
             Some(Fd::Eventfd(i)) => self.read_eventfd(pf, cx, i, buf, count, mem),
             Some(Fd::Timerfd(i)) => self.read_timerfd(pf, cx, i, buf, count, mem),
+            Some(Fd::Signalfd(i)) => self.read_signalfd(pf, cx, i, buf, count, mem),
             _ => err(Errno::EBADF),
         }
     }
@@ -4286,7 +4289,7 @@ impl Kernel {
                     Fd::PipeRead(i) => {
                         self.pipes.lock().unwrap().get(*i).map_or(0, |p| p.buf.len() as u64)
                     }
-                    Fd::Eventfd(_) | Fd::Timerfd(_) => self.pollfds.lock().unwrap().readable_bytes(&f),
+                    Fd::Eventfd(_) | Fd::Timerfd(_) | Fd::Signalfd(_) => self.pollfds.lock().unwrap().readable_bytes(&f),
                     Fd::Socket { sock, end } => {
                         let mut net = self.net.lock().unwrap();
                         self.socket_readable_bytes(&mut net, *sock, *end)
@@ -4429,7 +4432,7 @@ impl Kernel {
     fn fd_set_nonblock(&self, f: &Fd, nb: bool) {
         match f {
             Fd::Socket { sock, end } => self.net.lock().unwrap().set_nonblock(*sock, *end, nb),
-            Fd::Eventfd(_) | Fd::Timerfd(_) => self.pollfds.lock().unwrap().set_nonblock(f, nb),
+            Fd::Eventfd(_) | Fd::Timerfd(_) | Fd::Signalfd(_) => self.pollfds.lock().unwrap().set_nonblock(f, nb),
             Fd::PtyMaster(n) => self.ptys.lock().unwrap().set_nonblock(*n, true, nb),
             Fd::PtySlave(n) => self.ptys.lock().unwrap().set_nonblock(*n, false, nb),
             _ => {}
@@ -4440,7 +4443,7 @@ impl Kernel {
     fn fd_is_nonblock(&self, f: &Fd) -> bool {
         match f {
             Fd::Socket { sock, end } => self.net.lock().unwrap().is_nonblock(*sock, *end),
-            Fd::Eventfd(_) | Fd::Timerfd(_) => self.pollfds.lock().unwrap().is_nonblock(f),
+            Fd::Eventfd(_) | Fd::Timerfd(_) | Fd::Signalfd(_) => self.pollfds.lock().unwrap().is_nonblock(f),
             Fd::PtyMaster(n) => self.ptys.lock().unwrap().is_nonblock(*n, true),
             Fd::PtySlave(n) => self.ptys.lock().unwrap().is_nonblock(*n, false),
             _ => false,
@@ -4637,6 +4640,7 @@ impl Kernel {
                 | Fd::Stdout
                 | Fd::Stderr
                 | Fd::Eventfd(_)
+                | Fd::Signalfd(_)
                 | Fd::Timerfd(_)
                 | Fd::Epoll(_)
                 | Fd::PtyMaster(_)
@@ -6813,6 +6817,23 @@ mod tests {
         cx.cur.alarm_deadline = Some(1000);
         assert!(fire_alarm_if_due(&mut cx.cur, 1000));
         assert_eq!(cx.cur.alarm_deadline, Some(1000 + 1_000_000_000), "periodic re-arms");
+    }
+
+    #[test]
+    fn signalfd_reads_pending_masked_signals() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let maskptr = 0x1_0000;
+        mem.write_init(maskptr, &(1u64 << 9).to_le_bytes()).unwrap(); // SIGUSR1(10)
+        // signalfd4(-1, {SIGUSR1}, 8, 0) creates a new signalfd.
+        let fd = call(&k, &mut cx, &mut mem, &mut v, Sysno::Signalfd4, [(-1i64) as u64, maskptr, 8, 0, 0, 0]);
+        assert!(fd >= 3, "a fresh fd, got {fd}");
+        // With SIGUSR1 pending, a read returns one 128-byte siginfo and dequeues it.
+        cx.cur.pending = 1u64 << 9;
+        let buf = 0x1_1000;
+        let r = call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd as u64, buf, 128, 0, 0, 0]);
+        assert_eq!(r, 128);
+        assert_eq!(mem.read_u32(buf).unwrap(), 10, "ssi_signo = SIGUSR1");
+        assert_eq!(cx.cur.pending, 0, "the signal is consumed by the read");
     }
 
     #[test]

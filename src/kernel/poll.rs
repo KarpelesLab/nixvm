@@ -47,6 +47,17 @@ pub(super) struct PollFds {
     pub(super) timerfds: Vec<TimerFdInst>,
     /// `epoll_create1` instances, indexed by [`Fd::Epoll`].
     pub(super) epolls: Vec<EpollInst>,
+    /// `signalfd4` instances, indexed by [`Fd::Signalfd`].
+    pub(super) signalfds: Vec<SignalFdInst>,
+}
+
+/// One `signalfd4`: the accepted-signal mask. Readable when the owning process
+/// has a pending signal in `mask` (the process must block those signals so they
+/// stay pending rather than reaching a handler); `read` dequeues them.
+#[derive(Debug, Default)]
+pub(super) struct SignalFdInst {
+    pub(super) mask: u64,
+    nonblock: bool,
 }
 
 /// One `eventfd2` counter.
@@ -106,6 +117,11 @@ impl PollFds {
                     t.nonblock = nb;
                 }
             }
+            super::Fd::Signalfd(i) => {
+                if let Some(s) = self.signalfds.get_mut(*i) {
+                    s.nonblock = nb;
+                }
+            }
             _ => {}
         }
     }
@@ -116,6 +132,8 @@ impl PollFds {
         match fd {
             super::Fd::Eventfd(i) => u64::from(self.eventfds.get(*i).is_some_and(|e| e.count > 0)) * 8,
             super::Fd::Timerfd(i) => u64::from(self.timerfds.get(*i).is_some_and(|t| t.expirations > 0)) * 8,
+            // signalfd readability depends on the process's pending mask, not
+            // available here — poll (`fd_ready`, which has `cx`) is the real path.
             _ => 0,
         }
     }
@@ -125,6 +143,7 @@ impl PollFds {
         match fd {
             super::Fd::Eventfd(i) => self.eventfds.get(*i).is_some_and(|e| e.nonblock),
             super::Fd::Timerfd(i) => self.timerfds.get(*i).is_some_and(|t| t.nonblock),
+            super::Fd::Signalfd(i) => self.signalfds.get(*i).is_some_and(|s| s.nonblock),
             _ => false,
         }
     }
@@ -282,6 +301,16 @@ impl Kernel {
             Fd::Timerfd(i) => {
                 self.update_timerfd(pf, i);
                 if pf.timerfds[i].expirations > 0 {
+                    POLLIN
+                } else {
+                    0
+                }
+            }
+            // A signalfd is readable when the owning process has a pending signal
+            // in its mask (the process blocks those so they stay pending).
+            Fd::Signalfd(i) => {
+                let mask = pf.signalfds.get(i).map_or(0, |s| s.mask);
+                if cx.cur.pending & mask != 0 {
                     POLLIN
                 } else {
                     0
@@ -733,6 +762,69 @@ impl Kernel {
             timespec_to_ms(sec, nsec)
         };
         self.sys_epoll_wait(cx, epfd, events_ptr, maxevents, timeout_ms, mem)
+    }
+
+    // ---- signalfd -----------------------------------------------------------
+
+    /// `signalfd4(fd, mask, sizemask, flags)` — create (`fd == -1`) or re-target
+    /// (an existing signalfd) a descriptor that reports the process's pending
+    /// signals in `mask`. The caller is expected to block those signals so they
+    /// stay pending (rather than reaching a handler) for the fd to read.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_signalfd4(&self, pf: &mut PollFds, cx: &mut ServiceCtx, fd: i64, mask_ptr: u64, flags: u64, mem: &GuestMemory) -> i64 {
+        const SFD_NONBLOCK: u64 = 0o4000;
+        let Ok(mask) = mem.read_u64(mask_ptr) else {
+            return err(Errno::EFAULT);
+        };
+        let nonblock = flags & SFD_NONBLOCK != 0;
+        if fd == -1 {
+            let idx = pf.signalfds.len();
+            pf.signalfds.push(SignalFdInst { mask, nonblock });
+            return i64::from(cx.cur.fds.alloc(Fd::Signalfd(idx)));
+        }
+        // Re-target an existing signalfd (same fd, new mask).
+        if let Some(Fd::Signalfd(i)) = cx.cur.fds.get(fd as i32).cloned() {
+            if let Some(s) = pf.signalfds.get_mut(i) {
+                s.mask = mask;
+            }
+            return fd;
+        }
+        err(Errno::EINVAL)
+    }
+
+    /// `read(signalfd_fd, buf, count)` — dequeue the pending signals in the fd's
+    /// mask, one `struct signalfd_siginfo` (128 bytes) each, and clear their
+    /// pending bits. Blocks (or `EAGAIN`) when none are pending.
+    #[allow(clippy::unused_self)]
+    pub(super) fn read_signalfd(&self, pf: &mut PollFds, cx: &mut ServiceCtx, i: usize, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+        if count < 128 {
+            return err(Errno::EINVAL);
+        }
+        let mask = pf.signalfds.get(i).map_or(0, |s| s.mask);
+        let mut off = 0u64;
+        // Emit one siginfo per pending masked signal, up to what `count` holds.
+        while off + 128 <= count {
+            let ready = cx.cur.pending & mask;
+            if ready == 0 {
+                break;
+            }
+            let sig = ready.trailing_zeros() + 1;
+            cx.cur.pending &= !(1u64 << (sig - 1));
+            let mut si = [0u8; 128];
+            si[0..4].copy_from_slice(&sig.to_le_bytes()); // ssi_signo
+            if mem.write(buf + off, &si).is_err() {
+                return err(Errno::EFAULT);
+            }
+            off += 128;
+        }
+        if off == 0 {
+            if pf.signalfds.get(i).is_some_and(|s| s.nonblock) {
+                return err(Errno::EAGAIN);
+            }
+            cx.block = true;
+            return 0;
+        }
+        off as i64
     }
 
     // ---- eventfd ------------------------------------------------------------
