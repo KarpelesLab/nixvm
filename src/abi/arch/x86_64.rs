@@ -111,7 +111,8 @@ pub fn decode(nr: u64) -> Sysno {
         21 => Sysno::Access,
         // 90/92/94/132/235 are legacy chmod/chown/lchown/utime/utimes: all
         // always-succeed no-ops in the kernel, so the arg shape is moot.
-        90 | 268 => Sysno::Fchmodat,
+        90 => Sysno::Chmod,     // chmod(path, mode)
+        268 => Sysno::Fchmodat, // fchmodat(dirfd, path, mode, flags)
         91 => Sysno::Fchmod,
         92 | 94 | 260 => Sysno::Fchownat,
         93 => Sysno::Fchown,

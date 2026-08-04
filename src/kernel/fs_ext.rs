@@ -225,6 +225,33 @@ impl Kernel {
         }
     }
 
+    /// `fchmodat(dirfd, path, mode, flags)` / `chmod(path, mode)` — set a file's
+    /// permission bits. `fchmod(fd, mode)` shares the store via the fd's path.
+    pub(super) fn sys_fchmodat(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, dirfd: i64, pathptr: u64, mode: u64, mem: &GuestMemory) -> i64 {
+        let Some(rel) = read_path(mem, pathptr) else {
+            return err(Errno::EFAULT);
+        };
+        let abs = self.resolve_path(cx, dirfd, &rel);
+        let abs = self.follow_symlinks(vfs, &abs).unwrap_or(abs);
+        match vfs.set_mode(&abs, mode as u32) {
+            Ok(()) => 0,
+            Err(e) => io_errno(&e),
+        }
+    }
+
+    /// `fchmod(fd, mode)` — chmod on an open file, resolved via its path.
+    pub(super) fn sys_fchmod(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, mode: u64) -> i64 {
+        let path = match cx.cur.fds.get(fd as i32) {
+            Some(Fd::File { path, .. } | Fd::Dir { path, .. }) => path.clone(),
+            Some(_) => return 0, // non-file fds: accept (nothing to chmod)
+            None => return err(Errno::EBADF),
+        };
+        match vfs.set_mode(&path, mode as u32) {
+            Ok(()) => 0,
+            Err(e) => io_errno(&e),
+        }
+    }
+
     /// `renameat(olddirfd, old, newdirfd, new)` / `renameat2(..., flags)` — the
     /// flags argument is accepted but not honored.
     #[allow(clippy::too_many_arguments)]

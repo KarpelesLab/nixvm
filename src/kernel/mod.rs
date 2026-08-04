@@ -1988,6 +1988,9 @@ impl Kernel {
             | Sysno::Unlinkat
             | Sysno::Unlink
             | Sysno::Utimensat
+            | Sysno::Fchmodat
+            | Sysno::Chmod
+            | Sysno::Fchmod
             | Sysno::Rmdir
             | Sysno::Renameat
             | Sysno::Renameat2
@@ -2198,6 +2201,10 @@ impl Kernel {
             Sysno::Mkdir => self.sys_mkdirat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
             Sysno::Unlinkat => self.sys_unlinkat(vfs, cx, args[0] as i64, args[1], args[2], mem),
             Sysno::Utimensat => self.sys_utimensat(vfs, cx, args[0] as i64, args[1], args[2], args[3], mem),
+            // legacy chmod(path, mode) vs fchmodat(dirfd, path, mode, flags).
+            Sysno::Chmod => self.sys_fchmodat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
+            Sysno::Fchmodat => self.sys_fchmodat(vfs, cx, args[0] as i32 as i64, args[1], args[2], mem),
+            Sysno::Fchmod => self.sys_fchmod(vfs, cx, args[0], args[1]),
             Sysno::Unlink => self.sys_unlinkat(vfs, cx, AT_FDCWD, args[0], 0, mem),
             Sysno::Rmdir => {
                 const AT_REMOVEDIR: u64 = 0x200;
@@ -2407,8 +2414,6 @@ impl Kernel {
             | Sysno::Getgid
             | Sysno::Getegid
             | Sysno::SetRobustList
-            | Sysno::Fchmodat
-            | Sysno::Fchmod
             | Sysno::Fchownat
             | Sysno::Fchown
             // Locking/sync + scheduling/process-attr setters: all no-ops.

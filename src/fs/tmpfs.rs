@@ -296,6 +296,18 @@ impl MountFs for TmpFs {
         }
     }
 
+    fn set_mode(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        match self.nodes.get_mut(rel) {
+            // Files store their mode; dirs/symlinks don't model one here.
+            Some(Node::File { mode: m, .. }) => {
+                *m = (*m & !0o7777) | (mode & 0o7777);
+                Ok(())
+            }
+            Some(_) => Ok(()),
+            None => Err(enoent()),
+        }
+    }
+
     fn set_mtime(&mut self, rel: &str, mtime: Option<i64>) -> io::Result<()> {
         match self.nodes.get_mut(rel) {
             // `None` (UTIME_OMIT / atime-only) leaves the stored mtime alone.
@@ -561,6 +573,15 @@ mod tests {
         fs.write_at("f", 0, b"x").unwrap();
         let after = fs.stat("f").unwrap().mtime;
         assert!(after >= before);
+    }
+
+    #[test]
+    fn set_mode_updates_permission_bits() {
+        let mut fs = TmpFs::new();
+        fs.create("f", 0o644).unwrap();
+        fs.set_mode("f", 0o755).unwrap();
+        assert_eq!(fs.stat("f").unwrap().mode & 0o777, 0o755);
+        assert!(fs.set_mode("nope", 0o755).is_err());
     }
 
     #[test]

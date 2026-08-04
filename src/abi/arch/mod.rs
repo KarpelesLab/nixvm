@@ -128,6 +128,7 @@ pub enum Sysno {
     Faccessat2,
     Access,
     Fchmodat,
+    Chmod,
     Fchmod,
     Fchownat,
     Fchown,

@@ -120,6 +120,13 @@ pub trait MountFs: std::fmt::Debug + Send {
     fn set_mtime(&mut self, _rel: &str, _mtime: Option<i64>) -> io::Result<()> {
         Ok(())
     }
+    /// Set the node's permission bits (`chmod`; only the low `0o7777` are used).
+    /// The default accepts without storing, so `chmod` succeeds on backends that
+    /// don't model per-node permission bits; a writable backend stores them (so
+    /// `chmod +x` then `access(X_OK)`/exec works).
+    fn set_mode(&mut self, _rel: &str, _mode: u32) -> io::Result<()> {
+        Ok(())
+    }
     fn symlink(&mut self, _target: &str, _linkpath: &str) -> io::Result<()> {
         Err(erofs())
     }

@@ -141,6 +141,11 @@ impl MountTable {
         fs.set_mtime(&rel, mtime)
     }
 
+    pub fn set_mode(&mut self, abs_path: &str, mode: u32) -> io::Result<()> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.set_mode(&rel, mode)
+    }
+
     pub fn readlink(&mut self, abs_path: &str) -> io::Result<String> {
         let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
         fs.readlink(&rel)
