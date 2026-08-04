@@ -75,8 +75,8 @@ fn main() {
     }
     mounts.mount("/tmp", Box::new(TmpFs::new()));
     mounts.mount("/dev", Box::new(DevFs::new()));
-    mounts.mount("/proc", Box::new(ProcFs::new()));
-    mounts.mount("/sys", Box::new(SysFs::new()));
+    mounts.mount("/proc", Box::new(ProcFs::new(1)));
+    mounts.mount("/sys", Box::new(SysFs::new(1)));
     if let Ok(cwd) = std::env::current_dir() {
         mounts.mount("/work", Box::new(Passthrough::new(cwd)));
     }

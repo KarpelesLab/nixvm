@@ -44,10 +44,15 @@ impl Node {
     }
 }
 
-/// Number of logical CPUs to report, mirroring what the guest's `nproc` would
-/// see. Falls back to `1` if the host declines to say.
+/// The guest's logical-CPU count for `devices/system/cpu/*`. Set once from
+/// nixvm's own `ncpus` ([`SysFs::new`]) so `sysfs` agrees with `sched_getaffinity`
+/// and `/proc/cpuinfo` — reporting the *host's* core count here made the guest
+/// (via glibc `sysconf(_SC_NPROCESSORS_ONLN)`, which reads this file) think it
+/// had far more CPUs than the scheduler provides, oversubscribing thread pools.
+static GUEST_NPROC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
 fn nproc() -> usize {
-    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    GUEST_NPROC.load(std::sync::atomic::Ordering::Relaxed).max(1)
 }
 
 /// Render a CPU index set the way `sysfs` bitmap-list files do: `"0\n"` for a
@@ -107,13 +112,17 @@ pub struct SysFs;
 
 impl Default for SysFs {
     fn default() -> Self {
-        Self::new()
+        Self::new(1)
     }
 }
 
 impl SysFs {
+    /// Build a sysfs reporting `ncpu` logical CPUs (nixvm's own core count), so
+    /// `devices/system/cpu/*` matches `sched_getaffinity`/`cpuinfo`. Set before
+    /// the (lazily-built, process-global) CPU tree is first read.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(ncpu: usize) -> Self {
+        GUEST_NPROC.store(ncpu.max(1), std::sync::atomic::Ordering::Relaxed);
         Self
     }
 
@@ -329,7 +338,7 @@ mod tests {
 
     #[test]
     fn readdir_root_lists_top_level_dirs() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         let mut names: Vec<_> = fs
             .readdir("")
             .unwrap()
@@ -354,7 +363,7 @@ mod tests {
 
     #[test]
     fn read_kernel_ostype() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         let mut buf = [0u8; 32];
         let n = fs.read_at("kernel/ostype", 0, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"Linux\n");
@@ -362,7 +371,7 @@ mod tests {
 
     #[test]
     fn stat_dir_is_dir() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         let a = fs.stat("devices/system/cpu").unwrap();
         assert_eq!(a.kind, NodeKind::Dir);
         assert_eq!(a.mode, S_IFDIR | 0o755);
@@ -371,7 +380,7 @@ mod tests {
 
     #[test]
     fn stat_file_is_read_only_reg() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         let a = fs.stat("kernel/osrelease").unwrap();
         assert_eq!(a.kind, NodeKind::File);
         assert_eq!(a.mode, S_IFREG | 0o444);
@@ -380,7 +389,7 @@ mod tests {
 
     #[test]
     fn cpu_online_matches_nproc() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         let ncpu = nproc();
         let mut buf = [0u8; 64];
         for name in ["online", "possible", "present"] {
@@ -393,7 +402,7 @@ mod tests {
 
     #[test]
     fn per_cpu_dirs_match_nproc() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         let ncpu = nproc();
         let mut names: Vec<_> = fs
             .readdir("devices/system/cpu")
@@ -435,7 +444,7 @@ mod tests {
 
     #[test]
     fn ls_sys_devices_system_cpu_lists_expected_entries() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         let names: Vec<_> = fs
             .readdir("devices/system")
             .unwrap()
@@ -448,7 +457,7 @@ mod tests {
 
     #[test]
     fn node0_present_with_meminfo_and_cpulist() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         let a = fs.stat("devices/system/node/node0").unwrap();
         assert_eq!(a.kind, NodeKind::Dir);
         let mut buf = [0u8; 256];
@@ -460,7 +469,7 @@ mod tests {
 
     #[test]
     fn class_and_block_and_cgroup_present() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         for path in [
             "class",
             "class/net",
@@ -475,7 +484,7 @@ mod tests {
 
     #[test]
     fn transparent_hugepage_enabled_present() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         let mut buf = [0u8; 64];
         let n = fs
             .read_at("kernel/mm/transparent_hugepage/enabled", 0, &mut buf)
@@ -485,7 +494,7 @@ mod tests {
 
     #[test]
     fn unknown_path_errors() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         assert!(fs.stat("nope").is_none());
         let mut buf = [0u8; 4];
         assert_eq!(
@@ -497,7 +506,7 @@ mod tests {
 
     #[test]
     fn readdir_on_file_is_enotdir() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         assert_eq!(
             fs.readdir("kernel/ostype").unwrap_err().raw_os_error(),
             Some(20)
@@ -506,12 +515,12 @@ mod tests {
 
     #[test]
     fn read_only_by_default() {
-        assert!(SysFs::new().read_only());
+        assert!(SysFs::new(1).read_only());
     }
 
     #[test]
     fn class_net_lo_present_with_mtu_and_statistics() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         let mut buf = [0u8; 32];
 
         let n = fs.read_at("class/net/lo/mtu", 0, &mut buf).unwrap();
@@ -533,7 +542,7 @@ mod tests {
 
     #[test]
     fn ls_sys_class_net_lists_lo() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         let names: Vec<_> = fs
             .readdir("class/net")
             .unwrap()
@@ -546,7 +555,7 @@ mod tests {
 
     #[test]
     fn class_block_and_top_level_block_present() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         for path in ["class/block", "block"] {
             assert_eq!(fs.stat(path).unwrap().kind, NodeKind::Dir, "{path}");
         }
@@ -554,7 +563,7 @@ mod tests {
 
     #[test]
     fn cpu0_cpufreq_and_cache_present() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         let mut buf = [0u8; 32];
         let n = fs
             .read_at(
@@ -591,7 +600,7 @@ mod tests {
 
     #[test]
     fn cpu_kernel_max_isolated_and_nohz_full_present() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         let mut buf = [0u8; 32];
         let n = fs
             .read_at("devices/system/cpu/kernel_max", 0, &mut buf)
@@ -609,7 +618,7 @@ mod tests {
 
     #[test]
     fn kernel_security_and_module_dirs_present() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         for path in ["kernel/security", "module", "firmware"] {
             assert_eq!(fs.stat(path).unwrap().kind, NodeKind::Dir, "{path}");
         }
@@ -620,7 +629,7 @@ mod tests {
 
     #[test]
     fn power_and_cgroup_present() {
-        let mut fs = SysFs::new();
+        let mut fs = SysFs::new(1);
         assert_eq!(fs.stat("power").unwrap().kind, NodeKind::Dir);
         let mut buf = [0u8; 32];
         let n = fs.read_at("power/state", 0, &mut buf).unwrap();

@@ -2362,7 +2362,7 @@ impl Kernel {
             Sysno::Getppid => i64::from(cx.cur.ppid),
             // Resource / scheduling / process-attribute syscalls (informational).
             Sysno::SchedGetaffinity => {
-                sys_misc::sys_sched_getaffinity(args[1], args[2], mem)
+                sys_misc::sys_sched_getaffinity(self.ncpus, args[1], args[2], mem)
             }
             Sysno::SchedGetparam => sys_misc::sys_sched_getparam(args[1], mem),
             Sysno::Getrusage => self.sys_getrusage(sh, cx, args[0], args[1], mem),

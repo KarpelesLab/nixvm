@@ -531,15 +531,20 @@ pub struct ProcFs {
 
 impl Default for ProcFs {
     fn default() -> Self {
-        Self::new()
+        Self::new(1)
     }
 }
 
 impl ProcFs {
+    /// Build a procfs whose `cpuinfo`/`stat` render `ncpu` cores (nixvm's own
+    /// count), consistent with `sysfs` and `sched_getaffinity`.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(ncpu: usize) -> Self {
         Self {
-            data: ProcData::default(),
+            data: ProcData {
+                nproc: ncpu.max(1),
+                ..ProcData::default()
+            },
         }
     }
 
@@ -1263,14 +1268,14 @@ mod tests {
 
     #[test]
     fn version_contains_linux() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let data = read_all(&mut fs, "version");
         assert!(String::from_utf8_lossy(&data).contains("Linux"));
     }
 
     #[test]
     fn root_readdir_lists_files_and_dirs() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let names: Vec<String> = fs
             .readdir("")
             .unwrap()
@@ -1286,7 +1291,7 @@ mod tests {
 
     #[test]
     fn self_exe_is_a_symlink() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let attrs = fs.stat("self/exe").unwrap();
         assert_eq!(attrs.kind, NodeKind::Symlink);
         assert_eq!(attrs.mode, S_IFLNK | 0o777);
@@ -1296,7 +1301,7 @@ mod tests {
 
     #[test]
     fn set_self_changes_cmdline() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         // Placeholder cmdline is empty.
         assert!(read_all(&mut fs, "self/cmdline").is_empty());
         fs.set_self(sample());
@@ -1308,7 +1313,7 @@ mod tests {
 
     #[test]
     fn directories_and_inodes() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         assert_eq!(fs.stat("").unwrap().kind, NodeKind::Dir);
         assert_eq!(fs.stat("sys/kernel").unwrap().kind, NodeKind::Dir);
         assert_eq!(fs.stat("sys/kernel").unwrap().mode, S_IFDIR | 0o555);
@@ -1325,7 +1330,7 @@ mod tests {
 
     #[test]
     fn unknown_path_errors() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         assert!(fs.stat("nope").is_none());
         let mut buf = [0u8; 8];
         assert_eq!(
@@ -1337,12 +1342,12 @@ mod tests {
 
     #[test]
     fn read_only_backend() {
-        assert!(ProcFs::new().read_only());
+        assert!(ProcFs::new(1).read_only());
     }
 
     #[test]
     fn meminfo_contains_expected_fields() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let text = String::from_utf8(read_all(&mut fs, "meminfo")).unwrap();
         assert!(text.contains("MemTotal:"));
         assert!(text.contains("MemFree:"));
@@ -1350,7 +1355,7 @@ mod tests {
 
     #[test]
     fn self_status_reflects_injected_data() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         fs.set_self(sample());
         let text = String::from_utf8(read_all(&mut fs, "self/status")).unwrap();
         assert!(text.contains("Name:\tprog"));
@@ -1366,7 +1371,7 @@ mod tests {
 
     #[test]
     fn self_stat_has_pid_and_comm() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         fs.set_self(sample());
         let text = String::from_utf8(read_all(&mut fs, "self/stat")).unwrap();
         assert!(text.starts_with("42 (prog) R 7 "));
@@ -1375,7 +1380,7 @@ mod tests {
 
     #[test]
     fn pid_dir_mirrors_self() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         fs.set_self(sample());
         assert_eq!(read_all(&mut fs, "42/cmdline"), b"prog\0--flag\0");
         assert_eq!(fs.readlink("42/exe").unwrap(), "/usr/bin/prog");
@@ -1391,7 +1396,7 @@ mod tests {
 
     #[test]
     fn self_cwd_is_a_symlink() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         fs.set_self(sample());
         assert_eq!(fs.stat("self/cwd").unwrap().kind, NodeKind::Symlink);
         assert_eq!(fs.readlink("self/cwd").unwrap(), "/home/user");
@@ -1399,7 +1404,7 @@ mod tests {
 
     #[test]
     fn self_fd_lists_injected_descriptors() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         fs.set_self(sample());
         assert_eq!(fs.stat("self/fd").unwrap().kind, NodeKind::Dir);
         let names: Vec<String> = fs
@@ -1417,7 +1422,7 @@ mod tests {
 
     #[test]
     fn self_fd_unknown_descriptor_is_enoent() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         fs.set_self(sample());
         assert_eq!(
             fs.readlink("self/fd/99").unwrap_err().raw_os_error(),
@@ -1428,7 +1433,7 @@ mod tests {
 
     #[test]
     fn self_maps_falls_back_to_default_when_not_injected() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let text = String::from_utf8(read_all(&mut fs, "self/maps")).unwrap();
         assert!(text.contains("[stack]"));
         assert!(text.contains("[heap]"));
@@ -1437,13 +1442,13 @@ mod tests {
 
     #[test]
     fn self_auxv_is_empty_by_default() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         assert!(read_all(&mut fs, "self/auxv").is_empty());
     }
 
     #[test]
     fn cpuinfo_and_stat_track_nproc() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         fs.set_self(sample()); // nproc = 4
         let cpuinfo = String::from_utf8(read_all(&mut fs, "cpuinfo")).unwrap();
         assert_eq!(cpuinfo.matches("processor\t:").count(), 4);
@@ -1455,7 +1460,7 @@ mod tests {
 
     #[test]
     fn sys_kernel_files_present() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let text = String::from_utf8(read_all(&mut fs, "sys/kernel/hostname")).unwrap();
         assert_eq!(text, "nixvm\n");
         let pid_max = String::from_utf8(read_all(&mut fs, "sys/kernel/pid_max")).unwrap();
@@ -1464,7 +1469,7 @@ mod tests {
 
     #[test]
     fn net_tcp_has_expected_header() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let text = String::from_utf8(read_all(&mut fs, "net/tcp")).unwrap();
         assert!(text.contains("sl"));
         assert!(text.contains("local_address"));
@@ -1476,7 +1481,7 @@ mod tests {
 
     #[test]
     fn net_dev_has_headers_and_lo_row() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let text = String::from_utf8(read_all(&mut fs, "net/dev")).unwrap();
         assert!(text.contains("Inter-|"));
         assert!(text.contains("face |bytes"));
@@ -1485,7 +1490,7 @@ mod tests {
 
     #[test]
     fn net_unix_has_expected_header() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let text = String::from_utf8(read_all(&mut fs, "net/unix")).unwrap();
         assert!(text.starts_with("Num"));
         assert!(text.contains("RefCount"));
@@ -1499,7 +1504,7 @@ mod tests {
 
     #[test]
     fn net_directory_listing() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let names: Vec<String> = fs
             .readdir("net")
             .unwrap()
@@ -1531,7 +1536,7 @@ mod tests {
 
     #[test]
     fn sys_net_core_directory_listing() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let names: Vec<String> = fs
             .readdir("sys/net/core")
             .unwrap()
@@ -1545,7 +1550,7 @@ mod tests {
 
     #[test]
     fn sys_net_ipv4_and_vm_and_fs_files() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         assert_eq!(
             String::from_utf8(read_all(&mut fs, "sys/net/ipv4/tcp_rmem")).unwrap(),
             "4096\t131072\t6291456\n"
@@ -1562,7 +1567,7 @@ mod tests {
 
     #[test]
     fn self_statm_has_seven_numbers() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         fs.set_self(sample());
         let text = String::from_utf8(read_all(&mut fs, "self/statm")).unwrap();
         let fields: Vec<&str> = text.split_whitespace().collect();
@@ -1574,7 +1579,7 @@ mod tests {
 
     #[test]
     fn self_limits_contains_max_open_files() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let text = String::from_utf8(read_all(&mut fs, "self/limits")).unwrap();
         assert!(text.contains("Max open files"));
         assert!(text.contains("Soft Limit"));
@@ -1583,7 +1588,7 @@ mod tests {
 
     #[test]
     fn self_io_and_oom_and_wchan() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let io = String::from_utf8(read_all(&mut fs, "self/io")).unwrap();
         assert!(io.contains("rchar:"));
         assert!(io.contains("read_bytes:"));
@@ -1594,7 +1599,7 @@ mod tests {
 
     #[test]
     fn self_mountinfo_and_mounts() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let mountinfo = String::from_utf8(read_all(&mut fs, "self/mountinfo")).unwrap();
         assert!(mountinfo.contains(" / / "));
         assert!(mountinfo.contains(" - tmpfs tmpfs rw"));
@@ -1604,7 +1609,7 @@ mod tests {
 
     #[test]
     fn self_smaps_tracks_maps() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let text = String::from_utf8(read_all(&mut fs, "self/smaps")).unwrap();
         assert!(text.contains("[stack]"));
         assert!(text.contains("Rss:"));
@@ -1613,7 +1618,7 @@ mod tests {
 
     #[test]
     fn pid_alias_reaches_new_self_files() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         fs.set_self(sample());
         assert_eq!(read_all(&mut fs, "42/oom_score"), b"0\n");
         let statm = String::from_utf8(read_all(&mut fs, "42/statm")).unwrap();
@@ -1622,7 +1627,7 @@ mod tests {
 
     #[test]
     fn top_level_misc_files_present() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         assert!(
             String::from_utf8(read_all(&mut fs, "diskstats"))
                 .unwrap()
@@ -1648,7 +1653,7 @@ mod tests {
 
     #[test]
     fn self_environ_contains_path() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let text = String::from_utf8(read_all(&mut fs, "self/environ")).unwrap();
         assert!(text.contains("PATH="));
         // NUL-separated, as the kernel presents it.
@@ -1657,14 +1662,14 @@ mod tests {
 
     #[test]
     fn self_root_is_a_symlink_to_slash() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         assert_eq!(fs.stat("self/root").unwrap().kind, NodeKind::Symlink);
         assert_eq!(fs.readlink("self/root").unwrap(), "/");
     }
 
     #[test]
     fn cpuinfo_contains_arch_feature_line() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let text = String::from_utf8(read_all(&mut fs, "cpuinfo")).unwrap();
         assert!(text.contains("Features") || text.contains("flags"));
     }
@@ -1683,7 +1688,7 @@ mod tests {
 
     #[test]
     fn random_uuid_matches_uuid_shape() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let uuid = String::from_utf8(read_all(&mut fs, "sys/kernel/random/uuid")).unwrap();
         assert!(is_uuid_shaped(uuid.trim()), "not UUID-shaped: {uuid}");
         let boot_id = String::from_utf8(read_all(&mut fs, "sys/kernel/random/boot_id")).unwrap();
@@ -1692,7 +1697,7 @@ mod tests {
 
     #[test]
     fn random_entropy_and_poolsize() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         assert_eq!(
             read_all(&mut fs, "sys/kernel/random/entropy_avail"),
             b"256\n"
@@ -1702,7 +1707,7 @@ mod tests {
 
     #[test]
     fn self_uid_map_contains_0_0() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let text = String::from_utf8(read_all(&mut fs, "self/uid_map")).unwrap();
         assert!(text.contains("0 0"));
         let text = String::from_utf8(read_all(&mut fs, "self/gid_map")).unwrap();
@@ -1711,7 +1716,7 @@ mod tests {
 
     #[test]
     fn sys_kernel_extra_tunables_present() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         assert_eq!(
             String::from_utf8(read_all(&mut fs, "sys/kernel/ngroups_max")).unwrap(),
             "65536\n"
@@ -1731,7 +1736,7 @@ mod tests {
 
     #[test]
     fn new_top_level_files_present() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         assert!(read_all(&mut fs, "kallsyms").starts_with(b"0000000000000000"));
         assert!(read_all(&mut fs, "keys").is_empty());
         assert!(read_all(&mut fs, "key-users").is_empty());
@@ -1748,7 +1753,7 @@ mod tests {
 
     #[test]
     fn self_sched_and_schedstat_and_personality() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         fs.set_self(sample());
         let sched = String::from_utf8(read_all(&mut fs, "self/sched")).unwrap();
         assert!(sched.starts_with("prog (42, #threads: 3)"));
@@ -1759,7 +1764,7 @@ mod tests {
 
     #[test]
     fn new_listings_include_environ_and_random() {
-        let mut fs = ProcFs::new();
+        let mut fs = ProcFs::new(1);
         let self_names: Vec<String> = fs
             .readdir("self")
             .unwrap()

@@ -41,13 +41,16 @@ impl Kernel {
 
 /// `sched_getaffinity(pid, size, mask)` — report a single online CPU (bit 0),
 /// returning the number of bytes written (`min(size, 8)`).
-pub(super) fn sys_sched_getaffinity(size: u64, mask: u64, mem: &mut GuestMemory) -> i64 {
+pub(super) fn sys_sched_getaffinity(ncpu: usize, size: u64, mask: u64, mem: &mut GuestMemory) -> i64 {
     let n = size.min(8) as usize;
     if n == 0 {
         return err(Errno::EINVAL);
     }
+    // Report nixvm's own CPU count (bits 0..ncpu), consistent with sysfs/cpuinfo.
     let mut buf = vec![0u8; n];
-    buf[0] = 1;
+    for cpu in 0..ncpu.min(n * 8) {
+        buf[cpu / 8] |= 1 << (cpu % 8);
+    }
     if mem.write(mask, &buf).is_err() {
         return err(Errno::EFAULT);
     }
@@ -215,8 +218,12 @@ mod tests {
     fn sched_getaffinity_sets_bit0() {
         let (_k, mut mem) = setup();
         let mask = 0x1_0000;
-        assert_eq!(sys_sched_getaffinity(128, mask, &mut mem), 8);
+        // 1 CPU → only bit 0 set.
+        assert_eq!(sys_sched_getaffinity(1, 128, mask, &mut mem), 8);
         assert_eq!(mem.read_vec(mask, 1).unwrap()[0], 1);
+        // 4 CPUs → the low 4 bits (0xf).
+        assert_eq!(sys_sched_getaffinity(4, 128, mask, &mut mem), 8);
+        assert_eq!(mem.read_vec(mask, 1).unwrap()[0], 0xf);
     }
 
     #[test]

@@ -482,8 +482,8 @@ impl Sandbox {
         }
         mounts.mount("/tmp", Box::new(TmpFs::new()));
         mounts.mount("/dev", Box::new(DevFs::new()));
-        mounts.mount("/proc", Box::new(ProcFs::new()));
-        mounts.mount("/sys", Box::new(SysFs::new()));
+        mounts.mount("/proc", Box::new(ProcFs::new(self.config.ncpus)));
+        mounts.mount("/sys", Box::new(SysFs::new(self.config.ncpus)));
 
         #[cfg(unix)]
         {

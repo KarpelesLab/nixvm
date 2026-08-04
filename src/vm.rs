@@ -102,8 +102,8 @@ impl Vm {
 
         mounts.mount("/tmp", Box::new(TmpFs::new()));
         mounts.mount("/dev", Box::new(DevFs::new()));
-        mounts.mount("/proc", Box::new(ProcFs::new()));
-        mounts.mount("/sys", Box::new(SysFs::new()));
+        mounts.mount("/proc", Box::new(ProcFs::new(1)));
+        mounts.mount("/sys", Box::new(SysFs::new(1)));
 
         // With host egress enabled, give the guest resolver a nameserver
         // (a stock Alpine minirootfs ships no /etc/resolv.conf, so musl would

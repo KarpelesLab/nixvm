@@ -381,8 +381,8 @@ mod browser {
         mounts.mount("/", Box::new(TmpFs::new()));
         mounts.mount("/tmp", Box::new(TmpFs::new()));
         mounts.mount("/dev", Box::new(DevFs::new()));
-        mounts.mount("/proc", Box::new(ProcFs::new()));
-        mounts.mount("/sys", Box::new(SysFs::new()));
+        mounts.mount("/proc", Box::new(ProcFs::new(1)));
+        mounts.mount("/sys", Box::new(SysFs::new(1)));
 
         let stdout_buf = Arc::new(Mutex::new(Vec::new()));
         let stderr_buf = Arc::new(Mutex::new(Vec::new()));
