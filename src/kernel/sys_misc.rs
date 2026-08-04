@@ -181,10 +181,16 @@ pub(super) fn write_rlimit(mem: &mut GuestMemory, addr: u64, cur: u64, max: u64)
 /// Encode a 64-bit `struct sysinfo` (112 bytes): 2 GiB total RAM at offset 32,
 /// `procs = 1` at offset 80, `mem_unit = 1` at offset 104; everything else 0.
 fn encode_sysinfo() -> [u8; 112] {
+    const TOTAL_RAM: u64 = 2 * 1024 * 1024 * 1024;
     let mut b = [0u8; 112];
-    b[32..40].copy_from_slice(&(2u64 * 1024 * 1024 * 1024).to_le_bytes());
-    b[80..82].copy_from_slice(&1u16.to_le_bytes());
-    b[104..108].copy_from_slice(&1u32.to_le_bytes());
+    // uptime (offset 0): seconds the VM has been running.
+    b[0..8].copy_from_slice(&(crate::clock::now_monotonic().as_secs() as i64).to_le_bytes());
+    b[32..40].copy_from_slice(&TOTAL_RAM.to_le_bytes()); // totalram
+    // freeram (offset 40): report most of RAM free — 0 would make memory-sizing
+    // programs (JVMs, databases) think the machine is out of memory.
+    b[40..48].copy_from_slice(&(TOTAL_RAM * 3 / 4).to_le_bytes());
+    b[80..82].copy_from_slice(&1u16.to_le_bytes()); // procs
+    b[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
     b
 }
 
