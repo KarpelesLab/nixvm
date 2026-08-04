@@ -65,7 +65,9 @@ pub fn encode_stat(attrs: &Attrs, arch: Arch) -> Vec<u8> {
     }
     put64(&mut b, 48, attrs.size); // st_size
     put32(&mut b, 56, 4096); // st_blksize
-    put64(&mut b, 64, attrs.size.div_ceil(512)); // st_blocks (512-byte units)
+    // st_blocks (512-byte units). Like tmpfs, storage is page-granular, so round
+    // the size up to a 4 KiB page (= 8 × 512-byte blocks) — what `du`/`ls -s` see.
+    put64(&mut b, 64, attrs.size.div_ceil(4096) * 8);
     let t = attrs.mtime as u64;
     put64(&mut b, 72, t); // st_atime
     put64(&mut b, 88, t); // st_mtime
@@ -98,7 +100,7 @@ pub fn encode_statx(attrs: &Attrs) -> [u8; 256] {
     put16(&mut b, 28, attrs.mode as u16); // stx_mode (type + perms)
     put64(&mut b, 32, attrs.inode); // stx_ino
     put64(&mut b, 40, attrs.size); // stx_size
-    put64(&mut b, 48, attrs.size.div_ceil(512)); // stx_blocks
+    put64(&mut b, 48, attrs.size.div_ceil(4096) * 8); // stx_blocks (page-rounded)
     // stx_attributes_mask @56 = 0
     let t = attrs.mtime;
     put_ts(&mut b, 64, t); // stx_atime
