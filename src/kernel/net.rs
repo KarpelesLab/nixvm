@@ -187,6 +187,8 @@ pub(super) struct Net {
     listeners: BTreeMap<String, usize>,
     /// `"udp4:port"`/`"udp6:port"` -> bound `Dgram` slot.
     dgram_ports: BTreeMap<String, usize>,
+    /// AF_UNIX filesystem path -> bound datagram slot (e.g. syslog's /dev/log).
+    dgram_paths: BTreeMap<String, usize>,
     /// Host-egress backend. `None` = loopback-only (the default, and the only
     /// possible mode with no backend installed); `Some` bridges guest
     /// connections to *routable* addresses onto real host sockets. Installed
@@ -589,7 +591,9 @@ impl Kernel {
             return err(Errno::EAFNOSUPPORT);
         }
         let base_type = sotype & 0xf;
-        if base_type != SOCK_STREAM && !(domain != AF_UNIX && base_type == SOCK_DGRAM) {
+        // Stream and datagram are supported for every domain (including AF_UNIX
+        // datagram, which syslog's /dev/log uses); other types aren't.
+        if base_type != SOCK_STREAM && base_type != SOCK_DGRAM {
             return err(Errno::EOPNOTSUPP);
         }
         let nonblock = sotype & SOCK_NONBLOCK != 0;
@@ -666,13 +670,20 @@ impl Kernel {
             return err(Errno::EINVAL);
         };
         match parsed {
-            Addr::Unix(_) => {
+            Addr::Unix(ref path) => {
                 if net.socks[sock].domain != AF_UNIX {
                     return err(Errno::EINVAL);
                 }
+                let path = path.clone();
                 match &mut net.socks[sock].kind {
                     Kind::Idle { bound } => {
                         *bound = Some(parsed);
+                        0
+                    }
+                    // A datagram socket bound to a path receives datagrams sent to
+                    // it (syslog's /dev/log, and unix-dgram IPC generally).
+                    Kind::Dgram(_) => {
+                        net.dgram_paths.insert(path, sock);
                         0
                     }
                     _ => err(Errno::EINVAL),
@@ -1272,8 +1283,26 @@ impl Kernel {
             // as a plain `write`.
             return self.write_socket(net, cx, sock, end, data);
         }
-        let Some(Addr::Inet(dest)) = read_sockaddr(mem, dest_addr, dest_addrlen) else {
-            return err(Errno::EINVAL);
+        let dest = match read_sockaddr(mem, dest_addr, dest_addrlen) {
+            Some(Addr::Inet(d)) => d,
+            // A unix datagram to a bound path: deliver to that socket's queue.
+            // (An unbound/nonexistent path is silently dropped, as Linux does for
+            // a datagram to a since-removed socket — no deadlock on the sender.)
+            Some(Addr::Unix(path)) => {
+                if !matches!(net.socks[sock].kind, Kind::Dgram(_)) {
+                    return err(Errno::EINVAL);
+                }
+                if let Some(&tgt) = net.dgram_paths.get(&path)
+                    && let Kind::Dgram(td) = &mut net.socks[tgt].kind
+                {
+                    // Unix datagrams carry no INET src; a zeroed placeholder (the
+                    // recvfrom src is a unix path, usually ignored by the caller).
+                    let src = InetAddr { v6: false, port: 0, ip: [0; 16] };
+                    td.queue.push_back((src, data.to_vec()));
+                }
+                return data.len() as i64;
+            }
+            _ => return err(Errno::EINVAL),
         };
         if !matches!(net.socks[sock].kind, Kind::Dgram(_)) {
             return err(Errno::EINVAL); // real errno: EOPNOTSUPP/EISCONN
