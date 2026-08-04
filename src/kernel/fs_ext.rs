@@ -50,11 +50,19 @@ impl Kernel {
     #[allow(clippy::unused_self)]
     fn proc_fd_link(&self, cx: &ServiceCtx, abs: &str) -> Option<String> {
         let rest = abs.strip_prefix("/proc/")?;
-        let (who, tail) = rest.split_once("/fd/")?;
+        let (who, tail) = rest.split_once('/')?;
         if who != "self" && who != cx.cur.pid.to_string() {
             return None;
         }
-        let n: i32 = tail.parse().ok()?;
+        // `/proc/self/{exe,cwd,root}` resolve to *live* per-task state, not
+        // procfs's static snapshot — programs read these to locate themselves.
+        match tail {
+            "exe" => return (!cx.cur.exe.is_empty()).then(|| cx.cur.exe.clone()),
+            "cwd" => return Some(cx.cur.cwd.clone()),
+            "root" => return Some("/".to_string()),
+            _ => {}
+        }
+        let n: i32 = tail.strip_prefix("fd/")?.parse().ok()?;
         Some(match cx.cur.fds.get(n)? {
             Fd::File { path, .. } | Fd::Dir { path, .. } => path.clone(),
             Fd::Stdin | Fd::Stdout | Fd::Stderr => "/dev/null".to_string(),

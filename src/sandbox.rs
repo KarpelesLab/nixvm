@@ -348,6 +348,7 @@ impl Sandbox {
         } else {
             "/root"
         });
+        kernel.set_exe(&path); // /proc/self/exe for pid 1
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
         // Bridge guest sockets to the real internet when `NIXVM_NET=host`

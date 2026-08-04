@@ -156,6 +156,9 @@ struct ProcInfo {
     /// `ITIMER_REAL` reload interval (ns); `0` for a one-shot `alarm`. When the
     /// timer fires, `alarm_deadline` advances by this if non-zero, else disarms.
     alarm_interval_ns: u128,
+    /// Absolute path of the running program (last `execve`, or the initial image),
+    /// for the `/proc/self/exe` symlink. Empty until set.
+    exe: String,
 }
 
 /// A writable file-backed `MAP_SHARED` region awaiting flush-back.
@@ -202,6 +205,7 @@ impl Default for ProcInfo {
             child_cpu_ns: 0,
             alarm_deadline: None,
             alarm_interval_ns: 0,
+            exe: String::new(),
         }
     }
 }
@@ -988,6 +992,12 @@ impl Kernel {
     /// Set the first process's current working directory.
     pub fn set_cwd(&mut self, dir: impl Into<String>) {
         self.seed.cwd = path::normalize(&dir.into());
+    }
+
+    /// Set the first process's program path (for `/proc/self/exe`); later
+    /// `execve`s update it themselves.
+    pub fn set_exe(&mut self, path: impl Into<String>) {
+        self.seed.exe = path.into();
     }
 
     /// Set the number of virtual CPUs (host worker threads that run guest
@@ -2731,9 +2741,11 @@ impl Kernel {
             return err(Errno::ENOEXEC);
         }
         let spec = ProcessSpec { argv, envp };
-        // Point of no return. Close every `FD_CLOEXEC` descriptor (dropping its
-        // pipe/socket backing) — this is what execve is *for*, so a process
-        // doesn't leak private fds into the program it launches.
+        // Point of no return. Record the new program image for `/proc/self/exe`.
+        cx.cur.exe = abs.to_string();
+        // Close every `FD_CLOEXEC` descriptor (dropping its pipe/socket backing)
+        // — this is what execve is *for*, so a process doesn't leak private fds
+        // into the program it launches.
         for fd in cx.cur.fds.close_cloexec() {
             self.bump_pipe(&fd, false);
         }
