@@ -163,6 +163,12 @@ impl FdTable {
         self.map.values()
     }
 
+    /// Iterate over `(fd number, descriptor)` pairs, ascending (backs the live
+    /// `/proc/self/fd/` listing).
+    pub fn iter(&self) -> impl Iterator<Item = (i32, &Fd)> {
+        self.map.iter().map(|(&n, fd)| (n, fd))
+    }
+
     /// Remove every descriptor, returning them (used on process exit).
     pub fn drain(&mut self) -> Vec<Fd> {
         self.cloexec.clear();

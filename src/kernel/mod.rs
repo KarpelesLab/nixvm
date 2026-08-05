@@ -159,6 +159,14 @@ struct ProcInfo {
     /// Absolute path of the running program (last `execve`, or the initial image),
     /// for the `/proc/self/exe` symlink. Empty until set.
     exe: String,
+    /// The command name (`/proc/self/comm`, the `stat`/`status` name field, and
+    /// what `PR_GET_NAME` returns). Initialized to the executable's basename at
+    /// `execve`/boot, truncated to 15 bytes; `PR_SET_NAME`/`pthread_setname_np`
+    /// overwrite it. Per-task so threads can name themselves independently.
+    comm: String,
+    /// The full launch command line (`/proc/self/cmdline`): the task's `argv`
+    /// joined by NULs, exactly as the kernel presents it. Set at `execve`/boot.
+    cmdline: Vec<u8>,
     /// `PR_SET_NO_NEW_PRIVS` latch (sandboxing setups set and re-check it).
     no_new_privs: bool,
     /// `PR_SET_PDEATHSIG`: signal to send when the parent dies (stored/reported;
@@ -215,6 +223,8 @@ impl Default for ProcInfo {
             alarm_deadline: None,
             alarm_interval_ns: 0,
             exe: String::new(),
+            comm: String::new(),
+            cmdline: Vec::new(),
             no_new_privs: false,
             pdeathsig: 0,
             dumpable: 1,
@@ -747,8 +757,6 @@ pub(super) struct Shared {
     memfd_seq: u64,
     /// The process file-creation mask (`umask`); global for our single session.
     umask: u32,
-    /// The process name (`prctl(PR_SET_NAME)`); a fixed 16-byte, NUL-padded field.
-    procname: [u8; 16],
     unsupported: BTreeMap<u64, u64>,
     /// All tasks; the running one is `take`n out during its slice, so its
     /// slot is temporarily `None` (making `fork`/`wait4` on the table clean).
@@ -966,7 +974,6 @@ impl Kernel {
                 rlimit_nofile: (1024, 4096),
                 memfd_seq: 0,
                 umask: 0o022,
-                procname: [0u8; 16],
                 unsupported: BTreeMap::new(),
                 procs: Vec::new(),
                 spaces: Vec::new(),
@@ -1029,6 +1036,20 @@ impl Kernel {
     /// `execve`s update it themselves.
     pub fn set_exe(&mut self, path: impl Into<String>) {
         self.seed.exe = path.into();
+    }
+
+    /// Set pid 1's launch `argv`, backing `/proc/self/cmdline` and the initial
+    /// `comm` (argv[0]'s basename). Later `execve`s refresh both themselves.
+    pub fn set_cmdline<I, S>(&mut self, argv: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let argv: Vec<String> = argv.into_iter().map(Into::into).collect();
+        if let Some(argv0) = argv.first() {
+            self.seed.comm = comm_from_path(argv0);
+        }
+        self.seed.cmdline = cmdline_bytes(&argv);
     }
 
     /// Set the number of virtual CPUs (host worker threads that run guest
@@ -2425,7 +2446,7 @@ impl Kernel {
             Sysno::Capget => sys_misc::sys_capget(args[1], mem),
             Sysno::Prlimit64 => self.sys_prlimit64(sh, args[1], args[2], args[3], mem),
             Sysno::Getrlimit => self.sys_getrlimit(sh, args[0], args[1], mem),
-            Sysno::Prctl => self.sys_prctl(cx, sh, args, mem),
+            Sysno::Prctl => self.sys_prctl(cx, args, mem),
             // getpriority returns the kernel ABI value 20 - nice; nixvm models no
             // nice, so nice 0 → 20 (glibc converts back to 0). Setpriority no-ops.
             Sysno::Getpriority => 20,
@@ -2783,6 +2804,12 @@ impl Kernel {
         if elf.len() < 64 || elf[0..4] != [0x7f, b'E', b'L', b'F'] || elf[4] != 2 {
             return err(Errno::ENOEXEC);
         }
+        // Capture the launch identity for /proc/self/{cmdline,comm} before argv
+        // is moved into the spec: cmdline is argv NUL-joined; comm is the new
+        // program's basename (truncated to 15), which execve resets (a prior
+        // PR_SET_NAME does not survive exec).
+        cx.cur.cmdline = cmdline_bytes(&argv);
+        cx.cur.comm = comm_from_path(abs);
         let spec = ProcessSpec { argv, envp };
         // Point of no return. Record the new program image for `/proc/self/exe`.
         cx.cur.exe = abs.to_string();
@@ -4589,6 +4616,15 @@ impl Kernel {
         if self.trace {
             eprintln!("[open] pid={} {abs:?}", cx.cur.pid);
         }
+        // A `/proc` open (of a file to read or a directory to list) must see this
+        // task's live identity — its program name, cmdline, and open fds — not the
+        // boot-time placeholder. Refresh procfs's `self/` view before the fd is
+        // created so the following read/readdir renders the running process.
+        if abs == "/proc" || abs.starts_with("/proc/") {
+            if let Some(pf) = vfs.procfs_mut() {
+                pf.update_self(self.proc_self_live(cx));
+            }
+        }
 
         // Pseudo-terminals: `/dev/ptmx` allocates a fresh pty and returns its
         // master; `/dev/pts/N` opens the matching slave once unlocked.
@@ -5560,6 +5596,25 @@ fn page_down(v: u64) -> u64 {
 /// The process group of `p` — its explicit `pgid`, or its pid when unset.
 fn pgid_of(p: &ProcInfo) -> i32 {
     if p.pgid == 0 { p.pid } else { p.pgid }
+}
+
+/// Join `argv` into the NUL-separated, NUL-terminated blob the kernel exposes
+/// as `/proc/self/cmdline` (each argument followed by a `\0`).
+fn cmdline_bytes(argv: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for a in argv {
+        out.extend_from_slice(a.as_bytes());
+        out.push(0);
+    }
+    out
+}
+
+/// Derive the initial command name (`comm`) from an executable path: its final
+/// path component, truncated to Linux's 15-byte `TASK_COMM_LEN - 1` limit.
+fn comm_from_path(path: &str) -> String {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let n = base.len().min(15);
+    String::from_utf8_lossy(&base.as_bytes()[..n]).into_owned()
 }
 
 /// Map a host `io::Error` to a negative guest errno.

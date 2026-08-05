@@ -87,6 +87,13 @@ impl MountTable {
         fs.stat(&rel)
     }
 
+    /// The mounted procfs backend, if one is mounted, so the kernel can refresh
+    /// its live per-process data before serving a `/proc` read. `None` when no
+    /// procfs is mounted (e.g. minimal test harnesses).
+    pub fn procfs_mut(&mut self) -> Option<&mut super::ProcFs> {
+        self.mounts.iter_mut().find_map(|m| m.fs.as_procfs_mut())
+    }
+
     pub fn read_at(&mut self, abs_path: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {
         let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
         fs.read_at(&rel, off, buf)

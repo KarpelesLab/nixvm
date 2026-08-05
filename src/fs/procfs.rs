@@ -523,6 +523,21 @@ impl Default for ProcData {
     }
 }
 
+/// The live per-process fields the kernel refreshes into [`ProcData`] before
+/// serving a `/proc/self` read (see [`ProcFs::update_self`]). A narrow subset
+/// of [`ProcData`] — just the values that actually change per running task.
+#[derive(Debug, Clone)]
+pub struct ProcSelf {
+    pub comm: String,
+    pub cmdline: Vec<u8>,
+    pub exe: String,
+    pub cwd: String,
+    pub pid: u32,
+    pub ppid: u32,
+    /// Open descriptors as `(fd number, symlink target)`, backing `self/fd/`.
+    pub fds: Vec<(u32, String)>,
+}
+
 /// The synthesized `/proc` backend.
 #[derive(Debug)]
 pub struct ProcFs {
@@ -552,6 +567,30 @@ impl ProcFs {
     /// `<pid>` alias, and the per-cpu system files).
     pub fn set_self(&mut self, data: ProcData) {
         self.data = data;
+    }
+
+    /// Refresh only the *live* per-process fields backing `self/` from the task
+    /// the kernel is about to serve a `/proc` read for. System-wide fields
+    /// (`nproc`, the `cpuinfo`/`stat` cpu blocks) and coarse placeholders
+    /// (`state`, memory footprint) are left as configured — this exists so
+    /// `self/{comm,cmdline,stat,status,statm,exe}` stop reporting the stale
+    /// default (`comm = "nixvm"`, empty `cmdline`) and instead name the running
+    /// program. `pid`/`ppid` drive the `<pid>` alias too.
+    pub fn update_self(&mut self, live: ProcSelf) {
+        let d = &mut self.data;
+        d.comm = live.comm;
+        d.cmdline = live.cmdline;
+        d.exe = live.exe;
+        d.cwd = live.cwd;
+        d.pid = live.pid;
+        d.ppid = live.ppid;
+        d.fds = live.fds;
+        d.argv0 = d
+            .cmdline
+            .split(|&b| b == 0)
+            .next()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .unwrap_or_default();
     }
 
     /// Rewrite a numeric-pid path to its `self/...` equivalent when it names
@@ -1048,6 +1087,10 @@ fn einval() -> io::Error {
 }
 
 impl MountFs for ProcFs {
+    fn as_procfs_mut(&mut self) -> Option<&mut ProcFs> {
+        Some(self)
+    }
+
     fn stat(&mut self, rel: &str) -> Option<Attrs> {
         let rel = self.normalize(rel);
         let rel = rel.as_str();
@@ -1309,6 +1352,37 @@ mod tests {
         assert_eq!(fs.readlink("self/exe").unwrap(), "/usr/bin/prog");
         let comm = read_all(&mut fs, "self/comm");
         assert_eq!(comm, b"prog\n");
+    }
+
+    #[test]
+    fn update_self_refreshes_live_fields_but_keeps_nproc() {
+        let mut fs = ProcFs::new(4); // 4-cpu system files
+        // Default placeholder before any refresh.
+        assert_eq!(read_all(&mut fs, "self/comm"), b"nixvm\n");
+        fs.update_self(ProcSelf {
+            comm: "myprog".to_string(),
+            cmdline: b"/bin/myprog\0-x\0".to_vec(),
+            exe: "/bin/myprog".to_string(),
+            cwd: "/tmp".to_string(),
+            pid: 7,
+            ppid: 3,
+            fds: vec![(0, "/dev/null".to_string()), (3, "pipe:[9]".to_string())],
+        });
+        assert_eq!(read_all(&mut fs, "self/comm"), b"myprog\n");
+        assert_eq!(read_all(&mut fs, "self/cmdline"), b"/bin/myprog\0-x\0");
+        assert_eq!(fs.readlink("self/exe").unwrap(), "/bin/myprog");
+        // pid alias follows the refreshed pid.
+        assert_eq!(read_all(&mut fs, "7/comm"), b"myprog\n");
+        // The refreshed fd list backs self/fd/.
+        assert_eq!(fs.readlink("self/fd/3").unwrap(), "pipe:[9]");
+        // Status names the new program and pids.
+        let status = String::from_utf8(read_all(&mut fs, "self/status")).unwrap();
+        assert!(status.contains("Name:\tmyprog"));
+        assert!(status.contains("Pid:\t7"));
+        assert!(status.contains("PPid:\t3"));
+        // The system-wide cpu count (nproc) is untouched: /proc/stat keeps cpu0..3.
+        let stat = String::from_utf8(read_all(&mut fs, "stat")).unwrap();
+        assert!(stat.contains("cpu3"));
     }
 
     #[test]

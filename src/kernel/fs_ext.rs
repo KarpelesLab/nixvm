@@ -63,18 +63,28 @@ impl Kernel {
             _ => {}
         }
         let n: i32 = tail.strip_prefix("fd/")?.parse().ok()?;
-        Some(match cx.cur.fds.get(n)? {
-            Fd::File { path, .. } | Fd::Dir { path, .. } => path.clone(),
-            Fd::Stdin | Fd::Stdout | Fd::Stderr => "/dev/null".to_string(),
-            Fd::PipeRead(i) | Fd::PipeWrite(i) => format!("pipe:[{i}]"),
-            Fd::Socket { sock, .. } => format!("socket:[{sock}]"),
-            Fd::Eventfd(_) => "anon_inode:[eventfd]".to_string(),
-            Fd::Signalfd(_) => "anon_inode:[signalfd]".to_string(),
-            Fd::Timerfd(_) => "anon_inode:[timerfd]".to_string(),
-            Fd::Epoll(_) => "anon_inode:[eventpoll]".to_string(),
-            Fd::PtyMaster(_) => "/dev/ptmx".to_string(),
-            Fd::PtySlave(i) => format!("/dev/pts/{i}"),
-        })
+        Some(fd_link_target(cx.cur.fds.get(n)?))
+    }
+
+    /// Build the live `/proc/self` view (comm, cmdline, exe, cwd, pid/ppid, open
+    /// fds) for the running task, so procfs renders the real running program
+    /// instead of the boot-time placeholder. Called just before a `/proc` read.
+    pub(super) fn proc_self_live(&self, cx: &ServiceCtx) -> crate::fs::ProcSelf {
+        let fds = cx
+            .cur
+            .fds
+            .iter()
+            .map(|(n, fd)| (n as u32, fd_link_target(fd)))
+            .collect();
+        crate::fs::ProcSelf {
+            comm: cx.cur.comm.clone(),
+            cmdline: cx.cur.cmdline.clone(),
+            exe: cx.cur.exe.clone(),
+            cwd: cx.cur.cwd.clone(),
+            pid: cx.cur.pid as u32,
+            ppid: cx.cur.ppid as u32,
+            fds,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -332,6 +342,24 @@ fn write_statfs_or_fault(mem: &mut GuestMemory, addr: u64) -> i64 {
         err(Errno::EFAULT)
     } else {
         0
+    }
+}
+
+/// The `/proc/self/fd/<n>` symlink target for a descriptor: the path for a
+/// file/dir, an `anon_inode:`/`pipe:`/`socket:` name otherwise (matching the
+/// kernel's spellings).
+fn fd_link_target(fd: &Fd) -> String {
+    match fd {
+        Fd::File { path, .. } | Fd::Dir { path, .. } => path.clone(),
+        Fd::Stdin | Fd::Stdout | Fd::Stderr => "/dev/null".to_string(),
+        Fd::PipeRead(i) | Fd::PipeWrite(i) => format!("pipe:[{i}]"),
+        Fd::Socket { sock, .. } => format!("socket:[{sock}]"),
+        Fd::Eventfd(_) => "anon_inode:[eventfd]".to_string(),
+        Fd::Signalfd(_) => "anon_inode:[signalfd]".to_string(),
+        Fd::Timerfd(_) => "anon_inode:[timerfd]".to_string(),
+        Fd::Epoll(_) => "anon_inode:[eventpoll]".to_string(),
+        Fd::PtyMaster(_) => "/dev/ptmx".to_string(),
+        Fd::PtySlave(i) => format!("/dev/pts/{i}"),
     }
 }
 

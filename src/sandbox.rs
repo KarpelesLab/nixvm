@@ -319,7 +319,7 @@ impl Sandbox {
         let arch = self.config.arch;
         let mut mem = GuestMemory::new_split(GUEST_BASE, GUEST_VSIZE, round_up_page(self.config.mem_bytes));
         let spec = ProcessSpec {
-            argv,
+            argv: argv.clone(),
             envp: self.env(),
         };
         // Dynamic executables name their linker in PT_INTERP; load it alongside.
@@ -349,6 +349,7 @@ impl Sandbox {
             "/root"
         });
         kernel.set_exe(&path); // /proc/self/exe for pid 1
+        kernel.set_cmdline(argv); // /proc/self/cmdline + comm for pid 1
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
         // Bridge guest sockets to the real internet when `NIXVM_NET=host`
@@ -432,7 +433,7 @@ impl Sandbox {
             self.config.command.clone()
         };
         let spec = ProcessSpec {
-            argv,
+            argv: argv.clone(),
             envp: self.env(),
         };
         let img = load_static(&mut mem, elf, &spec)?;
@@ -449,6 +450,7 @@ impl Sandbox {
         kernel.set_ncpus(self.config.ncpus);
         kernel.set_host_tty(true);
         kernel.set_cwd("/work");
+        kernel.set_cmdline(argv);
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
         crate::vm::install_egress(&mut kernel);

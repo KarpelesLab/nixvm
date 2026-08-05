@@ -39,7 +39,7 @@ pub use mount::MountTable;
 pub use overlay::Overlay;
 #[cfg(unix)]
 pub use passthrough::Passthrough;
-pub use procfs::ProcFs;
+pub use procfs::{ProcFs, ProcSelf};
 pub use sysfs::SysFs;
 pub use tmpfs::TmpFs;
 
@@ -135,6 +135,13 @@ pub trait MountFs: std::fmt::Debug + Send {
     }
     fn rename(&mut self, _from: &str, _to: &str) -> io::Result<()> {
         Err(erofs())
+    }
+
+    /// Downcast hook for the one backend ([`ProcFs`]) whose `self/` files the
+    /// kernel refreshes from live task state before each read. Every other
+    /// backend keeps the default (`None`).
+    fn as_procfs_mut(&mut self) -> Option<&mut ProcFs> {
+        None
     }
 }
 
