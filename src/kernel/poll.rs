@@ -292,8 +292,11 @@ impl Kernel {
                 }
             }
             Fd::PipeWrite(i) => {
+                // Always writable (nixvm's pipes are unbounded, so never full);
+                // a vanished read end adds POLLERR on top, matching Linux's
+                // pipe_poll (POLLOUT | POLLERR), not POLLERR alone.
                 if pipes[i].readers == 0 {
-                    POLLERR
+                    POLLOUT | POLLERR
                 } else {
                     POLLOUT
                 }
@@ -1294,6 +1297,27 @@ mod tests {
         // Linux reports POLLHUP (0x10) alone at EOF, not POLLIN — a read would
         // return 0, so there is no data to signal with POLLIN.
         assert_eq!(mem.read_vec(pollfds + 6, 2).unwrap(), 0x10u16.to_le_bytes());
+    }
+
+    #[test]
+    fn poll_write_end_of_broken_pipe_is_pollout_plus_pollerr() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let fds = 0x1_0000;
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
+        let rfd = u64::from(mem.read_u32(fds).unwrap());
+        let wfd = u64::from(mem.read_u32(fds + 4).unwrap());
+        // Close the read end: the write end is now broken.
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Close, [rfd, 0, 0, 0, 0, 0]);
+
+        let pollfds = 0x1_2000;
+        mem.write_init(pollfds, &(wfd as u32).to_le_bytes()).unwrap();
+        mem.write_init(pollfds + 4, &4u16.to_le_bytes()).unwrap(); // POLLOUT
+        mem.write_init(pollfds + 6, &0u16.to_le_bytes()).unwrap();
+
+        let n = call(&k, &mut cx, &mut mem, &mut v, Sysno::Poll, [pollfds, 1, 0, 0, 0, 0]);
+        assert_eq!(n, 1);
+        // POLLOUT (0x4) | POLLERR (0x8) — writable but the reader is gone.
+        assert_eq!(mem.read_vec(pollfds + 6, 2).unwrap(), 0x0cu16.to_le_bytes());
     }
 
     #[test]
