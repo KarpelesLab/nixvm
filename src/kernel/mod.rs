@@ -2362,7 +2362,7 @@ impl Kernel {
             Sysno::Getxattr | Sysno::Lgetxattr | Sysno::Fgetxattr => err(Errno::ENODATA),
             Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], mem),
             Sysno::Ioctl => self.sys_ioctl(cx, args[0], args[1], args[2], mem),
-            Sysno::Fcntl => self.sys_fcntl(cx, args[0], args[1], args[2]),
+            Sysno::Fcntl => self.sys_fcntl(cx, args[0], args[1], args[2], mem),
             Sysno::Futex => self.sys_futex(sh, cx, args, mem),
             // Event-notification / readiness scans. `sh` stays held (outermost)
             // by this dispatcher; each scan additionally acquires
@@ -4501,16 +4501,23 @@ impl Kernel {
     }
 
     /// `fcntl(fd, cmd, ...)` — the subset real programs need at startup.
-    fn sys_fcntl(&self, cx: &mut ServiceCtx, fd: u64, cmd: u64, arg: u64) -> i64 {
+    fn sys_fcntl(&self, cx: &mut ServiceCtx, fd: u64, cmd: u64, arg: u64, mem: &mut GuestMemory) -> i64 {
         const F_DUPFD: u64 = 0;
         const F_GETFD: u64 = 1;
         const F_SETFD: u64 = 2;
         const F_GETFL: u64 = 3;
         const F_SETFL: u64 = 4;
+        const F_SETLK: u64 = 6;
+        const F_SETLKW: u64 = 7;
+        const F_GETLK: u64 = 5;
+        const F_OFD_GETLK: u64 = 36;
+        const F_OFD_SETLK: u64 = 37;
+        const F_OFD_SETLKW: u64 = 38;
         const F_DUPFD_CLOEXEC: u64 = 1030;
         const F_SETPIPE_SZ: u64 = 1031;
         const F_GETPIPE_SZ: u64 = 1032;
         const FD_CLOEXEC: u64 = 1;
+        const F_UNLCK: u16 = 2;
         const O_NONBLOCK: u64 = 0o4000;
         const O_RDWR: u64 = 2;
         // Every fcntl command operates on an open fd. Returning success for a
@@ -4556,6 +4563,22 @@ impl Kernel {
                 O_RDWR as i64
                     | if self.fd_is_nonblock(&f) { O_NONBLOCK as i64 } else { 0 }
                     | if cx.cur.fds.is_append(fd as i32) { O_APPEND as i64 } else { 0 }
+            }
+            // POSIX (and OFD) record locks. One kernel instance runs a single
+            // cooperating process tree over in-VM files nothing else can touch,
+            // so every lock request is granted immediately (like `flock`).
+            F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => 0,
+            // A lock *query*: the caller passes a `struct flock` and the kernel
+            // must report whether the region is locked. Since we grant every
+            // lock (nothing conflicts), the region is always available — set
+            // `l_type = F_UNLCK` so the guest doesn't read its own request back
+            // and conclude the file is already locked. `l_type` is the first
+            // field (a `short`); the rest of the struct is left as passed.
+            F_GETLK | F_OFD_GETLK => {
+                if mem.write(arg, &F_UNLCK.to_le_bytes()).is_err() {
+                    return err(Errno::EFAULT);
+                }
+                0
             }
             _ => 0,
         }
@@ -5952,6 +5975,24 @@ mod tests {
         // `dispatch` now takes its own per-handler locks; the caller must NOT
         // pre-hold `sh` (that would self-deadlock on the non-reentrant Mutex).
         k.dispatch(cx, s, 0, &a, v, mem)
+    }
+
+    #[test]
+    fn fcntl_getlk_reports_unlocked() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let path = 0x1_0000;
+        let flock = 0x1_1000;
+        mem.write_init(path, b"/lk\0").unwrap();
+        let fd = call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, [AT_CWD, path, 0o102, 0o644, 0, 0]);
+        assert_eq!(fd, 3);
+        // Caller seeds l_type = F_WRLCK (1); F_GETLK must overwrite it with
+        // F_UNLCK (2) since nothing conflicts.
+        mem.write_init(flock, &1u16.to_le_bytes()).unwrap();
+        const F_SETLK: u64 = 6;
+        const F_GETLK: u64 = 5;
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Fcntl, [fd as u64, F_SETLK, flock, 0, 0, 0]), 0);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Fcntl, [fd as u64, F_GETLK, flock, 0, 0, 0]), 0);
+        assert_eq!(mem.read_vec(flock, 2).unwrap(), 2u16.to_le_bytes(), "l_type should be F_UNLCK");
     }
 
     #[test]
