@@ -585,6 +585,13 @@ struct Pipe {
     buf: VecDeque<u8>,
     readers: usize,
     writers: usize,
+    /// `O_NONBLOCK` on the read/write open file descriptions (set by
+    /// `pipe2(O_NONBLOCK)` or `fcntl(F_SETFL)`/`ioctl(FIONBIO)`). A read of an
+    /// empty non-blocking pipe returns `EAGAIN` instead of parking the task —
+    /// without this a program that sets its pipe non-blocking (libuv's wakeup
+    /// pipe, a self-pipe) deadlocks the whole VM on the first empty read.
+    read_nonblock: bool,
+    write_nonblock: bool,
 }
 
 /// The running task's mutable servicing state, owned by the servicer for the
@@ -3727,6 +3734,11 @@ impl Kernel {
     fn read_pipe(&self, pipes: &mut [Pipe], cx: &mut ServiceCtx, i: usize, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
         if pipes[i].buf.is_empty() {
             if pipes[i].writers > 0 {
+                // Empty but still open: a non-blocking reader gets EAGAIN; a
+                // blocking one parks (re-trap) until a writer feeds the pipe.
+                if pipes[i].read_nonblock {
+                    return err(Errno::EAGAIN);
+                }
                 cx.block = true;
             }
             return 0;
@@ -4594,6 +4606,8 @@ impl Kernel {
             Fd::Eventfd(_) | Fd::Timerfd(_) | Fd::Signalfd(_) => self.pollfds.lock().unwrap().set_nonblock(f, nb),
             Fd::PtyMaster(n) => self.ptys.lock().unwrap().set_nonblock(*n, true, nb),
             Fd::PtySlave(n) => self.ptys.lock().unwrap().set_nonblock(*n, false, nb),
+            Fd::PipeRead(i) => self.pipes.lock().unwrap()[*i].read_nonblock = nb,
+            Fd::PipeWrite(i) => self.pipes.lock().unwrap()[*i].write_nonblock = nb,
             _ => {}
         }
     }
@@ -4605,6 +4619,8 @@ impl Kernel {
             Fd::Eventfd(_) | Fd::Timerfd(_) | Fd::Signalfd(_) => self.pollfds.lock().unwrap().is_nonblock(f),
             Fd::PtyMaster(n) => self.ptys.lock().unwrap().is_nonblock(*n, true),
             Fd::PtySlave(n) => self.ptys.lock().unwrap().is_nonblock(*n, false),
+            Fd::PipeRead(i) => self.pipes.lock().unwrap()[*i].read_nonblock,
+            Fd::PipeWrite(i) => self.pipes.lock().unwrap()[*i].write_nonblock,
             _ => false,
         }
     }
@@ -4716,11 +4732,15 @@ impl Kernel {
     #[allow(clippy::unused_self)]
     fn sys_pipe2(&self, pipes: &mut Vec<Pipe>, cx: &mut ServiceCtx, fds_ptr: u64, flags: u64, mem: &mut GuestMemory) -> i64 {
         const O_CLOEXEC: u64 = 0o2000000;
+        const O_NONBLOCK: u64 = 0o4000;
+        let nonblock = flags & O_NONBLOCK != 0;
         let idx = pipes.len();
         pipes.push(Pipe {
             buf: VecDeque::new(),
             readers: 1,
             writers: 1,
+            read_nonblock: nonblock,
+            write_nonblock: nonblock,
         });
         let rfd = cx.cur.fds.alloc(Fd::PipeRead(idx));
         let wfd = cx.cur.fds.alloc(Fd::PipeWrite(idx));
@@ -5975,6 +5995,21 @@ mod tests {
         // `dispatch` now takes its own per-handler locks; the caller must NOT
         // pre-hold `sh` (that would self-deadlock on the non-reentrant Mutex).
         k.dispatch(cx, s, 0, &a, v, mem)
+    }
+
+    #[test]
+    fn nonblock_pipe_read_is_eagain_not_deadlock() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let fds = 0x1_0000;
+        let buf = 0x1_1000;
+        const O_NONBLOCK: u64 = 0o4000;
+        // pipe2(fds, O_NONBLOCK).
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, O_NONBLOCK, 0, 0, 0, 0]), 0);
+        let rfd = u64::from(u32::from_le_bytes(mem.read_vec(fds, 4).unwrap().try_into().unwrap()));
+        // Reading the empty non-blocking pipe returns EAGAIN and must NOT park.
+        let r = call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [rfd, buf, 1, 0, 0, 0]);
+        assert_eq!(r, err(Errno::EAGAIN));
+        assert!(!cx.block, "a non-blocking read must not set the block flag");
     }
 
     #[test]
