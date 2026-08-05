@@ -159,6 +159,15 @@ struct ProcInfo {
     /// Absolute path of the running program (last `execve`, or the initial image),
     /// for the `/proc/self/exe` symlink. Empty until set.
     exe: String,
+    /// `PR_SET_NO_NEW_PRIVS` latch (sandboxing setups set and re-check it).
+    no_new_privs: bool,
+    /// `PR_SET_PDEATHSIG`: signal to send when the parent dies (stored/reported;
+    /// delivery-on-parent-death is not yet wired). `0` = none.
+    pdeathsig: u64,
+    /// `PR_SET_DUMPABLE` state: `1` = `SUID_DUMP_USER` (the default), `0` =
+    /// not dumpable, `2` = dumpable-by-root. Sandboxes set this and re-read it,
+    /// so it must round-trip even though we never produce core dumps.
+    dumpable: u64,
 }
 
 /// A writable file-backed `MAP_SHARED` region awaiting flush-back.
@@ -206,6 +215,9 @@ impl Default for ProcInfo {
             alarm_deadline: None,
             alarm_interval_ns: 0,
             exe: String::new(),
+            no_new_privs: false,
+            pdeathsig: 0,
+            dumpable: 1,
         }
     }
 }
@@ -604,6 +616,23 @@ pub(super) struct ServiceCtx {
     /// Syscalls serviced in the current slice (preemption quantum counter). (Was
     /// `Kernel::slice_syscalls`.)
     slice_syscalls: u32,
+}
+
+#[cfg(test)]
+impl ServiceCtx {
+    /// A minimal context for unit tests that exercise a single handler directly
+    /// (a default task, restartable, no pending flags).
+    pub(super) fn for_test() -> Self {
+        Self {
+            cur: ProcInfo::default(),
+            block: false,
+            yield_now: false,
+            exec_ok: false,
+            restartable: true,
+            restart_syscall: false,
+            slice_syscalls: 0,
+        }
+    }
 }
 
 /// The kernel: immutable-during-servicing config plus the coarse lock over all
@@ -2396,7 +2425,10 @@ impl Kernel {
             Sysno::Capget => sys_misc::sys_capget(args[1], mem),
             Sysno::Prlimit64 => self.sys_prlimit64(sh, args[1], args[2], args[3], mem),
             Sysno::Getrlimit => self.sys_getrlimit(sh, args[0], args[1], mem),
-            Sysno::Prctl => self.sys_prctl(sh, args, mem),
+            Sysno::Prctl => self.sys_prctl(cx, sh, args, mem),
+            // getpriority returns the kernel ABI value 20 - nice; nixvm models no
+            // nice, so nice 0 → 20 (glibc converts back to 0). Setpriority no-ops.
+            Sysno::Getpriority => 20,
             // arch_prctl(ARCH_SET_FS) — how an x86-64 guest installs its TLS
             // register (FS.base; aarch64 uses the MSR-like TPIDR_EL0 via
             // CLONE_SETTLS instead, so this arm only ever fires for x86-64).
@@ -2435,7 +2467,6 @@ impl Kernel {
             | Sysno::SchedGetPriorityMax
             | Sysno::SchedGetPriorityMin
             | Sysno::Setrlimit
-            | Sysno::Getpriority
             | Sysno::Setpriority
             | Sysno::Personality
             | Sysno::Sethostname

@@ -14,9 +14,15 @@ impl Kernel {
     /// name (`PR_SET_NAME`/`PR_GET_NAME`, stored on the kernel) and treat every
     /// other option as a successful no-op.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_prctl(&self, sh: &mut Shared, args: &[u64; 6], mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_prctl(&self, cx: &mut ServiceCtx, sh: &mut Shared, args: &[u64; 6], mem: &mut GuestMemory) -> i64 {
+        const PR_SET_PDEATHSIG: u64 = 1;
+        const PR_GET_PDEATHSIG: u64 = 2;
         const PR_SET_NAME: u64 = 15;
         const PR_GET_NAME: u64 = 16;
+        const PR_SET_DUMPABLE: u64 = 4;
+        const PR_GET_DUMPABLE: u64 = 3;
+        const PR_SET_NO_NEW_PRIVS: u64 = 38;
+        const PR_GET_NO_NEW_PRIVS: u64 = 39;
         match args[0] {
             PR_SET_NAME => {
                 if let Ok(name) = mem.read_cstr(args[1], 16) {
@@ -33,7 +39,35 @@ impl Kernel {
                 }
                 0
             }
-            // PR_SET_PDEATHSIG, PR_GET/SET_DUMPABLE, PR_CAPBSET_READ, ... : no-op.
+            // no_new_privs is a set-once latch a re-check must see.
+            PR_SET_NO_NEW_PRIVS => {
+                cx.cur.no_new_privs = args[1] != 0;
+                0
+            }
+            PR_GET_NO_NEW_PRIVS => i64::from(cx.cur.no_new_privs),
+            // pdeathsig: store and report (delivery-on-parent-death not yet wired).
+            PR_SET_PDEATHSIG => {
+                cx.cur.pdeathsig = args[1];
+                0
+            }
+            PR_GET_PDEATHSIG => {
+                if mem.write(args[1], &(cx.cur.pdeathsig as i32).to_le_bytes()).is_err() {
+                    return err(Errno::EFAULT);
+                }
+                0
+            }
+            // dumpable: store and report (we never emit cores, but sandboxes
+            // toggle it and re-read the value, so it must round-trip). Valid: 0/1/2.
+            PR_SET_DUMPABLE => {
+                if args[1] > 2 {
+                    return err(Errno::EINVAL);
+                }
+                cx.cur.dumpable = args[1];
+                0
+            }
+            #[allow(clippy::cast_possible_wrap)]
+            PR_GET_DUMPABLE => cx.cur.dumpable as i64,
+            // PR_CAPBSET_READ, PR_SET_SECCOMP, PR_SET_CHILD_SUBREAPER, … : accepted no-ops.
             _ => 0,
         }
     }
@@ -196,7 +230,7 @@ fn encode_sysinfo() -> [u8; 112] {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kernel, sys_sched_getaffinity, sys_sysinfo};
+    use super::{Errno, Kernel, ServiceCtx, err, sys_sched_getaffinity, sys_sysinfo};
     use crate::abi::Arch;
     use crate::fs::{MountTable, TmpFs};
     use crate::vcpu::GuestMemory;
@@ -235,11 +269,39 @@ mod tests {
     #[test]
     fn prctl_set_get_name_roundtrips() {
         let (k, mut mem) = setup();
+        let mut cx = ServiceCtx::for_test();
         let name = 0x1_0000;
         mem.write_init(name, b"myproc\0").unwrap();
-        assert_eq!(k.sys_prctl(&mut k.shared.lock().unwrap(), &[15, name, 0, 0, 0, 0], &mut mem), 0);
+        assert_eq!(k.sys_prctl(&mut cx, &mut k.shared.lock().unwrap(), &[15, name, 0, 0, 0, 0], &mut mem), 0);
         let out = 0x1_1000;
-        assert_eq!(k.sys_prctl(&mut k.shared.lock().unwrap(), &[16, out, 0, 0, 0, 0], &mut mem), 0);
+        assert_eq!(k.sys_prctl(&mut cx, &mut k.shared.lock().unwrap(), &[16, out, 0, 0, 0, 0], &mut mem), 0);
         assert_eq!(mem.read_vec(out, 6).unwrap(), b"myproc");
+    }
+
+    #[test]
+    fn prctl_no_new_privs_and_pdeathsig_latch() {
+        let (k, mut mem) = setup();
+        let mut cx = ServiceCtx::for_test();
+        // no_new_privs: set-once latch a re-check must observe.
+        assert_eq!(k.sys_prctl(&mut cx, &mut k.shared.lock().unwrap(), &[38, 1, 0, 0, 0, 0], &mut mem), 0);
+        assert_eq!(k.sys_prctl(&mut cx, &mut k.shared.lock().unwrap(), &[39, 0, 0, 0, 0, 0], &mut mem), 1);
+        // pdeathsig: store and report.
+        assert_eq!(k.sys_prctl(&mut cx, &mut k.shared.lock().unwrap(), &[1, 15, 0, 0, 0, 0], &mut mem), 0);
+        let out = 0x1_2000;
+        assert_eq!(k.sys_prctl(&mut cx, &mut k.shared.lock().unwrap(), &[2, out, 0, 0, 0, 0], &mut mem), 0);
+        assert_eq!(mem.read_vec(out, 4).unwrap(), 15i32.to_le_bytes());
+    }
+
+    #[test]
+    fn prctl_dumpable_roundtrips() {
+        let (k, mut mem) = setup();
+        let mut cx = ServiceCtx::for_test();
+        // Default is SUID_DUMP_USER (1).
+        assert_eq!(k.sys_prctl(&mut cx, &mut k.shared.lock().unwrap(), &[3, 0, 0, 0, 0, 0], &mut mem), 1);
+        // Set 0 (not dumpable) → reads back 0, not a hardcoded 1.
+        assert_eq!(k.sys_prctl(&mut cx, &mut k.shared.lock().unwrap(), &[4, 0, 0, 0, 0, 0], &mut mem), 0);
+        assert_eq!(k.sys_prctl(&mut cx, &mut k.shared.lock().unwrap(), &[3, 0, 0, 0, 0, 0], &mut mem), 0);
+        // Out-of-range set is rejected.
+        assert_eq!(k.sys_prctl(&mut cx, &mut k.shared.lock().unwrap(), &[4, 3, 0, 0, 0, 0], &mut mem), err(Errno::EINVAL));
     }
 }
