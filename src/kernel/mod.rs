@@ -251,6 +251,8 @@ const SIGILL: u64 = 4;
 const SIGSEGV: u64 = 11;
 /// Posted when an `ITIMER_REAL` (`alarm`/`setitimer`) deadline passes.
 const SIGALRM: u64 = 14;
+/// Posted to a process that writes to a pipe/socket with no reader.
+const SIGPIPE: u64 = 13;
 /// Sent to a process's parent when a child terminates (so a blocked `wait`
 /// wakes to reap it).
 const SIGCHLD: u64 = 17;
@@ -3435,7 +3437,7 @@ impl Kernel {
         let Ok(data) = mem.read_vec(buf, count as usize) else {
             return err(Errno::EFAULT);
         };
-        self.write_socket(net, cx, sock, end, &data)
+        self.write_socket(net, cx, sock, end, &data, false)
     }
 
     /// The `Fd::PipeWrite` arm of [`Self::sys_write`]/[`Self::sys_writev`]:
@@ -3447,7 +3449,7 @@ impl Kernel {
         let Ok(data) = mem.read_vec(buf, count as usize) else {
             return err(Errno::EFAULT);
         };
-        self.write_pipe(pipes, i, &data)
+        self.write_pipe(pipes, cx, i, &data, false)
     }
 
     /// The `Fd::File` arm of [`Self::sys_write`]: write `count` bytes at the
@@ -3679,14 +3681,27 @@ impl Kernel {
         n as i64
     }
 
-    /// Write to pipe `i` (`EPIPE` if all readers are gone).
-    #[allow(clippy::unused_self)]
-    fn write_pipe(&self, pipes: &mut [Pipe], i: usize, data: &[u8]) -> i64 {
+    /// Write to pipe `i` (`EPIPE` if all readers are gone). A broken-pipe write
+    /// also raises `SIGPIPE` on the writer (so `producer | consumer` dies when
+    /// the consumer exits) unless `nosignal` — the write's own default action
+    /// then terminates the process, or it sees `EPIPE` if SIGPIPE is caught/ignored.
+    fn write_pipe(&self, pipes: &mut [Pipe], cx: &mut ServiceCtx, i: usize, data: &[u8], nosignal: bool) -> i64 {
         if pipes[i].readers == 0 {
+            if !nosignal {
+                self.raise_sigpipe(cx);
+            }
             return err(Errno::EPIPE);
         }
         pipes[i].buf.extend(data.iter().copied());
         data.len() as i64
+    }
+
+    /// Post `SIGPIPE` to the current task — a write to a reader-less pipe/socket.
+    /// Its default action terminates the process; a caught/ignored SIGPIPE lets
+    /// the write's `EPIPE` return surface instead.
+    #[allow(clippy::unused_self)]
+    pub(super) fn raise_sigpipe(&self, cx: &mut ServiceCtx) {
+        cx.cur.pending |= 1u64 << (SIGPIPE - 1);
     }
 
     /// `pread64(fd, buf, count, offset)` — read at `offset` without moving the
@@ -3865,11 +3880,11 @@ impl Kernel {
             Some(Fd::Stderr) => sh.stderr.write_all(&buf).map_or(err(Errno::EIO), |()| buf.len() as i64),
             // Destination is a pipe: its buffer lives in `pipes`, taken *after*
             // sh, vfs (and it never coexists with `net` here) — pipes is last.
-            Some(Fd::PipeWrite(i)) => self.write_pipe(&mut self.pipes.lock().unwrap(), i, &buf),
+            Some(Fd::PipeWrite(i)) => self.write_pipe(&mut self.pipes.lock().unwrap(), cx, i, &buf, false),
             // Destination is a socket: its state lives in `net`, taken *after*
             // sh and vfs (sh → vfs → net order) and released with the arm.
             Some(Fd::Socket { sock, end }) => {
-                self.write_socket(&mut self.net.lock().unwrap(), cx, sock, end, &buf)
+                self.write_socket(&mut self.net.lock().unwrap(), cx, sock, end, &buf, false)
             }
             _ => err(Errno::EBADF),
         };

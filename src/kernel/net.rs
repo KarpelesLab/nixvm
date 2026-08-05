@@ -1250,15 +1250,16 @@ impl Kernel {
         fd: u64,
         buf: u64,
         len: u64,
-        _flags: u64,
+        flags: u64,
         dest_addr: u64,
         dest_addrlen: u64,
         mem: &GuestMemory,
     ) -> i64 {
+        const MSG_NOSIGNAL: u64 = 0x4000;
         let Ok(data) = mem.read_vec(buf, len as usize) else {
             return err(Errno::EFAULT);
         };
-        self.send_bytes(net, cx, fd, &data, dest_addr, dest_addrlen, mem)
+        self.send_bytes(net, cx, fd, &data, dest_addr, dest_addrlen, flags & MSG_NOSIGNAL != 0, mem)
     }
 
     /// The shared core of `sendto`/`sendmsg`: send an already-gathered `data`
@@ -1271,6 +1272,7 @@ impl Kernel {
         data: &[u8],
         dest_addr: u64,
         dest_addrlen: u64,
+        nosignal: bool,
         mem: &GuestMemory,
     ) -> i64 {
         let Some((sock, end)) = self.sock_of(cx, fd) else {
@@ -1281,7 +1283,7 @@ impl Kernel {
             // kernel), so a `dest_addr` sockaddr_nl, if given at all, carries
             // no information this module needs — it's the same request path
             // as a plain `write`.
-            return self.write_socket(net, cx, sock, end, data);
+            return self.write_socket(net, cx, sock, end, data, nosignal);
         }
         let dest = match read_sockaddr(mem, dest_addr, dest_addrlen) {
             Some(Addr::Inet(d)) => d,
@@ -1516,8 +1518,8 @@ impl Kernel {
                 Err(_) => return err(Errno::EFAULT),
             }
         }
-        let _ = flags;
-        self.send_bytes(net, cx, fd, &data, hdr.name, u64::from(hdr.namelen), mem)
+        const MSG_NOSIGNAL: u64 = 0x4000;
+        self.send_bytes(net, cx, fd, &data, hdr.name, u64::from(hdr.namelen), flags & MSG_NOSIGNAL != 0, mem)
     }
 
     /// `sendmmsg(fd, msgvec, vlen, flags)` — send an array of `struct mmsghdr`
@@ -1964,7 +1966,7 @@ impl Kernel {
     /// requires a `connect`-ed peer, else `ENOTCONN`) and delivers
     /// fire-and-forget, like real UDP: no error if nothing is bound at the
     /// peer's port. Mirrors `write_pipe`.
-    pub(super) fn write_socket(&self, net: &mut Net, cx: &mut ServiceCtx, sock: usize, end: usize, data: &[u8]) -> i64 {
+    pub(super) fn write_socket(&self, net: &mut Net, cx: &mut ServiceCtx, sock: usize, end: usize, data: &[u8], nosignal: bool) -> i64 {
         if matches!(net.socks[sock].kind, Kind::Netlink(_)) {
             return self.handle_netlink_request(net, sock, data);
         }
@@ -1987,6 +1989,9 @@ impl Kernel {
         }
         if let Kind::Host(h) = &mut net.socks[sock].kind {
             if h.wr_shut {
+                if !nosignal {
+                    self.raise_sigpipe(cx);
+                }
                 return err(Errno::EPIPE);
             }
             return match h.conn.send(data) {
@@ -2006,6 +2011,9 @@ impl Kernel {
         match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
                 if p.shut_wr[end] || p.refs[1 - end] == 0 {
+                    if !nosignal {
+                        self.raise_sigpipe(cx);
+                    }
                     return err(Errno::EPIPE);
                 }
                 p.to[1 - end].extend(data.iter().copied());
