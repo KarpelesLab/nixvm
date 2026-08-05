@@ -235,7 +235,58 @@ impl Default for ProcInfo {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RunState {
     Running,
-    Zombie(i32),
+    Zombie(ExitCause),
+}
+
+/// How a task died, so `wait4`/`waitid` can encode the distinction Linux makes
+/// between a normal exit and a signal death. The old model squashed both into a
+/// single "shell exit code" (`128 + signal`), which `wait4` then always encoded
+/// as `WIFEXITED` — so a child killed by a signal reported `WIFSIGNALED == 0`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExitCause {
+    /// Terminated normally via `exit`/`exit_group`; carries the exit code (only
+    /// the low 8 bits are meaningful to `waitpid`).
+    Exited(i32),
+    /// Terminated by a signal's default (fatal) action or an uncaught fatal
+    /// fault; carries the signal number.
+    Signaled(i32),
+}
+
+impl ExitCause {
+    /// The `waitpid` status word: `code << 8` for a normal exit (`WIFEXITED`),
+    /// or the bare signal number for a signal death (`WIFSIGNALED`). The
+    /// core-dump bit (`0x80`) is never set — nixvm produces no core files.
+    fn wait_status(self) -> u32 {
+        match self {
+            ExitCause::Exited(c) => ((c & 0xff) as u32) << 8,
+            ExitCause::Signaled(s) => (s & 0x7f) as u32,
+        }
+    }
+
+    /// The scalar exit code a shell reports in `$?` (and nixvm returns as pid 1's
+    /// process exit): the exit code, or `128 + signal` for a signal death.
+    fn shell_code(self) -> i32 {
+        match self {
+            ExitCause::Exited(c) => c & 0xff,
+            ExitCause::Signaled(s) => 128 + s,
+        }
+    }
+
+    /// `waitid` `si_code`: `CLD_EXITED` (1) or `CLD_KILLED` (2).
+    fn si_code(self) -> i32 {
+        match self {
+            ExitCause::Exited(_) => 1,
+            ExitCause::Signaled(_) => 2,
+        }
+    }
+
+    /// `waitid` `si_status`: the exit code for a normal exit, else the signal.
+    fn si_status(self) -> i32 {
+        match self {
+            ExitCause::Exited(c) => c & 0xff,
+            ExitCause::Signaled(s) => s,
+        }
+    }
 }
 
 /// Outcome of a [`Kernel::pump`] step in interactive mode.
@@ -828,7 +879,7 @@ impl Shared {
     /// pid 1's exit code, if it has become a zombie.
     fn pid1_code(&self) -> Option<i32> {
         self.procs.iter().flatten().find_map(|p| match p.info.run {
-            RunState::Zombie(c) if p.info.pid == 1 => Some(c),
+            RunState::Zombie(c) if p.info.pid == 1 => Some(c.shell_code()),
             _ => None,
         })
     }
@@ -1497,7 +1548,7 @@ impl Kernel {
                         vcpu.pc()
                     );
                     self.dump_fault_context(vcpu, mem);
-                    cx.cur.run = RunState::Zombie(139);
+                    cx.cur.run = RunState::Zombie(ExitCause::Signaled(SIGSEGV as i32));
                     Serviced::Ended
                 }
             }
@@ -1517,11 +1568,11 @@ impl Kernel {
                     cx.cur.pid,
                     hex.join(" ")
                 );
-                cx.cur.run = RunState::Zombie(132);
+                cx.cur.run = RunState::Zombie(ExitCause::Signaled(SIGILL as i32));
                 Serviced::Ended
             }
             Exit::Halt => {
-                cx.cur.run = RunState::Zombie(0);
+                cx.cur.run = RunState::Zombie(ExitCause::Exited(0));
                 Serviced::Ended
             }
         }
@@ -2891,8 +2942,8 @@ impl Kernel {
         }
         if let Some((child, code, child_cpu)) = zombie {
             if wstatus != 0 {
-                let status = ((code & 0xff) as u32) << 8; // WIFEXITED status
-                let _ = mem.write(wstatus, &status.to_le_bytes());
+                // WIFEXITED for a normal exit, WIFSIGNALED for a signal death.
+                let _ = mem.write(wstatus, &code.wait_status().to_le_bytes());
             }
             if rusage != 0 {
                 let _ = mem.write(rusage, &rusage_bytes(child_cpu));
@@ -2926,7 +2977,6 @@ impl Kernel {
         const P_PGID: u64 = 2;
         const WNOHANG: u64 = 1;
         const WNOWAIT: u64 = 0x0100_0000;
-        const CLD_EXITED: i32 = 1;
         let cur = cx.cur.pid;
         let matches_id = |p: &ProcInfo| match idtype {
             P_ALL => true,
@@ -2948,12 +2998,13 @@ impl Kernel {
         if let Some((child, code, child_cpu)) = zombie {
             if infop != 0 {
                 // siginfo_t: si_signo(0)=SIGCHLD(17), si_errno(4)=0,
-                // si_code(8)=CLD_EXITED, si_pid(16), si_uid(20), si_status(24).
+                // si_code(8)=CLD_EXITED/CLD_KILLED, si_pid(16), si_uid(20),
+                // si_status(24)=exit code or the killing signal.
                 let mut si = [0u8; 128];
                 si[0..4].copy_from_slice(&17i32.to_le_bytes());
-                si[8..12].copy_from_slice(&CLD_EXITED.to_le_bytes());
+                si[8..12].copy_from_slice(&code.si_code().to_le_bytes());
                 si[16..20].copy_from_slice(&child.to_le_bytes());
-                si[24..28].copy_from_slice(&(code & 0xff).to_le_bytes());
+                si[24..28].copy_from_slice(&code.si_status().to_le_bytes());
                 let _ = mem.write(infop, &si);
             }
             if rusage != 0 {
@@ -3173,7 +3224,7 @@ impl Kernel {
         if !self.has_cowaiter(sh, mm) {
             mem.release();
         }
-        cx.cur.run = RunState::Zombie(code & 0xff);
+        cx.cur.run = RunState::Zombie(ExitCause::Exited(code & 0xff));
         // Notify the parent: post SIGCHLD and unpark it so a `wait`/`sigsuspend`
         // blocked for it re-checks and reaps this zombie. A parent that left
         // SIGCHLD at its default disposition just ignores it (SIGCHLD is in the
@@ -3216,7 +3267,7 @@ impl Kernel {
             if !files_ids.contains(&p.info.files) {
                 files_ids.push(p.info.files);
             }
-            p.info.run = RunState::Zombie(status);
+            p.info.run = RunState::Zombie(ExitCause::Exited(status));
         }
         // Close each distinct table's fds (`bump_pipe` briefly takes `pipes`
         // for a pipe fd or `net` for a socket fd — after `sh`, which this holds
@@ -6251,7 +6302,7 @@ mod tests {
             .iter_mut()
             .find(|s| s.as_ref().is_some_and(|p| p.info.pid == 2))
         {
-            p.info.run = RunState::Zombie(7);
+            p.info.run = RunState::Zombie(ExitCause::Exited(7));
         }
         let reaped = call(
             &k,
@@ -6264,6 +6315,27 @@ mod tests {
         assert_eq!(reaped, 2);
         // WIFEXITED status: (code & 0xff) << 8
         assert_eq!(mem.read_u32(ws).unwrap(), 7 << 8);
+    }
+
+    #[test]
+    fn wait4_encodes_a_signal_death_as_wifsignaled() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        // A child (pid 2) of the caller, killed by SIGKILL (9).
+        let child = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(child, 2);
+        if let Some(Some(p)) = k.shared.lock().unwrap().procs
+            .iter_mut()
+            .find(|s| s.as_ref().is_some_and(|p| p.info.pid == 2))
+        {
+            p.info.run = RunState::Zombie(ExitCause::Signaled(9));
+        }
+        let ws = 0x1_0000;
+        let reaped = call(&k, &mut cx, &mut mem, &mut v, Sysno::Wait4, [child as u64, ws, 0, 0, 0, 0]);
+        assert_eq!(reaped, 2);
+        // WIFSIGNALED: the low 7 bits are the signal, no (code << 8) exit part.
+        let status = mem.read_u32(ws).unwrap();
+        assert_eq!(status & 0x7f, 9, "termsig should be SIGKILL");
+        assert_eq!(status & 0xff00, 0, "no WIFEXITED exit code for a signal death");
     }
 
     #[test]
@@ -6423,7 +6495,7 @@ mod tests {
             [42, 0, 0, 0, 0, 0],
         );
 
-        assert!(matches!(cx.cur.run, RunState::Zombie(42)), "leader exits");
+        assert!(matches!(cx.cur.run, RunState::Zombie(ExitCause::Exited(42))), "leader exits");
         let state = |pid| {
             k.shared.lock().unwrap().procs
                 .iter()
@@ -6433,12 +6505,12 @@ mod tests {
         };
         assert_eq!(
             state(2),
-            Some(RunState::Zombie(42)),
+            Some(RunState::Zombie(ExitCause::Exited(42))),
             "sibling thread killed"
         );
         assert_eq!(
             state(3),
-            Some(RunState::Zombie(42)),
+            Some(RunState::Zombie(ExitCause::Exited(42))),
             "sibling thread killed"
         );
         assert_eq!(
@@ -7052,9 +7124,10 @@ mod tests {
         );
         assert_eq!(cx.cur.pending, 1 << 14);
 
-        // Default disposition of SIGTERM is TERMINATE -> exit code 128 + 15.
+        // Default disposition of SIGTERM is TERMINATE -> a signal death (which
+        // wait4 encodes as WIFSIGNALED with termsig 15, not a WIFEXITED code).
         k.deliver_pending_signals(&mut cx, &mut v, &mut mem);
-        assert!(matches!(cx.cur.run, RunState::Zombie(143)));
+        assert!(matches!(cx.cur.run, RunState::Zombie(ExitCause::Signaled(15))));
     }
 
     #[test]

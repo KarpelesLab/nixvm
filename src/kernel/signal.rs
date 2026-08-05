@@ -17,7 +17,7 @@
 //! [`Kernel::sys_rt_sigsuspend`] for SIGCHLD — wake, run its handler, and reap.
 //! A signal left at its default disposition still takes the default action.
 
-use super::{Kernel, RunState, SA_ONSTACK, SIGSEGV, SS_DISABLE, ServiceCtx, Shared, err, pgid_of};
+use super::{ExitCause, Kernel, RunState, SA_ONSTACK, SIGSEGV, SS_DISABLE, ServiceCtx, Shared, err, pgid_of};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
@@ -354,7 +354,7 @@ impl Kernel {
                 // SIG_DFL: ignore the "ignored-by-default" set, else terminate.
                 _ if is_default_ignored(sig) => {}
                 _ => {
-                    cx.cur.run = RunState::Zombie(128 + sig as i32);
+                    cx.cur.run = RunState::Zombie(ExitCause::Signaled(sig as i32));
                     return false;
                 }
             }
