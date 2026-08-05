@@ -282,7 +282,11 @@ impl Kernel {
                 if !p.buf.is_empty() {
                     POLLIN
                 } else if p.writers == 0 {
-                    POLLIN | POLLHUP
+                    // EOF: the writer is gone and the buffer is drained. Linux's
+                    // pipe_poll reports POLLHUP *without* POLLIN here (POLLIN
+                    // means data is available; at EOF a read returns 0). A poller
+                    // watching POLLIN still wakes — poll always reports POLLHUP.
+                    POLLHUP
                 } else {
                     0
                 }
@@ -1268,6 +1272,28 @@ mod tests {
         );
         assert_eq!(n, 1);
         assert_eq!(mem.read_vec(pollfds + 6, 2).unwrap(), 1u16.to_le_bytes());
+    }
+
+    #[test]
+    fn poll_reports_pollhup_without_pollin_at_pipe_eof() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let fds = 0x1_0000;
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
+        let rfd = u64::from(mem.read_u32(fds).unwrap());
+        let wfd = u64::from(mem.read_u32(fds + 4).unwrap());
+        // Close the write end: the empty read end is now at EOF.
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Close, [wfd, 0, 0, 0, 0, 0]);
+
+        let pollfds = 0x1_2000;
+        mem.write_init(pollfds, &(rfd as u32).to_le_bytes()).unwrap();
+        mem.write_init(pollfds + 4, &1u16.to_le_bytes()).unwrap(); // POLLIN
+        mem.write_init(pollfds + 6, &0u16.to_le_bytes()).unwrap();
+
+        let n = call(&k, &mut cx, &mut mem, &mut v, Sysno::Poll, [pollfds, 1, 0, 0, 0, 0]);
+        assert_eq!(n, 1);
+        // Linux reports POLLHUP (0x10) alone at EOF, not POLLIN — a read would
+        // return 0, so there is no data to signal with POLLIN.
+        assert_eq!(mem.read_vec(pollfds + 6, 2).unwrap(), 0x10u16.to_le_bytes());
     }
 
     #[test]
