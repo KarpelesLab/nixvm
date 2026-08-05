@@ -835,6 +835,15 @@ impl MountFs for Passthrough {
     }
 
     fn readlink(&mut self, rel: &str) -> io::Result<String> {
+        // The mount root is a directory, and `readlink` on any non-symlink is
+        // EINVAL ("not a symbolic link") — never EISDIR. `resolve` reports the
+        // rootless case as EISDIR (right for unlink/rename, wrong here), which
+        // glibc's `realpath` treats as fatal: it readlinks every path prefix
+        // to detect symlinks, so an EISDIR on `/work` breaks realpath for
+        // everything under the passthrough. Return EINVAL directly for the root.
+        if Self::split_rel(rel)?.is_empty() {
+            return Err(io::Error::from_raw_os_error(22)); // EINVAL
+        }
         let (parent, name) = self.resolve(rel, false, false)?;
         let cname = cstr(&name)?;
         raw_readlinkat(parent.as_raw_fd(), &cname)?.ok_or_else(|| {
@@ -1013,6 +1022,21 @@ mod tests {
         pt.unlink("c.txt").unwrap();
         assert!(pt.stat("c.txt").is_none());
         assert!(pt.stat("b.txt").is_some());
+    }
+
+    #[test]
+    fn readlink_on_non_symlink_and_root_is_einval() {
+        let tmp = TempDir::new("readlink");
+        let mut pt = Passthrough::new(tmp.0.clone());
+        pt.create("file", 0o644).unwrap();
+        pt.mkdir("dir", 0o755).unwrap();
+        // A regular file, a directory, and the mount root are all "not a
+        // symbolic link" → EINVAL (22), never EISDIR — glibc's realpath
+        // readlinks every path prefix and treats a non-EINVAL error as fatal.
+        for p in ["file", "dir", "", "/"] {
+            let e = pt.readlink(p).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(22), "readlink({p:?}) should be EINVAL");
+        }
     }
 
     #[test]
