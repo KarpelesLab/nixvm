@@ -176,7 +176,32 @@ struct ProcInfo {
     /// not dumpable, `2` = dumpable-by-root. Sandboxes set this and re-read it,
     /// so it must round-trip even though we never produce core dumps.
     dumpable: u64,
+    /// The siginfo accompanying each pending signal (index = signal number),
+    /// so an `SA_SIGINFO` handler sees the right `si_code`/`si_pid`/`si_value`.
+    /// The `pending` bitmask decides *whether* a signal is delivered; this
+    /// carries the *detail* for the one that is. Because `pending` coalesces a
+    /// repeated signal into one bit, this likewise keeps the most recent info
+    /// (a real kernel queues real-time signals — an accepted simplification).
+    /// `None` for a signal posted without siginfo (a bare `kill`, a fault).
+    queued_siginfo: [Option<QueuedSig>; NSIG_SLOTS],
 }
+
+/// The subset of `siginfo_t` a queued/sent signal carries beyond its number,
+/// filled by `rt_sigqueueinfo`/`kill` and written into the delivered frame.
+#[derive(Clone, Copy, Debug)]
+struct QueuedSig {
+    /// `si_code`: `SI_USER` (0, from `kill`), `SI_QUEUE` (-1, from `sigqueue`), …
+    code: i32,
+    /// `si_pid`: the sending process.
+    pid: i32,
+    /// `si_uid`: the sending user (always 0 — the VM is single-user root).
+    uid: u32,
+    /// `si_value` (the `sigqueue` payload): an 8-byte union of int and pointer.
+    value: u64,
+}
+
+/// Signal-table size: signals `1..=64` plus the unused index 0.
+const NSIG_SLOTS: usize = 65;
 
 /// A writable file-backed `MAP_SHARED` region awaiting flush-back.
 #[derive(Clone, Debug)]
@@ -228,6 +253,7 @@ impl Default for ProcInfo {
             no_new_privs: false,
             pdeathsig: 0,
             dumpable: 1,
+            queued_siginfo: [None; NSIG_SLOTS],
         }
     }
 }
@@ -2478,11 +2504,11 @@ impl Kernel {
             // `kill(-pgrp)` the guest passed zero-extended as `0xFFFF_FFFF`.
             Sysno::Kill | Sysno::Tkill => self.sys_kill(sh, cx, args[0] as i32 as i64, args[1]),
             Sysno::Tgkill => self.sys_kill(sh, cx, args[1] as i32 as i64, args[2]),
-            // sigqueue/pthread_sigqueue: deliver the signal (the accompanying
-            // sival value isn't carried — the pending model is a bitmask, not a
-            // queue — but delivering beats failing). tgsigqueueinfo targets a tid.
-            Sysno::RtSigqueueinfo => self.sys_kill(sh, cx, args[0] as i32 as i64, args[1]),
-            Sysno::RtTgsigqueueinfo => self.sys_kill(sh, cx, args[1] as i32 as i64, args[2]),
+            // sigqueue/pthread_sigqueue: deliver the signal and carry its
+            // siginfo (si_code/si_value) so an SA_SIGINFO handler sees the real
+            // payload. tgsigqueueinfo targets a tid (args: tgid, tid, sig, uinfo).
+            Sysno::RtSigqueueinfo => self.sys_rt_sigqueueinfo(sh, cx, args[0] as i32 as i64, args[1], args[2], mem),
+            Sysno::RtTgsigqueueinfo => self.sys_rt_sigqueueinfo(sh, cx, args[1] as i32 as i64, args[2], args[3], mem),
             // getpid = thread-group id; gettid = this task's id.
             Sysno::Getpid => i64::from(cx.cur.tgid),
             Sysno::Gettid => i64::from(cx.cur.pid),
@@ -7025,6 +7051,40 @@ mod tests {
         assert_eq!(vcpu.reg(3), 0xdead, "rbx restored");
         assert_eq!(vcpu.reg(0), 0x1234, "rax restored");
         assert_eq!(cx.cur.blocked, 0, "signal mask restored");
+    }
+
+    #[test]
+    fn queued_signal_delivers_si_code_and_si_value() {
+        use crate::vcpu::Backend;
+        let backend = crate::vcpu::interp_x86::X86Backend::new(Arch::X86_64).unwrap();
+        let mut vcpu = backend.new_vcpu(0x1_1111, 0x1_3000).unwrap();
+        let (k, mut mem, _v, mut cx) = setup();
+        mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
+        cx.cur.mm = 0;
+        cx.cur.handlers[10] = SigAction { handler: 0x2_0000, flags: 0, restorer: 0x2_1000, mask: 0 };
+
+        // A guest siginfo with si_code = SI_QUEUE (-1) and si_value = 0xABCD.
+        let uinfo = 0x1_2000;
+        mem.write_init(uinfo + 8, &(-1i32).to_le_bytes()).unwrap();
+        mem.write_init(uinfo + 24, &0xABCDu64.to_le_bytes()).unwrap();
+
+        // sigqueue(self, SIGUSR1, {0xABCD}) records both pending + siginfo.
+        let target = i64::from(cx.cur.pid);
+        assert_eq!(
+            k.sys_rt_sigqueueinfo(&mut k.shared.lock().unwrap(), &mut cx, target, 10, uinfo, &mem),
+            0
+        );
+        assert_ne!(cx.cur.pending & (1 << 9), 0, "SIGUSR1 pending");
+        assert!(cx.cur.queued_siginfo[10].is_some(), "siginfo recorded");
+
+        // Deliver: the frame's siginfo must carry si_code and si_value through.
+        assert!(k.deliver_async_signal(&mut cx, 10, vcpu.as_mut(), &mut mem));
+        let si = vcpu.sp() + 8 + super::signal::signal_ucontext_size();
+        assert_eq!(mem.read_u32(si).unwrap(), 10, "si_signo");
+        assert_eq!(mem.read_u32(si + 8).unwrap() as i32, -1, "si_code = SI_QUEUE");
+        assert_eq!(mem.read_u64(si + 24).unwrap(), 0xABCD, "si_value carried");
+        // The info is consumed on delivery (not re-delivered on the next signal).
+        assert!(cx.cur.queued_siginfo[10].is_none(), "siginfo consumed");
     }
 
     #[test]

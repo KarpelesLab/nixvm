@@ -17,9 +17,27 @@
 //! [`Kernel::sys_rt_sigsuspend`] for SIGCHLD — wake, run its handler, and reap.
 //! A signal left at its default disposition still takes the default action.
 
-use super::{ExitCause, Kernel, RunState, SA_ONSTACK, SIGSEGV, SS_DISABLE, ServiceCtx, Shared, err, pgid_of};
+use super::{ExitCause, Kernel, QueuedSig, RunState, SA_ONSTACK, SIGSEGV, SS_DISABLE, ServiceCtx, Shared, err, pgid_of};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
+
+/// The mode-specific `siginfo_t` fields [`Kernel::push_sigframe`] writes past
+/// the common `si_signo`/`si_errno`/`si_code` header. A fault sets `addr`
+/// (`si_addr`); an async/queued signal sets `pid`/`uid`/`value` (the `_rt`
+/// union arm) — the two overlap in the C union, so only one is written.
+#[derive(Clone, Copy, Default)]
+struct SiFields {
+    /// `si_code` (SI_USER=0, SI_QUEUE=-1, SEGV_MAPERR=1, …); low 32 bits used.
+    code: u64,
+    /// `si_addr` for a fault (SIGSEGV/SIGILL).
+    addr: u64,
+    /// `si_pid` — the sending process (async signals).
+    pid: u64,
+    /// `si_uid` — the sending user (async signals).
+    uid: u64,
+    /// `si_value` — the `sigqueue` payload (async signals).
+    value: u64,
+}
 
 /// `SIG_DFL`: take the default action for the signal.
 const SIG_DFL: u64 = 0;
@@ -294,6 +312,40 @@ impl Kernel {
         if hit { 0 } else { err(Errno::ESRCH) }
     }
 
+    /// `rt_sigqueueinfo(pid, sig, uinfo)` / `rt_tgsigqueueinfo(tgid, tid, sig,
+    /// uinfo)` — like `kill`, but carries the sender's `siginfo_t` so an
+    /// `SA_SIGINFO` handler (or `sigwaitinfo`) sees the real `si_code`/`si_value`
+    /// (`sigqueue`'s payload). Delivery/targeting reuse [`Self::sys_kill`]; this
+    /// just records the accompanying info for the target's pending signal.
+    pub(super) fn sys_rt_sigqueueinfo(
+        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        pid: i64,
+        sig: u64,
+        uinfo: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        // Read the guest's siginfo: si_code (offset 8) and the sigqueue value
+        // (offset 24, the 8-byte `_rt` union). si_pid/si_uid are the sender's.
+        let code = mem.read_u32(uinfo + 8).map_or(-1, |v| v as i32);
+        let value = mem.read_u64(uinfo + 24).unwrap_or(0);
+        let info = QueuedSig { code, pid: cx.cur.pid, uid: 0, value };
+        let r = self.sys_kill(sh, cx, pid, sig);
+        if r == 0 && sig != 0 && sig <= NSIG {
+            let s = sig as usize;
+            if pid == i64::from(cx.cur.pid) {
+                cx.cur.queued_siginfo[s] = Some(info);
+            } else {
+                for slot in sh.procs.iter_mut().flatten() {
+                    if i64::from(slot.info.pid) == pid {
+                        slot.info.queued_siginfo[s] = Some(info);
+                        break;
+                    }
+                }
+            }
+        }
+        r
+    }
+
     /// The signal (`1..=NSIG`) whose *real handler* [`Self::deliver_pending_signals`]
     /// will run at this syscall boundary, or `None` when the first actionable
     /// pending signal isn't a caught one. Used by the syscall dispatcher to decide
@@ -455,7 +507,8 @@ impl Kernel {
         // trapno #PF(14)/#UD(6), si_code SEGV_MAPERR(1), si_addr = fault_addr,
         // and the handler's uc_sigmask is the *current* blocked mask (restored
         // by rt_sigreturn) — the fault path's original behavior, unchanged.
-        self.push_sigframe(cx, sig, if sig == SIGSEGV { 14 } else { 6 }, 1, fault_addr, cx.cur.blocked, vcpu, mem)
+        let si = SiFields { code: 1, addr: fault_addr, ..SiFields::default() }; // SEGV_MAPERR
+        self.push_sigframe(cx, sig, if sig == SIGSEGV { 14 } else { 6 }, si, cx.cur.blocked, vcpu, mem)
     }
 
     /// Deliver an *asynchronous* signal (posted by `kill`/`tgkill`/on-exit
@@ -495,7 +548,18 @@ impl Kernel {
             let syscall_pc = vcpu.reg(1).wrapping_sub(2); // rcx − len(`syscall`)
             vcpu.set_pc(syscall_pc);
         }
-        self.push_sigframe(cx, sig, 0, 0 /* SI_USER */, 0, restore, vcpu, mem)
+        // Carry the siginfo the sender queued (sigqueue's si_value/si_code, or a
+        // sender pid); a bare `kill`/on-exit SIGCHLD leaves it SI_USER (all 0).
+        let si = cx.cur.queued_siginfo[sig as usize]
+            .take()
+            .map_or(SiFields::default(), |q| SiFields {
+                code: q.code as u32 as u64,
+                addr: 0,
+                pid: u64::from(q.pid as u32),
+                uid: u64::from(q.uid),
+                value: q.value,
+            });
+        self.push_sigframe(cx, sig, 0, si, restore, vcpu, mem)
     }
 
     /// Build the x86-64 `rt_sigframe` for `sig` on the (alternate or interrupted)
@@ -509,12 +573,13 @@ impl Kernel {
         &self, cx: &mut ServiceCtx,
         sig: u64,
         trapno: u64,
-        si_code: u64,
-        si_addr: u64,
+        si: SiFields,
         restore_mask: u64,
         vcpu: &mut dyn crate::vcpu::Vcpu,
         mem: &mut GuestMemory,
     ) -> bool {
+        let si_code = si.code;
+        let si_addr = si.addr;
         let act = cx.cur.handlers[sig as usize];
         // Choose the stack: the alternate stack if the handler asked for it and
         // one is configured, else just below the current rsp (with the ABI red
@@ -564,11 +629,20 @@ impl Kernel {
         put(MCTX_OFF + (GREG_COUNT as u64) * 8, 0);
         put(UC_OFF + 296, restore_mask); // uc_sigmask (kernel 8-byte)
 
-        // siginfo: si_signo, si_errno, si_code, then si_addr for SIGSEGV/SIGILL.
-        let si = frame + UC_OFF + UCONTEXT_SIZE;
-        put(si - frame, sig & 0xffff_ffff); // si_signo (si_errno = 0)
-        put(si - frame + 8, si_code); // si_code (SEGV_MAPERR=1 fault / SI_USER=0 async)
-        put(si - frame + 16, si_addr); // si_addr
+        // siginfo: si_signo, si_errno, si_code, then the mode-specific union at
+        // offset 16. A fault carries si_addr there (SIGSEGV/SIGILL); an async
+        // signal carries the sending pid/uid and the sigqueue value instead
+        // (the `_sigfault` and `_rt` arms of the `_sifields` union overlap).
+        let si_base = frame + UC_OFF + UCONTEXT_SIZE;
+        put(si_base - frame, sig & 0xffff_ffff); // si_signo (si_errno = 0)
+        put(si_base - frame + 8, si_code & 0xffff_ffff); // si_code
+        if trapno != 0 {
+            put(si_base - frame + 16, si_addr); // _sigfault: si_addr
+        } else {
+            // _rt: si_pid @16, si_uid @20, si_value @24 (8-byte union).
+            put(si_base - frame + 16, (si.pid & 0xffff_ffff) | (si.uid << 32));
+            put(si_base - frame + 24, si.value);
+        }
 
         if !wrote_ok {
             return false; // couldn't build the frame (guest stack unusable)
@@ -587,7 +661,7 @@ impl Kernel {
         }
         // Enter the handler: SysV entry regs, masked signals, redirected pc/sp.
         vcpu.set_reg(7, sig); // rdi = signum
-        vcpu.set_reg(6, si); // rsi = &siginfo
+        vcpu.set_reg(6, si_base); // rsi = &siginfo
         vcpu.set_reg(2, frame + UC_OFF); // rdx = &ucontext
         vcpu.set_reg(0, 0); // rax cleared, per the SysV entry convention
         vcpu.set_sp(frame);
