@@ -3199,7 +3199,7 @@ impl Kernel {
         if vfs.create(&path, 0o600).is_err() {
             return err(Errno::ENOSPC);
         }
-        i64::from(cx.cur.fds.alloc(Fd::File { path, offset: 0, writable: true }))
+        i64::from(cx.cur.fds.alloc(Fd::File { path, offset: 0, readable: true, writable: true }))
     }
 
     /// `inotify_init1(flags)` stub — an eventfd-backed descriptor that is always
@@ -3611,7 +3611,7 @@ impl Kernel {
     /// fd's offset and advance it. `vfs`-only.
     #[allow(clippy::unused_self)]
     fn write_file_fd(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &GuestMemory) -> i64 {
-        let Some(Fd::File { path, offset, writable }) = cx.cur.fds.get(fd as i32).cloned() else {
+        let Some(Fd::File { path, offset, writable, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
         if !writable {
@@ -3763,9 +3763,12 @@ impl Kernel {
     /// advance it. `vfs`-only.
     #[allow(clippy::unused_self)]
     fn read_file_fd(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
-        let Some(Fd::File { path, offset, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
+        let Some(Fd::File { path, offset, readable, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
+        if !readable {
+            return err(Errno::EBADF); // fd opened O_WRONLY
+        }
         let mut tmp = vec![0u8; count as usize];
         match vfs.read_at(&path, offset, &mut tmp) {
             Ok(n) => {
@@ -3871,9 +3874,12 @@ impl Kernel {
     /// fd's position. Files only (a pipe/socket has no position → `ESPIPE`).
     #[allow(clippy::too_many_arguments, clippy::unused_self)]
     fn sys_pread(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, offset: u64, mem: &mut GuestMemory) -> i64 {
-        let Some(Fd::File { path, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
+        let Some(Fd::File { path, readable, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::ESPIPE);
         };
+        if !readable {
+            return err(Errno::EBADF); // fd opened O_WRONLY
+        }
         let mut tmp = vec![0u8; count as usize];
         match vfs.read_at(&path, offset, &mut tmp) {
             Ok(n) => {
@@ -4025,9 +4031,12 @@ impl Kernel {
                 _ => return err(Errno::EINVAL),
             }
         };
-        let Some(Fd::File { path, .. }) = cx.cur.fds.get(in_fd as i32).cloned() else {
+        let Some(Fd::File { path, readable, .. }) = cx.cur.fds.get(in_fd as i32).cloned() else {
             return err(Errno::EINVAL);
         };
+        if !readable {
+            return err(Errno::EBADF); // source opened O_WRONLY
+        }
         let mut buf = vec![0u8; count as usize];
         let n = match vfs.read_at(&path, start, &mut buf) {
             Ok(n) => n,
@@ -4075,9 +4084,12 @@ impl Kernel {
     #[allow(clippy::unused_self)]
     fn sys_copy_file_range(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, a: &[u64; 6], mem: &mut GuestMemory) -> i64 {
         let (fd_in, off_in_p, fd_out, off_out_p, len) = (a[0], a[1], a[2], a[3], a[4]);
-        let Some(Fd::File { path: in_path, offset: in_pos, .. }) = cx.cur.fds.get(fd_in as i32).cloned() else {
+        let Some(Fd::File { path: in_path, offset: in_pos, readable: in_r, .. }) = cx.cur.fds.get(fd_in as i32).cloned() else {
             return err(Errno::EBADF);
         };
+        if !in_r {
+            return err(Errno::EBADF); // source opened O_WRONLY
+        }
         let in_off = if off_in_p != 0 {
             mem.read_u64(off_in_p).unwrap_or(in_pos)
         } else {
@@ -4089,7 +4101,7 @@ impl Kernel {
             Err(e) => return io_errno(&e),
         };
         buf.truncate(n);
-        let Some(Fd::File { path: out_path, offset: out_pos, writable: out_w }) = cx.cur.fds.get(fd_out as i32).cloned() else {
+        let Some(Fd::File { path: out_path, offset: out_pos, writable: out_w, .. }) = cx.cur.fds.get(fd_out as i32).cloned() else {
             return err(Errno::EBADF);
         };
         if !out_w {
@@ -4846,6 +4858,7 @@ impl Kernel {
             cx.cur.fds.alloc(Fd::File {
                 path: abs,
                 offset: 0,
+                readable: flags & O_ACCMODE != 1, // not O_WRONLY
                 writable: flags & O_ACCMODE != 0, // O_WRONLY or O_RDWR
             })
         };
@@ -6207,6 +6220,10 @@ mod tests {
         // ftruncate on the read-only fd is likewise EBADF; on the writable one it works.
         assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Ftruncate, [ro as u64, 0, 0, 0, 0, 0]), err(Errno::EBADF));
         assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Ftruncate, [rw as u64, 0, 0, 0, 0, 0]), 0);
+        // Symmetric: a read through an O_WRONLY fd is EBADF.
+        let wo = call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, [AT_CWD, path, O_WRONLY, 0, 0, 0]);
+        let rbuf = 0x1_2000;
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [wo as u64, rbuf, 2, 0, 0, 0]), err(Errno::EBADF));
     }
 
     #[test]
