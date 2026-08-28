@@ -4122,6 +4122,16 @@ impl Kernel {
         if attrs.kind == NodeKind::Dir {
             return err(Errno::EPERM); // can't hard-link a directory
         }
+        // Make a real hard link where the backend supports it (host-backed
+        // mounts): st_nlink, the shared inode, and write-through then behave.
+        // EOPNOTSUPP means the backend has no inodes to share (path-keyed
+        // tmpfs/overlay) or the paths cross mounts — fall back to a copy, the
+        // historical behavior; any other error (EEXIST/EACCES/…) is real.
+        match vfs.link(&old_abs, &new_abs) {
+            Ok(()) => return 0,
+            Err(e) if e.raw_os_error() == Some(95) => {} // EOPNOTSUPP: copy below
+            Err(e) => return io_errno(&e),
+        }
         // Read the whole source, create the target, copy.
         let mut data = vec![0u8; attrs.size as usize];
         if vfs.read_at(&old_abs, 0, &mut data).is_err() {

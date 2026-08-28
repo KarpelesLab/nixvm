@@ -178,6 +178,25 @@ impl MountTable {
         let to_rel = relative_to(&to, &point);
         self.mounts[from_idx].fs.rename(&from_rel, &to_rel)
     }
+
+    /// Hard-link `new` to the existing `old` within a single backend. Returns
+    /// `EOPNOTSUPP` for a cross-mount request (leaving the kernel to fall back
+    /// to copying, its historical behavior) and otherwise delegates to the
+    /// backend — which either makes a real hard link (host-backed) or itself
+    /// reports `EOPNOTSUPP` (path-keyed in-memory backends → copy).
+    pub fn link(&mut self, old: &str, new: &str) -> io::Result<()> {
+        let old = normalize(old);
+        let new = normalize(new);
+        let old_idx = self.best_mount(&old).ok_or_else(enoent)?;
+        let new_idx = self.best_mount(&new).ok_or_else(enoent)?;
+        if old_idx != new_idx {
+            return Err(io::Error::from_raw_os_error(95)); // EOPNOTSUPP → caller copies
+        }
+        let point = self.mounts[old_idx].point.clone();
+        let old_rel = relative_to(&old, &point);
+        let new_rel = relative_to(&new, &point);
+        self.mounts[old_idx].fs.link(&old_rel, &new_rel)
+    }
 }
 
 fn enoent() -> io::Error {

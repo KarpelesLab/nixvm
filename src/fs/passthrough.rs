@@ -136,6 +136,13 @@ unsafe extern "C" {
         newdirfd: c_int,
         newpath: *const c_char,
     ) -> c_int;
+    fn linkat(
+        olddirfd: c_int,
+        oldpath: *const c_char,
+        newdirfd: c_int,
+        newpath: *const c_char,
+        flags: c_int,
+    ) -> c_int;
     fn readlinkat(dirfd: c_int, path: *const c_char, buf: *mut c_char, bufsiz: usize) -> isize;
     /// Takes ownership of `fd` (POSIX: on success the fd must not be used or
     /// closed independently afterward — only via `closedir`).
@@ -312,6 +319,18 @@ fn raw_symlinkat(target: &CStr, dirfd: RawFd, name: &CStr) -> io::Result<()> {
 
 fn raw_renameat(from_dirfd: RawFd, from: &CStr, to_dirfd: RawFd, to: &CStr) -> io::Result<()> {
     let r = unsafe { renameat(from_dirfd, from.as_ptr(), to_dirfd, to.as_ptr()) };
+    if r < 0 {
+        Err(normalize_errno(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Hard-link `to` (under `to_dirfd`) to the existing `from` (under `from_dirfd`).
+/// `flags = 0`: the final component of `from` is not followed, so linking a
+/// symlink links the link itself — matching `link(2)`.
+fn raw_linkat(from_dirfd: RawFd, from: &CStr, to_dirfd: RawFd, to: &CStr) -> io::Result<()> {
+    let r = unsafe { linkat(from_dirfd, from.as_ptr(), to_dirfd, to.as_ptr(), 0) };
     if r < 0 {
         Err(normalize_errno(io::Error::last_os_error()))
     } else {
@@ -859,6 +878,18 @@ impl MountFs for Passthrough {
         let cto = cstr(&to_name)?;
         raw_renameat(from_parent.as_raw_fd(), &cfrom, to_parent.as_raw_fd(), &cto)
     }
+
+    fn link(&mut self, old_rel: &str, new_rel: &str) -> io::Result<()> {
+        self.deny_if_ro()?;
+        // Resolve both without following the final component (link(2) links the
+        // symlink itself), then make a real host hard link so st_nlink, the
+        // shared inode, and write-through all behave.
+        let (old_parent, old_name) = self.resolve(old_rel, false, false)?;
+        let (new_parent, new_name) = self.resolve(new_rel, false, false)?;
+        let cold = cstr(&old_name)?;
+        let cnew = cstr(&new_name)?;
+        raw_linkat(old_parent.as_raw_fd(), &cold, new_parent.as_raw_fd(), &cnew)
+    }
 }
 
 #[cfg(test)]
@@ -1022,6 +1053,28 @@ mod tests {
         pt.unlink("c.txt").unwrap();
         assert!(pt.stat("c.txt").is_none());
         assert!(pt.stat("b.txt").is_some());
+    }
+
+    #[test]
+    fn link_makes_a_real_hard_link() {
+        let tmp = TempDir::new("link");
+        let mut pt = Passthrough::new(tmp.0.clone());
+        pt.create("orig", 0o644).unwrap();
+        pt.write_at("orig", 0, b"data").unwrap();
+        pt.link("orig", "hard").unwrap();
+        // Same inode, nlink == 2 (a real hard link, not a copy).
+        let a = pt.stat("orig").unwrap();
+        let b = pt.stat("hard").unwrap();
+        assert_eq!(a.inode, b.inode, "shared inode");
+        assert_eq!(a.nlink, 2, "st_nlink reflects the extra link");
+        // Write-through: a write via one link is visible via the other.
+        pt.write_at("hard", 0, b"XXXX").unwrap();
+        let mut buf = [0u8; 4];
+        pt.read_at("orig", 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"XXXX");
+        // Linking onto an existing name fails EEXIST; a missing source ENOENT.
+        assert_eq!(pt.link("orig", "hard").unwrap_err().raw_os_error(), Some(17));
+        assert_eq!(pt.link("nope", "x").unwrap_err().raw_os_error(), Some(2));
     }
 
     #[test]

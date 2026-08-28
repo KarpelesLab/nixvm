@@ -137,6 +137,16 @@ pub trait MountFs: std::fmt::Debug + Send {
         Err(erofs())
     }
 
+    /// Create a hard link at `new_rel` to the existing file at `old_rel` (both
+    /// within this backend). The default reports `EOPNOTSUPP`, which tells the
+    /// kernel to fall back to copying the file's contents — correct for the
+    /// path-keyed in-memory backends (tmpfs/overlay) that have no inodes to
+    /// share. A host-backed backend overrides this to make a real hard link,
+    /// so `st_nlink`, the shared inode, and write-through all behave.
+    fn link(&mut self, _old_rel: &str, _new_rel: &str) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(95)) // EOPNOTSUPP
+    }
+
     /// Downcast hook for the one backend ([`ProcFs`]) whose `self/` files the
     /// kernel refreshes from live task state before each read. Every other
     /// backend keeps the default (`None`).
