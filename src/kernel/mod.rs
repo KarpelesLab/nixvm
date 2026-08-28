@@ -3199,7 +3199,7 @@ impl Kernel {
         if vfs.create(&path, 0o600).is_err() {
             return err(Errno::ENOSPC);
         }
-        i64::from(cx.cur.fds.alloc(Fd::File { path, offset: 0 }))
+        i64::from(cx.cur.fds.alloc(Fd::File { path, offset: 0, writable: true }))
     }
 
     /// `inotify_init1(flags)` stub — an eventfd-backed descriptor that is always
@@ -3611,9 +3611,12 @@ impl Kernel {
     /// fd's offset and advance it. `vfs`-only.
     #[allow(clippy::unused_self)]
     fn write_file_fd(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &GuestMemory) -> i64 {
-        let Some(Fd::File { path, offset }) = cx.cur.fds.get(fd as i32).cloned() else {
+        let Some(Fd::File { path, offset, writable }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
+        if !writable {
+            return err(Errno::EBADF); // fd opened O_RDONLY
+        }
         let Ok(data) = mem.read_vec(buf, count as usize) else {
             return err(Errno::EFAULT);
         };
@@ -3760,7 +3763,7 @@ impl Kernel {
     /// advance it. `vfs`-only.
     #[allow(clippy::unused_self)]
     fn read_file_fd(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
-        let Some(Fd::File { path, offset }) = cx.cur.fds.get(fd as i32).cloned() else {
+        let Some(Fd::File { path, offset, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
         let mut tmp = vec![0u8; count as usize];
@@ -3887,9 +3890,12 @@ impl Kernel {
     /// the fd's position.
     #[allow(clippy::too_many_arguments, clippy::unused_self)]
     fn sys_pwrite(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, offset: u64, mem: &GuestMemory) -> i64 {
-        let Some(Fd::File { path, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
+        let Some(Fd::File { path, writable, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::ESPIPE);
         };
+        if !writable {
+            return err(Errno::EBADF); // fd opened O_RDONLY
+        }
         let Ok(data) = mem.read_vec(buf, count as usize) else {
             return err(Errno::EFAULT);
         };
@@ -3956,9 +3962,12 @@ impl Kernel {
     /// `ftruncate(fd, len)` — resize the file the fd refers to.
     #[allow(clippy::unused_self)]
     fn sys_ftruncate(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, len: u64) -> i64 {
-        let Some(Fd::File { path, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
+        let Some(Fd::File { path, writable, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
+        if !writable {
+            return err(Errno::EBADF); // ftruncate needs an fd open for writing
+        }
         match vfs.truncate(&path, len) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
@@ -4027,7 +4036,8 @@ impl Kernel {
         buf.truncate(n);
         // Write it out through the normal write path (files, pipes, sockets).
         let written = match cx.cur.fds.get(out_fd as i32).cloned() {
-            Some(Fd::File { path, offset }) => match vfs.write_at(&path, offset, &buf) {
+            Some(Fd::File { writable: false, .. }) => err(Errno::EBADF), // out fd is O_RDONLY
+            Some(Fd::File { path, offset, .. }) => match vfs.write_at(&path, offset, &buf) {
                 Ok(w) => {
                     if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(out_fd as i32) {
                         *offset += w as u64;
@@ -4065,7 +4075,7 @@ impl Kernel {
     #[allow(clippy::unused_self)]
     fn sys_copy_file_range(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, a: &[u64; 6], mem: &mut GuestMemory) -> i64 {
         let (fd_in, off_in_p, fd_out, off_out_p, len) = (a[0], a[1], a[2], a[3], a[4]);
-        let Some(Fd::File { path: in_path, offset: in_pos }) = cx.cur.fds.get(fd_in as i32).cloned() else {
+        let Some(Fd::File { path: in_path, offset: in_pos, .. }) = cx.cur.fds.get(fd_in as i32).cloned() else {
             return err(Errno::EBADF);
         };
         let in_off = if off_in_p != 0 {
@@ -4079,9 +4089,12 @@ impl Kernel {
             Err(e) => return io_errno(&e),
         };
         buf.truncate(n);
-        let Some(Fd::File { path: out_path, offset: out_pos }) = cx.cur.fds.get(fd_out as i32).cloned() else {
+        let Some(Fd::File { path: out_path, offset: out_pos, writable: out_w }) = cx.cur.fds.get(fd_out as i32).cloned() else {
             return err(Errno::EBADF);
         };
+        if !out_w {
+            return err(Errno::EBADF); // destination opened O_RDONLY
+        }
         let out_off = if off_out_p != 0 {
             mem.read_u64(off_out_p).unwrap_or(out_pos)
         } else {
@@ -4833,6 +4846,7 @@ impl Kernel {
             cx.cur.fds.alloc(Fd::File {
                 path: abs,
                 offset: 0,
+                writable: flags & O_ACCMODE != 0, // O_WRONLY or O_RDWR
             })
         };
         const O_CLOEXEC: u64 = 0o2000000;
@@ -4941,7 +4955,7 @@ impl Kernel {
     #[allow(clippy::unused_self)]
     fn sys_lseek(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, offset: i64, whence: u64) -> i64 {
         let (cur, path) = match cx.cur.fds.get(fd as i32) {
-            Some(Fd::File { path, offset }) => (*offset, path.clone()),
+            Some(Fd::File { path, offset, .. }) => (*offset, path.clone()),
             _ => return err(Errno::ESPIPE),
         };
         let size = vfs.stat(&path).map_or(0, |a| a.size);
@@ -6172,6 +6186,27 @@ mod tests {
         assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Fcntl, [fd as u64, F_SETLK, flock, 0, 0, 0]), 0);
         assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Fcntl, [fd as u64, F_GETLK, flock, 0, 0, 0]), 0);
         assert_eq!(mem.read_vec(flock, 2).unwrap(), 2u16.to_le_bytes(), "l_type should be F_UNLCK");
+    }
+
+    #[test]
+    fn write_to_readonly_fd_is_ebadf() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        const O_WRONLY: u64 = 1;
+        const O_RDWR: u64 = 2;
+        const O_CREAT: u64 = 0o100;
+        let path = 0x1_0000;
+        let data = 0x1_1000;
+        mem.write_init(path, b"/f\0").unwrap();
+        mem.write_init(data, b"hi").unwrap();
+        // Create + write via an O_RDWR fd works.
+        let rw = call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, [AT_CWD, path, O_CREAT | O_RDWR, 0o644, 0, 0]);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Write, [rw as u64, data, 2, 0, 0, 0]), 2);
+        // A write through an O_RDONLY fd (accmode 0) is EBADF and changes nothing.
+        let ro = call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, [AT_CWD, path, 0, 0, 0, 0]);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Write, [ro as u64, data, 2, 0, 0, 0]), err(Errno::EBADF));
+        // ftruncate on the read-only fd is likewise EBADF; on the writable one it works.
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Ftruncate, [ro as u64, 0, 0, 0, 0, 0]), err(Errno::EBADF));
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Ftruncate, [rw as u64, 0, 0, 0, 0, 0]), 0);
     }
 
     #[test]

@@ -15,6 +15,9 @@ pub enum Fd {
     File {
         path: String,
         offset: u64,
+        /// Whether the open access mode permits writing (`O_WRONLY`/`O_RDWR`).
+        /// A `write`/`pwrite`/`ftruncate` on a read-only fd must fail `EBADF`.
+        writable: bool,
     },
     /// An open directory being walked by `getdents64`.
     Dir {
