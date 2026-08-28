@@ -2247,7 +2247,7 @@ impl Kernel {
             Sysno::EpollCtl => self.sys_epoll_ctl(pf, cx, args[0], args[1], args[2], args[3], mem),
             // inotify gets an eventfd-backed descriptor that never becomes
             // readable (no filesystem events delivered — a safe degradation).
-            Sysno::InotifyInit1 => self.sys_inotify_init1(pf, cx),
+            Sysno::InotifyInit1 => self.sys_inotify_init1(pf, cx, args[0]),
             // signalfd4(fd, mask, sizemask, flags): a real signal-reading fd. The
             // `fd` is a 32-bit int (`-1` = create), read via `as i32`.
             Sysno::Signalfd4 => self.sys_signalfd4(pf, cx, args[0] as i32 as i64, args[1], args[3], mem),
@@ -3176,14 +3176,27 @@ impl Kernel {
         i64::from(cx.cur.fds.alloc(Fd::File { path, offset: 0 }))
     }
 
-    /// `inotify_init1`/`signalfd4` stub — a descriptor that is always empty
-    /// (never becomes readable). Programs get a valid fd and simply never see
-    /// events/signals, which is a safe degradation for optional watching.
+    /// `inotify_init1(flags)` stub — an eventfd-backed descriptor that is always
+    /// empty (no filesystem events are delivered). Programs get a valid fd and
+    /// simply never see events, a safe degradation for optional watching.
+    ///
+    /// `IN_NONBLOCK` must be honored: the fd never becomes readable, so a
+    /// *blocking* `read` on it would park forever — and for a single-threaded
+    /// watcher that is the whole VM, tripping the deadlock detector. A
+    /// non-blocking reader instead gets `EAGAIN`, which is exactly how `fs.watch`
+    /// / chokidar / Bun drive an inotify fd (non-blocking + epoll/poll).
     #[allow(clippy::unused_self)]
-    fn sys_inotify_init1(&self, pf: &mut PollFds, cx: &mut ServiceCtx) -> i64 {
+    fn sys_inotify_init1(&self, pf: &mut PollFds, cx: &mut ServiceCtx, flags: u64) -> i64 {
+        const IN_NONBLOCK: u64 = 0o4000; // == O_NONBLOCK
+        const IN_CLOEXEC: u64 = 0o2000000; // == O_CLOEXEC
         let idx = pf.eventfds.len();
         pf.eventfds.push(EventFdInst::default());
-        i64::from(cx.cur.fds.alloc(Fd::Eventfd(idx)))
+        if flags & IN_NONBLOCK != 0 {
+            pf.set_nonblock(&Fd::Eventfd(idx), true);
+        }
+        let fd = cx.cur.fds.alloc(Fd::Eventfd(idx));
+        cx.cur.fds.set_cloexec(fd, flags & IN_CLOEXEC != 0);
+        i64::from(fd)
     }
 
     /// `exit` — terminate just this task: run its `CLONE_CHILD_CLEARTID`
@@ -6046,6 +6059,20 @@ mod tests {
         // `dispatch` now takes its own per-handler locks; the caller must NOT
         // pre-hold `sh` (that would self-deadlock on the non-reentrant Mutex).
         k.dispatch(cx, s, 0, &a, v, mem)
+    }
+
+    #[test]
+    fn nonblock_inotify_read_is_eagain_not_deadlock() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        const IN_NONBLOCK: u64 = 0o4000;
+        let fd = call(&k, &mut cx, &mut mem, &mut v, Sysno::InotifyInit1, [IN_NONBLOCK, 0, 0, 0, 0, 0]);
+        assert!(fd >= 3);
+        // The stub never delivers events; a non-blocking read must return EAGAIN
+        // rather than parking (which for a lone watcher would deadlock the VM).
+        let buf = 0x1_0000;
+        let r = call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd as u64, buf, 16, 0, 0, 0]);
+        assert_eq!(r, err(Errno::EAGAIN));
+        assert!(!cx.block, "a non-blocking inotify read must not block");
     }
 
     #[test]
