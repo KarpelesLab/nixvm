@@ -218,9 +218,19 @@ impl Kernel {
             let sig = u64::from(ready.trailing_zeros()) + 1;
             cx.cur.pending &= !(1u64 << (sig - 1));
             cx.cur.wake_deadline = None;
+            // Consume the queued siginfo so sigwaitinfo reports the same
+            // si_code/si_value a handler would have seen (and it isn't
+            // re-delivered later).
+            let q = cx.cur.queued_siginfo[sig as usize].take();
             if info != 0 {
                 let mut si = [0u8; 128];
                 si[0..4].copy_from_slice(&(sig as i32).to_le_bytes()); // si_signo
+                if let Some(q) = q {
+                    si[8..12].copy_from_slice(&q.code.to_le_bytes()); // si_code
+                    si[16..20].copy_from_slice(&q.pid.to_le_bytes()); // si_pid
+                    si[20..24].copy_from_slice(&q.uid.to_le_bytes()); // si_uid
+                    si[24..32].copy_from_slice(&q.value.to_le_bytes()); // si_value
+                }
                 let _ = mem.write(info, &si);
             }
             return sig as i64;
