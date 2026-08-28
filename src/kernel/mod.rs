@@ -4736,8 +4736,12 @@ impl Kernel {
         mem: &GuestMemory,
     ) -> i64 {
         const O_CREAT: u64 = 0o100;
+        const O_EXCL: u64 = 0o200;
         const O_TRUNC: u64 = 0o1000;
+        const O_NOFOLLOW: u64 = 0o400000;
+        const O_DIRECTORY: u64 = 0o200000;
         const O_TMPFILE: u64 = 0o20000000; // the __O_TMPFILE bit
+        const O_ACCMODE: u64 = 0o3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
 
         // Anonymous temp files (O_TMPFILE) need inode-based fds; nixvm's are
         // path-based, so a real backing file would be lost. Report "unsupported"
@@ -4750,8 +4754,16 @@ impl Kernel {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
-        let abs = self.resolve_path(cx, dirfd, &rel);
-        let abs = self.follow_symlinks(vfs, &abs).unwrap_or(abs);
+        let resolved = self.resolve_path(cx, dirfd, &rel);
+        // O_NOFOLLOW: if the final component is itself a symlink, fail with ELOOP
+        // rather than following it (a security check `open`ers rely on). Checked
+        // against the *unfollowed* path; intermediate symlinks still resolve.
+        if flags & O_NOFOLLOW != 0
+            && vfs.stat(&resolved).is_some_and(|a| a.kind == NodeKind::Symlink)
+        {
+            return err(Errno::ELOOP);
+        }
+        let abs = self.follow_symlinks(vfs, &resolved).unwrap_or(resolved);
         if self.trace {
             eprintln!("[open] pid={} {abs:?}", cx.cur.pid);
         }
@@ -4782,21 +4794,39 @@ impl Kernel {
             return i64::from(cx.cur.fds.alloc(Fd::PtySlave(n)));
         }
 
-        if vfs.stat(&abs).is_none() {
-            if flags & O_CREAT != 0 {
-                if let Err(e) = vfs.create(&abs, (mode & 0o777) as u32) {
-                    return io_errno(&e);
+        match vfs.stat(&abs) {
+            None => {
+                if flags & O_CREAT != 0 {
+                    if let Err(e) = vfs.create(&abs, (mode & 0o777) as u32) {
+                        return io_errno(&e);
+                    }
+                } else {
+                    return err(Errno::ENOENT);
                 }
-            } else {
-                return err(Errno::ENOENT);
             }
-        } else if flags & O_TRUNC != 0 {
-            let _ = vfs.truncate(&abs, 0);
+            // O_CREAT|O_EXCL demands the file not already exist (atomic create —
+            // the standard lock-file / mkstemp idiom); anything else is EEXIST.
+            Some(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => {
+                return err(Errno::EEXIST);
+            }
+            Some(_) if flags & O_TRUNC != 0 => {
+                let _ = vfs.truncate(&abs, 0);
+            }
+            Some(_) => {}
         }
 
         let Some(attrs) = vfs.stat(&abs) else {
             return err(Errno::ENOENT);
         };
+        let is_dir = attrs.kind == NodeKind::Dir;
+        // O_DIRECTORY requires a directory; a non-dir is ENOTDIR.
+        if flags & O_DIRECTORY != 0 && !is_dir {
+            return err(Errno::ENOTDIR);
+        }
+        // A directory can't be opened for writing — EISDIR.
+        if is_dir && flags & O_ACCMODE != 0 {
+            return err(Errno::EISDIR);
+        }
         let fd = if attrs.kind == NodeKind::Dir {
             cx.cur.fds.alloc(Fd::Dir { path: abs, pos: 0 })
         } else {
@@ -6142,6 +6172,35 @@ mod tests {
         assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Fcntl, [fd as u64, F_SETLK, flock, 0, 0, 0]), 0);
         assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Fcntl, [fd as u64, F_GETLK, flock, 0, 0, 0]), 0);
         assert_eq!(mem.read_vec(flock, 2).unwrap(), 2u16.to_le_bytes(), "l_type should be F_UNLCK");
+    }
+
+    #[test]
+    fn openat_rejects_bad_flag_combinations() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        const O_WRONLY: u64 = 1;
+        const O_CREAT: u64 = 0o100;
+        const O_EXCL: u64 = 0o200;
+        const O_DIRECTORY: u64 = 0o200000;
+        const O_NOFOLLOW: u64 = 0o400000;
+        let p = |s: &[u8], at: u64, m: &mut GuestMemory| {
+            m.write_init(at, s).unwrap();
+            at
+        };
+        // Create /f, mkdir /d, symlink /l -> f.
+        let fpath = p(b"/f\0", 0x1_0000, &mut mem);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, [AT_CWD, fpath, O_CREAT | O_WRONLY, 0o644, 0, 0]), 3);
+        let dpath = p(b"/d\0", 0x1_0100, &mut mem);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Mkdirat, [AT_CWD, dpath, 0o755, 0, 0, 0]);
+        let tgt = p(b"f\0", 0x1_0200, &mut mem);
+        let lpath = p(b"/l\0", 0x1_0300, &mut mem);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Symlinkat, [tgt, AT_CWD, lpath, 0, 0, 0]);
+
+        // O_DIRECTORY on a file → ENOTDIR; O_WRONLY on a dir → EISDIR;
+        // O_CREAT|O_EXCL on an existing file → EEXIST; O_NOFOLLOW on a symlink → ELOOP.
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, [AT_CWD, fpath, O_DIRECTORY, 0, 0, 0]), err(Errno::ENOTDIR));
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, [AT_CWD, dpath, O_WRONLY, 0, 0, 0]), err(Errno::EISDIR));
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, [AT_CWD, fpath, O_CREAT | O_EXCL | O_WRONLY, 0o644, 0, 0]), err(Errno::EEXIST));
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, [AT_CWD, lpath, O_NOFOLLOW, 0, 0, 0]), err(Errno::ELOOP));
     }
 
     #[test]
