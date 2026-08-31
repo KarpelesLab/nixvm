@@ -3019,6 +3019,12 @@ impl Kernel {
         info.run = RunState::Running;
         info.futex_wait = None;
         info.futex_woken = false;
+        // A child inherits the parent's *process group*, so resolve the `pgid == 0`
+        // ("group leader = self") sentinel to the parent's effective pgid here.
+        // Left as 0 it would default to the child's *own* pid (`pgid_of`), putting
+        // every forked child in its own group — then a parent's `wait4(0)`
+        // (same-process-group) or `kill(0, …)` would miss all its children.
+        info.pgid = pgid_of(&cx.cur);
         if is_thread {
             // A thread joins the caller's group: shared tgid, the leader's parent,
             // and no exit signal (only the group's termination notifies the parent).
