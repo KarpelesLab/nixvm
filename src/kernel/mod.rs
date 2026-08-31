@@ -5351,6 +5351,9 @@ impl Kernel {
         const MAP_SHARED: u64 = 0x01;
         const MAP_FIXED: u64 = 0x10;
         const MAP_ANONYMOUS: u64 = 0x20;
+        // MAP_FIXED_NOREPLACE places at `addr` exactly (like MAP_FIXED) but fails
+        // with EEXIST instead of clobbering an existing mapping in the range.
+        const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 
         let (addr, len, prot, flags) = (a[0], a[1], a[2], a[3]);
         let (fd, offset) = (a[4], a[5]);
@@ -5372,8 +5375,23 @@ impl Kernel {
             None
         };
 
-        let base = if flags & MAP_FIXED != 0 && addr != 0 {
-            addr - addr % PAGE_SIZE
+        let noreplace = flags & MAP_FIXED_NOREPLACE != 0 && addr != 0;
+        let base = if (flags & MAP_FIXED != 0 || noreplace) && addr != 0 {
+            let base = addr - addr % PAGE_SIZE;
+            // MAP_FIXED_NOREPLACE is atomic: if *any* page in the target range is
+            // already mapped, fail with EEXIST and disturb nothing (don't relocate
+            // and don't clobber). A free range is placed exactly at `base`.
+            if noreplace {
+                let end = base + len;
+                let mut p = base;
+                while p < end {
+                    if mem.page_prot(p).is_some() {
+                        return err(Errno::EEXIST);
+                    }
+                    p += PAGE_SIZE;
+                }
+            }
+            base
         } else {
             let Some(base) = sh.arena(cx).alloc(len) else {
                 return err(Errno::ENOMEM);
@@ -7772,6 +7790,31 @@ mod tests {
         }
         let big = call(&k, &mut cx, &mut mem, &mut v, Sysno::Mmap, [0, 3 * 4096, 0x3, 0x22, u64::MAX, 0]);
         assert!(big > 0, "coalesced free space must satisfy a 3-page mmap, got {big}");
+    }
+
+    #[test]
+    fn mmap_fixed_noreplace_fails_eexist_over_mapped_but_places_when_free() {
+        // MAP_FIXED_NOREPLACE (0x100000) must be atomic: EEXIST over an occupied
+        // range (never relocate, never clobber), exact placement over a free one.
+        let (k, mut mem, mut v, mut cx) = setup();
+        cx.cur.mm = 0;
+        const NOREPLACE: u64 = 0x02 | 0x20 | 0x10_0000; // PRIVATE|ANON|FIXED_NOREPLACE
+        // 0x1_0000..0x1_4000 is mapped by setup(): a NOREPLACE there is EEXIST.
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Mmap, [0x1_0000, 4096, 0x3, NOREPLACE, u64::MAX, 0]),
+            err(Errno::EEXIST),
+        );
+        // A partial overlap (page 0x1_3000 is mapped) is still EEXIST, atomically.
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Mmap, [0x1_3000, 2 * 4096, 0x3, NOREPLACE, u64::MAX, 0]),
+            err(Errno::EEXIST),
+        );
+        // A free, in-bounds page is placed exactly at the requested address.
+        let want = 0x1_9000;
+        let got = call(&k, &mut cx, &mut mem, &mut v, Sysno::Mmap, [want, 4096, 0x3, NOREPLACE, u64::MAX, 0]);
+        assert_eq!(got, want as i64, "free NOREPLACE lands exactly at addr");
+        mem.write_u64(want, 0xfeed).unwrap();
+        assert_eq!(mem.read_u64(want).unwrap(), 0xfeed);
     }
 
     #[test]
