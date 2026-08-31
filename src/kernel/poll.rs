@@ -49,6 +49,17 @@ pub(super) struct PollFds {
     pub(super) epolls: Vec<EpollInst>,
     /// `signalfd4` instances, indexed by [`Fd::Signalfd`].
     pub(super) signalfds: Vec<SignalFdInst>,
+    /// `CLONE_PIDFD` process descriptors, indexed by [`Fd::Pidfd`].
+    pub(super) pidfds: Vec<PidfdInst>,
+}
+
+/// One `CLONE_PIDFD` process descriptor: the pid it refers to and whether that
+/// process has exited yet. A poll reports `POLLIN` once `exited` is set (the
+/// child became a zombie); [`Kernel::sys_exit`](super::Kernel) flips it.
+#[derive(Debug, Default)]
+pub(super) struct PidfdInst {
+    pub(super) target_pid: i32,
+    pub(super) exited: bool,
 }
 
 /// One `signalfd4`: the accepted-signal mask. Readable when the owning process
@@ -322,6 +333,14 @@ impl Kernel {
             Fd::Signalfd(i) => {
                 let mask = pf.signalfds.get(i).map_or(0, |s| s.mask);
                 if cx.cur.pending & mask != 0 {
+                    POLLIN
+                } else {
+                    0
+                }
+            }
+            // A pidfd is readable (POLLIN) once its target process has exited.
+            Fd::Pidfd(i) => {
+                if pf.pidfds.get(i).is_some_and(|p| p.exited) {
                     POLLIN
                 } else {
                     0

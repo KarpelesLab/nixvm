@@ -44,6 +44,10 @@ pub enum Fd {
     Signalfd(usize),
     /// A `timerfd_create` timer: index into the kernel's timerfd table.
     Timerfd(usize),
+    /// A `CLONE_PIDFD` process descriptor: index into the kernel's pidfd table.
+    /// Becomes `POLLIN`-readable when the referenced process exits; `read` on it
+    /// is `EINVAL` (matching Linux — a pidfd carries no data).
+    Pidfd(usize),
     /// An `epoll_create1` instance: index into the kernel's epoll table.
     Epoll(usize),
     /// The master end of pseudo-terminal `index` (`/dev/ptmx`).
