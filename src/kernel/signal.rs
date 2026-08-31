@@ -18,6 +18,7 @@
 //! A signal left at its default disposition still takes the default action.
 
 use super::{ExitCause, Kernel, QueuedSig, RunState, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SIGSEGV, SS_DISABLE, ServiceCtx, Shared, err, pgid_of};
+use crate::abi::Arch;
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
@@ -648,9 +649,13 @@ impl Kernel {
         // re-executes it. `rcx` holds the syscall's return address on both x86-64
         // backends (KVM's `settle` set rip←rcx just above; the interpreter set rcx
         // at `syscall` entry), so the instruction is at `rcx − 2`. RAX still holds
-        // the syscall number — a restarted syscall skips `set_syscall_ret`. (This,
-        // like the whole `rt_sigframe` path, is x86-64-specific.)
-        if cx.restart_syscall {
+        // the syscall number — a restarted syscall skips `set_syscall_ret`.
+        //
+        // On aarch64 the interpreter never advanced past the `svc #0` for a
+        // blocked-then-interrupted syscall (`set_syscall_ret` — which does `pc +=
+        // 4` — runs only on completion), so `pc` already sits on the `svc`; no
+        // rewind is needed. x8 still holds the syscall number for the re-issue.
+        if cx.restart_syscall && self.arch == Arch::X86_64 {
             let syscall_pc = vcpu.reg(1).wrapping_sub(2); // rcx − len(`syscall`)
             vcpu.set_pc(syscall_pc);
         }
@@ -688,6 +693,9 @@ impl Kernel {
         vcpu: &mut dyn crate::vcpu::Vcpu,
         mem: &mut GuestMemory,
     ) -> bool {
+        if self.arch == Arch::Aarch64 {
+            return self.push_sigframe_aarch64(cx, sig, si, restore_mask, vcpu, mem);
+        }
         let si_code = si.code;
         let si_addr = si.addr;
         let act = cx.cur.handlers[sig as usize];
@@ -796,6 +804,9 @@ impl Kernel {
     /// so `uc_mcontext` is at a fixed offset below the current `rsp`.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_rt_sigreturn(&self, cx: &mut ServiceCtx, vcpu: &mut dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
+        if self.arch == Arch::Aarch64 {
+            return self.sys_rt_sigreturn_aarch64(cx, vcpu, mem);
+        }
         // `rt_sigreturn` arrives as a syscall: the (KVM) vcpu is parked at CPL0 on
         // the return trampoline. Collapse it to CPL3 user mode now; the explicit
         // rip/sp/rflags restores below then overwrite the rip/rflags this set from
@@ -821,7 +832,149 @@ impl Kernel {
             cx.cur.blocked = mask;
         }
     }
+
+    /// Build the aarch64 `rt_sigframe` on the (alternate or interrupted) stack,
+    /// block the handler's mask, and point the vcpu at the handler. The aarch64
+    /// ABI is the mirror of the x86-64 [`Self::push_sigframe`]: the frame is
+    /// `{ siginfo_t info; struct ucontext uc; }` (siginfo *first*), the handler
+    /// is entered with `x0=signo`, `x1=&info`, `x2=&uc`, `x30(lr)=sa_restorer`,
+    /// `sp=frame`, and `pc=handler` (SysV/AAPCS64), and the saved GPRs/sp/pc/
+    /// pstate live in `uc.uc_mcontext` (a `struct sigcontext`). Offsets are the
+    /// arm64 UAPI (`asm/sigcontext.h`, `asm/ucontext.h`): within the ucontext
+    /// `uc_mcontext` is at +168; within the sigcontext `regs[0]` is at +8, `sp`
+    /// at +256, `pc` at +264, `pstate` at +272.
+    #[allow(clippy::unused_self)]
+    fn push_sigframe_aarch64(
+        &self, cx: &mut ServiceCtx,
+        sig: u64,
+        si: SiFields,
+        restore_mask: u64,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &mut GuestMemory,
+    ) -> bool {
+        let act = cx.cur.handlers[sig as usize];
+        let cur_sp = vcpu.sp();
+        let (alt_sp, alt_size, alt_flags) = cx.cur.altstack;
+        // aarch64 has no ABI red zone: build directly below the current sp (or on
+        // the alternate stack if the handler asked for one and it's enabled).
+        let base = if act.flags & SA_ONSTACK != 0 && alt_flags & SS_DISABLE == 0 && alt_size != 0 {
+            alt_sp + alt_size
+        } else {
+            cur_sp
+        };
+
+        // frame = { siginfo(128) ; ucontext } followed by a 16-byte frame record
+        // (fp,lr) for the unwinder. 16-align the whole thing.
+        let frame = (base - AA64_FRAME_SIZE) & !15;
+        let uc = frame + AA64_SIGINFO_SIZE;
+        let mctx = uc + AA64_UC_MCONTEXT_OFF; // struct sigcontext
+        let frame_record = uc + AA64_UC_SIZE;
+
+        let mut ok = true;
+        let mut put = |addr: u64, v: u64| {
+            ok &= mem.write(addr, &v.to_le_bytes()).is_ok();
+        };
+        // siginfo_t: si_signo@0, si_errno@4, si_code@8, then the union at @16.
+        // A fault carries si_addr; an async signal carries si_pid/si_uid/si_value.
+        put(frame, sig & 0xffff_ffff); // si_signo (si_errno = high 32 = 0)
+        put(frame + 8, si.code & 0xffff_ffff); // si_code
+        if si.addr != 0 {
+            put(frame + 16, si.addr); // _sigfault: si_addr
+        } else {
+            put(frame + 16, (si.pid & 0xffff_ffff) | (si.uid << 32)); // _rt: si_pid/si_uid
+            put(frame + 24, si.value); // si_value
+        }
+        // ucontext: uc_flags@0, uc_link@8, uc_stack{ss_sp@16,ss_flags@24,ss_size@32},
+        // uc_sigmask@40 (kernel 8-byte set), then uc_mcontext at +168.
+        put(uc, 0); // uc_flags
+        put(uc + 8, 0); // uc_link
+        put(uc + 16, alt_sp); // uc_stack.ss_sp
+        put(uc + 24, alt_flags); // ss_flags (+ pad)
+        put(uc + 32, alt_size); // ss_size
+        put(uc + 40, restore_mask); // uc_sigmask
+        // uc_mcontext (struct sigcontext): fault_address@0, regs[0..31]@8, sp@256,
+        // pc@264, pstate@272, then a 4K __reserved area for FP/SIMD context.
+        put(mctx, si.addr); // fault_address
+        for i in 0..31u64 {
+            put(mctx + 8 + i * 8, vcpu.reg(i as usize)); // x0..x30
+        }
+        put(mctx + 256, cur_sp); // sp
+        put(mctx + 264, vcpu.pc()); // pc
+        put(mctx + 272, vcpu.rflags()); // pstate (NZCV)
+        // __reserved: leave a null terminator record (magic=0, size=0) so anything
+        // walking the FP/SIMD context list stops immediately (we save no fpsimd).
+        put(mctx + 280, 0);
+        // Unwinder frame record after the ucontext: fp = caller's x29, lr = restorer.
+        put(frame_record, vcpu.reg(29));
+        put(frame_record + 8, act.restorer);
+
+        if !ok {
+            return false; // couldn't build the frame (guest stack unusable)
+        }
+
+        if std::env::var_os("NIXVM_SIGTRACE").is_some() {
+            let hb = mem.read_vec(act.handler, 8).unwrap_or_default();
+            eprintln!(
+                "[sig] deliver(aa64) sig={sig} pc={:#x} -> handler={:#x} restorer={:#x} frame={frame:#x} handler_bytes={:02x?}",
+                vcpu.pc(),
+                act.handler,
+                act.restorer,
+                hb,
+            );
+        }
+        // Enter the handler: AAPCS64 argument regs, lr = restorer, sp/pc redirected.
+        vcpu.set_reg(0, sig); // x0 = signo
+        vcpu.set_reg(1, frame); // x1 = &siginfo
+        vcpu.set_reg(2, uc); // x2 = &ucontext
+        vcpu.set_reg(29, frame_record); // x29 = fp
+        vcpu.set_reg(30, act.restorer); // x30 = lr = sa_restorer
+        vcpu.set_sp(frame);
+        vcpu.set_pc(act.handler);
+        // Block the handler's mask, plus this signal unless SA_NODEFER.
+        cx.cur.blocked |= act.mask;
+        if act.flags & SA_NODEFER == 0 {
+            cx.cur.blocked |= 1u64 << (sig - 1);
+        }
+        if act.flags & SA_RESETHAND != 0 {
+            cx.cur.handlers[sig as usize] = super::SigAction::default();
+        }
+        true
+    }
+
+    /// aarch64 `rt_sigreturn` — the mirror of [`Self::sys_rt_sigreturn`]. The
+    /// restorer trampoline (`mov x8,#139; svc #0`) never touched `sp`, so it still
+    /// points at the `rt_sigframe` base; restore the GPRs/sp/pc/pstate and the
+    /// signal mask from `uc.uc_mcontext` / `uc.uc_sigmask`.
+    #[allow(clippy::unused_self)]
+    fn sys_rt_sigreturn_aarch64(&self, cx: &mut ServiceCtx, vcpu: &mut dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
+        let frame = vcpu.sp();
+        let uc = frame + AA64_SIGINFO_SIZE;
+        let mctx = uc + AA64_UC_MCONTEXT_OFF;
+        let read = |addr: u64| mem.read_u64(addr).unwrap_or(0);
+        for i in 0..31u64 {
+            vcpu.set_reg(i as usize, read(mctx + 8 + i * 8)); // x0..x30
+        }
+        vcpu.set_sp(read(mctx + 256));
+        vcpu.set_rflags(read(mctx + 272)); // pstate before pc, order is immaterial
+        vcpu.set_pc(read(mctx + 264));
+        cx.cur.blocked = read(uc + 40); // uc_sigmask
+    }
 }
+
+// aarch64 signal-frame geometry (arm64 UAPI `asm/sigcontext.h` + `asm/ucontext.h`).
+/// `sizeof(siginfo_t)` — the frame's leading member.
+const AA64_SIGINFO_SIZE: u64 = 128;
+/// Byte offset of `uc_mcontext` (a `struct sigcontext`) within `struct ucontext`:
+/// uc_flags(8)+uc_link(8)+uc_stack(24)=40, uc_sigmask + `__unused` padding fills
+/// to a 1024-bit set (128 bytes) → 40 + 128 = 168.
+const AA64_UC_MCONTEXT_OFF: u64 = 168;
+/// `sizeof(struct sigcontext)`: fault_address(8)+regs[31](248)+sp(8)+pc(8)+
+/// pstate(8)=280, plus the 4096-byte `__reserved` FP/SIMD area.
+const AA64_SIGCONTEXT_SIZE: u64 = 280 + 4096;
+/// `sizeof(struct ucontext)`.
+const AA64_UC_SIZE: u64 = AA64_UC_MCONTEXT_OFF + AA64_SIGCONTEXT_SIZE;
+/// Whole frame: siginfo + ucontext + a 16-byte unwinder frame record (fp,lr).
+const AA64_FRAME_SIZE: u64 = AA64_SIGINFO_SIZE + AA64_UC_SIZE + 16;
 
 /// Signals whose default disposition is to be ignored.
 fn is_default_ignored(sig: u64) -> bool {

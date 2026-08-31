@@ -8317,7 +8317,8 @@ mod tests {
         vcpu.set_reg(0, 0x1234); // rax
         let (orig_pc, orig_sp) = (vcpu.pc(), vcpu.sp());
 
-        let (k, mut mem, _v, mut cx) = setup();
+        let (mut k, mut mem, _v, mut cx) = setup();
+        k.arch = Arch::X86_64; // this test drives an x86-64 vcpu + frame layout
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
         cx.cur.mm = 0;
         cx.cur.handlers[11] = SigAction { handler: 0x2_0000, flags: 0, restorer: 0x2_1000, mask: 0 };
@@ -8348,7 +8349,8 @@ mod tests {
         use crate::vcpu::Backend;
         let backend = crate::vcpu::interp_x86::X86Backend::new(Arch::X86_64).unwrap();
         let mut vcpu = backend.new_vcpu(0x1_1111, 0x1_3000).unwrap();
-        let (k, mut mem, _v, mut cx) = setup();
+        let (mut k, mut mem, _v, mut cx) = setup();
+        k.arch = Arch::X86_64; // this test drives an x86-64 vcpu + frame layout
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
         cx.cur.mm = 0;
         cx.cur.handlers[10] = SigAction { handler: 0x2_0000, flags: 0, restorer: 0x2_1000, mask: 0 };
@@ -8375,6 +8377,47 @@ mod tests {
         assert_eq!(mem.read_u64(si + 24).unwrap(), 0xABCD, "si_value carried");
         // The info is consumed on delivery (not re-delivered on the next signal).
         assert!(cx.cur.queued_siginfo[10].is_none(), "siginfo consumed");
+    }
+
+    #[test]
+    fn aarch64_signal_delivery_and_rt_sigreturn_round_trip() {
+        use crate::vcpu::Backend;
+        // A real aarch64 interpreter vcpu with distinctive register/flag state.
+        let backend = crate::vcpu::interp::InterpBackend::new(Arch::Aarch64).unwrap();
+        let mut vcpu = backend.new_vcpu(0x1_1111, 0x1_3000).unwrap();
+        vcpu.set_reg(19, 0xdead); // x19 (callee-saved) — must survive the handler
+        vcpu.set_reg(0, 0x1234); // x0
+        vcpu.set_rflags(1 << 30); // PSTATE.Z set — must round-trip
+        let (orig_pc, orig_sp, orig_pstate) = (vcpu.pc(), vcpu.sp(), vcpu.rflags());
+
+        let (k, mut mem, _v, mut cx) = setup(); // setup() is already Arch::Aarch64
+        mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
+        cx.cur.mm = 0;
+        cx.cur.handlers[11] = SigAction { handler: 0x2_0000, flags: 0, restorer: 0x2_1000, mask: 0 };
+
+        // Deliver SIGSEGV (fault addr 0xcafe) → the vcpu enters the aarch64 handler.
+        assert!(k.deliver_fault_signal(&mut cx, 11, 0xcafe, vcpu.as_mut(), &mut mem));
+        assert_eq!(vcpu.pc(), 0x2_0000, "pc → handler");
+        assert_eq!(vcpu.reg(0), 11, "x0 = signum");
+        assert_eq!(vcpu.reg(30), 0x2_1000, "x30 = sa_restorer");
+        let frame = vcpu.sp();
+        assert_eq!(vcpu.reg(1), frame, "x1 = &siginfo (frame base)");
+        assert_eq!(vcpu.reg(2), frame + 128, "x2 = &ucontext");
+        // siginfo at the frame base carries si_signo and the fault address.
+        assert_eq!(mem.read_u32(frame).unwrap(), 11, "si_signo");
+        assert_eq!(cx.cur.blocked & (1 << 10), 1 << 10, "SIGSEGV blocked in handler");
+
+        // The handler clobbers x19, sp, and the flags; rt_sigreturn restores them.
+        vcpu.set_reg(19, 0);
+        vcpu.set_rflags(0);
+        // sp still points at the frame base (the restorer trampoline doesn't move it).
+        k.sys_rt_sigreturn(&mut cx, vcpu.as_mut(), &mem);
+        assert_eq!(vcpu.pc(), orig_pc, "pc restored");
+        assert_eq!(vcpu.sp(), orig_sp, "sp restored");
+        assert_eq!(vcpu.reg(19), 0xdead, "x19 restored");
+        assert_eq!(vcpu.reg(0), 0x1234, "x0 restored");
+        assert_eq!(vcpu.rflags(), orig_pstate, "pstate (NZCV) restored");
+        assert_eq!(cx.cur.blocked, 0, "signal mask restored");
     }
 
     #[test]

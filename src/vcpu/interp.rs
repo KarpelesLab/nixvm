@@ -3519,6 +3519,24 @@ impl Vcpu for Aarch64Interp {
     fn set_sp(&mut self, sp: u64) {
         self.sp = sp;
     }
+    /// PSTATE, packed with the condition flags in their architectural bits
+    /// (`N`=31, `Z`=30, `C`=29, `V`=28) — the only fields the interpreter models.
+    /// Signal delivery saves this into `uc_mcontext.pstate`; `rt_sigreturn`
+    /// restores it via [`Self::set_rflags`].
+    fn rflags(&self) -> u64 {
+        (u64::from(self.flags.n) << 31)
+            | (u64::from(self.flags.z) << 30)
+            | (u64::from(self.flags.c) << 29)
+            | (u64::from(self.flags.v) << 28)
+    }
+    fn set_rflags(&mut self, value: u64) {
+        self.flags = Flags {
+            n: value & (1 << 31) != 0,
+            z: value & (1 << 30) != 0,
+            c: value & (1 << 29) != 0,
+            v: value & (1 << 28) != 0,
+        };
+    }
     fn set_tls(&mut self, value: u64) {
         self.tpidr = value;
     }
