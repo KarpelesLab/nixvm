@@ -218,10 +218,13 @@ impl Kernel {
             let sig = u64::from(ready.trailing_zeros()) + 1;
             cx.cur.pending &= !(1u64 << (sig - 1));
             cx.cur.wake_deadline = None;
-            // Consume the queued siginfo so sigwaitinfo reports the same
-            // si_code/si_value a handler would have seen (and it isn't
-            // re-delivered later).
-            let q = cx.cur.queued_siginfo[sig as usize].take();
+            // Consume one queued instance so sigwaitinfo reports the same
+            // si_code/si_value a handler would have seen. A real-time signal
+            // dequeues FIFO; if more remain, keep its pending bit set.
+            let (q, more) = cx.cur.take_siginfo(sig);
+            if more {
+                cx.cur.pending |= 1u64 << (sig - 1);
+            }
             if info != 0 {
                 let mut si = [0u8; 128];
                 si[0..4].copy_from_slice(&(sig as i32).to_le_bytes()); // si_signo
@@ -272,23 +275,28 @@ impl Kernel {
     /// (`tkill`/`tgkill` reach here too — they always pass a positive tid, so only
     /// the single-target branch fires.)
     pub(super) fn sys_kill(&self, sh: &mut Shared, cx: &mut ServiceCtx, pid: i64, sig: u64) -> i64 {
+        // A bare kill carries SI_USER (code 0) with the sender's pid.
+        let sender = super::QueuedSig { code: 0, pid: cx.cur.pid, uid: 0, value: 0 };
+        self.post_signal(sh, cx, pid, sig, sender)
+    }
+
+    /// The shared core of `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`: post `sig`
+    /// (with its accompanying `info`) to the POSIX target(s). `sender`-vs-queued
+    /// siginfo differs only in the `info` the caller supplies.
+    pub(super) fn post_signal(&self, sh: &mut Shared, cx: &mut ServiceCtx, pid: i64, sig: u64, sender: super::QueuedSig) -> i64 {
         if sig > NSIG {
             return err(Errno::EINVAL);
         }
         let deliver = sig != 0; // sig == 0 is an existence/permission probe
         let bit = if deliver { 1u64 << (sig - 1) } else { 0 };
         let cur_pid = i64::from(cx.cur.pid);
-        // The siginfo a caught handler sees: SI_USER (0) with the sender's pid.
-        // (rt_sigqueueinfo overwrites this with SI_QUEUE + the value afterward.)
-        let sender = super::QueuedSig { code: 0, pid: cx.cur.pid, uid: 0, value: 0 };
-        let s = sig as usize;
 
         // Single process (or a tkill/tgkill tid): the common path.
         if pid > 0 {
             if pid == cur_pid {
                 cx.cur.pending |= bit;
                 if deliver {
-                    cx.cur.queued_siginfo[s] = Some(sender);
+                    cx.cur.post_siginfo(sig, sender);
                 }
                 return 0;
             }
@@ -297,7 +305,7 @@ impl Kernel {
                     slot.info.pending |= bit;
                     slot.info.parked = false;
                     if deliver {
-                        slot.info.queued_siginfo[s] = Some(sender);
+                        slot.info.post_siginfo(sig, sender);
                     }
                     return 0;
                 }
@@ -317,7 +325,7 @@ impl Kernel {
         if target_pgrp.is_none_or(|pg| pgid_of(&cx.cur) == pg) {
             cx.cur.pending |= bit;
             if deliver {
-                cx.cur.queued_siginfo[s] = Some(sender);
+                cx.cur.post_siginfo(sig, sender);
             }
             hit = true;
         }
@@ -330,7 +338,7 @@ impl Kernel {
                 slot.info.pending |= bit;
                 slot.info.parked = false;
                 if deliver {
-                    slot.info.queued_siginfo[s] = Some(sender);
+                    slot.info.post_siginfo(sig, sender);
                 }
                 hit = true;
             }
@@ -355,21 +363,9 @@ impl Kernel {
         let code = mem.read_u32(uinfo + 8).map_or(-1, |v| v as i32);
         let value = mem.read_u64(uinfo + 24).unwrap_or(0);
         let info = QueuedSig { code, pid: cx.cur.pid, uid: 0, value };
-        let r = self.sys_kill(sh, cx, pid, sig);
-        if r == 0 && sig != 0 && sig <= NSIG {
-            let s = sig as usize;
-            if pid == i64::from(cx.cur.pid) {
-                cx.cur.queued_siginfo[s] = Some(info);
-            } else {
-                for slot in sh.procs.iter_mut().flatten() {
-                    if i64::from(slot.info.pid) == pid {
-                        slot.info.queued_siginfo[s] = Some(info);
-                        break;
-                    }
-                }
-            }
-        }
-        r
+        // Post with the caller's siginfo directly (a real-time signal thereby
+        // queues this exact value; a standard one records it).
+        self.post_signal(sh, cx, pid, sig, info)
     }
 
     /// The signal (`1..=NSIG`) whose *real handler* [`Self::deliver_pending_signals`]
@@ -421,8 +417,8 @@ impl Kernel {
             // Clear the pending bit: every branch below acts on this signal.
             cx.cur.pending &= !bit;
             match cx.cur.handlers[sig as usize].handler {
-                // Ignored explicitly: drop it and keep scanning.
-                SIG_IGN => {}
+                // Ignored explicitly: drop it (and any queued RT instances).
+                SIG_IGN => cx.cur.drain_rt(sig),
                 // A real handler: push the frame + redirect the vcpu, then STOP —
                 // the guest runs the handler now; any remaining pendings deliver
                 // at the next syscall boundary. Returns whether the frame built.
@@ -430,7 +426,7 @@ impl Kernel {
                     return self.deliver_async_signal(cx, sig, vcpu, mem);
                 }
                 // SIG_DFL: ignore the "ignored-by-default" set, else terminate.
-                _ if is_default_ignored(sig) => {}
+                _ if is_default_ignored(sig) => cx.cur.drain_rt(sig),
                 _ => {
                     cx.cur.run = RunState::Zombie(ExitCause::Signaled(sig as i32));
                     return false;
@@ -576,15 +572,19 @@ impl Kernel {
         }
         // Carry the siginfo the sender queued (sigqueue's si_value/si_code, or a
         // sender pid); a bare `kill`/on-exit SIGCHLD leaves it SI_USER (all 0).
-        let si = cx.cur.queued_siginfo[sig as usize]
-            .take()
-            .map_or(SiFields::default(), |q| SiFields {
-                code: q.code as u32 as u64,
-                addr: 0,
-                pid: u64::from(q.pid as u32),
-                uid: u64::from(q.uid),
-                value: q.value,
-            });
+        // A real-time signal dequeues one instance FIFO; if more remain queued,
+        // re-arm its pending bit so the next boundary delivers the next one.
+        let (info, more) = cx.cur.take_siginfo(sig);
+        if more {
+            cx.cur.pending |= 1u64 << (sig - 1);
+        }
+        let si = info.map_or(SiFields::default(), |q| SiFields {
+            code: q.code as u32 as u64,
+            addr: 0,
+            pid: u64::from(q.pid as u32),
+            uid: u64::from(q.uid),
+            value: q.value,
+        });
         self.push_sigframe(cx, sig, 0, si, restore, vcpu, mem)
     }
 

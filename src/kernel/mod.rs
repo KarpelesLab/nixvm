@@ -176,14 +176,17 @@ struct ProcInfo {
     /// not dumpable, `2` = dumpable-by-root. Sandboxes set this and re-read it,
     /// so it must round-trip even though we never produce core dumps.
     dumpable: u64,
-    /// The siginfo accompanying each pending signal (index = signal number),
-    /// so an `SA_SIGINFO` handler sees the right `si_code`/`si_pid`/`si_value`.
-    /// The `pending` bitmask decides *whether* a signal is delivered; this
-    /// carries the *detail* for the one that is. Because `pending` coalesces a
-    /// repeated signal into one bit, this likewise keeps the most recent info
-    /// (a real kernel queues real-time signals — an accepted simplification).
-    /// `None` for a signal posted without siginfo (a bare `kill`, a fault).
+    /// The siginfo accompanying each pending *standard* signal (index = signal
+    /// number), so an `SA_SIGINFO` handler sees the right `si_code`/`si_pid`/
+    /// `si_value`. Standard signals coalesce (one `pending` bit), so this keeps
+    /// the most recent info; `None` for a signal posted without siginfo (a bare
+    /// `kill`, a fault). Real-time signals use [`Self::rt_queue`] instead.
     queued_siginfo: [Option<QueuedSig>; NSIG_SLOTS],
+    /// Real-time signals (`>= SIGRTMIN`, 32) *queue* rather than coalesce: each
+    /// send is delivered separately, FIFO, carrying its own `si_value`. Keyed by
+    /// signal number; the `pending` bit for an RT signal mirrors "its queue is
+    /// non-empty".
+    rt_queue: BTreeMap<u32, VecDeque<QueuedSig>>,
 }
 
 /// The subset of `siginfo_t` a queued/sent signal carries beyond its number,
@@ -254,6 +257,51 @@ impl Default for ProcInfo {
             pdeathsig: 0,
             dumpable: 1,
             queued_siginfo: [None; NSIG_SLOTS],
+            rt_queue: BTreeMap::new(),
+        }
+    }
+}
+
+impl ProcInfo {
+    /// Record the siginfo for a just-posted signal. Real-time signals (`>=
+    /// SIGRTMIN`) append to their FIFO queue (each delivery is distinct);
+    /// standard signals coalesce, keeping the newest info.
+    fn post_siginfo(&mut self, sig: u64, qs: QueuedSig) {
+        if sig >= SIGRTMIN {
+            self.rt_queue.entry(sig as u32).or_default().push_back(qs);
+        } else if (sig as usize) < NSIG_SLOTS {
+            self.queued_siginfo[sig as usize] = Some(qs);
+        }
+    }
+
+    /// Consume the siginfo for a signal about to be delivered/dequeued, and
+    /// report whether *more* of that signal remains queued (only possible for
+    /// real-time signals, whose `pending` bit must then stay set to redeliver).
+    fn take_siginfo(&mut self, sig: u64) -> (Option<QueuedSig>, bool) {
+        if sig >= SIGRTMIN {
+            if let Some(q) = self.rt_queue.get_mut(&(sig as u32)) {
+                let info = q.pop_front();
+                let more = !q.is_empty();
+                if !more {
+                    self.rt_queue.remove(&(sig as u32));
+                }
+                return (info, more);
+            }
+            return (None, false);
+        }
+        let info = if (sig as usize) < NSIG_SLOTS {
+            self.queued_siginfo[sig as usize].take()
+        } else {
+            None
+        };
+        (info, false)
+    }
+
+    /// Drop a real-time signal's whole queue (it was ignored / the process is
+    /// dying). A no-op for standard signals.
+    fn drain_rt(&mut self, sig: u64) {
+        if sig >= SIGRTMIN {
+            self.rt_queue.remove(&(sig as u32));
         }
     }
 }
@@ -351,6 +399,9 @@ const SA_NODEFER: u64 = 0x4000_0000;
 /// `sigaction` flag: reset the disposition to `SIG_DFL` on entry to the handler
 /// (a one-shot handler; the classic `signal()` semantics).
 const SA_RESETHAND: u64 = 0x8000_0000;
+/// Lowest real-time signal (`SIGRTMIN` at the kernel ABI). Signals `>=` this
+/// queue rather than coalesce.
+const SIGRTMIN: u64 = 32;
 /// The synchronous fault signals this kernel can deliver to a handler.
 const SIGILL: u64 = 4;
 const SIGSEGV: u64 = 11;
