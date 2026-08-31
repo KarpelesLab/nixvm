@@ -5121,8 +5121,15 @@ impl Kernel {
                     None => return err(Errno::ENOENT),
                 }
             }
+            // A pty slave is the `/dev/pts/N` char device: resolve it through the
+            // same path a bare `stat("/dev/pts/N")` takes, so the fd's `st_dev`/
+            // `st_ino` match the path's — the equality `ttyname()` checks.
+            Some(Fd::PtySlave(n)) => {
+                let n = *n;
+                vfs.stat(&format!("/dev/pts/{n}")).unwrap_or_else(stat::char_device_attrs)
+            }
             // eventfd/timerfd/epoll are anonymous-inode char-device-like fds;
-            // pty ends are genuine tty char devices.
+            // the pty master is a genuine tty char device.
             Some(
                 Fd::Stdin
                 | Fd::Stdout
@@ -5131,8 +5138,7 @@ impl Kernel {
                 | Fd::Signalfd(_)
                 | Fd::Timerfd(_)
                 | Fd::Epoll(_)
-                | Fd::PtyMaster(_)
-                | Fd::PtySlave(_),
+                | Fd::PtyMaster(_),
             ) => stat::char_device_attrs(),
             Some(Fd::PipeRead(_) | Fd::PipeWrite(_)) => stat::fifo_attrs(),
             Some(Fd::Socket { .. }) => stat::socket_attrs(),

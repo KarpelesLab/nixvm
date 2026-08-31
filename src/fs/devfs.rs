@@ -41,6 +41,9 @@ const BLK_MODE: u32 = S_IFBLK | 0o666;
 
 /// Inode of the `/dev` root directory.
 const ROOT_INODE: u64 = 1;
+/// Base inode for `/dev/pts/<N>` slaves; `+ N` keeps them distinct and clear of
+/// the small fixed `/dev` inodes.
+const PTS_INODE_BASE: u64 = 0x1000;
 
 /// Encode a device number from `major`/`minor` using the Linux glibc `makedev`
 /// layout (matching `crate::kernel::stat::makedev`). For the small in-range
@@ -166,6 +169,28 @@ impl DevFs {
         DIRS.iter()
             .find(|(n, _)| *n == name)
             .map(|(_, inode)| *inode)
+    }
+
+    /// Parse a `pts/<N>` relative path into the slave number `N`.
+    fn pts_lookup(rel: &str) -> Option<u64> {
+        rel.strip_prefix("pts/").and_then(|n| n.parse::<u64>().ok())
+    }
+
+    /// Char-device attributes for pty slave `n` (`/dev/pts/<n>`, major 136). The
+    /// inode is derived from `n` so a slave fd's `fstat` (which routes here) and a
+    /// path `stat` agree — the equality `ttyname()` requires.
+    fn pts_attrs(n: u64) -> Attrs {
+        Attrs {
+            kind: NodeKind::CharDevice,
+            size: 0,
+            mode: S_IFCHR | 0o620,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+            inode: PTS_INODE_BASE + n,
+            nlink: 1,
+            rdev: makedev(136, n),
+        }
     }
 
     /// Look up a symlink name, returning its `(inode, target)`.
@@ -294,6 +319,13 @@ impl MountFs for DevFs {
                 nlink: 1,
                 rdev: 0,
             });
+        }
+        // `/dev/pts/<N>` — a pty slave. The pty table owns which slaves are open,
+        // but a bare `stat` here is what `ttyname()` verifies the `/proc/self/fd`
+        // readlink against (it compares this against the slave fd's `fstat`), so
+        // any numeric name resolves to the matching char device (major 136).
+        if let Some(n) = Self::pts_lookup(rel) {
+            return Some(Self::pts_attrs(n));
         }
         Self::symlink_lookup(rel).map(|(inode, target)| Attrs {
             kind: NodeKind::Symlink,
