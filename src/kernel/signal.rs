@@ -278,17 +278,27 @@ impl Kernel {
         let deliver = sig != 0; // sig == 0 is an existence/permission probe
         let bit = if deliver { 1u64 << (sig - 1) } else { 0 };
         let cur_pid = i64::from(cx.cur.pid);
+        // The siginfo a caught handler sees: SI_USER (0) with the sender's pid.
+        // (rt_sigqueueinfo overwrites this with SI_QUEUE + the value afterward.)
+        let sender = super::QueuedSig { code: 0, pid: cx.cur.pid, uid: 0, value: 0 };
+        let s = sig as usize;
 
         // Single process (or a tkill/tgkill tid): the common path.
         if pid > 0 {
             if pid == cur_pid {
                 cx.cur.pending |= bit;
+                if deliver {
+                    cx.cur.queued_siginfo[s] = Some(sender);
+                }
                 return 0;
             }
             for slot in sh.procs.iter_mut().flatten() {
                 if i64::from(slot.info.pid) == pid {
                     slot.info.pending |= bit;
                     slot.info.parked = false;
+                    if deliver {
+                        slot.info.queued_siginfo[s] = Some(sender);
+                    }
                     return 0;
                 }
             }
@@ -306,6 +316,9 @@ impl Kernel {
         let mut hit = false;
         if target_pgrp.is_none_or(|pg| pgid_of(&cx.cur) == pg) {
             cx.cur.pending |= bit;
+            if deliver {
+                cx.cur.queued_siginfo[s] = Some(sender);
+            }
             hit = true;
         }
         for slot in sh.procs.iter_mut().flatten() {
@@ -316,6 +329,9 @@ impl Kernel {
             if is_target {
                 slot.info.pending |= bit;
                 slot.info.parked = false;
+                if deliver {
+                    slot.info.queued_siginfo[s] = Some(sender);
+                }
                 hit = true;
             }
         }
