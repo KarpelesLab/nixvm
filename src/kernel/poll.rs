@@ -276,7 +276,7 @@ impl Kernel {
             // A host-bridged socket gets a precise readable answer (a peek);
             // in-VM loopback sockets stay best-effort always-ready, since
             // their queues aren't observable from here.
-            Fd::Socket { sock, .. } => self.host_socket_readiness(net, sock).unwrap_or(POLLIN | POLLOUT),
+            Fd::Socket { sock, end } => self.sock_readiness(net, sock, end),
             Fd::PipeRead(i) => {
                 let p = &pipes[i];
                 if !p.buf.is_empty() {
@@ -1298,6 +1298,33 @@ mod tests {
         // Linux reports POLLHUP (0x10) alone at EOF, not POLLIN — a read would
         // return 0, so there is no data to signal with POLLIN.
         assert_eq!(mem.read_vec(pollfds + 6, 2).unwrap(), 0x10u16.to_le_bytes());
+    }
+
+    #[test]
+    fn poll_idle_socket_is_not_readable_but_wakes_on_data() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let fds = 0x1_0000;
+        // socketpair(AF_UNIX, SOCK_STREAM, 0, fds)
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, fds, 0, 0]), 0);
+        let a = u64::from(mem.read_u32(fds).unwrap());
+        let b = u64::from(mem.read_u32(fds + 4).unwrap());
+
+        let pollfds = 0x1_2000;
+        mem.write_init(pollfds, &(a as u32).to_le_bytes()).unwrap();
+        mem.write_init(pollfds + 4, &1u16.to_le_bytes()).unwrap(); // POLLIN
+        mem.write_init(pollfds + 6, &0u16.to_le_bytes()).unwrap();
+        // Idle connected socket with no buffered data must NOT report POLLIN —
+        // otherwise a level-triggered event loop busy-spins (recv → EAGAIN).
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Poll, [pollfds, 1, 0, 0, 0, 0]), 0);
+
+        // A write to the peer end makes it readable.
+        let msg = 0x1_3000;
+        mem.write_init(msg, b"hi").unwrap();
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Write, [b, msg, 2, 0, 0, 0]);
+        mem.write_init(pollfds + 6, &0u16.to_le_bytes()).unwrap();
+        let n = call(&k, &mut cx, &mut mem, &mut v, Sysno::Poll, [pollfds, 1, 0, 0, 0, 0]);
+        assert_eq!(n, 1);
+        assert_eq!(mem.read_vec(pollfds + 6, 2).unwrap(), 1u16.to_le_bytes());
     }
 
     #[test]

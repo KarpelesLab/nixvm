@@ -1347,6 +1347,53 @@ impl Kernel {
         }
     }
 
+    /// Poll/epoll readiness for a socket fd's end `e`, covering host-bridged
+    /// sockets, in-VM stream pairs, listeners, and datagram sockets. Crucially,
+    /// an idle connected pair with **no buffered data is not readable** — the old
+    /// blanket `POLLIN | POLLOUT` for in-VM sockets made level-triggered event
+    /// loops (libuv/Node/Bun/tokio) busy-spin at 100% CPU: poll said "readable",
+    /// the follow-up `recv` returned `EAGAIN`, and the loop repeated forever.
+    pub(super) fn sock_readiness(&self, net: &mut Net, sock: usize, end: usize) -> u32 {
+        const POLLIN: u32 = 0x1;
+        const POLLOUT: u32 = 0x4;
+        const POLLHUP: u32 = 0x10;
+        // Host-bridged sockets (egress TCP, host-backed UDP) get a precise answer.
+        if let Some(m) = self.host_socket_readiness(net, sock) {
+            return m;
+        }
+        match net.socks.get(sock).map(|s| &s.kind) {
+            Some(Kind::Pair(p)) => {
+                let e = end.min(1);
+                let peer_closed = p.refs[1 - e] == 0;
+                // EOF (a read returns 0 without blocking): our inbound queue is
+                // drained and the peer is gone / shut its write / we shut our read.
+                let eof = p.to[e].is_empty()
+                    && (peer_closed || p.shut_wr[1 - e] || p.shut_rd[e]);
+                let mut m = 0;
+                if !p.to[e].is_empty() || eof {
+                    m |= POLLIN;
+                }
+                if !p.shut_wr[e] {
+                    m |= POLLOUT; // unbounded send buffer → always writable
+                }
+                if peer_closed {
+                    m |= POLLHUP;
+                }
+                m
+            }
+            // A listener is readable exactly when a connection is pending to accept.
+            Some(Kind::Listener { backlog, .. }) => {
+                if backlog.is_empty() { 0 } else { POLLIN }
+            }
+            // A datagram socket is readable when a datagram is queued.
+            Some(Kind::Dgram(d)) => POLLOUT | if d.queue.is_empty() { 0 } else { POLLIN },
+            // Netlink replies are synchronous; an unconnected/idle socket is just
+            // writable. Neither should report a spurious POLLIN.
+            Some(Kind::Netlink(_)) => POLLIN | POLLOUT,
+            _ => POLLOUT,
+        }
+    }
+
     pub(super) fn host_socket_readiness(&self, net: &mut Net, sock: usize) -> Option<u32> {
         const POLLIN: u32 = 0x1;
         const POLLOUT: u32 = 0x4;
