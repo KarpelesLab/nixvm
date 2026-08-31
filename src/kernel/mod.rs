@@ -345,6 +345,12 @@ const SA_ONSTACK: u64 = 0x0800_0000;
 /// `sigaction` flag: restart an interruptible syscall after the handler returns
 /// (rather than failing it with `EINTR`).
 const SA_RESTART: u64 = 0x1000_0000;
+/// `sigaction` flag: don't block the signal itself while its handler runs, so
+/// the handler can be re-entered by another instance of the same signal.
+const SA_NODEFER: u64 = 0x4000_0000;
+/// `sigaction` flag: reset the disposition to `SIG_DFL` on entry to the handler
+/// (a one-shot handler; the classic `signal()` semantics).
+const SA_RESETHAND: u64 = 0x8000_0000;
 /// The synchronous fault signals this kernel can deliver to a handler.
 const SIGILL: u64 = 4;
 const SIGSEGV: u64 = 11;

@@ -17,7 +17,7 @@
 //! [`Kernel::sys_rt_sigsuspend`] for SIGCHLD — wake, run its handler, and reap.
 //! A signal left at its default disposition still takes the default action.
 
-use super::{ExitCause, Kernel, QueuedSig, RunState, SA_ONSTACK, SIGSEGV, SS_DISABLE, ServiceCtx, Shared, err, pgid_of};
+use super::{ExitCause, Kernel, QueuedSig, RunState, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SIGSEGV, SS_DISABLE, ServiceCtx, Shared, err, pgid_of};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
@@ -676,8 +676,18 @@ impl Kernel {
         vcpu.set_reg(0, 0); // rax cleared, per the SysV entry convention
         vcpu.set_sp(frame);
         vcpu.set_pc(act.handler);
-        // Block this signal (unless SA_NODEFER) plus the handler's mask.
-        cx.cur.blocked |= act.mask | (1u64 << (sig - 1));
+        // Block the handler's mask, and this signal too *unless* SA_NODEFER —
+        // without honoring SA_NODEFER a handler that re-raises its own signal
+        // could never re-enter, and (with our redelivery loop) deadlocks.
+        cx.cur.blocked |= act.mask;
+        if act.flags & SA_NODEFER == 0 {
+            cx.cur.blocked |= 1u64 << (sig - 1);
+        }
+        // SA_RESETHAND (one-shot): reset the disposition to SIG_DFL on entry, so
+        // a second delivery takes the default action (classic `signal()`).
+        if act.flags & SA_RESETHAND != 0 {
+            cx.cur.handlers[sig as usize] = super::SigAction::default();
+        }
         true
     }
 
