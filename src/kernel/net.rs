@@ -368,6 +368,11 @@ impl Pair {
 struct Dgram {
     local: Option<InetAddr>,
     peer: Option<InetAddr>,
+    /// The slot index of the connected peer for a `socketpair(AF_UNIX,
+    /// SOCK_DGRAM)` pair: a `write`/`send` on this socket delivers a datagram
+    /// straight into that slot's `queue`, with no address namespace involved.
+    /// `None` for a standalone (named/INET) datagram socket.
+    pair_peer: Option<usize>,
     queue: VecDeque<(InetAddr, Vec<u8>)>,
     /// A host UDP socket, opened lazily the first time this datagram socket
     /// sends to a *routable* address with egress enabled. Once present, all
@@ -634,21 +639,45 @@ impl Kernel {
         if domain as u16 != AF_UNIX {
             return err(Errno::EAFNOSUPPORT);
         }
-        if sotype & 0xf != SOCK_STREAM {
+        let base_type = sotype & 0xf;
+        if base_type != SOCK_STREAM && base_type != SOCK_DGRAM {
             return err(Errno::EOPNOTSUPP);
         }
         let nonblock = sotype & SOCK_NONBLOCK != 0;
-        let mut pair = Pair::new();
-        pair.nonblock = [nonblock, nonblock];
-        let idx = net.socks.len();
-        net.socks.push(Sock {
-            domain: AF_UNIX,
-            kind: Kind::Pair(pair),
-            nonblock,
-            opts: SockOpts::default(),
-        });
-        let fd0 = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
-        let fd1 = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 1 });
+        // A datagram socketpair is two connected `Dgram` slots that deliver
+        // straight into each other's queue (no address namespace); a stream
+        // socketpair is a single two-ended `Pair`. The two fds returned differ
+        // accordingly: (slotA end0, slotB end0) for dgram, (slot end0, slot
+        // end1) for stream.
+        let (idx0, idx1, end0, end1) = if base_type == SOCK_DGRAM {
+            let a = net.socks.len();
+            let b = a + 1;
+            for peer in [b, a] {
+                net.socks.push(Sock {
+                    domain: AF_UNIX,
+                    kind: Kind::Dgram(Dgram {
+                        pair_peer: Some(peer),
+                        ..Dgram::default()
+                    }),
+                    nonblock,
+                    opts: SockOpts::default(),
+                });
+            }
+            (a, b, 0, 0)
+        } else {
+            let mut pair = Pair::new();
+            pair.nonblock = [nonblock, nonblock];
+            let idx = net.socks.len();
+            net.socks.push(Sock {
+                domain: AF_UNIX,
+                kind: Kind::Pair(pair),
+                nonblock,
+                opts: SockOpts::default(),
+            });
+            (idx, idx, 0, 1)
+        };
+        let fd0 = cx.cur.fds.alloc(Fd::Socket { sock: idx0, end: end0 });
+        let fd1 = cx.cur.fds.alloc(Fd::Socket { sock: idx1, end: end1 });
         let cloexec = sotype & SOCK_CLOEXEC != 0;
         cx.cur.fds.set_cloexec(fd0, cloexec);
         cx.cur.fds.set_cloexec(fd1, cloexec);
@@ -2037,6 +2066,16 @@ impl Kernel {
             return self.handle_netlink_request(net, sock, data);
         }
         if matches!(net.socks[sock].kind, Kind::Dgram(_)) {
+            // A connected `socketpair(AF_UNIX, SOCK_DGRAM)` end: deliver the
+            // datagram straight into the peer slot's queue (no addresses).
+            if let Kind::Dgram(Dgram { pair_peer: Some(tgt), .. }) = &net.socks[sock].kind {
+                let tgt = *tgt;
+                let src = InetAddr { v6: false, port: 0, ip: [0; 16] };
+                if let Kind::Dgram(td) = &mut net.socks[tgt].kind {
+                    td.queue.push_back((src, data.to_vec()));
+                }
+                return data.len() as i64;
+            }
             let peer = match &net.socks[sock].kind {
                 Kind::Dgram(d) => d.peer,
                 _ => unreachable!("checked above"),
@@ -2872,6 +2911,51 @@ mod tests {
             [end0, msg, 1, 0, 0, 0],
         );
         assert_eq!(ret, -i64::from(Errno::EPIPE.0));
+    }
+
+    #[test]
+    fn unix_dgram_socketpair_roundtrip() {
+        // socketpair(AF_UNIX, SOCK_DGRAM) yields a connected datagram pair:
+        // a write on one end is a discrete datagram read on the other, with
+        // MSG_TRUNC when the receive buffer is too small.
+        let (k, mut mem, mut v, mut cx) = setup();
+        let sv = 0x1_0000;
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Socketpair, [1, SOCK_DGRAM, 0, sv, 0, 0]),
+            0
+        );
+        let a = u64::from(mem.read_u32(sv).unwrap());
+        let b = u64::from(mem.read_u32(sv + 4).unwrap());
+        assert!(a >= 3 && b >= 3 && a != b, "two distinct fds: {a},{b}");
+
+        let msg = 0x1_1000;
+        mem.write_init(msg, b"0123456789").unwrap();
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Write, [b, msg, 10, 0, 0, 0]),
+            10
+        );
+        // Read the whole datagram on the other end.
+        let out = 0x1_1100;
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [a, out, 16, 0, 0, 0]),
+            10
+        );
+        assert_eq!(mem.read_vec(out, 10).unwrap(), b"0123456789");
+
+        // A second datagram read into a short buffer truncates (recvfrom with
+        // MSG_TRUNC reports the true length).
+        mem.write_init(msg, b"ABCDEFGHIJ").unwrap();
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Write, [b, msg, 10, 0, 0, 0]),
+            10
+        );
+        const MSG_TRUNC: u64 = 0x20;
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Recvfrom, [a, out, 4, MSG_TRUNC, 0, 0]),
+            10,
+            "MSG_TRUNC reports the full datagram length"
+        );
+        assert_eq!(mem.read_vec(out, 4).unwrap(), b"ABCD");
     }
 
     #[test]
