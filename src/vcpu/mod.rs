@@ -42,15 +42,27 @@ pub use mem::{GuestMemory, MemError, Prot};
 /// first use.
 #[must_use]
 pub(crate) fn preempt_quantum() -> Option<std::time::Duration> {
-    use std::sync::OnceLock;
-    static Q: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *Q.get_or_init(|| {
-        let ms = std::env::var("NIXVM_QUANTUM_MS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(10);
-        (ms > 0).then(|| std::time::Duration::from_millis(ms))
-    })
+    // wasm32-unknown-unknown has no monotonic clock: `Instant::now()` panics
+    // ("time not implemented on this platform"). Time-based preemption is a
+    // scheduling nicety, not a correctness requirement — the per-run `MAX_STEPS`
+    // budget still bounds a compute-bound slice — so disable it there rather
+    // than crash the browser demo the first time the x86 interpreter runs.
+    #[cfg(target_arch = "wasm32")]
+    {
+        return None;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::OnceLock;
+        static Q: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+        *Q.get_or_init(|| {
+            let ms = std::env::var("NIXVM_QUANTUM_MS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(10);
+            (ms > 0).then(|| std::time::Duration::from_millis(ms))
+        })
+    }
 }
 
 /// Why [`Vcpu::run`] returned control to the kernel.

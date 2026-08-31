@@ -184,12 +184,13 @@ pub(super) fn install_poll_sigmask(cx: &mut ServiceCtx, mask_ptr: u64, mem: &Gue
     cx.cur.blocked = mask;
 }
 
-/// Nanoseconds since the UNIX epoch on the host wall clock.
+/// Nanoseconds since the UNIX epoch on the host wall clock. Routed through
+/// [`crate::clock`] — the platform-safe source that also works on
+/// wasm32-unknown-unknown (which has no `std::time` clock and would otherwise
+/// panic "time not implemented on this platform" the first time the demo's
+/// pump loop consulted a poll/timeout deadline).
 pub(super) fn now_ns() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
+    crate::clock::now_unix().as_nanos()
 }
 
 fn read_u16(mem: &GuestMemory, addr: u64) -> Option<u16> {
