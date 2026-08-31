@@ -170,8 +170,10 @@ impl Kernel {
         0
     }
 
-    /// `mincore(addr, len, vec)` — report residency. Everything mapped here is
-    /// resident, so write `1` for each page spanned by `[addr, addr + len)`.
+    /// `mincore(addr, len, vec)` — report per-page residency. Bit 0 of each byte
+    /// is set only for pages that actually have a backing frame right now; a
+    /// mapped-but-untouched (demand-paged, lazy) page reports 0, matching Linux.
+    /// A range with any unmapped page is rejected with ENOMEM.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_mincore(
         &self,
@@ -183,8 +185,22 @@ impl Kernel {
         if len == 0 {
             return 0;
         }
-        let pages = ((page_up(addr + len) - page_down(addr)) / PAGE_SIZE) as usize;
-        let resident = vec![1u8; pages];
+        // addr must be page-aligned (Linux answers EINVAL otherwise).
+        if addr % PAGE_SIZE != 0 {
+            return err(Errno::EINVAL);
+        }
+        let start = page_down(addr);
+        let end = page_up(addr + len);
+        let pages = ((end - start) / PAGE_SIZE) as usize;
+        let mut resident = vec![0u8; pages];
+        for (i, r) in resident.iter_mut().enumerate() {
+            let p = start + i as u64 * PAGE_SIZE;
+            // A hole anywhere in the range makes the whole call ENOMEM.
+            if mem.page_prot(p).is_none() {
+                return err(Errno::ENOMEM);
+            }
+            *r = u8::from(mem.is_resident(p));
+        }
         if mem.write(vec, &resident).is_err() {
             return err(Errno::EFAULT);
         }
@@ -326,12 +342,27 @@ mod tests {
     }
 
     #[test]
-    fn mincore_reports_resident() {
+    fn mincore_reports_real_residency() {
         let (k, mut mem, _cx) = setup();
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
-        let vec = 0x1_0000;
-        assert_eq!(k.sys_mincore(0x1_1000, 2 * PAGE, vec, &mut mem), 0);
-        assert_eq!(mem.read_vec(vec, 2).unwrap(), vec![1, 1]);
+        // Touch pages 0 and 2 so they get a backing frame; 1 and 3 stay lazy.
+        mem.write_u64(0x1_0000, 1).unwrap();
+        mem.write_u64(0x1_0000 + 2 * PAGE, 1).unwrap();
+        let out = 0x1_0000; // report vector shares page 0 (already resident)
+        assert_eq!(k.sys_mincore(0x1_0000, 4 * PAGE, out, &mut mem), 0);
+        // 1 only for the touched (resident) pages, 0 for the demand-paged ones.
+        assert_eq!(mem.read_vec(out, 4).unwrap(), vec![1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn mincore_over_unmapped_is_enomem() {
+        let (k, mut mem, _cx) = setup();
+        mem.map(0x1_0000, PAGE, Prot::rw()).unwrap();
+        // Range extends into an unmapped page → ENOMEM.
+        assert_eq!(
+            k.sys_mincore(0x1_0000, 2 * PAGE, 0x1_0000, &mut mem),
+            err(Errno::ENOMEM),
+        );
     }
 
     #[test]
