@@ -3,7 +3,7 @@
 [![CI](https://github.com/KarpelesLab/nixvm/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/nixvm/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/nixvm.svg)](https://crates.io/crates/nixvm)
 [![docs.rs](https://img.shields.io/docsrs/nixvm)](https://docs.rs/nixvm)
-[![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Browser demo](https://img.shields.io/badge/demo-live-brightgreen.svg)](https://karpeleslab.github.io/nixvm/)
 
 **A portable, VM-style sandbox that runs a real Linux userland by emulating
@@ -190,4 +190,4 @@ Useful environment variables (both harnesses):
 
 ## License
 
-Apache-2.0 OR MIT, at your option.
+MIT — see [LICENSE](LICENSE).
