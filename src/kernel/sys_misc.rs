@@ -9,7 +9,199 @@ use super::{Kernel, ServiceCtx, Shared, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
+/// A `set*id` argument's "leave unchanged" sentinel is `(uid_t)-1`, which the
+/// guest passes zero-extended as `0xFFFF_FFFF`. Returns the new id, or `None`
+/// to leave the field alone.
+fn opt_id(v: u64) -> Option<u32> {
+    let v = v as u32;
+    (v != u32::MAX).then_some(v)
+}
+
 impl Kernel {
+    /// `setuid(uid)`: a privileged process (euid 0) sets the real, effective,
+    /// saved, and fs uid all to `uid`; an unprivileged one may only set the
+    /// effective (and fs) uid to its real or saved uid, else `EPERM`.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_setuid(&self, cx: &mut ServiceCtx, uid: u32) -> i64 {
+        let c = &mut cx.cur.creds;
+        if c.euid == 0 {
+            c.ruid = uid;
+            c.euid = uid;
+            c.suid = uid;
+            c.fsuid = uid;
+            0
+        } else if uid == c.ruid || uid == c.suid {
+            c.euid = uid;
+            c.fsuid = uid;
+            0
+        } else {
+            err(Errno::EPERM)
+        }
+    }
+
+    /// `setgid(gid)` — the group analogue of [`Self::sys_setuid`] (privilege is
+    /// still determined by the *user* euid).
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_setgid(&self, cx: &mut ServiceCtx, gid: u32) -> i64 {
+        let privileged = cx.cur.creds.euid == 0;
+        let c = &mut cx.cur.creds;
+        if privileged {
+            c.rgid = gid;
+            c.egid = gid;
+            c.sgid = gid;
+            c.fsgid = gid;
+            0
+        } else if gid == c.rgid || gid == c.sgid {
+            c.egid = gid;
+            c.fsgid = gid;
+            0
+        } else {
+            err(Errno::EPERM)
+        }
+    }
+
+    /// `setresuid(ruid, euid, suid)` — set each id independently (`-1` leaves it
+    /// unchanged). Privileged sets any; unprivileged only among its current
+    /// real/effective/saved uids.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_setresuid(&self, cx: &mut ServiceCtx, r: u64, e: u64, s: u64) -> i64 {
+        let c = cx.cur.creds;
+        let privileged = c.euid == 0;
+        let ok = |id: u32| privileged || id == c.ruid || id == c.euid || id == c.suid;
+        for id in [opt_id(r), opt_id(e), opt_id(s)].into_iter().flatten() {
+            if !ok(id) {
+                return err(Errno::EPERM);
+            }
+        }
+        let c = &mut cx.cur.creds;
+        if let Some(v) = opt_id(r) {
+            c.ruid = v;
+        }
+        if let Some(v) = opt_id(e) {
+            c.euid = v;
+            c.fsuid = v;
+        }
+        if let Some(v) = opt_id(s) {
+            c.suid = v;
+        }
+        0
+    }
+
+    /// `setresgid(rgid, egid, sgid)` — the group analogue.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_setresgid(&self, cx: &mut ServiceCtx, r: u64, e: u64, s: u64) -> i64 {
+        let c = cx.cur.creds;
+        let privileged = c.euid == 0;
+        let ok = |id: u32| privileged || id == c.rgid || id == c.egid || id == c.sgid;
+        for id in [opt_id(r), opt_id(e), opt_id(s)].into_iter().flatten() {
+            if !ok(id) {
+                return err(Errno::EPERM);
+            }
+        }
+        let c = &mut cx.cur.creds;
+        if let Some(v) = opt_id(r) {
+            c.rgid = v;
+        }
+        if let Some(v) = opt_id(e) {
+            c.egid = v;
+            c.fsgid = v;
+        }
+        if let Some(v) = opt_id(s) {
+            c.sgid = v;
+        }
+        0
+    }
+
+    /// `setreuid(ruid, euid)` — set real and/or effective uid (`-1` leaves one
+    /// unchanged); the saved uid follows the effective uid when either changes.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_setreuid(&self, cx: &mut ServiceCtx, r: u64, e: u64) -> i64 {
+        let c = cx.cur.creds;
+        let privileged = c.euid == 0;
+        if let Some(r) = opt_id(r)
+            && !(privileged || r == c.ruid || r == c.euid)
+        {
+            return err(Errno::EPERM);
+        }
+        if let Some(e) = opt_id(e)
+            && !(privileged || e == c.ruid || e == c.euid || e == c.suid)
+        {
+            return err(Errno::EPERM);
+        }
+        let nc = &mut cx.cur.creds;
+        if let Some(r) = opt_id(r) {
+            nc.ruid = r;
+        }
+        if let Some(e) = opt_id(e) {
+            nc.euid = e;
+            nc.fsuid = e;
+        }
+        // The saved uid tracks the effective uid when the real uid is set or the
+        // effective uid is changed to something other than the old real uid.
+        if opt_id(r).is_some() || opt_id(e).is_some_and(|e| e != c.ruid) {
+            nc.suid = nc.euid;
+        }
+        0
+    }
+
+    /// `setregid(rgid, egid)` — the group analogue of [`Self::sys_setreuid`].
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_setregid(&self, cx: &mut ServiceCtx, r: u64, e: u64) -> i64 {
+        let c = cx.cur.creds;
+        let privileged = c.euid == 0;
+        if let Some(r) = opt_id(r)
+            && !(privileged || r == c.rgid || r == c.egid)
+        {
+            return err(Errno::EPERM);
+        }
+        if let Some(e) = opt_id(e)
+            && !(privileged || e == c.rgid || e == c.egid || e == c.sgid)
+        {
+            return err(Errno::EPERM);
+        }
+        let nc = &mut cx.cur.creds;
+        if let Some(r) = opt_id(r) {
+            nc.rgid = r;
+        }
+        if let Some(e) = opt_id(e) {
+            nc.egid = e;
+            nc.fsgid = e;
+        }
+        if opt_id(r).is_some() || opt_id(e).is_some_and(|e| e != c.rgid) {
+            nc.sgid = nc.egid;
+        }
+        0
+    }
+
+    /// `setfsuid(fsuid)` / `setfsgid(fsgid)` — set the filesystem id, returning
+    /// the *previous* one. Allowed if privileged or the id matches the caller's
+    /// real/effective/saved/current-fs id; otherwise the change is silently
+    /// ignored (the syscall never fails, it just returns the old value).
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_setfsuid(&self, cx: &mut ServiceCtx, fsuid: u64) -> i64 {
+        let c = &mut cx.cur.creds;
+        let old = c.fsuid;
+        if let Some(v) = opt_id(fsuid)
+            && (c.euid == 0 || v == c.ruid || v == c.euid || v == c.suid || v == c.fsuid)
+        {
+            c.fsuid = v;
+        }
+        i64::from(old)
+    }
+
+    /// `setfsgid(fsgid)` — the group analogue of [`Self::sys_setfsuid`].
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_setfsgid(&self, cx: &mut ServiceCtx, fsgid: u64) -> i64 {
+        let c = &mut cx.cur.creds;
+        let old = c.fsgid;
+        if let Some(v) = opt_id(fsgid)
+            && (c.euid == 0 || v == c.rgid || v == c.egid || v == c.sgid || v == c.fsgid)
+        {
+            c.fsgid = v;
+        }
+        i64::from(old)
+    }
+
     /// `prctl(option, ...)` — process-attribute get/set. We model the process
     /// name (`PR_SET_NAME`/`PR_GET_NAME`, stored on the kernel) and treat every
     /// other option as a successful no-op.

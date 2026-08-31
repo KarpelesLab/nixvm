@@ -118,6 +118,11 @@ struct ProcInfo {
     pgid: i32,
     /// Session id (`setsid`/`getsid`). `0` means "defaults to `pid`".
     sid: i32,
+    /// Real/effective/saved/fs user and group ids. The VM starts as root
+    /// (all 0); a process may drop privileges (`setuid`/`setgid`/`setres*`),
+    /// after which regaining them is `EPERM` — so a dropped-privilege program
+    /// behaves correctly instead of silently staying root.
+    creds: Creds,
     /// Parked: the task blocked on its last slice (futex/poll/wait4/stdin) and
     /// should not be re-run until something might wake it. Distinct from
     /// `RunState::Running` so the scheduler doesn't busy-spin re-running a
@@ -258,8 +263,24 @@ impl Default for ProcInfo {
             dumpable: 1,
             queued_siginfo: [None; NSIG_SLOTS],
             rt_queue: BTreeMap::new(),
+            creds: Creds::default(),
         }
     }
+}
+
+/// A process's real/effective/saved-set/filesystem user and group ids. Default
+/// is all-zero (root), and privileged (`euid == 0`) transitions can set any id;
+/// once dropped, only the current real/effective/saved set may be restored.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Creds {
+    ruid: u32,
+    euid: u32,
+    suid: u32,
+    fsuid: u32,
+    rgid: u32,
+    egid: u32,
+    sgid: u32,
+    fsgid: u32,
 }
 
 impl ProcInfo {
@@ -2467,11 +2488,28 @@ impl Kernel {
             Sysno::Settimeofday | Sysno::ClockSettime | Sysno::Ptrace => err(Errno::EPERM),
             Sysno::Close => self.sys_close(cx, args[0] as i32),
             Sysno::CloseRange => self.sys_close_range(cx, args[0], args[1]),
-            // Credentials: this VM runs as root and models no multi-user
-            // policy, so the setters all succeed and the getters report root.
-            Sysno::Getresuid | Sysno::Getresgid => {
-                self.sys_getres_id(args[0], args[1], args[2], mem)
+            // Credentials: the VM starts as root but a process may drop
+            // privileges; the ids are tracked per task (see `Creds`).
+            Sysno::Getuid => i64::from(cx.cur.creds.ruid),
+            Sysno::Geteuid => i64::from(cx.cur.creds.euid),
+            Sysno::Getgid => i64::from(cx.cur.creds.rgid),
+            Sysno::Getegid => i64::from(cx.cur.creds.egid),
+            Sysno::Getresuid => {
+                let c = cx.cur.creds;
+                self.sys_getres_id([c.ruid, c.euid, c.suid], args[0], args[1], args[2], mem)
             }
+            Sysno::Getresgid => {
+                let c = cx.cur.creds;
+                self.sys_getres_id([c.rgid, c.egid, c.sgid], args[0], args[1], args[2], mem)
+            }
+            Sysno::Setuid => self.sys_setuid(cx, args[0] as u32),
+            Sysno::Setgid => self.sys_setgid(cx, args[0] as u32),
+            Sysno::Setreuid => self.sys_setreuid(cx, args[0], args[1]),
+            Sysno::Setregid => self.sys_setregid(cx, args[0], args[1]),
+            Sysno::Setresuid => self.sys_setresuid(cx, args[0], args[1], args[2]),
+            Sysno::Setresgid => self.sys_setresgid(cx, args[0], args[1], args[2]),
+            Sysno::Setfsuid => self.sys_setfsuid(cx, args[0]),
+            Sysno::Setfsgid => self.sys_setfsgid(cx, args[0]),
             // Process groups / sessions.
             Sysno::Setpgid => self.sys_setpgid(sh, cx, args[0] as i32, args[1] as i32),
             Sysno::Getpgid => self.sys_getpgid(sh, cx, args[0] as i32),
@@ -2610,10 +2648,6 @@ impl Kernel {
             // modeled yet.
             Sysno::Adjtimex
             | Sysno::ClockAdjtime
-            | Sysno::Getuid
-            | Sysno::Geteuid
-            | Sysno::Getgid
-            | Sysno::Getegid
             | Sysno::SetRobustList
             | Sysno::Fchownat
             | Sysno::Fchown
@@ -2648,16 +2682,7 @@ impl Kernel {
             | Sysno::Readahead
             | Sysno::Fadvise64
             | Sysno::SyncFileRange
-            // Credential setters: single-user (root) VM, so they all succeed
-            // (setfsuid/setfsgid return the previous id, which is always 0).
-            | Sysno::Setuid
-            | Sysno::Setgid
-            | Sysno::Setreuid
-            | Sysno::Setregid
-            | Sysno::Setresuid
-            | Sysno::Setresgid
-            | Sysno::Setfsuid
-            | Sysno::Setfsgid
+            // No supplementary-group model: setgroups succeeds as a no-op.
             | Sysno::Setgroups
             // Namespacing/mount ops we accept but don't model (no real jail
             // layering yet): chroot, mount, umount2 succeed as no-ops.
@@ -3165,9 +3190,9 @@ impl Kernel {
     /// `getresuid`/`getresgid` — write `(real, effective, saved)` = `(0,0,0)`
     /// (this VM is single-user root).
     #[allow(clippy::unused_self)] // method form keeps the dispatch table uniform
-    fn sys_getres_id(&self, a: u64, b: u64, c: u64, mem: &mut GuestMemory) -> i64 {
-        for p in [a, b, c] {
-            if p != 0 && mem.write(p, &0u32.to_le_bytes()).is_err() {
+    fn sys_getres_id(&self, ids: [u32; 3], a: u64, b: u64, c: u64, mem: &mut GuestMemory) -> i64 {
+        for (p, v) in [(a, ids[0]), (b, ids[1]), (c, ids[2])] {
+            if p != 0 && mem.write(p, &v.to_le_bytes()).is_err() {
                 return err(Errno::EFAULT);
             }
         }
