@@ -9,7 +9,7 @@
 //! and either succeed or report the benign "unset" error.
 
 use crate::abi::errno::Errno;
-use crate::fs::MountTable;
+use crate::fs::{MountTable, NodeKind};
 use crate::vcpu::GuestMemory;
 
 use super::{AT_FDCWD, Fd, Kernel, ServiceCtx, Shared, err, io_errno, read_path, stat};
@@ -25,7 +25,10 @@ impl Kernel {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(cx, AT_FDCWD, &rel);
-        let abs = self.follow_symlinks(vfs, &abs).unwrap_or(abs);
+        let abs = match self.follow_or_eloop(vfs, &abs) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
         if vfs.stat(&abs).is_none() {
             return err(Errno::ENOENT);
         }
@@ -180,12 +183,12 @@ impl Kernel {
         }
     }
 
-    /// `utimensat(dirfd, path, times, flags)` — set a node's modification time.
-    /// `times` is `[atime, mtime]`; nixvm models only mtime (there is no atime
-    /// field), so atime is accepted but not stored. A NULL `times` or a `tv_nsec`
-    /// of `UTIME_NOW` uses the current time; `UTIME_OMIT` leaves mtime unchanged.
-    /// A NULL `path` targets `dirfd` itself (`futimens`); `AT_SYMLINK_NOFOLLOW`
-    /// acts on the link rather than its target.
+    /// `utimensat(dirfd, path, times, flags)` — set a node's access and
+    /// modification times. `times` is `[atime, mtime]`, each a `struct timespec`
+    /// (`{ tv_sec, tv_nsec }`); a `tv_nsec` of `UTIME_NOW` uses the current time,
+    /// `UTIME_OMIT` leaves that field unchanged, and a NULL `times` sets both to
+    /// now. A NULL `path` targets `dirfd` itself (`futimens`);
+    /// `AT_SYMLINK_NOFOLLOW` acts on the link rather than its target.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_utimensat(
         &self, vfs: &mut MountTable, cx: &mut ServiceCtx,
@@ -195,27 +198,31 @@ impl Kernel {
         flags: u64,
         mem: &GuestMemory,
     ) -> i64 {
-        const UTIME_NOW: u64 = 0x3fff_ffff;
-        const UTIME_OMIT: u64 = 0x3fff_fffe;
         const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
-        let now = crate::clock::now_unix().as_secs() as i64;
-        // mtime is the second timespec (offset 16): { tv_sec@16, tv_nsec@24 }.
-        let mtime = if times == 0 {
-            Some(now)
+        // Decode the timespec at `times + off` into a `SetTime`.
+        let read_field = |off: u64| -> Option<crate::fs::SetTime> {
+            const UTIME_NOW: u64 = 0x3fff_ffff;
+            const UTIME_OMIT: u64 = 0x3fff_fffe;
+            let (sec, nsec) = (mem.read_u64(times + off).ok()?, mem.read_u64(times + off + 8).ok()?);
+            Some(match nsec {
+                UTIME_OMIT => crate::fs::SetTime::Omit,
+                UTIME_NOW => crate::fs::SetTime::Now,
+                _ => crate::fs::SetTime::Set { sec: sec as i64, nsec: nsec as i64 },
+            })
+        };
+        // atime is the first timespec (offset 0), mtime the second (offset 16).
+        let (atime, mtime) = if times == 0 {
+            (crate::fs::SetTime::Now, crate::fs::SetTime::Now)
         } else {
-            let (Ok(sec), Ok(nsec)) = (mem.read_u64(times + 16), mem.read_u64(times + 24)) else {
+            let (Some(a), Some(m)) = (read_field(0), read_field(16)) else {
                 return err(Errno::EFAULT);
             };
-            match nsec {
-                UTIME_OMIT => None,
-                UTIME_NOW => Some(now),
-                _ => Some(sec as i64),
-            }
+            (a, m)
         };
         // A NULL path means dirfd *is* the file (futimens); otherwise resolve.
         let abs = if pathptr == 0 {
             match cx.cur.fds.get(dirfd as i32) {
-                Some(Fd::File { path, .. }) => path.clone(),
+                Some(Fd::File { path, .. } | Fd::Dir { path, .. }) => path.clone(),
                 _ => return err(Errno::EBADF),
             }
         } else {
@@ -224,12 +231,15 @@ impl Kernel {
             };
             let abs = self.resolve_path(cx, dirfd, &rel);
             if flags & AT_SYMLINK_NOFOLLOW == 0 {
-                self.follow_symlinks(vfs, &abs).unwrap_or(abs)
+                match self.follow_or_eloop(vfs, &abs) {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                }
             } else {
                 abs
             }
         };
-        match vfs.set_mtime(&abs, mtime) {
+        match vfs.set_times(&abs, atime, mtime) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
         }
@@ -242,7 +252,10 @@ impl Kernel {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(cx, dirfd, &rel);
-        let abs = self.follow_symlinks(vfs, &abs).unwrap_or(abs);
+        let abs = match self.follow_or_eloop(vfs, &abs) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
         match vfs.set_mode(&abs, mode as u32) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
@@ -257,6 +270,70 @@ impl Kernel {
             None => return err(Errno::EBADF),
         };
         match vfs.set_mode(&path, mode as u32) {
+            Ok(()) => 0,
+            Err(e) => io_errno(&e),
+        }
+    }
+
+    /// `fchownat(dirfd, path, uid, gid, flags)` — and the `chown`/`lchown`
+    /// spellings, which route here with `AT_FDCWD` and the appropriate
+    /// follow/no-follow flag. A `uid`/`gid` of `(uid_t)-1` leaves that id
+    /// unchanged. Symlinks are followed unless `AT_SYMLINK_NOFOLLOW` is set.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn sys_fchownat(
+        &self, vfs: &mut MountTable, cx: &mut ServiceCtx,
+        dirfd: i64,
+        pathptr: u64,
+        uid: u64,
+        gid: u64,
+        flags: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+        let Some(rel) = read_path(mem, pathptr) else {
+            return err(Errno::EFAULT);
+        };
+        let abs = self.resolve_path(cx, dirfd, &rel);
+        let abs = if flags & AT_SYMLINK_NOFOLLOW == 0 {
+            self.follow_symlinks(vfs, &abs).unwrap_or(abs)
+        } else {
+            abs
+        };
+        match vfs.set_owner(&abs, decode_id(uid), decode_id(gid)) {
+            Ok(()) => 0,
+            Err(e) => io_errno(&e),
+        }
+    }
+
+    /// `fchown(fd, uid, gid)` — chown on an open file, resolved via its path.
+    pub(super) fn sys_fchown(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, uid: u64, gid: u64) -> i64 {
+        let path = match cx.cur.fds.get(fd as i32) {
+            Some(Fd::File { path, .. } | Fd::Dir { path, .. }) => path.clone(),
+            Some(_) => return 0, // non-file fds: accept (nothing to chown)
+            None => return err(Errno::EBADF),
+        };
+        match vfs.set_owner(&path, decode_id(uid), decode_id(gid)) {
+            Ok(()) => 0,
+            Err(e) => io_errno(&e),
+        }
+    }
+
+    /// `mknodat(dirfd, path, mode, dev)` / `mknod(path, mode, dev)` /
+    /// `mkfifo` (glibc issues `mknodat` with `S_IFIFO`). Creates a regular file
+    /// or FIFO; device/socket nodes are left for the backend to reject
+    /// (`EPERM` on the in-memory backends).
+    pub(super) fn sys_mknodat(
+        &self, vfs: &mut MountTable, cx: &mut ServiceCtx,
+        dirfd: i64,
+        pathptr: u64,
+        mode: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        let Some(rel) = read_path(mem, pathptr) else {
+            return err(Errno::EFAULT);
+        };
+        let abs = self.resolve_path(cx, dirfd, &rel);
+        match vfs.mknod(&abs, mode as u32) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
         }
@@ -313,11 +390,21 @@ impl Kernel {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
+        let had_slash = rel.len() > 1 && rel.ends_with('/');
         let abs = self.resolve_path(cx, dirfd, &rel);
-        let abs = self.follow_symlinks(vfs, &abs).unwrap_or(abs);
+        let abs = match self.follow_or_eloop(vfs, &abs) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
         let Some(attrs) = vfs.stat(&abs) else {
+            if self.has_nondir_component(vfs, &abs) {
+                return err(Errno::ENOTDIR);
+            }
             return err(Errno::ENOENT);
         };
+        if had_slash && attrs.kind != NodeKind::Dir {
+            return err(Errno::ENOTDIR);
+        }
         // The VM runs as root, so read/write are always granted; execute still
         // requires at least one execute bit (even root can't exec a plain file).
         if mode & X_OK != 0 && attrs.mode & 0o111 == 0 {
@@ -333,6 +420,13 @@ impl Kernel {
         sh.umask = (mask & 0o777) as u32;
         i64::from(old)
     }
+}
+
+/// Decode a `chown` uid/gid argument: `(uid_t)-1` (`0xFFFF_FFFF`, how the guest
+/// zero-extends a 32-bit `-1`) means "leave unchanged" → `None`.
+fn decode_id(v: u64) -> Option<u32> {
+    let id = v as u32;
+    if id == u32::MAX { None } else { Some(id) }
 }
 
 /// Write a `struct statfs` at `addr`, or return `-EFAULT`.

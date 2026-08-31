@@ -116,8 +116,12 @@ pub fn decode(nr: u64) -> Sysno {
         90 => Sysno::Chmod,     // chmod(path, mode)
         268 => Sysno::Fchmodat, // fchmodat(dirfd, path, mode, flags)
         91 => Sysno::Fchmod,
-        92 | 94 | 260 => Sysno::Fchownat,
+        92 => Sysno::Chown,
+        94 => Sysno::Lchown,
+        260 => Sysno::Fchownat,
         93 => Sysno::Fchown,
+        133 => Sysno::Mknod,
+        259 => Sysno::Mknodat,
         132 | 235 | 280 => Sysno::Utimensat,
         95 => Sysno::Umask,
         191 => Sysno::Getxattr,

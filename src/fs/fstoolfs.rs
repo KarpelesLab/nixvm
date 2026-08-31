@@ -289,6 +289,7 @@ impl MountFs for FsToolMount {
             mode: type_bits(kind) | (u32::from(a.mode) & 0o7_777),
             uid: a.uid,
             gid: a.gid,
+            atime: i64::from(a.mtime),
             mtime: i64::from(a.mtime),
             inode: u64::from(a.inode),
             nlink: a.nlink,

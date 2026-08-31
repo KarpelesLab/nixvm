@@ -46,8 +46,8 @@ use poll::{EventFdInst, PollFds};
 
 /// `dirfd` value meaning "resolve relative to the current working directory".
 const AT_FDCWD: i64 = -100;
-/// Max symlink hops before `ELOOP`.
-const SYMLINK_MAX: u32 = 16;
+/// Max symlink hops before `ELOOP` (matches Linux's `MAXSYMLINKS`).
+const SYMLINK_MAX: u32 = 40;
 
 /// Per-process kernel-side state (swapped into `Kernel::cur` while running).
 #[derive(Clone)]
@@ -2133,6 +2133,12 @@ impl Kernel {
             | Sysno::Fchmodat
             | Sysno::Chmod
             | Sysno::Fchmod
+            | Sysno::Fchownat
+            | Sysno::Fchown
+            | Sysno::Chown
+            | Sysno::Lchown
+            | Sysno::Mknod
+            | Sysno::Mknodat
             | Sysno::Rmdir
             | Sysno::Renameat
             | Sysno::Renameat2
@@ -2347,6 +2353,15 @@ impl Kernel {
             Sysno::Chmod => self.sys_fchmodat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
             Sysno::Fchmodat => self.sys_fchmodat(vfs, cx, args[0] as i32 as i64, args[1], args[2], mem),
             Sysno::Fchmod => self.sys_fchmod(vfs, cx, args[0], args[1]),
+            // chown follows symlinks; lchown acts on the link (AT_SYMLINK_NOFOLLOW=0x100).
+            Sysno::Chown => self.sys_fchownat(vfs, cx, AT_FDCWD, args[0], args[1], args[2], 0, mem),
+            Sysno::Lchown => self.sys_fchownat(vfs, cx, AT_FDCWD, args[0], args[1], args[2], 0x100, mem),
+            Sysno::Fchownat => self.sys_fchownat(vfs, cx, args[0] as i32 as i64, args[1], args[2], args[3], args[4], mem),
+            Sysno::Fchown => self.sys_fchown(vfs, cx, args[0], args[1], args[2]),
+            // mknod(path, mode, dev); mknodat(dirfd, path, mode, dev). mkfifo is
+            // glibc's mknod with S_IFIFO. `dev` is ignored (no device nodes).
+            Sysno::Mknod => self.sys_mknodat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
+            Sysno::Mknodat => self.sys_mknodat(vfs, cx, args[0] as i32 as i64, args[1], args[2], mem),
             Sysno::Unlink => self.sys_unlinkat(vfs, cx, AT_FDCWD, args[0], 0, mem),
             Sysno::Rmdir => {
                 const AT_REMOVEDIR: u64 = 0x200;
@@ -2564,8 +2579,6 @@ impl Kernel {
             | Sysno::Getgid
             | Sysno::Getegid
             | Sysno::SetRobustList
-            | Sysno::Fchownat
-            | Sysno::Fchown
             // Locking/sync + scheduling/process-attr setters: all no-ops.
             | Sysno::Mlock
             | Sysno::Mlock2
@@ -4867,6 +4880,8 @@ impl Kernel {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
+        // A trailing slash on the guest path demands a directory target.
+        let had_slash = rel.len() > 1 && rel.ends_with('/');
         let resolved = self.resolve_path(cx, dirfd, &rel);
         // O_NOFOLLOW: if the final component is itself a symlink, fail with ELOOP
         // rather than following it (a security check `open`ers rely on). Checked
@@ -4876,7 +4891,10 @@ impl Kernel {
         {
             return err(Errno::ELOOP);
         }
-        let abs = self.follow_symlinks(vfs, &resolved).unwrap_or(resolved);
+        let abs = match self.follow_or_eloop(vfs, &resolved) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
         if self.trace {
             eprintln!("[open] pid={} {abs:?}", cx.cur.pid);
         }
@@ -4910,12 +4928,23 @@ impl Kernel {
         match vfs.stat(&abs) {
             None => {
                 if flags & O_CREAT != 0 {
+                    // Creating a name with a trailing slash asks for a directory,
+                    // which open(2) can't make → ENOTDIR (Linux via ENOTDIR/EISDIR).
+                    if had_slash {
+                        return err(Errno::ENOTDIR);
+                    }
                     if let Err(e) = vfs.create(&abs, (mode & 0o777) as u32) {
                         return io_errno(&e);
                     }
+                } else if self.has_nondir_component(vfs, &abs) {
+                    return err(Errno::ENOTDIR);
                 } else {
                     return err(Errno::ENOENT);
                 }
+            }
+            // A trailing slash on a non-directory is ENOTDIR ("file/").
+            Some(a) if had_slash && a.kind != NodeKind::Dir => {
+                return err(Errno::ENOTDIR);
             }
             // O_CREAT|O_EXCL demands the file not already exist (atomic create —
             // the standard lock-file / mkstemp idiom); anything else is EEXIST.
@@ -5155,13 +5184,24 @@ impl Kernel {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
+        let had_slash = rel.len() > 1 && rel.ends_with('/');
         let mut abs = self.resolve_path(cx, dirfd, &rel);
         if flags & AT_SYMLINK_NOFOLLOW == 0 {
-            abs = self.follow_symlinks(vfs, &abs).unwrap_or(abs);
+            abs = match self.follow_or_eloop(vfs, &abs) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
         }
         let Some(attrs) = vfs.stat(&abs) else {
+            if self.has_nondir_component(vfs, &abs) {
+                return err(Errno::ENOTDIR);
+            }
             return err(Errno::ENOENT);
         };
+        // A trailing slash on a non-directory target is ENOTDIR.
+        if had_slash && attrs.kind != NodeKind::Dir {
+            return err(Errno::ENOTDIR);
+        }
         write_stat_or_fault(mem, statbuf, &attrs, self.arch)
     }
 
@@ -5260,7 +5300,47 @@ impl Kernel {
         path::normalize(&format!("{base}/{p}"))
     }
 
+    /// True if any *non-final* component of `abs` exists but is not a directory
+    /// (nor a symlink, which might point at one) — meaning a lookup that failed
+    /// with a missing final component should really be `ENOTDIR`, not `ENOENT`
+    /// (e.g. `stat("file/foo")` where `file` is a regular file). Consulted only
+    /// on the failure path, so the common success case pays nothing. Works
+    /// uniformly across backends since it walks via [`MountTable::stat`].
+    #[allow(clippy::unused_self)]
+    fn has_nondir_component(&self, vfs: &mut MountTable, abs: &str) -> bool {
+        let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
+        if comps.len() < 2 {
+            return false;
+        }
+        let mut prefix = String::new();
+        for c in &comps[..comps.len() - 1] {
+            prefix.push('/');
+            prefix.push_str(c);
+            match vfs.stat(&prefix) {
+                Some(a) if a.kind != NodeKind::Dir && a.kind != NodeKind::Symlink => return true,
+                // A missing intermediate component means the failure is a plain
+                // ENOENT, not ENOTDIR — stop walking.
+                None => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Follow the final-component symlink chain, surfacing a cycle (or an
+    /// over-long chain) as `ELOOP` (an encoded `-i64`) instead of silently
+    /// falling back to the unresolved path — which would make a mutual
+    /// `a -> b -> a` loop `stat`/`open` "succeed" on the link node. Returns the
+    /// resolved path on success (including the case where the final component
+    /// doesn't exist yet — that's `ENOENT` at the caller, not here).
+    fn follow_or_eloop(&self, vfs: &mut MountTable, path: &str) -> Result<String, i64> {
+        self.follow_symlinks(vfs, path)
+            .ok_or_else(|| err(Errno::ELOOP))
+    }
+
     /// Follow the final-component symlink chain (bounded), returning the target.
+    /// `None` means the chain exceeded [`SYMLINK_MAX`] hops (a loop) — callers
+    /// that must report `ELOOP` should go through [`Self::follow_or_eloop`].
     #[allow(clippy::unused_self)]
     fn follow_symlinks(&self, vfs: &mut MountTable, path: &str) -> Option<String> {
         let mut p = path.to_string();

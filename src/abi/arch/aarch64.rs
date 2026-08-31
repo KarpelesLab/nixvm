@@ -94,6 +94,7 @@ pub fn decode(nr: u64) -> Sysno {
         52 => Sysno::Fchmod,
         54 => Sysno::Fchownat,
         55 => Sysno::Fchown,
+        33 => Sysno::Mknodat,
         88 => Sysno::Utimensat,
         166 => Sysno::Umask,
         8 => Sysno::Getxattr,

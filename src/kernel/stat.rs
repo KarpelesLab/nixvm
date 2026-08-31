@@ -68,10 +68,9 @@ pub fn encode_stat(attrs: &Attrs, arch: Arch) -> Vec<u8> {
     // st_blocks (512-byte units). Like tmpfs, storage is page-granular, so round
     // the size up to a 4 KiB page (= 8 × 512-byte blocks) — what `du`/`ls -s` see.
     put64(&mut b, 64, attrs.size.div_ceil(4096) * 8);
-    let t = attrs.mtime as u64;
-    put64(&mut b, 72, t); // st_atime
-    put64(&mut b, 88, t); // st_mtime
-    put64(&mut b, 104, t); // st_ctime
+    put64(&mut b, 72, attrs.atime as u64); // st_atime
+    put64(&mut b, 88, attrs.mtime as u64); // st_mtime
+    put64(&mut b, 104, attrs.mtime as u64); // st_ctime (tracks mtime here)
     b
 }
 
@@ -102,11 +101,10 @@ pub fn encode_statx(attrs: &Attrs) -> [u8; 256] {
     put64(&mut b, 40, attrs.size); // stx_size
     put64(&mut b, 48, attrs.size.div_ceil(4096) * 8); // stx_blocks (page-rounded)
     // stx_attributes_mask @56 = 0
-    let t = attrs.mtime;
-    put_ts(&mut b, 64, t); // stx_atime
-    put_ts(&mut b, 80, t); // stx_btime
-    put_ts(&mut b, 96, t); // stx_ctime
-    put_ts(&mut b, 112, t); // stx_mtime
+    put_ts(&mut b, 64, attrs.atime); // stx_atime
+    put_ts(&mut b, 80, attrs.mtime); // stx_btime
+    put_ts(&mut b, 96, attrs.mtime); // stx_ctime
+    put_ts(&mut b, 112, attrs.mtime); // stx_mtime
     // stx_rdev_major/minor @128/132, stx_dev_major/minor @136/140.
     let rdev = attrs.rdev;
     put32(&mut b, 128, ((rdev >> 8) & 0xfff) as u32); // major
@@ -145,6 +143,7 @@ pub fn char_device_attrs() -> Attrs {
         mode: S_IFCHR | 0o620,
         uid: 0,
         gid: 0,
+        atime: 0,
         mtime: 0,
         inode: 0,
         nlink: 1,
@@ -160,6 +159,7 @@ pub fn fifo_attrs() -> Attrs {
         mode: S_IFIFO | 0o600,
         uid: 0,
         gid: 0,
+        atime: 0,
         mtime: 0,
         inode: 0,
         nlink: 1,
@@ -175,6 +175,7 @@ pub fn socket_attrs() -> Attrs {
         mode: S_IFSOCK | 0o777,
         uid: 0,
         gid: 0,
+        atime: 0,
         mtime: 0,
         inode: 0,
         nlink: 1,
@@ -235,6 +236,7 @@ mod tests {
             mode: 0o100_644,
             uid: 0,
             gid: 0,
+            atime: 0,
             mtime: 0,
             inode: 42,
             nlink: 1,
@@ -254,6 +256,7 @@ mod tests {
             mode: S_IFCHR | 0o666,
             uid: 0,
             gid: 0,
+            atime: 0,
             mtime: 0,
             inode: 7,
             nlink: 1,
@@ -276,6 +279,7 @@ mod tests {
             mode: 0o100_755,
             uid: 3,
             gid: 4,
+            atime: 0,
             mtime: 0,
             inode: 42,
             nlink: 2,

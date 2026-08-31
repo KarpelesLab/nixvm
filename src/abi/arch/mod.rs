@@ -134,6 +134,14 @@ pub enum Sysno {
     Fchmod,
     Fchownat,
     Fchown,
+    /// x86-64 only — `chown(path, uid, gid)`, follows symlinks.
+    Chown,
+    /// x86-64 only — `lchown(path, uid, gid)`, acts on the link itself.
+    Lchown,
+    /// Create a special file (`mknod(path, mode, dev)`); x86-64 only.
+    Mknod,
+    /// Create a special file relative to a dirfd (`mknodat`).
+    Mknodat,
     Utimensat,
     Umask,
     Getxattr,
