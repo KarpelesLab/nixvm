@@ -364,6 +364,21 @@ impl Ptys {
             p.slave_write(data);
         }
     }
+    /// `TCFLSH` (`tcflush`): discard queued, not-yet-read data. `input` drops the
+    /// terminal input queue (the completed lines plus the in-progress canonical
+    /// line); `output` drops the terminal output queue (bytes the master has yet
+    /// to read).
+    pub(super) fn flush(&mut self, n: usize, input: bool, output: bool) {
+        if let Some(p) = self.table.get_mut(n) {
+            if input {
+                p.input.clear();
+                p.canon.clear();
+            }
+            if output {
+                p.output.clear();
+            }
+        }
+    }
     /// Master read: drain up to `cap` bytes of terminal output. `None` = would
     /// block (no data yet, slave still open); `Some(vec)` may be empty on EOF
     /// (all slaves closed).
@@ -635,6 +650,29 @@ mod tests {
         assert_eq!(t.slave_read(n, 64), None, "CR ignored, still no line");
     }
 
+    #[test]
+    fn flush_discards_input_and_output_queues() {
+        let mut t = Ptys::default();
+        let n = t.alloc();
+        t.open_slave(n, 0);
+        // Clear ECHO so the input write does not also queue echo into output.
+        let mut tm = t.get_termios(n).unwrap();
+        let lflag = u32::from_le_bytes(tm[12..16].try_into().unwrap()) & !ECHO;
+        tm[12..16].copy_from_slice(&lflag.to_le_bytes());
+        t.set_termios(n, tm);
+        // Queue a complete input line and some output.
+        t.master_write(n, b"hi\n");
+        t.slave_write(n, b"out");
+        assert_eq!(t.slave_avail(n), 3);
+        assert_eq!(t.master_avail(n), 3);
+        // Flush input only: the slave-readable queue is emptied, output stays.
+        t.flush(n, true, false);
+        assert_eq!(t.slave_avail(n), 0);
+        assert_eq!(t.master_avail(n), 3);
+        // Flush output too.
+        t.flush(n, false, true);
+        assert_eq!(t.master_avail(n), 0);
+    }
 
     #[test]
     fn master_sees_eof_when_all_slaves_close() {

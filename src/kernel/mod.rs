@@ -4662,6 +4662,11 @@ impl Kernel {
         const TIOCSPGRP: u32 = 0x5410;
         const FIONREAD: u32 = 0x541B;
         const FIONBIO: u32 = 0x5421;
+        const TCSBRK: u32 = 0x5409; // tcdrain (arg!=0) / tcsendbreak
+        const TCXONC: u32 = 0x540A; // tcflow
+        const TCFLSH: u32 = 0x540B; // tcflush
+        const TCSBRKP: u32 = 0x5425; // tcsendbreak (POSIX)
+        const TIOCOUTQ: u32 = 0x5411; // bytes still queued for output
         let mut ptys = self.ptys.lock().unwrap();
         match req {
             TCGETS => match ptys.get_termios(n) {
@@ -4720,6 +4725,30 @@ impl Kernel {
             FIONBIO => {
                 ptys.set_nonblock(n, is_master, mem.read_u32(arg).is_ok_and(|v| v != 0));
                 0
+            }
+            // `tcflush`: `arg` is the queue selector, passed by value (not a
+            // pointer). TCIFLUSH=0 (input), TCOFLUSH=1 (output), TCIOFLUSH=2.
+            TCFLSH => {
+                const TCIFLUSH: u64 = 0;
+                const TCOFLUSH: u64 = 1;
+                const TCIOFLUSH: u64 = 2;
+                let (input, output) = match arg {
+                    TCIFLUSH => (true, false),
+                    TCOFLUSH => (false, true),
+                    TCIOFLUSH => (true, true),
+                    _ => return err(Errno::EINVAL),
+                };
+                ptys.flush(n, input, output);
+                0
+            }
+            // `tcdrain`/`tcsendbreak` (output reaches the master queue instantly,
+            // nothing to wait for) and `tcflow` (no software flow control is
+            // modelled): accept every selector as a success no-op.
+            TCSBRK | TCSBRKP | TCXONC => 0,
+            // `TIOCOUTQ`: bytes still queued to transmit. Output is flushed to the
+            // master immediately, so nothing is ever pending.
+            TIOCOUTQ => {
+                if mem.write(arg, &0u32.to_le_bytes()).is_ok() { 0 } else { err(Errno::EFAULT) }
             }
             _ => err(Errno::ENOTTY),
         }
