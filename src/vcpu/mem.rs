@@ -449,6 +449,20 @@ impl GuestMemory {
         self.file_backed.get(p).copied().unwrap_or(false)
     }
 
+    /// Whether the page containing `addr` is *resident* — has a backing frame
+    /// installed in the page tables right now. A mapped-but-never-touched
+    /// (demand-paged) page is not resident until its first access mints a frame;
+    /// an unmapped or out-of-bounds page is never resident. Read-only; installs
+    /// nothing. This is exactly what `mincore` reports per page.
+    #[must_use]
+    pub fn is_resident(&self, addr: u64) -> bool {
+        let page = addr - addr % PAGE_SIZE;
+        if self.page_index(page).is_none() {
+            return false;
+        }
+        self.space.translate(page, &self.phys).is_some()
+    }
+
     /// The effective (intended) protection of the page containing `addr`, or
     /// `None` if unmapped.
     #[must_use]

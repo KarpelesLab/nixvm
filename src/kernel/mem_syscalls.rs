@@ -14,6 +14,9 @@ use crate::vcpu::mem::{MemError, PAGE_SIZE, Prot};
 
 /// `MREMAP_MAYMOVE`: the kernel may relocate the mapping to satisfy a grow.
 const MREMAP_MAYMOVE: u64 = 1;
+/// `MREMAP_FIXED`: relocate the mapping to a caller-chosen address (requires
+/// `MREMAP_MAYMOVE`), replacing whatever is currently mapped there.
+const MREMAP_FIXED: u64 = 2;
 /// `MADV_DONTNEED`: drop the pages; a later access reads fresh zeros.
 const MADV_DONTNEED: u64 = 4;
 
@@ -69,7 +72,7 @@ impl Kernel {
         old_size: u64,
         new_size: u64,
         flags: u64,
-        _new_addr: u64,
+        new_addr: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
         if old_size == 0 || new_size == 0 {
@@ -87,6 +90,29 @@ impl Kernel {
         // pages under it.
         if !range_is_mapped(mem, old_addr, old_addr + old_size) {
             return err(Errno::EFAULT);
+        }
+
+        // MREMAP_FIXED: relocate to a caller-chosen address (only valid with
+        // MREMAP_MAYMOVE), clobbering whatever sits at the destination. We honor
+        // the requested target exactly rather than picking our own arena slot.
+        if flags & MREMAP_FIXED != 0 {
+            if flags & MREMAP_MAYMOVE == 0 {
+                return err(Errno::EINVAL);
+            }
+            let dst = page_down(new_addr);
+            // `map` drops any existing backing at the destination (zero-fills).
+            if mem.map(dst, new_size, Prot::rw()).is_err() {
+                return err(Errno::ENOMEM);
+            }
+            let copy = old_size.min(new_size);
+            if let Ok(data) = mem.read_vec(old_addr, copy as usize) {
+                let _ = mem.write(dst, &data);
+            }
+            let _ = mem.unmap(old_addr, old_size);
+            // The old block returns to the arena so it can be reused (see the
+            // MAYMOVE relocate path below for why this matters).
+            sh.arena(cx).free_range(old_addr, old_size);
+            return dst as i64;
         }
 
         if new_size <= old_size {
@@ -144,8 +170,15 @@ impl Kernel {
         mem: &mut GuestMemory,
     ) -> i64 {
         if advice == MADV_DONTNEED && len != 0 {
-            let mut p = page_down(addr);
+            let start = page_down(addr);
             let end = page_up(addr + len);
+            // Linux refuses to discard a range with holes: an unmapped page
+            // anywhere in it makes the whole call fail with ENOMEM, discarding
+            // nothing. musl's allocator relies on this to detect gaps.
+            if !range_is_mapped(mem, start, end) {
+                return err(Errno::ENOMEM);
+            }
+            let mut p = start;
             let zero = [0u8; PAGE_SIZE as usize];
             while p < end {
                 // File-backed (ELF-segment) pages must keep their contents: on
@@ -163,8 +196,10 @@ impl Kernel {
         0
     }
 
-    /// `mincore(addr, len, vec)` — report residency. Everything mapped here is
-    /// resident, so write `1` for each page spanned by `[addr, addr + len)`.
+    /// `mincore(addr, len, vec)` — report per-page residency. Bit 0 of each byte
+    /// is set only for pages that actually have a backing frame right now; a
+    /// mapped-but-untouched (demand-paged, lazy) page reports 0, matching Linux.
+    /// A range with any unmapped page is rejected with ENOMEM.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_mincore(
         &self,
@@ -176,8 +211,22 @@ impl Kernel {
         if len == 0 {
             return 0;
         }
-        let pages = ((page_up(addr + len) - page_down(addr)) / PAGE_SIZE) as usize;
-        let resident = vec![1u8; pages];
+        // addr must be page-aligned (Linux answers EINVAL otherwise).
+        if addr % PAGE_SIZE != 0 {
+            return err(Errno::EINVAL);
+        }
+        let start = page_down(addr);
+        let end = page_up(addr + len);
+        let pages = ((end - start) / PAGE_SIZE) as usize;
+        let mut resident = vec![0u8; pages];
+        for (i, r) in resident.iter_mut().enumerate() {
+            let p = start + i as u64 * PAGE_SIZE;
+            // A hole anywhere in the range makes the whole call ENOMEM.
+            if mem.page_prot(p).is_none() {
+                return err(Errno::ENOMEM);
+            }
+            *r = u8::from(mem.is_resident(p));
+        }
         if mem.write(vec, &resident).is_err() {
             return err(Errno::EFAULT);
         }
@@ -294,6 +343,25 @@ mod tests {
     }
 
     #[test]
+    fn mremap_fixed_honors_requested_destination() {
+        let (k, mut mem, mut cx) = setup();
+        // Source page with content, and a distinct reserved destination page.
+        mem.map(0x1_0000, PAGE, Prot::rw()).unwrap();
+        mem.write_u64(0x1_0000, 0x7777).unwrap();
+        let dst = 0x1_5000;
+        mem.map(dst, PAGE, Prot::rw()).unwrap();
+
+        let ret = k.sys_mremap(
+            &mut k.shared.lock().unwrap(), &mut cx,
+            0x1_0000, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, dst, &mut mem,
+        );
+        assert_eq!(ret, dst as i64, "MREMAP_FIXED lands at the requested addr");
+        // Content moved to the destination; the source is unmapped.
+        assert_eq!(mem.read_u64(dst).unwrap(), 0x7777);
+        assert!(matches!(mem.read_u64(0x1_0000), Err(MemError::Unmapped(_))));
+    }
+
+    #[test]
     fn madvise_dontneed_zeros_pages() {
         let (k, mut mem, _cx) = setup();
         mem.map(0x1_0000, PAGE, Prot::rw()).unwrap();
@@ -304,12 +372,63 @@ mod tests {
     }
 
     #[test]
-    fn mincore_reports_resident() {
+    fn madvise_dontneed_over_unmapped_is_enomem() {
+        let (k, mut mem, _cx) = setup();
+        // One mapped page followed by an unmapped hole: DONTNEED across both must
+        // fail ENOMEM and touch nothing.
+        mem.map(0x1_0000, PAGE, Prot::rw()).unwrap();
+        mem.write_u64(0x1_0000, 0x41).unwrap();
+        assert_eq!(
+            k.sys_madvise(0x1_0000, 2 * PAGE, MADV_DONTNEED, &mut mem),
+            err(Errno::ENOMEM),
+        );
+        // The mapped page was NOT zeroed (the call discarded nothing).
+        assert_eq!(mem.read_u64(0x1_0000).unwrap(), 0x41);
+    }
+
+    #[test]
+    fn mincore_reports_real_residency() {
         let (k, mut mem, _cx) = setup();
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
-        let vec = 0x1_0000;
-        assert_eq!(k.sys_mincore(0x1_1000, 2 * PAGE, vec, &mut mem), 0);
-        assert_eq!(mem.read_vec(vec, 2).unwrap(), vec![1, 1]);
+        // Touch pages 0 and 2 so they get a backing frame; 1 and 3 stay lazy.
+        mem.write_u64(0x1_0000, 1).unwrap();
+        mem.write_u64(0x1_0000 + 2 * PAGE, 1).unwrap();
+        let out = 0x1_0000; // report vector shares page 0 (already resident)
+        assert_eq!(k.sys_mincore(0x1_0000, 4 * PAGE, out, &mut mem), 0);
+        // 1 only for the touched (resident) pages, 0 for the demand-paged ones.
+        assert_eq!(mem.read_vec(out, 4).unwrap(), vec![1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn mincore_over_unmapped_is_enomem() {
+        let (k, mut mem, _cx) = setup();
+        mem.map(0x1_0000, PAGE, Prot::rw()).unwrap();
+        // Range extends into an unmapped page → ENOMEM.
+        assert_eq!(
+            k.sys_mincore(0x1_0000, 2 * PAGE, 0x1_0000, &mut mem),
+            err(Errno::ENOMEM),
+        );
+    }
+
+    #[test]
+    fn msync_rejects_bad_flags() {
+        let (k, mut mem, mut cx) = setup();
+        let mut v = DummyVcpu;
+        // MS_SYNC(4) | MS_ASYNC(1) together is mutually exclusive → EINVAL.
+        assert_eq!(
+            k.dispatch(&mut cx, Sysno::Msync, 0, &[0, PAGE, 5, 0, 0, 0], &mut v, &mut mem),
+            err(Errno::EINVAL),
+        );
+        // An unknown flag bit → EINVAL.
+        assert_eq!(
+            k.dispatch(&mut cx, Sysno::Msync, 0, &[0, PAGE, 0x10, 0, 0, 0], &mut v, &mut mem),
+            err(Errno::EINVAL),
+        );
+        // MS_SYNC alone is fine (no shared maps: a plain no-op success).
+        assert_eq!(
+            k.dispatch(&mut cx, Sysno::Msync, 0, &[0, PAGE, 4, 0, 0, 0], &mut v, &mut mem),
+            0,
+        );
     }
 
     #[test]
