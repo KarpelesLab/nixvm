@@ -4967,6 +4967,27 @@ impl Kernel {
     /// `lseek(fd, offset, whence)`.
     #[allow(clippy::unused_self)]
     fn sys_lseek(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, offset: i64, whence: u64) -> i64 {
+        // Directory fds are seekable too — this is what backs rewinddir (lseek
+        // 0/SEEK_SET), telldir (lseek 0/SEEK_CUR), and seekdir. The position is
+        // the getdents entry cursor, and the d_off cookies getdents emits are
+        // exactly those cursor values, so seekdir(cookie) resumes at the right
+        // entry. Without this, a second directory scan reads zero entries.
+        if let Some(Fd::Dir { pos, .. }) = cx.cur.fds.get(fd as i32) {
+            let cur = *pos as i64;
+            let base = match whence {
+                0 => 0,          // SEEK_SET
+                1 | 2 => cur,    // SEEK_CUR; SEEK_END has no meaningful dir size
+                _ => return err(Errno::EINVAL),
+            };
+            let newpos = base + offset;
+            if newpos < 0 {
+                return err(Errno::EINVAL);
+            }
+            if let Some(Fd::Dir { pos, .. }) = cx.cur.fds.get_mut(fd as i32) {
+                *pos = newpos as usize;
+            }
+            return newpos;
+        }
         let (cur, path) = match cx.cur.fds.get(fd as i32) {
             Some(Fd::File { path, offset, .. }) => (*offset, path.clone()),
             _ => return err(Errno::ESPIPE),
@@ -7088,6 +7109,28 @@ mod tests {
             call(&k, &mut cx, &mut mem, &mut v, Sysno::Nanosleep, [req, 0, 0, 0, 0, 0]),
             err(Errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn lseek_on_directory_rewinds_getdents() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        // Create a file so the root dir has content beyond "."/"..".
+        let path = 0x1_0000;
+        mem.write_init(path, b"/f\0").unwrap();
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, [AT_CWD, path, 0o102, 0o644, 0, 0]);
+        let root = 0x1_1000;
+        mem.write_init(root, b"/\0").unwrap();
+        let dirfd = call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, [AT_CWD, root, 0, 0, 0, 0]) as u64;
+        let buf = 0x1_2000;
+        // First scan consumes the directory.
+        let n1 = call(&k, &mut cx, &mut mem, &mut v, Sysno::Getdents64, [dirfd, buf, PAGE, 0, 0, 0]);
+        assert!(n1 > 0);
+        // At EOF a second getdents returns 0.
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Getdents64, [dirfd, buf, PAGE, 0, 0, 0]), 0);
+        // lseek(0, SEEK_SET) rewinds (rewinddir); the next getdents re-reads all.
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Lseek, [dirfd, 0, 0, 0, 0, 0]), 0);
+        let n3 = call(&k, &mut cx, &mut mem, &mut v, Sysno::Getdents64, [dirfd, buf, PAGE, 0, 0, 0]);
+        assert_eq!(n3, n1, "rewound scan re-reads the whole directory");
     }
 
     #[test]
