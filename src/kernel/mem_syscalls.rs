@@ -313,6 +313,27 @@ mod tests {
     }
 
     #[test]
+    fn msync_rejects_bad_flags() {
+        let (k, mut mem, mut cx) = setup();
+        let mut v = DummyVcpu;
+        // MS_SYNC(4) | MS_ASYNC(1) together is mutually exclusive → EINVAL.
+        assert_eq!(
+            k.dispatch(&mut cx, Sysno::Msync, 0, &[0, PAGE, 5, 0, 0, 0], &mut v, &mut mem),
+            err(Errno::EINVAL),
+        );
+        // An unknown flag bit → EINVAL.
+        assert_eq!(
+            k.dispatch(&mut cx, Sysno::Msync, 0, &[0, PAGE, 0x10, 0, 0, 0], &mut v, &mut mem),
+            err(Errno::EINVAL),
+        );
+        // MS_SYNC alone is fine (no shared maps: a plain no-op success).
+        assert_eq!(
+            k.dispatch(&mut cx, Sysno::Msync, 0, &[0, PAGE, 4, 0, 0, 0], &mut v, &mut mem),
+            0,
+        );
+    }
+
+    #[test]
     fn mlock_family_are_noops() {
         let (k, mut mem, mut cx) = setup();
         let mut v = DummyVcpu;

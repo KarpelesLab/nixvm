@@ -2360,7 +2360,7 @@ impl Kernel {
                 self.sys_faccessat(vfs, cx, args[0] as i64, args[1], args[2], mem)
             }
             Sysno::Access => self.sys_faccessat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
-            Sysno::Msync => self.sys_msync(vfs, cx, args[0], args[1], mem),
+            Sysno::Msync => self.sys_msync(vfs, cx, args[0], args[1], args[2], mem),
             // Unreachable: `dispatch_impl` only routes the syscalls above here.
             _ => unreachable!("dispatch_vfs: {sys:?} is not a vfs-only syscall"),
         }
@@ -5500,7 +5500,18 @@ impl Kernel {
 
     /// `msync(addr, len, flags)` — flush a writable shared file mapping to its
     /// file without unmapping it.
-    fn sys_msync(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, addr: u64, len: u64, mem: &GuestMemory) -> i64 {
+    fn sys_msync(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, addr: u64, len: u64, flags: u64, mem: &GuestMemory) -> i64 {
+        const MS_ASYNC: u64 = 1;
+        const MS_INVALIDATE: u64 = 2;
+        const MS_SYNC: u64 = 4;
+        // Reject unknown flag bits, and MS_SYNC|MS_ASYNC together — the two are
+        // mutually exclusive (one requests a blocking flush, the other a lazy
+        // one), exactly as the kernel validates before touching the mapping.
+        if flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
+            || (flags & MS_SYNC != 0 && flags & MS_ASYNC != 0)
+        {
+            return err(Errno::EINVAL);
+        }
         if !cx.cur.shared_maps.is_empty() {
             let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
             // msync flushes but keeps the mapping — re-add after the flush.
