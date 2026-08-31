@@ -2903,6 +2903,18 @@ impl Kernel {
         let spec = ProcessSpec { argv, envp };
         // Point of no return. Record the new program image for `/proc/self/exe`.
         cx.cur.exe = abs.to_string();
+        // execve resets every *caught* signal handler to SIG_DFL — the handler
+        // addresses point into the image being replaced, so keeping them would
+        // jump the new program to garbage on the next signal. Ignored (SIG_IGN)
+        // dispositions are preserved, as Linux does; the blocked mask and pending
+        // signals survive too. The alternate signal stack does not survive exec.
+        for h in &mut cx.cur.handlers {
+            if h.handler != 1 {
+                // != SIG_IGN
+                *h = SigAction::default(); // SIG_DFL, no flags/mask/restorer
+            }
+        }
+        cx.cur.altstack = (0, 0, SS_DISABLE);
         // Close every `FD_CLOEXEC` descriptor (dropping its pipe/socket backing)
         // — this is what execve is *for*, so a process doesn't leak private fds
         // into the program it launches.
