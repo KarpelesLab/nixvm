@@ -14,6 +14,9 @@ use crate::vcpu::mem::{MemError, PAGE_SIZE, Prot};
 
 /// `MREMAP_MAYMOVE`: the kernel may relocate the mapping to satisfy a grow.
 const MREMAP_MAYMOVE: u64 = 1;
+/// `MREMAP_FIXED`: relocate the mapping to a caller-chosen address (requires
+/// `MREMAP_MAYMOVE`), replacing whatever is currently mapped there.
+const MREMAP_FIXED: u64 = 2;
 /// `MADV_DONTNEED`: drop the pages; a later access reads fresh zeros.
 const MADV_DONTNEED: u64 = 4;
 
@@ -69,7 +72,7 @@ impl Kernel {
         old_size: u64,
         new_size: u64,
         flags: u64,
-        _new_addr: u64,
+        new_addr: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
         if old_size == 0 || new_size == 0 {
@@ -87,6 +90,29 @@ impl Kernel {
         // pages under it.
         if !range_is_mapped(mem, old_addr, old_addr + old_size) {
             return err(Errno::EFAULT);
+        }
+
+        // MREMAP_FIXED: relocate to a caller-chosen address (only valid with
+        // MREMAP_MAYMOVE), clobbering whatever sits at the destination. We honor
+        // the requested target exactly rather than picking our own arena slot.
+        if flags & MREMAP_FIXED != 0 {
+            if flags & MREMAP_MAYMOVE == 0 {
+                return err(Errno::EINVAL);
+            }
+            let dst = page_down(new_addr);
+            // `map` drops any existing backing at the destination (zero-fills).
+            if mem.map(dst, new_size, Prot::rw()).is_err() {
+                return err(Errno::ENOMEM);
+            }
+            let copy = old_size.min(new_size);
+            if let Ok(data) = mem.read_vec(old_addr, copy as usize) {
+                let _ = mem.write(dst, &data);
+            }
+            let _ = mem.unmap(old_addr, old_size);
+            // The old block returns to the arena so it can be reused (see the
+            // MAYMOVE relocate path below for why this matters).
+            sh.arena(cx).free_range(old_addr, old_size);
+            return dst as i64;
         }
 
         if new_size <= old_size {
@@ -313,6 +339,25 @@ mod tests {
         // Old bytes were copied to the new region.
         assert_eq!(mem.read_u64(ret as u64).unwrap(), 0x1122_3344);
         // The old range is unmapped.
+        assert!(matches!(mem.read_u64(0x1_0000), Err(MemError::Unmapped(_))));
+    }
+
+    #[test]
+    fn mremap_fixed_honors_requested_destination() {
+        let (k, mut mem, mut cx) = setup();
+        // Source page with content, and a distinct reserved destination page.
+        mem.map(0x1_0000, PAGE, Prot::rw()).unwrap();
+        mem.write_u64(0x1_0000, 0x7777).unwrap();
+        let dst = 0x1_5000;
+        mem.map(dst, PAGE, Prot::rw()).unwrap();
+
+        let ret = k.sys_mremap(
+            &mut k.shared.lock().unwrap(), &mut cx,
+            0x1_0000, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, dst, &mut mem,
+        );
+        assert_eq!(ret, dst as i64, "MREMAP_FIXED lands at the requested addr");
+        // Content moved to the destination; the source is unmapped.
+        assert_eq!(mem.read_u64(dst).unwrap(), 0x7777);
         assert!(matches!(mem.read_u64(0x1_0000), Err(MemError::Unmapped(_))));
     }
 
