@@ -144,8 +144,15 @@ impl Kernel {
         mem: &mut GuestMemory,
     ) -> i64 {
         if advice == MADV_DONTNEED && len != 0 {
-            let mut p = page_down(addr);
+            let start = page_down(addr);
             let end = page_up(addr + len);
+            // Linux refuses to discard a range with holes: an unmapped page
+            // anywhere in it makes the whole call fail with ENOMEM, discarding
+            // nothing. musl's allocator relies on this to detect gaps.
+            if !range_is_mapped(mem, start, end) {
+                return err(Errno::ENOMEM);
+            }
+            let mut p = start;
             let zero = [0u8; PAGE_SIZE as usize];
             while p < end {
                 // File-backed (ELF-segment) pages must keep their contents: on
@@ -301,6 +308,21 @@ mod tests {
 
         assert_eq!(k.sys_madvise(0x1_0000, PAGE, MADV_DONTNEED, &mut mem), 0);
         assert_eq!(mem.read_u64(0x1_0010).unwrap(), 0, "page was zeroed");
+    }
+
+    #[test]
+    fn madvise_dontneed_over_unmapped_is_enomem() {
+        let (k, mut mem, _cx) = setup();
+        // One mapped page followed by an unmapped hole: DONTNEED across both must
+        // fail ENOMEM and touch nothing.
+        mem.map(0x1_0000, PAGE, Prot::rw()).unwrap();
+        mem.write_u64(0x1_0000, 0x41).unwrap();
+        assert_eq!(
+            k.sys_madvise(0x1_0000, 2 * PAGE, MADV_DONTNEED, &mut mem),
+            err(Errno::ENOMEM),
+        );
+        // The mapped page was NOT zeroed (the call discarded nothing).
+        assert_eq!(mem.read_u64(0x1_0000).unwrap(), 0x41);
     }
 
     #[test]
