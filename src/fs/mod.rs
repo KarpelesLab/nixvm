@@ -64,12 +64,29 @@ pub struct Attrs {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
+    /// Access time (`st_atime`), Unix seconds.
+    pub atime: i64,
     pub mtime: i64,
     pub inode: u64,
     pub nlink: u32,
     /// Device number (major/minor, `st_rdev`) for a character or block special
     /// file; `0` for every other node kind.
     pub rdev: u64,
+}
+
+/// One field of a `utimensat`/`futimens` request (`atime` or `mtime`).
+///
+/// The kernel decodes each `struct timespec`'s `tv_nsec` sentinel into this
+/// before handing it to a backend, so backends never re-interpret the raw
+/// `UTIME_NOW`/`UTIME_OMIT` values themselves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetTime {
+    /// `UTIME_OMIT` — leave this timestamp unchanged.
+    Omit,
+    /// `UTIME_NOW` (or a NULL `times` array) — set to the current time.
+    Now,
+    /// An explicit `(tv_sec, tv_nsec)` value.
+    Set { sec: i64, nsec: i64 },
 }
 
 /// One entry returned by [`MountFs::readdir`].
@@ -104,6 +121,15 @@ pub trait MountFs: std::fmt::Debug + Send {
     fn mkdir(&mut self, _rel: &str, _mode: u32) -> io::Result<()> {
         Err(erofs())
     }
+    /// Create a special node (`mknod`/`mkfifo`). `mode` carries the full type
+    /// bits (`S_IFREG`/`S_IFIFO`/…) plus permission bits. A writable in-memory
+    /// backend models regular files and FIFOs; anything it can't represent
+    /// (device nodes, sockets) is left to report `EPERM`. The default is
+    /// `EROFS` (read-only backends) — the kernel maps an unsupported node type
+    /// to `EPERM` before reaching a writable backend.
+    fn mknod(&mut self, _rel: &str, _mode: u32) -> io::Result<()> {
+        Err(erofs())
+    }
     fn unlink(&mut self, _rel: &str) -> io::Result<()> {
         Err(erofs())
     }
@@ -113,11 +139,19 @@ pub trait MountFs: std::fmt::Debug + Send {
     fn truncate(&mut self, _rel: &str, _len: u64) -> io::Result<()> {
         Err(erofs())
     }
-    /// Set the node's modification time (`utimensat`). `None` leaves it unchanged
-    /// (`UTIME_OMIT` / atime-only). The default accepts the call without storing
-    /// anything, so a backend that doesn't model per-node mtime (procfs/sysfs)
-    /// doesn't fail a `touch`; a writable backend overrides to actually store it.
-    fn set_mtime(&mut self, _rel: &str, _mtime: Option<i64>) -> io::Result<()> {
+    /// Set the node's access and modification times (`utimensat`/`futimens`).
+    /// Each field is a [`SetTime`]: `Omit` leaves it unchanged, `Now` uses the
+    /// current time, `Set` an explicit value. The default accepts the call
+    /// without storing anything, so a backend that doesn't model per-node
+    /// timestamps (procfs/sysfs) doesn't fail a `touch`; a writable backend
+    /// overrides to actually store them.
+    fn set_times(&mut self, _rel: &str, _atime: SetTime, _mtime: SetTime) -> io::Result<()> {
+        Ok(())
+    }
+    /// Set the node's owner (`chown`). Either field `None` leaves that id
+    /// unchanged. The default accepts without storing (single-user backends);
+    /// a writable backend overrides so `stat` reflects the new owner.
+    fn set_owner(&mut self, _rel: &str, _uid: Option<u32>, _gid: Option<u32>) -> io::Result<()> {
         Ok(())
     }
     /// Set the node's permission bits (`chmod`; only the low `0o7777` are used).

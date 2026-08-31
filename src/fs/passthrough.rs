@@ -66,7 +66,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
-use super::{Attrs, DirEntry, MountFs, NodeKind};
+use super::{Attrs, DirEntry, MountFs, NodeKind, SetTime};
 
 /// `openat(2)`-family flag and errno values `std` doesn't expose. Declared
 /// by hand (rather than depending on the `libc` crate, which is not a
@@ -90,7 +90,12 @@ mod sys {
     /// racy path.
     pub const O_PATH: c_int = 0o10_000_000;
     pub const AT_REMOVEDIR: c_int = 0x200;
+    pub const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
     pub const ELOOP: i32 = 40;
+    /// `utimensat` `tv_nsec` sentinels (Linux `<bits/stat.h>`): use the current
+    /// time / leave this field unchanged.
+    pub const UTIME_NOW: i64 = 0x3fff_ffff;
+    pub const UTIME_OMIT: i64 = 0x3fff_fffe;
 
     use std::ffi::c_int;
 }
@@ -110,7 +115,11 @@ mod sys {
     /// can `fstat` to `lstat` a symlink).
     pub const O_SYMLINK: c_int = 0x0020_0000;
     pub const AT_REMOVEDIR: c_int = 0x0080;
+    pub const AT_SYMLINK_NOFOLLOW: c_int = 0x0020;
     pub const ELOOP: i32 = 62;
+    /// `utimensat` `tv_nsec` sentinels (macOS `<sys/stat.h>`).
+    pub const UTIME_NOW: i64 = -1;
+    pub const UTIME_OMIT: i64 = -2;
 
     use std::ffi::c_int;
 }
@@ -144,6 +153,10 @@ unsafe extern "C" {
         flags: c_int,
     ) -> c_int;
     fn readlinkat(dirfd: c_int, path: *const c_char, buf: *mut c_char, bufsiz: usize) -> isize;
+    fn utimensat(dirfd: c_int, path: *const c_char, times: *const Timespec, flags: c_int) -> c_int;
+    fn fchmodat(dirfd: c_int, path: *const c_char, mode: u32, flags: c_int) -> c_int;
+    fn fchownat(dirfd: c_int, path: *const c_char, owner: u32, group: u32, flags: c_int) -> c_int;
+    fn mknodat(dirfd: c_int, path: *const c_char, mode: u32, dev: u64) -> c_int;
     /// Takes ownership of `fd` (POSIX: on success the fd must not be used or
     /// closed independently afterward — only via `closedir`).
     fn fdopendir(fd: c_int) -> *mut c_void;
@@ -255,6 +268,79 @@ fn normalize_errno(err: io::Error) -> io::Error {
 #[cfg(target_os = "linux")]
 fn normalize_errno(err: io::Error) -> io::Error {
     err
+}
+
+/// The kernel `struct timespec` (64-bit `tv_sec`/`tv_nsec`) passed to
+/// `utimensat`. Same layout on Linux and macOS for 64-bit targets.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// Translate one [`SetTime`] into a host `timespec` for `utimensat`.
+fn to_timespec(t: SetTime) -> Timespec {
+    match t {
+        SetTime::Omit => Timespec {
+            tv_sec: 0,
+            tv_nsec: sys::UTIME_OMIT,
+        },
+        SetTime::Now => Timespec {
+            tv_sec: 0,
+            tv_nsec: sys::UTIME_NOW,
+        },
+        SetTime::Set { sec, nsec } => Timespec {
+            tv_sec: sec,
+            tv_nsec: nsec,
+        },
+    }
+}
+
+/// `utimensat(parent, name, [atime, mtime], AT_SYMLINK_NOFOLLOW)` — set both
+/// timestamps on the node named by `(dirfd, name)` without following a final
+/// symlink (the confined walk has already done any following the guest asked
+/// for).
+fn raw_utimensat(dirfd: RawFd, name: &CStr, atime: SetTime, mtime: SetTime) -> io::Result<()> {
+    let times = [to_timespec(atime), to_timespec(mtime)];
+    let r = unsafe { utimensat(dirfd, name.as_ptr(), times.as_ptr(), sys::AT_SYMLINK_NOFOLLOW) };
+    if r < 0 {
+        Err(normalize_errno(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+fn raw_fchmodat(dirfd: RawFd, name: &CStr, mode: u32) -> io::Result<()> {
+    // The confined resolution already followed any symlink the guest wanted
+    // followed, so the final component is a concrete node; flags = 0.
+    let r = unsafe { fchmodat(dirfd, name.as_ptr(), mode & 0o7777, 0) };
+    if r < 0 {
+        Err(normalize_errno(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+fn raw_fchownat(dirfd: RawFd, name: &CStr, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+    // A `-1` (u32::MAX) owner/group means "leave unchanged", matching chown(2).
+    let owner = uid.unwrap_or(u32::MAX);
+    let group = gid.unwrap_or(u32::MAX);
+    let r = unsafe { fchownat(dirfd, name.as_ptr(), owner, group, sys::AT_SYMLINK_NOFOLLOW) };
+    if r < 0 {
+        Err(normalize_errno(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+fn raw_mknodat(dirfd: RawFd, name: &CStr, mode: u32) -> io::Result<()> {
+    let r = unsafe { mknodat(dirfd, name.as_ptr(), mode, 0) };
+    if r < 0 {
+        Err(normalize_errno(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
 }
 
 fn raw_openat(dirfd: RawFd, name: &CStr, flags: c_int, mode: u32) -> io::Result<OwnedFd> {
@@ -414,7 +500,8 @@ fn list_dir_fd(fd: OwnedFd) -> io::Result<Vec<DirEntry>> {
     let mut out = Vec::with_capacity(names.len());
     for name in names {
         let cname = cstr(&name)?;
-        let (kind, inode) = match raw_openat(raw, &cname, sys::O_RDONLY | sys::O_NOFOLLOW, 0) {
+        // O_NONBLOCK: a FIFO entry must not block this listing's per-entry fstat.
+        let (kind, inode) = match raw_openat(raw, &cname, sys::O_RDONLY | sys::O_NOFOLLOW | sys::O_NONBLOCK, 0) {
             Ok(entry_fd) => match fs::File::from(entry_fd).metadata() {
                 Ok(m) => (kind_of(&m), m.ino()),
                 Err(_) => (NodeKind::File, 0),
@@ -659,6 +746,7 @@ fn attrs_of(m: &fs::Metadata) -> Attrs {
         mode: m.mode(),
         uid: m.uid(),
         gid: m.gid(),
+        atime: m.atime(),
         mtime: m.mtime(),
         inode: m.ino(),
         nlink: m.nlink() as u32,
@@ -679,10 +767,12 @@ impl MountFs for Passthrough {
         }
         let (parent, name) = self.resolve(rel, false, false).ok()?;
         let cname = cstr(&name).ok()?;
+        // O_NONBLOCK so a FIFO (or other special file) opens immediately for the
+        // fstat instead of blocking forever waiting for a peer.
         match raw_openat(
             parent.as_raw_fd(),
             &cname,
-            sys::O_RDONLY | sys::O_NOFOLLOW,
+            sys::O_RDONLY | sys::O_NOFOLLOW | sys::O_NONBLOCK,
             0,
         ) {
             Ok(fd) => {
@@ -779,6 +869,38 @@ impl MountFs for Passthrough {
         )
         .map_err(normalize_errno)?;
         fs::File::from(fd).set_permissions(fs::Permissions::from_mode(mode & 0o777))
+    }
+
+    fn mknod(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        self.deny_if_ro()?;
+        let (parent, name) = self.resolve(rel, false, false)?;
+        let cname = cstr(&name)?;
+        raw_mknodat(parent.as_raw_fd(), &cname, mode)?;
+        // Match the exact requested permission bits (mknod's mode is subject to
+        // the umask), mirroring `create`/`mkdir`.
+        let _ = raw_fchmodat(parent.as_raw_fd(), &cname, mode & 0o7777);
+        Ok(())
+    }
+
+    fn set_times(&mut self, rel: &str, atime: SetTime, mtime: SetTime) -> io::Result<()> {
+        self.deny_if_ro()?;
+        let (parent, name) = self.resolve(rel, false, false)?;
+        let cname = cstr(&name)?;
+        raw_utimensat(parent.as_raw_fd(), &cname, atime, mtime)
+    }
+
+    fn set_mode(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        self.deny_if_ro()?;
+        let (parent, name) = self.resolve(rel, false, false)?;
+        let cname = cstr(&name)?;
+        raw_fchmodat(parent.as_raw_fd(), &cname, mode)
+    }
+
+    fn set_owner(&mut self, rel: &str, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+        self.deny_if_ro()?;
+        let (parent, name) = self.resolve(rel, false, false)?;
+        let cname = cstr(&name)?;
+        raw_fchownat(parent.as_raw_fd(), &cname, uid, gid)
     }
 
     fn unlink(&mut self, rel: &str) -> io::Result<()> {

@@ -283,6 +283,7 @@ impl MountFs for SysFs {
             mode,
             uid: 0,
             gid: 0,
+            atime: 0,
             mtime: 0,
             inode: node.inode(),
             nlink: 1,

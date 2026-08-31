@@ -46,8 +46,8 @@ use poll::{EventFdInst, PollFds};
 
 /// `dirfd` value meaning "resolve relative to the current working directory".
 const AT_FDCWD: i64 = -100;
-/// Max symlink hops before `ELOOP`.
-const SYMLINK_MAX: u32 = 16;
+/// Max symlink hops before `ELOOP` (matches Linux's `MAXSYMLINKS`).
+const SYMLINK_MAX: u32 = 40;
 
 /// Per-process kernel-side state (swapped into `Kernel::cur` while running).
 #[derive(Clone)]
@@ -2217,6 +2217,12 @@ impl Kernel {
             | Sysno::Fchmodat
             | Sysno::Chmod
             | Sysno::Fchmod
+            | Sysno::Fchownat
+            | Sysno::Fchown
+            | Sysno::Chown
+            | Sysno::Lchown
+            | Sysno::Mknod
+            | Sysno::Mknodat
             | Sysno::Rmdir
             | Sysno::Renameat
             | Sysno::Renameat2
@@ -2397,7 +2403,7 @@ impl Kernel {
             Sysno::Pwritev => self.sys_pwritev(vfs, cx, args[0], args[1], args[2], args[3], mem),
             Sysno::Ftruncate => self.sys_ftruncate(vfs, cx, args[0], args[1]),
             Sysno::Truncate => self.sys_truncate(vfs, cx, args[0], args[1], mem),
-            Sysno::Fallocate => self.sys_fallocate(vfs, cx, args[0], args[2], args[3]),
+            Sysno::Fallocate => self.sys_fallocate(vfs, cx, args[0], args[1], args[2], args[3]),
             Sysno::CopyFileRange => self.sys_copy_file_range(vfs, cx, args, mem),
             Sysno::Link => self.sys_linkat(vfs, cx, AT_FDCWD, args[0], AT_FDCWD, args[1], 0, mem),
             Sysno::Linkat => {
@@ -2431,6 +2437,15 @@ impl Kernel {
             Sysno::Chmod => self.sys_fchmodat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
             Sysno::Fchmodat => self.sys_fchmodat(vfs, cx, args[0] as i32 as i64, args[1], args[2], mem),
             Sysno::Fchmod => self.sys_fchmod(vfs, cx, args[0], args[1]),
+            // chown follows symlinks; lchown acts on the link (AT_SYMLINK_NOFOLLOW=0x100).
+            Sysno::Chown => self.sys_fchownat(vfs, cx, AT_FDCWD, args[0], args[1], args[2], 0, mem),
+            Sysno::Lchown => self.sys_fchownat(vfs, cx, AT_FDCWD, args[0], args[1], args[2], 0x100, mem),
+            Sysno::Fchownat => self.sys_fchownat(vfs, cx, args[0] as i32 as i64, args[1], args[2], args[3], args[4], mem),
+            Sysno::Fchown => self.sys_fchown(vfs, cx, args[0], args[1], args[2]),
+            // mknod(path, mode, dev); mknodat(dirfd, path, mode, dev). mkfifo is
+            // glibc's mknod with S_IFIFO. `dev` is ignored (no device nodes).
+            Sysno::Mknod => self.sys_mknodat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
+            Sysno::Mknodat => self.sys_mknodat(vfs, cx, args[0] as i32 as i64, args[1], args[2], mem),
             Sysno::Unlink => self.sys_unlinkat(vfs, cx, AT_FDCWD, args[0], 0, mem),
             Sysno::Rmdir => {
                 const AT_REMOVEDIR: u64 = 0x200;
@@ -2549,6 +2564,16 @@ impl Kernel {
             Sysno::Getcwd => self.sys_getcwd(cx, args[0], args[1], mem),
             Sysno::Fstatfs => self.sys_fstatfs(cx, args[0], args[1], mem),
             Sysno::Umask => self.sys_umask(sh, args[0]),
+            // Sync family that takes an fd: nothing is durably backed, so there's
+            // nothing to flush — but a bad fd must still report EBADF (real
+            // fsync/fdatasync/syncfs/sync_file_range validate the descriptor).
+            Sysno::Fsync | Sysno::Fdatasync | Sysno::Syncfs | Sysno::SyncFileRange => {
+                if cx.cur.fds.get(args[0] as i32).is_some() {
+                    0
+                } else {
+                    err(Errno::EBADF)
+                }
+            }
             // No extended attributes: report "no such attribute".
             Sysno::Getxattr | Sysno::Lgetxattr | Sysno::Fgetxattr => err(Errno::ENODATA),
             Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], mem),
@@ -2580,8 +2605,8 @@ impl Kernel {
             }
             Sysno::Dup => self.sys_dup(cx, args[0]),
             // dup2 has no flags (pass 0); dup3's 3rd arg is O_CLOEXEC.
-            Sysno::Dup2 => self.sys_dup2(cx, args[0], args[1], 0),
-            Sysno::Dup3 => self.sys_dup2(cx, args[0], args[1], args[2]),
+            Sysno::Dup2 => self.sys_dup2(cx, args[0], args[1], 0, false),
+            Sysno::Dup3 => self.sys_dup2(cx, args[0], args[1], args[2], true),
             Sysno::Clone => self.sys_clone(sh, cx, args, vcpu, mem),
             // x86-64's legacy spellings of clone: `fork` is
             // `clone(SIGCHLD, ...)`, `vfork` is `clone(CLONE_VM|CLONE_VFORK|
@@ -2678,8 +2703,6 @@ impl Kernel {
             Sysno::Adjtimex
             | Sysno::ClockAdjtime
             | Sysno::SetRobustList
-            | Sysno::Fchownat
-            | Sysno::Fchown
             // Locking/sync setters: all no-ops.
             | Sysno::Mlock
             | Sysno::Mlock2
@@ -2697,14 +2720,12 @@ impl Kernel {
             // locks its database this way.
             | Sysno::Flock
             // Sync family: nothing is durably backed (in-memory / host
-            // passthrough), so there's nothing to flush.
-            | Sysno::Fsync
-            | Sysno::Fdatasync
+            // passthrough), so there's nothing to flush. `sync()` takes no fd;
+            // the fd-taking members (fsync/fdatasync/syncfs/sync_file_range) are
+            // handled separately below so a bad fd reports EBADF.
             | Sysno::Sync
-            | Sysno::Syncfs
             | Sysno::Readahead
             | Sysno::Fadvise64
-            | Sysno::SyncFileRange
             // No supplementary-group model: setgroups succeeds as a no-op.
             | Sysno::Setgroups
             // Namespacing/mount ops we accept but don't model (no real jail
@@ -4201,16 +4222,39 @@ impl Kernel {
         }
     }
 
-    /// `fallocate(fd, mode, offset, len)` — for the default allocate/extend
-    /// mode, grow the file to at least `offset + len`; other modes (punch
-    /// hole, and so on) are accepted as no-ops.
+    /// `fallocate(fd, mode, offset, len)`. Default mode (0) grows the file to at
+    /// least `offset + len`. `FALLOC_FL_PUNCH_HOLE` (which must be combined with
+    /// `FALLOC_FL_KEEP_SIZE`) zeroes the byte range without changing the file
+    /// size. Other modes are accepted as no-ops.
     #[allow(clippy::unused_self)]
-    fn sys_fallocate(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, offset: u64, len: u64) -> i64 {
-        let Some(Fd::File { path, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
+    fn sys_fallocate(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, mode: u64, offset: u64, len: u64) -> i64 {
+        const FALLOC_FL_KEEP_SIZE: u64 = 0x01;
+        const FALLOC_FL_PUNCH_HOLE: u64 = 0x02;
+        let Some(Fd::File { path, writable, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
-        let want = offset.saturating_add(len);
+        if !writable {
+            return err(Errno::EBADF); // fallocate needs a writable fd
+        }
         let cur = vfs.stat(&path).map_or(0, |a| a.size);
+        if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+            // PUNCH_HOLE requires KEEP_SIZE and must not extend the file: zero
+            // only the portion of [offset, offset+len) that lies within EOF.
+            if mode & FALLOC_FL_KEEP_SIZE == 0 {
+                return err(Errno::EINVAL);
+            }
+            let end = offset.saturating_add(len).min(cur);
+            if end <= offset {
+                return 0;
+            }
+            let zeros = vec![0u8; (end - offset) as usize];
+            return match vfs.write_at(&path, offset, &zeros) {
+                Ok(_) => 0,
+                Err(e) => io_errno(&e),
+            };
+        }
+        // Default allocate/extend: grow the file if the range runs past EOF.
+        let want = offset.saturating_add(len);
         if want > cur {
             match vfs.truncate(&path, want) {
                 Ok(()) => 0,
@@ -5017,6 +5061,8 @@ impl Kernel {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
+        // A trailing slash on the guest path demands a directory target.
+        let had_slash = rel.len() > 1 && rel.ends_with('/');
         let resolved = self.resolve_path(cx, dirfd, &rel);
         // O_NOFOLLOW: if the final component is itself a symlink, fail with ELOOP
         // rather than following it (a security check `open`ers rely on). Checked
@@ -5026,7 +5072,10 @@ impl Kernel {
         {
             return err(Errno::ELOOP);
         }
-        let abs = self.follow_symlinks(vfs, &resolved).unwrap_or(resolved);
+        let abs = match self.follow_or_eloop(vfs, &resolved) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
         if self.trace {
             eprintln!("[open] pid={} {abs:?}", cx.cur.pid);
         }
@@ -5060,12 +5109,23 @@ impl Kernel {
         match vfs.stat(&abs) {
             None => {
                 if flags & O_CREAT != 0 {
+                    // Creating a name with a trailing slash asks for a directory,
+                    // which open(2) can't make → ENOTDIR (Linux via ENOTDIR/EISDIR).
+                    if had_slash {
+                        return err(Errno::ENOTDIR);
+                    }
                     if let Err(e) = vfs.create(&abs, (mode & 0o777) as u32) {
                         return io_errno(&e);
                     }
+                } else if self.has_nondir_component(vfs, &abs) {
+                    return err(Errno::ENOTDIR);
                 } else {
                     return err(Errno::ENOENT);
                 }
+            }
+            // A trailing slash on a non-directory is ENOTDIR ("file/").
+            Some(a) if had_slash && a.kind != NodeKind::Dir => {
+                return err(Errno::ENOTDIR);
             }
             // O_CREAT|O_EXCL demands the file not already exist (atomic create —
             // the standard lock-file / mkstemp idiom); anything else is EEXIST.
@@ -5161,9 +5221,15 @@ impl Kernel {
     }
 
     /// `dup2`/`dup3(oldfd, newfd, flags)`. `dup3` sets `FD_CLOEXEC` from
-    /// `O_CLOEXEC`; `dup2` always clears it (via `insert`).
-    fn sys_dup2(&self, cx: &mut ServiceCtx, oldfd: u64, newfd: u64, flags: u64) -> i64 {
+    /// `O_CLOEXEC`; `dup2` always clears it (via `insert`). `dup3` also differs
+    /// on the `oldfd == newfd` case: `dup2` returns `newfd` unchanged, but
+    /// `dup3` rejects it with `EINVAL`.
+    fn sys_dup2(&self, cx: &mut ServiceCtx, oldfd: u64, newfd: u64, flags: u64, is_dup3: bool) -> i64 {
         const O_CLOEXEC: u64 = 0o2000000;
+        // dup3 rejects equal fds with EINVAL *before* validating oldfd.
+        if is_dup3 && oldfd == newfd {
+            return err(Errno::EINVAL);
+        }
         let Some(fd) = cx.cur.fds.get(oldfd as i32).cloned() else {
             return err(Errno::EBADF);
         };
@@ -5311,13 +5377,24 @@ impl Kernel {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
+        let had_slash = rel.len() > 1 && rel.ends_with('/');
         let mut abs = self.resolve_path(cx, dirfd, &rel);
         if flags & AT_SYMLINK_NOFOLLOW == 0 {
-            abs = self.follow_symlinks(vfs, &abs).unwrap_or(abs);
+            abs = match self.follow_or_eloop(vfs, &abs) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
         }
         let Some(attrs) = vfs.stat(&abs) else {
+            if self.has_nondir_component(vfs, &abs) {
+                return err(Errno::ENOTDIR);
+            }
             return err(Errno::ENOENT);
         };
+        // A trailing slash on a non-directory target is ENOTDIR.
+        if had_slash && attrs.kind != NodeKind::Dir {
+            return err(Errno::ENOTDIR);
+        }
         write_stat_or_fault(mem, statbuf, &attrs, self.arch)
     }
 
@@ -5416,7 +5493,47 @@ impl Kernel {
         path::normalize(&format!("{base}/{p}"))
     }
 
+    /// True if any *non-final* component of `abs` exists but is not a directory
+    /// (nor a symlink, which might point at one) — meaning a lookup that failed
+    /// with a missing final component should really be `ENOTDIR`, not `ENOENT`
+    /// (e.g. `stat("file/foo")` where `file` is a regular file). Consulted only
+    /// on the failure path, so the common success case pays nothing. Works
+    /// uniformly across backends since it walks via [`MountTable::stat`].
+    #[allow(clippy::unused_self)]
+    fn has_nondir_component(&self, vfs: &mut MountTable, abs: &str) -> bool {
+        let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
+        if comps.len() < 2 {
+            return false;
+        }
+        let mut prefix = String::new();
+        for c in &comps[..comps.len() - 1] {
+            prefix.push('/');
+            prefix.push_str(c);
+            match vfs.stat(&prefix) {
+                Some(a) if a.kind != NodeKind::Dir && a.kind != NodeKind::Symlink => return true,
+                // A missing intermediate component means the failure is a plain
+                // ENOENT, not ENOTDIR — stop walking.
+                None => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Follow the final-component symlink chain, surfacing a cycle (or an
+    /// over-long chain) as `ELOOP` (an encoded `-i64`) instead of silently
+    /// falling back to the unresolved path — which would make a mutual
+    /// `a -> b -> a` loop `stat`/`open` "succeed" on the link node. Returns the
+    /// resolved path on success (including the case where the final component
+    /// doesn't exist yet — that's `ENOENT` at the caller, not here).
+    fn follow_or_eloop(&self, vfs: &mut MountTable, path: &str) -> Result<String, i64> {
+        self.follow_symlinks(vfs, path)
+            .ok_or_else(|| err(Errno::ELOOP))
+    }
+
     /// Follow the final-component symlink chain (bounded), returning the target.
+    /// `None` means the chain exceeded [`SYMLINK_MAX`] hops (a loop) — callers
+    /// that must report `ELOOP` should go through [`Self::follow_or_eloop`].
     #[allow(clippy::unused_self)]
     fn follow_symlinks(&self, vfs: &mut MountTable, path: &str) -> Option<String> {
         let mut p = path.to_string();

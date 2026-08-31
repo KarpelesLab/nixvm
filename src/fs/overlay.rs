@@ -228,6 +228,15 @@ impl MountFs for Overlay {
         self.upper.mkdir(rel, mode)
     }
 
+    fn mknod(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        if self.stat(rel).is_some() {
+            return Err(eexist());
+        }
+        self.whiteouts.remove(rel);
+        self.ensure_dir_in_upper(parent_of(rel));
+        self.upper.mknod(rel, mode)
+    }
+
     fn unlink(&mut self, rel: &str) -> io::Result<()> {
         match self.stat(rel) {
             None => return Err(enoent()),
@@ -256,6 +265,37 @@ impl MountFs for Overlay {
     fn truncate(&mut self, rel: &str, len: u64) -> io::Result<()> {
         self.copy_up(rel)?;
         self.upper.truncate(rel, len)
+    }
+
+    fn set_times(
+        &mut self,
+        rel: &str,
+        atime: super::SetTime,
+        mtime: super::SetTime,
+    ) -> io::Result<()> {
+        if self.stat(rel).is_none() {
+            return Err(enoent());
+        }
+        // Copy the node up so the timestamp change lands on a writable node
+        // (the lower layer is immutable), then apply it there.
+        self.copy_up(rel)?;
+        self.upper.set_times(rel, atime, mtime)
+    }
+
+    fn set_mode(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        if self.stat(rel).is_none() {
+            return Err(enoent());
+        }
+        self.copy_up(rel)?;
+        self.upper.set_mode(rel, mode)
+    }
+
+    fn set_owner(&mut self, rel: &str, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+        if self.stat(rel).is_none() {
+            return Err(enoent());
+        }
+        self.copy_up(rel)?;
+        self.upper.set_owner(rel, uid, gid)
     }
 
     fn symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {

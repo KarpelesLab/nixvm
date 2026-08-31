@@ -128,6 +128,11 @@ impl MountTable {
         fs.mkdir(&rel, mode)
     }
 
+    pub fn mknod(&mut self, abs_path: &str, mode: u32) -> io::Result<()> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.mknod(&rel, mode)
+    }
+
     pub fn unlink(&mut self, abs_path: &str) -> io::Result<()> {
         let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
         fs.unlink(&rel)
@@ -143,9 +148,24 @@ impl MountTable {
         fs.truncate(&rel, len)
     }
 
-    pub fn set_mtime(&mut self, abs_path: &str, mtime: Option<i64>) -> io::Result<()> {
+    pub fn set_times(
+        &mut self,
+        abs_path: &str,
+        atime: super::SetTime,
+        mtime: super::SetTime,
+    ) -> io::Result<()> {
         let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
-        fs.set_mtime(&rel, mtime)
+        fs.set_times(&rel, atime, mtime)
+    }
+
+    pub fn set_owner(
+        &mut self,
+        abs_path: &str,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> io::Result<()> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.set_owner(&rel, uid, gid)
     }
 
     pub fn set_mode(&mut self, abs_path: &str, mode: u32) -> io::Result<()> {
@@ -312,6 +332,7 @@ mod tests {
                 mode: 0o755,
                 uid: 0,
                 gid: 0,
+                atime: 0,
                 mtime: 0,
                 inode: 0,
                 nlink: 1,
