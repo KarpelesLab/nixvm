@@ -3703,6 +3703,16 @@ impl Kernel {
     /// EOF (0).
     fn read_pty_fd(&self, cx: &mut ServiceCtx, fd: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
         let f = cx.cur.fds.get(fd as i32).cloned();
+        // A slave read in *non-canonical* mode is governed by VMIN/VTIME; the
+        // master and canonical-slave paths keep the simple block-until-ready
+        // behavior. Without VMIN/VTIME, a VMIN=0 read blocked forever instead of
+        // returning after the VTIME timeout (a whole-VM hang for a lone reader).
+        if let Some(Fd::PtySlave(n)) = f {
+            let (canon, vmin, vtime_ds) = self.ptys.lock().unwrap().slave_read_params(n);
+            if !canon {
+                return self.read_pty_slave_noncanon(cx, n, vmin, vtime_ds, buf, count, mem);
+            }
+        }
         let (res, nonblock) = {
             let mut ptys = self.ptys.lock().unwrap();
             match f {
@@ -3729,6 +3739,66 @@ impl Kernel {
                 data.len() as i64
             }
         }
+    }
+
+    /// A non-canonical (`ICANON` off) slave read, honoring `VMIN`/`VTIME`:
+    /// - `VMIN==0`: return immediately with whatever is buffered; if nothing and
+    ///   `VTIME>0`, wait up to `VTIME` deciseconds then return 0 (never blocks
+    ///   forever); with `VTIME==0` it's a pure non-blocking poll.
+    /// - `VMIN>0`: block until at least `VMIN` bytes are available (as Linux does
+    ///   for `VTIME==0`), then return them. `VTIME` acts as an inter-byte timer
+    ///   once some data has arrived.
+    fn read_pty_slave_noncanon(&self, cx: &mut ServiceCtx, n: usize, vmin: usize, vtime_ds: u64, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+        let (avail, master_open) = self.ptys.lock().unwrap().slave_input(n);
+        if avail == 0 && !master_open {
+            cx.cur.wake_deadline = None;
+            return 0; // EOF
+        }
+        let nonblock = self.ptys.lock().unwrap().is_nonblock(n, false);
+        let ready = if vmin == 0 { avail > 0 } else { avail >= vmin };
+        if ready {
+            cx.cur.wake_deadline = None;
+            let data = self.ptys.lock().unwrap().slave_read(n, count as usize).unwrap_or_default();
+            if mem.write(buf, &data).is_err() {
+                return err(Errno::EFAULT);
+            }
+            return data.len() as i64;
+        }
+        // Not enough data yet.
+        if nonblock {
+            // VMIN==0 returns 0 (no data now); VMIN>0 with too few bytes → EAGAIN.
+            return if vmin == 0 { 0 } else { err(Errno::EAGAIN) };
+        }
+        // A VTIME timer applies for VMIN==0, or for VMIN>0 once some bytes exist
+        // (the inter-byte timer). VMIN==0/VTIME==0 is a pure poll → return 0.
+        let timed = vtime_ds > 0 && (vmin == 0 || avail > 0);
+        if !timed {
+            if vmin == 0 {
+                cx.cur.wake_deadline = None;
+                return 0; // poll: nothing available
+            }
+            cx.block = true; // VMIN>0/VTIME==0: wait for VMIN bytes
+            return 0;
+        }
+        let deadline = match cx.cur.wake_deadline {
+            Some(dl) => dl,
+            None => {
+                let dl = poll::now_ns() + u128::from(vtime_ds) * 100_000_000; // deciseconds → ns
+                cx.cur.wake_deadline = Some(dl);
+                dl
+            }
+        };
+        if poll::now_ns() >= deadline {
+            // Timed out: return whatever is buffered (0 for VMIN==0).
+            cx.cur.wake_deadline = None;
+            let data = self.ptys.lock().unwrap().slave_read(n, count as usize).unwrap_or_default();
+            if mem.write(buf, &data).is_err() {
+                return err(Errno::EFAULT);
+            }
+            return data.len() as i64;
+        }
+        cx.block = true; // park until the deadline or until more data arrives
+        0
     }
 
     /// The `Fd::Eventfd`/`Fd::Timerfd` arm of [`Self::sys_read`]/

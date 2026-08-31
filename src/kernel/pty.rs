@@ -308,6 +308,21 @@ impl Ptys {
         let k = cap.min(p.output.len());
         Some(p.output.drain(..k).collect())
     }
+    /// Non-canonical read parameters for a slave end: `(canonical, VMIN,
+    /// VTIME-in-deciseconds)`. `c_lflag` bit `ICANON`; `c_cc[VMIN]` at index 6,
+    /// `c_cc[VTIME]` at index 5 (the control chars start at termios offset 17).
+    pub(super) fn slave_read_params(&self, n: usize) -> (bool, usize, u64) {
+        self.table.get(n).map_or((true, 1, 0), |p| {
+            let lflag = u32::from_le_bytes(p.termios[12..16].try_into().unwrap());
+            (lflag & ICANON != 0, usize::from(p.termios[17 + 6]), u64::from(p.termios[17 + 5]))
+        })
+    }
+
+    /// Bytes currently available to a slave read, and whether the master is open.
+    pub(super) fn slave_input(&self, n: usize) -> (usize, bool) {
+        self.table.get(n).map_or((0, false), |p| (p.input.len(), p.master_open))
+    }
+
     /// Slave read: drain up to `cap` bytes of terminal input. `None` = would
     /// block; `Some(vec)` may be empty on EOF (master closed).
     pub(super) fn slave_read(&mut self, n: usize, cap: usize) -> Option<Vec<u8>> {
