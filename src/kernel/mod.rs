@@ -2463,6 +2463,16 @@ impl Kernel {
             Sysno::Getcwd => self.sys_getcwd(cx, args[0], args[1], mem),
             Sysno::Fstatfs => self.sys_fstatfs(cx, args[0], args[1], mem),
             Sysno::Umask => self.sys_umask(sh, args[0]),
+            // Sync family that takes an fd: nothing is durably backed, so there's
+            // nothing to flush — but a bad fd must still report EBADF (real
+            // fsync/fdatasync/syncfs/sync_file_range validate the descriptor).
+            Sysno::Fsync | Sysno::Fdatasync | Sysno::Syncfs | Sysno::SyncFileRange => {
+                if cx.cur.fds.get(args[0] as i32).is_some() {
+                    0
+                } else {
+                    err(Errno::EBADF)
+                }
+            }
             // No extended attributes: report "no such attribute".
             Sysno::Getxattr | Sysno::Lgetxattr | Sysno::Fgetxattr => err(Errno::ENODATA),
             Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], mem),
@@ -2494,8 +2504,8 @@ impl Kernel {
             }
             Sysno::Dup => self.sys_dup(cx, args[0]),
             // dup2 has no flags (pass 0); dup3's 3rd arg is O_CLOEXEC.
-            Sysno::Dup2 => self.sys_dup2(cx, args[0], args[1], 0),
-            Sysno::Dup3 => self.sys_dup2(cx, args[0], args[1], args[2]),
+            Sysno::Dup2 => self.sys_dup2(cx, args[0], args[1], 0, false),
+            Sysno::Dup3 => self.sys_dup2(cx, args[0], args[1], args[2], true),
             Sysno::Clone => self.sys_clone(sh, cx, args, vcpu, mem),
             // x86-64's legacy spellings of clone: `fork` is
             // `clone(SIGCHLD, ...)`, `vfork` is `clone(CLONE_VM|CLONE_VFORK|
@@ -2602,14 +2612,12 @@ impl Kernel {
             // locks its database this way.
             | Sysno::Flock
             // Sync family: nothing is durably backed (in-memory / host
-            // passthrough), so there's nothing to flush.
-            | Sysno::Fsync
-            | Sysno::Fdatasync
+            // passthrough), so there's nothing to flush. `sync()` takes no fd;
+            // the fd-taking members (fsync/fdatasync/syncfs/sync_file_range) are
+            // handled separately below so a bad fd reports EBADF.
             | Sysno::Sync
-            | Sysno::Syncfs
             | Sysno::Readahead
             | Sysno::Fadvise64
-            | Sysno::SyncFileRange
             // Credential setters: single-user (root) VM, so they all succeed
             // (setfsuid/setfsgid return the previous id, which is always 0).
             | Sysno::Setuid
@@ -5063,9 +5071,15 @@ impl Kernel {
     }
 
     /// `dup2`/`dup3(oldfd, newfd, flags)`. `dup3` sets `FD_CLOEXEC` from
-    /// `O_CLOEXEC`; `dup2` always clears it (via `insert`).
-    fn sys_dup2(&self, cx: &mut ServiceCtx, oldfd: u64, newfd: u64, flags: u64) -> i64 {
+    /// `O_CLOEXEC`; `dup2` always clears it (via `insert`). `dup3` also differs
+    /// on the `oldfd == newfd` case: `dup2` returns `newfd` unchanged, but
+    /// `dup3` rejects it with `EINVAL`.
+    fn sys_dup2(&self, cx: &mut ServiceCtx, oldfd: u64, newfd: u64, flags: u64, is_dup3: bool) -> i64 {
         const O_CLOEXEC: u64 = 0o2000000;
+        // dup3 rejects equal fds with EINVAL *before* validating oldfd.
+        if is_dup3 && oldfd == newfd {
+            return err(Errno::EINVAL);
+        }
         let Some(fd) = cx.cur.fds.get(oldfd as i32).cloned() else {
             return err(Errno::EBADF);
         };
