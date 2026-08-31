@@ -270,8 +270,12 @@ impl Default for SockOpts {
             linger_secs: 0,
             rcvtimeo: [0; 16],
             sndtimeo: [0; 16],
-            rcvbuf: 212_992,
-            sndbuf: 212_992,
+            // Stored as the *internal* buffer size; `getsockopt` reports twice
+            // this, matching Linux (`net.core.{r,w}mem_default` = 212992, so the
+            // internal default is half that). `setsockopt` overwrites it with the
+            // caller's requested value, also doubled on readback.
+            rcvbuf: 106_496,
+            sndbuf: 106_496,
             tos: 0,
             error: 0,
         }
@@ -1212,8 +1216,11 @@ impl Kernel {
                 SO_REUSEPORT => u32::from(net.socks[sock].opts.reuseport),
                 SO_KEEPALIVE => u32::from(net.socks[sock].opts.keepalive),
                 SO_BROADCAST => u32::from(net.socks[sock].opts.broadcast),
-                SO_RCVBUF => net.socks[sock].opts.rcvbuf,
-                SO_SNDBUF => net.socks[sock].opts.sndbuf,
+                // Linux reports twice the internally stored buffer size (it
+                // reserves the other half for bookkeeping/skb overhead), so a
+                // read after `setsockopt` returns ~2× what was requested.
+                SO_RCVBUF => net.socks[sock].opts.rcvbuf.saturating_mul(2),
+                SO_SNDBUF => net.socks[sock].opts.sndbuf.saturating_mul(2),
                 SO_ACCEPTCONN => {
                     u32::from(matches!(net.socks[sock].kind, Kind::Listener { .. }))
                 }
@@ -3260,7 +3267,8 @@ mod tests {
             k.sys_getsockopt(&mut k.net.lock().unwrap(), &mut cx, s, SOL_SOCKET, SO_RCVBUF, out, outlen, &mut mem),
             0
         );
-        assert_eq!(mem.read_u32(out).unwrap(), 65_536);
+        // Linux reports twice the requested value (kernel bookkeeping overhead).
+        assert_eq!(mem.read_u32(out).unwrap(), 131_072);
 
         mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
         assert_eq!(
