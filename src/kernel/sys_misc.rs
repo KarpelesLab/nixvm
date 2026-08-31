@@ -202,6 +202,61 @@ impl Kernel {
         i64::from(old)
     }
 
+    /// `sched_get_priority_min`/`_max(policy)` — the valid real-time priority
+    /// range. `SCHED_FIFO`(1)/`SCHED_RR`(2) use `1..=99`; the others (OTHER/
+    /// BATCH/IDLE) have no RT priority, so both bounds are 0.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_sched_priority_bound(&self, policy: u64, max: bool) -> i64 {
+        match policy {
+            1 | 2 => i64::from(max) * 98 + 1, // 1 (min) or 99 (max)
+            _ => 0,
+        }
+    }
+
+    /// `sched_setscheduler(pid, policy, param)` — record the policy and its
+    /// real-time priority (self only; other pids aren't modeled). Reported back
+    /// by `sched_getscheduler`/`sched_getparam`.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_sched_setscheduler(&self, cx: &mut ServiceCtx, policy: i32, param: u64, mem: &GuestMemory) -> i64 {
+        cx.cur.sched_policy = policy;
+        if param != 0
+            && let Ok(prio) = mem.read_u32(param)
+        {
+            cx.cur.sched_priority = prio as i32;
+        }
+        0
+    }
+
+    /// `setpriority(which, who, prio)` — record the nice value (clamped to
+    /// −20..=19). `getpriority` reports it back as the kernel ABI `20 - nice`.
+    /// Only `PRIO_PROCESS` on self is modeled; other targets succeed as a no-op.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_setpriority(&self, cx: &mut ServiceCtx, prio: i64) -> i64 {
+        cx.cur.nice = (prio as i32).clamp(-20, 19);
+        0
+    }
+
+    /// `sched_setaffinity(pid, cpusetsize, mask)` — record the affinity mask
+    /// (self only). `sched_getaffinity` reports it back.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_sched_setaffinity(&self, cx: &mut ServiceCtx, size: u64, mask: u64, mem: &GuestMemory) -> i64 {
+        let n = (size as usize).min(8);
+        if n == 0 {
+            return err(Errno::EINVAL);
+        }
+        let mut bytes = [0u8; 8];
+        let Ok(v) = mem.read_vec(mask, n) else {
+            return err(Errno::EFAULT);
+        };
+        bytes[..n].copy_from_slice(&v);
+        let m = u64::from_le_bytes(bytes);
+        if m == 0 {
+            return err(Errno::EINVAL); // an empty set is rejected
+        }
+        cx.cur.affinity = m;
+        0
+    }
+
     /// `prctl(option, ...)` — process-attribute get/set. We model the process
     /// name (`PR_SET_NAME`/`PR_GET_NAME`, stored on the kernel) and treat every
     /// other option as a successful no-op.
@@ -270,25 +325,22 @@ impl Kernel {
 
 /// `sched_getaffinity(pid, size, mask)` — report a single online CPU (bit 0),
 /// returning the number of bytes written (`min(size, 8)`).
-pub(super) fn sys_sched_getaffinity(ncpu: usize, size: u64, mask: u64, mem: &mut GuestMemory) -> i64 {
+pub(super) fn sys_sched_getaffinity(bits: u64, size: u64, mask: u64, mem: &mut GuestMemory) -> i64 {
     let n = size.min(8) as usize;
     if n == 0 {
         return err(Errno::EINVAL);
     }
-    // Report nixvm's own CPU count (bits 0..ncpu), consistent with sysfs/cpuinfo.
-    let mut buf = vec![0u8; n];
-    for cpu in 0..ncpu.min(n * 8) {
-        buf[cpu / 8] |= 1 << (cpu % 8);
-    }
-    if mem.write(mask, &buf).is_err() {
+    // Report the task's affinity mask (its set, or the default all-CPUs set).
+    let buf = bits.to_le_bytes();
+    if mem.write(mask, &buf[..n]).is_err() {
         return err(Errno::EFAULT);
     }
     n as i64
 }
 
 /// `sched_getparam(pid, param)` — write a `sched_param { sched_priority = 0 }`.
-pub(super) fn sys_sched_getparam(param: u64, mem: &mut GuestMemory) -> i64 {
-    if mem.write(param, &0i32.to_le_bytes()).is_err() {
+pub(super) fn sys_sched_getparam(priority: i32, param: u64, mem: &mut GuestMemory) -> i64 {
+    if mem.write(param, &priority.to_le_bytes()).is_err() {
         return err(Errno::EFAULT);
     }
     0
@@ -450,14 +502,14 @@ mod tests {
     }
 
     #[test]
-    fn sched_getaffinity_sets_bit0() {
+    fn sched_getaffinity_writes_the_mask() {
         let (_k, mut mem) = setup();
         let mask = 0x1_0000;
-        // 1 CPU → only bit 0 set.
-        assert_eq!(sys_sched_getaffinity(1, 128, mask, &mut mem), 8);
+        // The effective mask bits are written out (the dispatcher passes the
+        // task's mask, or the default all-CPUs set).
+        assert_eq!(sys_sched_getaffinity(0b1, 128, mask, &mut mem), 8);
         assert_eq!(mem.read_vec(mask, 1).unwrap()[0], 1);
-        // 4 CPUs → the low 4 bits (0xf).
-        assert_eq!(sys_sched_getaffinity(4, 128, mask, &mut mem), 8);
+        assert_eq!(sys_sched_getaffinity(0xf, 128, mask, &mut mem), 8);
         assert_eq!(mem.read_vec(mask, 1).unwrap()[0], 0xf);
     }
 

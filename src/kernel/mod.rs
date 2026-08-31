@@ -123,6 +123,14 @@ struct ProcInfo {
     /// after which regaining them is `EPERM` — so a dropped-privilege program
     /// behaves correctly instead of silently staying root.
     creds: Creds,
+    /// Scheduling attributes, reported back to the guest (the cooperative
+    /// scheduler doesn't actually honor them, but a program that sets and reads
+    /// them back must see what it set): policy (`SCHED_OTHER`=0/`FIFO`=1/`RR`=2/
+    /// …), real-time priority, `nice` (−20..19), and CPU-affinity mask.
+    sched_policy: i32,
+    sched_priority: i32,
+    nice: i32,
+    affinity: u64,
     /// Parked: the task blocked on its last slice (futex/poll/wait4/stdin) and
     /// should not be re-run until something might wake it. Distinct from
     /// `RunState::Running` so the scheduler doesn't busy-spin re-running a
@@ -264,6 +272,10 @@ impl Default for ProcInfo {
             queued_siginfo: [None; NSIG_SLOTS],
             rt_queue: BTreeMap::new(),
             creds: Creds::default(),
+            sched_policy: 0, // SCHED_OTHER
+            sched_priority: 0,
+            nice: 0,
+            affinity: 0, // 0 = "all CPUs" (default; never a real mask)
         }
     }
 }
@@ -2613,11 +2625,27 @@ impl Kernel {
                 i64::from(cx.cur.pid)
             }
             Sysno::Getppid => i64::from(cx.cur.ppid),
-            // Resource / scheduling / process-attribute syscalls (informational).
+            // Resource / scheduling / process-attribute syscalls. The scheduling
+            // attrs (policy/priority/nice/affinity) are recorded and reported
+            // back — the cooperative scheduler doesn't honor them, but a program
+            // that sets and re-reads them must see what it set.
             Sysno::SchedGetaffinity => {
-                sys_misc::sys_sched_getaffinity(self.ncpus, args[1], args[2], mem)
+                // The task's mask, or the default all-CPUs set when unset.
+                let bits = if cx.cur.affinity != 0 {
+                    cx.cur.affinity
+                } else if self.ncpus >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << self.ncpus) - 1
+                };
+                sys_misc::sys_sched_getaffinity(bits, args[1], args[2], mem)
             }
-            Sysno::SchedGetparam => sys_misc::sys_sched_getparam(args[1], mem),
+            Sysno::SchedSetaffinity => self.sys_sched_setaffinity(cx, args[1], args[2], mem),
+            Sysno::SchedGetparam => sys_misc::sys_sched_getparam(cx.cur.sched_priority, args[1], mem),
+            Sysno::SchedGetscheduler => i64::from(cx.cur.sched_policy),
+            Sysno::SchedSetscheduler => self.sys_sched_setscheduler(cx, args[1] as i32, args[2], mem),
+            Sysno::SchedGetPriorityMax => self.sys_sched_priority_bound(args[0], true),
+            Sysno::SchedGetPriorityMin => self.sys_sched_priority_bound(args[0], false),
             Sysno::Getrusage => self.sys_getrusage(sh, cx, args[0], args[1], mem),
             Sysno::Sysinfo => sys_misc::sys_sysinfo(args[0], mem),
             Sysno::Times => self.sys_times(sh, cx, args[0], mem),
@@ -2626,9 +2654,10 @@ impl Kernel {
             Sysno::Prlimit64 => self.sys_prlimit64(sh, args[1], args[2], args[3], mem),
             Sysno::Getrlimit => self.sys_getrlimit(sh, args[0], args[1], mem),
             Sysno::Prctl => self.sys_prctl(cx, args, mem),
-            // getpriority returns the kernel ABI value 20 - nice; nixvm models no
-            // nice, so nice 0 → 20 (glibc converts back to 0). Setpriority no-ops.
-            Sysno::Getpriority => 20,
+            // getpriority returns the kernel ABI value 20 - nice (glibc converts
+            // it back to the nice value); setpriority records the nice.
+            Sysno::Getpriority => i64::from(20 - cx.cur.nice),
+            Sysno::Setpriority => self.sys_setpriority(cx, args[2] as i32 as i64),
             // arch_prctl(ARCH_SET_FS) — how an x86-64 guest installs its TLS
             // register (FS.base; aarch64 uses the MSR-like TPIDR_EL0 via
             // CLONE_SETTLS instead, so this arm only ever fires for x86-64).
@@ -2651,19 +2680,13 @@ impl Kernel {
             | Sysno::SetRobustList
             | Sysno::Fchownat
             | Sysno::Fchown
-            // Locking/sync + scheduling/process-attr setters: all no-ops.
+            // Locking/sync setters: all no-ops.
             | Sysno::Mlock
             | Sysno::Mlock2
             | Sysno::Munlock
             | Sysno::Mlockall
             | Sysno::Munlockall
-            | Sysno::SchedSetaffinity
-            | Sysno::SchedGetscheduler
-            | Sysno::SchedSetscheduler
-            | Sysno::SchedGetPriorityMax
-            | Sysno::SchedGetPriorityMin
             | Sysno::Setrlimit
-            | Sysno::Setpriority
             | Sysno::Personality
             | Sysno::Sethostname
             | Sysno::Setdomainname
