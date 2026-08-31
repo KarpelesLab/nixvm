@@ -95,6 +95,16 @@ struct ProcInfo {
     /// Set by `FUTEX_WAKE` to release a parked waiter on its next slice.
     futex_woken: bool,
     run: RunState,
+    /// Job control: set `true` when a posted SIGCONT resumed this task from
+    /// `RunState::Stopped`, latching a "continued" event for a
+    /// `wait4(WCONTINUED)`/`waitid(WCONTINUED)` parent to report. Cleared when
+    /// reported. Irrelevant across fork (a fresh child starts `false`).
+    continued: bool,
+    /// Job control: set `true` once a `wait4(WUNTRACED)`/`waitid(WSTOPPED)`
+    /// parent has reported this task's current stop, so the same stop isn't
+    /// reported again on a later wait. Reset each time the task stops afresh (or
+    /// is continued). Irrelevant across fork.
+    stop_reported: bool,
     /// Per-signal disposition (handler address / `SIG_DFL` / `SIG_IGN`, plus the
     /// flags, restorer, and mask from `rt_sigaction`). Indexed by signal number
     /// (1..=64); index 0 is unused.
@@ -249,6 +259,8 @@ impl Default for ProcInfo {
             futex_wait: None,
             futex_woken: false,
             run: RunState::Running,
+            continued: false,
+            stop_reported: false,
             handlers: [SigAction::default(); 65],
             altstack: (0, 0, SS_DISABLE),
             blocked: 0,
@@ -342,6 +354,12 @@ impl ProcInfo {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RunState {
     Running,
+    /// Job-control stopped by SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU; carries the stop
+    /// signal (for `WSTOPSIG`/`si_status`). A stopped task is not `Running`, so
+    /// the scheduler's runnable predicates never dispatch it; a posted SIGCONT
+    /// flips it back to `Running`. Reported to a `wait4(WUNTRACED)`/
+    /// `waitid(WSTOPPED)` parent, then latched via `stop_reported`.
+    Stopped(i32),
     Zombie(ExitCause),
 }
 
@@ -3078,6 +3096,8 @@ impl Kernel {
     /// `<-1` group `-pid`) and filling `rusage` with the child's CPU time.
     fn sys_wait4(&self, sh: &mut Shared, cx: &mut ServiceCtx, pid: i64, wstatus: u64, options: u64, rusage: u64, mem: &mut GuestMemory) -> i64 {
         const WNOHANG: u64 = 1;
+        const WUNTRACED: u64 = 2; // also report a child that job-control-stopped
+        const WCONTINUED: u64 = 8; // also report a child that was continued
         let cur = cx.cur.pid;
         let cur_pgid = pgid_of(&cx.cur);
         // Threads (CLONE_THREAD) are not reaped by wait4; only child processes
@@ -3094,16 +3114,27 @@ impl Kernel {
             }
         };
         let mut zombie = None;
+        let mut stopped = None; // (pid, stop signal) — an unreported stop
+        let mut continued = None; // pid of a continued child
         let mut has_child = false;
         for p in sh.procs.iter().flatten() {
             if wanted(&p.info) {
                 has_child = true;
-                if let RunState::Zombie(code) = p.info.run {
-                    zombie = Some((p.info.pid, code, p.info.cpu_ns));
-                    break;
+                match p.info.run {
+                    RunState::Zombie(code) if zombie.is_none() => {
+                        zombie = Some((p.info.pid, code, p.info.cpu_ns));
+                    }
+                    RunState::Stopped(sig) if !p.info.stop_reported && stopped.is_none() => {
+                        stopped = Some((p.info.pid, sig));
+                    }
+                    _ => {}
+                }
+                if p.info.continued && continued.is_none() {
+                    continued = Some(p.info.pid);
                 }
             }
         }
+        // A zombie reap takes priority over a stop/continue report.
         if let Some((child, code, child_cpu)) = zombie {
             if wstatus != 0 {
                 // WIFEXITED for a normal exit, WIFSIGNALED for a signal death.
@@ -3121,13 +3152,46 @@ impl Kernel {
             }
             return i64::from(child);
         }
+        // WUNTRACED: report a stopped child (WIFSTOPPED | WSTOPSIG<<8), latching
+        // it so the same stop isn't re-reported; the child is NOT reaped.
+        if options & WUNTRACED != 0
+            && let Some((child, sig)) = stopped
+        {
+            if wstatus != 0 {
+                let status = ((sig as u32) << 8) | 0x7f;
+                let _ = mem.write(wstatus, &status.to_le_bytes());
+            }
+            for slot in sh.procs.iter_mut().flatten() {
+                if slot.info.pid == child {
+                    slot.info.stop_reported = true;
+                    break;
+                }
+            }
+            return i64::from(child);
+        }
+        // WCONTINUED: report a continued child (WIFCONTINUED = 0xffff), clearing
+        // the latch; the child is NOT reaped.
+        if options & WCONTINUED != 0
+            && let Some(child) = continued
+        {
+            if wstatus != 0 {
+                let _ = mem.write(wstatus, &0xffffu32.to_le_bytes());
+            }
+            for slot in sh.procs.iter_mut().flatten() {
+                if slot.info.pid == child {
+                    slot.info.continued = false;
+                    break;
+                }
+            }
+            return i64::from(child);
+        }
         if !has_child {
             return err(Errno::ECHILD);
         }
         if options & WNOHANG != 0 {
             return 0;
         }
-        cx.block = true; // wait for a child to exit
+        cx.block = true; // wait for a child to exit / stop / continue
         0
     }
 
@@ -3140,7 +3204,13 @@ impl Kernel {
         const P_PID: u64 = 1;
         const P_PGID: u64 = 2;
         const WNOHANG: u64 = 1;
+        const WSTOPPED: u64 = 2; // report a job-control-stopped child
+        const WCONTINUED: u64 = 8; // report a continued child
         const WNOWAIT: u64 = 0x0100_0000;
+        const SIGCHLD: i32 = 17;
+        const SIGCONT: i32 = 18;
+        const CLD_STOPPED: i32 = 5;
+        const CLD_CONTINUED: i32 = 6;
         let cur = cx.cur.pid;
         let matches_id = |p: &ProcInfo| match idtype {
             P_ALL => true,
@@ -3149,16 +3219,38 @@ impl Kernel {
             _ => false,
         };
         let mut zombie = None;
+        let mut stopped = None; // (pid, stop signal)
+        let mut continued = None; // pid
         let mut has_child = false;
         for p in sh.procs.iter().flatten() {
             if p.info.ppid == cur && !p.info.is_thread && matches_id(&p.info) {
                 has_child = true;
-                if let RunState::Zombie(code) = p.info.run {
-                    zombie = Some((p.info.pid, code, p.info.cpu_ns));
-                    break;
+                match p.info.run {
+                    RunState::Zombie(code) if zombie.is_none() => {
+                        zombie = Some((p.info.pid, code, p.info.cpu_ns));
+                    }
+                    RunState::Stopped(sig) if !p.info.stop_reported && stopped.is_none() => {
+                        stopped = Some((p.info.pid, sig));
+                    }
+                    _ => {}
+                }
+                if p.info.continued && continued.is_none() {
+                    continued = Some(p.info.pid);
                 }
             }
         }
+        // A `siginfo_t` for a child job-control event (CLD_STOPPED/CLD_CONTINUED):
+        // si_signo=SIGCHLD, si_code=the event, si_pid=child, si_status=the signal.
+        let write_child_si = |mem: &mut GuestMemory, code: i32, child: i32, status: i32| {
+            if infop != 0 {
+                let mut si = [0u8; 128];
+                si[0..4].copy_from_slice(&SIGCHLD.to_le_bytes());
+                si[8..12].copy_from_slice(&code.to_le_bytes());
+                si[16..20].copy_from_slice(&child.to_le_bytes());
+                si[24..28].copy_from_slice(&status.to_le_bytes());
+                let _ = mem.write(infop, &si);
+            }
+        };
         if let Some((child, code, child_cpu)) = zombie {
             if infop != 0 {
                 // siginfo_t: si_signo(0)=SIGCHLD(17), si_errno(4)=0,
@@ -3181,6 +3273,38 @@ impl Kernel {
                 for slot in &mut sh.procs {
                     if slot.as_ref().is_some_and(|p| p.info.pid == child) {
                         *slot = None;
+                        break;
+                    }
+                }
+            }
+            return 0;
+        }
+        // WSTOPPED: report a job-control-stopped child. WNOWAIT leaves the stop
+        // un-latched so a later wait sees it again; otherwise latch it. Not reaped.
+        if options & WSTOPPED != 0
+            && let Some((child, sig)) = stopped
+        {
+            write_child_si(mem, CLD_STOPPED, child, sig);
+            if options & WNOWAIT == 0 {
+                for slot in sh.procs.iter_mut().flatten() {
+                    if slot.info.pid == child {
+                        slot.info.stop_reported = true;
+                        break;
+                    }
+                }
+            }
+            return 0;
+        }
+        // WCONTINUED: report a continued child (si_status = SIGCONT). WNOWAIT
+        // leaves the "continued" latch set; otherwise clear it. Not reaped.
+        if options & WCONTINUED != 0
+            && let Some(child) = continued
+        {
+            write_child_si(mem, CLD_CONTINUED, child, SIGCONT);
+            if options & WNOWAIT == 0 {
+                for slot in sh.procs.iter_mut().flatten() {
+                    if slot.info.pid == child {
+                        slot.info.continued = false;
                         break;
                     }
                 }
@@ -6927,6 +7051,151 @@ mod tests {
         let status = mem.read_u32(ws).unwrap();
         assert_eq!(status & 0x7f, 9, "termsig should be SIGKILL");
         assert_eq!(status & 0xff00, 0, "no WIFEXITED exit code for a signal death");
+    }
+
+    /// Helper: set a table process's `run` state, by pid.
+    fn set_run(k: &Kernel, pid: i32, run: RunState) {
+        for slot in k.shared.lock().unwrap().procs.iter_mut().flatten() {
+            if slot.info.pid == pid {
+                slot.info.run = run;
+            }
+        }
+    }
+
+    /// Helper: read a table process's fields, by pid.
+    fn proc_field<T>(k: &Kernel, pid: i32, f: impl Fn(&ProcInfo) -> T) -> T {
+        for slot in k.shared.lock().unwrap().procs.iter().flatten() {
+            if slot.info.pid == pid {
+                return f(&slot.info);
+            }
+        }
+        panic!("no proc pid {pid}");
+    }
+
+    #[test]
+    fn sigstop_delivery_stops_the_task_and_notifies_the_parent() {
+        // The current task is a child (pid 2, ppid 1) with a parent in the table.
+        let (k, mut mem, mut v, mut cx) = setup();
+        k.shared.lock().unwrap().procs.push(Some(make_proc(1, 1, 0, false)));
+        cx.cur.pid = 2;
+        cx.cur.ppid = 1;
+        // SIGSTOP (19) pending → deliver_pending_signals stops it (uncatchable).
+        cx.cur.pending = 1 << (19 - 1);
+        k.deliver_pending_signals(&mut cx, &mut v, &mut mem);
+        assert!(matches!(cx.cur.run, RunState::Stopped(19)), "SIGSTOP stops the task");
+        assert!(!cx.cur.stop_reported, "a fresh stop is unreported");
+        // The parent got SIGCHLD (17) posted and was unparked.
+        assert_eq!(proc_field(&k, 1, |p| p.pending) & (1 << (17 - 1)), 1 << (17 - 1));
+        assert!(!proc_field(&k, 1, |p| p.parked));
+    }
+
+    #[test]
+    fn sigtstp_disposition_governs_whether_it_stops() {
+        // SIGTSTP (20) is a *catchable* stop: at SIG_IGN it is dropped, not a
+        // stop (the stop guard only fires at SIG_DFL / for SIGSTOP). SIGSTOP,
+        // by contrast, always stops regardless of disposition.
+        let (k, mut mem, mut v, mut cx) = setup();
+        const SIG_IGN: u64 = 1;
+        // SIGTSTP ignored → dropped, task stays Running.
+        cx.cur.handlers[20] = SigAction { handler: SIG_IGN, flags: 0, restorer: 0, mask: 0 };
+        cx.cur.pending = 1 << (20 - 1);
+        k.deliver_pending_signals(&mut cx, &mut v, &mut mem);
+        assert!(matches!(cx.cur.run, RunState::Running), "an ignored SIGTSTP does not stop");
+        assert_eq!(cx.cur.pending & (1 << (20 - 1)), 0, "and is dropped");
+        // SIGTSTP at SIG_DFL → stop.
+        cx.cur.handlers[20] = SigAction::default();
+        cx.cur.pending = 1 << (20 - 1);
+        k.deliver_pending_signals(&mut cx, &mut v, &mut mem);
+        assert!(matches!(cx.cur.run, RunState::Stopped(20)), "a default SIGTSTP stops");
+    }
+
+    #[test]
+    fn wait4_wuntraced_reports_a_stopped_child_then_latches() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let child = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(child, 2);
+        set_run(&k, 2, RunState::Stopped(19));
+        let ws = 0x1_0000;
+        // WUNTRACED (0x2): WIFSTOPPED, WSTOPSIG == 19, child NOT reaped.
+        let r = call(&k, &mut cx, &mut mem, &mut v, Sysno::Wait4, [child as u64, ws, 2, 0, 0, 0]);
+        assert_eq!(r, 2);
+        let st = mem.read_u32(ws).unwrap();
+        assert_eq!(st & 0xff, 0x7f, "WIFSTOPPED");
+        assert_eq!((st >> 8) & 0xff, 19, "WSTOPSIG == SIGSTOP");
+        assert!(proc_field(&k, 2, |p| p.stop_reported), "the stop is latched");
+        // A second WUNTRACED wait doesn't re-report the same stop — it blocks.
+        cx.block = false;
+        let r2 = call(&k, &mut cx, &mut mem, &mut v, Sysno::Wait4, [child as u64, ws, 2, 0, 0, 0]);
+        assert_eq!(r2, 0);
+        assert!(cx.block, "an already-reported stop doesn't re-report");
+    }
+
+    #[test]
+    fn sigcont_resumes_a_stopped_child_and_wcontinued_reports_it() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let child = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(child, 2);
+        set_run(&k, 2, RunState::Stopped(19));
+        // kill(child, SIGCONT=18) resumes it and latches "continued".
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [2, 18, 0, 0, 0, 0]), 0);
+        assert!(matches!(proc_field(&k, 2, |p| p.run), RunState::Running), "SIGCONT resumes");
+        assert!(proc_field(&k, 2, |p| p.continued), "continued latched");
+        assert!(!proc_field(&k, 2, |p| p.parked), "and it's runnable again");
+        // The parent (pid 1, the current task) got SIGCHLD from the resume.
+        assert_eq!(cx.cur.pending & (1 << (17 - 1)), 1 << (17 - 1));
+        // WCONTINUED (0x8): WIFCONTINUED == 0xffff, latch cleared, not reaped.
+        let ws = 0x1_0000;
+        let r = call(&k, &mut cx, &mut mem, &mut v, Sysno::Wait4, [child as u64, ws, 8, 0, 0, 0]);
+        assert_eq!(r, 2);
+        assert_eq!(mem.read_u32(ws).unwrap(), 0xffff, "WIFCONTINUED");
+        assert!(!proc_field(&k, 2, |p| p.continued), "continued cleared after report");
+    }
+
+    #[test]
+    fn waitid_reports_stop_and_continue_via_siginfo() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let child = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(child, 2);
+        set_run(&k, 2, RunState::Stopped(19));
+        let si = 0x1_0000;
+        const P_PID: u64 = 1;
+        const WSTOPPED: u64 = 2;
+        const WCONTINUED: u64 = 8;
+        const WNOWAIT: u64 = 0x0100_0000;
+        // WNOWAIT stop report: CLD_STOPPED(5), si_status=19, and NOT latched.
+        let r = call(&k, &mut cx, &mut mem, &mut v, Sysno::Waitid, [P_PID, 2, si, WSTOPPED | WNOWAIT, 0, 0]);
+        assert_eq!(r, 0);
+        assert_eq!(mem.read_u32(si).unwrap(), 17, "si_signo == SIGCHLD");
+        assert_eq!(mem.read_u32(si + 8).unwrap(), 5, "si_code == CLD_STOPPED");
+        assert_eq!(mem.read_u32(si + 16).unwrap(), 2, "si_pid == child");
+        assert_eq!(mem.read_u32(si + 24).unwrap(), 19, "si_status == SIGSTOP");
+        assert!(!proc_field(&k, 2, |p| p.stop_reported), "WNOWAIT does not latch");
+        // Now a real (non-WNOWAIT) WSTOPPED wait latches it.
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Waitid, [P_PID, 2, si, WSTOPPED, 0, 0]);
+        assert!(proc_field(&k, 2, |p| p.stop_reported));
+        // Continue it and report CLD_CONTINUED(6), si_status = SIGCONT(18).
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [2, 18, 0, 0, 0, 0]);
+        let r = call(&k, &mut cx, &mut mem, &mut v, Sysno::Waitid, [P_PID, 2, si, WCONTINUED, 0, 0]);
+        assert_eq!(r, 0);
+        assert_eq!(mem.read_u32(si + 8).unwrap(), 6, "si_code == CLD_CONTINUED");
+        assert_eq!(mem.read_u32(si + 24).unwrap(), 18, "si_status == SIGCONT");
+    }
+
+    #[test]
+    fn stop_and_cont_pending_bits_annihilate() {
+        // Posting SIGCONT clears a pending stop; posting a stop clears pending CONT.
+        let (k, mut mem, mut v, mut cx) = setup();
+        let child = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(child, 2);
+        // Pending SIGTSTP(20), then SIGCONT(18) cancels it.
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [2, 20, 0, 0, 0, 0]);
+        assert_eq!(proc_field(&k, 2, |p| p.pending) & (1 << (20 - 1)), 1 << (20 - 1));
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [2, 18, 0, 0, 0, 0]);
+        assert_eq!(proc_field(&k, 2, |p| p.pending) & (1 << (20 - 1)), 0, "SIGCONT cancels the pending stop");
+        // Pending SIGCONT(18), then SIGSTOP(19) cancels it.
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [2, 18, 0, 0, 0, 0]);
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Kill, [2, 19, 0, 0, 0, 0]);
+        assert_eq!(proc_field(&k, 2, |p| p.pending) & (1 << (18 - 1)), 0, "a stop cancels the pending SIGCONT");
     }
 
     #[test]

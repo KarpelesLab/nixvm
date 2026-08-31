@@ -47,7 +47,32 @@ const SIG_IGN: u64 = 1;
 /// Highest supported signal number (`_NSIG - 1` on Linux).
 pub(super) const NSIG: u64 = 64;
 const SIGKILL: u64 = 9;
+/// SIGCHLD — posted to a parent when a child stops or continues (to wake its
+/// `wait4`/`waitid`), on top of the usual on-exit delivery.
+const SIGCHLD: u64 = 17;
+/// SIGCONT — resumes a stopped process (job control's "fg"/"bg").
+const SIGCONT: u64 = 18;
 const SIGSTOP: u64 = 19;
+/// SIGTSTP/SIGTTIN/SIGTTOU — the *catchable* stop signals: they stop the target
+/// only at their default disposition (a caught handler runs instead; SIG_IGN
+/// drops them). SIGSTOP (19) always stops and can't be caught or ignored.
+const SIGTSTP: u64 = 20;
+const SIGTTIN: u64 = 21;
+const SIGTTOU: u64 = 22;
+
+/// The stop signals (`SIGSTOP`/`SIGTSTP`/`SIGTTIN`/`SIGTTOU`), whose default
+/// action is to job-control-stop the target.
+pub(super) fn is_stop_signal(sig: u64) -> bool {
+    matches!(sig, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
+}
+
+/// Bit-mask of the four stop signals' pending bits.
+pub(super) const STOP_SIG_BITS: u64 =
+    (1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)) | (1 << (SIGTTIN - 1)) | (1 << (SIGTTOU - 1));
+/// The SIGCONT pending bit.
+pub(super) const CONT_SIG_BIT: u64 = 1 << (SIGCONT - 1);
+/// The SIGCHLD pending bit.
+const CHLD_SIG_BIT: u64 = 1 << (SIGCHLD - 1);
 
 impl Kernel {
     /// `rt_sigaction(sig, act, oldact, sigsetsize)` — store the disposition for
@@ -297,20 +322,36 @@ impl Kernel {
                 cx.cur.pending |= bit;
                 if deliver {
                     cx.cur.post_siginfo(sig, sender);
+                    // The current task is Running (it's executing this syscall),
+                    // so this never resumes it, but it still applies the
+                    // stop/cont bit cancellation.
+                    if let Some(ppid) = apply_stop_cont(&mut cx.cur, sig) {
+                        notify_parent(sh, cx, ppid);
+                    }
                 }
                 return 0;
             }
+            let mut resumed_ppid = None;
+            let mut found = false;
             for slot in sh.procs.iter_mut().flatten() {
                 if i64::from(slot.info.pid) == pid {
                     slot.info.pending |= bit;
                     slot.info.parked = false;
                     if deliver {
                         slot.info.post_siginfo(sig, sender);
+                        resumed_ppid = apply_stop_cont(&mut slot.info, sig);
                     }
-                    return 0;
+                    found = true;
+                    break;
                 }
             }
-            return err(Errno::ESRCH);
+            if !found {
+                return err(Errno::ESRCH);
+            }
+            if let Some(ppid) = resumed_ppid {
+                notify_parent(sh, cx, ppid);
+            }
+            return 0;
         }
 
         // Group / broadcast. `None` = broadcast (pid == -1); otherwise the target
@@ -322,10 +363,14 @@ impl Kernel {
             _ => Some((-pid) as i32),    // group -pid
         };
         let mut hit = false;
+        let mut resumed_ppids: Vec<i32> = Vec::new();
         if target_pgrp.is_none_or(|pg| pgid_of(&cx.cur) == pg) {
             cx.cur.pending |= bit;
             if deliver {
                 cx.cur.post_siginfo(sig, sender);
+                if let Some(ppid) = apply_stop_cont(&mut cx.cur, sig) {
+                    resumed_ppids.push(ppid);
+                }
             }
             hit = true;
         }
@@ -339,9 +384,15 @@ impl Kernel {
                 slot.info.parked = false;
                 if deliver {
                     slot.info.post_siginfo(sig, sender);
+                    if let Some(ppid) = apply_stop_cont(&mut slot.info, sig) {
+                        resumed_ppids.push(ppid);
+                    }
                 }
                 hit = true;
             }
+        }
+        for ppid in resumed_ppids {
+            notify_parent(sh, cx, ppid);
         }
         if hit { 0 } else { err(Errno::ESRCH) }
     }
@@ -416,6 +467,21 @@ impl Kernel {
             }
             // Clear the pending bit: every branch below acts on this signal.
             cx.cur.pending &= !bit;
+            // Job-control stop: SIGSTOP always stops (uncatchable), and the
+            // other stop signals stop only at their default disposition. A
+            // caught stop signal falls through to run its handler; SIG_IGN
+            // falls through and is dropped. Stopping parks the task and notifies
+            // the parent so its `wait4(WUNTRACED)`/`waitid(WSTOPPED)` wakes.
+            if sig == SIGSTOP
+                || (is_stop_signal(sig) && cx.cur.handlers[sig as usize].handler == SIG_DFL)
+            {
+                cx.cur.run = RunState::Stopped(sig as i32);
+                cx.cur.stop_reported = false;
+                // A pending SIGCONT is cancelled by an actual stop.
+                cx.cur.pending &= !CONT_SIG_BIT;
+                self.notify_parent_of_child_event(cx.cur.ppid);
+                return false;
+            }
             match cx.cur.handlers[sig as usize].handler {
                 // Ignored explicitly: drop it (and any queued RT instances).
                 SIG_IGN => cx.cur.drain_rt(sig),
@@ -442,6 +508,24 @@ impl Kernel {
             cx.cur.blocked = prev;
         }
         false
+    }
+
+    /// Notify a parent that a child changed job-control state (stopped or
+    /// continued): post SIGCHLD and unpark it, so a `wait4`/`waitid` blocked for
+    /// the event wakes and reports it. Called from
+    /// [`Self::deliver_pending_signals`], which runs with **no kernel lock held**
+    /// (see `service` in `mod.rs`), so it takes `self.shared` itself. The child
+    /// itself is checked out into `cx.cur` and never in `sh.procs`, so this only
+    /// scans the table for the parent — no aliasing with the current task.
+    fn notify_parent_of_child_event(&self, ppid: i32) {
+        let mut sh = self.shared.lock().unwrap();
+        for slot in sh.procs.iter_mut().flatten() {
+            if slot.info.pid == ppid {
+                slot.info.pending |= CHLD_SIG_BIT;
+                slot.info.parked = false;
+                break;
+            }
+        }
     }
 }
 
@@ -746,4 +830,45 @@ fn is_default_ignored(sig: u64) -> bool {
     const SIGURG: u64 = 23;
     const SIGWINCH: u64 = 28;
     matches!(sig, SIGCHLD | SIGCONT | SIGURG | SIGWINCH)
+}
+
+/// Apply the *job-control* side effects of posting `sig` to `info`, on top of
+/// the pending bit the caller already set. Posting SIGCONT cancels any pending
+/// (not-yet-delivered) stop and, if the task is `Stopped`, resumes it — flipping
+/// it back to `Running`, latching a "continued" event for its parent's
+/// `wait4(WCONTINUED)`, and unparking it. Posting a stop signal conversely
+/// cancels a pending SIGCONT (they annihilate). Returns `Some(ppid)` when the
+/// task was resumed from `Stopped`, so the caller can notify that parent.
+fn apply_stop_cont(info: &mut super::ProcInfo, sig: u64) -> Option<i32> {
+    if sig == SIGCONT {
+        info.pending &= !STOP_SIG_BITS; // a pending stop is cancelled by SIGCONT
+        if matches!(info.run, RunState::Stopped(_)) {
+            info.run = RunState::Running;
+            info.continued = true;
+            info.stop_reported = false;
+            info.parked = false;
+            return Some(info.ppid);
+        }
+    } else if is_stop_signal(sig) {
+        info.pending &= !CONT_SIG_BIT; // a pending SIGCONT is cancelled by a stop
+    }
+    None
+}
+
+/// Post SIGCHLD to the parent `ppid` and unpark it (so its `wait4`/`waitid`
+/// wakes to report a child's stop/continue). Used by [`Kernel::post_signal`],
+/// which already holds the kernel lock (`sh`) and has the caller checked out
+/// into `cx.cur` — the parent may be either, so both are searched.
+fn notify_parent(sh: &mut Shared, cx: &mut ServiceCtx, ppid: i32) {
+    if cx.cur.pid == ppid {
+        cx.cur.pending |= CHLD_SIG_BIT;
+        return;
+    }
+    for slot in sh.procs.iter_mut().flatten() {
+        if slot.info.pid == ppid {
+            slot.info.pending |= CHLD_SIG_BIT;
+            slot.info.parked = false;
+            return;
+        }
+    }
 }
