@@ -282,10 +282,11 @@ impl Kernel {
                 if !p.buf.is_empty() {
                     POLLIN
                 } else if p.writers == 0 {
-                    // EOF: the writer is gone and the buffer is drained. Linux's
-                    // pipe_poll reports POLLHUP *without* POLLIN here (POLLIN
-                    // means data is available; at EOF a read returns 0). A poller
-                    // watching POLLIN still wakes — poll always reports POLLHUP.
+                    // EOF: the writer is gone and the buffer is drained. Linux
+                    // reports POLLHUP *without* POLLIN here (POLLIN means data is
+                    // available; at EOF a read returns 0) — confirmed by probing a
+                    // real host. A poller watching POLLIN still wakes, since poll
+                    // always reports POLLHUP regardless of the requested mask.
                     POLLHUP
                 } else {
                     0
@@ -293,8 +294,8 @@ impl Kernel {
             }
             Fd::PipeWrite(i) => {
                 // Always writable (nixvm's pipes are unbounded, so never full);
-                // a vanished read end adds POLLERR on top, matching Linux's
-                // pipe_poll (POLLOUT | POLLERR), not POLLERR alone.
+                // a vanished read end adds POLLERR on top (POLLOUT | POLLERR, not
+                // POLLERR alone) — the readiness a real host reports here.
                 if pipes[i].readers == 0 {
                     POLLOUT | POLLERR
                 } else {
