@@ -85,6 +85,8 @@ impl Errno {
     const ENETUNREACH: Errno = Errno(101);
     /// A host `connect_tcp` that timed out.
     const ETIMEDOUT: Errno = Errno(110);
+    /// A nonblocking TCP `connect` that has been started but not yet completed.
+    const EINPROGRESS: Errno = Errno(115);
     /// A host socket read/write errored (connection reset).
     const ECONNRESET: Errno = Errno(104);
 }
@@ -864,6 +866,16 @@ impl Kernel {
         net.socks[sock].kind = Kind::Pair(pair);
         if let Kind::Listener { backlog, .. } = &mut net.socks[lidx].kind {
             backlog.push_back(sock);
+        }
+        // A nonblocking TCP connect can't report success synchronously: real
+        // Linux returns EINPROGRESS and the socket becomes writable (POLLOUT)
+        // with SO_ERROR==0 once the handshake finishes. This virtual pair is
+        // already fully connected — hence immediately POLLOUT and SO_ERROR==0 —
+        // so returning EINPROGRESS here alone reproduces the observable
+        // sequence. AF_UNIX stream connects complete synchronously even when
+        // nonblocking (Linux returns 0), so this only applies to AF_INET(6).
+        if domain != AF_UNIX && net.socks[sock].nonblock {
+            return err(Errno::EINPROGRESS);
         }
         0
     }
@@ -2752,6 +2764,72 @@ mod tests {
             [cli, addr, 8, 0, 0, 0],
         );
         assert_eq!(ret, -i64::from(Errno::ECONNREFUSED.0));
+    }
+
+    #[test]
+    fn nonblocking_tcp_connect_returns_einprogress() {
+        // A nonblocking connect to a loopback listener returns EINPROGRESS (not
+        // 0), matching Linux; the (already fully connected) socket is then
+        // immediately writable and SO_ERROR reads 0.
+        let (k, mut mem, mut v, mut cx) = setup();
+        let addr = 0x1_1000;
+        write_sockaddr_in(&mut mem, addr, [127, 0, 0, 1], 9100);
+        let srv = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [2, 1, 0, 0, 0, 0]) as u64;
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Bind, [srv, addr, 16, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Listen, [srv, 8, 0, 0, 0, 0]),
+            0
+        );
+        // AF_INET, SOCK_STREAM | SOCK_NONBLOCK.
+        let cli = call(
+            &k, &mut cx, &mut mem, &mut v,
+            Sysno::Socket,
+            [2, SOCK_STREAM | SOCK_NONBLOCK, 0, 0, 0, 0],
+        ) as u64;
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Connect, [cli, addr, 16, 0, 0, 0]),
+            -i64::from(Errno::EINPROGRESS.0),
+        );
+        // SO_ERROR reads 0 (the virtual handshake already completed).
+        let out = 0x1_1300;
+        let outlen = 0x1_1400;
+        mem.write_init(outlen, &4u32.to_le_bytes()).unwrap();
+        assert_eq!(
+            k.sys_getsockopt(&mut k.net.lock().unwrap(), &mut cx, cli, SOL_SOCKET, SO_ERROR, out, outlen, &mut mem),
+            0
+        );
+        assert_eq!(mem.read_u32(out).unwrap(), 0);
+    }
+
+    #[test]
+    fn nonblocking_unix_connect_completes_synchronously() {
+        // AF_UNIX stream connects complete immediately even when nonblocking:
+        // Linux returns 0, not EINPROGRESS.
+        let (k, mut mem, mut v, mut cx) = setup();
+        let addr = 0x1_1000;
+        mem.write_init(addr, &1u16.to_le_bytes()).unwrap();
+        mem.write_init(addr + 2, b"/sock\0").unwrap();
+        let srv = call(&k, &mut cx, &mut mem, &mut v, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Bind, [srv, addr, 8, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Listen, [srv, 8, 0, 0, 0, 0]),
+            0
+        );
+        let cli = call(
+            &k, &mut cx, &mut mem, &mut v,
+            Sysno::Socket,
+            [1, SOCK_STREAM | SOCK_NONBLOCK, 0, 0, 0, 0],
+        ) as u64;
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Connect, [cli, addr, 8, 0, 0, 0]),
+            0
+        );
     }
 
     #[test]
