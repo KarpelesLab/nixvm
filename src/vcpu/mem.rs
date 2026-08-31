@@ -422,6 +422,14 @@ impl GuestMemory {
         if !self.mapped[p] || self.space.translate(page, &self.phys).is_some() {
             return false;
         }
+        // A PROT_NONE page grants no access — never install a backing frame for
+        // it. Returning `false` lets the read/write fault propagate as SIGSEGV
+        // (guard pages, redzones, poisoned regions), matching the interpreter,
+        // which enforces this in software via `check()`. Backing it would leave a
+        // present, readable KVM leaf and let out-of-bounds reads sail through.
+        if self.prot[p] == Prot::NONE {
+            return false;
+        }
         let mut fa = self.fa.lock().unwrap();
         Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, page)
     }
