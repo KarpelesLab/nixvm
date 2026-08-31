@@ -42,7 +42,7 @@ mod time;
 
 pub use fd::{Fd, FdTable};
 use net::Net;
-use poll::{EventFdInst, PollFds};
+use poll::{EventFdInst, PidfdInst, PollFds};
 
 /// `dirfd` value meaning "resolve relative to the current working directory".
 const AT_FDCWD: i64 = -100;
@@ -53,6 +53,10 @@ const SYMLINK_MAX: u32 = 40;
 #[derive(Clone)]
 struct ProcInfo {
     fds: FdTable,
+    /// Current working directory. Shared across a `CLONE_FS` group via
+    /// [`Shared::cwd_tables`] (indexed by [`ProcInfo::fs`]): checked out into this
+    /// field while the task runs, checked back in between slices so siblings see a
+    /// `chdir`. A plain `fork` gets a private copy.
     cwd: String,
     brk: u64,
     heap_start: u64,
@@ -75,6 +79,12 @@ struct ProcInfo {
     /// True for a `CLONE_THREAD` task (a thread, not a child process). Threads
     /// are not reaped by their parent's `wait4`.
     is_thread: bool,
+    /// Signal delivered to the parent when this task terminates (the low byte of
+    /// `clone`'s flags, or `clone3`'s `exit_signal`; `SIGCHLD`=17 for a plain
+    /// `fork`). `0` for a `CLONE_THREAD` task — an individual thread's death does
+    /// not signal the parent; only the thread group's exit does, and it carries
+    /// the group *leader's* `exit_signal`.
+    exit_signal: u8,
     /// Address-space id: an index into [`Kernel::spaces`]. Threads that share
     /// memory (`CLONE_VM`) share one `mm`; a forked child gets a fresh copy.
     mm: usize,
@@ -86,6 +96,15 @@ struct ProcInfo {
     /// is *checked out* into [`ProcInfo::fds`]; between slices it lives in
     /// `file_tables[files]` (and `fds` holds an empty placeholder).
     files: usize,
+    /// Filesystem-context id: an index into [`Shared::cwd_tables`]. Tasks created
+    /// with `CLONE_FS` (every pthread, via `CLONE_THREAD`'s implied fs-sharing)
+    /// share one entry, so a `chdir` in one is seen by all; a plain `fork` gets a
+    /// private copy. Like [`ProcInfo::files`] the entry is *checked out* into
+    /// [`ProcInfo::cwd`] while the task runs, and lives in `cwd_tables[fs]`
+    /// between slices. (The `umask` half of a filesystem context is already a
+    /// single global in [`Shared::umask`], and there is no per-task chroot root,
+    /// so `cwd` is the only per-task fs state a `CLONE_FS` share must unify.)
+    fs: usize,
     /// `set_tid_address` / `CLONE_CHILD_CLEARTID`: on exit, zero this guest
     /// word and futex-wake it (lets `pthread_join` return). 0 = unset.
     clear_child_tid: u64,
@@ -253,8 +272,10 @@ impl Default for ProcInfo {
             ppid: 0,
             tgid: 0,
             is_thread: false,
+            exit_signal: SIGCHLD as u8, // a plain fork signals SIGCHLD on exit
             mm: 0,
             files: 0,
+            fs: 0,
             clear_child_tid: 0,
             futex_wait: None,
             futex_woken: false,
@@ -463,6 +484,118 @@ const SIGPIPE: u64 = 13;
 /// Sent to a process's parent when a child terminates (so a blocked `wait`
 /// wakes to reap it).
 const SIGCHLD: u64 = 17;
+
+// ---- clone(2)/clone3(2) flags (asm-generic; identical on x86-64 & aarch64) ---
+// The child's termination signal is the low byte of `clone`'s `flags` (or
+// `clone3`'s `exit_signal` field); these named bits occupy the high 3 bytes.
+/// Share the address space with the caller (a thread) rather than copying it.
+const CLONE_VM: u64 = 0x0000_0100;
+/// Share the filesystem context (cwd/umask/root) — a `chdir` is seen groupwide.
+const CLONE_FS: u64 = 0x0000_0200;
+/// Share the open-file-descriptor table.
+const CLONE_FILES: u64 = 0x0000_0400;
+/// Share the table of signal handlers (implied by `CLONE_THREAD`).
+const CLONE_SIGHAND: u64 = 0x0000_0800;
+/// Allocate a pidfd for the child and store it at the `parent_tid`/`pidfd` slot.
+const CLONE_PIDFD: u64 = 0x0000_1000;
+/// Continue tracing the child if the caller is being traced (ptrace).
+const CLONE_PTRACE: u64 = 0x0000_2000;
+/// Suspend the caller until the child `execve`s or exits (`vfork`).
+const CLONE_VFORK: u64 = 0x0000_4000;
+/// Make the child a sibling: its parent is the caller's parent, not the caller.
+const CLONE_PARENT: u64 = 0x0000_8000;
+/// Put the child in the caller's thread group (shared tgid; a thread).
+const CLONE_THREAD: u64 = 0x0001_0000;
+/// New mount namespace.
+const CLONE_NEWNS: u64 = 0x0002_0000;
+/// Share System V semaphore undo state.
+const CLONE_SYSVSEM: u64 = 0x0004_0000;
+/// Seed the child's thread-pointer (TLS) register.
+const CLONE_SETTLS: u64 = 0x0008_0000;
+/// Write the child's tid into the caller's memory at `parent_tid`.
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+/// Zero+futex-wake the child's `child_tid` word when the child exits (join).
+const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+/// Obsolete no-op (historically "detach"; the kernel ignores it).
+const CLONE_DETACHED: u64 = 0x0040_0000;
+/// Forbid the tracing process from forcing `CLONE_PTRACE` on this child.
+const CLONE_UNTRACED: u64 = 0x0080_0000;
+/// Write the child's tid into the child's memory at `child_tid`.
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+/// New cgroup namespace.
+const CLONE_NEWCGROUP: u64 = 0x0200_0000;
+/// New UTS (hostname) namespace.
+const CLONE_NEWUTS: u64 = 0x0400_0000;
+/// New System V IPC namespace.
+const CLONE_NEWIPC: u64 = 0x0800_0000;
+/// New user namespace.
+const CLONE_NEWUSER: u64 = 0x1000_0000;
+/// New PID namespace.
+const CLONE_NEWPID: u64 = 0x2000_0000;
+/// New network namespace.
+const CLONE_NEWNET: u64 = 0x4000_0000;
+/// Share the I/O context (block-layer scheduling).
+const CLONE_IO: u64 = 0x8000_0000;
+/// (`clone3` only) Reset all signal handlers to `SIG_DFL` in the child.
+const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+/// (`clone3` only) Place the child into the cgroup named by `cl_args.cgroup`.
+const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+/// Every `clone`/`clone3` flag nixvm recognizes (the union of the bits above),
+/// so an unknown high bit can be reported as `EINVAL` the way Linux does.
+const CLONE_ALL_FLAGS: u64 = CLONE_VM
+    | CLONE_FS
+    | CLONE_FILES
+    | CLONE_SIGHAND
+    | CLONE_PIDFD
+    | CLONE_PTRACE
+    | CLONE_VFORK
+    | CLONE_PARENT
+    | CLONE_THREAD
+    | CLONE_NEWNS
+    | CLONE_SYSVSEM
+    | CLONE_SETTLS
+    | CLONE_PARENT_SETTID
+    | CLONE_CHILD_CLEARTID
+    | CLONE_DETACHED
+    | CLONE_UNTRACED
+    | CLONE_CHILD_SETTID
+    | CLONE_NEWCGROUP
+    | CLONE_NEWUTS
+    | CLONE_NEWIPC
+    | CLONE_NEWUSER
+    | CLONE_NEWPID
+    | CLONE_NEWNET
+    | CLONE_IO
+    | CLONE_CLEAR_SIGHAND
+    | CLONE_INTO_CGROUP;
+// nixvm models a single global namespace of each `CLONE_NEW*` kind, and runs as
+// root (for whom real Linux *succeeds* and creates a namespace), so those flags
+// are ACCEPTED as no-ops — the child runs against the one global view — rather
+// than returning `EPERM`/`EINVAL`. That is the closest faithful behavior a
+// namespace-less VM can offer; failing would wrongly break a root program that
+// legitimately asks for a fresh namespace.
+
+/// The fully-decoded arguments of a `clone`/`clone3`, normalized so the shared
+/// [`Kernel::do_clone`] core is arch- and syscall-independent. Legacy `clone`
+/// packs the termination signal into the low byte of `flags` and (for
+/// `CLONE_PIDFD`) reuses the `parent_tid` pointer as the pidfd output; `clone3`
+/// carries both as their own fields. Both are lowered to this.
+struct CloneArgs {
+    /// The clone flags with the exit-signal byte masked off.
+    flags: u64,
+    /// Child stack pointer (top of the stack region; grows down). 0 = inherit.
+    stack_ptr: u64,
+    /// Guest address to write the child tid to (`CLONE_PARENT_SETTID`).
+    parent_tid: u64,
+    /// Guest address for the child-tid word (`CLONE_CHILD_SETTID`/`CLEARTID`).
+    child_tid: u64,
+    /// New thread pointer (`CLONE_SETTLS`).
+    tls: u64,
+    /// Signal delivered to the parent on the child's exit (0 for a thread).
+    exit_signal: u64,
+    /// Guest address to write the allocated pidfd to (`CLONE_PIDFD`), else 0.
+    pidfd_ptr: u64,
+}
 
 /// One signal's disposition, as `rt_sigaction` records it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -965,6 +1098,12 @@ pub(super) struct Shared {
     /// `None` while its owning task is mid-slice (the table is checked out into
     /// [`ProcInfo::fds`]); see [`Shared::check_out_files`].
     file_tables: Vec<Option<FdTable>>,
+    /// Working directories indexed by [`ProcInfo::fs`]. A `CLONE_FS` group (every
+    /// pthread) shares one entry so a `chdir` is seen groupwide; a forked child
+    /// gets its own. Checked out into [`ProcInfo::cwd`] while the owning task runs
+    /// (slot `None` meanwhile), alongside the fd table — see
+    /// [`Shared::check_out_files`].
+    cwd_tables: Vec<Option<String>>,
     /// Anonymous-`mmap` arenas indexed by [`ProcInfo::mm`] — one per address
     /// space, so every `CLONE_VM` thread allocates from the same arena and two
     /// threads can never be handed overlapping ranges.
@@ -1110,24 +1249,33 @@ impl Shared {
     }
 
     /// Check the running task's shared fd table out of [`Shared::file_tables`]
-    /// into `cur.fds` for the duration of its slice. Called right after `cur` is
-    /// swapped in. Its sibling threads (same `files` id) are parked, so the slot
-    /// is free; servicing is single-threaded, so no two tasks are ever checked
-    /// out at once.
+    /// into `cur.fds` — and its working directory out of [`Shared::cwd_tables`]
+    /// into `cur.cwd` — for the duration of its slice. Called right after `cur`
+    /// is swapped in. Its sibling threads (same `files`/`fs` id) are parked, so
+    /// the slots are free; servicing is single-threaded, so no two tasks are ever
+    /// checked out at once.
     fn check_out_files(&mut self, cx: &mut ServiceCtx) {
         let f = cx.cur.files;
         cx.cur.fds = self.file_tables[f]
             .take()
             .expect("fd table already checked out");
+        let s = cx.cur.fs;
+        cx.cur.cwd = self.cwd_tables[s]
+            .take()
+            .expect("cwd already checked out");
     }
 
-    /// Check the running task's fd table back into [`Shared::file_tables`] so its
-    /// siblings see any changes it made. Called right before `cur` is swapped
-    /// out. If the task exited as the last user of its table, `cur.fds` was
-    /// drained and we store the emptied table back (its slot is now idle).
+    /// Check the running task's fd table back into [`Shared::file_tables`] and its
+    /// cwd back into [`Shared::cwd_tables`] so its siblings see any changes it
+    /// made (a `chdir` in a `CLONE_FS` group, an fd opened by a `CLONE_FILES`
+    /// thread). Called right before `cur` is swapped out. If the task exited as
+    /// the last user of its fd table, `cur.fds` was drained and we store the
+    /// emptied table back (its slot is now idle).
     fn check_in_files(&mut self, cx: &mut ServiceCtx) {
         let f = cx.cur.files;
         self.file_tables[f] = Some(std::mem::take(&mut cx.cur.fds));
+        let s = cx.cur.fs;
+        self.cwd_tables[s] = Some(std::mem::take(&mut cx.cur.cwd));
     }
 
     /// The running task's `mmap` arena — the one shared by every task in its
@@ -1170,6 +1318,7 @@ impl Kernel {
                 procs: Vec::new(),
                 spaces: Vec::new(),
                 file_tables: Vec::new(),
+                cwd_tables: Vec::new(),
                 mmap_areas: Vec::new(),
                 stdin_buf: VecDeque::new(),
                 stdin_closed: false,
@@ -1268,6 +1417,8 @@ impl Kernel {
             info.run = RunState::Running;
             info.files = sh.file_tables.len();
             sh.file_tables.push(Some(std::mem::take(&mut info.fds)));
+            info.fs = sh.cwd_tables.len();
+            sh.cwd_tables.push(Some(std::mem::take(&mut info.cwd)));
             sh.mmap_areas.push(Arena::new(info.mmap_cursor, info.mmap_floor));
             sh.spaces.push(Arc::new(Mutex::new(mem)));
             sh.procs.push(Some(Process {
@@ -1439,6 +1590,8 @@ impl Kernel {
         // scheduler checks it out into `cur.fds` for each slice.
         info.files = sh.file_tables.len();
         sh.file_tables.push(Some(std::mem::take(&mut info.fds)));
+        info.fs = sh.cwd_tables.len();
+        sh.cwd_tables.push(Some(std::mem::take(&mut info.cwd)));
         sh.mmap_areas.push(Arena::new(info.mmap_cursor, info.mmap_floor));
         sh.spaces.push(Arc::new(Mutex::new(mem)));
         sh.procs.push(Some(Process {
@@ -2783,17 +2936,7 @@ impl Kernel {
     /// the `*_SETTID`/`CHILD_CLEARTID` flags write/clear the tid words musl's
     /// pthread layer relies on. `CLONE_FILES` shares the fd table (every pthread
     /// sets it); without it — fork — the child gets a private copy.
-    #[allow(clippy::too_many_lines)]
     fn sys_clone(&self, sh: &mut Shared, cx: &mut ServiceCtx, args: &[u64; 6], vcpu: &mut dyn Vcpu, mem: &mut GuestMemory) -> i64 {
-        const CLONE_VM: u64 = 0x0000_0100;
-        const CLONE_FILES: u64 = 0x0000_0400;
-        const CLONE_VFORK: u64 = 0x0000_4000;
-        const CLONE_THREAD: u64 = 0x0001_0000;
-        const CLONE_SETTLS: u64 = 0x0008_0000;
-        const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
-        const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
-        const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
-
         let flags = args[0];
         let stack = args[1];
         // clone's tls/child_tid argument order differs by arch:
@@ -2804,6 +2947,39 @@ impl Kernel {
             Arch::X86_64 => (args[4], args[3]),
             Arch::Aarch64 => (args[3], args[4]),
         };
+        // Legacy `clone` packs the child's termination signal into the low byte
+        // of `flags`, and `CLONE_PIDFD` reuses the `parent_tid` pointer as the
+        // pidfd output (so it is mutually exclusive with `CLONE_PARENT_SETTID`,
+        // which also writes through `parent_tid`). `clone3` splits both out; we
+        // lower legacy to the same normalized [`CloneArgs`].
+        let ca = CloneArgs {
+            flags: flags & !0xff,
+            stack_ptr: stack,
+            parent_tid,
+            child_tid,
+            tls,
+            exit_signal: flags & 0xff,
+            pidfd_ptr: if flags & CLONE_PIDFD != 0 { parent_tid } else { 0 },
+        };
+        self.do_clone(sh, cx, &ca, vcpu, mem)
+    }
+
+    /// The shared `clone`/`clone3` core: create a task per the fully-decoded
+    /// [`CloneArgs`], implementing every flag nixvm honors and gracefully
+    /// accepting the rest. Returns the child pid, or a negative errno.
+    #[allow(clippy::too_many_lines)]
+    fn do_clone(&self, sh: &mut Shared, cx: &mut ServiceCtx, ca: &CloneArgs, vcpu: &mut dyn Vcpu, mem: &mut GuestMemory) -> i64 {
+        let flags = ca.flags;
+        let stack = ca.stack_ptr;
+        let parent_tid = ca.parent_tid;
+        let child_tid = ca.child_tid;
+        let tls = ca.tls;
+        // An unknown high bit is a malformed request — Linux rejects it EINVAL.
+        // (`CLONE_ALL_FLAGS` already spans the two clone3-only flags, so a valid
+        // `CLONE_INTO_CGROUP`/`CLONE_CLEAR_SIGHAND` is not caught here.)
+        if flags & !CLONE_ALL_FLAGS != 0 {
+            return err(Errno::EINVAL);
+        }
         // `vfork` (CLONE_VM | CLONE_VFORK, no CLONE_THREAD) asks to *borrow* the
         // parent's address space, relying on real page tables: the child runs in
         // it only until it `execve`s (which installs a fresh mm) or `_exit`s,
@@ -2819,6 +2995,22 @@ impl Kernel {
         let is_vfork = flags & CLONE_VFORK != 0;
         let share_vm = flags & CLONE_VM != 0 && (is_thread || !is_vfork);
         let share_files = flags & CLONE_FILES != 0;
+        // CLONE_FS shares the filesystem context (cwd); CLONE_THREAD implies it,
+        // and every pthread sets it, so a `chdir` in one thread is seen by all.
+        let share_fs = flags & CLONE_FS != 0;
+        // The namespace flags (CLONE_NEW*), CLONE_SYSVSEM, CLONE_IO, CLONE_PTRACE,
+        // CLONE_UNTRACED, CLONE_DETACHED and CLONE_INTO_CGROUP need no code here:
+        // nixvm models one global namespace of each kind (and runs as root, for
+        // whom real Linux *creates* a new namespace successfully), a single SysV
+        // sem/IO/cgroup context, and no ptrace — so each is ACCEPTED as a no-op,
+        // the child simply running against the one global view. See the flag
+        // definitions for why acceptance (not EPERM) is the faithful choice.
+        // CLONE_SIGHAND asks to *share* the handler table; nixvm copies handlers
+        // per task (`info = cx.cur.clone()` below), so a CLONE_SIGHAND/THREAD
+        // child gets a snapshot of the caller's handlers rather than a live-shared
+        // table. This matches the common case (handlers are installed before
+        // threads spawn and rarely change afterward); true live sharing would need
+        // a handler table like `file_tables` and is deferred.
 
         let pid = sh.next_pid;
         sh.next_pid += 1;
@@ -2828,13 +3020,24 @@ impl Kernel {
         info.futex_wait = None;
         info.futex_woken = false;
         if is_thread {
+            // A thread joins the caller's group: shared tgid, the leader's parent,
+            // and no exit signal (only the group's termination notifies the parent).
             info.tgid = cx.cur.tgid;
             info.ppid = cx.cur.ppid;
             info.is_thread = true;
+            info.exit_signal = 0;
         } else {
             info.tgid = pid;
-            info.ppid = cx.cur.pid;
+            // CLONE_PARENT makes the child a *sibling* of the caller: its parent is
+            // the caller's parent, so it is reaped by (and signals) the grandparent.
+            info.ppid = if flags & CLONE_PARENT != 0 { cx.cur.ppid } else { cx.cur.pid };
             info.is_thread = false;
+            // The termination signal is the low byte of `flags` (SIGCHLD for fork).
+            info.exit_signal = (ca.exit_signal & 0xff) as u8;
+        }
+        // CLONE_CLEAR_SIGHAND (clone3): the child starts with default dispositions.
+        if flags & CLONE_CLEAR_SIGHAND != 0 {
+            info.handlers = [SigAction::default(); 65];
         }
 
         // Address space: share the caller's slot (CLONE_VM), or fork a
@@ -2861,7 +3064,11 @@ impl Kernel {
 
         // tid notifications. The parent word lives in the caller's space (`mem`);
         // the child word lives in the child's space (shared `mem`, or the fresh
-        // copy we are about to install).
+        // copy we are about to install). In *legacy* clone, CLONE_PIDFD repurposes
+        // the `parent_tid` pointer for its pidfd output — but that flag is mutually
+        // exclusive with CLONE_PARENT_SETTID, so at most one of the two writes ever
+        // fires for a given pointer and no guard is needed here. (`clone3` gives
+        // pidfd its own field, so the two never collide there either.)
         if flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
             let _ = mem.write(parent_tid, &(pid as u32).to_le_bytes());
         }
@@ -2920,6 +3127,17 @@ impl Kernel {
             sh.file_tables.push(Some(copy));
         }
 
+        // Filesystem context (cwd). CLONE_FS shares the caller's `cwd_tables`
+        // entry (a `chdir` in either is seen by both); a fork gets a private copy
+        // of the current cwd. `cx.cur.cwd` holds the caller's live value (checked
+        // out for the slice), so the fork snapshots it here.
+        if share_fs {
+            info.fs = cx.cur.fs;
+        } else {
+            info.fs = sh.cwd_tables.len();
+            sh.cwd_tables.push(Some(cx.cur.cwd.clone()));
+        }
+
         if let Some(cm) = child_mem.take() {
             // A forked address space inherits the parent's arena position (its
             // pages were copied); `CLONE_VM` threads instead share the parent's
@@ -2943,6 +3161,24 @@ impl Kernel {
         // writing through a stale writable entry into the now-shared frame. (Free
         // for a `CLONE_VM` thread, which shares the mm and downgraded nothing.)
         vcpu.flush_tlb();
+        // CLONE_PIDFD: allocate a process descriptor for the child in the caller's
+        // fd table and write its number to the requested slot (`parent_tid` for
+        // legacy `clone`, the `pidfd` field for `clone3`). The pidfd becomes
+        // `POLLIN`-readable when the child exits (see `sys_exit`), so a parent can
+        // `poll` it instead of catching SIGCHLD. `pollfds` is the innermost lock;
+        // acquired after `sh` (which we already hold) it respects the lock order.
+        if flags & CLONE_PIDFD != 0 {
+            let pidfd_idx = {
+                let mut pf = self.pollfds.lock().unwrap();
+                let idx = pf.pidfds.len();
+                pf.pidfds.push(PidfdInst { target_pid: pid, exited: false });
+                idx
+            };
+            let pidfd = cx.cur.fds.alloc(Fd::Pidfd(pidfd_idx));
+            if ca.pidfd_ptr != 0 {
+                let _ = mem.write(ca.pidfd_ptr, &(pidfd as u32).to_le_bytes());
+            }
+        }
         sh.procs.push(Some(Process {
             vcpu: Some(child_vcpu),
             info,
@@ -3321,27 +3557,54 @@ impl Kernel {
         0
     }
 
-    /// `clone3(cl_args, size)` — the modern `clone`. Reads the `clone_args`
-    /// struct and forwards to [`Kernel::sys_clone`] with the equivalent
-    /// register arguments.
+    /// `clone3(cl_args, size)` — the modern `clone`. Reads the full `clone_args`
+    /// struct and forwards it to the shared [`Kernel::do_clone`] core. Unlike
+    /// legacy `clone`, the termination signal and pidfd pointer are their own
+    /// fields (not packed into `flags`/`parent_tid`), and `stack`+`stack_size`
+    /// give the region rather than a pre-computed stack pointer.
     fn sys_clone3(&self, sh: &mut Shared, cx: &mut ServiceCtx, args_ptr: u64, size: u64, vcpu: &mut dyn Vcpu, mem: &mut GuestMemory) -> i64 {
+        // The struct is versioned by size: 64 bytes (v0) through 88 (with the
+        // set_tid/cgroup fields). A short size is malformed (EINVAL).
         if size < 64 {
             return err(Errno::EINVAL);
         }
-        // clone_args: flags@0, pidfd@8, child_tid@16, parent_tid@24,
-        // exit_signal@32, stack@40, stack_size@48, tls@56.
+        // struct clone_args: flags@0, pidfd@8, child_tid@16, parent_tid@24,
+        // exit_signal@32, stack@40, stack_size@48, tls@56, set_tid@64,
+        // set_tid_size@72, cgroup@80.
         let rd = |off: u64| mem.read_u64(args_ptr + off).unwrap_or(0);
         let flags = rd(0);
+        let pidfd_ptr = rd(8);
         let child_tid = rd(16);
         let parent_tid = rd(24);
         let exit_signal = rd(32);
         let stack = rd(40);
         let stack_size = rd(48);
         let tls = rd(56);
-        // The child SP is the top of the provided stack region (grows down).
-        let sp = stack.wrapping_add(stack_size);
-        let legacy = [flags | (exit_signal & 0xff), sp, parent_tid, child_tid, tls, 0];
-        self.sys_clone(sh, cx, &legacy, vcpu, mem)
+        // set_tid[] (request specific pids per namespace) and cgroup are read for
+        // completeness but not honored: nixvm assigns pids from its own counter
+        // and models a single global cgroup, so a set_tid request cannot be
+        // satisfied — Linux would return EINVAL if the requested pid is taken, but
+        // since we never reuse pids the field is simply ignored. `CLONE_INTO_CGROUP`
+        // (whose target lives in `cgroup`) is accepted as a no-op like the other
+        // namespace/context flags.
+        let set_tid = if size >= 80 { rd(64) } else { 0 };
+        let set_tid_size = if size >= 80 { rd(72) } else { 0 };
+        let _cgroup = if size >= 88 { rd(80) } else { 0 };
+        let _ = (set_tid, set_tid_size);
+        // The child SP is the top of the provided stack region (grows down); a
+        // zero stack means "inherit the caller's" (do_clone leaves SP untouched).
+        let sp = if stack == 0 { 0 } else { stack.wrapping_add(stack_size) };
+        let ca = CloneArgs {
+            // clone3's flags never carry the exit signal in their low byte.
+            flags,
+            stack_ptr: sp,
+            parent_tid,
+            child_tid,
+            tls,
+            exit_signal,
+            pidfd_ptr,
+        };
+        self.do_clone(sh, cx, &ca, vcpu, mem)
     }
 
     /// `close_range(first, last, flags)` — close every open fd in `[first,
@@ -3536,18 +3799,38 @@ impl Kernel {
             mem.release();
         }
         cx.cur.run = RunState::Zombie(ExitCause::Exited(code & 0xff));
-        // Notify the parent: post SIGCHLD and unpark it so a `wait`/`sigsuspend`
-        // blocked for it re-checks and reaps this zombie. A parent that left
-        // SIGCHLD at its default disposition just ignores it (SIGCHLD is in the
-        // default-ignored set); a parent with a handler (the shell) gets it
-        // delivered. `exit_group` funnels through here for the current task, so
-        // this covers both exit paths. (Sibling zombies share our `ppid`, so one
-        // SIGCHLD to the parent is enough to wake its `wait` loop.)
+        // The signal a terminating child sends its parent. A plain fork uses
+        // SIGCHLD, but `clone` can request any signal (or none). For a process
+        // (non-thread) it is the child's own `exit_signal`. A thread's individual
+        // death sends nothing — UNLESS the whole group is going down (exit_group
+        // already zombified the leader), in which case the parent must receive the
+        // *leader's* exit signal, not the (signal-less) thread's; find the leader
+        // and use its signal only if it, too, is now a zombie.
+        let exit_sig: u64 = if cx.cur.is_thread {
+            sh.procs
+                .iter()
+                .flatten()
+                .find(|p| p.info.pid == cx.cur.tgid)
+                .filter(|p| matches!(p.info.run, RunState::Zombie(_)))
+                .map_or(0, |p| u64::from(p.info.exit_signal))
+        } else {
+            u64::from(cx.cur.exit_signal)
+        };
+        // Notify the parent: post `exit_sig` (if any) and unpark it so a
+        // `wait`/`sigsuspend` blocked for it re-checks and reaps this zombie. The
+        // unpark is unconditional even when no signal is sent (a thread's death,
+        // or `clone` with exit signal 0), so a parked `wait4` still re-runs and
+        // reaps. A parent that left SIGCHLD at its default disposition just ignores
+        // the signal (it is in the default-ignored set); one with a handler (the
+        // shell) gets it delivered. `exit_group` funnels through here for the
+        // current task, so this covers both exit paths.
         let ppid = cx.cur.ppid;
         let me = cx.cur.pid;
         for slot in sh.procs.iter_mut().flatten() {
             if slot.info.pid == ppid {
-                slot.info.pending |= 1u64 << (SIGCHLD - 1);
+                if (1..=64).contains(&exit_sig) {
+                    slot.info.pending |= 1u64 << (exit_sig - 1);
+                }
                 slot.info.parked = false;
             }
             // Reparent our children to init (pid 1): an orphan must not keep its
@@ -3560,6 +3843,26 @@ impl Kernel {
                 if ds >= 1 && ds <= 64 {
                     slot.info.pending |= 1u64 << (ds - 1);
                     slot.info.parked = false;
+                }
+            }
+        }
+        // Make any `CLONE_PIDFD` descriptor pointing at this task readable, so a
+        // parent polling the pidfd (rather than catching the exit signal) wakes.
+        // Only a whole process becoming reapable satisfies a pidfd — an individual
+        // thread's death does not (its group leader is still alive), so skip the
+        // mark for a thread whose leader has not also exited.
+        let group_gone = !cx.cur.is_thread
+            || sh
+                .procs
+                .iter()
+                .flatten()
+                .find(|p| p.info.pid == cx.cur.tgid)
+                .is_none_or(|p| matches!(p.info.run, RunState::Zombie(_)));
+        if group_gone {
+            let mut pf = self.pollfds.lock().unwrap();
+            for pfd in &mut pf.pidfds {
+                if pfd.target_pid == me || pfd.target_pid == cx.cur.tgid {
+                    pfd.exited = true;
                 }
             }
         }
@@ -3968,6 +4271,8 @@ impl Kernel {
                 self.read_pollfd_fd(&mut pf, cx, fd, buf, count, mem)
             }
             Some(Fd::PtyMaster(..) | Fd::PtySlave(..)) => self.read_pty_fd(cx, fd, buf, count, mem),
+            // A pidfd carries no data — `read` is EINVAL (it is only pollable).
+            Some(Fd::Pidfd(..)) => err(Errno::EINVAL),
             _ => {
                 let mut sh = self.shared.lock().unwrap();
                 self.read_shared_fd(&mut sh, cx, fd, buf, count, mem)
@@ -5477,6 +5782,7 @@ impl Kernel {
                 | Fd::Eventfd(_)
                 | Fd::Signalfd(_)
                 | Fd::Timerfd(_)
+                | Fd::Pidfd(_)
                 | Fd::Epoll(_)
                 | Fd::PtyMaster(_),
             ) => stat::char_device_attrs(),
@@ -7336,6 +7642,149 @@ mod tests {
         assert_eq!(c.info.tgid, 2, "a forked process is its own group");
         assert_ne!(c.info.mm, cx.cur.mm, "fork copies the address space");
         assert_eq!(sh.spaces.len(), before + 1);
+    }
+
+    #[test]
+    fn clone_records_the_exit_signal_and_thread_has_none() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        // A plain fork (flags = SIGCHLD in the low byte) must record SIGCHLD (17).
+        let c1 = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [0x11, 0, 0, 0, 0, 0]);
+        // A clone requesting SIGUSR1 (10) as the exit signal records exactly that.
+        let c2 = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [10, 0, 0, 0, 0, 0]);
+        // A thread (CLONE_VM|CLONE_THREAD) has no exit signal at all.
+        let t = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [0x0000_0100 | 0x0001_0000, 0, 0, 0, 0, 0]);
+        let sh = k.shared.lock().unwrap();
+        let sig = |pid: i64| sh.procs.iter().flatten().find(|p| i64::from(p.info.pid) == pid).unwrap().info.exit_signal;
+        assert_eq!(sig(c1), 17, "fork signals SIGCHLD");
+        assert_eq!(sig(c2), 10, "clone honors a custom exit signal");
+        assert_eq!(sig(t), 0, "a thread has no exit signal");
+    }
+
+    #[test]
+    fn exiting_child_posts_its_exit_signal_to_the_parent() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        // A parent process (pid 100) sits parked in the table waiting on a child.
+        {
+            let mut sh = k.shared.lock().unwrap();
+            let mut parent = make_proc(100, 100, 0, false);
+            parent.info.parked = true;
+            sh.procs.push(Some(parent));
+        }
+        // The running task is that child: pid 200, parent 100, exit signal SIGUSR1.
+        cx.cur.pid = 200;
+        cx.cur.tgid = 200;
+        cx.cur.ppid = 100;
+        cx.cur.exit_signal = 10; // SIGUSR1
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Exit, [0, 0, 0, 0, 0, 0]);
+        let sh = k.shared.lock().unwrap();
+        let parent = sh.procs.iter().flatten().find(|p| p.info.pid == 100).unwrap();
+        assert!(parent.info.pending & (1 << (10 - 1)) != 0, "parent gets SIGUSR1, not SIGCHLD");
+        assert!(parent.info.pending & (1 << (17 - 1)) == 0, "no spurious SIGCHLD");
+        assert!(!parent.info.parked, "the parent is unparked so its wait re-checks");
+    }
+
+    #[test]
+    fn clone_parent_makes_the_child_a_sibling() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        // The caller (pid 1) itself has a parent (pid 50).
+        cx.cur.ppid = 50;
+        const CLONE_PARENT: u64 = 0x0000_8000;
+        // A plain fork's child is parented to the caller...
+        let plain = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [0x11, 0, 0, 0, 0, 0]);
+        // ...but CLONE_PARENT parents the child to the caller's parent (a sibling).
+        let sib = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [CLONE_PARENT | 0x11, 0, 0, 0, 0, 0]);
+        let sh = k.shared.lock().unwrap();
+        let ppid = |pid: i64| sh.procs.iter().flatten().find(|p| i64::from(p.info.pid) == pid).unwrap().info.ppid;
+        assert_eq!(ppid(plain), 1, "a plain fork's parent is the caller");
+        assert_eq!(ppid(sib), 50, "CLONE_PARENT reparents to the caller's parent");
+    }
+
+    #[test]
+    fn clone_fs_shares_the_cwd_slot_a_fork_copies_it() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        // Seed the caller's cwd slot (index 0) so a fork's fresh slot is distinct.
+        k.shared.lock().unwrap().cwd_tables.push(Some("/".to_string()));
+        cx.cur.fs = 0;
+        const CLONE_FS: u64 = 0x0000_0200;
+        let shared = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [CLONE_FS | 0x11, 0, 0, 0, 0, 0]);
+        let forked = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [0x11, 0, 0, 0, 0, 0]);
+        let sh = k.shared.lock().unwrap();
+        let fs = |pid: i64| sh.procs.iter().flatten().find(|p| i64::from(p.info.pid) == pid).unwrap().info.fs;
+        assert_eq!(fs(shared), 0, "CLONE_FS shares the caller's cwd slot");
+        assert_ne!(fs(forked), 0, "a fork gets its own cwd slot");
+    }
+
+    #[test]
+    fn clone_pidfd_yields_an_fd_that_polls_ready_after_the_child_exits() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        const CLONE_PIDFD: u64 = 0x0000_1000;
+        let pidfd_out = 0x1_0000; // where the kernel writes the pidfd number
+        let child = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [CLONE_PIDFD | 0x11, 0, pidfd_out, 0, 0, 0]);
+        let pidfd = u64::from(mem.read_u32(pidfd_out).unwrap());
+        assert!(pidfd >= 3, "a real fd was allocated for the pidfd");
+        // Poll it before the child exits: not ready.
+        let pollfds = 0x1_2000;
+        mem.write_init(pollfds, &(pidfd as u32).to_le_bytes()).unwrap();
+        mem.write_init(pollfds + 4, &1u16.to_le_bytes()).unwrap(); // POLLIN
+        mem.write_init(pollfds + 6, &0u16.to_le_bytes()).unwrap();
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Poll, [pollfds, 1, 0, 0, 0, 0]), 0, "pidfd not ready while the child lives");
+        // The child exits (its proc stays in the table sharing mm, so nothing is
+        // freed): drive its exit through a child ServiceCtx.
+        let child_mm = k.shared.lock().unwrap().procs.iter().flatten().find(|p| i64::from(p.info.pid) == child).unwrap().info.mm;
+        let mut cx_child = ServiceCtx::default();
+        cx_child.cur.pid = child as i32;
+        cx_child.cur.tgid = child as i32;
+        cx_child.cur.ppid = 1;
+        cx_child.cur.mm = child_mm;
+        call(&k, &mut cx_child, &mut mem, &mut v, Sysno::Exit, [0, 0, 0, 0, 0, 0]);
+        // Now the pidfd is POLLIN-readable.
+        mem.write_init(pollfds + 6, &0u16.to_le_bytes()).unwrap();
+        let n = call(&k, &mut cx, &mut mem, &mut v, Sysno::Poll, [pollfds, 1, 0, 0, 0, 0]);
+        assert_eq!(n, 1, "pidfd is ready once the child exits");
+        assert_eq!(mem.read_vec(pollfds + 6, 2).unwrap(), 1u16.to_le_bytes(), "revents = POLLIN");
+    }
+
+    #[test]
+    fn clone_rejects_an_unknown_flag_bit() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        // Bit 34 (0x4_0000_0000) is above every defined clone flag.
+        let r = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [0x4_0000_0000, 0, 0, 0, 0, 0]);
+        assert_eq!(r, err(Errno::EINVAL), "an undefined high flag bit is EINVAL");
+    }
+
+    #[test]
+    fn clone_into_a_new_namespace_as_root_succeeds() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        // As root, real Linux creates the namespace and succeeds; nixvm accepts
+        // the flags (single global namespace) rather than returning EPERM.
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const CLONE_NEWNET: u64 = 0x4000_0000;
+        const CLONE_NEWPID: u64 = 0x2000_0000;
+        let child = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWPID | 0x11, 0, 0, 0, 0, 0]);
+        assert!(child > 0, "a namespace clone as root produces a child, not EPERM");
+    }
+
+    #[test]
+    fn clone3_honors_the_exit_signal_and_pidfd_fields() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        const CLONE_PIDFD: u64 = 0x0000_1000;
+        let args = 0x1_0000;
+        let pidfd_out: u64 = 0x1_1000;
+        // struct clone_args, 64 bytes: flags@0, pidfd@8, child_tid@16,
+        // parent_tid@24, exit_signal@32, stack@40, stack_size@48, tls@56.
+        for off in (0..64).step_by(8) {
+            mem.write_init(args + off, &0u64.to_le_bytes()).unwrap();
+        }
+        mem.write_init(args, &CLONE_PIDFD.to_le_bytes()).unwrap();
+        mem.write_init(args + 8, &pidfd_out.to_le_bytes()).unwrap();
+        mem.write_init(args + 32, &10u64.to_le_bytes()).unwrap(); // exit_signal SIGUSR1
+        let child = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone3, [args, 64, 0, 0, 0, 0]);
+        assert!(child > 0);
+        let pidfd = mem.read_u32(pidfd_out).unwrap();
+        assert!(pidfd >= 3, "clone3 wrote a pidfd into the struct's pidfd field");
+        let sh = k.shared.lock().unwrap();
+        let c = sh.procs.iter().flatten().find(|p| i64::from(p.info.pid) == child).unwrap();
+        assert_eq!(c.info.exit_signal, 10, "clone3 exit_signal is its own field, not flags");
     }
 
     #[test]

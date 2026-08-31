@@ -451,6 +451,7 @@ fn fd_link_target(fd: &Fd) -> String {
         Fd::Eventfd(_) => "anon_inode:[eventfd]".to_string(),
         Fd::Signalfd(_) => "anon_inode:[signalfd]".to_string(),
         Fd::Timerfd(_) => "anon_inode:[timerfd]".to_string(),
+        Fd::Pidfd(_) => "anon_inode:[pidfd]".to_string(),
         Fd::Epoll(_) => "anon_inode:[eventpoll]".to_string(),
         Fd::PtyMaster(_) => "/dev/ptmx".to_string(),
         Fd::PtySlave(i) => format!("/dev/pts/{i}"),
