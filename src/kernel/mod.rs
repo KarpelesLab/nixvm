@@ -2422,7 +2422,7 @@ impl Kernel {
                 self.sys_getres_id(args[0], args[1], args[2], mem)
             }
             // Process groups / sessions.
-            Sysno::Setpgid => self.sys_setpgid(cx, args[0] as i32, args[1] as i32),
+            Sysno::Setpgid => self.sys_setpgid(sh, cx, args[0] as i32, args[1] as i32),
             Sysno::Getpgid => self.sys_getpgid(sh, cx, args[0] as i32),
             Sysno::Getpgrp => i64::from(pgid_of(&cx.cur)),
             Sysno::Setsid => self.sys_setsid(cx),
@@ -3126,13 +3126,23 @@ impl Kernel {
     /// `setpgid(pid, pgid)` — set the process group of `pid` (0 = self) to
     /// `pgid` (0 = the target's own pid). Only the current task is tracked.
     #[allow(clippy::unused_self)]
-    fn sys_setpgid(&self, cx: &mut ServiceCtx, pid: i32, pgid: i32) -> i64 {
-        if pid != 0 && pid != cx.cur.pid {
-            // Setting another process's pgid isn't modeled; accept for self only.
-            return err(Errno::ESRCH);
+    fn sys_setpgid(&self, sh: &mut Shared, cx: &mut ServiceCtx, pid: i32, pgid: i32) -> i64 {
+        if pgid < 0 {
+            return err(Errno::EINVAL);
         }
-        cx.cur.pgid = if pgid == 0 { cx.cur.pid } else { pgid };
-        0
+        if pid == 0 || pid == cx.cur.pid {
+            cx.cur.pgid = if pgid == 0 { cx.cur.pid } else { pgid };
+            return 0;
+        }
+        // Setting a child's process group (what a shell does to build a job): the
+        // target must be an existing process. `pgid == 0` means the target's pid.
+        for slot in sh.procs.iter_mut().flatten() {
+            if slot.info.pid == pid {
+                slot.info.pgid = if pgid == 0 { pid } else { pgid };
+                return 0;
+            }
+        }
+        err(Errno::ESRCH)
     }
 
     /// `getpgid(pid)` — the process group of `pid` (0 = self).
@@ -3290,11 +3300,17 @@ impl Kernel {
         // this covers both exit paths. (Sibling zombies share our `ppid`, so one
         // SIGCHLD to the parent is enough to wake its `wait` loop.)
         let ppid = cx.cur.ppid;
+        let me = cx.cur.pid;
         for slot in sh.procs.iter_mut().flatten() {
             if slot.info.pid == ppid {
                 slot.info.pending |= 1u64 << (SIGCHLD - 1);
                 slot.info.parked = false;
-                break;
+            }
+            // Reparent our children to init (pid 1): an orphan must not keep its
+            // dead parent's pid as `getppid()`, and its eventual zombie must be
+            // reaped by init rather than stranding forever.
+            if slot.info.ppid == me && slot.info.pid != me {
+                slot.info.ppid = 1;
             }
         }
         0
