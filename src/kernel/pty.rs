@@ -24,17 +24,24 @@ pub const TERMIOS_LEN: usize = 36;
 pub const WINSIZE_LEN: usize = 8;
 
 // c_iflag / c_oflag / c_lflag bits (asm-generic/termbits.h).
-const ICRNL: u32 = 0o000400;
+const INLCR: u32 = 0o000100; // input NL -> CR
+const IGNCR: u32 = 0o000200; // input: drop CR
+const ICRNL: u32 = 0o000400; // input CR -> NL
 const OPOST: u32 = 0o000001;
-const ONLCR: u32 = 0o000004;
+const ONLCR: u32 = 0o000004; // output NL -> CR-NL
+const OCRNL: u32 = 0o000010; // output CR -> NL
 const ISIG: u32 = 0o000001;
 const ICANON: u32 = 0o000002;
 const ECHO: u32 = 0o000010;
-const ECHOE: u32 = 0o000020;
+const ECHOE: u32 = 0o000020; // visual erase (BS SP BS)
+const ECHOK: u32 = 0o000040; // line-kill echoes a newline
+const ECHOCTL: u32 = 0o001000; // echo control chars as ^X
+const ECHOKE: u32 = 0o004000; // line-kill erases the line visually
 // c_cc indices.
 const VINTR: usize = 0;
 const VQUIT: usize = 1;
 const VERASE: usize = 2;
+const VKILL: usize = 3;
 const VEOF: usize = 4;
 const VSUSP: usize = 10;
 
@@ -130,24 +137,44 @@ impl Pty {
         self.termios[17 + i]
     }
 
-    /// Append `byte` to the master-side output, applying `OPOST`/`ONLCR`
-    /// (NL → CR-NL) when post-processing is on.
+    /// Append `byte` to the master-side output, applying the `OPOST` output
+    /// mappings: `ONLCR` (NL → CR-NL) and `OCRNL` (CR → NL).
     fn out_byte(&mut self, byte: u8) {
-        if byte == b'\n' && self.oflag() & OPOST != 0 && self.oflag() & ONLCR != 0 {
-            self.output.push_back(b'\r');
+        if self.oflag() & OPOST != 0 {
+            if byte == b'\n' && self.oflag() & ONLCR != 0 {
+                self.output.push_back(b'\r');
+            } else if byte == b'\r' && self.oflag() & OCRNL != 0 {
+                self.output.push_back(b'\n');
+                return;
+            }
         }
         self.output.push_back(byte);
     }
 
-    /// Echo one input byte, rendering a control char as `^X` (as a cooked
-    /// terminal does for e.g. `^C`) so the master sees what was typed.
+    /// Echo one input byte. With `ECHOCTL` a control char (`< 0x20`, other than
+    /// TAB/NL) is rendered as `^X` (`^` + `char ^ 0x40`) and DEL (`0x7f`) as
+    /// `^?`, the way a cooked terminal shows e.g. `^C`; without it the raw byte
+    /// is echoed.
     fn echo_byte(&mut self, b: u8) {
-        if b < 0x20 && b != b'\n' && b != b'\t' {
+        if self.lflag() & ECHOCTL != 0 && Self::is_ctrl(b) {
             self.out_byte(b'^');
-            self.out_byte(b | 0x40);
+            self.out_byte(b ^ 0x40);
         } else {
             self.out_byte(b);
         }
+    }
+
+    /// A control char that `ECHOCTL` renders as `^X`: `< 0x20` (except TAB/NL,
+    /// which have their own handling) or DEL.
+    fn is_ctrl(b: u8) -> bool {
+        (b < 0x20 && b != b'\n' && b != b'\t') || b == 0x7f
+    }
+
+    /// Number of terminal columns one canonical-buffer byte occupied when
+    /// echoed — 2 for a control char shown as `^X` under `ECHOCTL`, else 1 —
+    /// so erase/kill can back over exactly what echo wrote.
+    fn echo_width(&self, b: u8) -> usize {
+        if self.lflag() & ECHOCTL != 0 && Self::is_ctrl(b) { 2 } else { 1 }
     }
 
     /// The slave wrote `data` (terminal output): post-process and queue it for
@@ -165,12 +192,27 @@ impl Pty {
     fn master_write(&mut self, data: &[u8]) -> Vec<u32> {
         let (canon, echo) = (self.lflag() & ICANON != 0, self.lflag() & ECHO != 0);
         let isig = self.lflag() & ISIG != 0;
-        let icrnl = self.iflag() & ICRNL != 0;
-        let (verase, veof) = (self.cc(VERASE), self.cc(VEOF));
+        let (icrnl, inlcr, igncr) =
+            (self.iflag() & ICRNL != 0, self.iflag() & INLCR != 0, self.iflag() & IGNCR != 0);
+        let (verase, vkill, veof) = (self.cc(VERASE), self.cc(VKILL), self.cc(VEOF));
         let (vintr, vquit, vsusp) = (self.cc(VINTR), self.cc(VQUIT), self.cc(VSUSP));
         let mut signals = Vec::new();
         for &raw in data {
-            let b = if raw == b'\r' && icrnl { b'\n' } else { raw };
+            // Input CR/NL translation: IGNCR drops CR entirely; else ICRNL maps
+            // CR → NL; INLCR maps NL → CR.
+            let b = if raw == b'\r' {
+                if igncr {
+                    continue;
+                } else if icrnl {
+                    b'\n'
+                } else {
+                    raw
+                }
+            } else if raw == b'\n' && inlcr {
+                b'\r'
+            } else {
+                raw
+            };
             // `ISIG` control chars generate a signal, are echoed as `^X`, flush
             // the pending line (NOFLSH not modelled), and are not queued.
             if isig && b != 0 && (b == vintr || b == vquit || b == vsusp) {
@@ -189,12 +231,37 @@ impl Pty {
             }
             if canon {
                 if b == verase && verase != 0 {
-                    if self.canon.pop().is_some() && echo && self.lflag() & ECHOE != 0 {
-                        // Erase: backspace, space, backspace.
-                        for &e in b"\x08 \x08" {
-                            self.out_byte(e);
+                    // Erase the last char, backing echo over the columns it took
+                    // (BS SP BS per column) when ECHOE is on.
+                    if let Some(c) = self.canon.pop()
+                        && echo
+                        && self.lflag() & ECHOE != 0
+                    {
+                        for _ in 0..self.echo_width(c) {
+                            for &e in b"\x08 \x08" {
+                                self.out_byte(e);
+                            }
                         }
                     }
+                    continue;
+                }
+                if b == vkill && vkill != 0 {
+                    // Line-kill: discard the whole in-progress line. ECHOKE erases
+                    // it visually (BS SP BS over every echoed column); otherwise
+                    // ECHOK echoes a newline to move past the killed line.
+                    if echo {
+                        if self.lflag() & (ECHOKE | ECHOE) == (ECHOKE | ECHOE) {
+                            let cols: usize = self.canon.iter().map(|&c| self.echo_width(c)).sum();
+                            for _ in 0..cols {
+                                for &e in b"\x08 \x08" {
+                                    self.out_byte(e);
+                                }
+                            }
+                        } else if self.lflag() & ECHOK != 0 {
+                            self.out_byte(b'\n');
+                        }
+                    }
+                    self.canon.clear();
                     continue;
                 }
                 if b == veof && veof != 0 {
@@ -205,7 +272,7 @@ impl Pty {
                     continue;
                 }
                 if echo {
-                    self.out_byte(b);
+                    self.echo_byte(b);
                 }
                 self.canon.push(b);
                 if b == b'\n' {
@@ -214,7 +281,7 @@ impl Pty {
                 }
             } else {
                 if echo {
-                    self.out_byte(b);
+                    self.echo_byte(b);
                 }
                 self.input.push_back(b);
             }
@@ -295,6 +362,21 @@ impl Ptys {
     pub(super) fn slave_write(&mut self, n: usize, data: &[u8]) {
         if let Some(p) = self.table.get_mut(n) {
             p.slave_write(data);
+        }
+    }
+    /// `TCFLSH` (`tcflush`): discard queued, not-yet-read data. `input` drops the
+    /// terminal input queue (the completed lines plus the in-progress canonical
+    /// line); `output` drops the terminal output queue (bytes the master has yet
+    /// to read).
+    pub(super) fn flush(&mut self, n: usize, input: bool, output: bool) {
+        if let Some(p) = self.table.get_mut(n) {
+            if input {
+                p.input.clear();
+                p.canon.clear();
+            }
+            if output {
+                p.output.clear();
+            }
         }
     }
     /// Master read: drain up to `cap` bytes of terminal output. `None` = would
@@ -491,6 +573,105 @@ mod tests {
         let (sigs, _) = t.master_write(n, b"\x03\n");
         assert!(sigs.is_empty(), "no signal with ISIG off");
         assert_eq!(t.slave_read(n, 64).unwrap(), b"\x03\n");
+    }
+
+    #[test]
+    fn vkill_erases_the_whole_pending_line() {
+        let mut t = Ptys::default();
+        let n = t.alloc();
+        t.open_slave(n, 0);
+        // "abc", then ^U (VKILL, 0x15) wipes the line, then "xy", Enter.
+        t.master_write(n, b"abc\x15xy\n");
+        assert_eq!(t.slave_read(n, 64).unwrap(), b"xy\n");
+    }
+
+    #[test]
+    fn echoctl_renders_control_chars_as_caret() {
+        let mut t = Ptys::default();
+        let n = t.alloc();
+        t.open_slave(n, 0);
+        // Default termios has ICANON|ECHO|ECHOCTL. ^A (0x01) echoes as "^A"; the
+        // completing \n echoes as \r\n (ONLCR). ^A is not an ISIG char.
+        t.master_write(n, b"\x01\n");
+        assert_eq!(t.master_read(n, 64).unwrap(), b"^A\r\n");
+        assert_eq!(t.slave_read(n, 64).unwrap(), b"\x01\n");
+    }
+
+    #[test]
+    fn echoctl_off_echoes_control_chars_raw() {
+        let mut t = Ptys::default();
+        let n = t.alloc();
+        t.open_slave(n, 0);
+        let mut tm = t.get_termios(n).unwrap();
+        let lflag = u32::from_le_bytes(tm[12..16].try_into().unwrap()) & !ECHOCTL;
+        tm[12..16].copy_from_slice(&lflag.to_le_bytes());
+        t.set_termios(n, tm);
+        t.master_write(n, b"\x01\n");
+        assert_eq!(t.master_read(n, 64).unwrap(), b"\x01\r\n");
+    }
+
+    #[test]
+    fn ocrnl_maps_output_cr_to_nl() {
+        let mut t = Ptys::default();
+        let n = t.alloc();
+        t.open_slave(n, 0);
+        // Set OPOST|OCRNL, clear ONLCR.
+        let mut tm = t.get_termios(n).unwrap();
+        let oflag = (u32::from_le_bytes(tm[4..8].try_into().unwrap()) | OPOST | OCRNL) & !ONLCR;
+        tm[4..8].copy_from_slice(&oflag.to_le_bytes());
+        t.set_termios(n, tm);
+        t.slave_write(n, b"B\r");
+        assert_eq!(t.master_read(n, 64).unwrap(), b"B\n");
+    }
+
+    #[test]
+    fn inlcr_and_igncr_input_cr_nl_mapping() {
+        let mut t = Ptys::default();
+        let n = t.alloc();
+        t.open_slave(n, 0);
+        // INLCR (NL->CR), clear ICRNL, no echo: '\n' becomes '\r' (does not end
+        // the line); a following ICRNL '\r' would end it, but here we terminate
+        // with a raw '\r' after re-enabling ICRNL.
+        let mut tm = t.get_termios(n).unwrap();
+        let iflag = (u32::from_le_bytes(tm[0..4].try_into().unwrap()) | INLCR) & !ICRNL;
+        let lflag = u32::from_le_bytes(tm[12..16].try_into().unwrap()) & !ECHO;
+        tm[0..4].copy_from_slice(&iflag.to_le_bytes());
+        tm[12..16].copy_from_slice(&lflag.to_le_bytes());
+        t.set_termios(n, tm);
+        t.master_write(n, b"y\n"); // 'y', then '\n'->'\r' (no line end yet)
+        assert_eq!(t.slave_read(n, 64), None, "no complete line: \\n became \\r");
+
+        // IGNCR: a raw '\r' is dropped entirely.
+        let mut tm = t.get_termios(n).unwrap();
+        let iflag = u32::from_le_bytes(tm[0..4].try_into().unwrap()) | IGNCR;
+        tm[0..4].copy_from_slice(&iflag.to_le_bytes());
+        t.set_termios(n, tm);
+        t.master_write(n, b"\r"); // dropped
+        assert_eq!(t.slave_read(n, 64), None, "CR ignored, still no line");
+    }
+
+    #[test]
+    fn flush_discards_input_and_output_queues() {
+        let mut t = Ptys::default();
+        let n = t.alloc();
+        t.open_slave(n, 0);
+        // Clear ECHO so the input write does not also queue echo into output.
+        let mut tm = t.get_termios(n).unwrap();
+        let lflag = u32::from_le_bytes(tm[12..16].try_into().unwrap()) & !ECHO;
+        tm[12..16].copy_from_slice(&lflag.to_le_bytes());
+        t.set_termios(n, tm);
+        // Queue a complete input line and some output.
+        t.master_write(n, b"hi\n");
+        t.slave_write(n, b"out");
+        assert_eq!(t.slave_avail(n), 3);
+        assert_eq!(t.master_avail(n), 3);
+        // Flush input only: the slave-readable queue is emptied, output stays.
+        t.flush(n, true, false);
+        assert_eq!(t.slave_avail(n), 0);
+        assert_eq!(t.master_avail(n), 3);
+        // Flush output too.
+        t.flush(n, false, true);
+        assert_eq!(t.master_avail(n), 0);
     }
 
     #[test]
