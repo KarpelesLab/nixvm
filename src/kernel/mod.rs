@@ -3308,9 +3308,15 @@ impl Kernel {
             }
             // Reparent our children to init (pid 1): an orphan must not keep its
             // dead parent's pid as `getppid()`, and its eventual zombie must be
-            // reaped by init rather than stranding forever.
+            // reaped by init rather than stranding forever. A child that armed
+            // PR_SET_PDEATHSIG gets that signal now that its parent has died.
             if slot.info.ppid == me && slot.info.pid != me {
                 slot.info.ppid = 1;
+                let ds = slot.info.pdeathsig;
+                if ds >= 1 && ds <= 64 {
+                    slot.info.pending |= 1u64 << (ds - 1);
+                    slot.info.parked = false;
+                }
             }
         }
         0
@@ -5300,6 +5306,12 @@ impl Kernel {
     /// Resolve an `execve` target: absolute-ize, then follow symlinks.
     fn resolve_exec(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, p: &str) -> Option<String> {
         let abs = self.resolve_path(cx, AT_FDCWD, p);
+        // `/proc/self/exe` (and `/proc/<pid>/exe`) is a magic symlink to the
+        // running program — a common way to re-exec oneself. The mount table
+        // has no such node, so resolve it from the live per-task path.
+        if abs == "/proc/self/exe" || abs == format!("/proc/{}/exe", cx.cur.pid) {
+            return (!cx.cur.exe.is_empty()).then(|| cx.cur.exe.clone());
+        }
         self.follow_symlinks(vfs, &abs)
     }
 
