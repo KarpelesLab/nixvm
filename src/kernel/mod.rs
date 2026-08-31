@@ -2319,7 +2319,7 @@ impl Kernel {
             Sysno::Pwritev => self.sys_pwritev(vfs, cx, args[0], args[1], args[2], args[3], mem),
             Sysno::Ftruncate => self.sys_ftruncate(vfs, cx, args[0], args[1]),
             Sysno::Truncate => self.sys_truncate(vfs, cx, args[0], args[1], mem),
-            Sysno::Fallocate => self.sys_fallocate(vfs, cx, args[0], args[2], args[3]),
+            Sysno::Fallocate => self.sys_fallocate(vfs, cx, args[0], args[1], args[2], args[3]),
             Sysno::CopyFileRange => self.sys_copy_file_range(vfs, cx, args, mem),
             Sysno::Link => self.sys_linkat(vfs, cx, AT_FDCWD, args[0], AT_FDCWD, args[1], 0, mem),
             Sysno::Linkat => {
@@ -4093,16 +4093,39 @@ impl Kernel {
         }
     }
 
-    /// `fallocate(fd, mode, offset, len)` — for the default allocate/extend
-    /// mode, grow the file to at least `offset + len`; other modes (punch
-    /// hole, and so on) are accepted as no-ops.
+    /// `fallocate(fd, mode, offset, len)`. Default mode (0) grows the file to at
+    /// least `offset + len`. `FALLOC_FL_PUNCH_HOLE` (which must be combined with
+    /// `FALLOC_FL_KEEP_SIZE`) zeroes the byte range without changing the file
+    /// size. Other modes are accepted as no-ops.
     #[allow(clippy::unused_self)]
-    fn sys_fallocate(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, offset: u64, len: u64) -> i64 {
-        let Some(Fd::File { path, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
+    fn sys_fallocate(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, mode: u64, offset: u64, len: u64) -> i64 {
+        const FALLOC_FL_KEEP_SIZE: u64 = 0x01;
+        const FALLOC_FL_PUNCH_HOLE: u64 = 0x02;
+        let Some(Fd::File { path, writable, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
-        let want = offset.saturating_add(len);
+        if !writable {
+            return err(Errno::EBADF); // fallocate needs a writable fd
+        }
         let cur = vfs.stat(&path).map_or(0, |a| a.size);
+        if mode & FALLOC_FL_PUNCH_HOLE != 0 {
+            // PUNCH_HOLE requires KEEP_SIZE and must not extend the file: zero
+            // only the portion of [offset, offset+len) that lies within EOF.
+            if mode & FALLOC_FL_KEEP_SIZE == 0 {
+                return err(Errno::EINVAL);
+            }
+            let end = offset.saturating_add(len).min(cur);
+            if end <= offset {
+                return 0;
+            }
+            let zeros = vec![0u8; (end - offset) as usize];
+            return match vfs.write_at(&path, offset, &zeros) {
+                Ok(_) => 0,
+                Err(e) => io_errno(&e),
+            };
+        }
+        // Default allocate/extend: grow the file if the range runs past EOF.
+        let want = offset.saturating_add(len);
         if want > cur {
             match vfs.truncate(&path, want) {
                 Ok(()) => 0,
