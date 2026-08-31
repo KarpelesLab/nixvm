@@ -6107,7 +6107,19 @@ impl Kernel {
             };
             base
         };
-        if mem.map(base, len, prot).is_err() {
+        // A writable MAP_SHARED|MAP_ANONYMOUS region must be shared across fork
+        // (the standard shared-memory IPC primitive) — map it eagerly-backed and
+        // shared so a forked child aliases the same frames rather than getting a
+        // copy-on-write copy. Everything else is an ordinary (demand-paged) map.
+        let shared_anon = file_src.is_none()
+            && flags & MAP_SHARED != 0
+            && prot.contains(Prot::WRITE);
+        let mapped = if shared_anon {
+            mem.map_shared_anon(base, len, prot)
+        } else {
+            mem.map(base, len, prot)
+        };
+        if mapped.is_err() {
             return err(Errno::ENOMEM);
         }
 

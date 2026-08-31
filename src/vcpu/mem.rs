@@ -112,6 +112,12 @@ pub struct GuestMemory {
     /// Per-page: loaded from a file (an ELF segment). `MADV_DONTNEED` preserves
     /// these; cleared when a page is re-`map`ped anonymously.
     file_backed: Vec<bool>,
+    /// Per-page `MAP_SHARED | MAP_ANONYMOUS` marker. These pages back a shared
+    /// anonymous region: they are eagerly frame-backed at `mmap`, and across
+    /// `fork` the child *aliases* the same frame writable (not copy-on-write),
+    /// so parent and child see each other's stores — the standard shared-memory
+    /// IPC primitive. `make_writable`/`leaf_prot` therefore never privatize them.
+    shared_anon: Vec<bool>,
     /// Set whenever a *present* page-table leaf is cleared or changed from the
     /// host (unmap, protect, copy-on-write privatize). A KVM vcpu running this
     /// address space must flush its TLB before its next run, or a stale entry
@@ -220,6 +226,7 @@ impl GuestMemory {
             prot: vec![Prot::NONE; npages],
             mapped: vec![false; npages],
             file_backed: vec![false; npages],
+            shared_anon: vec![false; npages],
             tlb_dirty: false,
             kstack_pa,
             shared: false,
@@ -345,7 +352,10 @@ impl GuestMemory {
     /// intended protection, but read-only if the frame is copy-on-write-shared
     /// (so the next store faults and privatizes).
     fn leaf_prot(&self, p: usize, frame: u64, fa: &FrameAllocator) -> Prot {
-        if self.prot[p].contains(Prot::WRITE) && fa.refcount(frame) > 1 {
+        // A shared-anonymous page is deliberately aliased across address spaces:
+        // it stays writable even at refcount > 1 (writes go to the shared frame,
+        // not a private copy).
+        if !self.shared_anon[p] && self.prot[p].contains(Prot::WRITE) && fa.refcount(frame) > 1 {
             self.prot[p].read_only()
         } else {
             self.prot[p]
@@ -379,6 +389,29 @@ impl GuestMemory {
             self.mapped[p] = true;
             self.prot[p] = prot;
             self.file_backed[p] = false;
+            self.shared_anon[p] = false; // a fresh mapping is private until tagged
+        }
+        Ok(())
+    }
+
+    /// Map a `MAP_SHARED | MAP_ANONYMOUS` region: like [`Self::map`], but tag the
+    /// pages shared and **eagerly** back each with a frame. Eager backing is what
+    /// makes cross-`fork` sharing work — a shared page must have a real frame at
+    /// fork time so the child can alias it; a lazily-faulted page would mint a
+    /// private frame per address space and defeat the sharing. Returns `ENOMEM`
+    /// (as `Host`) if the pool can't back the whole region.
+    pub fn map_shared_anon(&mut self, addr: u64, len: u64, prot: Prot) -> Result<(), MemError> {
+        self.map(addr, len, prot)?;
+        let start = addr - addr % PAGE_SIZE;
+        let end = round_up(addr + len, PAGE_SIZE);
+        let (first, last) = self.page_range(start, (end - start) as usize)?;
+        let mut fa = self.fa.lock().unwrap();
+        for p in first..=last {
+            self.shared_anon[p] = true;
+            let va = self.base + (p as u64) * PAGE_SIZE;
+            if !Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, va) {
+                return Err(MemError::Host("frame pool exhausted".into()));
+            }
         }
         Ok(())
     }
@@ -525,6 +558,7 @@ impl GuestMemory {
             self.mapped[p] = false;
             self.prot[p] = Prot::NONE;
             self.file_backed[p] = false;
+            self.shared_anon[p] = false;
         }
         Ok(())
     }
@@ -627,13 +661,15 @@ impl GuestMemory {
     /// leaf write bit. An associated fn over the disjoint `space`/`phys` fields so
     /// callers can hold the `fa` guard (which borrows the `fa` field) at once.
     /// Returns whether it changed a present leaf (so the caller flags the TLB).
-    fn make_writable(space: &mut AddrSpace, phys: &PhysMem, prot: Prot, fa: &mut FrameAllocator, va: u64) -> bool {
+    fn make_writable(space: &mut AddrSpace, phys: &PhysMem, prot: Prot, fa: &mut FrameAllocator, va: u64, shared_anon: bool) -> bool {
         let Some(t) = space.translate(va, phys) else {
             return false;
         };
         let frame = t.paddr & !(PAGE_SIZE - 1);
-        if fa.refcount(frame) > 1 {
-            // Copy-on-write shared: privatize into a fresh frame.
+        if !shared_anon && fa.refcount(frame) > 1 {
+            // Copy-on-write shared: privatize into a fresh frame. (A shared-anon
+            // page is intentionally aliased — writes go to the shared frame, so
+            // it takes the `else` branch and just gets its leaf write bit set.)
             if let Some(new) = fa.alloc(phys) {
                 phys.copy_frame(new, frame);
                 if let Ok(old) = space.map(va, new, prot, false, fa, phys) {
@@ -667,7 +703,7 @@ impl GuestMemory {
                 if !Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, va) {
                     return Err(MemError::Host("frame pool exhausted".into()));
                 }
-                changed |= Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va);
+                changed |= Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va, self.shared_anon[p]);
             }
             self.tlb_dirty |= changed;
         }
@@ -716,7 +752,7 @@ impl GuestMemory {
         }
         let va = self.base + (p as u64) * PAGE_SIZE;
         let mut fa = self.fa.lock().unwrap();
-        Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va);
+        Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va, self.shared_anon[p]);
         true
     }
 
@@ -742,7 +778,7 @@ impl GuestMemory {
                 if !Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, va) {
                     return Err(MemError::Host("frame pool exhausted".into()));
                 }
-                changed |= Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va);
+                changed |= Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va, self.shared_anon[p]);
             }
             self.tlb_dirty |= changed;
         }
@@ -786,6 +822,19 @@ impl GuestMemory {
             // are transient supervisor scratch, so nothing is lost by not copying.
             let parent_kstack = install_kstack(&mut self.space, &mut fa, &self.phys);
             let child_kstack = install_kstack(&mut child, &mut fa, &self.phys);
+            // `MAP_SHARED | MAP_ANONYMOUS` pages must stay a *single writable*
+            // frame shared between parent and child, not copy-on-write. fork_cow
+            // already increffed the frame and installed a (read-only) child leaf;
+            // republish both sides' leaves writable so stores land in the shared
+            // frame and each side sees the other's writes. These pages are eagerly
+            // backed at mmap, so a frame always exists here.
+            for p in 0..self.mapped.len() {
+                if self.shared_anon[p] && self.mapped[p] {
+                    let va = self.base + (p as u64) * PAGE_SIZE;
+                    self.space.protect(va, self.prot[p], false, &self.phys);
+                    child.protect(va, self.prot[p], false, &self.phys);
+                }
+            }
             (child, parent_kstack, child_kstack)
         };
         self.kstack_pa = parent_kstack;
@@ -798,6 +847,7 @@ impl GuestMemory {
             prot: self.prot.clone(),
             mapped: self.mapped.clone(),
             file_backed: self.file_backed.clone(),
+            shared_anon: self.shared_anon.clone(),
             tlb_dirty: false,
             kstack_pa: child_kstack,
             shared: self.shared,
@@ -838,6 +888,9 @@ impl GuestMemory {
             *x = false;
         }
         for x in &mut self.file_backed {
+            *x = false;
+        }
+        for x in &mut self.shared_anon {
             *x = false;
         }
     }
@@ -1052,6 +1105,29 @@ mod tests {
         m.write_u64(0x1_0000, 1).unwrap();
         m.exec_reset();
         assert_eq!(m.frames_in_use(), baseline, "exec_reset returned all frames");
+    }
+
+    #[test]
+    fn shared_anon_pages_are_visible_across_fork() {
+        let mut parent = mem();
+        // A MAP_SHARED|ANON page and an ordinary (private/COW) page.
+        parent.map_shared_anon(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
+        parent.map(0x1_1000, PAGE_SIZE, Prot::rw()).unwrap();
+        parent.write_u64(0x1_0000, 100).unwrap();
+        parent.write_u64(0x1_1000, 100).unwrap();
+
+        let mut child = parent.fork();
+        child.write_u64(0x1_0000, 999).unwrap();
+        child.write_u64(0x1_1000, 999).unwrap();
+
+        // The shared-anon page reflects the child's write; the private page stays
+        // copy-on-write isolated.
+        assert_eq!(parent.read_u64(0x1_0000).unwrap(), 999, "shared-anon visible across fork");
+        assert_eq!(parent.read_u64(0x1_1000).unwrap(), 100, "private page stays COW-isolated");
+
+        // Sharing is bidirectional: the parent's write is visible to the child.
+        parent.write_u64(0x1_0000, 42).unwrap();
+        assert_eq!(child.read_u64(0x1_0000).unwrap(), 42, "shared-anon is bidirectional");
     }
 
     #[test]
