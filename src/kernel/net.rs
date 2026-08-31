@@ -27,6 +27,10 @@ use crate::vcpu::GuestMemory;
 use super::egress::{Egress, HostConn, HostDgram};
 use super::{Fd, Kernel, ServiceCtx, err};
 
+/// One received message: `(source address, payload, out `msg_flags`,
+/// `SCM_RIGHTS` fds delivered with it)`. Returned by [`Kernel::recv_message`].
+type RecvMsg = (Option<Addr>, Vec<u8>, u64, Vec<Fd>);
+
 impl Net {
     pub(super) fn set_egress(&mut self, egress: Box<dyn Egress>) {
         self.egress = Some(egress);
@@ -131,9 +135,20 @@ const IPV6_V6ONLY: u64 = 26;
 
 // `sendto`/`recvfrom` `flags` bits this module honors (linux/socket.h).
 const MSG_PEEK: u64 = 0x02;
+/// Ancillary data (an `SCM_RIGHTS` cmsg) was too large for the caller's
+/// `msg_control` buffer and was truncated — set in `recvmsg`'s out `msg_flags`.
+const MSG_CTRUNC: u64 = 0x08;
 const MSG_TRUNC: u64 = 0x20;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_WAITALL: u64 = 0x100;
+/// `recvmsg` flag: set `FD_CLOEXEC` on every fd received via `SCM_RIGHTS`.
+const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+
+/// `cmsg_level`/`cmsg_type` for file-descriptor passing (SOL_SOCKET/SCM_RIGHTS).
+const SCM_RIGHTS: i32 = 1;
+/// Size of a 64-bit `struct cmsghdr`: `cmsg_len`(size_t,8) + `cmsg_level`(int,4)
+/// + `cmsg_type`(int,4). `CMSG_DATA` follows immediately (already 8-aligned).
+const CMSG_HDR_LEN: usize = 16;
 // MSG_NOSIGNAL (0x4000) is a documented no-op: this virtual transport never
 // raises SIGPIPE on a peer-closed write in the first place (it returns
 // `EPIPE`), so there is nothing to suppress.
@@ -345,6 +360,15 @@ struct Pair {
     shut_rd: [bool; 2],
     nonblock: [bool; 2],
     addrs: [Option<InetAddr>; 2],
+    /// In-flight `SCM_RIGHTS` ancillary file descriptors, parallel to `to`:
+    /// `scm[e]` rides the byte stream the reader on end `e` consumes. Each entry
+    /// is `(pos, fds)` where `pos` is the number of stream bytes still queued
+    /// *ahead* of the message these fds were sent with — so they are delivered
+    /// with the `recvmsg` that first reads that message's data (Linux attaches
+    /// ancillary data to the sending `sendmsg`'s bytes). Each `Fd` here holds a
+    /// duplicated backing reference, transferred to a fresh guest fd on receipt
+    /// or dropped if the bytes are consumed by a plain `read`/`recv`.
+    scm: [VecDeque<(usize, Vec<Fd>)>; 2],
 }
 
 impl Pair {
@@ -357,7 +381,39 @@ impl Pair {
             shut_rd: [false, false],
             nonblock: [false, false],
             addrs: [None, None],
+            scm: [VecDeque::new(), VecDeque::new()],
         }
+    }
+
+    /// Bytes readable from `to[e]` in one `recvmsg` without merging past an
+    /// `SCM_RIGHTS` boundary: Linux does not coalesce an ancillary-bearing
+    /// message with a following one. `want` is the caller's desired count.
+    fn scm_read_len(&self, e: usize, want: usize) -> usize {
+        match self.scm[e].front() {
+            None => want,
+            // The front message carries fds and starts now — deliver it, but
+            // stop before the next ancillary-bearing message.
+            Some(&(0, _)) => self.scm[e].get(1).map_or(want, |&(next, _)| want.min(next)),
+            // Plain data ahead: read up to the ancillary boundary, no further.
+            Some(&(pos, _)) => want.min(pos),
+        }
+    }
+
+    /// After consuming `n` bytes from `to[e]`, pop and return the `SCM_RIGHTS`
+    /// fd groups whose message boundary now falls within the consumed bytes,
+    /// and shift the remaining entries' offsets down by `n`.
+    fn scm_take(&mut self, e: usize, n: usize) -> Vec<Fd> {
+        let mut out = Vec::new();
+        let threshold = n.max(1); // n == 0 still delivers a zero-length message
+        while self.scm[e].front().is_some_and(|&(pos, _)| pos < threshold) {
+            if let Some((_, fds)) = self.scm[e].pop_front() {
+                out.extend(fds);
+            }
+        }
+        for (pos, _) in &mut self.scm[e] {
+            *pos = pos.saturating_sub(n);
+        }
+        out
     }
 }
 
@@ -386,6 +442,7 @@ impl std::fmt::Debug for Dgram {
         f.debug_struct("Dgram")
             .field("local", &self.local)
             .field("peer", &self.peer)
+            .field("pair_peer", &self.pair_peer)
             .field("queue", &self.queue)
             .field("host", &self.host.is_some())
             .finish()
@@ -542,6 +599,18 @@ impl Kernel {
         match cx.cur.fds.get(fd as i32) {
             Some(Fd::Socket { sock, end }) => Some((*sock, *end)),
             _ => None,
+        }
+    }
+
+    /// Adjust the backing refcount of an in-flight `SCM_RIGHTS` fd. `net` is
+    /// already held here, so a socket fd is bumped directly (via `net.bump`);
+    /// routing it through `bump_pipe` would re-lock `net` and deadlock. Pipe
+    /// (and any other refcounted) fds go through the shared `bump_pipe`, which
+    /// only takes `pipes` — legal after `net` in the lock order.
+    fn scm_ref(&self, net: &mut Net, fd: &Fd, inc: bool) {
+        match fd {
+            Fd::Socket { .. } => net.bump(fd, inc),
+            other => self.bump_pipe(other, inc),
         }
     }
 
@@ -1613,8 +1682,41 @@ impl Kernel {
                 Err(_) => return err(Errno::EFAULT),
             }
         }
+        // Parse any SCM_RIGHTS ancillary data and translate each passed guest fd
+        // to a duplicated kernel-side `Fd` (validated up front: an unknown fd
+        // fails the whole sendmsg with EBADF, before anything is queued).
+        let Some(guest_fds) = parse_scm_rights(mem, hdr.control, hdr.controllen) else {
+            return err(Errno::EFAULT);
+        };
+        let mut passed: Vec<Fd> = Vec::with_capacity(guest_fds.len());
+        for g in &guest_fds {
+            match cx.cur.fds.get(*g) {
+                Some(f) => passed.push(f.clone()),
+                None => return err(Errno::EBADF),
+            }
+        }
         const MSG_NOSIGNAL: u64 = 0x4000;
-        self.send_bytes(net, cx, fd, &data, hdr.name, u64::from(hdr.namelen), flags & MSG_NOSIGNAL != 0, mem)
+        let r = self.send_bytes(net, cx, fd, &data, hdr.name, u64::from(hdr.namelen), flags & MSG_NOSIGNAL != 0, mem);
+        // On a successful send over a connected AF_UNIX stream pair, queue the
+        // passed fds as ancillary data riding the just-written bytes: bump each
+        // backing ref (the in-flight duplicate) and record the stream offset the
+        // fds attach to, so the matching `recvmsg` materializes them.
+        if r >= 0 && !passed.is_empty()
+            && let Some((sock, end)) = self.sock_of(cx, fd)
+            && matches!(net.socks[sock].kind, Kind::Pair(_))
+        {
+            for f in &passed {
+                self.scm_ref(net, f, true);
+            }
+            if let Kind::Pair(p) = &mut net.socks[sock].kind {
+                let reader = 1 - end;
+                // Bytes already queued ahead of this message (this write appended
+                // `r` bytes to the tail).
+                let pos = p.to[reader].len().saturating_sub(r as usize);
+                p.scm[reader].push_back((pos, passed));
+            }
+        }
+        r
     }
 
     /// `sendmmsg(fd, msgvec, vlen, flags)` — send an array of `struct mmsghdr`
@@ -1692,7 +1794,7 @@ impl Kernel {
         // Instead gather into a host Vec by receiving into the largest single
         // iovec repeatedly is also wrong for datagrams. So: receive once into
         // a host buffer via a dedicated helper.
-        let (src, mut got, msg_flags) = match self.recv_message(net, cx, fd, total, flags) {
+        let (src, mut got, mut msg_flags, scm_fds) = match self.recv_message(net, cx, fd, total, flags) {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -1709,20 +1811,80 @@ impl Kernel {
             off += take;
         }
         got.truncate(off);
-        // Fill msg_name (source address) and msg_flags; clear control length.
-        // `msg_namelen` (socklen_t at msg+8) doubles as write_sockaddr's
-        // in/out length word — it carries the caller's capacity in and the
-        // written length out, exactly as recvmsg wants.
+        // Fill msg_name (source address); `msg_namelen` (socklen_t at msg+8)
+        // doubles as write_sockaddr's in/out length word — it carries the
+        // caller's capacity in and the written length out, exactly as recvmsg
+        // wants.
         if hdr.name != 0 && hdr.namelen > 0 {
             let domain = self
                 .sock_of(cx, fd)
                 .map_or(AF_INET, |(s, _)| net.socks[s].domain);
             write_sockaddr(mem, hdr.name, msg + 8, domain, src.as_ref());
         }
-        // msg_controllen := 0 (offset 40), msg_flags := msg_flags (offset 48).
-        let _ = mem.write(msg + 40, &0u64.to_le_bytes());
+        // Emit any SCM_RIGHTS ancillary data into msg_control (offset 40 =
+        // msg_controllen), setting msg_flags (offset 48).
+        self.emit_scm_rights(net, cx, msg, &hdr, flags, scm_fds, &mut msg_flags, mem);
         let _ = mem.write(msg + 48, &(msg_flags as i32).to_le_bytes());
         off as i64
+    }
+
+    /// Materialize `scm_fds` (in-flight SCM_RIGHTS fds delivered with this
+    /// `recvmsg`) into fresh guest fds and write the `SCM_RIGHTS` cmsg into the
+    /// caller's `msg_control` buffer. Fds that don't fit the buffer are dropped
+    /// (their backing ref released) and `MSG_CTRUNC` is set. Always writes
+    /// `msg_controllen` (offset 40); may set bits in `msg_flags`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_scm_rights(
+        &self, net: &mut Net, cx: &mut ServiceCtx,
+        msg: u64,
+        hdr: &MsgHdr,
+        flags: u64,
+        scm_fds: Vec<Fd>,
+        msg_flags: &mut u64,
+        mem: &mut GuestMemory,
+    ) {
+        if scm_fds.is_empty() {
+            let _ = mem.write(msg + 40, &0u64.to_le_bytes());
+            return;
+        }
+        // How many fds fit in the caller's control buffer.
+        let capacity = if hdr.control != 0 && hdr.controllen >= CMSG_HDR_LEN as u64 {
+            (hdr.controllen as usize - CMSG_HDR_LEN) / 4
+        } else {
+            0
+        };
+        let deliver = capacity.min(scm_fds.len());
+        if deliver < scm_fds.len() {
+            *msg_flags |= MSG_CTRUNC;
+        }
+        // Release the backing ref of every fd that won't fit (they are lost,
+        // exactly as Linux drops overflowing SCM_RIGHTS fds).
+        for fd in &scm_fds[deliver..] {
+            self.scm_ref(net, fd, false);
+        }
+        let cloexec = flags & MSG_CMSG_CLOEXEC != 0;
+        let mut guest_fds: Vec<i32> = Vec::with_capacity(deliver);
+        for fd in scm_fds.into_iter().take(deliver) {
+            // The in-flight duplicate's ref transfers to this new guest fd, so
+            // no extra bump is needed.
+            let g = cx.cur.fds.alloc(fd);
+            cx.cur.fds.set_cloexec(g, cloexec);
+            guest_fds.push(g);
+        }
+        if deliver == 0 {
+            let _ = mem.write(msg + 40, &0u64.to_le_bytes());
+            return;
+        }
+        let cmsg_len = CMSG_HDR_LEN + 4 * deliver;
+        let mut cbuf = Vec::with_capacity(cmsg_len);
+        cbuf.extend_from_slice(&(cmsg_len as u64).to_le_bytes());
+        cbuf.extend_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
+        cbuf.extend_from_slice(&SCM_RIGHTS.to_le_bytes());
+        for g in &guest_fds {
+            cbuf.extend_from_slice(&g.to_le_bytes());
+        }
+        let _ = mem.write(hdr.control, &cbuf);
+        let _ = mem.write(msg + 40, &(cmsg_len as u64).to_le_bytes());
     }
 
     /// Receive one message's bytes (up to `cap`) from socket `fd` into a host
@@ -1734,7 +1896,7 @@ impl Kernel {
         fd: u64,
         cap: u64,
         flags: u64,
-    ) -> Result<(Option<Addr>, Vec<u8>, u64), i64> {
+    ) -> Result<RecvMsg, i64> {
         let Some((sock, end)) = self.sock_of(cx, fd) else {
             return Err(err(Errno::ENOTSOCK));
         };
@@ -1742,13 +1904,13 @@ impl Kernel {
             Kind::Netlink(_) => {
                 let nonblock = net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
                 match self.drain_netlink(net, sock, cap as usize) {
-                    Some(data) => Ok((None, data, 0)),
+                    Some(data) => Ok((None, data, 0, Vec::new())),
                     None => {
                         if nonblock {
                             Err(err(Errno::EAGAIN))
                         } else {
                             cx.block = true;
-                            Ok((None, Vec::new(), 0))
+                            Ok((None, Vec::new(), 0, Vec::new()))
                         }
                     }
                 }
@@ -1760,14 +1922,14 @@ impl Kernel {
                         let truncated = data.len() as u64 > cap;
                         data.truncate(cap as usize);
                         let mf = if truncated { MSG_TRUNC } else { 0 };
-                        Ok((Some(Addr::Inet(from)), data, mf))
+                        Ok((Some(Addr::Inet(from)), data, mf, Vec::new()))
                     }
                     None => {
                         if nonblock {
                             Err(err(Errno::EAGAIN))
                         } else {
                             cx.block = true;
-                            Ok((None, Vec::new(), 0))
+                            Ok((None, Vec::new(), 0, Vec::new()))
                         }
                     }
                 }
@@ -1778,23 +1940,19 @@ impl Kernel {
                     Kind::Host(h) => Some(Addr::Inet(h.peer)),
                     _ => None,
                 };
-                Ok((peer, bytes, 0))
+                Ok((peer, bytes, 0, Vec::new()))
             }
             _ => {
                 // Stream: pull bytes directly out of the inbound queue (the
                 // flag-aware `recv_stream` writes to guest memory, so replicate
-                // its dequeue here against a host buffer instead).
-                let data = self.recv_stream_bytes(net, cx, sock, end, cap, flags);
-                match data {
-                    Ok(bytes) => {
-                        let peer = match &net.socks[sock].kind {
-                            Kind::Pair(p) => p.addrs[1 - end].map(Addr::Inet),
-                            _ => None,
-                        };
-                        Ok((peer, bytes, 0))
-                    }
-                    Err(e) => Err(e),
-                }
+                // its dequeue here against a host buffer instead), carrying any
+                // SCM_RIGHTS fds that ride the consumed bytes.
+                let (bytes, fds) = self.recv_stream_bytes(net, cx, sock, end, cap, flags)?;
+                let peer = match &net.socks[sock].kind {
+                    Kind::Pair(p) => p.addrs[1 - end].map(Addr::Inet),
+                    _ => None,
+                };
+                Ok((peer, bytes, 0, fds))
             }
         }
     }
@@ -2003,6 +2161,18 @@ impl Kernel {
             }
             _ => return err(Errno::EINVAL),
         };
+        // A plain `read`/`recv`/`recvfrom` can't carry ancillary data, so any
+        // SCM_RIGHTS fds riding the consumed bytes are discarded (their backing
+        // ref released), matching Linux.
+        if !peek {
+            let dropped = match &mut net.socks[sock].kind {
+                Kind::Pair(p) => p.scm_take(end, data.len()),
+                _ => Vec::new(),
+            };
+            for fd in &dropped {
+                self.scm_ref(net, fd, false);
+            }
+        }
         if mem.write(buf, &data).is_err() {
             return err(Errno::EFAULT);
         }
@@ -2019,37 +2189,46 @@ impl Kernel {
         end: usize,
         count: u64,
         flags: u64,
-    ) -> Result<Vec<u8>, i64> {
-        let (shut_rd, avail, peer_open, nonblock) = match &net.socks[sock].kind {
+    ) -> Result<(Vec<u8>, Vec<Fd>), i64> {
+        let (shut_rd, avail, peer_open, nonblock, scm_ready) = match &net.socks[sock].kind {
             Kind::Pair(p) => (
                 p.shut_rd[end],
                 p.to[end].len(),
                 p.refs[1 - end] > 0 && !p.shut_wr[1 - end],
                 p.nonblock[end] || flags & MSG_DONTWAIT != 0,
+                matches!(p.scm[end].front(), Some(&(0, _))),
             ),
             _ => return Err(err(Errno::EINVAL)),
         };
         if shut_rd {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
-        if avail == 0 {
+        // A pending zero-offset SCM group (fds sent with a zero-length message,
+        // or whose preceding bytes are already drained) is deliverable even with
+        // no data bytes queued.
+        if avail == 0 && !scm_ready {
             if peer_open {
                 if nonblock {
                     return Err(err(Errno::EAGAIN));
                 }
                 cx.block = true;
             }
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let peek = flags & MSG_PEEK != 0;
         match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
-                let n = (count as usize).min(p.to[end].len());
-                Ok(if peek {
+                let want = (count as usize).min(p.to[end].len());
+                let n = p.scm_read_len(end, want);
+                let data: Vec<u8> = if peek {
                     p.to[end].iter().take(n).copied().collect()
                 } else {
                     p.to[end].drain(..n).collect()
-                })
+                };
+                // MSG_PEEK leaves the ancillary data queued too (a later real
+                // recv still gets the fds); a real read transfers them out.
+                let fds = if peek { Vec::new() } else { p.scm_take(end, n) };
+                Ok((data, fds))
             }
             _ => Err(err(Errno::EINVAL)),
         }
@@ -2213,6 +2392,9 @@ struct MsgHdr {
     namelen: u32,
     iov: u64,
     iovlen: u64,
+    /// `msg_control`(32) / `msg_controllen`(40): the ancillary-data buffer.
+    control: u64,
+    controllen: u64,
 }
 
 impl MsgHdr {
@@ -2222,8 +2404,46 @@ impl MsgHdr {
             namelen: mem.read_u32(ptr + 8).ok()?,
             iov: mem.read_u64(ptr + 16).ok()?,
             iovlen: mem.read_u64(ptr + 24).ok()?,
+            control: mem.read_u64(ptr + 32).ok()?,
+            controllen: mem.read_u64(ptr + 40).ok()?,
         })
     }
+}
+
+/// Round `len` up to the next 8-byte `CMSG_ALIGN` boundary.
+fn cmsg_align(len: usize) -> usize {
+    (len + 7) & !7
+}
+
+/// Parse the guest ancillary buffer `[control, control+controllen)` for
+/// `SOL_SOCKET`/`SCM_RIGHTS` control messages, returning every passed guest fd
+/// number in order. Non-SCM_RIGHTS cmsgs are skipped. Returns `None` only on a
+/// faulting read of the buffer.
+fn parse_scm_rights(mem: &GuestMemory, control: u64, controllen: u64) -> Option<Vec<i32>> {
+    if control == 0 || controllen < CMSG_HDR_LEN as u64 {
+        return Some(Vec::new());
+    }
+    let buf = mem.read_vec(control, controllen as usize).ok()?;
+    let mut fds = Vec::new();
+    let mut off = 0usize;
+    while off + CMSG_HDR_LEN <= buf.len() {
+        let cmsg_len = u64::from_le_bytes(buf[off..off + 8].try_into().ok()?) as usize;
+        let level = i32::from_le_bytes(buf[off + 8..off + 12].try_into().ok()?);
+        let ctype = i32::from_le_bytes(buf[off + 12..off + 16].try_into().ok()?);
+        if cmsg_len < CMSG_HDR_LEN || off + cmsg_len > buf.len() {
+            break;
+        }
+        if level == SOL_SOCKET as i32 && ctype == SCM_RIGHTS {
+            let data = &buf[off + CMSG_HDR_LEN..off + cmsg_len];
+            for chunk in data.as_chunks::<4>().0 {
+                fds.push(i32::from_le_bytes(*chunk));
+            }
+        }
+        // Advance to the next CMSG_ALIGN-ed header; guard against a zero stride.
+        let step = cmsg_align(cmsg_len).max(CMSG_HDR_LEN);
+        off += step;
+    }
+    Some(fds)
 }
 
 fn read_sockaddr(mem: &GuestMemory, ptr: u64, addrlen: u64) -> Option<Addr> {
@@ -2956,6 +3176,128 @@ mod tests {
             "MSG_TRUNC reports the full datagram length"
         );
         assert_eq!(mem.read_vec(out, 4).unwrap(), b"ABCD");
+    }
+
+    #[test]
+    fn scm_rights_passes_an_fd_over_a_unix_socketpair() {
+        // sendmsg an SCM_RIGHTS cmsg carrying a pipe read end over an AF_UNIX
+        // stream socketpair; recvmsg on the peer must materialize a fresh fd and
+        // emit the cmsg, and the received fd must read the pipe's data.
+        let (k, mut mem, mut v, mut cx) = setup();
+
+        // Connected AF_UNIX stream socketpair -> sa, sb.
+        let sv = 0x1_0000;
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, sv, 0, 0]),
+            0
+        );
+        let sa = u64::from(mem.read_u32(sv).unwrap());
+        let sb = u64::from(mem.read_u32(sv + 4).unwrap());
+
+        // A pipe; write a marker into the write end, pass the read end.
+        let pfd = 0x1_0010;
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [pfd, 0, 0, 0, 0, 0]),
+            0
+        );
+        let pr = u64::from(mem.read_u32(pfd).unwrap());
+        let pw = u64::from(mem.read_u32(pfd + 4).unwrap());
+        let marker = 0x1_0020;
+        mem.write_init(marker, b"XYZ").unwrap();
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Write, [pw, marker, 3, 0, 0, 0]),
+            3
+        );
+
+        // Build the send msghdr: 1 data byte + an SCM_RIGHTS cmsg carrying `pr`.
+        let (m, iov, dat, ctl) = (0x1_0100u64, 0x1_0140u64, 0x1_0180u64, 0x1_01c0u64);
+        mem.write_init(dat, b"A").unwrap();
+        mem.write_init(iov, &dat.to_le_bytes()).unwrap();
+        mem.write_init(iov + 8, &1u64.to_le_bytes()).unwrap();
+        // cmsg: cmsg_len(20), SOL_SOCKET(1), SCM_RIGHTS(1), fd(pr).
+        mem.write_init(ctl, &20u64.to_le_bytes()).unwrap();
+        mem.write_init(ctl + 8, &1i32.to_le_bytes()).unwrap();
+        mem.write_init(ctl + 12, &1i32.to_le_bytes()).unwrap();
+        mem.write_init(ctl + 16, &(pr as i32).to_le_bytes()).unwrap();
+        // msghdr fields: name/namelen/iov/iovlen/control/controllen/flags.
+        for (o, val) in [(0u64, 0u64), (8, 0), (16, iov), (24, 1), (32, ctl), (40, 24), (48, 0)] {
+            mem.write_init(m + o, &val.to_le_bytes()).unwrap();
+        }
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Sendmsg, [sa, m, 0, 0, 0, 0]),
+            1
+        );
+
+        // Build the recv msghdr and recvmsg on the peer.
+        let (rm, riov, rdat, rctl) = (0x1_0200u64, 0x1_0240u64, 0x1_0280u64, 0x1_02c0u64);
+        mem.write_init(riov, &rdat.to_le_bytes()).unwrap();
+        mem.write_init(riov + 8, &4u64.to_le_bytes()).unwrap();
+        for (o, val) in [(0u64, 0u64), (8, 0), (16, riov), (24, 1), (32, rctl), (40, 24), (48, 0)] {
+            mem.write_init(rm + o, &val.to_le_bytes()).unwrap();
+        }
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Recvmsg, [sb, rm, 0, 0, 0, 0]),
+            1
+        );
+        assert_eq!(mem.read_vec(rdat, 1).unwrap(), b"A");
+        // The cmsg is present: controllen == CMSG_LEN(4) == 20, level/type == 1.
+        assert_eq!(mem.read_u64(rm + 40).unwrap(), 20, "msg_controllen");
+        assert_eq!(mem.read_u32(rm + 48).unwrap(), 0, "no MSG_CTRUNC");
+        assert_eq!(mem.read_u64(rctl).unwrap(), 20, "cmsg_len");
+        assert_eq!(mem.read_u32(rctl + 8).unwrap(), 1, "SOL_SOCKET");
+        assert_eq!(mem.read_u32(rctl + 12).unwrap(), 1, "SCM_RIGHTS");
+        let gotfd = u64::from(mem.read_u32(rctl + 16).unwrap());
+        assert!(gotfd >= 3, "materialized a fresh guest fd: {gotfd}");
+
+        // The received fd reads the pipe marker.
+        let out = 0x1_0300;
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [gotfd, out, 3, 0, 0, 0]),
+            3
+        );
+        assert_eq!(mem.read_vec(out, 3).unwrap(), b"XYZ");
+    }
+
+    #[test]
+    fn scm_rights_ctrunc_when_control_buffer_too_small() {
+        // A recvmsg whose msg_control can't hold the cmsg sets MSG_CTRUNC and
+        // drops the fd (no cmsg emitted).
+        let (k, mut mem, mut v, mut cx) = setup();
+        let sv = 0x1_0000;
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, sv, 0, 0]);
+        let sa = u64::from(mem.read_u32(sv).unwrap());
+        let sb = u64::from(mem.read_u32(sv + 4).unwrap());
+        let pfd = 0x1_0010;
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [pfd, 0, 0, 0, 0, 0]);
+        let pr = u64::from(mem.read_u32(pfd).unwrap());
+
+        let (m, iov, dat, ctl) = (0x1_0100u64, 0x1_0140u64, 0x1_0180u64, 0x1_01c0u64);
+        mem.write_init(dat, b"A").unwrap();
+        mem.write_init(iov, &dat.to_le_bytes()).unwrap();
+        mem.write_init(iov + 8, &1u64.to_le_bytes()).unwrap();
+        mem.write_init(ctl, &20u64.to_le_bytes()).unwrap();
+        mem.write_init(ctl + 8, &1i32.to_le_bytes()).unwrap();
+        mem.write_init(ctl + 12, &1i32.to_le_bytes()).unwrap();
+        mem.write_init(ctl + 16, &(pr as i32).to_le_bytes()).unwrap();
+        for (o, val) in [(0u64, 0u64), (8, 0), (16, iov), (24, 1), (32, ctl), (40, 24), (48, 0)] {
+            mem.write_init(m + o, &val.to_le_bytes()).unwrap();
+        }
+        call(&k, &mut cx, &mut mem, &mut v, Sysno::Sendmsg, [sa, m, 0, 0, 0, 0]);
+
+        // recv with a control buffer too small for even the cmsg header.
+        let (rm, riov, rdat, rctl) = (0x1_0200u64, 0x1_0240u64, 0x1_0280u64, 0x1_02c0u64);
+        mem.write_init(riov, &rdat.to_le_bytes()).unwrap();
+        mem.write_init(riov + 8, &4u64.to_le_bytes()).unwrap();
+        for (o, val) in [(0u64, 0u64), (8, 0), (16, riov), (24, 1), (32, rctl), (40, 8), (48, 0)] {
+            mem.write_init(rm + o, &val.to_le_bytes()).unwrap();
+        }
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Recvmsg, [sb, rm, 0, 0, 0, 0]),
+            1
+        );
+        const MSG_CTRUNC_BIT: u32 = 0x08;
+        assert_eq!(mem.read_u64(rm + 40).unwrap(), 0, "no cmsg fit");
+        assert_ne!(mem.read_u32(rm + 48).unwrap() & MSG_CTRUNC_BIT, 0, "MSG_CTRUNC set");
     }
 
     #[test]
