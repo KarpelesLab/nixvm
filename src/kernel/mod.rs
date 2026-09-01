@@ -187,6 +187,16 @@ struct ProcInfo {
     /// (the thread-group sum) measure CPU rather than wall time, per task rather
     /// than per host process.
     cpu_ns: u128,
+    /// Weighted *virtual* runtime for fair scheduling (CFS-style), in nice-0
+    /// nanosecond units: each executed step adds its CPU delta scaled by
+    /// `NICE0_WEIGHT / nice_weight(nice)`, so a low-priority (higher-`nice`) task's
+    /// vruntime climbs faster and it is picked less. Both schedulers always run
+    /// the runnable task with the *least* vruntime (clamped up to
+    /// [`Shared::min_vruntime`] so a long-blocked task can't hoard the CPU on
+    /// wake). Unlike [`Self::cpu_ns`] this is not real time — it exists only to
+    /// order the run queue. A forked child inherits the parent's value (via the
+    /// `ProcInfo` clone) so it gets no free head start.
+    vruntime: u128,
     /// CPU time (ns) of this task's *reaped* children, accumulated on `wait4`/
     /// `waitid` — Linux's `ru_utime` for `RUSAGE_CHILDREN` and `tms_cutime`.
     child_cpu_ns: u128,
@@ -293,6 +303,7 @@ impl Default for ProcInfo {
             shared_maps: Vec::new(),
             wake_deadline: None,
             cpu_ns: 0,
+            vruntime: 0,
             child_cpu_ns: 0,
             alarm_deadline: None,
             alarm_interval_ns: 0,
@@ -1109,6 +1120,13 @@ pub(super) struct Shared {
     /// threads can never be handed overlapping ranges.
     mmap_areas: Vec<Arena>,
     next_pid: i32,
+    /// Fair-scheduling floor: the monotonic minimum weighted virtual runtime of
+    /// the run queue (CFS's `min_vruntime`). Advanced to the vruntime of each task
+    /// as it is picked; a task about to run is clamped *up* to this floor first,
+    /// so a task that was blocked for a long time (its vruntime frozen while
+    /// parked) rejoins at the current front of the queue instead of monopolizing
+    /// the CPU until its stale vruntime catches up. See [`ProcInfo::vruntime`].
+    min_vruntime: u128,
     /// `NIXVM_WATCHCODE` debug watch: address whose 8 bytes are checked after
     /// every syscall, and the last value seen there.
     watch_addr: Option<u64>,
@@ -1235,17 +1253,54 @@ impl Shared {
             .min()
     }
 
+    /// Admit task `i` to the CPU: clamp its virtual runtime up to the run-queue
+    /// floor ([`Shared::min_vruntime`]) and advance the floor to it. The clamp is
+    /// what stops a task that sat blocked for a long time — its vruntime frozen
+    /// while parked — from monopolizing the CPU on wake until its stale vruntime
+    /// catches up; instead it rejoins at the front of the queue. Returns `i` for
+    /// chaining. See [`ProcInfo::vruntime`].
+    fn admit_fair(&mut self, i: usize) -> usize {
+        let eff = self.procs[i].as_ref().unwrap().info.vruntime.max(self.min_vruntime);
+        self.procs[i].as_mut().unwrap().info.vruntime = eff;
+        self.min_vruntime = eff;
+        i
+    }
+
+    /// Pick the fairest runnable task for the serial scheduler / interactive
+    /// pump: the `Running`, un-parked task holding its vcpu with the *least*
+    /// virtual runtime (nice-weighted CPU consumed). Running one such task per
+    /// call — the callers loop — gives least-vruntime-first, proportional-share
+    /// scheduling instead of the old fixed pid-table order.
+    fn pick_serial_runnable(&mut self) -> Option<usize> {
+        let floor = self.min_vruntime;
+        let best = (0..self.procs.len())
+            .filter(|&i| {
+                matches!(self.procs.get(i),
+                    Some(Some(p)) if p.info.run == RunState::Running && !p.info.parked && p.vcpu.is_some())
+            })
+            .min_by_key(|&i| self.procs[i].as_ref().unwrap().info.vruntime.max(floor));
+        best.map(|i| self.admit_fair(i))
+    }
+
     /// Pick a runnable task for an SMP worker: `Running`, holding its vcpu (not
-    /// already in flight), and not parked at the current progress epoch.
-    fn pick_smp_runnable(&self, blocked_at: &BTreeMap<usize, u64>, epoch: u64) -> Option<usize> {
-        (0..self.procs.len()).find(|&i| {
-            let Some(Some(p)) = self.procs.get(i) else {
-                return false;
-            };
-            p.info.run == RunState::Running
-                && p.vcpu.is_some()
-                && blocked_at.get(&i).copied() != Some(epoch)
-        })
+    /// already in flight), and not parked at the current progress epoch — and,
+    /// among those, the one with the least virtual runtime. Choosing by vruntime
+    /// (rather than the first free pid index) is what makes N CPU-bound processes
+    /// on M<N workers share the cores fairly instead of the low-index ones
+    /// starving the rest, and makes `nice` proportional here too.
+    fn pick_smp_runnable(&mut self, blocked_at: &BTreeMap<usize, u64>, epoch: u64) -> Option<usize> {
+        let floor = self.min_vruntime;
+        let best = (0..self.procs.len())
+            .filter(|&i| {
+                let Some(Some(p)) = self.procs.get(i) else {
+                    return false;
+                };
+                p.info.run == RunState::Running
+                    && p.vcpu.is_some()
+                    && blocked_at.get(&i).copied() != Some(epoch)
+            })
+            .min_by_key(|&i| self.procs[i].as_ref().unwrap().info.vruntime.max(floor));
+        best.map(|i| self.admit_fair(i))
     }
 
     /// Check the running task's shared fd table out of [`Shared::file_tables`]
@@ -1316,6 +1371,7 @@ impl Kernel {
                 umask: 0o022,
                 unsupported: BTreeMap::new(),
                 procs: Vec::new(),
+                min_vruntime: 0,
                 spaces: Vec::new(),
                 file_tables: Vec::new(),
                 cwd_tables: Vec::new(),
@@ -1478,46 +1534,46 @@ impl Kernel {
         }
     }
 
-    /// One pass over the process table on the current thread: run each runnable
-    /// task's slice. Returns whether any task made progress. Shared by the
-    /// blocking scheduler and the interactive [`Kernel::pump`] loop.
+    /// Run the fairest runnable task that makes progress — one slice — on the
+    /// current thread. "Fairest" is least virtual runtime (nice-weighted CPU),
+    /// so calling this in a loop (as [`Kernel::schedule_serial`] and the
+    /// interactive [`Kernel::pump`] both do) gives least-vruntime-first,
+    /// proportional-share scheduling rather than the old fixed pid-table order.
+    /// Returns whether a task made progress; `false` means nothing was runnable
+    /// (or every runnable task blocked immediately without progress), so the
+    /// caller runs its unpark / timer / deadlock logic.
     ///
-    /// The coarse kernel lock ([`Kernel::shared`]) is held for the whole sweep —
-    /// behavior-identical to the old exclusive `&mut Kernel`, since the serial
-    /// path is single-threaded and nothing else contends for it.
+    /// A task that blocks immediately with no progress is parked and skipped
+    /// past *within* this call, so one poll of an unready fd doesn't cost a whole
+    /// unpark round; as soon as one task makes progress we return, so the caller
+    /// re-picks by vruntime for the next slice.
+    ///
+    /// The coarse kernel lock ([`Kernel::shared`]) is taken only for the
+    /// check-out/check-in bookkeeping; the slice itself runs holding just the
+    /// per-address-space memory lock (outermost), so a syscall's own per-handler
+    /// locks nest correctly under it.
     fn serial_sweep(&self) -> Result<bool, VcpuError> {
         let mut progressed = false;
-        let nprocs = self.shared.lock().unwrap().procs.len();
-        for i in 0..nprocs {
-            // Bookkeeping under `sh`: check the task out (its slot goes `None`,
-            // its fd table into `cx`), then RELEASE `sh` before running the
-            // slice, so the slice's syscalls take their own per-handler locks
-            // (dispatch would self-deadlock re-locking a held `sh`). The memory
-            // lock stays held across the slice — memory is outermost, and it
-            // serializes same-address-space siblings' service phases.
-            let (mut proc, mut vcpu, space_arc, mut cx) = {
+        loop {
+            // Pick the least-vruntime runnable task and check it out (slot → `None`,
+            // fd table into `cx`), releasing `sh` before running the slice so the
+            // slice's syscalls can take their own per-handler locks.
+            let Some((i, mut proc, mut vcpu, space_arc, mut cx)) = ({
                 let mut sh = self.shared.lock().unwrap();
-                // Run only tasks that are Running *and not parked*: a parked
-                // task blocked last slice and won't progress until woken.
-                let runnable = matches!(
-                    sh.procs.get(i),
-                    Some(Some(p)) if p.info.run == RunState::Running && !p.info.parked
-                );
-                if !runnable {
-                    continue;
-                }
-                let mut proc = sh.procs[i].take().unwrap();
-                let mm = proc.info.mm;
-                let vcpu = proc.vcpu.take().expect("runnable task has a vcpu");
-                let space_arc = Arc::clone(&sh.spaces[mm]);
-                // Own the task's per-slice servicing state for the duration of
-                // the slice (was swapped into `self.cur`; now a passed-in value).
-                let mut cx = ServiceCtx {
-                    cur: std::mem::take(&mut proc.info),
-                    ..ServiceCtx::default()
-                };
-                sh.check_out_files(&mut cx);
-                (proc, vcpu, space_arc, cx)
+                sh.pick_serial_runnable().map(|i| {
+                    let mut proc = sh.procs[i].take().unwrap();
+                    let mm = proc.info.mm;
+                    let vcpu = proc.vcpu.take().expect("runnable task has a vcpu");
+                    let space_arc = Arc::clone(&sh.spaces[mm]);
+                    let mut cx = ServiceCtx {
+                        cur: std::mem::take(&mut proc.info),
+                        ..ServiceCtx::default()
+                    };
+                    sh.check_out_files(&mut cx);
+                    (i, proc, vcpu, space_arc, cx)
+                })
+            }) else {
+                return Ok(progressed);
             };
             let mut guard = space_arc.lock().unwrap();
             let made = self.run_slice(&mut cx, &mut vcpu, &mut guard)?;
@@ -1530,24 +1586,32 @@ impl Kernel {
                     "yield"
                 };
                 eprintln!(
-                    "[sched] pid={} slice={} syscalls={} end={end}",
-                    cx.cur.pid, i, cx.slice_syscalls
+                    "[sched] pid={} slot={} vr={} syscalls={} end={end}",
+                    cx.cur.pid, i, cx.cur.vruntime, cx.slice_syscalls
                 );
             }
-            // The slice ended either by exiting or by blocking; `cx.block`
-            // reflects the last syscall. A blocked task parks until a wake.
+            // The slice ended by exiting, yielding, preemption, or blocking;
+            // `cx.block` reflects the last syscall. A blocked task parks.
             let blocked = cx.block;
-            // Drop the memory lock before re-taking `sh` (memory is outermost).
-            drop(guard);
-            let mut sh = self.shared.lock().unwrap();
-            sh.check_in_files(&mut cx);
-            proc.info = cx.cur;
-            proc.info.parked = blocked && proc.info.run == RunState::Running;
-            proc.vcpu = Some(vcpu);
-            sh.procs[i] = Some(proc);
+            drop(guard); // memory is outermost — drop before re-taking `sh`
+            {
+                let mut sh = self.shared.lock().unwrap();
+                sh.check_in_files(&mut cx);
+                proc.info = cx.cur;
+                proc.info.parked = blocked && proc.info.run == RunState::Running;
+                proc.vcpu = Some(vcpu);
+                sh.procs[i] = Some(proc);
+            }
             progressed |= made;
+            // Made progress → hand control back so the caller re-picks fairly.
+            // No progress but the task blocked → try the next fairest task in
+            // this same call (it is now parked, so it won't be re-picked). No
+            // progress and didn't block → nothing more to do (avoids a busy spin
+            // re-picking the same task).
+            if made || !blocked {
+                return Ok(progressed);
+            }
         }
-        Ok(progressed)
     }
 
     // ---- interactive driver (the browser terminal) -----------------------
@@ -1655,10 +1719,9 @@ impl Kernel {
                 fire_alarm_if_due(&mut cx.cur, poll::now_ns());
             }
             let flow = self.service(cx, exit, vcpu.as_mut(), mem);
-            cx.cur.cpu_ns = cx
-                .cur
-                .cpu_ns
-                .saturating_add(crate::clock::now_monotonic().as_nanos().saturating_sub(step_start));
+            let delta = crate::clock::now_monotonic().as_nanos().saturating_sub(step_start);
+            cx.cur.cpu_ns = cx.cur.cpu_ns.saturating_add(delta);
+            charge_vruntime(&mut cx.cur, delta);
             match flow {
                 Serviced::SetRet => {
                     // The result was already written to the vcpu inside `service`
@@ -2163,11 +2226,11 @@ impl Kernel {
             fire_alarm_if_due(&mut cx.cur, poll::now_ns());
         }
         let flow = self.service(&mut cx, exit, vcpu, mem);
-        // Charge this step's wall time (run + service) to the task's CPU total.
-        cx.cur.cpu_ns = cx
-            .cur
-            .cpu_ns
-            .saturating_add(crate::clock::now_monotonic().as_nanos().saturating_sub(step_start));
+        // Charge this step's wall time (run + service) to the task's CPU total,
+        // and its nice-weighted share to the fair-scheduling virtual runtime.
+        let delta = crate::clock::now_monotonic().as_nanos().saturating_sub(step_start);
+        cx.cur.cpu_ns = cx.cur.cpu_ns.saturating_add(delta);
+        charge_vruntime(&mut cx.cur, delta);
         {
             let mut sh = self.shared.lock().unwrap();
             sh.check_in_files(&mut cx);
@@ -6663,6 +6726,39 @@ fn pgid_of(p: &ProcInfo) -> i32 {
     if p.pgid == 0 { p.pid } else { p.pgid }
 }
 
+/// The scheduling weight of a nice-0 task; `vruntime` accrues at `1×` here.
+const NICE0_WEIGHT: u128 = 1024;
+
+/// Scheduling weight for a `nice` value, on the standard CFS curve: each nice
+/// level is worth ~1.25× the CPU, i.e. `weight = 1024 / 1.25^nice` (nice 0 →
+/// 1024, so ~10% CPU per step). A step's `vruntime` grows by `cpu_delta *
+/// NICE0_WEIGHT / nice_weight(nice)`, so a higher-`nice` (lower-weight) task's
+/// vruntime climbs faster and the least-vruntime scheduler picks it less often —
+/// the proportional-share behavior real Linux gives `nice`. Computed from the
+/// documented 1.25-per-level rule (not copied from any table), cached once.
+fn nice_weight(nice: i32) -> u128 {
+    use std::sync::OnceLock;
+    static W: OnceLock<[u128; 40]> = OnceLock::new();
+    let table = W.get_or_init(|| {
+        let mut t = [0u128; 40];
+        for (i, w) in t.iter_mut().enumerate() {
+            let n = i as i32 - 20; // index 0 → nice -20 … index 39 → nice 19
+            *w = (1024.0 / 1.25f64.powi(n)).round().max(1.0) as u128;
+        }
+        t
+    });
+    table[(nice.clamp(-20, 19) + 20) as usize]
+}
+
+/// Add one executed step's weighted virtual runtime to a task, given the raw CPU
+/// nanoseconds it consumed. Shared by the serial and SMP accounting sites so the
+/// two paths order their run queues identically.
+fn charge_vruntime(p: &mut ProcInfo, cpu_delta_ns: u128) {
+    p.vruntime = p
+        .vruntime
+        .saturating_add(cpu_delta_ns.saturating_mul(NICE0_WEIGHT) / nice_weight(p.nice));
+}
+
 /// Join `argv` into the NUL-separated, NUL-terminated blob the kernel exposes
 /// as `/proc/self/cmdline` (each argument followed by a `\0`).
 fn cmdline_bytes(argv: &[String]) -> Vec<u8> {
@@ -8383,6 +8479,68 @@ mod tests {
         assert_eq!(mem.read_u64(si + 24).unwrap(), 0xABCD, "si_value carried");
         // The info is consumed on delivery (not re-delivered on the next signal).
         assert!(cx.cur.queued_siginfo[10].is_none(), "siginfo consumed");
+    }
+
+    #[test]
+    fn nice_weight_follows_the_cfs_curve() {
+        // nice 0 is the reference weight; the curve is monotone (lower nice =
+        // more weight = more CPU), and each step is ~1.25×.
+        assert_eq!(nice_weight(0), 1024);
+        assert!(nice_weight(-20) > nice_weight(0), "negative nice weighs more");
+        assert!(nice_weight(19) < nice_weight(0), "positive nice weighs less");
+        for n in -19..=19 {
+            assert!(nice_weight(n - 1) > nice_weight(n), "monotone at nice {n}");
+        }
+        // ~1.25 per level (allow rounding slack on the integer table).
+        let ratio = nice_weight(0) as f64 / nice_weight(1) as f64;
+        assert!((ratio - 1.25).abs() < 0.05, "≈1.25× per nice level, got {ratio}");
+        // Out-of-range nice clamps to the table ends rather than panicking.
+        assert_eq!(nice_weight(-100), nice_weight(-20));
+        assert_eq!(nice_weight(100), nice_weight(19));
+    }
+
+    #[test]
+    fn charge_vruntime_makes_nice_proportional() {
+        // Equal CPU consumed, but a higher-nice task accrues more virtual runtime
+        // (so the least-vruntime scheduler picks it less) — proportional to the
+        // inverse weight ratio, which is the whole point of the nice curve.
+        let cpu = 10_000_000u128; // 10 ms
+        let mut fast = ProcInfo { nice: 0, ..ProcInfo::default() };
+        let mut slow = ProcInfo { nice: 5, ..ProcInfo::default() };
+        charge_vruntime(&mut fast, cpu);
+        charge_vruntime(&mut slow, cpu);
+        assert!(slow.vruntime > fast.vruntime, "niced task's vruntime climbs faster");
+        let got = slow.vruntime as f64 / fast.vruntime as f64;
+        let want = nice_weight(0) as f64 / nice_weight(5) as f64; // ≈ 1.25^5 ≈ 3.05
+        assert!((got - want).abs() / want < 0.02, "vruntime ratio ≈ weight ratio: {got} vs {want}");
+    }
+
+    #[test]
+    fn serial_pick_is_least_vruntime_and_clamps_woken_tasks() {
+        fn task(pid: i32, vruntime: u128) -> Process {
+            Process {
+                vcpu: Some(Box::new(DummyVcpu)),
+                info: ProcInfo { pid, vruntime, run: RunState::Running, ..ProcInfo::default() },
+            }
+        }
+        let (k, _mem, _v, _cx) = setup();
+        let mut sh = k.shared.lock().unwrap();
+        sh.procs = vec![Some(task(10, 300)), Some(task(11, 100)), Some(task(12, 200))];
+
+        // The least-vruntime task is picked (index 1, pid 11) — not pid order.
+        assert_eq!(sh.pick_serial_runnable(), Some(1));
+        // Picking advances the floor to that task's vruntime.
+        assert_eq!(sh.min_vruntime, 100);
+
+        // A task that blocked long ago carries a stale, tiny vruntime; on wake it
+        // must not monopolize the CPU. Give index 0 a vruntime far below the
+        // floor and confirm admission clamps it up to the floor rather than
+        // letting it run unbounded ahead of the others.
+        sh.procs[0].as_mut().unwrap().info.vruntime = 5;
+        sh.min_vruntime = 250;
+        assert_eq!(sh.pick_serial_runnable(), Some(0), "the woken task is picked (now lowest)");
+        assert_eq!(sh.procs[0].as_ref().unwrap().info.vruntime, 250, "clamped up to the floor");
+        assert_eq!(sh.min_vruntime, 250, "floor stays monotonic");
     }
 
     #[test]
