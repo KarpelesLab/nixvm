@@ -214,3 +214,29 @@ fn boots_alpine_from_targz_via_compcol() {
         "shell runs from the compcol-decompressed rootfs, got: {out:?}"
     );
 }
+
+/// Relative symlinks in the squashfs lower resolve (`/lib/libz.so.1 ->
+/// libz.so.1.3.2`), so the dynamic linker can load apk's libz. A regression
+/// here showed up in the browser as "Error loading shared library libz.so.1:
+/// Symbolic link loop". Gated like the other live Alpine tests.
+#[cfg(feature = "fstool")]
+#[test]
+fn squashfs_relative_symlinks_resolve_for_apk() {
+    let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
+        eprintln!("NIXVM_ALPINE_TAR not set; skipping squashfs symlink test");
+        return;
+    };
+    let tar = std::fs::read(&tar_path).expect("read Alpine tar");
+    let mut vm = Vm::boot_squashfs(
+        &tar,
+        vec!["/bin/busybox".to_string(), "sh".to_string()],
+        256 * 1024 * 1024,
+    )
+    .expect("boot from in-memory squashfs overlay");
+    let _ = drain(&mut vm);
+    vm.write_stdin(b"readlink /lib/libz.so.1; head -c 4 /lib/libz.so.1 | od -c | head -1; apk --version; echo done-$?\n");
+    let out = drain(&mut vm);
+    eprintln!("--- squashfs symlinks ---\n{out}");
+    assert!(!out.contains("Symbolic link loop"), "symlink loop: {out:?}");
+    assert!(out.contains("apk-tools"), "apk runs (loads libz): {out:?}");
+}

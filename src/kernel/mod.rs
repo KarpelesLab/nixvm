@@ -6159,9 +6159,16 @@ impl Kernel {
         const O_CREAT: u64 = 0o100;
         const O_EXCL: u64 = 0o200;
         const O_TRUNC: u64 = 0o1000;
-        const O_NOFOLLOW: u64 = 0o400000;
-        const O_DIRECTORY: u64 = 0o200000;
-        const O_TMPFILE: u64 = 0o20000000; // the __O_TMPFILE bit
+        const O_TMPFILE: u64 = 0o20000000; // the __O_TMPFILE bit (both arches)
+        // O_DIRECTORY/O_NOFOLLOW are arch-specific: arm64 (asm-generic) uses
+        // 0o40000/0o100000, and its 0o200000/0o400000 are O_DIRECT/O_LARGEFILE
+        // — the x86-64 values. musl ORs O_LARGEFILE into every open, so using
+        // the x86 values for an arm64 guest made every open through a symlink
+        // fail with ELOOP (e.g. the dynamic linker loading libz.so.1).
+        let (o_directory, o_nofollow): (u64, u64) = match self.arch {
+            Arch::X86_64 => (0o200000, 0o400000),
+            Arch::Aarch64 => (0o40000, 0o100000),
+        };
         const O_ACCMODE: u64 = 0o3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
 
         // Anonymous temp files (O_TMPFILE) need inode-based fds; nixvm's are
@@ -6181,7 +6188,7 @@ impl Kernel {
         // O_NOFOLLOW: if the final component is itself a symlink, fail with ELOOP
         // rather than following it (a security check `open`ers rely on). Checked
         // against the *unfollowed* path; intermediate symlinks still resolve.
-        if flags & O_NOFOLLOW != 0
+        if flags & o_nofollow != 0
             && vfs
                 .stat(&resolved)
                 .is_some_and(|a| a.kind == NodeKind::Symlink)
@@ -6259,7 +6266,7 @@ impl Kernel {
         };
         let is_dir = attrs.kind == NodeKind::Dir;
         // O_DIRECTORY requires a directory; a non-dir is ENOTDIR.
-        if flags & O_DIRECTORY != 0 && !is_dir {
+        if flags & o_directory != 0 && !is_dir {
             return err(Errno::ENOTDIR);
         }
         // A directory can't be opened for writing — EISDIR.
@@ -8102,8 +8109,9 @@ mod tests {
         const O_WRONLY: u64 = 1;
         const O_CREAT: u64 = 0o100;
         const O_EXCL: u64 = 0o200;
-        const O_DIRECTORY: u64 = 0o200000;
-        const O_NOFOLLOW: u64 = 0o400000;
+        // arm64 values: `setup()` builds an aarch64 kernel.
+        const O_DIRECTORY: u64 = 0o40000;
+        const O_NOFOLLOW: u64 = 0o100000;
         let p = |s: &[u8], at: u64, m: &mut GuestMemory| {
             m.write_init(at, s).unwrap();
             at
@@ -8186,6 +8194,20 @@ mod tests {
                 [AT_CWD, lpath, O_NOFOLLOW, 0, 0, 0]
             ),
             err(Errno::ELOOP)
+        );
+        // arm64's O_LARGEFILE (0o400000, x86-64's O_NOFOLLOW value) — which
+        // musl sets on every open — must follow the symlink, not ELOOP.
+        const O_LARGEFILE_ARM64: u64 = 0o400000;
+        assert!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Openat,
+                [AT_CWD, lpath, O_LARGEFILE_ARM64, 0, 0, 0]
+            ) >= 0,
+            "O_LARGEFILE open through a symlink follows it"
         );
     }
 
