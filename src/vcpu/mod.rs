@@ -17,12 +17,12 @@
 
 use crate::abi::Arch;
 
-pub mod mem;
 pub(crate) mod ctrl;
+pub mod mem;
 pub(crate) mod pagetable;
-pub(crate) mod vdso;
 pub(crate) mod phys;
 pub(crate) mod region;
+pub(crate) mod vdso;
 
 pub use mem::{GuestMemory, MemError, Prot};
 

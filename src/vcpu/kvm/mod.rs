@@ -99,7 +99,9 @@ mod tests {
         program.extend_from_slice(&[0x0F, 0x05]); // syscall
         mem.write_init(base, &program).unwrap();
 
-        let mut v = backend.new_vcpu(base, base + 0x8000).expect("create KVM vcpu");
+        let mut v = backend
+            .new_vcpu(base, base + 0x8000)
+            .expect("create KVM vcpu");
 
         assert_eq!(
             v.run(&mut mem).unwrap(),
@@ -175,7 +177,11 @@ mod tests {
 
         let code = kernel.run(vcpu, mem).expect("kernel run");
         assert_eq!(code, 0, "exit code");
-        assert_eq!(&*captured.lock().unwrap(), b"hi\n", "stdout via KVM write()");
+        assert_eq!(
+            &*captured.lock().unwrap(),
+            b"hi\n",
+            "stdout via KVM write()"
+        );
     }
 
     /// A guest touching a guest-physical hole (below the mapped region) must
@@ -192,7 +198,9 @@ mod tests {
         // (below the region): C6 04 25 00 10 00 00 01
         mem.write_init(base, &[0xC6, 0x04, 0x25, 0x00, 0x10, 0x00, 0x00, 0x01])
             .unwrap();
-        let mut v = backend.new_vcpu(base, base + 0x8000).expect("create KVM vcpu");
+        let mut v = backend
+            .new_vcpu(base, base + 0x8000)
+            .expect("create KVM vcpu");
         match v.run(&mut mem).unwrap() {
             Exit::MemFault { addr, .. } => {
                 // The access is to an unmapped page (below the guest region), so
@@ -222,7 +230,8 @@ mod tests {
             mem.map(base, PAGE_SIZE, Prot::rx()).unwrap(); // read + execute, no write
             // mov byte ptr [rip-relative self], 1 → write into the code page:
             //   C6 05 00 00 00 00 01  (mov byte [rip+0], 1) then it faults on the store.
-            mem.write_init(base, &[0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01]).unwrap();
+            mem.write_init(base, &[0xC6, 0x05, 0x00, 0x00, 0x00, 0x00, 0x01])
+                .unwrap();
             let mut v = backend.new_vcpu(base, base + 0x8000).unwrap();
             assert!(
                 matches!(v.run(&mut mem).unwrap(), Exit::MemFault { .. }),
@@ -245,7 +254,10 @@ mod tests {
             let mut v = backend.new_vcpu(base, base + 0x1_0000).unwrap();
             match v.run(&mut mem).unwrap() {
                 Exit::MemFault { addr, .. } => {
-                    assert_eq!(addr, data, "instruction fetch from the NX page faults at it");
+                    assert_eq!(
+                        addr, data,
+                        "instruction fetch from the NX page faults at it"
+                    );
                 }
                 other => panic!("expected an NX fetch fault, got {other:?}"),
             }
@@ -335,8 +347,16 @@ mod tests {
             max_seen.load(Ordering::SeqCst)
         );
         let m = mem.lock().unwrap();
-        assert_eq!(m.read_u32(slots[0]).unwrap(), magic[0], "vcpu 0 wrote its slot");
-        assert_eq!(m.read_u32(slots[1]).unwrap(), magic[1], "vcpu 1 wrote its slot");
+        assert_eq!(
+            m.read_u32(slots[0]).unwrap(),
+            magic[0],
+            "vcpu 0 wrote its slot"
+        );
+        assert_eq!(
+            m.read_u32(slots[1]).unwrap(),
+            magic[1],
+            "vcpu 1 wrote its slot"
+        );
     }
 
     /// Time-based preemption on the hardware path: a guest spinning forever in a
@@ -356,9 +376,15 @@ mod tests {
         mem.map(base, PAGE_SIZE, Prot::rwx()).unwrap();
         mem.write_init(base, &[0xEB, 0xFE]).unwrap(); // jmp $ (spin forever)
 
-        let mut v = backend.new_vcpu(base, base + 0x8000).expect("create KVM vcpu");
+        let mut v = backend
+            .new_vcpu(base, base + 0x8000)
+            .expect("create KVM vcpu");
         let exit = v.run(&mut mem).expect("KVM run");
-        assert_eq!(exit, Exit::Interrupted, "the quantum timer preempts the guest");
+        assert_eq!(
+            exit,
+            Exit::Interrupted,
+            "the quantum timer preempts the guest"
+        );
         assert_eq!(v.pc(), base, "still on the self-loop, resumable");
     }
 }

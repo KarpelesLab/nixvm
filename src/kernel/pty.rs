@@ -55,7 +55,9 @@ const SIGTSTP: u32 = 20;
 /// `ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN` local, standard `c_cc`.
 fn default_termios() -> [u8; TERMIOS_LEN] {
     let mut t = [0u8; TERMIOS_LEN];
-    let put = |t: &mut [u8; TERMIOS_LEN], off: usize, v: u32| t[off..off + 4].copy_from_slice(&v.to_le_bytes());
+    let put = |t: &mut [u8; TERMIOS_LEN], off: usize, v: u32| {
+        t[off..off + 4].copy_from_slice(&v.to_le_bytes())
+    };
     put(&mut t, 0, ICRNL | 0o002000); // c_iflag = ICRNL | IXON
     put(&mut t, 4, OPOST | ONLCR); // c_oflag
     put(&mut t, 8, 0o000277); // c_cflag = B38400|CS8|CREAD (0xbf)
@@ -174,7 +176,11 @@ impl Pty {
     /// echoed — 2 for a control char shown as `^X` under `ECHOCTL`, else 1 —
     /// so erase/kill can back over exactly what echo wrote.
     fn echo_width(&self, b: u8) -> usize {
-        if self.lflag() & ECHOCTL != 0 && Self::is_ctrl(b) { 2 } else { 1 }
+        if self.lflag() & ECHOCTL != 0 && Self::is_ctrl(b) {
+            2
+        } else {
+            1
+        }
     }
 
     /// The slave wrote `data` (terminal output): post-process and queue it for
@@ -192,8 +198,11 @@ impl Pty {
     fn master_write(&mut self, data: &[u8]) -> Vec<u32> {
         let (canon, echo) = (self.lflag() & ICANON != 0, self.lflag() & ECHO != 0);
         let isig = self.lflag() & ISIG != 0;
-        let (icrnl, inlcr, igncr) =
-            (self.iflag() & ICRNL != 0, self.iflag() & INLCR != 0, self.iflag() & IGNCR != 0);
+        let (icrnl, inlcr, igncr) = (
+            self.iflag() & ICRNL != 0,
+            self.iflag() & INLCR != 0,
+            self.iflag() & IGNCR != 0,
+        );
         let (verase, vkill, veof) = (self.cc(VERASE), self.cc(VKILL), self.cc(VEOF));
         let (vintr, vquit, vsusp) = (self.cc(VINTR), self.cc(VQUIT), self.cc(VSUSP));
         let mut signals = Vec::new();
@@ -302,7 +311,11 @@ impl Ptys {
     /// index — the number `TIOCGPTN` reports and the `N` in `/dev/pts/N`.
     pub(super) fn alloc(&mut self) -> usize {
         // Reuse a fully-closed slot if one exists, else grow.
-        if let Some(i) = self.table.iter().position(|p| !p.master_open && p.slave_refs == 0) {
+        if let Some(i) = self
+            .table
+            .iter()
+            .position(|p| !p.master_open && p.slave_refs == 0)
+        {
             self.table[i] = Pty::new();
             i
         } else {
@@ -314,7 +327,9 @@ impl Ptys {
     /// Whether slave `n` may be opened (`/dev/pts/N`): it exists, its master is
     /// open, and it has been unlocked with `TIOCSPTLCK`.
     pub(super) fn slave_openable(&self, n: usize) -> bool {
-        self.table.get(n).is_some_and(|p| p.master_open && !p.locked)
+        self.table
+            .get(n)
+            .is_some_and(|p| p.master_open && !p.locked)
     }
     /// Open a slave, defaulting the foreground process group to the opener's
     /// `pgid` if none has been set — so a shell that opens its controlling
@@ -385,7 +400,11 @@ impl Ptys {
     pub(super) fn master_read(&mut self, n: usize, cap: usize) -> Option<Vec<u8>> {
         let p = self.table.get_mut(n)?;
         if p.output.is_empty() {
-            return if p.slave_refs == 0 { Some(Vec::new()) } else { None };
+            return if p.slave_refs == 0 {
+                Some(Vec::new())
+            } else {
+                None
+            };
         }
         let k = cap.min(p.output.len());
         Some(p.output.drain(..k).collect())
@@ -396,13 +415,19 @@ impl Ptys {
     pub(super) fn slave_read_params(&self, n: usize) -> (bool, usize, u64) {
         self.table.get(n).map_or((true, 1, 0), |p| {
             let lflag = u32::from_le_bytes(p.termios[12..16].try_into().unwrap());
-            (lflag & ICANON != 0, usize::from(p.termios[17 + 6]), u64::from(p.termios[17 + 5]))
+            (
+                lflag & ICANON != 0,
+                usize::from(p.termios[17 + 6]),
+                u64::from(p.termios[17 + 5]),
+            )
         })
     }
 
     /// Bytes currently available to a slave read, and whether the master is open.
     pub(super) fn slave_input(&self, n: usize) -> (usize, bool) {
-        self.table.get(n).map_or((0, false), |p| (p.input.len(), p.master_open))
+        self.table
+            .get(n)
+            .map_or((0, false), |p| (p.input.len(), p.master_open))
     }
 
     /// Slave read: drain up to `cap` bytes of terminal input. `None` = would
@@ -410,7 +435,11 @@ impl Ptys {
     pub(super) fn slave_read(&mut self, n: usize, cap: usize) -> Option<Vec<u8>> {
         let p = self.table.get_mut(n)?;
         if p.input.is_empty() {
-            return if p.master_open { None } else { Some(Vec::new()) };
+            return if p.master_open {
+                None
+            } else {
+                Some(Vec::new())
+            };
         }
         let k = cap.min(p.input.len());
         Some(p.input.drain(..k).collect())
@@ -494,7 +523,13 @@ impl Ptys {
         }
     }
     pub(super) fn is_nonblock(&self, n: usize, master: bool) -> bool {
-        self.table.get(n).is_some_and(|p| if master { p.master_nonblock } else { p.slave_nonblock })
+        self.table.get(n).is_some_and(|p| {
+            if master {
+                p.master_nonblock
+            } else {
+                p.slave_nonblock
+            }
+        })
     }
 }
 
@@ -528,7 +563,11 @@ mod tests {
         tm[12..16].copy_from_slice(&lflag.to_le_bytes());
         t.set_termios(n, tm);
         t.master_write(n, b"ab");
-        assert_eq!(t.slave_read(n, 64).unwrap(), b"ab", "raw: available immediately");
+        assert_eq!(
+            t.slave_read(n, 64).unwrap(),
+            b"ab",
+            "raw: available immediately"
+        );
         assert_eq!(t.master_read(n, 64), None, "raw: no echo");
     }
 
@@ -552,7 +591,11 @@ mod tests {
         let (sigs, pgrp) = t.master_write(n, b"ab\x03");
         assert_eq!(sigs, vec![SIGINT]);
         assert_eq!(pgrp, 42);
-        assert_eq!(t.slave_read(n, 64), None, "line flushed, nothing for the slave");
+        assert_eq!(
+            t.slave_read(n, 64),
+            None,
+            "line flushed, nothing for the slave"
+        );
         let echo = t.master_read(n, 64).unwrap();
         assert!(echo.ends_with(b"^C"), "^C echoed, got {echo:?}");
         // ^\ → SIGQUIT, ^Z → SIGTSTP.
@@ -639,7 +682,11 @@ mod tests {
         tm[12..16].copy_from_slice(&lflag.to_le_bytes());
         t.set_termios(n, tm);
         t.master_write(n, b"y\n"); // 'y', then '\n'->'\r' (no line end yet)
-        assert_eq!(t.slave_read(n, 64), None, "no complete line: \\n became \\r");
+        assert_eq!(
+            t.slave_read(n, 64),
+            None,
+            "no complete line: \\n became \\r"
+        );
 
         // IGNCR: a raw '\r' is dropped entirely.
         let mut tm = t.get_termios(n).unwrap();
@@ -680,7 +727,11 @@ mod tests {
         let n = t.alloc();
         t.open_slave(n, 0);
         t.close_slave(n);
-        assert_eq!(t.master_read(n, 64).unwrap(), Vec::<u8>::new(), "EOF, not block");
+        assert_eq!(
+            t.master_read(n, 64).unwrap(),
+            Vec::<u8>::new(),
+            "EOF, not block"
+        );
         assert!(t.master_ready(n) & 0x10 != 0, "POLLHUP set");
     }
 }

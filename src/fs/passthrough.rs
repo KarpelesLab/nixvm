@@ -303,7 +303,14 @@ fn to_timespec(t: SetTime) -> Timespec {
 /// for).
 fn raw_utimensat(dirfd: RawFd, name: &CStr, atime: SetTime, mtime: SetTime) -> io::Result<()> {
     let times = [to_timespec(atime), to_timespec(mtime)];
-    let r = unsafe { utimensat(dirfd, name.as_ptr(), times.as_ptr(), sys::AT_SYMLINK_NOFOLLOW) };
+    let r = unsafe {
+        utimensat(
+            dirfd,
+            name.as_ptr(),
+            times.as_ptr(),
+            sys::AT_SYMLINK_NOFOLLOW,
+        )
+    };
     if r < 0 {
         Err(normalize_errno(io::Error::last_os_error()))
     } else {
@@ -501,7 +508,12 @@ fn list_dir_fd(fd: OwnedFd) -> io::Result<Vec<DirEntry>> {
     for name in names {
         let cname = cstr(&name)?;
         // O_NONBLOCK: a FIFO entry must not block this listing's per-entry fstat.
-        let (kind, inode) = match raw_openat(raw, &cname, sys::O_RDONLY | sys::O_NOFOLLOW | sys::O_NONBLOCK, 0) {
+        let (kind, inode) = match raw_openat(
+            raw,
+            &cname,
+            sys::O_RDONLY | sys::O_NOFOLLOW | sys::O_NONBLOCK,
+            0,
+        ) {
             Ok(entry_fd) => match fs::File::from(entry_fd).metadata() {
                 Ok(m) => (kind_of(&m), m.ino()),
                 Err(_) => (NodeKind::File, 0),
@@ -1195,7 +1207,10 @@ mod tests {
         pt.read_at("orig", 0, &mut buf).unwrap();
         assert_eq!(&buf, b"XXXX");
         // Linking onto an existing name fails EEXIST; a missing source ENOENT.
-        assert_eq!(pt.link("orig", "hard").unwrap_err().raw_os_error(), Some(17));
+        assert_eq!(
+            pt.link("orig", "hard").unwrap_err().raw_os_error(),
+            Some(17)
+        );
         assert_eq!(pt.link("nope", "x").unwrap_err().raw_os_error(), Some(2));
     }
 
@@ -1210,7 +1225,11 @@ mod tests {
         // readlinks every path prefix and treats a non-EINVAL error as fatal.
         for p in ["file", "dir", "", "/"] {
             let e = pt.readlink(p).unwrap_err();
-            assert_eq!(e.raw_os_error(), Some(22), "readlink({p:?}) should be EINVAL");
+            assert_eq!(
+                e.raw_os_error(),
+                Some(22),
+                "readlink({p:?}) should be EINVAL"
+            );
         }
     }
 

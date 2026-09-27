@@ -401,7 +401,10 @@ fn fpu_write_f32(mem: &mut GuestMemory, addr: u64, v: F80, mode: Round) -> Resul
     let (bits, flags) = v.to_f32_round(mode);
     mem.write_trap(addr, &bits.to_le_bytes())
         .map(|()| flags)
-        .map_err(|e| Step::Fault { addr: e.fault_addr(), write: true })
+        .map_err(|e| Step::Fault {
+            addr: e.fault_addr(),
+            write: true,
+        })
 }
 
 fn fpu_read_f64(mem: &GuestMemory, addr: u64) -> Result<F80, Step> {
@@ -415,7 +418,10 @@ fn fpu_write_f64(mem: &mut GuestMemory, addr: u64, v: F80, mode: Round) -> Resul
     let (bits, flags) = v.to_f64_round(mode);
     mem.write_trap(addr, &bits.to_le_bytes())
         .map(|()| flags)
-        .map_err(|e| Step::Fault { addr: e.fault_addr(), write: true })
+        .map_err(|e| Step::Fault {
+            addr: e.fault_addr(),
+            write: true,
+        })
 }
 
 fn fpu_read_f80(mem: &GuestMemory, addr: u64) -> Result<F80, Step> {
@@ -1087,8 +1093,8 @@ impl X86Interp {
             let base_val = base.map_or(0, |b| self.gpr[b]);
             let index_val = index.map_or(0, |i| self.gpr[i]);
             let addr = self.mask_addr(
-                (base_val.wrapping_add(index_val.wrapping_mul(scale)) as i64)
-                    .wrapping_add(disp) as u64,
+                (base_val.wrapping_add(index_val.wrapping_mul(scale)) as i64).wrapping_add(disp)
+                    as u64,
             );
             return Ok((
                 ModRm {
@@ -1144,7 +1150,11 @@ impl X86Interp {
     /// truncate to 32 bits under the `0x67` address-size prefix, then add the
     /// segment base (nonzero only under an `fs:` override — TLS access).
     fn mask_addr(&self, addr: u64) -> u64 {
-        let ea = if self.addr32 { addr & 0xffff_ffff } else { addr };
+        let ea = if self.addr32 {
+            addr & 0xffff_ffff
+        } else {
+            addr
+        };
         ea.wrapping_add(self.seg_base)
     }
 
@@ -2852,19 +2862,19 @@ impl X86Interp {
             0x38 => self.exec_0f_38(mem, pc, rex),
             0x3A => self.exec_0f_3a(mem, pc, rex),
             0x50 => self.sse_movmskp(mem, pc, rex, opsize16),
-            0x63 => self.sse_pack(mem, pc, rex, 2, true),  // PACKSSWB
+            0x63 => self.sse_pack(mem, pc, rex, 2, true), // PACKSSWB
             0x67 => self.sse_pack(mem, pc, rex, 2, false), // PACKUSWB
-            0x6B => self.sse_pack(mem, pc, rex, 4, true),  // PACKSSDW
+            0x6B => self.sse_pack(mem, pc, rex, 4, true), // PACKSSDW
             0x60 => self.sse_unpck(mem, pc, rex, 1, false), // PUNPCKLBW
             0x61 => self.sse_unpck(mem, pc, rex, 2, false), // PUNPCKLWD
             0x62 => self.sse_unpck(mem, pc, rex, 4, false), // PUNPCKLDQ
-            0x64 => self.sse_pcmpgt(mem, pc, rex, 1),       // PCMPGTB
-            0x66 => self.sse_pcmpgt(mem, pc, rex, 4),       // PCMPGTD
-            0x68 => self.sse_unpck(mem, pc, rex, 1, true),  // PUNPCKHBW
-            0x69 => self.sse_unpck(mem, pc, rex, 2, true),  // PUNPCKHWD
-            0x6A => self.sse_unpck(mem, pc, rex, 4, true),  // PUNPCKHDQ
+            0x64 => self.sse_pcmpgt(mem, pc, rex, 1),     // PCMPGTB
+            0x66 => self.sse_pcmpgt(mem, pc, rex, 4),     // PCMPGTD
+            0x68 => self.sse_unpck(mem, pc, rex, 1, true), // PUNPCKHBW
+            0x69 => self.sse_unpck(mem, pc, rex, 2, true), // PUNPCKHWD
+            0x6A => self.sse_unpck(mem, pc, rex, 4, true), // PUNPCKHDQ
             0x6C => self.sse_unpck(mem, pc, rex, 8, false), // PUNPCKLQDQ
-            0x6D => self.sse_unpck(mem, pc, rex, 8, true),  // PUNPCKHQDQ
+            0x6D => self.sse_unpck(mem, pc, rex, 8, true), // PUNPCKHQDQ
             0x6E => self.sse_movd_load(mem, pc, rex, gw),
             0x7E if rep == 1 => self.sse_movq_xmm_load(mem, pc, rex),
             0x7E => self.sse_movd_store(mem, pc, rex, gw),
@@ -2878,7 +2888,7 @@ impl X86Interp {
             0x54 | 0xDB => self.sse_bitwise(mem, pc, rex, BitOp::And),
             0x55 | 0xDF => self.sse_bitwise(mem, pc, rex, BitOp::Andn), // ANDNPS/ANDNPD, PANDN
             0x56 | 0xEB => self.sse_bitwise(mem, pc, rex, BitOp::Or),   // ORPS/ORPD, POR
-            0xC2 => self.sse_cmp(mem, pc, rex, opsize16, rep),   // CMPPS/CMPSS/CMPPD/CMPSD
+            0xC2 => self.sse_cmp(mem, pc, rex, opsize16, rep),          // CMPPS/CMPSS/CMPPD/CMPSD
             0x57 | 0xEF => self.sse_bitwise(mem, pc, rex, BitOp::Xor),
             0x58 => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Add),
             0x59 => self.sse_arith(mem, pc, rex, opsize16, rep, SseOp::Mul),
@@ -2941,10 +2951,13 @@ impl X86Interp {
             };
             let v = self.xmm[modrm.reg];
             let half = if high { (v >> 64) as u64 } else { v as u64 };
-            fetch!(mem.write_trap(a, &half.to_le_bytes()).map_err(|e| Step::Fault {
-                addr: e.fault_addr(),
-                write: true
-            }));
+            fetch!(
+                mem.write_trap(a, &half.to_le_bytes())
+                    .map_err(|e| Step::Fault {
+                        addr: e.fault_addr(),
+                        write: true
+                    })
+            );
             return self.next(pc2);
         }
         match rep {
@@ -3207,15 +3220,13 @@ impl X86Interp {
                 let bits = fetch!(self.xmm_read_lo(mem, rm_op, 64));
                 let (f, flags) = softfloat::f64_to_f32(bits, self.sse_round());
                 self.mxcsr |= flags & 0x3f;
-                self.xmm[modrm.reg] =
-                    (self.xmm[modrm.reg] & !u128::from(u32::MAX)) | u128::from(f);
+                self.xmm[modrm.reg] = (self.xmm[modrm.reg] & !u128::from(u32::MAX)) | u128::from(f);
             }
             1 => {
                 // CVTSS2SD: widen (exact, never rounds).
                 let bits = fetch!(self.xmm_read_lo(mem, rm_op, 32));
                 let f = softfloat::f32_to_f64(bits as u32);
-                self.xmm[modrm.reg] =
-                    (self.xmm[modrm.reg] & !u128::from(u64::MAX)) | u128::from(f);
+                self.xmm[modrm.reg] = (self.xmm[modrm.reg] & !u128::from(u64::MAX)) | u128::from(f);
             }
             _ => return Step::Illegal, // CVTPS2PD/CVTPD2PS (packed): not in our documented subset
         }
@@ -3286,16 +3297,28 @@ impl X86Interp {
         let apply_f64 = |dst: u128, src: u128, lanes: usize| -> (u128, u32) {
             match op {
                 SseOp::Sqrt => f64_lanes_sqrt(dst, src, lanes, mode),
-                SseOp::Min => (f64_lane_binop(dst, src, lanes, |a, b| if a < b { a } else { b }), 0),
-                SseOp::Max => (f64_lane_binop(dst, src, lanes, |a, b| if a > b { a } else { b }), 0),
+                SseOp::Min => (
+                    f64_lane_binop(dst, src, lanes, |a, b| if a < b { a } else { b }),
+                    0,
+                ),
+                SseOp::Max => (
+                    f64_lane_binop(dst, src, lanes, |a, b| if a > b { a } else { b }),
+                    0,
+                ),
                 other => f64_lanes_op(dst, src, lanes, arith_op(other).unwrap(), mode),
             }
         };
         let apply_f32 = |dst: u128, src: u128, lanes: usize| -> (u128, u32) {
             match op {
                 SseOp::Sqrt => f32_lanes_sqrt(dst, src, lanes, mode),
-                SseOp::Min => (f32_lane_binop(dst, src, lanes, |a, b| if a < b { a } else { b }), 0),
-                SseOp::Max => (f32_lane_binop(dst, src, lanes, |a, b| if a > b { a } else { b }), 0),
+                SseOp::Min => (
+                    f32_lane_binop(dst, src, lanes, |a, b| if a < b { a } else { b }),
+                    0,
+                ),
+                SseOp::Max => (
+                    f32_lane_binop(dst, src, lanes, |a, b| if a > b { a } else { b }),
+                    0,
+                ),
                 other => f32_lanes_op(dst, src, lanes, arith_op(other).unwrap(), mode),
             }
         };
@@ -3578,9 +3601,9 @@ impl X86Interp {
         let dst = fetch!(self.xmm_read128(mem, rm_op));
         let count = u32::from(imm);
         let result = match (lane_bytes, modrm.reg) {
-            (2, 2) => pack_shift_right(dst, 16, count), // PSRLW
+            (2, 2) => pack_shift_right(dst, 16, count),       // PSRLW
             (2, 4) => pack_shift_arith_right(dst, 16, count), // PSRAW
-            (2, 6) => pack_shift_left(dst, 16, count), // PSLLW
+            (2, 6) => pack_shift_left(dst, 16, count),        // PSLLW
             (4, 2) => pack_shift_right(dst, 32, count),
             (4, 4) => pack_shift_arith_right(dst, 32, count), // PSRAD
             (4, 6) => pack_shift_left(dst, 32, count),
@@ -4018,12 +4041,12 @@ impl X86Interp {
                         // f64-rounded values), so FLDPI et al. match hardware.
                         let Some(c) = (match rm {
                             0 => Some(0x3fff_8000_0000_0000_0000_u128), // FLD1
-                            1 => Some(0x4000_d49a_784b_cd1b_8afe), // FLDL2T  log2(10)
-                            2 => Some(0x3fff_b8aa_3b29_5c17_f0bc), // FLDL2E  log2(e)
-                            3 => Some(0x4000_c90f_daa2_2168_c235), // FLDPI   π
-                            4 => Some(0x3ffd_9a20_9a84_fbcf_f799), // FLDLG2  log10(2)
-                            5 => Some(0x3ffe_b172_17f7_d1cf_79ac), // FLDLN2  ln(2)
-                            6 => Some(0u128),                      // FLDZ    +0.0
+                            1 => Some(0x4000_d49a_784b_cd1b_8afe),      // FLDL2T  log2(10)
+                            2 => Some(0x3fff_b8aa_3b29_5c17_f0bc),      // FLDL2E  log2(e)
+                            3 => Some(0x4000_c90f_daa2_2168_c235),      // FLDPI   π
+                            4 => Some(0x3ffd_9a20_9a84_fbcf_f799),      // FLDLG2  log10(2)
+                            5 => Some(0x3ffe_b172_17f7_d1cf_79ac),      // FLDLN2  ln(2)
+                            6 => Some(0u128),                           // FLDZ    +0.0
                             _ => None,
                         }) else {
                             return Step::Illegal;
@@ -4481,7 +4504,10 @@ impl X86Interp {
         // than running whatever bytes are there — matching real hardware and
         // keeping the sandbox from executing injected data.
         if !mem.can_exec(self.rip) {
-            return Step::Fault { addr: self.rip, write: false };
+            return Step::Fault {
+                addr: self.rip,
+                write: false,
+            };
         }
         let mut pc = self.rip;
         let mut opsize16 = false;
@@ -4939,7 +4965,6 @@ impl Vcpu for X86Interp {
         self.fs_base = 0;
         self.fpu_init();
     }
-
 }
 
 #[cfg(test)]
@@ -4978,14 +5003,22 @@ mod tests {
         // A page mapped RW (no EXEC) holds a valid `nop`; executing from it must
         // fault at rip rather than run the byte — NX enforcement.
         let mut m = GuestMemory::new(0x1_0000, 16 * crate::vcpu::mem::PAGE_SIZE);
-        m.map(0x1_0000, crate::vcpu::mem::PAGE_SIZE, Prot::rw()).unwrap(); // data page
-        m.map(0x1_1000, crate::vcpu::mem::PAGE_SIZE, Prot::rx()).unwrap(); // code page
+        m.map(0x1_0000, crate::vcpu::mem::PAGE_SIZE, Prot::rw())
+            .unwrap(); // data page
+        m.map(0x1_1000, crate::vcpu::mem::PAGE_SIZE, Prot::rx())
+            .unwrap(); // code page
         m.write_init(0x1_0000, &[0x90]).unwrap(); // nop on the data page
         m.write_init(0x1_1000, &[0x90]).unwrap(); // nop on the code page
 
         // Executing the data page faults at its address.
         let mut cpu = X86Interp::new(0x1_0000, STACK);
-        assert!(matches!(cpu.exec(&mut m), Step::Fault { addr: 0x1_0000, write: false }));
+        assert!(matches!(
+            cpu.exec(&mut m),
+            Step::Fault {
+                addr: 0x1_0000,
+                write: false
+            }
+        ));
         // Executing the code page runs the nop.
         let mut cpu = X86Interp::new(0x1_1000, STACK);
         assert!(matches!(cpu.exec(&mut m), Step::Next));
@@ -6448,7 +6481,11 @@ mod tests {
         )
         .0;
         assert_eq!(got, want, "divsd rounded per MXCSR");
-        assert_eq!(got, (1.0f64 / 10.0).to_bits() - 1, "one ulp below round-to-nearest");
+        assert_eq!(
+            got,
+            (1.0f64 / 10.0).to_bits() - 1,
+            "one ulp below round-to-nearest"
+        );
         assert!(cpu.mxcsr & 0x20 != 0, "PE (inexact) flag accumulated");
     }
 
@@ -6518,7 +6555,11 @@ mod tests {
         cpu.exec(&mut m);
         assert_eq!(cpu.st_get(0).to_f64(), 1.0);
         cpu.exec(&mut m);
-        assert_eq!(cpu.st_get(0).to_f64(), 0.0, "FLDZ pushes 0.0 as the new ST(0)");
+        assert_eq!(
+            cpu.st_get(0).to_f64(),
+            0.0,
+            "FLDZ pushes 0.0 as the new ST(0)"
+        );
         assert_eq!(cpu.st_get(1).to_f64(), 1.0, "FLD1's value is still ST(1)");
     }
 
@@ -6579,10 +6620,17 @@ mod tests {
         cpu.fpu_push(F80::from_f64_val(5.3)); // ST(0) dividend
         m.write_init(CODE, &[0xD9, 0xF8]).unwrap(); // FPREM
         cpu.exec(&mut m);
-        assert!((cpu.st_get(0).to_f64() - (5.3f64 % 2.0)).abs() < 1e-12, "{}", cpu.st_get(0).to_f64());
+        assert!(
+            (cpu.st_get(0).to_f64() - (5.3f64 % 2.0)).abs() < 1e-12,
+            "{}",
+            cpu.st_get(0).to_f64()
+        );
         assert!(!cpu.fpu_c2, "single-step reduction is always complete");
         // trunc(5.3/2.0) = 2 = 0b010 → Q0=0 (C1), Q1=1 (C3), Q2=0 (C0).
-        assert!(!cpu.fpu_c1 && cpu.fpu_c3 && !cpu.fpu_c0, "quotient bits in C1/C3/C0");
+        assert!(
+            !cpu.fpu_c1 && cpu.fpu_c3 && !cpu.fpu_c0,
+            "quotient bits in C1/C3/C0"
+        );
     }
 
     #[test]
@@ -6594,7 +6642,11 @@ mod tests {
         m.write_init(CODE, &[0xD9, 0xF5]).unwrap(); // FPREM1
         cpu.exec(&mut m);
         // IEEE remainder: 5.3 - 2.0*round(2.65) = 5.3 - 6.0 = -0.7.
-        assert!((cpu.st_get(0).to_f64() + 0.7).abs() < 1e-12, "{}", cpu.st_get(0).to_f64());
+        assert!(
+            (cpu.st_get(0).to_f64() + 0.7).abs() < 1e-12,
+            "{}",
+            cpu.st_get(0).to_f64()
+        );
         assert!(!cpu.fpu_c2);
     }
 
@@ -6703,7 +6755,9 @@ mod tests {
         let mut m = mem();
         let cpu = run_one(
             &mut m,
-            &[0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+            &[
+                0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ],
         );
         assert_eq!(cpu.rip, CODE + 11);
     }
@@ -6726,13 +6780,13 @@ mod tests {
         // The override is transient: the next instruction is fs-free.
         m.write_init(0x1_2000, &42u64.to_le_bytes()).unwrap();
         // mov rbx, [0x12000]
-        m.write_init(
-            CODE + 9,
-            &[0x48, 0x8B, 0x1C, 0x25, 0x00, 0x20, 0x01, 0x00],
-        )
-        .unwrap();
+        m.write_init(CODE + 9, &[0x48, 0x8B, 0x1C, 0x25, 0x00, 0x20, 0x01, 0x00])
+            .unwrap();
         cpu.exec(&mut m);
-        assert_eq!(cpu.gpr[RBX], 42, "seg base must not leak across instructions");
+        assert_eq!(
+            cpu.gpr[RBX], 42,
+            "seg base must not leak across instructions"
+        );
     }
 
     #[test]
@@ -6746,7 +6800,8 @@ mod tests {
         assert!(cpu.flags.zf);
         assert_eq!(cpu.gpr[RAX], 0x3d);
         // add eax, 0x100 — writes back, zero-extending to 64 bits.
-        m.write_init(CODE + 2, &[0x05, 0x00, 0x01, 0x00, 0x00]).unwrap();
+        m.write_init(CODE + 2, &[0x05, 0x00, 0x01, 0x00, 0x00])
+            .unwrap();
         cpu.exec(&mut m);
         assert_eq!(cpu.gpr[RAX], 0x13d);
         // test al, 0x80 — flags only.
@@ -6773,7 +6828,10 @@ mod tests {
         cpu.gpr[RSI] = 0x8000_0000_0000_0002;
         m.write_init(CODE + 8, &[0x48, 0xD1, 0xFE]).unwrap();
         cpu.exec(&mut m);
-        assert_eq!(cpu.gpr[RSI], 0xC000_0000_0000_0001, "arithmetic: sign fills");
+        assert_eq!(
+            cpu.gpr[RSI], 0xC000_0000_0000_0001,
+            "arithmetic: sign fills"
+        );
     }
 
     #[test]
@@ -6884,8 +6942,7 @@ mod tests {
         m.write_init(CODE + 16, &[0x0F, 0x12, 0xC8]).unwrap();
         cpu.exec(&mut m);
         assert_eq!(
-            cpu.xmm[1],
-            0xFFFF_FFFF_FFFF_FFFF_1111_2222_3333_4444,
+            cpu.xmm[1], 0xFFFF_FFFF_FFFF_FFFF_1111_2222_3333_4444,
             "low half replaced, high preserved"
         );
     }
@@ -6900,7 +6957,8 @@ mod tests {
         let data = 0x1_2000u64;
         cpu.gpr[RBP] = data;
         // mov word [rbp+0], 0x1234  (66 C7 45 00 34 12) — exactly 6 bytes.
-        m.write_init(CODE, &[0x66, 0xC7, 0x45, 0x00, 0x34, 0x12]).unwrap();
+        m.write_init(CODE, &[0x66, 0xC7, 0x45, 0x00, 0x34, 0x12])
+            .unwrap();
         cpu.exec(&mut m);
         assert_eq!(cpu.rip, CODE + 6, "imm16 form is 6 bytes, not 8");
         assert_eq!(m.read_vec(data, 2).unwrap(), vec![0x34, 0x12]);
@@ -6994,7 +7052,10 @@ mod tests {
         m.write_init(CODE, &[0x66, 0x0F, 0x71, 0xD0, 0x04]).unwrap();
         cpu.exec(&mut m);
         // each 16-bit lane >> 4, zero-filled.
-        assert_eq!(cpu.xmm[0], 0x0800_0001_0000_0fff_u128 << 64 | 0x0fff_0008_0001_0800);
+        assert_eq!(
+            cpu.xmm[0],
+            0x0800_0001_0000_0fff_u128 << 64 | 0x0fff_0008_0001_0800
+        );
         // psraw xmm0, 4  (66 0F 71 E0 04): arithmetic — 0x8000 → 0xF800.
         cpu.xmm[0] = 0x8000;
         cpu.rip = CODE;
@@ -7035,7 +7096,8 @@ mod tests {
         cpu.xmm[0] = 0x03; // dst byte 0 = 3
         cpu.xmm[1] = 0x01; // src byte 0 = 1
         // palignr xmm0, xmm1, 15  (66 0F 3A 0F C1 0F): result[1] = dst[0].
-        m.write_init(CODE, &[0x66, 0x0F, 0x3A, 0x0F, 0xC1, 0x0F]).unwrap();
+        m.write_init(CODE, &[0x66, 0x0F, 0x3A, 0x0F, 0xC1, 0x0F])
+            .unwrap();
         cpu.exec(&mut m);
         assert_eq!(cpu.xmm[0], 0x0300);
     }
@@ -7139,7 +7201,10 @@ mod tests {
         // It ran until (roughly) the quantum, not instantly and not for the
         // whole MAX_STEPS budget: the upper bound is far below the time tens of
         // millions of interpreted `jmp`s take, so a broken quantum fails here.
-        assert!(elapsed >= quantum, "slice lasted at least the quantum: {elapsed:?}");
+        assert!(
+            elapsed >= quantum,
+            "slice lasted at least the quantum: {elapsed:?}"
+        );
         assert!(
             elapsed < quantum * 15,
             "slice ended near the quantum, not at MAX_STEPS: {elapsed:?}"

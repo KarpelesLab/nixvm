@@ -84,11 +84,23 @@ pub struct Fmt {
     pub emin: i32,
 }
 
-pub const FMT32: Fmt = Fmt { prec: 24, emax: 127, emin: -126 };
-pub const FMT64: Fmt = Fmt { prec: 53, emax: 1023, emin: -1022 };
+pub const FMT32: Fmt = Fmt {
+    prec: 24,
+    emax: 127,
+    emin: -126,
+};
+pub const FMT64: Fmt = Fmt {
+    prec: 53,
+    emax: 1023,
+    emin: -1022,
+};
 /// x87 80-bit extended: 64-bit significand with an *explicit* integer bit,
 /// 15-bit exponent (bias 16383).
-pub const FMT80: Fmt = Fmt { prec: 64, emax: 16383, emin: -16382 };
+pub const FMT80: Fmt = Fmt {
+    prec: 64,
+    emax: 16383,
+    emin: -16382,
+};
 
 /// The category of a value, kept separate so arithmetic can branch on it
 /// without decoding bit patterns repeatedly.
@@ -115,16 +127,31 @@ struct Unpacked {
 
 impl Unpacked {
     const fn zero(sign: bool) -> Self {
-        Self { sign, class: Class::Zero, sig: 0, exp: 0 }
+        Self {
+            sign,
+            class: Class::Zero,
+            sig: 0,
+            exp: 0,
+        }
     }
     const fn inf(sign: bool) -> Self {
-        Self { sign, class: Class::Inf, sig: 0, exp: 0 }
+        Self {
+            sign,
+            class: Class::Inf,
+            sig: 0,
+            exp: 0,
+        }
     }
     /// A quiet NaN carrying `payload` (the source mantissa, quiet bit optional —
     /// callers set it). The canonical x86 QNaN ("real indefinite") has just the
     /// quiet bit set, which callers request with `payload == 0` after quieting.
     const fn nan(sign: bool, payload: u128) -> Self {
-        Self { sign, class: Class::Nan, sig: payload, exp: 0 }
+        Self {
+            sign,
+            class: Class::Nan,
+            sig: payload,
+            exp: 0,
+        }
     }
 }
 
@@ -145,7 +172,12 @@ fn unpack_f32(bits: u32) -> Unpacked {
         0xff => Unpacked::nan(sign, mant),
         0 if mant == 0 => Unpacked::zero(sign),
         // Subnormal: value = mant · 2^(1-127-23).
-        0 => Unpacked { sign, class: Class::Finite, sig: mant, exp: -149 },
+        0 => Unpacked {
+            sign,
+            class: Class::Finite,
+            sig: mant,
+            exp: -149,
+        },
         // Normal: value = (2^23 | mant) · 2^(exp-127-23).
         _ => Unpacked {
             sign,
@@ -164,7 +196,12 @@ fn unpack_f64(bits: u64) -> Unpacked {
         0x7ff if mant == 0 => Unpacked::inf(sign),
         0x7ff => Unpacked::nan(sign, mant),
         0 if mant == 0 => Unpacked::zero(sign),
-        0 => Unpacked { sign, class: Class::Finite, sig: mant, exp: -1074 },
+        0 => Unpacked {
+            sign,
+            class: Class::Finite,
+            sig: mant,
+            exp: -1074,
+        },
         _ => Unpacked {
             sign,
             class: Class::Finite,
@@ -189,7 +226,12 @@ fn unpack_f80(bits: u128) -> Unpacked {
         0 if sig == 0 => Unpacked::zero(sign),
         // Both normals (integer bit set) and subnormals (clear) reduce to the
         // same exact value = sig · 2^(exp - 16383 - 63).
-        _ => Unpacked { sign, class: Class::Finite, sig, exp: exp as i32 - 16446 },
+        _ => Unpacked {
+            sign,
+            class: Class::Finite,
+            sig,
+            exp: exp as i32 - 16446,
+        },
     }
 }
 
@@ -340,7 +382,11 @@ fn round(
     // Subnormal that rounded up exactly to the smallest normal is fine: it now
     // has prec bits and its computed leading-bit exponent equals emin.
 
-    let final_e = if q == 0 { fmt.emin } else { result_ulp + msb(q) as i32 };
+    let final_e = if q == 0 {
+        fmt.emin
+    } else {
+        result_ulp + msb(q) as i32
+    };
 
     // Overflow: past the largest representable exponent.
     if final_e > fmt.emax {
@@ -357,7 +403,12 @@ fn round(
         // Largest finite: significand all ones at emax.
         let maxsig = (1u128 << fmt.prec) - 1;
         return (
-            Unpacked { sign, class: Class::Finite, sig: maxsig, exp: fmt.emax - (fmt.prec as i32 - 1) },
+            Unpacked {
+                sign,
+                class: Class::Finite,
+                sig: maxsig,
+                exp: fmt.emax - (fmt.prec as i32 - 1),
+            },
             flags,
         );
     }
@@ -371,7 +422,15 @@ fn round(
     if q == 0 {
         return (Unpacked::zero(sign), flags);
     }
-    (Unpacked { sign, class: Class::Finite, sig: q, exp: result_ulp }, flags)
+    (
+        Unpacked {
+            sign,
+            class: Class::Finite,
+            sig: q,
+            exp: result_ulp,
+        },
+        flags,
+    )
 }
 
 // ---- NaN handling ----------------------------------------------------------
@@ -426,7 +485,11 @@ fn add_unpacked(a: Unpacked, b: Unpacked, fmt: Fmt, mode: Round) -> (Unpacked, u
         (_, Inf) => (Unpacked::inf(b.sign), 0),
         (Zero, Zero) => {
             // −0 + −0 = −0; every other zero-sum is +0 except toward −∞.
-            let sign = if a.sign == b.sign { a.sign } else { mode == Round::Down };
+            let sign = if a.sign == b.sign {
+                a.sign
+            } else {
+                mode == Round::Down
+            };
             (Unpacked::zero(sign), 0)
         }
         (Zero, _) => (b, dflag),
@@ -552,7 +615,14 @@ fn div_unpacked(a: Unpacked, b: Unpacked, fmt: Fmt, mode: Round) -> (Unpacked, u
             let sticky = rem != 0;
             // Each step doubles q once and shifts rem once, so q carries an
             // extra factor of two: value = q · 2^(a_exp - b_exp - (nbits-1)).
-            let (r, f) = round(sign, q, a_exp - b_exp - (nbits as i32 - 1), sticky, fmt, mode);
+            let (r, f) = round(
+                sign,
+                q,
+                a_exp - b_exp - (nbits as i32 - 1),
+                sticky,
+                fmt,
+                mode,
+            );
             (r, f | dflag)
         }
     }
@@ -586,7 +656,7 @@ fn sqrt_unpacked(a: Unpacked, fmt: Fmt, mode: Round) -> (Unpacked, u32) {
     use Class::{Finite, Inf, Nan, Zero};
     match a.class {
         Nan => propagate_nan(&a, None, fmt),
-        Zero => (a, 0), // √±0 = ±0
+        Zero => (a, 0),                 // √±0 = ±0
         Inf if a.sign => default_nan(), // √−∞
         Inf => (a, 0),
         Finite if a.sign => default_nan(), // √(negative)
@@ -631,9 +701,7 @@ fn sqrt_unpacked(a: Unpacked, fmt: Fmt, mode: Round) -> (Unpacked, u32) {
             let (mut res, mut flags) = round(false, qr, exp / 2, false, fmt, Round::Nearest);
             if inexact {
                 flags |= INEXACT;
-                if res.class == Class::Finite
-                    && res.exp + (msb(res.sig) as i32) < fmt.emin
-                {
+                if res.class == Class::Finite && res.exp + (msb(res.sig) as i32) < fmt.emin {
                     flags |= UNDERFLOW;
                 }
             }
@@ -654,7 +722,12 @@ pub struct F80(pub u128);
 
 impl core::fmt::Debug for F80 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "F80({:#022x}={})", self.0 & 0xffff_ffff_ffff_ffff_ffff, self.to_f64())
+        write!(
+            f,
+            "F80({:#022x}={})",
+            self.0 & 0xffff_ffff_ffff_ffff_ffff,
+            self.to_f64()
+        )
     }
 }
 
@@ -730,7 +803,12 @@ impl F80 {
     }
 
     pub fn add(self, o: F80, mode: Round) -> (F80, u32) {
-        pack_res(add_unpacked(unpack_f80(self.0), unpack_f80(o.0), FMT80, mode))
+        pack_res(add_unpacked(
+            unpack_f80(self.0),
+            unpack_f80(o.0),
+            FMT80,
+            mode,
+        ))
     }
     pub fn sub(self, o: F80, mode: Round) -> (F80, u32) {
         let mut b = unpack_f80(o.0);
@@ -738,10 +816,20 @@ impl F80 {
         pack_res(add_unpacked(unpack_f80(self.0), b, FMT80, mode))
     }
     pub fn mul(self, o: F80, mode: Round) -> (F80, u32) {
-        pack_res(mul_unpacked(unpack_f80(self.0), unpack_f80(o.0), FMT80, mode))
+        pack_res(mul_unpacked(
+            unpack_f80(self.0),
+            unpack_f80(o.0),
+            FMT80,
+            mode,
+        ))
     }
     pub fn div(self, o: F80, mode: Round) -> (F80, u32) {
-        pack_res(div_unpacked(unpack_f80(self.0), unpack_f80(o.0), FMT80, mode))
+        pack_res(div_unpacked(
+            unpack_f80(self.0),
+            unpack_f80(o.0),
+            FMT80,
+            mode,
+        ))
     }
     pub fn sqrt(self, mode: Round) -> (F80, u32) {
         pack_res(sqrt_unpacked(unpack_f80(self.0), FMT80, mode))
@@ -767,7 +855,11 @@ impl F80 {
     pub fn remainder(self, y: F80, nearest: bool) -> (F80, u64) {
         let a = self.to_f64();
         let b = y.to_f64();
-        let q = if nearest { (a / b).round_ties_even() } else { (a / b).trunc() };
+        let q = if nearest {
+            (a / b).round_ties_even()
+        } else {
+            (a / b).trunc()
+        };
         // Compute the remainder at 80-bit precision: x - y·q.
         let (yq, _) = y.mul(F80::from_f64_val(q), Round::Nearest);
         let (r, _) = self.sub(yq, Round::Nearest);
@@ -813,7 +905,10 @@ fn round_to_int_mag(sign: bool, sig: u128, exp: i32, mode: Round) -> (u128, bool
     let shift = (-exp) as u32;
     if shift >= 128 {
         let sticky = sig != 0;
-        return (u128::from(round_decision(false, false, sticky, sign, mode)), sticky);
+        return (
+            u128::from(round_decision(false, false, sticky, sign, mode)),
+            sticky,
+        );
     }
     let q = sig >> shift;
     let round_bit = (sig >> (shift - 1)) & 1 != 0;
@@ -846,7 +941,11 @@ fn compare(a: Unpacked, b: Unpacked) -> Option<core::cmp::Ordering> {
     }
     let (as_, bs_) = (val_sign(&a), val_sign(&b));
     if as_ != bs_ {
-        return Some(if as_ { Ordering::Less } else { Ordering::Greater });
+        return Some(if as_ {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
     }
     // Same sign (or both non-negative). Compare magnitudes, then apply sign.
     let mag = magnitude_cmp(&a, &b);

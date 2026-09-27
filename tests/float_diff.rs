@@ -44,8 +44,10 @@ fn run(backend: &dyn Backend, code: &[u8], mxcsr: u32, a: f64, b: f64) -> Vec<u8
     mem.map(BASE, 512 * PAGE_SIZE, Prot::rwx()).unwrap();
     mem.write_init(BASE, code).unwrap();
     mem.write_init(DATA, &mxcsr.to_le_bytes()).unwrap();
-    mem.write_init(DATA + 8, &a.to_bits().to_le_bytes()).unwrap();
-    mem.write_init(DATA + 16, &b.to_bits().to_le_bytes()).unwrap();
+    mem.write_init(DATA + 8, &a.to_bits().to_le_bytes())
+        .unwrap();
+    mem.write_init(DATA + 16, &b.to_bits().to_le_bytes())
+        .unwrap();
 
     let mut vcpu = backend.new_vcpu(BASE, BASE + 400 * PAGE_SIZE).unwrap();
     // The snippet ends in an exit `syscall`; run until it traps out.
@@ -74,10 +76,10 @@ fn sse_and_x87_match_hardware_across_rounding_modes() {
         (1.0, 3.0),
         (2.0, 7.0),
         (10.0, 3.0),
-        (1.0, 0.0),          // divide by zero -> inf + ZE flag
-        (2.0, 1.0),          // √2 inexact
+        (1.0, 0.0), // divide by zero -> inf + ZE flag
+        (2.0, 1.0), // √2 inexact
         (1e300, 7.0),
-        (5e-324, 3.0),       // smallest subnormal
+        (5e-324, 3.0), // smallest subnormal
         (-1.0, 3.0),
     ];
     // MXCSR values selecting each rounding mode (exceptions masked, bits set).

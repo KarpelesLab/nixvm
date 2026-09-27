@@ -378,7 +378,8 @@ impl FrameAllocator {
             self.refcount[f] = PINNED;
         }
         // A pinned frame must not sit in the free list.
-        self.free_list.retain(|&f| self.refcount[f as usize] != PINNED);
+        self.free_list
+            .retain(|&f| self.refcount[f as usize] != PINNED);
     }
 
     /// Number of live (allocated, non-pinned) frames.
@@ -482,7 +483,10 @@ mod tests {
         assert_ne!(a, b, "distinct frames");
         assert_ne!(a, 0, "frame 0 never handed out");
         assert_ne!(b, 0);
-        assert!(a.is_multiple_of(FRAME) && b.is_multiple_of(FRAME), "frame-aligned");
+        assert!(
+            a.is_multiple_of(FRAME) && b.is_multiple_of(FRAME),
+            "frame-aligned"
+        );
         assert_eq!(phys.read_u64(a), 0, "handed-out frame is zeroed");
         assert_eq!(phys.read_u64(b), 0);
         assert_eq!(alloc.refcount(a), 1);

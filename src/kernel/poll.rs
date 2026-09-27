@@ -144,8 +144,12 @@ impl PollFds {
     /// counter word when it is signalled (its `read` returns 8 bytes), else 0.
     pub(super) fn readable_bytes(&self, fd: &super::Fd) -> u64 {
         match fd {
-            super::Fd::Eventfd(i) => u64::from(self.eventfds.get(*i).is_some_and(|e| e.count > 0)) * 8,
-            super::Fd::Timerfd(i) => u64::from(self.timerfds.get(*i).is_some_and(|t| t.expirations > 0)) * 8,
+            super::Fd::Eventfd(i) => {
+                u64::from(self.eventfds.get(*i).is_some_and(|e| e.count > 0)) * 8
+            }
+            super::Fd::Timerfd(i) => {
+                u64::from(self.timerfds.get(*i).is_some_and(|t| t.expirations > 0)) * 8
+            }
             // signalfd readability depends on the process's pending mask, not
             // available here — poll (`fd_ready`, which has `cx`) is the real path.
             _ => 0,
@@ -275,7 +279,14 @@ impl Kernel {
     /// once around the whole scan — always *after* `sh` (strict order
     /// sh → net → pipes → pollfds) — and pass all three in. `pf` is the
     /// innermost lock, so nothing is acquired below it here.
-    fn fd_ready(&self, net: &mut Net, pipes: &[Pipe], pf: &mut PollFds, cx: &mut ServiceCtx, fd_num: i32) -> u32 {
+    fn fd_ready(
+        &self,
+        net: &mut Net,
+        pipes: &[Pipe],
+        pf: &mut PollFds,
+        cx: &mut ServiceCtx,
+        fd_num: i32,
+    ) -> u32 {
         let Some(fd) = cx.cur.fds.get(fd_num).cloned() else {
             return POLLNVAL;
         };
@@ -401,7 +412,8 @@ impl Kernel {
 
     /// `poll(fds, nfds, timeout_ms)`.
     pub(super) fn sys_poll(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         fds_ptr: u64,
         nfds: u64,
         timeout_ms: i64,
@@ -432,7 +444,8 @@ impl Kernel {
             let revents = if fd < 0 {
                 0
             } else {
-                self.fd_ready(&mut net, &pipes, &mut pf, cx, fd) & (u32::from(events) | POLLERR | POLLHUP | POLLNVAL)
+                self.fd_ready(&mut net, &pipes, &mut pf, cx, fd)
+                    & (u32::from(events) | POLLERR | POLLHUP | POLLNVAL)
             };
             if !write_u16(mem, addr + 6, revents as u16) {
                 return err(Errno::EFAULT);
@@ -453,7 +466,8 @@ impl Kernel {
     /// installed for the duration of the wait (see [`install_poll_sigmask`]).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_ppoll(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         fds_ptr: u64,
         nfds: u64,
         timeout_ts: u64,
@@ -480,7 +494,8 @@ impl Kernel {
     /// count set across all three sets. `immediate` is the zero-timeout case.
     #[allow(clippy::too_many_arguments)]
     fn sys_select_core(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         nfds: u64,
         r: u64,
         w: u64,
@@ -548,7 +563,8 @@ impl Kernel {
     /// dereferenced to reach the mask, then installed for the wait.
     #[allow(clippy::too_many_arguments)] // one parameter per syscall argument
     pub(super) fn sys_pselect6(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         nfds: u64,
         r: u64,
         w: u64,
@@ -578,7 +594,8 @@ impl Kernel {
     /// (x86-64 only); `timeout` is a `struct timeval { i64 sec; i64 usec; }`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_select(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         nfds: u64,
         r: u64,
         w: u64,
@@ -626,7 +643,12 @@ impl Kernel {
 
     /// `epoll_create`/`epoll_create1(flags)` — a fresh, empty interest set.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_epoll_create1(&self, pf: &mut PollFds, cx: &mut ServiceCtx, flags: u64) -> i64 {
+    pub(super) fn sys_epoll_create1(
+        &self,
+        pf: &mut PollFds,
+        cx: &mut ServiceCtx,
+        flags: u64,
+    ) -> i64 {
         let idx = pf.epolls.len();
         pf.epolls.push(EpollInst::default());
         let fd = cx.cur.fds.alloc(Fd::Epoll(idx));
@@ -637,7 +659,9 @@ impl Kernel {
     /// `epoll_ctl(epfd, op, fd, event)`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_epoll_ctl(
-        &self, pf: &mut PollFds, cx: &mut ServiceCtx,
+        &self,
+        pf: &mut PollFds,
+        cx: &mut ServiceCtx,
         epfd: u64,
         op: u64,
         fd: u64,
@@ -663,9 +687,15 @@ impl Kernel {
                 let Some((events, data)) = self.read_epoll_event(mem, event_ptr) else {
                     return err(Errno::EFAULT);
                 };
-                pf.epolls[idx]
-                    .interest
-                    .insert(target, EpollWatch { events, data, last_level: 0, disarmed: false });
+                pf.epolls[idx].interest.insert(
+                    target,
+                    EpollWatch {
+                        events,
+                        data,
+                        last_level: 0,
+                        disarmed: false,
+                    },
+                );
                 0
             }
             EPOLL_CTL_MOD => {
@@ -675,9 +705,15 @@ impl Kernel {
                 let Some((events, data)) = self.read_epoll_event(mem, event_ptr) else {
                     return err(Errno::EFAULT);
                 };
-                pf.epolls[idx]
-                    .interest
-                    .insert(target, EpollWatch { events, data, last_level: 0, disarmed: false });
+                pf.epolls[idx].interest.insert(
+                    target,
+                    EpollWatch {
+                        events,
+                        data,
+                        last_level: 0,
+                        disarmed: false,
+                    },
+                );
                 0
             }
             EPOLL_CTL_DEL => {
@@ -694,7 +730,8 @@ impl Kernel {
     /// The `epoll_pwait` sigmask argument is accepted but not honored.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_epoll_wait(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         epfd: u64,
         events_ptr: u64,
         maxevents: u64,
@@ -732,7 +769,8 @@ impl Kernel {
         // edge-trigger bookkeeping below.
         let mut computed: Vec<(i32, EpollWatch, u32, u64)> = Vec::with_capacity(watches.len());
         for (fd, w) in watches {
-            let ready = self.fd_ready(&mut net, &pipes, &mut pf, cx, fd) & (w.events | POLLERR | POLLHUP);
+            let ready =
+                self.fd_ready(&mut net, &pipes, &mut pf, cx, fd) & (w.events | POLLERR | POLLHUP);
             // Edge level: a counter fd's count (so a fresh post is a new edge even
             // when it stays signalled); the readiness mask for everything else.
             let level = match cx.cur.fds.get(fd) {
@@ -787,7 +825,8 @@ impl Kernel {
     /// like `epoll_pwait` but the timeout is a `struct timespec*`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_epoll_pwait2(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         epfd: u64,
         events_ptr: u64,
         maxevents: u64,
@@ -812,7 +851,15 @@ impl Kernel {
     /// signals in `mask`. The caller is expected to block those signals so they
     /// stay pending (rather than reaching a handler) for the fd to read.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_signalfd4(&self, pf: &mut PollFds, cx: &mut ServiceCtx, fd: i64, mask_ptr: u64, flags: u64, mem: &GuestMemory) -> i64 {
+    pub(super) fn sys_signalfd4(
+        &self,
+        pf: &mut PollFds,
+        cx: &mut ServiceCtx,
+        fd: i64,
+        mask_ptr: u64,
+        flags: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
         const SFD_NONBLOCK: u64 = 0o4000;
         let Ok(mask) = mem.read_u64(mask_ptr) else {
             return err(Errno::EFAULT);
@@ -839,7 +886,15 @@ impl Kernel {
     /// mask, one `struct signalfd_siginfo` (128 bytes) each, and clear their
     /// pending bits. Blocks (or `EAGAIN`) when none are pending.
     #[allow(clippy::unused_self)]
-    pub(super) fn read_signalfd(&self, pf: &mut PollFds, cx: &mut ServiceCtx, i: usize, buf: u64, count: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn read_signalfd(
+        &self,
+        pf: &mut PollFds,
+        cx: &mut ServiceCtx,
+        i: usize,
+        buf: u64,
+        count: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         if count < 128 {
             return err(Errno::EINVAL);
         }
@@ -874,7 +929,13 @@ impl Kernel {
 
     /// `eventfd`/`eventfd2(initval, flags)`.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_eventfd2(&self, pf: &mut PollFds, cx: &mut ServiceCtx, initval: u64, flags: u64) -> i64 {
+    pub(super) fn sys_eventfd2(
+        &self,
+        pf: &mut PollFds,
+        cx: &mut ServiceCtx,
+        initval: u64,
+        flags: u64,
+    ) -> i64 {
         const EFD_SEMAPHORE: u64 = 1;
         const EFD_NONBLOCK: u64 = 0o4000;
         let idx = pf.eventfds.len();
@@ -892,7 +953,9 @@ impl Kernel {
     /// [`Kernel::sys_read`](super::Kernel)).
     #[allow(clippy::unused_self)]
     pub(super) fn read_eventfd(
-        &self, pf: &mut PollFds, cx: &mut ServiceCtx,
+        &self,
+        pf: &mut PollFds,
+        cx: &mut ServiceCtx,
         i: usize,
         buf: u64,
         count: u64,
@@ -923,7 +986,13 @@ impl Kernel {
     /// `write(eventfd_fd, buf, count)` — add to the counter (called from
     /// [`Kernel::sys_write`](super::Kernel)).
     #[allow(clippy::unused_self)]
-    pub(super) fn write_eventfd(&self, pf: &mut PollFds, cx: &mut ServiceCtx, i: usize, data: &[u8]) -> i64 {
+    pub(super) fn write_eventfd(
+        &self,
+        pf: &mut PollFds,
+        cx: &mut ServiceCtx,
+        i: usize,
+        data: &[u8],
+    ) -> i64 {
         if data.len() < 8 {
             return err(Errno::EINVAL);
         }
@@ -952,7 +1021,13 @@ impl Kernel {
     /// `timerfd_create(clockid, flags)` — `clockid` is accepted but ignored
     /// (there is only the one host wall clock).
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_timerfd_create(&self, pf: &mut PollFds, cx: &mut ServiceCtx, _clockid: u64, flags: u64) -> i64 {
+    pub(super) fn sys_timerfd_create(
+        &self,
+        pf: &mut PollFds,
+        cx: &mut ServiceCtx,
+        _clockid: u64,
+        flags: u64,
+    ) -> i64 {
         const TFD_NONBLOCK: u64 = 0o4000;
         let idx = pf.timerfds.len();
         pf.timerfds.push(TimerFdInst {
@@ -1013,7 +1088,9 @@ impl Kernel {
     /// `timerfd_settime(fd, flags, new_value, old_value)`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_timerfd_settime(
-        &self, pf: &mut PollFds, cx: &mut ServiceCtx,
+        &self,
+        pf: &mut PollFds,
+        cx: &mut ServiceCtx,
         fd: u64,
         flags: u64,
         new_value: u64,
@@ -1065,7 +1142,9 @@ impl Kernel {
 
     /// `timerfd_gettime(fd, curr_value)`.
     pub(super) fn sys_timerfd_gettime(
-        &self, pf: &mut PollFds, cx: &mut ServiceCtx,
+        &self,
+        pf: &mut PollFds,
+        cx: &mut ServiceCtx,
         fd: u64,
         curr_value: u64,
         mem: &mut GuestMemory,
@@ -1090,7 +1169,9 @@ impl Kernel {
     /// `read(timerfd_fd, buf, count)` — drain the accumulated expiration
     /// count (called from [`Kernel::sys_read`](super::Kernel)).
     pub(super) fn read_timerfd(
-        &self, pf: &mut PollFds, cx: &mut ServiceCtx,
+        &self,
+        pf: &mut PollFds,
+        cx: &mut ServiceCtx,
         i: usize,
         buf: u64,
         count: u64,
@@ -1224,7 +1305,14 @@ mod tests {
 
         let out = 0x1_1000;
         assert_eq!(
-            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Read,
+                [fd, out, 8, 0, 0, 0]
+            ),
             8
         );
         assert_eq!(mem.read_u64(out).unwrap(), 7);
@@ -1232,7 +1320,14 @@ mod tests {
         // Drained: read again with count == 0 (non-blocking check via the
         // `block` flag, mirroring the pipe test's convention).
         assert_eq!(
-            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Read,
+                [fd, out, 8, 0, 0, 0]
+            ),
             0
         );
         assert!(cx.block);
@@ -1253,7 +1348,14 @@ mod tests {
 
         let out = 0x1_0000;
         assert_eq!(
-            call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]),
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Read,
+                [fd, out, 8, 0, 0, 0]
+            ),
             8
         );
         assert_eq!(mem.read_u64(out).unwrap(), 1);
@@ -1263,7 +1365,14 @@ mod tests {
     fn poll_reports_pollin_when_pipe_has_data() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_0000;
-        call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
+        call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Pipe2,
+            [fds, 0, 0, 0, 0, 0],
+        );
         let rfd = u64::from(mem.read_u32(fds).unwrap());
         let wfd = u64::from(mem.read_u32(fds + 4).unwrap());
 
@@ -1302,18 +1411,40 @@ mod tests {
     fn poll_reports_pollhup_without_pollin_at_pipe_eof() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_0000;
-        call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
+        call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Pipe2,
+            [fds, 0, 0, 0, 0, 0],
+        );
         let rfd = u64::from(mem.read_u32(fds).unwrap());
         let wfd = u64::from(mem.read_u32(fds + 4).unwrap());
         // Close the write end: the empty read end is now at EOF.
-        call(&k, &mut cx, &mut mem, &mut v, Sysno::Close, [wfd, 0, 0, 0, 0, 0]);
+        call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Close,
+            [wfd, 0, 0, 0, 0, 0],
+        );
 
         let pollfds = 0x1_2000;
-        mem.write_init(pollfds, &(rfd as u32).to_le_bytes()).unwrap();
+        mem.write_init(pollfds, &(rfd as u32).to_le_bytes())
+            .unwrap();
         mem.write_init(pollfds + 4, &1u16.to_le_bytes()).unwrap(); // POLLIN
         mem.write_init(pollfds + 6, &0u16.to_le_bytes()).unwrap();
 
-        let n = call(&k, &mut cx, &mut mem, &mut v, Sysno::Poll, [pollfds, 1, 0, 0, 0, 0]);
+        let n = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Poll,
+            [pollfds, 1, 0, 0, 0, 0],
+        );
         assert_eq!(n, 1);
         // Linux reports POLLHUP (0x10) alone at EOF, not POLLIN — a read would
         // return 0, so there is no data to signal with POLLIN.
@@ -1325,7 +1456,17 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_0000;
         // socketpair(AF_UNIX, SOCK_STREAM, 0, fds)
-        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Socketpair, [1, 1, 0, fds, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Socketpair,
+                [1, 1, 0, fds, 0, 0]
+            ),
+            0
+        );
         let a = u64::from(mem.read_u32(fds).unwrap());
         let b = u64::from(mem.read_u32(fds + 4).unwrap());
 
@@ -1335,14 +1476,38 @@ mod tests {
         mem.write_init(pollfds + 6, &0u16.to_le_bytes()).unwrap();
         // Idle connected socket with no buffered data must NOT report POLLIN —
         // otherwise a level-triggered event loop busy-spins (recv → EAGAIN).
-        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Poll, [pollfds, 1, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Poll,
+                [pollfds, 1, 0, 0, 0, 0]
+            ),
+            0
+        );
 
         // A write to the peer end makes it readable.
         let msg = 0x1_3000;
         mem.write_init(msg, b"hi").unwrap();
-        call(&k, &mut cx, &mut mem, &mut v, Sysno::Write, [b, msg, 2, 0, 0, 0]);
+        call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Write,
+            [b, msg, 2, 0, 0, 0],
+        );
         mem.write_init(pollfds + 6, &0u16.to_le_bytes()).unwrap();
-        let n = call(&k, &mut cx, &mut mem, &mut v, Sysno::Poll, [pollfds, 1, 0, 0, 0, 0]);
+        let n = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Poll,
+            [pollfds, 1, 0, 0, 0, 0],
+        );
         assert_eq!(n, 1);
         assert_eq!(mem.read_vec(pollfds + 6, 2).unwrap(), 1u16.to_le_bytes());
     }
@@ -1351,18 +1516,40 @@ mod tests {
     fn poll_write_end_of_broken_pipe_is_pollout_plus_pollerr() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_0000;
-        call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
+        call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Pipe2,
+            [fds, 0, 0, 0, 0, 0],
+        );
         let rfd = u64::from(mem.read_u32(fds).unwrap());
         let wfd = u64::from(mem.read_u32(fds + 4).unwrap());
         // Close the read end: the write end is now broken.
-        call(&k, &mut cx, &mut mem, &mut v, Sysno::Close, [rfd, 0, 0, 0, 0, 0]);
+        call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Close,
+            [rfd, 0, 0, 0, 0, 0],
+        );
 
         let pollfds = 0x1_2000;
-        mem.write_init(pollfds, &(wfd as u32).to_le_bytes()).unwrap();
+        mem.write_init(pollfds, &(wfd as u32).to_le_bytes())
+            .unwrap();
         mem.write_init(pollfds + 4, &4u16.to_le_bytes()).unwrap(); // POLLOUT
         mem.write_init(pollfds + 6, &0u16.to_le_bytes()).unwrap();
 
-        let n = call(&k, &mut cx, &mut mem, &mut v, Sysno::Poll, [pollfds, 1, 0, 0, 0, 0]);
+        let n = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Poll,
+            [pollfds, 1, 0, 0, 0, 0],
+        );
         assert_eq!(n, 1);
         // POLLOUT (0x4) | POLLERR (0x8) — writable but the reader is gone.
         assert_eq!(mem.read_vec(pollfds + 6, 2).unwrap(), 0x0cu16.to_le_bytes());
@@ -1372,7 +1559,14 @@ mod tests {
     fn poll_zero_timeout_on_empty_pipe_returns_immediately() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_0000;
-        call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
+        call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Pipe2,
+            [fds, 0, 0, 0, 0, 0],
+        );
         let rfd = u64::from(mem.read_u32(fds).unwrap());
 
         let pollfds = 0x1_2000;
@@ -1396,7 +1590,14 @@ mod tests {
     fn epoll_create_ctl_wait_on_ready_pipe() {
         let (k, mut mem, mut v, mut cx) = setup();
         let fds = 0x1_0000;
-        call(&k, &mut cx, &mut mem, &mut v, Sysno::Pipe2, [fds, 0, 0, 0, 0, 0]);
+        call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Pipe2,
+            [fds, 0, 0, 0, 0, 0],
+        );
         let rfd = u64::from(mem.read_u32(fds).unwrap());
         let wfd = u64::from(mem.read_u32(fds + 4).unwrap());
 
@@ -1506,7 +1707,14 @@ mod tests {
         // expired -> EAGAIN via O_NONBLOCK-equivalent isn't set, so it would
         // normally block; assert it sets the block flag instead of hanging).
         let out = 0x1_2000;
-        let ret = call(&k, &mut cx, &mut mem, &mut v, Sysno::Read, [fd, out, 8, 0, 0, 0]);
+        let ret = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Read,
+            [fd, out, 8, 0, 0, 0],
+        );
         assert_eq!(ret, 0);
         assert!(cx.block);
     }

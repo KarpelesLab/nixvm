@@ -356,7 +356,9 @@ pub struct kvm_xcrs {
 #[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for kvm_cpuid2 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("kvm_cpuid2").field("nent", &self.nent).finish()
+        f.debug_struct("kvm_cpuid2")
+            .field("nent", &self.nent)
+            .finish()
     }
 }
 

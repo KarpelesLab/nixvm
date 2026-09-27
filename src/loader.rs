@@ -317,7 +317,10 @@ fn map_image(
                     match mism {
                         None if back.len() == bytes.len() => "OK".to_string(),
                         None => format!("SHORT readback {} vs {}", back.len(), bytes.len()),
-                        Some(i) => format!("MISMATCH at +{i:#x} (guest {:#04x} != file {:#04x})", back[i], bytes[i]),
+                        Some(i) => format!(
+                            "MISMATCH at +{i:#x} (guest {:#04x} != file {:#04x})",
+                            back[i], bytes[i]
+                        ),
                     }
                 );
             }

@@ -84,11 +84,26 @@ struct Sym {
 /// the `.dynsym` layout (index 1..=N; index 0 is the reserved null entry) and the
 /// hash chain.
 const SYMS: &[Sym] = &[
-    Sym { name: "__vdso_clock_gettime", off: 0x0 },
-    Sym { name: "__vdso_gettimeofday", off: 0x70 },
-    Sym { name: "__vdso_clock_getres", off: 0xe2 },
-    Sym { name: "__vdso_time", off: 0x113 },
-    Sym { name: "__vdso_getcpu", off: 0x15e },
+    Sym {
+        name: "__vdso_clock_gettime",
+        off: 0x0,
+    },
+    Sym {
+        name: "__vdso_gettimeofday",
+        off: 0x70,
+    },
+    Sym {
+        name: "__vdso_clock_getres",
+        off: 0xe2,
+    },
+    Sym {
+        name: "__vdso_time",
+        off: 0x113,
+    },
+    Sym {
+        name: "__vdso_getcpu",
+        off: 0x15e,
+    },
 ];
 
 // ---- ELF-image layout (all within one 4 KiB page, ET_DYN, load base = 0) ----
@@ -196,12 +211,12 @@ pub fn build_image(vvar_va: u64) -> [u8; PAGE] {
 
     // Dynamic section: DT_HASH, DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT, DT_NULL.
     let dyn_entries: [(u64, u64); 6] = [
-        (4, HASH),    // DT_HASH
-        (5, DYNSTR),  // DT_STRTAB
-        (6, DYNSYM),  // DT_SYMTAB
-        (10, strsz),  // DT_STRSZ
-        (11, 24),     // DT_SYMENT
-        (0, 0),       // DT_NULL
+        (4, HASH),   // DT_HASH
+        (5, DYNSTR), // DT_STRTAB
+        (6, DYNSYM), // DT_SYMTAB
+        (10, strsz), // DT_STRSZ
+        (11, 24),    // DT_SYMENT
+        (0, 0),      // DT_NULL
     ];
     for (i, (tag, val)) in dyn_entries.iter().enumerate() {
         let o = DYNAMIC + (i as u64) * 16;
@@ -210,7 +225,10 @@ pub fn build_image(vvar_va: u64) -> [u8; PAGE] {
     }
 
     // Guard the fixed layout against overlap as the table grows.
-    debug_assert!(HASH + 8 + nchain * 4 <= DYNSYM, "hash table overlaps dynsym");
+    debug_assert!(
+        HASH + 8 + nchain * 4 <= DYNSYM,
+        "hash table overlaps dynsym"
+    );
     debug_assert!(DYNSYM + nchain * 24 <= DYNSTR, "dynsym overlaps dynstr");
     debug_assert!(DYNSTR + strsz <= DYNAMIC, "dynstr overlaps dynamic");
     debug_assert!(TEXT as usize + CODE.len() <= PAGE, "code overruns the page");
@@ -218,7 +236,11 @@ pub fn build_image(vvar_va: u64) -> [u8; PAGE] {
     // Code, with the vvar VA patched into each `movabs` immediate.
     b[TEXT as usize..TEXT as usize + CODE.len()].copy_from_slice(CODE);
     for &p in &VVAR_PATCH {
-        assert_eq!(&b[TEXT as usize + p..TEXT as usize + p + 8], &0x1122_3344_5566_7788u64.to_le_bytes(), "VVAR_PATCH offset must land on the movabs sentinel");
+        assert_eq!(
+            &b[TEXT as usize + p..TEXT as usize + p + 8],
+            &0x1122_3344_5566_7788u64.to_le_bytes(),
+            "VVAR_PATCH offset must land on the movabs sentinel"
+        );
         w64(&mut b, TEXT + p as u64, vvar_va);
     }
     b
@@ -247,8 +269,11 @@ mod tests {
             if u32::from_le_bytes(img[p..p + 4].try_into().unwrap()) == 2 {
                 let mut d = u64::from_le_bytes(img[p + 8..p + 16].try_into().unwrap());
                 loop {
-                    let tag = u64::from_le_bytes(img[d as usize..d as usize + 8].try_into().unwrap());
-                    let val = u64::from_le_bytes(img[d as usize + 8..d as usize + 16].try_into().unwrap());
+                    let tag =
+                        u64::from_le_bytes(img[d as usize..d as usize + 8].try_into().unwrap());
+                    let val = u64::from_le_bytes(
+                        img[d as usize + 8..d as usize + 16].try_into().unwrap(),
+                    );
                     match tag {
                         4 => hash = val,
                         5 => strtab = val,
@@ -273,24 +298,49 @@ mod tests {
             let end = img[start..].iter().position(|&c| c == 0).unwrap() + start;
             String::from_utf8_lossy(&img[start..end]).into_owned()
         };
-        let val = |idx: u64| u64::from_le_bytes(img[(symtab + idx * 24 + 8) as usize..(symtab + idx * 24 + 16) as usize].try_into().unwrap());
+        let val = |idx: u64| {
+            u64::from_le_bytes(
+                img[(symtab + idx * 24 + 8) as usize..(symtab + idx * 24 + 16) as usize]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
         // Follow bucket[0] → chain until STN_UNDEF, collecting (name → value).
         let mut resolved = std::collections::HashMap::new();
-        let mut idx = u64::from(u32::from_le_bytes(img[hash as usize + 8..hash as usize + 12].try_into().unwrap()));
+        let mut idx = u64::from(u32::from_le_bytes(
+            img[hash as usize + 8..hash as usize + 12]
+                .try_into()
+                .unwrap(),
+        ));
         while idx != 0 {
             resolved.insert(sym_name(idx), val(idx));
             let chain = hash + 8 + nbucket as u64 * 4 + idx * 4;
-            idx = u64::from(u32::from_le_bytes(img[chain as usize..chain as usize + 4].try_into().unwrap()));
+            idx = u64::from(u32::from_le_bytes(
+                img[chain as usize..chain as usize + 4].try_into().unwrap(),
+            ));
         }
         // Every exported symbol resolves to the right code offset.
         for s in SYMS {
-            assert_eq!(resolved.get(s.name), Some(&(TEXT + s.off)), "symbol {}", s.name);
+            assert_eq!(
+                resolved.get(s.name),
+                Some(&(TEXT + s.off)),
+                "symbol {}",
+                s.name
+            );
         }
-        assert_eq!(resolved.len(), SYMS.len(), "chain reaches exactly the exports");
+        assert_eq!(
+            resolved.len(),
+            SYMS.len(),
+            "chain reaches exactly the exports"
+        );
 
         // The vvar VA was patched into every movabs immediate.
         for &p in &VVAR_PATCH {
-            let got = u64::from_le_bytes(img[(TEXT + p as u64) as usize..(TEXT + p as u64) as usize + 8].try_into().unwrap());
+            let got = u64::from_le_bytes(
+                img[(TEXT + p as u64) as usize..(TEXT + p as u64) as usize + 8]
+                    .try_into()
+                    .unwrap(),
+            );
             assert_eq!(got, vvar);
         }
     }

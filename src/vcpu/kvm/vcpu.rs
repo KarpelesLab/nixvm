@@ -282,13 +282,7 @@ impl KvmVcpu {
 
         // SAFETY: `fd` is a live vcpu fd; the cpuid2 struct is valid for the
         // call and the kernel only reads it.
-        let ret = unsafe {
-            sys::ioctl(
-                fd.0,
-                sys::KVM_SET_CPUID2,
-                std::ptr::from_ref(vm.cpuid()),
-            )
-        };
+        let ret = unsafe { sys::ioctl(fd.0, sys::KVM_SET_CPUID2, std::ptr::from_ref(vm.cpuid())) };
         check(ret, "KVM_SET_CPUID2")?;
 
         // The syscall trampoline wiring (see `super::vm`).
@@ -314,7 +308,9 @@ impl KvmVcpu {
         let ret = unsafe { sys::ioctl(fd.0, sys::KVM_SET_MSRS, std::ptr::from_ref(&msrs)) };
         // KVM_SET_MSRS returns the number of MSRs set; a short count is a failure.
         if check(ret, "KVM_SET_MSRS")? != entries.len() as i32 {
-            return Err(VcpuError::Backend("KVM_SET_MSRS set fewer MSRs than requested".into()));
+            return Err(VcpuError::Backend(
+                "KVM_SET_MSRS set fewer MSRs than requested".into(),
+            ));
         }
 
         // Start from the vcpu's current sregs (sane reset values for the
@@ -447,7 +443,11 @@ impl KvmVcpu {
             self.sregs.cr3 = real ^ (1 << 4);
             // SAFETY: valid struct pointer; the fd is live.
             let ret = unsafe {
-                sys::ioctl(self.fd.0, sys::KVM_SET_SREGS, std::ptr::from_ref(&self.sregs))
+                sys::ioctl(
+                    self.fd.0,
+                    sys::KVM_SET_SREGS,
+                    std::ptr::from_ref(&self.sregs),
+                )
             };
             check(ret, "KVM_SET_SREGS")?;
             self.sregs.cr3 = real;
@@ -457,7 +457,11 @@ impl KvmVcpu {
         if self.sregs_dirty {
             // SAFETY: valid struct pointer; the fd is live.
             let ret = unsafe {
-                sys::ioctl(self.fd.0, sys::KVM_SET_SREGS, std::ptr::from_ref(&self.sregs))
+                sys::ioctl(
+                    self.fd.0,
+                    sys::KVM_SET_SREGS,
+                    std::ptr::from_ref(&self.sregs),
+                )
             };
             check(ret, "KVM_SET_SREGS")?;
             self.sregs_dirty = false;
@@ -489,12 +493,21 @@ impl KvmVcpu {
 
         // Refresh both caches so accessors (and `fork`) see the true state.
         // SAFETY: valid out-pointers; the fd is live.
-        let ret =
-            unsafe { sys::ioctl(self.fd.0, sys::KVM_GET_REGS, std::ptr::from_mut(&mut self.regs)) };
+        let ret = unsafe {
+            sys::ioctl(
+                self.fd.0,
+                sys::KVM_GET_REGS,
+                std::ptr::from_mut(&mut self.regs),
+            )
+        };
         check(ret, "KVM_GET_REGS")?;
         // SAFETY: as above.
         let ret = unsafe {
-            sys::ioctl(self.fd.0, sys::KVM_GET_SREGS, std::ptr::from_mut(&mut self.sregs))
+            sys::ioctl(
+                self.fd.0,
+                sys::KVM_GET_SREGS,
+                std::ptr::from_mut(&mut self.sregs),
+            )
         };
         check(ret, "KVM_GET_SREGS")?;
 
@@ -596,7 +609,10 @@ impl KvmVcpu {
                 } else {
                     // The frame wasn't on the kernel stack (unexpected); fall
                     // back to a bare fault at cr2 rather than crashing.
-                    Ok(Exit::MemFault { addr: self.sregs.cr2, write: false })
+                    Ok(Exit::MemFault {
+                        addr: self.sregs.cr2,
+                        write: false,
+                    })
                 }
             }
             // The trampoline's `hlt` — a guest `syscall`. (With no in-kernel
@@ -954,7 +970,8 @@ impl Vcpu for KvmVcpu {
         };
         msrs.entries[0].index = 0x10; // IA32_TSC
         // SAFETY: valid struct; `nmsrs = 1` bounds the entries read/written.
-        let got = unsafe { sys::ioctl(self.fd.0, sys::KVM_GET_MSRS, std::ptr::from_mut(&mut msrs)) };
+        let got =
+            unsafe { sys::ioctl(self.fd.0, sys::KVM_GET_MSRS, std::ptr::from_mut(&mut msrs)) };
         if got != 1 {
             return None;
         }

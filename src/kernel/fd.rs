@@ -149,7 +149,9 @@ impl FdTable {
     /// caller can drop backing refcounts (pipes/sockets). Runs on `execve`.
     pub fn close_cloexec(&mut self) -> Vec<Fd> {
         let fds: Vec<i32> = std::mem::take(&mut self.cloexec).into_iter().collect();
-        fds.into_iter().filter_map(|n| self.map.remove(&n)).collect()
+        fds.into_iter()
+            .filter_map(|n| self.map.remove(&n))
+            .collect()
     }
 
     #[must_use]

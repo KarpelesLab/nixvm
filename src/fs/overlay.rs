@@ -546,11 +546,23 @@ mod tests {
         o.create("g", 0o644).unwrap(); // upper-only file
         let lower_ino = o.stat("f").unwrap().inode; // lower `/f`
         let upper_ino = o.stat("g").unwrap().inode; // upper `/g`
-        assert_ne!(lower_ino, upper_ino, "upper and lower inodes must be distinct");
-        assert_eq!(upper_ino & UPPER_INODE_TAG, UPPER_INODE_TAG, "upper is tagged");
+        assert_ne!(
+            lower_ino, upper_ino,
+            "upper and lower inodes must be distinct"
+        );
+        assert_eq!(
+            upper_ino & UPPER_INODE_TAG,
+            UPPER_INODE_TAG,
+            "upper is tagged"
+        );
         assert_eq!(lower_ino & UPPER_INODE_TAG, 0, "lower is untagged");
         // readdir agrees with stat on the upper tag.
-        let g = o.readdir("").unwrap().into_iter().find(|e| e.name == "g").unwrap();
+        let g = o
+            .readdir("")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == "g")
+            .unwrap();
         assert_eq!(g.inode, upper_ino, "readdir and stat agree on the inode");
     }
 

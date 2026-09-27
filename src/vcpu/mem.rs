@@ -579,7 +579,9 @@ impl GuestMemory {
     /// leaves — exactly what a CPL3 guest could touch — so the supervisor control
     /// pages (GDT/IDT/kstack) stay unreadable.
     fn check(&self, addr: u64, len: usize, need: Prot) -> Result<(), MemError> {
-        let end = addr.checked_add(len as u64).ok_or(MemError::OutOfBounds(addr))?;
+        let end = addr
+            .checked_add(len as u64)
+            .ok_or(MemError::OutOfBounds(addr))?;
         if addr < self.base || end > self.base + self.size {
             return self.check_paged(addr, len, need);
         }
@@ -609,7 +611,12 @@ impl GuestMemory {
         while cur < end {
             match self.space.translate(cur, &self.phys) {
                 Some(t) if !t.supervisor && t.prot.contains(need) => {}
-                Some(_) => return Err(MemError::Protection { addr: cur, needed: need }),
+                Some(_) => {
+                    return Err(MemError::Protection {
+                        addr: cur,
+                        needed: need,
+                    });
+                }
                 None => return Err(MemError::OutOfBounds(addr)),
             }
             cur += PAGE_SIZE;
@@ -661,7 +668,14 @@ impl GuestMemory {
     /// leaf write bit. An associated fn over the disjoint `space`/`phys` fields so
     /// callers can hold the `fa` guard (which borrows the `fa` field) at once.
     /// Returns whether it changed a present leaf (so the caller flags the TLB).
-    fn make_writable(space: &mut AddrSpace, phys: &PhysMem, prot: Prot, fa: &mut FrameAllocator, va: u64, shared_anon: bool) -> bool {
+    fn make_writable(
+        space: &mut AddrSpace,
+        phys: &PhysMem,
+        prot: Prot,
+        fa: &mut FrameAllocator,
+        va: u64,
+        shared_anon: bool,
+    ) -> bool {
         let Some(t) = space.translate(va, phys) else {
             return false;
         };
@@ -703,7 +717,14 @@ impl GuestMemory {
                 if !Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, va) {
                     return Err(MemError::Host("frame pool exhausted".into()));
                 }
-                changed |= Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va, self.shared_anon[p]);
+                changed |= Self::make_writable(
+                    &mut self.space,
+                    &self.phys,
+                    self.prot[p],
+                    &mut fa,
+                    va,
+                    self.shared_anon[p],
+                );
             }
             self.tlb_dirty |= changed;
         }
@@ -752,7 +773,14 @@ impl GuestMemory {
         }
         let va = self.base + (p as u64) * PAGE_SIZE;
         let mut fa = self.fa.lock().unwrap();
-        Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va, self.shared_anon[p]);
+        Self::make_writable(
+            &mut self.space,
+            &self.phys,
+            self.prot[p],
+            &mut fa,
+            va,
+            self.shared_anon[p],
+        );
         true
     }
 
@@ -778,7 +806,14 @@ impl GuestMemory {
                 if !Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, va) {
                     return Err(MemError::Host("frame pool exhausted".into()));
                 }
-                changed |= Self::make_writable(&mut self.space, &self.phys, self.prot[p], &mut fa, va, self.shared_anon[p]);
+                changed |= Self::make_writable(
+                    &mut self.space,
+                    &self.phys,
+                    self.prot[p],
+                    &mut fa,
+                    va,
+                    self.shared_anon[p],
+                );
             }
             self.tlb_dirty |= changed;
         }
@@ -950,8 +985,14 @@ mod tests {
     #[test]
     fn out_of_bounds_faults() {
         let m = mem();
-        assert!(matches!(m.read_u32(0x9_0000), Err(MemError::OutOfBounds(_))));
-        assert!(matches!(m.read_u32(0x0_0000), Err(MemError::OutOfBounds(_))));
+        assert!(matches!(
+            m.read_u32(0x9_0000),
+            Err(MemError::OutOfBounds(_))
+        ));
+        assert!(matches!(
+            m.read_u32(0x0_0000),
+            Err(MemError::OutOfBounds(_))
+        ));
     }
 
     #[test]
@@ -964,9 +1005,15 @@ mod tests {
         let ehdr = m.read_vec(ctrl::VDSO_VA, 4).expect("vDSO must be readable");
         assert_eq!(&ehdr, b"\x7fELF", "vDSO ELF magic at AT_SYSINFO_EHDR");
         assert!(m.can_exec(ctrl::VDSO_VA), "vDSO code page is executable");
-        assert!(m.read_vec(ctrl::VVAR_VA, 8).is_ok(), "vvar page is readable");
+        assert!(
+            m.read_vec(ctrl::VVAR_VA, 8).is_ok(),
+            "vvar page is readable"
+        );
         // Supervisor-only control pages (GDT) stay unreachable from the guest.
-        assert!(m.read_u32(ctrl::GDT_BASE).is_err(), "GDT is supervisor-only");
+        assert!(
+            m.read_u32(ctrl::GDT_BASE).is_err(),
+            "GDT is supervisor-only"
+        );
     }
 
     #[test]
@@ -997,7 +1044,10 @@ mod tests {
         let mut m = mem();
         m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
         let boundary = 0x1_0000 + PAGE_SIZE - 8;
-        assert!(matches!(m.read_u64(boundary + 4), Err(MemError::Unmapped(_))));
+        assert!(matches!(
+            m.read_u64(boundary + 4),
+            Err(MemError::Unmapped(_))
+        ));
         m.map(0x1_0000 + PAGE_SIZE, PAGE_SIZE, Prot::rw()).unwrap();
         m.write_u64(boundary + 4, 42).unwrap();
         assert_eq!(m.read_u64(boundary + 4).unwrap(), 42);
@@ -1034,7 +1084,10 @@ mod tests {
         m.map(0x1_0000, 2 * PAGE_SIZE, Prot::rw()).unwrap();
         m.write(0x1_0000 + PAGE_SIZE, &[0xEE]).unwrap();
         let boundary = 0x1_0000 + PAGE_SIZE - 2;
-        assert_eq!(m.read_vec(boundary, 4).unwrap(), vec![0x00, 0x00, 0xEE, 0x00]);
+        assert_eq!(
+            m.read_vec(boundary, 4).unwrap(),
+            vec![0x00, 0x00, 0xEE, 0x00]
+        );
     }
 
     #[test]
@@ -1072,7 +1125,10 @@ mod tests {
         parent.write(0x1_0000 + 2 * PAGE_SIZE, &[2]).unwrap();
         let child = parent.fork();
         assert_eq!(child.read_vec(0x1_0000, 1).unwrap(), vec![1]);
-        assert_eq!(child.read_vec(0x1_0000 + 2 * PAGE_SIZE, 1).unwrap(), vec![2]);
+        assert_eq!(
+            child.read_vec(0x1_0000 + 2 * PAGE_SIZE, 1).unwrap(),
+            vec![2]
+        );
         assert!(child.read_vec(0x1_0000 + PAGE_SIZE, 1).is_err());
     }
 
@@ -1085,7 +1141,10 @@ mod tests {
         // A write to genuinely read-only memory is a real fault (not CoW).
         m.protect(0x1_0000, PAGE_SIZE, Prot::READ).unwrap();
         assert!(m.write_trap(0x1_0000, &[0]).is_err());
-        assert!(!m.cow_fault(0x1_0000, true), "read-only page is a genuine fault");
+        assert!(
+            !m.cow_fault(0x1_0000, true),
+            "read-only page is a genuine fault"
+        );
     }
 
     #[test]
@@ -1097,21 +1156,30 @@ mod tests {
         for i in 0..8 {
             m.write_u64(0x1_0000 + i * PAGE_SIZE, 0xdead).unwrap();
         }
-        assert!(m.frames_in_use() > baseline, "touched pages consumed frames");
+        assert!(
+            m.frames_in_use() > baseline,
+            "touched pages consumed frames"
+        );
         // exit / execve must return every data + table frame the process held.
         m.release();
         assert_eq!(m.frames_in_use(), baseline, "release returned all frames");
         m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
         m.write_u64(0x1_0000, 1).unwrap();
         m.exec_reset();
-        assert_eq!(m.frames_in_use(), baseline, "exec_reset returned all frames");
+        assert_eq!(
+            m.frames_in_use(),
+            baseline,
+            "exec_reset returned all frames"
+        );
     }
 
     #[test]
     fn shared_anon_pages_are_visible_across_fork() {
         let mut parent = mem();
         // A MAP_SHARED|ANON page and an ordinary (private/COW) page.
-        parent.map_shared_anon(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
+        parent
+            .map_shared_anon(0x1_0000, PAGE_SIZE, Prot::rw())
+            .unwrap();
         parent.map(0x1_1000, PAGE_SIZE, Prot::rw()).unwrap();
         parent.write_u64(0x1_0000, 100).unwrap();
         parent.write_u64(0x1_1000, 100).unwrap();
@@ -1122,12 +1190,24 @@ mod tests {
 
         // The shared-anon page reflects the child's write; the private page stays
         // copy-on-write isolated.
-        assert_eq!(parent.read_u64(0x1_0000).unwrap(), 999, "shared-anon visible across fork");
-        assert_eq!(parent.read_u64(0x1_1000).unwrap(), 100, "private page stays COW-isolated");
+        assert_eq!(
+            parent.read_u64(0x1_0000).unwrap(),
+            999,
+            "shared-anon visible across fork"
+        );
+        assert_eq!(
+            parent.read_u64(0x1_1000).unwrap(),
+            100,
+            "private page stays COW-isolated"
+        );
 
         // Sharing is bidirectional: the parent's write is visible to the child.
         parent.write_u64(0x1_0000, 42).unwrap();
-        assert_eq!(child.read_u64(0x1_0000).unwrap(), 42, "shared-anon is bidirectional");
+        assert_eq!(
+            child.read_u64(0x1_0000).unwrap(),
+            42,
+            "shared-anon is bidirectional"
+        );
     }
 
     #[test]

@@ -17,7 +17,10 @@
 //! [`Kernel::sys_rt_sigsuspend`] for SIGCHLD — wake, run its handler, and reap.
 //! A signal left at its default disposition still takes the default action.
 
-use super::{ExitCause, Kernel, QueuedSig, RunState, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SIGSEGV, SS_DISABLE, ServiceCtx, Shared, err, pgid_of};
+use super::{
+    ExitCause, Kernel, QueuedSig, RunState, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SIGSEGV,
+    SS_DISABLE, ServiceCtx, Shared, err, pgid_of,
+};
 use crate::abi::Arch;
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
@@ -81,7 +84,8 @@ impl Kernel {
     /// is rejected with `EINVAL`.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_rt_sigaction(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         sig: u64,
         act: u64,
         oldact: u64,
@@ -126,7 +130,13 @@ impl Kernel {
     /// registered `SA_ONSTACK` runs on. `stack_t` is `{ void *ss_sp; int
     /// ss_flags; size_t ss_size }`.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_sigaltstack(&self, cx: &mut ServiceCtx, ss: u64, old_ss: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_sigaltstack(
+        &self,
+        cx: &mut ServiceCtx,
+        ss: u64,
+        old_ss: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         let (sp, size, flags) = cx.cur.altstack;
         if old_ss != 0 {
             let mut buf = [0u8; 24];
@@ -154,7 +164,8 @@ impl Kernel {
     /// mask. `sigsetsize` is accepted but ignored.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_rt_sigprocmask(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         how: u64,
         set: u64,
         oldset: u64,
@@ -183,7 +194,12 @@ impl Kernel {
 
     /// `rt_sigpending(set, sigsetsize)` — report the pending-signal mask.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_rt_sigpending(&self, cx: &mut ServiceCtx, set: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_rt_sigpending(
+        &self,
+        cx: &mut ServiceCtx,
+        set: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         if set != 0 && mem.write(set, &cx.cur.pending.to_le_bytes()).is_err() {
             return err(Errno::EFAULT);
         }
@@ -202,7 +218,12 @@ impl Kernel {
     /// handler consumes `sigsuspend_prev` (restoring the pre-call mask as its
     /// `uc_sigmask`); an ignored one is cleaned up by that fn's post-loop restore.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_rt_sigsuspend(&self, cx: &mut ServiceCtx, mask_ptr: u64, mem: &GuestMemory) -> i64 {
+    pub(super) fn sys_rt_sigsuspend(
+        &self,
+        cx: &mut ServiceCtx,
+        mask_ptr: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
         let Ok(new_mask) = mem.read_u64(mask_ptr) else {
             return err(Errno::EFAULT);
         };
@@ -232,7 +253,14 @@ impl Kernel {
     /// returned. With none pending it waits — until one arrives (re-trap after an
     /// unpark), until `timeout` elapses (`EAGAIN`), or until an unblocked caught
     /// signal interrupts it (`EINTR`, via the dispatcher). A zero `timeout` polls.
-    pub(super) fn sys_rt_sigtimedwait(&self, cx: &mut ServiceCtx, set_ptr: u64, info: u64, timeout: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_rt_sigtimedwait(
+        &self,
+        cx: &mut ServiceCtx,
+        set_ptr: u64,
+        info: u64,
+        timeout: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         let Ok(set) = mem.read_u64(set_ptr) else {
             return err(Errno::EFAULT);
         };
@@ -270,7 +298,8 @@ impl Kernel {
             let deadline = match cx.cur.wake_deadline {
                 Some(dl) => dl,
                 None => {
-                    let (Ok(sec), Ok(nsec)) = (mem.read_u64(timeout), mem.read_u64(timeout + 8)) else {
+                    let (Ok(sec), Ok(nsec)) = (mem.read_u64(timeout), mem.read_u64(timeout + 8))
+                    else {
                         return err(Errno::EFAULT);
                     };
                     if nsec >= 1_000_000_000 {
@@ -279,7 +308,8 @@ impl Kernel {
                     if sec == 0 && nsec == 0 {
                         return err(Errno::EAGAIN); // {0,0}: a non-blocking poll
                     }
-                    let dl = super::poll::now_ns() + u128::from(sec) * 1_000_000_000 + u128::from(nsec);
+                    let dl =
+                        super::poll::now_ns() + u128::from(sec) * 1_000_000_000 + u128::from(nsec);
                     cx.cur.wake_deadline = Some(dl);
                     dl
                 }
@@ -302,14 +332,26 @@ impl Kernel {
     /// the single-target branch fires.)
     pub(super) fn sys_kill(&self, sh: &mut Shared, cx: &mut ServiceCtx, pid: i64, sig: u64) -> i64 {
         // A bare kill carries SI_USER (code 0) with the sender's pid.
-        let sender = super::QueuedSig { code: 0, pid: cx.cur.pid, uid: 0, value: 0 };
+        let sender = super::QueuedSig {
+            code: 0,
+            pid: cx.cur.pid,
+            uid: 0,
+            value: 0,
+        };
         self.post_signal(sh, cx, pid, sig, sender)
     }
 
     /// The shared core of `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`: post `sig`
     /// (with its accompanying `info`) to the POSIX target(s). `sender`-vs-queued
     /// siginfo differs only in the `info` the caller supplies.
-    pub(super) fn post_signal(&self, sh: &mut Shared, cx: &mut ServiceCtx, pid: i64, sig: u64, sender: super::QueuedSig) -> i64 {
+    pub(super) fn post_signal(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        pid: i64,
+        sig: u64,
+        sender: super::QueuedSig,
+    ) -> i64 {
         if sig > NSIG {
             return err(Errno::EINVAL);
         }
@@ -404,7 +446,9 @@ impl Kernel {
     /// (`sigqueue`'s payload). Delivery/targeting reuse [`Self::sys_kill`]; this
     /// just records the accompanying info for the target's pending signal.
     pub(super) fn sys_rt_sigqueueinfo(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
         pid: i64,
         sig: u64,
         uinfo: u64,
@@ -414,7 +458,12 @@ impl Kernel {
         // (offset 24, the 8-byte `_rt` union). si_pid/si_uid are the sender's.
         let code = mem.read_u32(uinfo + 8).map_or(-1, |v| v as i32);
         let value = mem.read_u64(uinfo + 24).unwrap_or(0);
-        let info = QueuedSig { code, pid: cx.cur.pid, uid: 0, value };
+        let info = QueuedSig {
+            code,
+            pid: cx.cur.pid,
+            uid: 0,
+            value,
+        };
         // Post with the caller's siginfo directly (a real-time signal thereby
         // queues this exact value; a standard one records it).
         self.post_signal(sh, cx, pid, sig, info)
@@ -435,10 +484,10 @@ impl Kernel {
                 continue;
             }
             match cx.cur.handlers[sig as usize].handler {
-                SIG_IGN => {}                              // dropped — no interrupt
+                SIG_IGN => {}                                   // dropped — no interrupt
                 h if h != SIG_DFL => return Some(sig as usize), // real handler runs
-                _ if is_default_ignored(sig) => {}         // dropped — no interrupt
-                _ => return None,                          // default terminate/stop
+                _ if is_default_ignored(sig) => {}              // dropped — no interrupt
+                _ => return None,                               // default terminate/stop
             }
         }
         None
@@ -453,7 +502,8 @@ impl Kernel {
     /// it (and `rt_sigreturn`) before the next pending signal is considered, so
     /// any others deliver at the following syscall boundary.
     pub(super) fn deliver_pending_signals(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         vcpu: &mut dyn crate::vcpu::Vcpu,
         mem: &mut GuestMemory,
     ) -> bool {
@@ -571,9 +621,9 @@ impl Kernel {
     const GREG_TO_GPR: [usize; GREG_COUNT] = [
         8, 9, 10, 11, 12, 13, 14, 15, // r8..r15
         7, 6, 5, 3, 2, 0, 1, // rdi rsi rbp rbx rdx rax rcx
-        4,  // rsp (index 15)
-        0,  // rip (index 16) — placeholder, written from vcpu.pc()
-        0,  // eflags (17)
+        4, // rsp (index 15)
+        0, // rip (index 16) — placeholder, written from vcpu.pc()
+        0, // eflags (17)
         0, 0, 0, 0, 0, // csgsfs, err, trapno, oldmask, cr2
     ];
 
@@ -587,7 +637,8 @@ impl Kernel {
     /// for stack-limit and null checks and to poll for VM interrupts — run at
     /// all: without it every such trap is a hard crash.
     pub(super) fn deliver_fault_signal(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         sig: u64,
         fault_addr: u64,
         vcpu: &mut dyn crate::vcpu::Vcpu,
@@ -614,8 +665,20 @@ impl Kernel {
         // trapno #PF(14)/#UD(6), si_code SEGV_MAPERR(1), si_addr = fault_addr,
         // and the handler's uc_sigmask is the *current* blocked mask (restored
         // by rt_sigreturn) — the fault path's original behavior, unchanged.
-        let si = SiFields { code: 1, addr: fault_addr, ..SiFields::default() }; // SEGV_MAPERR
-        self.push_sigframe(cx, sig, if sig == SIGSEGV { 14 } else { 6 }, si, cx.cur.blocked, vcpu, mem)
+        let si = SiFields {
+            code: 1,
+            addr: fault_addr,
+            ..SiFields::default()
+        }; // SEGV_MAPERR
+        self.push_sigframe(
+            cx,
+            sig,
+            if sig == SIGSEGV { 14 } else { 6 },
+            si,
+            cx.cur.blocked,
+            vcpu,
+            mem,
+        )
     }
 
     /// Deliver an *asynchronous* signal (posted by `kill`/`tgkill`/on-exit
@@ -627,7 +690,8 @@ impl Kernel {
     /// in progress its saved pre-call mask is the mask to restore on
     /// `rt_sigreturn`; otherwise the current blocked mask is restored.
     pub(super) fn deliver_async_signal(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         sig: u64,
         vcpu: &mut dyn crate::vcpu::Vcpu,
         mem: &mut GuestMemory,
@@ -685,7 +749,8 @@ impl Kernel {
     /// frame was built and the vcpu redirected.
     #[allow(clippy::unused_self, clippy::too_many_arguments)]
     fn push_sigframe(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         sig: u64,
         trapno: u64,
         si: SiFields,
@@ -727,8 +792,8 @@ impl Kernel {
         put(UC_OFF + 24, alt_flags); // ss_flags (+ padded size)
         put(UC_OFF + 32, alt_size); // ss_size
         for (i, &gpr) in Self::GREG_TO_GPR.iter().enumerate() {
-            #[allow(clippy::match_same_arms)] // each greg is a distinct field that happens to share a value
-
+            #[allow(clippy::match_same_arms)]
+            // each greg is a distinct field that happens to share a value
             let v = match i {
                 REG_RSP => cur_sp,
                 REG_RIP => vcpu.pc(),
@@ -758,7 +823,10 @@ impl Kernel {
             put(si_base - frame + 16, si_addr); // _sigfault: si_addr
         } else {
             // _rt: si_pid @16, si_uid @20, si_value @24 (8-byte union).
-            put(si_base - frame + 16, (si.pid & 0xffff_ffff) | (si.uid << 32));
+            put(
+                si_base - frame + 16,
+                (si.pid & 0xffff_ffff) | (si.uid << 32),
+            );
             put(si_base - frame + 24, si.value);
         }
 
@@ -803,7 +871,12 @@ impl Kernel {
     /// frame is at `rsp - 8` (the handler's trampoline `ret`'d off `pretcode`),
     /// so `uc_mcontext` is at a fixed offset below the current `rsp`.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_rt_sigreturn(&self, cx: &mut ServiceCtx, vcpu: &mut dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
+    pub(super) fn sys_rt_sigreturn(
+        &self,
+        cx: &mut ServiceCtx,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &GuestMemory,
+    ) {
         if self.arch == Arch::Aarch64 {
             return self.sys_rt_sigreturn_aarch64(cx, vcpu, mem);
         }
@@ -845,7 +918,8 @@ impl Kernel {
     /// at +256, `pc` at +264, `pstate` at +272.
     #[allow(clippy::unused_self)]
     fn push_sigframe_aarch64(
-        &self, cx: &mut ServiceCtx,
+        &self,
+        cx: &mut ServiceCtx,
         sig: u64,
         si: SiFields,
         restore_mask: u64,
@@ -946,7 +1020,12 @@ impl Kernel {
     /// points at the `rt_sigframe` base; restore the GPRs/sp/pc/pstate and the
     /// signal mask from `uc.uc_mcontext` / `uc.uc_sigmask`.
     #[allow(clippy::unused_self)]
-    fn sys_rt_sigreturn_aarch64(&self, cx: &mut ServiceCtx, vcpu: &mut dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
+    fn sys_rt_sigreturn_aarch64(
+        &self,
+        cx: &mut ServiceCtx,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &GuestMemory,
+    ) {
         let frame = vcpu.sp();
         let uc = frame + AA64_SIGINFO_SIZE;
         let mctx = uc + AA64_UC_MCONTEXT_OFF;

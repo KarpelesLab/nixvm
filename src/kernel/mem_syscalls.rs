@@ -67,7 +67,9 @@ impl Kernel {
     /// the old range is unmapped (best-effort relocate).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_mremap(
-        &self, sh: &mut Shared, cx: &mut ServiceCtx,
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
         old_addr: u64,
         old_size: u64,
         new_size: u64,
@@ -201,13 +203,7 @@ impl Kernel {
     /// mapped-but-untouched (demand-paged, lazy) page reports 0, matching Linux.
     /// A range with any unmapped page is rejected with ENOMEM.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_mincore(
-        &self,
-        addr: u64,
-        len: u64,
-        vec: u64,
-        mem: &mut GuestMemory,
-    ) -> i64 {
+    pub(super) fn sys_mincore(&self, addr: u64, len: u64, vec: u64, mem: &mut GuestMemory) -> i64 {
         if len == 0 {
             return 0;
         }
@@ -287,7 +283,12 @@ mod tests {
         // its mmap arena set up here.
         cx.cur.mm = 0;
         kernel.set_mmap_area(0x1_0000 + 16 * PAGE, 0x1_0000);
-        kernel.shared.get_mut().unwrap().mmap_areas.push(crate::kernel::Arena::new(0x1_0000 + 16 * PAGE, 0x1_0000));
+        kernel
+            .shared
+            .get_mut()
+            .unwrap()
+            .mmap_areas
+            .push(crate::kernel::Arena::new(0x1_0000 + 16 * PAGE, 0x1_0000));
         let mem = GuestMemory::new(0x1_0000, 16 * PAGE);
         (kernel, mem, cx)
     }
@@ -298,7 +299,16 @@ mod tests {
         // A 2-page mapping with 2 free pages after it.
         mem.map(0x1_0000, 2 * PAGE, Prot::rw()).unwrap();
 
-        let ret = k.sys_mremap(&mut k.shared.lock().unwrap(), &mut cx, 0x1_0000, 2 * PAGE, 4 * PAGE, 0, 0, &mut mem);
+        let ret = k.sys_mremap(
+            &mut k.shared.lock().unwrap(),
+            &mut cx,
+            0x1_0000,
+            2 * PAGE,
+            4 * PAGE,
+            0,
+            0,
+            &mut mem,
+        );
         assert_eq!(ret, 0x1_0000, "grow-in-place returns the same address");
 
         // The freshly grown page is usable.
@@ -312,7 +322,16 @@ mod tests {
         let (k, mut mem, mut cx) = setup();
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
 
-        let ret = k.sys_mremap(&mut k.shared.lock().unwrap(), &mut cx, 0x1_0000, 4 * PAGE, 2 * PAGE, 0, 0, &mut mem);
+        let ret = k.sys_mremap(
+            &mut k.shared.lock().unwrap(),
+            &mut cx,
+            0x1_0000,
+            4 * PAGE,
+            2 * PAGE,
+            0,
+            0,
+            &mut mem,
+        );
         assert_eq!(ret, 0x1_0000, "shrink returns the old address");
 
         // The tail is gone: an access there now faults.
@@ -333,7 +352,16 @@ mod tests {
         mem.map(0x1_1000, PAGE, Prot::rw()).unwrap();
         mem.write_u64(0x1_0000, 0x1122_3344).unwrap();
 
-        let ret = k.sys_mremap(&mut k.shared.lock().unwrap(), &mut cx, 0x1_0000, PAGE, 2 * PAGE, MREMAP_MAYMOVE, 0, &mut mem);
+        let ret = k.sys_mremap(
+            &mut k.shared.lock().unwrap(),
+            &mut cx,
+            0x1_0000,
+            PAGE,
+            2 * PAGE,
+            MREMAP_MAYMOVE,
+            0,
+            &mut mem,
+        );
         assert_ne!(ret, 0x1_0000, "MAYMOVE relocated the mapping");
         assert!(ret >= 0);
         // Old bytes were copied to the new region.
@@ -352,8 +380,14 @@ mod tests {
         mem.map(dst, PAGE, Prot::rw()).unwrap();
 
         let ret = k.sys_mremap(
-            &mut k.shared.lock().unwrap(), &mut cx,
-            0x1_0000, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED, dst, &mut mem,
+            &mut k.shared.lock().unwrap(),
+            &mut cx,
+            0x1_0000,
+            PAGE,
+            PAGE,
+            MREMAP_MAYMOVE | MREMAP_FIXED,
+            dst,
+            &mut mem,
         );
         assert_eq!(ret, dst as i64, "MREMAP_FIXED lands at the requested addr");
         // Content moved to the destination; the source is unmapped.
@@ -416,17 +450,38 @@ mod tests {
         let mut v = DummyVcpu;
         // MS_SYNC(4) | MS_ASYNC(1) together is mutually exclusive → EINVAL.
         assert_eq!(
-            k.dispatch(&mut cx, Sysno::Msync, 0, &[0, PAGE, 5, 0, 0, 0], &mut v, &mut mem),
+            k.dispatch(
+                &mut cx,
+                Sysno::Msync,
+                0,
+                &[0, PAGE, 5, 0, 0, 0],
+                &mut v,
+                &mut mem
+            ),
             err(Errno::EINVAL),
         );
         // An unknown flag bit → EINVAL.
         assert_eq!(
-            k.dispatch(&mut cx, Sysno::Msync, 0, &[0, PAGE, 0x10, 0, 0, 0], &mut v, &mut mem),
+            k.dispatch(
+                &mut cx,
+                Sysno::Msync,
+                0,
+                &[0, PAGE, 0x10, 0, 0, 0],
+                &mut v,
+                &mut mem
+            ),
             err(Errno::EINVAL),
         );
         // MS_SYNC alone is fine (no shared maps: a plain no-op success).
         assert_eq!(
-            k.dispatch(&mut cx, Sysno::Msync, 0, &[0, PAGE, 4, 0, 0, 0], &mut v, &mut mem),
+            k.dispatch(
+                &mut cx,
+                Sysno::Msync,
+                0,
+                &[0, PAGE, 4, 0, 0, 0],
+                &mut v,
+                &mut mem
+            ),
             0,
         );
     }
@@ -443,7 +498,11 @@ mod tests {
             Sysno::Munlockall,
             Sysno::Msync,
         ] {
-            assert_eq!(k.dispatch(&mut cx, s, 0, &[0; 6], &mut v, &mut mem), 0, "{s:?}");
+            assert_eq!(
+                k.dispatch(&mut cx, s, 0, &[0; 6], &mut v, &mut mem),
+                0,
+                "{s:?}"
+            );
         }
     }
 }

@@ -52,7 +52,9 @@ impl Node {
 static GUEST_NPROC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 fn nproc() -> usize {
-    GUEST_NPROC.load(std::sync::atomic::Ordering::Relaxed).max(1)
+    GUEST_NPROC
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1)
 }
 
 /// Render a CPU index set the way `sysfs` bitmap-list files do: `"0\n"` for a

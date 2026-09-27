@@ -172,6 +172,9 @@ mod tests {
     #[test]
     fn now_is_after_2020() {
         // A very loose sanity bound: the host clock reads as a real date.
-        assert!(now_unix().as_secs() > 1_577_836_800, "clock reads as post-2020");
+        assert!(
+            now_unix().as_secs() > 1_577_836_800,
+            "clock reads as post-2020"
+        );
     }
 }

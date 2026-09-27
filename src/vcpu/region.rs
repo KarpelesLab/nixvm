@@ -53,7 +53,12 @@ mod sys {
     use std::ffi::c_void;
     unsafe extern "C" {
         pub fn mmap(
-            addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64,
+            addr: *mut c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            off: i64,
         ) -> *mut c_void;
         pub fn munmap(addr: *mut c_void, len: usize) -> i32;
         pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
@@ -103,13 +108,20 @@ impl Region {
                 0,
             )
         };
-        assert!(raw != sys::MAP_FAILED, "mmap {map_len} bytes of guest RAM failed");
+        assert!(
+            raw != sys::MAP_FAILED,
+            "mmap {map_len} bytes of guest RAM failed"
+        );
         let base = (raw as usize).next_multiple_of(HOST_PAGE) as *mut u8;
         // Best-effort: keep a sparsely-touched pool from being backed by 2 MiB THP
         // pages (which would commit far more than the guest actually touches).
         // SAFETY: `[base, base+len)` is within the fresh mapping.
         unsafe { sys::madvise(base.cast::<c_void>(), len, sys::MADV_NOHUGEPAGE) };
-        Self { ptr: base, len, map: (raw.cast::<u8>(), map_len) }
+        Self {
+            ptr: base,
+            len,
+            map: (raw.cast::<u8>(), map_len),
+        }
     }
 
     /// Non-unix fallback: an eager, zero-filled, aligned allocation.

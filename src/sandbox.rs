@@ -317,7 +317,11 @@ impl Sandbox {
         })?;
 
         let arch = self.config.arch;
-        let mut mem = GuestMemory::new_split(GUEST_BASE, GUEST_VSIZE, round_up_page(self.config.mem_bytes));
+        let mut mem = GuestMemory::new_split(
+            GUEST_BASE,
+            GUEST_VSIZE,
+            round_up_page(self.config.mem_bytes),
+        );
         let spec = ProcessSpec {
             argv: argv.clone(),
             envp: self.env(),
@@ -425,7 +429,11 @@ impl Sandbox {
     /// and embeddable ahead of that.
     pub fn exec_elf(&self, elf: &[u8]) -> Result<i32, Error> {
         let arch = self.config.arch;
-        let mut mem = GuestMemory::new_split(GUEST_BASE, GUEST_VSIZE, round_up_page(self.config.mem_bytes));
+        let mut mem = GuestMemory::new_split(
+            GUEST_BASE,
+            GUEST_VSIZE,
+            round_up_page(self.config.mem_bytes),
+        );
 
         let argv = if self.config.command.is_empty() {
             vec!["prog".to_string()]

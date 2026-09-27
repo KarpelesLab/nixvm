@@ -31,7 +31,7 @@ fn rand_f64(rng: &mut Rng) -> u64 {
     let r = rng.next();
     let sign = (r & 1) << 63;
     match r % 16 {
-        0 => r, // fully random: includes inf/NaN/subnormal
+        0 => r,                                      // fully random: includes inf/NaN/subnormal
         1 => sign | ((r >> 8) & 0xf_ffff_ffff_ffff), // subnormal (exp field 0)
         2 => sign | (0x7fe << 52) | ((r >> 8) & 0xf_ffff_ffff_ffff), // near overflow
         3 => sign | (0x001 << 52) | ((r >> 8) & 0xf_ffff_ffff_ffff), // near underflow
@@ -134,8 +134,14 @@ fn conversions_match_native() {
     let mut rng = Rng(0xdead_beef_cafe_babe);
     for _ in 0..iters() {
         let v = rng.next() as i64;
-        assert!(same_f64(i64_to_f64(v, Round::Nearest).0, v as f64), "i64->f64 {v}");
-        assert!(same_f32(i64_to_f32(v, Round::Nearest).0, v as f32), "i64->f32 {v}");
+        assert!(
+            same_f64(i64_to_f64(v, Round::Nearest).0, v as f64),
+            "i64->f64 {v}"
+        );
+        assert!(
+            same_f32(i64_to_f32(v, Round::Nearest).0, v as f32),
+            "i64->f32 {v}"
+        );
 
         let a = rand_f64(&mut rng);
         // f64->f32 narrowing (RNE) must match native `as f32`.
@@ -161,7 +167,7 @@ fn f64_to_int_truncates_like_x86() {
         (-2.9, -2),
         (1e18, 1_000_000_000_000_000_000),
         (-1e18, -1_000_000_000_000_000_000),
-        (9.3e18, i64::MIN),       // overflow -> indefinite
+        (9.3e18, i64::MIN), // overflow -> indefinite
         (f64::NAN, i64::MIN),
         (f64::INFINITY, i64::MIN),
     ];
@@ -197,7 +203,11 @@ fn directed_rounding_negative_and_flags() {
     let down = f64_op(a, three, Op::Div, Round::Down).0; // toward -inf: away from zero
     let zero = f64_op(a, three, Op::Div, Round::Zero).0;
     assert_eq!(up, zero, "negative: toward +inf == toward zero");
-    assert_eq!(down, up.wrapping_add(1), "toward -inf is one ulp more negative (larger magnitude)");
+    assert_eq!(
+        down,
+        up.wrapping_add(1),
+        "toward -inf is one ulp more negative (larger magnitude)"
+    );
 
     // Inexact flag is set for 1/3; exact ops don't set it.
     let (_, f_inexact) = f64_op(1.0f64.to_bits(), three, Op::Div, Round::Nearest);
@@ -214,7 +224,10 @@ fn directed_rounding_negative_and_flags() {
 fn overflow_respects_direction() {
     let big = f64::MAX.to_bits();
     // MAX + MAX overflows: RNE -> +inf; toward zero -> stays MAX.
-    assert_eq!(f64_op(big, big, Op::Add, Round::Nearest).0, f64::INFINITY.to_bits());
+    assert_eq!(
+        f64_op(big, big, Op::Add, Round::Nearest).0,
+        f64::INFINITY.to_bits()
+    );
     assert_eq!(f64_op(big, big, Op::Add, Round::Zero).0, f64::MAX.to_bits());
     // Toward -inf keeps MAX for a positive overflow.
     assert_eq!(f64_op(big, big, Op::Add, Round::Down).0, f64::MAX.to_bits());
@@ -259,7 +272,11 @@ fn f32_directed_rounding_matches_reference() {
             let down = f32::from_bits(f32_op(a, b, op, Round::Down).0);
             let up = f32::from_bits(f32_op(a, b, op, Round::Up).0);
             let zero = f32::from_bits(f32_op(a, b, op, Round::Zero).0);
-            assert_eq!(down.to_bits(), down_ref.to_bits(), "{op:?} down {a:#x} {b:#x}");
+            assert_eq!(
+                down.to_bits(),
+                down_ref.to_bits(),
+                "{op:?} down {a:#x} {b:#x}"
+            );
             assert_eq!(up.to_bits(), up_ref.to_bits(), "{op:?} up {a:#x} {b:#x}");
             // Toward zero == toward the smaller magnitude neighbour.
             let zref = if v >= 0.0 { down_ref } else { up_ref };
@@ -293,7 +310,10 @@ fn f80_round_trips_and_computes() {
     for _ in 0..iters() {
         let a = rand_f64(&mut rng);
         let back = F80::from_f64(a).to_f64_round(Round::Nearest).0;
-        assert!(same_f64(back, f64::from_bits(a)), "f80 round-trip {a:#018x}");
+        assert!(
+            same_f64(back, f64::from_bits(a)),
+            "f80 round-trip {a:#018x}"
+        );
     }
     // A computation carrying more than 53 bits: (1 + 2^-60) done at 80-bit and
     // narrowed back to f64 keeps the extra bit that pure-f64 would have lost.

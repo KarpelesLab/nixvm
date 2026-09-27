@@ -1655,7 +1655,8 @@ impl Aarch64Interp {
             for i in 0..regs {
                 // Registers wrap around the 32-entry SIMD file (v31 -> v0).
                 let vt = (rt + i) & 31;
-                let step = self.ldst_vec(base.wrapping_add(i as u64 * nbytes), scale, l == 1, vt, mem);
+                let step =
+                    self.ldst_vec(base.wrapping_add(i as u64 * nbytes), scale, l == 1, vt, mem);
                 if !matches!(step, Step::Next) {
                     return step;
                 }

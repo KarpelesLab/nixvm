@@ -217,7 +217,13 @@ impl Kernel {
     /// real-time priority (self only; other pids aren't modeled). Reported back
     /// by `sched_getscheduler`/`sched_getparam`.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_sched_setscheduler(&self, cx: &mut ServiceCtx, policy: i32, param: u64, mem: &GuestMemory) -> i64 {
+    pub(super) fn sys_sched_setscheduler(
+        &self,
+        cx: &mut ServiceCtx,
+        policy: i32,
+        param: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
         cx.cur.sched_policy = policy;
         if param != 0
             && let Ok(prio) = mem.read_u32(param)
@@ -239,7 +245,13 @@ impl Kernel {
     /// `sched_setaffinity(pid, cpusetsize, mask)` — record the affinity mask
     /// (self only). `sched_getaffinity` reports it back.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_sched_setaffinity(&self, cx: &mut ServiceCtx, size: u64, mask: u64, mem: &GuestMemory) -> i64 {
+    pub(super) fn sys_sched_setaffinity(
+        &self,
+        cx: &mut ServiceCtx,
+        size: u64,
+        mask: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
         let n = (size as usize).min(8);
         if n == 0 {
             return err(Errno::EINVAL);
@@ -261,7 +273,12 @@ impl Kernel {
     /// name (`PR_SET_NAME`/`PR_GET_NAME`, stored on the kernel) and treat every
     /// other option as a successful no-op.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_prctl(&self, cx: &mut ServiceCtx, args: &[u64; 6], mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_prctl(
+        &self,
+        cx: &mut ServiceCtx,
+        args: &[u64; 6],
+        mem: &mut GuestMemory,
+    ) -> i64 {
         const PR_SET_PDEATHSIG: u64 = 1;
         const PR_GET_PDEATHSIG: u64 = 2;
         const PR_SET_NAME: u64 = 15;
@@ -301,7 +318,10 @@ impl Kernel {
                 0
             }
             PR_GET_PDEATHSIG => {
-                if mem.write(args[1], &(cx.cur.pdeathsig as i32).to_le_bytes()).is_err() {
+                if mem
+                    .write(args[1], &(cx.cur.pdeathsig as i32).to_le_bytes())
+                    .is_err()
+                {
                     return err(Errno::EFAULT);
                 }
                 0
@@ -354,13 +374,20 @@ impl Kernel {
     /// system time); the remaining counters (maxrss, faults, context switches)
     /// stay zero. `RUSAGE_CHILDREN` reports nothing (child accounting isn't
     /// tracked). Called with `sh` held (the B1 dispatch table).
-    pub(super) fn sys_getrusage(&self, sh: &Shared, cx: &ServiceCtx, who: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_getrusage(
+        &self,
+        sh: &Shared,
+        cx: &ServiceCtx,
+        who: u64,
+        buf: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         // `who` is a 32-bit `int`: RUSAGE_SELF(0), RUSAGE_CHILDREN(-1),
         // RUSAGE_THREAD(1). Read it via `as i32` so a `-1` the guest passed as a
         // zero-extended `0xFFFF_FFFF` is recognized.
         let cpu_ns = match who as i32 {
-            1 => cx.cur.cpu_ns,             // RUSAGE_THREAD
-            -1 => cx.cur.child_cpu_ns,      // RUSAGE_CHILDREN: reaped children's CPU
+            1 => cx.cur.cpu_ns,                 // RUSAGE_THREAD
+            -1 => cx.cur.child_cpu_ns,          // RUSAGE_CHILDREN: reaped children's CPU
             _ => super::process_cpu_ns(sh, cx), // RUSAGE_SELF (0) and anything else
         };
         if mem.write(buf, &super::rusage_bytes(cpu_ns)).is_err() {
@@ -374,10 +401,17 @@ impl Kernel {
     /// (10 ms), as on Linux. `tms_utime` carries the process CPU time (the same
     /// per-task accounting as `getrusage`/`clock_gettime`); system and children
     /// fields are zero. Called with `sh` held.
-    pub(super) fn sys_times(&self, sh: &Shared, cx: &ServiceCtx, buf: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_times(
+        &self,
+        sh: &Shared,
+        cx: &ServiceCtx,
+        buf: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         const TICK_NS: u128 = 10_000_000; // 1 tick = 10 ms (USER_HZ = 100)
         let mut tms = [0u8; 32];
-        tms[0..8].copy_from_slice(&((super::process_cpu_ns(sh, cx) / TICK_NS) as i64).to_le_bytes()); // tms_utime
+        tms[0..8]
+            .copy_from_slice(&((super::process_cpu_ns(sh, cx) / TICK_NS) as i64).to_le_bytes()); // tms_utime
         // tms_stime stays zero; tms_cutime carries reaped children's CPU.
         tms[16..24].copy_from_slice(&((cx.cur.child_cpu_ns / TICK_NS) as i64).to_le_bytes()); // tms_cutime
         // tms_cstime stays zero.
@@ -549,6 +583,9 @@ mod tests {
         assert_eq!(k.sys_prctl(&mut cx, &[4, 0, 0, 0, 0, 0], &mut mem), 0);
         assert_eq!(k.sys_prctl(&mut cx, &[3, 0, 0, 0, 0, 0], &mut mem), 0);
         // Out-of-range set is rejected.
-        assert_eq!(k.sys_prctl(&mut cx, &[4, 3, 0, 0, 0, 0], &mut mem), err(Errno::EINVAL));
+        assert_eq!(
+            k.sys_prctl(&mut cx, &[4, 3, 0, 0, 0, 0], &mut mem),
+            err(Errno::EINVAL)
+        );
     }
 }

@@ -124,7 +124,8 @@ mod native {
         fn connect_tcp(&self, ip: [u8; 16], v6: bool, port: u16) -> io::Result<Box<dyn HostConn>> {
             // A bounded blocking connect (the guest is mid-`connect()`), then
             // switch to non-blocking for all subsequent I/O.
-            let stream = TcpStream::connect_timeout(&sockaddr(ip, v6, port), Duration::from_secs(10))?;
+            let stream =
+                TcpStream::connect_timeout(&sockaddr(ip, v6, port), Duration::from_secs(10))?;
             stream.set_nonblocking(true)?;
             let _ = stream.set_nodelay(true);
             Ok(Box::new(TcpConn(stream)))

@@ -22,8 +22,8 @@
 //! the CPU pushes onto the kernel stack.
 
 use super::mem::{PAGE_SIZE, Prot};
-use super::phys::{FrameAllocator, PhysMem};
 use super::pagetable::AddrSpace;
+use super::phys::{FrameAllocator, PhysMem};
 
 /// Top of the (old) identity window; the control block sits just below it, so
 /// its virtual addresses stay far above any guest user mapping.
@@ -86,8 +86,7 @@ pub const SEL_KDATA: u16 = 0x10;
 pub const SEL_UDATA: u16 = 0x18 | 3;
 pub const SEL_UCODE: u16 = 0x20 | 3;
 /// `IA32_STAR`: `sysretq` base selector in [63:48], `syscall` CS in [47:32].
-pub const STAR_VALUE: u64 =
-    (((SEL_UDATA as u64 & !3) - 8) | 3) << 48 | (SEL_KCODE as u64) << 32;
+pub const STAR_VALUE: u64 = (((SEL_UDATA as u64 & !3) - 8) | 3) << 48 | (SEL_KCODE as u64) << 32;
 /// GDTR limit: 5 segment descriptors + a 16-byte TSS descriptor.
 pub const GDT_LIMIT: u16 = 7 * 8 - 1;
 
@@ -115,11 +114,26 @@ struct Page {
 
 /// The five shared pages, in physical order starting at [`CTRL_PHYS_BASE`].
 const PAGES: [Page; 5] = [
-    Page { voff: GDT_OFF, prot: Prot::rw() },
-    Page { voff: TRAMP_OFF, prot: Prot::rx() },
-    Page { voff: FAULT_TRAMP_OFF, prot: Prot::rx() },
-    Page { voff: IDT_OFF, prot: Prot::rw() },
-    Page { voff: TSS_OFF, prot: Prot::rw() },
+    Page {
+        voff: GDT_OFF,
+        prot: Prot::rw(),
+    },
+    Page {
+        voff: TRAMP_OFF,
+        prot: Prot::rx(),
+    },
+    Page {
+        voff: FAULT_TRAMP_OFF,
+        prot: Prot::rx(),
+    },
+    Page {
+        voff: IDT_OFF,
+        prot: Prot::rw(),
+    },
+    Page {
+        voff: TSS_OFF,
+        prot: Prot::rw(),
+    },
 ];
 
 /// Physical address of the control-block page at physical index `i`.
@@ -192,7 +206,14 @@ pub fn reserve_and_build(fa: &mut FrameAllocator, phys: &PhysMem) {
 /// frame. Called once after the vcpu is created and the TSC is read, before the
 /// guest runs. A non-zero `mult` also arms the vDSO fast path (it treats
 /// `mult == 0` as "not calibrated" and uses the syscall instead).
-pub fn write_vvar(phys: &PhysMem, mult: u64, shift: u64, base_tsc: u64, base_mono_ns: u64, base_wall_ns: u64) {
+pub fn write_vvar(
+    phys: &PhysMem,
+    mult: u64,
+    shift: u64,
+    base_tsc: u64,
+    base_mono_ns: u64,
+    base_wall_ns: u64,
+) {
     use super::vdso::vvar;
     let pa = frame_pa(VVAR_FIDX);
     phys.write(pa + vvar::MULT, &mult.to_le_bytes());

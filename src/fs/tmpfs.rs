@@ -339,8 +339,8 @@ impl MountFs for TmpFs {
         // device/socket nodes report EPERM, matching an unprivileged mknod.
         let typ = mode & 0o170_000;
         let node_kind = match typ {
-            0 | S_IFREG => false, // regular file
-            S_IFIFO => true,      // fifo
+            0 | S_IFREG => false,                             // regular file
+            S_IFIFO => true,                                  // fifo
             _ => return Err(io::Error::from_raw_os_error(1)), // EPERM
         };
         self.require_parent(rel)?;
