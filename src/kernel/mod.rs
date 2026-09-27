@@ -2,7 +2,7 @@
 //! and schedules multiple guest processes.
 //!
 //! State is split between **global** kernel state (mount table, pipes, stdio,
-//! process table) and the **running task's** state ([`ServiceCtx`]: its
+//! process table) and the **running task's** state (`ServiceCtx`: its
 //! `ProcInfo` — fds, cwd, brk, mmap arena, pid — plus the per-syscall `block`/
 //! `yield_now`/`exec_ok` flags). The servicer owns a `ServiceCtx` for the
 //! duration of a slice (built from the task's `ProcInfo`, restored after), and
@@ -51,6 +51,7 @@ const SYMLINK_MAX: u32 = 40;
 
 /// Per-process kernel-side state (swapped into `Kernel::cur` while running).
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
 struct ProcInfo {
     fds: FdTable,
     /// Current working directory. Shared across a `CLONE_FS` group via
@@ -991,11 +992,11 @@ impl ServiceCtx {
 }
 
 /// The kernel: immutable-during-servicing config plus the coarse lock over all
-/// mutable state ([`Shared`]).
+/// mutable state (`Shared`).
 ///
 /// Only the config fields live directly on `Kernel` (written just by `new`/the
 /// pre-boot `set_*` setters, never during servicing); everything mutated while
-/// servicing a syscall lives in [`Shared`] behind `shared`. Servicing therefore
+/// servicing a syscall lives in `Shared` behind `shared`. Servicing therefore
 /// takes `&self` + `&mut Shared` (B1): still exactly one coarse lock held for
 /// one syscall at a time (the "big kernel lock"), but with the `&mut Kernel`
 /// requirement gone so later steps can peel individual subsystems onto their own
@@ -1439,7 +1440,7 @@ impl Kernel {
     /// Set the initial anonymous-`mmap` arena for the first process. `top` is
     /// the initial stack's low bound; the arena is placed a guard gap below it
     /// so an unmapped region separates the stack from any `mmap` — see
-    /// [`STACK_GUARD_GAP`].
+    /// `STACK_GUARD_GAP`.
     pub fn set_mmap_area(&mut self, top: u64, floor: u64) {
         self.seed.stack_limit = top; // `top` is the stack's growth floor
         self.seed.mmap_cursor = arena_top(top, floor);
@@ -1458,7 +1459,7 @@ impl Kernel {
     }
 
     /// Set pid 1's launch `argv`, backing `/proc/self/cmdline` and the initial
-    /// `comm` (argv[0]'s basename). Later `execve`s refresh both themselves.
+    /// `comm` (`argv[0]`'s basename). Later `execve`s refresh both themselves.
     pub fn set_cmdline<I, S>(&mut self, argv: I)
     where
         I: IntoIterator<Item = S>,
@@ -1642,7 +1643,7 @@ impl Kernel {
     /// Enable interactive mode: guest reads of fd 0 draw from the buffer fed via
     /// [`Kernel::feed_stdin`] and block when empty, instead of the host stdin.
     /// Mark the guest's stdio as the host process's own, so terminal ioctls are
-    /// forwarded to the real host tty (see [`Kernel::host_tty`]). The `nixvm run`
+    /// forwarded to the real host tty (see `Kernel::host_tty`). The `nixvm run`
     /// CLI sets this; capture/redirect paths leave it clear.
     pub fn set_host_tty(&mut self, yes: bool) {
         self.host_tty = yes;
@@ -1837,24 +1838,24 @@ impl Kernel {
                 // and the handler must run now. (A default-*terminate* signal is
                 // handled by the `Zombie` check below, which wins over `block`;
                 // `SIG_IGN`/default-ignored signals correctly leave it blocked.)
-                if cx.block {
-                    if let Some(sig) = self.first_handled_signal(cx) {
-                        cx.block = false;
-                        if cx.cur.handlers[sig].flags & SA_RESTART != 0 && cx.restartable {
-                            // Re-run the `syscall` once the handler returns; the
-                            // re-run re-establishes any wait bookkeeping (e.g. a
-                            // futex's), so leave it in place.
-                            cx.restart_syscall = true;
-                        } else {
-                            ret = err(Errno::EINTR);
-                            // Abandoning the syscall (not restarting): drop the
-                            // futex-wait bookkeeping so a later FUTEX_WAKE on the
-                            // old address can't spuriously flag this now-running
-                            // task. (`wake_deadline` is cleared below since the
-                            // syscall no longer blocks.)
-                            cx.cur.futex_wait = None;
-                            cx.cur.futex_woken = false;
-                        }
+                if cx.block
+                    && let Some(sig) = self.first_handled_signal(cx)
+                {
+                    cx.block = false;
+                    if cx.cur.handlers[sig].flags & SA_RESTART != 0 && cx.restartable {
+                        // Re-run the `syscall` once the handler returns; the
+                        // re-run re-establishes any wait bookkeeping (e.g. a
+                        // futex's), so leave it in place.
+                        cx.restart_syscall = true;
+                    } else {
+                        ret = err(Errno::EINTR);
+                        // Abandoning the syscall (not restarting): drop the
+                        // futex-wait bookkeeping so a later FUTEX_WAKE on the
+                        // old address can't spuriously flag this now-running
+                        // task. (`wake_deadline` is cleared below since the
+                        // syscall no longer blocks.)
+                        cx.cur.futex_wait = None;
+                        cx.cur.futex_woken = false;
                     }
                 }
                 // Land the syscall's result in the vcpu *before* delivering any
@@ -1919,17 +1920,14 @@ impl Kernel {
                 // stale mapping would be used. `flush_tlb` is a no-op for the
                 // interpreter (no TLB) and a not-present demand fault leaves no
                 // stale entry, but flushing uniformly keeps the seam simple.
-                if mem.demand_fault(addr) {
-                    vcpu.flush_tlb();
-                    Serviced::Resume
-                }
+                //
                 // A write fault on a copy-on-write page is resolved by
                 // privatizing the page and re-running the instruction (the vcpu
                 // left PC on the faulting store). Anything else — a read fault, a
                 // write to read-only/unmapped memory, or an already-private page
                 // — is a genuine segfault. This is the software mirror of a
                 // hardware MMU's page-fault-driven COW.
-                else if mem.cow_fault(addr, write) {
+                if mem.demand_fault(addr) || mem.cow_fault(addr, write) {
                     vcpu.flush_tlb();
                     Serviced::Resume
                 } else if self.grow_stack(cx, addr, mem) {
@@ -2678,7 +2676,7 @@ impl Kernel {
             // signalfd4(fd, mask, sizemask, flags): a real signal-reading fd. The
             // `fd` is a 32-bit int (`-1` = create), read via `as i32`.
             Sysno::Signalfd4 => {
-                self.sys_signalfd4(pf, cx, args[0] as i32 as i64, args[1], args[3], mem)
+                self.sys_signalfd4(pf, cx, i64::from(args[0] as i32), args[1], args[3], mem)
             }
             // Unreachable: `dispatch_impl` only routes the syscalls above here.
             _ => unreachable!("dispatch_pollfds: {sys:?} is not a pollfds-only syscall"),
@@ -2774,7 +2772,7 @@ impl Kernel {
             // legacy chmod(path, mode) vs fchmodat(dirfd, path, mode, flags).
             Sysno::Chmod => self.sys_fchmodat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
             Sysno::Fchmodat => {
-                self.sys_fchmodat(vfs, cx, args[0] as i32 as i64, args[1], args[2], mem)
+                self.sys_fchmodat(vfs, cx, i64::from(args[0] as i32), args[1], args[2], mem)
             }
             Sysno::Fchmod => self.sys_fchmod(vfs, cx, args[0], args[1]),
             // chown follows symlinks; lchown acts on the link (AT_SYMLINK_NOFOLLOW=0x100).
@@ -2785,7 +2783,7 @@ impl Kernel {
             Sysno::Fchownat => self.sys_fchownat(
                 vfs,
                 cx,
-                args[0] as i32 as i64,
+                i64::from(args[0] as i32),
                 args[1],
                 args[2],
                 args[3],
@@ -2797,7 +2795,7 @@ impl Kernel {
             // glibc's mknod with S_IFIFO. `dev` is ignored (no device nodes).
             Sysno::Mknod => self.sys_mknodat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
             Sysno::Mknodat => {
-                self.sys_mknodat(vfs, cx, args[0] as i32 as i64, args[1], args[2], mem)
+                self.sys_mknodat(vfs, cx, i64::from(args[0] as i32), args[1], args[2], mem)
             }
             Sysno::Unlink => self.sys_unlinkat(vfs, cx, AT_FDCWD, args[0], 0, mem),
             Sysno::Rmdir => {
@@ -2919,7 +2917,7 @@ impl Kernel {
             Sysno::Setsid => self.sys_setsid(cx),
             Sysno::Getsid => self.sys_getsid(sh, cx, args[0] as i32),
             // Process lifecycle.
-            Sysno::Waitid => self.sys_waitid(sh, cx, args[0], args[1] as i32 as i64, args[2], args[3], args[4], mem),
+            Sysno::Waitid => self.sys_waitid(sh, cx, args[0], i64::from(args[1] as i32), args[2], args[3], args[4], mem),
             Sysno::Clone3 => self.sys_clone3(sh, cx, args[0], args[1], vcpu, mem),
             Sysno::Execveat => {
                 self.sys_execveat(sh, cx, args[0] as i64, args[1], args[2], args[3], args[4], vcpu, mem)
@@ -2991,7 +2989,7 @@ impl Kernel {
             Sysno::Execve => self.sys_execve(sh, cx, args[0], args[1], args[2], vcpu, mem),
             // `pid` is a 32-bit int: `as i32 as i64` sign-extends a `-1` the guest
             // passed as a zero-extended `0xFFFF_FFFF` (else `waitpid(-1)` breaks).
-            Sysno::Wait4 => self.sys_wait4(sh, cx, args[0] as i32 as i64, args[1], args[2], args[3], mem),
+            Sysno::Wait4 => self.sys_wait4(sh, cx, i64::from(args[0] as i32), args[1], args[2], args[3], mem),
             Sysno::Exit => self.sys_exit(sh, cx, args[0] as i32, mem),
             Sysno::ExitGroup => self.sys_exit_group(sh, cx, args[0] as i32, mem),
             Sysno::RtSigaction => self.sys_rt_sigaction(cx, args[0], args[1], args[2], mem),
@@ -3009,13 +3007,13 @@ impl Kernel {
             Sysno::RtSigtimedwait => self.sys_rt_sigtimedwait(cx, args[0], args[1], args[2], mem),
             // `pid`/`tid` is a 32-bit int: `as i32 as i64` recovers a negative
             // `kill(-pgrp)` the guest passed zero-extended as `0xFFFF_FFFF`.
-            Sysno::Kill | Sysno::Tkill => self.sys_kill(sh, cx, args[0] as i32 as i64, args[1]),
-            Sysno::Tgkill => self.sys_kill(sh, cx, args[1] as i32 as i64, args[2]),
+            Sysno::Kill | Sysno::Tkill => self.sys_kill(sh, cx, i64::from(args[0] as i32), args[1]),
+            Sysno::Tgkill => self.sys_kill(sh, cx, i64::from(args[1] as i32), args[2]),
             // sigqueue/pthread_sigqueue: deliver the signal and carry its
             // siginfo (si_code/si_value) so an SA_SIGINFO handler sees the real
             // payload. tgsigqueueinfo targets a tid (args: tgid, tid, sig, uinfo).
-            Sysno::RtSigqueueinfo => self.sys_rt_sigqueueinfo(sh, cx, args[0] as i32 as i64, args[1], args[2], mem),
-            Sysno::RtTgsigqueueinfo => self.sys_rt_sigqueueinfo(sh, cx, args[1] as i32 as i64, args[2], args[3], mem),
+            Sysno::RtSigqueueinfo => self.sys_rt_sigqueueinfo(sh, cx, i64::from(args[0] as i32), args[1], args[2], mem),
+            Sysno::RtTgsigqueueinfo => self.sys_rt_sigqueueinfo(sh, cx, i64::from(args[1] as i32), args[2], args[3], mem),
             // getpid = thread-group id; gettid = this task's id.
             Sysno::Getpid => i64::from(cx.cur.tgid),
             Sysno::Gettid => i64::from(cx.cur.pid),
@@ -3057,7 +3055,7 @@ impl Kernel {
             // getpriority returns the kernel ABI value 20 - nice (glibc converts
             // it back to the nice value); setpriority records the nice.
             Sysno::Getpriority => i64::from(20 - cx.cur.nice),
-            Sysno::Setpriority => self.sys_setpriority(cx, args[2] as i32 as i64),
+            Sysno::Setpriority => self.sys_setpriority(cx, i64::from(args[2] as i32)),
             // arch_prctl(ARCH_SET_FS) — how an x86-64 guest installs its TLS
             // register (FS.base; aarch64 uses the MSR-like TPIDR_EL0 via
             // CLONE_SETTLS instead, so this arm only ever fires for x86-64).
@@ -3572,6 +3570,7 @@ impl Kernel {
     /// `wait4(pid, wstatus, options, rusage)` — reap a zombie child, honoring the
     /// `pid` filter (`>0` a specific child, `-1` any, `0` the caller's group,
     /// `<-1` group `-pid`) and filling `rusage` with the child's CPU time.
+    #[allow(clippy::unused_self, clippy::too_many_arguments)]
     fn sys_wait4(
         &self,
         sh: &mut Shared,
@@ -4146,7 +4145,7 @@ impl Kernel {
             if slot.info.ppid == me && slot.info.pid != me {
                 slot.info.ppid = 1;
                 let ds = slot.info.pdeathsig;
-                if ds >= 1 && ds <= 64 {
+                if (1..=64).contains(&ds) {
                     slot.info.pending |= 1u64 << (ds - 1);
                     slot.info.parked = false;
                 }
@@ -4482,6 +4481,7 @@ impl Kernel {
     /// foreground-group `^C`/`^\`/`^Z` path) and un-park them so a blocked
     /// `read`/`wait` re-checks. The signalling task's own `cur` is out of
     /// `sh.procs` during its slice, so it is handled separately.
+    #[allow(clippy::unused_self)]
     fn signal_pgrp(&self, sh: &mut Shared, cx: &mut ServiceCtx, pgrp: i32, sig: u32) {
         if sig == 0 || u64::from(sig) > signal::NSIG {
             return;
@@ -4739,6 +4739,7 @@ impl Kernel {
     /// - `VMIN>0`: block until at least `VMIN` bytes are available (as Linux does
     ///   for `VTIME==0`), then return them. `VTIME` acts as an inter-byte timer
     ///   once some data has arrived.
+    #[allow(clippy::too_many_arguments)]
     fn read_pty_slave_noncanon(
         &self,
         cx: &mut ServiceCtx,
@@ -4785,13 +4786,12 @@ impl Kernel {
             cx.block = true; // VMIN>0/VTIME==0: wait for VMIN bytes
             return 0;
         }
-        let deadline = match cx.cur.wake_deadline {
-            Some(dl) => dl,
-            None => {
-                let dl = poll::now_ns() + u128::from(vtime_ds) * 100_000_000; // deciseconds → ns
-                cx.cur.wake_deadline = Some(dl);
-                dl
-            }
+        let deadline = if let Some(dl) = cx.cur.wake_deadline {
+            dl
+        } else {
+            let dl = poll::now_ns() + u128::from(vtime_ds) * 100_000_000; // deciseconds → ns
+            cx.cur.wake_deadline = Some(dl);
+            dl
         };
         if poll::now_ns() >= deadline {
             // Timed out: return whatever is buffered (0 for VMIN==0).
@@ -5852,7 +5852,7 @@ impl Kernel {
                         let mut net = self.net.lock().unwrap();
                         self.socket_readable_bytes(&mut net, *sock, *end)
                     }
-                    Fd::Stdin => 0, // host stdin count is not tracked
+                    // Host stdin's count is not tracked, nor any other kind's.
                     _ => 0,
                 };
                 let v = u32::try_from(bytes).unwrap_or(u32::MAX);
@@ -6057,8 +6057,7 @@ impl Kernel {
             }
             // Pipe capacity: nixvm's pipes are unbounded, so report/accept the
             // Linux default (64 KiB) rather than the misleading 0.
-            F_GETPIPE_SZ => 65536,
-            F_SETPIPE_SZ => 65536,
+            F_GETPIPE_SZ | F_SETPIPE_SZ => 65536,
             // The close-on-exec flag (`FD_CLOEXEC`) — the only `F_*FD` bit.
             F_GETFD => i64::from(cx.cur.fds.is_cloexec(fd as i32)),
             F_SETFD => {
@@ -6094,6 +6093,7 @@ impl Kernel {
             // POSIX (and OFD) record locks. One kernel instance runs a single
             // cooperating process tree over in-VM files nothing else can touch,
             // so every lock request is granted immediately (like `flock`).
+            #[allow(clippy::match_same_arms)] // named for the record, same as `_`
             F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => 0,
             // A lock *query*: the caller passes a `struct flock` and the kernel
             // must report whether the region is locked. Since we grant every
@@ -6119,7 +6119,7 @@ impl Kernel {
         match f {
             Fd::Socket { sock, end } => self.net.lock().unwrap().set_nonblock(*sock, *end, nb),
             Fd::Eventfd(_) | Fd::Timerfd(_) | Fd::Signalfd(_) => {
-                self.pollfds.lock().unwrap().set_nonblock(f, nb)
+                self.pollfds.lock().unwrap().set_nonblock(f, nb);
             }
             Fd::PtyMaster(n) => self.ptys.lock().unwrap().set_nonblock(*n, true, nb),
             Fd::PtySlave(n) => self.ptys.lock().unwrap().set_nonblock(*n, false, nb),
@@ -6199,10 +6199,10 @@ impl Kernel {
         // task's live identity — its program name, cmdline, and open fds — not the
         // boot-time placeholder. Refresh procfs's `self/` view before the fd is
         // created so the following read/readdir renders the running process.
-        if abs == "/proc" || abs.starts_with("/proc/") {
-            if let Some(pf) = vfs.procfs_mut() {
-                pf.update_self(self.proc_self_live(cx));
-            }
+        if (abs == "/proc" || abs.starts_with("/proc/"))
+            && let Some(pf) = vfs.procfs_mut()
+        {
+            pf.update_self(self.proc_self_live(cx));
         }
 
         // Pseudo-terminals: `/dev/ptmx` allocates a fresh pty and returns its
@@ -7099,10 +7099,10 @@ fn host_tty_ioctl(host_fd: i32, req: u32, arg: u64, mem: &mut GuestMemory) -> i6
         fn ioctl(fd: i32, request: c_ulong, ...) -> i32;
     }
     let (size, write) = match req {
-        0x5401 => (36usize, false),             // TCGETS
-        0x5402 | 0x5403 | 0x5404 => (36, true), // TCSETS/TCSETSW/TCSETSF
-        0x5413 => (8, false),                   // TIOCGWINSZ
-        _ => (8, true),                         // TIOCSWINSZ
+        0x5401 => (36usize, false),    // TCGETS
+        0x5402..=0x5404 => (36, true), // TCSETS/TCSETSW/TCSETSF
+        0x5413 => (8, false),          // TIOCGWINSZ
+        _ => (8, true),                // TIOCSWINSZ
     };
     let mut buf = if write {
         match mem.read_vec(arg, size) {
@@ -7306,36 +7306,35 @@ impl Kernel {
         let abstime = flags & TIMER_ABSTIME != 0;
 
         // Seed the absolute wall-clock deadline once; re-traps reuse it.
-        let deadline = match cx.cur.wake_deadline {
-            Some(dl) => dl,
-            None => {
-                let (Ok(sec), Ok(nsec)) = (mem.read_u64(req), mem.read_u64(req + 8)) else {
-                    return err(Errno::EFAULT);
-                };
-                if nsec >= 1_000_000_000 || (sec as i64) < 0 {
-                    return err(Errno::EINVAL);
-                }
-                let want = u128::from(sec) * 1_000_000_000 + u128::from(nsec);
-                let now_wall = poll::now_ns();
-                let dl = if abstime {
-                    // `want` is an absolute time on `clock_id`; convert to how long
-                    // remains, then to a wall-clock deadline the scheduler tracks.
-                    let clock_now = if clock_id == CLOCK_REALTIME {
-                        crate::clock::now_unix()
-                    } else {
-                        crate::clock::now_monotonic()
-                    }
-                    .as_nanos();
-                    if want <= clock_now {
-                        return 0; // the absolute deadline already passed
-                    }
-                    now_wall + (want - clock_now)
-                } else {
-                    now_wall + want
-                };
-                cx.cur.wake_deadline = Some(dl);
-                dl
+        let deadline = if let Some(dl) = cx.cur.wake_deadline {
+            dl
+        } else {
+            let (Ok(sec), Ok(nsec)) = (mem.read_u64(req), mem.read_u64(req + 8)) else {
+                return err(Errno::EFAULT);
+            };
+            if nsec >= 1_000_000_000 || (sec as i64) < 0 {
+                return err(Errno::EINVAL);
             }
+            let want = u128::from(sec) * 1_000_000_000 + u128::from(nsec);
+            let now_wall = poll::now_ns();
+            let dl = if abstime {
+                // `want` is an absolute time on `clock_id`; convert to how long
+                // remains, then to a wall-clock deadline the scheduler tracks.
+                let clock_now = if clock_id == CLOCK_REALTIME {
+                    crate::clock::now_unix()
+                } else {
+                    crate::clock::now_monotonic()
+                }
+                .as_nanos();
+                if want <= clock_now {
+                    return 0; // the absolute deadline already passed
+                }
+                now_wall + (want - clock_now)
+            } else {
+                now_wall + want
+            };
+            cx.cur.wake_deadline = Some(dl);
+            dl
         };
 
         let now = poll::now_ns();
@@ -9767,7 +9766,8 @@ mod tests {
         let req = 0x1_2000;
         let rem = 0x1_2100;
         mem.write_init(req, &0u64.to_le_bytes()).unwrap();
-        mem.write_init(req + 8, &500u64.to_le_bytes()).unwrap(); // 500 ns
+        mem.write_init(req + 8, &20_000_000u64.to_le_bytes())
+            .unwrap(); // 20 ms
         mem.write_init(rem, &7u64.to_le_bytes()).unwrap();
         mem.write_init(rem + 8, &7u64.to_le_bytes()).unwrap();
         cx.block = false;
@@ -9785,8 +9785,10 @@ mod tests {
         );
         assert!(cx.block, "nanosleep parks the caller until its deadline");
         assert!(cx.cur.wake_deadline.is_some());
-        // Let the (500 ns) deadline pass, then re-trap: it completes.
-        std::thread::sleep(std::time::Duration::from_micros(50));
+        // Let the (20 ms) deadline pass, then re-trap: it completes. (A
+        // sub-microsecond sleep could expire before the first check under a
+        // loaded parallel test run, so the "parks" assertion raced.)
+        std::thread::sleep(std::time::Duration::from_millis(30));
         cx.block = false;
         assert_eq!(
             call(
@@ -10047,6 +10049,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)] // small integers; a ratio check
     fn nice_weight_follows_the_cfs_curve() {
         // nice 0 is the reference weight; the curve is monotone (lower nice =
         // more weight = more CPU), and each step is ~1.25×.
@@ -10074,6 +10077,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)] // small integers; a ratio check
     fn charge_vruntime_makes_nice_proportional() {
         // Equal CPU consumed, but a higher-nice task accrues more virtual runtime
         // (so the least-vruntime scheduler picks it less) — proportional to the

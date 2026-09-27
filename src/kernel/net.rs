@@ -235,6 +235,7 @@ impl std::fmt::Debug for Net {
             .field("socks", &self.socks)
             .field("listeners", &self.listeners)
             .field("dgram_ports", &self.dgram_ports)
+            .field("dgram_paths", &self.dgram_paths)
             .field("egress", &self.egress.is_some())
             .finish()
     }

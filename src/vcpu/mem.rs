@@ -2,8 +2,8 @@
 //!
 //! Phase 3 of the MMU refactor replaced the flat, identity-mapped backing with a
 //! *real* MMU model. Guest RAM is one shared pool of physical frames
-//! ([`super::phys::PhysMem`]) registered as a single KVM memslot; each process
-//! owns a 4-level x86-64 page-table tree ([`super::pagetable::AddrSpace`], its own
+//! (`super::phys::PhysMem`) registered as a single KVM memslot; each process
+//! owns a 4-level x86-64 page-table tree (`super::pagetable::AddrSpace`, its own
 //! `CR3`) over that pool. A [`GuestMemory`] bundles the two together plus the
 //! per-page bookkeeping the kernel and loader need.
 //!
@@ -16,7 +16,7 @@
 //! copy-on-write page all fault identically under the interpreter and under KVM.
 //!
 //! Copy-on-write: [`GuestMemory::fork`] shares every mapped frame read-only with
-//! the child (via [`AddrSpace::fork_cow`]); the first write on either side
+//! the child (via `AddrSpace::fork_cow`); the first write on either side
 //! privatizes the frame ([`GuestMemory::cow_fault`], or transparently inside
 //! `write`/`write_init`). Only touched pages ever consume a private frame.
 
@@ -178,7 +178,7 @@ impl GuestMemory {
     ///
     /// This is the *only* constructor that mints a pool; every other address
     /// space in a run comes from [`GuestMemory::fork`] (which shares this pool) or
-    /// [`GuestMemory::exec_reset`] (which rebuilds within it).
+    /// `GuestMemory::exec_reset` (which rebuilds within it).
     #[must_use]
     pub fn new(base: u64, size: u64) -> Self {
         // The tied form (virtual bound == physical pool), used by tests.
@@ -237,6 +237,10 @@ impl GuestMemory {
 
     /// The `CR3` value (PML4 physical address) for this address space.
     #[must_use]
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )] // KVM-only
     pub(crate) fn cr3(&self) -> u64 {
         self.space.cr3()
     }
@@ -244,12 +248,20 @@ impl GuestMemory {
     /// Host pointer to physical address 0 of the shared pool — the single KVM
     /// memslot's `userspace_addr`.
     #[must_use]
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )] // KVM-only
     pub(crate) fn phys_ptr(&self) -> *mut u8 {
         self.phys.as_ptr()
     }
 
     /// Size of the shared pool in bytes — the memslot's `memory_size`.
     #[must_use]
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )] // KVM-only
     pub(crate) fn phys_len(&self) -> u64 {
         self.phys.len() as u64
     }
@@ -265,6 +277,10 @@ impl GuestMemory {
     /// KVM vcpu can read the pushed `#PF` exception frame lock-free (no
     /// `GuestMemory` borrow) on the SMP path. Changes on `fork`/`exec_reset`.
     #[must_use]
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )] // KVM-only
     pub(crate) fn kstack_pa(&self) -> u64 {
         self.kstack_pa
     }
@@ -433,12 +449,11 @@ impl GuestMemory {
         let Some(frame) = fa.alloc(phys) else {
             return false;
         };
-        match space.map(va, frame, prot, false, fa, phys) {
-            Ok(_) => true,
-            Err(_) => {
-                fa.free(frame);
-                false
-            }
+        if space.map(va, frame, prot, false, fa, phys).is_ok() {
+            true
+        } else {
+            fa.free(frame);
+            false
         }
     }
 
@@ -549,11 +564,11 @@ impl GuestMemory {
         let (first, last) = self.page_range(start, (end - start) as usize)?;
         let mut fa = self.fa.lock().unwrap();
         for p in first..=last {
-            if self.mapped[p] {
-                if let Some(frame) = self.space.unmap(self.page_base(p), &mut fa, &self.phys) {
-                    fa.free(frame);
-                    self.tlb_dirty = true; // a present leaf was cleared
-                }
+            if self.mapped[p]
+                && let Some(frame) = self.space.unmap(self.page_base(p), &mut fa, &self.phys)
+            {
+                fa.free(frame);
+                self.tlb_dirty = true; // a present leaf was cleared
             }
             self.mapped[p] = false;
             self.prot[p] = Prot::NONE;
@@ -633,7 +648,7 @@ impl GuestMemory {
     /// Copy from the pool at guest `addr` into `buf`, translating per page. The
     /// caller must have verified access. A mapped-but-unbacked page (demand-paged,
     /// never touched) reads as zero without allocating a frame.
-    fn copy_out(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemError> {
+    fn copy_out(&self, addr: u64, buf: &mut [u8]) {
         let mut done = 0usize;
         while done < buf.len() {
             let cur = addr + done as u64;
@@ -646,13 +661,13 @@ impl GuestMemory {
             }
             done += n;
         }
-        Ok(())
     }
 
     /// Read `buf.len()` bytes from guest `addr` (requires `READ`).
     pub fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemError> {
         self.check(addr, buf.len(), Prot::READ)?;
-        self.copy_out(addr, buf)
+        self.copy_out(addr, buf);
+        Ok(())
     }
 
     /// Read `len` bytes into a fresh `Vec` (requires `READ`).
@@ -916,18 +931,10 @@ impl GuestMemory {
         old.destroy(&mut fa, &self.phys);
         self.kstack_pa = kstack_pa;
         drop(fa);
-        for x in &mut self.prot {
-            *x = Prot::NONE;
-        }
-        for x in &mut self.mapped {
-            *x = false;
-        }
-        for x in &mut self.file_backed {
-            *x = false;
-        }
-        for x in &mut self.shared_anon {
-            *x = false;
-        }
+        self.prot.fill(Prot::NONE);
+        self.mapped.fill(false);
+        self.file_backed.fill(false);
+        self.shared_anon.fill(false);
     }
 
     // ---- fixed-width helpers --------------------------------------------

@@ -473,13 +473,13 @@ mod tests {
 
     #[test]
     fn alloc_returns_distinct_aligned_zeroed_frames() {
-        let (mut phys, mut alloc) = pool(8);
+        let (phys, mut alloc) = pool(8);
         // Pre-dirty the whole pool so alloc must actively zero.
         for f in 0..8u64 {
             phys.write(f * FRAME, &[0xCC; 8]);
         }
-        let a = alloc.alloc(&mut phys).unwrap();
-        let b = alloc.alloc(&mut phys).unwrap();
+        let a = alloc.alloc(&phys).unwrap();
+        let b = alloc.alloc(&phys).unwrap();
         assert_ne!(a, b, "distinct frames");
         assert_ne!(a, 0, "frame 0 never handed out");
         assert_ne!(b, 0);
@@ -495,22 +495,22 @@ mod tests {
 
     #[test]
     fn free_returns_frame_to_the_pool_and_it_is_reused() {
-        let (mut phys, mut alloc) = pool(4);
-        let a = alloc.alloc(&mut phys).unwrap();
+        let (phys, mut alloc) = pool(4);
+        let a = alloc.alloc(&phys).unwrap();
         let free_before = alloc.free_count();
         alloc.free(a);
         assert_eq!(alloc.refcount(a), 0, "freed");
         assert_eq!(alloc.free_count(), free_before + 1);
         assert_eq!(alloc.alloc_count(), 0);
         // The very next alloc reuses the just-freed frame (LIFO).
-        let b = alloc.alloc(&mut phys).unwrap();
+        let b = alloc.alloc(&phys).unwrap();
         assert_eq!(a, b, "freed frame is reused");
     }
 
     #[test]
     fn incref_decref_frees_only_at_zero() {
-        let (mut phys, mut alloc) = pool(4);
-        let a = alloc.alloc(&mut phys).unwrap(); // rc 1
+        let (phys, mut alloc) = pool(4);
+        let a = alloc.alloc(&phys).unwrap(); // rc 1
         alloc.incref(a); // rc 2 — shared by two address spaces
         alloc.incref(a); // rc 3
         assert_eq!(alloc.refcount(a), 3);
@@ -528,12 +528,12 @@ mod tests {
 
     #[test]
     fn frame_zero_is_never_allocated_and_pinned() {
-        let (mut phys, mut alloc) = pool(3);
+        let (phys, mut alloc) = pool(3);
         let allocatable = phys.nframes() as usize - 1; // all but the null frame
         assert_eq!(alloc.refcount(0), PINNED, "frame 0 pinned");
         // Drain the pool; frame 0 must never appear.
         let mut seen = Vec::new();
-        while let Some(pa) = alloc.alloc(&mut phys) {
+        while let Some(pa) = alloc.alloc(&phys) {
             assert_ne!(pa, 0);
             seen.push(pa);
         }
@@ -546,24 +546,24 @@ mod tests {
 
     #[test]
     fn exhaustion_returns_none_without_panic() {
-        let (mut phys, mut alloc) = pool(3);
+        let (phys, mut alloc) = pool(3);
         // Drain every allocatable frame, then confirm a full pool yields None.
-        while alloc.alloc(&mut phys).is_some() {}
+        while alloc.alloc(&phys).is_some() {}
         assert_eq!(alloc.free_count(), 0);
-        assert!(alloc.alloc(&mut phys).is_none(), "exhausted -> None");
-        assert!(alloc.alloc(&mut phys).is_none(), "still None, no panic");
+        assert!(alloc.alloc(&phys).is_none(), "exhausted -> None");
+        assert!(alloc.alloc(&phys).is_none(), "still None, no panic");
     }
 
     #[test]
     fn reserve_holds_a_range_out_of_circulation() {
-        let (mut phys, mut alloc) = pool(8);
+        let (phys, mut alloc) = pool(8);
         // Reserve frames covering [FRAME, 3*FRAME) => frames 1 and 2.
         alloc.reserve(FRAME, 2 * FRAME);
         assert_eq!(alloc.refcount(FRAME), PINNED);
         assert_eq!(alloc.refcount(2 * FRAME), PINNED);
         // Drain and confirm reserved frames never come back.
         let mut seen = Vec::new();
-        while let Some(pa) = alloc.alloc(&mut phys) {
+        while let Some(pa) = alloc.alloc(&phys) {
             seen.push(pa);
         }
         assert!(!seen.contains(&FRAME), "reserved frame not handed out");

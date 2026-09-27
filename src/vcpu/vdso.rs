@@ -293,7 +293,7 @@ mod tests {
         assert_eq!(nbucket, 1);
         let sym_name = |idx: u64| -> String {
             let s = (symtab + idx * 24) as usize;
-            let n = u32::from_le_bytes(img[s..s + 4].try_into().unwrap()) as u64;
+            let n = u64::from(u32::from_le_bytes(img[s..s + 4].try_into().unwrap()));
             let start = (strtab + n) as usize;
             let end = img[start..].iter().position(|&c| c == 0).unwrap() + start;
             String::from_utf8_lossy(&img[start..end]).into_owned()
@@ -314,7 +314,7 @@ mod tests {
         ));
         while idx != 0 {
             resolved.insert(sym_name(idx), val(idx));
-            let chain = hash + 8 + nbucket as u64 * 4 + idx * 4;
+            let chain = hash + 8 + u64::from(nbucket) * 4 + idx * 4;
             idx = u64::from(u32::from_le_bytes(
                 img[chain as usize..chain as usize + 4].try_into().unwrap(),
             ));

@@ -582,10 +582,10 @@ impl Kernel {
             sec == 0 && nsec == 0
         };
         // Deref the argpack: `ss` is the sigset pointer at offset 0.
-        if sigmask != 0 {
-            if let Ok(ss) = mem.read_u64(sigmask) {
-                install_poll_sigmask(cx, ss, mem);
-            }
+        if sigmask != 0
+            && let Ok(ss) = mem.read_u64(sigmask)
+        {
+            install_poll_sigmask(cx, ss, mem);
         }
         self.sys_select_core(cx, nfds, r, w, e, immediate, mem)
     }
@@ -807,10 +807,10 @@ impl Kernel {
             }
             n += 1;
             // EPOLLONESHOT: disable the watch until EPOLL_CTL_MOD re-arms it.
-            if w.events & EPOLLONESHOT != 0 {
-                if let Some(e) = pf.epolls[idx].interest.get_mut(&fd) {
-                    e.disarmed = true;
-                }
+            if w.events & EPOLLONESHOT != 0
+                && let Some(e) = pf.epolls[idx].interest.get_mut(&fd)
+            {
+                e.disarmed = true;
             }
         }
 

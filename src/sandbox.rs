@@ -69,7 +69,7 @@ const GUEST_BASE: u64 = 0x1_0000;
 /// working set; if the virtual arena is too small a plain `mmap` fails with
 /// `ENOMEM` and the engine traps. 32 GiB comfortably fits that (Bun/JSC needs
 /// >8 GiB), costs only ~24 MiB of per-page metadata, and the pool (physical RAM,
-/// demand-paged, lazily host-committed) bounds the actual footprint.
+/// > demand-paged, lazily host-committed) bounds the actual footprint.
 const GUEST_VSIZE: u64 = 32 * 1024 * 1024 * 1024;
 
 /// A fully-specified sandbox run.

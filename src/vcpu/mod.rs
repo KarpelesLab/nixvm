@@ -122,7 +122,7 @@ impl From<MemError> for VcpuError {
 }
 
 /// vDSO clock calibration produced by [`Vcpu::vdso_calibration`] and written to
-/// the guest's vvar page by [`ctrl::write_vvar`]. The guest's
+/// the guest's vvar page by `ctrl::write_vvar`. The guest's
 /// `__vdso_clock_gettime` computes `base_*_ns + ((rdtsc() - base_tsc) * mult) >>
 /// shift`.
 #[derive(Clone, Copy, Debug)]
@@ -253,7 +253,7 @@ pub trait Vcpu: Send {
 
     /// One-time vDSO clock calibration: read the guest TSC frequency and its
     /// current value and correlate it with the host wall clock, so the guest's
-    /// [`vdso`] can compute `clock_gettime` from `rdtsc` with no syscall. `None`
+    /// `vdso` can compute `clock_gettime` from `rdtsc` with no syscall. `None`
     /// when the backend can't (the interpreter — no real TSC) or calibration
     /// failed; the caller then leaves the vvar page zeroed and the vDSO falls
     /// back to the syscall. Read once, before the guest runs.

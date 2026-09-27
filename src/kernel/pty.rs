@@ -56,7 +56,7 @@ const SIGTSTP: u32 = 20;
 fn default_termios() -> [u8; TERMIOS_LEN] {
     let mut t = [0u8; TERMIOS_LEN];
     let put = |t: &mut [u8; TERMIOS_LEN], off: usize, v: u32| {
-        t[off..off + 4].copy_from_slice(&v.to_le_bytes())
+        t[off..off + 4].copy_from_slice(&v.to_le_bytes());
     };
     put(&mut t, 0, ICRNL | 0o002000); // c_iflag = ICRNL | IXON
     put(&mut t, 4, OPOST | ONLCR); // c_oflag
@@ -82,6 +82,7 @@ fn default_termios() -> [u8; TERMIOS_LEN] {
 
 /// One pseudo-terminal.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub(super) struct Pty {
     termios: [u8; TERMIOS_LEN],
     winsize: [u8; WINSIZE_LEN],
@@ -276,7 +277,7 @@ impl Pty {
                 if b == veof && veof != 0 {
                     // End-of-file / end-of-line: flush the pending line (an EOF on
                     // an empty line yields a zero-length read = EOF for the slave).
-                    let line: Vec<u8> = self.canon.drain(..).collect();
+                    let line: Vec<u8> = std::mem::take(&mut self.canon);
                     self.input.extend(line);
                     continue;
                 }
@@ -285,7 +286,7 @@ impl Pty {
                 }
                 self.canon.push(b);
                 if b == b'\n' {
-                    let line: Vec<u8> = self.canon.drain(..).collect();
+                    let line: Vec<u8> = std::mem::take(&mut self.canon);
                     self.input.extend(line);
                 }
             } else {

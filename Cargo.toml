@@ -124,6 +124,14 @@ cast_possible_wrap = "allow"
 verbose_bit_mask = "allow"
 # Binary opcode literals (0b000101 …) read best without digit separators.
 unreadable_literal = "allow"
+# ABI constants (flag bits, struct offsets) are declared right where the one
+# syscall that uses them decodes its arguments, after the early-return checks.
+items_after_statements = "allow"
+# Instruction/ABI decode names operands the way the spec does (a/b/c/d, n/m/s/t…).
+many_single_char_names = "allow"
+# Syscall dispatchers and instruction decoders are long flat matches; splitting
+# them for a line count would scatter one ABI table across helpers.
+too_many_lines = "allow"
 
 [profile.release]
 lto = "thin"

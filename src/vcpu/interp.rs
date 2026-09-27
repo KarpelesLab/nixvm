@@ -4302,8 +4302,13 @@ fn aes_round(vd: u128, vn: u128, encrypt: bool) -> u128 {
 fn aes_mix_columns(vn: u128, forward: bool) -> u128 {
     let state = vn.to_le_bytes();
     let mut out = [0u8; 16];
-    for (out_col, in_col) in out.chunks_exact_mut(4).zip(state.chunks_exact(4)) {
-        let a = [in_col[0], in_col[1], in_col[2], in_col[3]];
+    for (out_col, in_col) in out
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(state.as_chunks::<4>().0)
+    {
+        let a = *in_col;
         let r = if forward {
             aes_mix_column(a)
         } else {

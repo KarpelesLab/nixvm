@@ -459,14 +459,14 @@ mod tests {
 
     #[test]
     fn map_then_translate_and_raw_bits() {
-        let (mut phys, mut fa) = pool(32);
-        let mut space = AddrSpace::new(&mut fa, &mut phys).unwrap();
-        let frame = fa.alloc(&mut phys).unwrap();
+        let (phys, mut fa) = pool(32);
+        let mut space = AddrSpace::new(&mut fa, &phys).unwrap();
+        let frame = fa.alloc(&phys).unwrap();
 
         let vaddr = 0x1234_5000;
         assert_eq!(
             space
-                .map(vaddr, frame, Prot::rw(), false, &mut fa, &mut phys)
+                .map(vaddr, frame, Prot::rw(), false, &mut fa, &phys)
                 .unwrap(),
             None,
             "fresh slot clobbers nothing"
@@ -485,77 +485,75 @@ mod tests {
         assert_ne!(e & US, 0, "user");
         assert_ne!(e & NX, 0, "NX set for non-exec");
 
-        space.destroy(&mut fa, &mut phys);
+        space.destroy(&mut fa, &phys);
     }
 
     #[test]
     fn exec_mapping_has_no_nx() {
-        let (mut phys, mut fa) = pool(16);
-        let mut space = AddrSpace::new(&mut fa, &mut phys).unwrap();
-        let frame = fa.alloc(&mut phys).unwrap();
+        let (phys, mut fa) = pool(16);
+        let mut space = AddrSpace::new(&mut fa, &phys).unwrap();
+        let frame = fa.alloc(&phys).unwrap();
         space
-            .map(0x4000, frame, Prot::rx(), false, &mut fa, &mut phys)
+            .map(0x4000, frame, Prot::rx(), false, &mut fa, &phys)
             .unwrap();
         let e = raw_leaf(&space, &phys, 0x4000);
         assert_eq!(e & NX, 0, "executable leaf clears NX");
         assert_eq!(e & RW, 0, "read-exec is not writable");
         let t = space.translate(0x4000, &phys).unwrap();
         assert_eq!(t.prot, Prot::rx());
-        space.destroy(&mut fa, &mut phys);
+        space.destroy(&mut fa, &phys);
     }
 
     #[test]
     fn supervisor_mapping_clears_us() {
-        let (mut phys, mut fa) = pool(16);
-        let mut space = AddrSpace::new(&mut fa, &mut phys).unwrap();
-        let frame = fa.alloc(&mut phys).unwrap();
+        let (phys, mut fa) = pool(16);
+        let mut space = AddrSpace::new(&mut fa, &phys).unwrap();
+        let frame = fa.alloc(&phys).unwrap();
         space
-            .map(0x8000, frame, Prot::rw(), true, &mut fa, &mut phys)
+            .map(0x8000, frame, Prot::rw(), true, &mut fa, &phys)
             .unwrap();
         let e = raw_leaf(&space, &phys, 0x8000);
         assert_eq!(e & US, 0, "supervisor leaf has US clear");
         let t = space.translate(0x8000, &phys).unwrap();
         assert!(t.supervisor, "translate reports supervisor-only");
-        space.destroy(&mut fa, &mut phys);
+        space.destroy(&mut fa, &phys);
     }
 
     #[test]
     fn spanning_slots_allocates_the_right_interior_tables() {
-        let (mut phys, mut fa) = pool(64);
-        let mut space = AddrSpace::new(&mut fa, &mut phys).unwrap();
+        let (phys, mut fa) = pool(64);
+        let mut space = AddrSpace::new(&mut fa, &phys).unwrap();
         let base = fa.alloc_count(); // 1: the PML4
 
         // Same PML4/PDPT/PD, different PT slot: +1 PT + data frame (2 allocs).
-        let f0 = fa.alloc(&mut phys).unwrap();
-        space
-            .map(0, f0, Prot::rw(), false, &mut fa, &mut phys)
-            .unwrap();
+        let f0 = fa.alloc(&phys).unwrap();
+        space.map(0, f0, Prot::rw(), false, &mut fa, &phys).unwrap();
         assert_eq!(fa.alloc_count() - base, 1 /*data*/ + 3 /*PDPT,PD,PT*/);
 
         // Different PD index (bit 21): new PT only (share PDPT+PD) + data frame.
         let after0 = fa.alloc_count();
-        let f1 = fa.alloc(&mut phys).unwrap();
+        let f1 = fa.alloc(&phys).unwrap();
         let v1 = 1u64 << 21;
         space
-            .map(v1, f1, Prot::rw(), false, &mut fa, &mut phys)
+            .map(v1, f1, Prot::rw(), false, &mut fa, &phys)
             .unwrap();
         assert_eq!(fa.alloc_count() - after0, 1 /*data*/ + 1 /*PT*/);
 
         // Different PDPT index (bit 30): new PD + PT + data frame.
         let after1 = fa.alloc_count();
-        let f2 = fa.alloc(&mut phys).unwrap();
+        let f2 = fa.alloc(&phys).unwrap();
         let v2 = 1u64 << 30;
         space
-            .map(v2, f2, Prot::rw(), false, &mut fa, &mut phys)
+            .map(v2, f2, Prot::rw(), false, &mut fa, &phys)
             .unwrap();
         assert_eq!(fa.alloc_count() - after1, 1 /*data*/ + 2 /*PD,PT*/);
 
         // Different PML4 index (bit 39): new PDPT + PD + PT + data frame.
         let after2 = fa.alloc_count();
-        let f3 = fa.alloc(&mut phys).unwrap();
+        let f3 = fa.alloc(&phys).unwrap();
         let v3 = 1u64 << 39;
         space
-            .map(v3, f3, Prot::rw(), false, &mut fa, &mut phys)
+            .map(v3, f3, Prot::rw(), false, &mut fa, &phys)
             .unwrap();
         assert_eq!(
             fa.alloc_count() - after2,
@@ -572,55 +570,55 @@ mod tests {
         // to the page table (it does not incref), so `destroy` frees the four data
         // frames along with every interior table and the PML4 — nothing is left,
         // and the test must not free the data frames again.
-        space.destroy(&mut fa, &mut phys);
+        space.destroy(&mut fa, &phys);
         assert_eq!(fa.alloc_count(), 0, "no frames leaked");
     }
 
     #[test]
     fn map_overwrite_returns_old_frame() {
-        let (mut phys, mut fa) = pool(16);
-        let mut space = AddrSpace::new(&mut fa, &mut phys).unwrap();
-        let a = fa.alloc(&mut phys).unwrap();
-        let b = fa.alloc(&mut phys).unwrap();
+        let (phys, mut fa) = pool(16);
+        let mut space = AddrSpace::new(&mut fa, &phys).unwrap();
+        let a = fa.alloc(&phys).unwrap();
+        let b = fa.alloc(&phys).unwrap();
         space
-            .map(0x2000, a, Prot::rw(), false, &mut fa, &mut phys)
+            .map(0x2000, a, Prot::rw(), false, &mut fa, &phys)
             .unwrap();
         let old = space
-            .map(0x2000, b, Prot::rx(), false, &mut fa, &mut phys)
+            .map(0x2000, b, Prot::rx(), false, &mut fa, &phys)
             .unwrap();
         assert_eq!(old, Some(a), "overwrite returns the clobbered frame");
         assert_eq!(space.translate(0x2000, &phys).unwrap().paddr, b);
-        space.destroy(&mut fa, &mut phys);
+        space.destroy(&mut fa, &phys);
     }
 
     #[test]
     fn misaligned_map_is_rejected() {
-        let (mut phys, mut fa) = pool(8);
-        let mut space = AddrSpace::new(&mut fa, &mut phys).unwrap();
+        let (phys, mut fa) = pool(8);
+        let mut space = AddrSpace::new(&mut fa, &phys).unwrap();
         assert_eq!(
-            space.map(0x1001, 0x1000, Prot::rw(), false, &mut fa, &mut phys),
+            space.map(0x1001, 0x1000, Prot::rw(), false, &mut fa, &phys),
             Err(MapErr::Misaligned(0x1001))
         );
         assert_eq!(
-            space.map(0x1000, 0x1001, Prot::rw(), false, &mut fa, &mut phys),
+            space.map(0x1000, 0x1001, Prot::rw(), false, &mut fa, &phys),
             Err(MapErr::Misaligned(0x1001))
         );
-        space.destroy(&mut fa, &mut phys);
+        space.destroy(&mut fa, &phys);
     }
 
     #[test]
     fn unmap_returns_frame_and_frees_empty_interior_tables() {
-        let (mut phys, mut fa) = pool(16);
-        let mut space = AddrSpace::new(&mut fa, &mut phys).unwrap();
+        let (phys, mut fa) = pool(16);
+        let mut space = AddrSpace::new(&mut fa, &phys).unwrap();
         let baseline = fa.alloc_count(); // just the PML4
-        let frame = fa.alloc(&mut phys).unwrap();
+        let frame = fa.alloc(&phys).unwrap();
         space
-            .map(0x9000, frame, Prot::rw(), false, &mut fa, &mut phys)
+            .map(0x9000, frame, Prot::rw(), false, &mut fa, &phys)
             .unwrap();
         // PML4 + PDPT + PD + PT + data.
         assert_eq!(fa.alloc_count(), baseline + 4);
 
-        let got = space.unmap(0x9000, &mut fa, &mut phys);
+        let got = space.unmap(0x9000, &mut fa, &phys);
         assert_eq!(got, Some(frame), "unmap returns the data frame");
         assert!(space.translate(0x9000, &phys).is_none(), "gone");
         // The now-empty PT/PD/PDPT were freed; only the PML4 (baseline) plus the
@@ -632,35 +630,29 @@ mod tests {
         );
         assert_eq!(fa.refcount(frame), 1, "caller still owns the data frame");
 
-        assert_eq!(
-            space.unmap(0x9000, &mut fa, &mut phys),
-            None,
-            "already gone"
-        );
+        assert_eq!(space.unmap(0x9000, &mut fa, &phys), None, "already gone");
         fa.free(frame);
-        space.destroy(&mut fa, &mut phys);
+        space.destroy(&mut fa, &phys);
         assert_eq!(fa.alloc_count(), 0);
     }
 
     #[test]
     fn unmap_keeps_shared_interior_tables() {
-        let (mut phys, mut fa) = pool(16);
-        let mut space = AddrSpace::new(&mut fa, &mut phys).unwrap();
-        let f0 = fa.alloc(&mut phys).unwrap();
-        let f1 = fa.alloc(&mut phys).unwrap();
+        let (phys, mut fa) = pool(16);
+        let mut space = AddrSpace::new(&mut fa, &phys).unwrap();
+        let f0 = fa.alloc(&phys).unwrap();
+        let f1 = fa.alloc(&phys).unwrap();
         // Two leaves sharing the same PT (adjacent pages).
+        space.map(0, f0, Prot::rw(), false, &mut fa, &phys).unwrap();
         space
-            .map(0, f0, Prot::rw(), false, &mut fa, &mut phys)
-            .unwrap();
-        space
-            .map(FRAME, f1, Prot::rw(), false, &mut fa, &mut phys)
+            .map(FRAME, f1, Prot::rw(), false, &mut fa, &phys)
             .unwrap();
         let with_both = fa.alloc_count();
 
         // Unmapping one leaf must not free the still-shared PT/PD/PDPT. unmap
         // hands the frame back without decref'ing, so the live count is unchanged
         // by the unmap itself; the surviving mapping still resolves.
-        assert_eq!(space.unmap(0, &mut fa, &mut phys), Some(f0));
+        assert_eq!(space.unmap(0, &mut fa, &phys), Some(f0));
         assert_eq!(fa.alloc_count(), with_both, "shared interior tables kept");
         assert_eq!(space.translate(FRAME, &phys).unwrap().paddr, f1);
         assert!(
@@ -669,22 +661,22 @@ mod tests {
         );
 
         fa.free(f0); // caller decrefs the frame unmap handed back
-        space.unmap(FRAME, &mut fa, &mut phys).unwrap();
+        space.unmap(FRAME, &mut fa, &phys).unwrap();
         fa.free(f1);
-        space.destroy(&mut fa, &mut phys);
+        space.destroy(&mut fa, &phys);
         assert_eq!(fa.alloc_count(), 0);
     }
 
     #[test]
     fn protect_flips_rw_and_nx() {
-        let (mut phys, mut fa) = pool(16);
-        let mut space = AddrSpace::new(&mut fa, &mut phys).unwrap();
-        let frame = fa.alloc(&mut phys).unwrap();
+        let (phys, mut fa) = pool(16);
+        let mut space = AddrSpace::new(&mut fa, &phys).unwrap();
+        let frame = fa.alloc(&phys).unwrap();
         space
-            .map(0x5000, frame, Prot::rw(), false, &mut fa, &mut phys)
+            .map(0x5000, frame, Prot::rw(), false, &mut fa, &phys)
             .unwrap();
 
-        assert!(space.protect(0x5000, Prot::rx(), false, &mut phys));
+        assert!(space.protect(0x5000, Prot::rx(), false, &phys));
         let e = raw_leaf(&space, &phys, 0x5000);
         assert_eq!(e & RW, 0, "write cleared");
         assert_eq!(e & NX, 0, "exec set (NX cleared)");
@@ -693,30 +685,27 @@ mod tests {
         assert_eq!(t.prot, Prot::rx());
 
         // Back to read-only data (NX set again, no write).
-        assert!(space.protect(0x5000, Prot::READ, false, &mut phys));
+        assert!(space.protect(0x5000, Prot::READ, false, &phys));
         let e = raw_leaf(&space, &phys, 0x5000);
         assert_ne!(e & NX, 0);
         assert_eq!(e & RW, 0);
 
-        assert!(
-            !space.protect(0x6000, Prot::rw(), false, &mut phys),
-            "unmapped"
-        );
-        space.destroy(&mut fa, &mut phys);
+        assert!(!space.protect(0x6000, Prot::rw(), false, &phys), "unmapped");
+        space.destroy(&mut fa, &phys);
     }
 
     #[test]
     fn not_present_walk_returns_none_at_each_level() {
-        let (mut phys, mut fa) = pool(16);
-        let mut space = AddrSpace::new(&mut fa, &mut phys).unwrap();
+        let (phys, mut fa) = pool(16);
+        let mut space = AddrSpace::new(&mut fa, &phys).unwrap();
         // Nothing mapped at all: PML4 slot empty.
         assert!(space.translate(0, &phys).is_none());
 
         // Map one page, then probe addresses that diverge at each interior level
         // — each shares the levels above but hits an absent entry below.
-        let frame = fa.alloc(&mut phys).unwrap();
+        let frame = fa.alloc(&phys).unwrap();
         space
-            .map(0, frame, Prot::rw(), false, &mut fa, &mut phys)
+            .map(0, frame, Prot::rw(), false, &mut fa, &phys)
             .unwrap();
         assert!(
             space.translate(1u64 << 39, &phys).is_none(),
@@ -739,31 +728,31 @@ mod tests {
             "the mapped page still resolves"
         );
 
-        space.unmap(0, &mut fa, &mut phys);
+        space.unmap(0, &mut fa, &phys);
         fa.free(frame);
-        space.destroy(&mut fa, &mut phys);
+        space.destroy(&mut fa, &phys);
     }
 
     #[test]
     fn fork_cow_shares_frames_read_only_and_no_leaks() {
-        let (mut phys, mut fa) = pool(64);
+        let (phys, mut fa) = pool(64);
         // Full baseline: an empty allocator before any AddrSpace exists.
         let alloc_baseline = fa.alloc_count();
         assert_eq!(alloc_baseline, 0);
 
-        let mut parent = AddrSpace::new(&mut fa, &mut phys).unwrap();
+        let mut parent = AddrSpace::new(&mut fa, &phys).unwrap();
         // Two parent mappings in different PD slots (exercise interior copying).
-        let d0 = fa.alloc(&mut phys).unwrap();
-        let d1 = fa.alloc(&mut phys).unwrap();
+        let d0 = fa.alloc(&phys).unwrap();
+        let d1 = fa.alloc(&phys).unwrap();
         parent
-            .map(0x1000, d0, Prot::rw(), false, &mut fa, &mut phys)
+            .map(0x1000, d0, Prot::rw(), false, &mut fa, &phys)
             .unwrap();
         parent
-            .map(1u64 << 21, d1, Prot::rwx(), false, &mut fa, &mut phys)
+            .map(1u64 << 21, d1, Prot::rwx(), false, &mut fa, &phys)
             .unwrap();
 
         let before_fork = fa.alloc_count();
-        let child = parent.fork_cow(&mut fa, &mut phys).unwrap();
+        let child = parent.fork_cow(&mut fa, &phys).unwrap();
 
         // Child interior tables: PML4 + PDPT + PD + 2×PT = 5 new frames; the two
         // data frames are shared (incref, not alloc), so alloc_count grew by 5.
@@ -816,13 +805,13 @@ mod tests {
 
         // Destroy the child: shared frames drop to 1 (still mapped in parent),
         // the child's interior frames are freed.
-        child.destroy(&mut fa, &mut phys);
+        child.destroy(&mut fa, &phys);
         assert_eq!(fa.refcount(d0), 1, "still owned by parent");
         assert_eq!(fa.refcount(d1), 1);
         assert_eq!(fa.alloc_count(), before_fork, "child interior reclaimed");
 
         // Destroy the parent: everything returns to the pre-test baseline.
-        parent.destroy(&mut fa, &mut phys);
+        parent.destroy(&mut fa, &phys);
         assert_eq!(fa.refcount(d0), 0, "no owner left");
         assert_eq!(fa.refcount(d1), 0);
         assert_eq!(
@@ -836,16 +825,16 @@ mod tests {
     fn fork_cow_out_of_frames_leaves_parent_untouched() {
         // Sized so the parent + its mappings fit, but the child's interior tables
         // cannot all be allocated — fork_cow must fail cleanly.
-        let (mut phys, mut fa) = pool(8);
-        let mut parent = AddrSpace::new(&mut fa, &mut phys).unwrap();
-        let d0 = fa.alloc(&mut phys).unwrap();
+        let (phys, mut fa) = pool(8);
+        let mut parent = AddrSpace::new(&mut fa, &phys).unwrap();
+        let d0 = fa.alloc(&phys).unwrap();
         parent
-            .map(0x1000, d0, Prot::rw(), false, &mut fa, &mut phys)
+            .map(0x1000, d0, Prot::rw(), false, &mut fa, &phys)
             .unwrap();
         // Drain the pool so fork_cow's first interior alloc (after the child PML4)
         // eventually fails.
         let mut drained = Vec::new();
-        while let Some(f) = fa.alloc(&mut phys) {
+        while let Some(f) = fa.alloc(&phys) {
             drained.push(f);
         }
         // Free just enough for the child PML4 but not the whole interior chain.
@@ -854,7 +843,7 @@ mod tests {
         let live_before = fa.alloc_count();
         let d0_rc_before = fa.refcount(d0);
         assert!(
-            parent.fork_cow(&mut fa, &mut phys).is_none(),
+            parent.fork_cow(&mut fa, &phys).is_none(),
             "exhausted -> None"
         );
 
@@ -880,6 +869,6 @@ mod tests {
         }
         // `d0`'s single reference was transferred to the parent's page table by
         // `map`; `destroy` releases it, so the test must not free it again.
-        parent.destroy(&mut fa, &mut phys);
+        parent.destroy(&mut fa, &phys);
     }
 }

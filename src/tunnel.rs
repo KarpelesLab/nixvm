@@ -37,9 +37,6 @@ use pktkit::{IpPrefix, L3Device, Packet, Protocol, transport_checksum};
 
 use crate::kernel::egress::{Datagram, Egress, HostConn, HostDgram};
 
-/// Default link MTU until [`Tunnel::up`] says otherwise (grouterd's).
-const DEFAULT_MTU: u16 = 1400;
-
 /// Most packets buffered for the transport before new ones are dropped: a
 /// transport that stopped draining (a dead WebSocket) must not grow this
 /// without bound. TCP retransmits whatever was lost.

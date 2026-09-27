@@ -85,6 +85,7 @@ impl Kernel {
     /// Build the live `/proc/self` view (comm, cmdline, exe, cwd, pid/ppid, open
     /// fds) for the running task, so procfs renders the real running program
     /// instead of the boot-time placeholder. Called just before a `/proc` read.
+    #[allow(clippy::unused_self)]
     pub(super) fn proc_self_live(&self, cx: &ServiceCtx) -> crate::fs::ProcSelf {
         let fds = cx
             .cur
@@ -300,6 +301,7 @@ impl Kernel {
     }
 
     /// `fchmod(fd, mode)` — chmod on an open file, resolved via its path.
+    #[allow(clippy::unused_self)]
     pub(super) fn sys_fchmod(
         &self,
         vfs: &mut MountTable,
@@ -351,6 +353,7 @@ impl Kernel {
     }
 
     /// `fchown(fd, uid, gid)` — chown on an open file, resolved via its path.
+    #[allow(clippy::unused_self)]
     pub(super) fn sys_fchown(
         &self,
         vfs: &mut MountTable,

@@ -2,7 +2,7 @@
 //! internet, so `apk`/`curl`/`npm` work instead of only talking to endpoints
 //! inside the VM.
 //!
-//! The in-VM loopback transport in [`super::net`] stays the default and the
+//! The in-VM loopback transport in `super::net` stays the default and the
 //! only thing available with no egress backend installed. When a backend *is*
 //! installed (`NIXVM_NET=host`, or [`crate::sandbox`]/[`crate::vm`] policy), a
 //! guest `connect()` to a **routable** address (anything that isn't this VM's

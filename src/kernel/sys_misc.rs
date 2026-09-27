@@ -374,6 +374,7 @@ impl Kernel {
     /// system time); the remaining counters (maxrss, faults, context switches)
     /// stay zero. `RUSAGE_CHILDREN` reports nothing (child accounting isn't
     /// tracked). Called with `sh` held (the B1 dispatch table).
+    #[allow(clippy::unused_self)]
     pub(super) fn sys_getrusage(
         &self,
         sh: &Shared,
@@ -401,6 +402,7 @@ impl Kernel {
     /// (10 ms), as on Linux. `tms_utime` carries the process CPU time (the same
     /// per-task accounting as `getrusage`/`clock_gettime`); system and children
     /// fields are zero. Called with `sh` held.
+    #[allow(clippy::unused_self)]
     pub(super) fn sys_times(
         &self,
         sh: &Shared,

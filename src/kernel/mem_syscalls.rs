@@ -208,7 +208,7 @@ impl Kernel {
             return 0;
         }
         // addr must be page-aligned (Linux answers EINVAL otherwise).
-        if addr % PAGE_SIZE != 0 {
+        if !addr.is_multiple_of(PAGE_SIZE) {
             return err(Errno::EINVAL);
         }
         let start = page_down(addr);

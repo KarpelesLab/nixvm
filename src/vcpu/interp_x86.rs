@@ -4942,8 +4942,8 @@ impl Vcpu for X86Interp {
     }
 
     fn set_simd_state(&mut self, bytes: &[u8]) {
-        for (i, chunk) in bytes.chunks_exact(16).take(16).enumerate() {
-            self.xmm[i] = u128::from_le_bytes(chunk.try_into().unwrap());
+        for (i, chunk) in bytes.as_chunks::<16>().0.iter().take(16).enumerate() {
+            self.xmm[i] = u128::from_le_bytes(*chunk);
         }
     }
 

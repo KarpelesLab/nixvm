@@ -253,6 +253,7 @@ impl Kernel {
     /// returned. With none pending it waits — until one arrives (re-trap after an
     /// unpark), until `timeout` elapses (`EAGAIN`), or until an unblocked caught
     /// signal interrupts it (`EINTR`, via the dispatcher). A zero `timeout` polls.
+    #[allow(clippy::unused_self)]
     pub(super) fn sys_rt_sigtimedwait(
         &self,
         cx: &mut ServiceCtx,
@@ -295,24 +296,21 @@ impl Kernel {
         // Nothing pending: honor a finite/zero timeout via the scheduler's timed
         // wait (seeded once, reused across re-traps — like nanosleep).
         if timeout != 0 {
-            let deadline = match cx.cur.wake_deadline {
-                Some(dl) => dl,
-                None => {
-                    let (Ok(sec), Ok(nsec)) = (mem.read_u64(timeout), mem.read_u64(timeout + 8))
-                    else {
-                        return err(Errno::EFAULT);
-                    };
-                    if nsec >= 1_000_000_000 {
-                        return err(Errno::EINVAL);
-                    }
-                    if sec == 0 && nsec == 0 {
-                        return err(Errno::EAGAIN); // {0,0}: a non-blocking poll
-                    }
-                    let dl =
-                        super::poll::now_ns() + u128::from(sec) * 1_000_000_000 + u128::from(nsec);
-                    cx.cur.wake_deadline = Some(dl);
-                    dl
+            let deadline = if let Some(dl) = cx.cur.wake_deadline {
+                dl
+            } else {
+                let (Ok(sec), Ok(nsec)) = (mem.read_u64(timeout), mem.read_u64(timeout + 8)) else {
+                    return err(Errno::EFAULT);
+                };
+                if nsec >= 1_000_000_000 {
+                    return err(Errno::EINVAL);
                 }
+                if sec == 0 && nsec == 0 {
+                    return err(Errno::EAGAIN); // {0,0}: a non-blocking poll
+                }
+                let dl = super::poll::now_ns() + u128::from(sec) * 1_000_000_000 + u128::from(nsec);
+                cx.cur.wake_deadline = Some(dl);
+                dl
             };
             if super::poll::now_ns() >= deadline {
                 cx.cur.wake_deadline = None;
@@ -344,6 +342,7 @@ impl Kernel {
     /// The shared core of `kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`: post `sig`
     /// (with its accompanying `info`) to the POSIX target(s). `sender`-vs-queued
     /// siginfo differs only in the `info` the caller supplies.
+    #[allow(clippy::unused_self)]
     pub(super) fn post_signal(
         &self,
         sh: &mut Shared,
@@ -477,6 +476,7 @@ impl Kernel {
     /// exactly: `SIG_IGN` and default-ignored signals are skipped (they don't
     /// interrupt), and a default-*terminate* signal returns `None` (the process is
     /// about to die — the dispatcher's `Zombie` check handles it, not the block path).
+    #[allow(clippy::unused_self)]
     pub(super) fn first_handled_signal(&self, cx: &ServiceCtx) -> Option<usize> {
         let deliverable = cx.cur.pending & !cx.cur.blocked;
         for sig in 1..=NSIG {
@@ -732,7 +732,7 @@ impl Kernel {
             cx.cur.pending |= 1u64 << (sig - 1);
         }
         let si = info.map_or(SiFields::default(), |q| SiFields {
-            code: q.code as u32 as u64,
+            code: u64::from(q.code as u32),
             addr: 0,
             pid: u64::from(q.pid as u32),
             uid: u64::from(q.uid),

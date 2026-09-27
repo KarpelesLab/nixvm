@@ -288,7 +288,7 @@ impl std::fmt::Debug for Region {
         f.debug_struct("Region")
             .field("ptr", &self.ptr)
             .field("len", &self.len)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
