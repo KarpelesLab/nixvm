@@ -28,7 +28,7 @@ for a in "$@"; do
 done
 
 echo "==> building lib test binary"
-bin=$(cargo test --lib --no-run --message-format=json "${build_args[@]}" 2>/dev/null \
+bin=$(cargo test --lib --no-run --features hvf --message-format=json "${build_args[@]}" 2>/dev/null \
   | python3 -c "import sys,json
 for line in sys.stdin:
     try: o=json.loads(line)

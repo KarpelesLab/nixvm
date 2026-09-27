@@ -34,11 +34,12 @@ required-features = ["cli"]
 default = ["cli"]
 # CLI-only deps (clap, tracing-subscriber, …) get added here in a later phase.
 cli = []
-# Hardware virtualization backends. Both are compiled by target cfg, not these
-# features — they link no extra crates (hand-rolled FFI) and `vcpu::select`
-# probes them at runtime, falling back to the interpreter when unavailable
-# (HVF: unentitled binary; KVM: no /dev/kvm). Features kept as reserved
-# placeholders.
+# Hardware virtualization backends. Both link no extra crates (hand-rolled FFI)
+# and `vcpu::select` probes them at runtime, falling back to the interpreter
+# when unavailable (HVF: unentitled binary; KVM: no /dev/kvm). KVM is compiled
+# by target cfg alone. HVF additionally needs this feature: it predates the
+# paged GuestMemory (it maps guest RAM flat, MMU off) and doesn't build against
+# it until it gains guest page tables.
 hvf = []    # Hypervisor.framework, macOS/arm64
 kvm = []    # KVM, Linux/x86-64 (x86-64 guests); arm64 KVM is Phase 10
 # Software CPU interpreter — the no-acceleration fallback (Phase 10).

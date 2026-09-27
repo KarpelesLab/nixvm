@@ -282,7 +282,11 @@ pub trait Backend {
     fn new_vcpu(&self, entry: u64, stack: u64) -> Result<Box<dyn Vcpu>, VcpuError>;
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// Behind the `hvf` feature: the backend still maps guest RAM as one flat,
+// identity-mapped region, which the paged `GuestMemory` (frame pool + page
+// tables) no longer provides. It needs guest stage-1 page tables before it can
+// run again; until then default macOS builds use the interpreter.
+#[cfg(all(feature = "hvf", target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -297,13 +301,13 @@ pub(crate) mod softfloat;
 /// Prefers hardware virtualization when the guest arch matches the host and the
 /// process can create a VM; otherwise falls back to the software interpreter.
 /// The fallback is what keeps an unentitled/unsigned binary (CI, plain
-/// `cargo test`) working — [`hvf::HvfBackend::new`] fails there, and we drop to
+/// `cargo test`) working — `hvf::HvfBackend::new` fails there, and we drop to
 /// the interpreter instead of erroring. `NIXVM_INTERP=1` skips the hardware
 /// probes entirely (a debugging/parity escape hatch, the env twin of
 /// `SandboxBuilder::prefer_interp`).
 pub fn select(guest: Arch) -> Result<Box<dyn Backend>, VcpuError> {
     let force_interp = std::env::var_os("NIXVM_INTERP").is_some_and(|v| v == "1");
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(feature = "hvf", target_os = "macos", target_arch = "aarch64"))]
     {
         // When the hypervisor is unavailable/unentitled, `new` fails and we fall
         // through to the interpreter.
