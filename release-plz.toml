@@ -1,0 +1,8 @@
+[workspace]
+# cargo-semver-checks rebuilds the published baseline (nixvm 0.0.0), whose
+# Cargo.toml predates fstool's per-filesystem features (0.4.28) and so no
+# longer compiles against any current fstool — every run failed. For a 0.0.x
+# crate the check has nothing to tell us (each 0.0.x bump is breaking by
+# definition). Re-enable once a release with the fixed fstool dependency is
+# published and the crate reaches 0.1.
+semver_check = false
