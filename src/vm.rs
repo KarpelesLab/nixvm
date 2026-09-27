@@ -245,6 +245,12 @@ impl Vm {
         self.kernel.unsupported()
     }
 
+    /// Ctrl-C: interrupt the running command (see [`Kernel::interrupt`]).
+    /// Returns whether a command was running. Pump afterwards.
+    pub fn interrupt(&mut self) -> bool {
+        self.kernel.interrupt()
+    }
+
     /// Whether pid 1 has exited (with its code).
     #[must_use]
     pub fn exit_code(&self) -> Option<i32> {

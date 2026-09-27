@@ -350,6 +350,44 @@ fn ping_over_tunnel_and_loopback() {
         out.contains("1 packets received"),
         "loopback answered: {out:?}"
     );
+
+    // Ctrl-C stops an endless ping: it prints its statistics (its SIGINT
+    // handler runs) and the shell — not interrupted itself — reads again.
+    vm.write_stdin(b"ping 8.8.8.8; echo after-ping\n");
+    let mut out = Vec::new();
+    let t = std::time::Instant::now();
+    let mut interrupted = false;
+    loop {
+        let step = vm.pump().expect("pump");
+        out.extend_from_slice(&step.stdout);
+        out.extend_from_slice(&step.stderr);
+        for p in net.take_outbound() {
+            if let Some(r) = echo_reply(&p) {
+                net.inject(&r);
+            }
+        }
+        if !interrupted && t.elapsed() > std::time::Duration::from_millis(1500) {
+            assert!(vm.interrupt(), "a command was running");
+            interrupted = true;
+        }
+        if interrupted && vm.awaiting_input() {
+            break;
+        }
+        assert!(
+            t.elapsed().as_secs() < 20,
+            "ping not interrupted: {}",
+            String::from_utf8_lossy(&out)
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let out = String::from_utf8_lossy(&out);
+    eprintln!("--- ping + ^C ---\n{out}");
+    assert!(
+        out.contains("packets transmitted"),
+        "ping printed its stats: {out:?}"
+    );
+    assert!(out.contains("after-ping"), "the shell carried on: {out:?}");
+    assert!(vm.exit_code().is_none(), "the shell survived ^C");
 }
 
 /// The real network path of the browser demo, natively: packets go through

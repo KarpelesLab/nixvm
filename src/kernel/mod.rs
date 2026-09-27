@@ -1717,6 +1717,27 @@ impl Kernel {
         self.shared.get_mut().unwrap().stdin_closed = true;
     }
 
+    /// Ctrl-C on the interactive terminal: post `SIGINT` to the running
+    /// command — every live process except the session's shell (pid 1). The
+    /// terminal here is not a tty with a line discipline, so a `^C` byte in
+    /// stdin would just be data; and the demo's `sh` runs without job control
+    /// (one process group), where a real interactive shell ignores `SIGINT`
+    /// while its foreground command receives it. Background jobs started with
+    /// `&` have `SIGINT` ignored by the shell, so they carry on. Returns
+    /// whether any process was signalled (i.e. a command was running).
+    pub fn interrupt(&mut self) -> bool {
+        const SIGINT_BIT: u64 = 1 << (2 - 1);
+        let mut any = false;
+        for p in self.shared.get_mut().unwrap().procs.iter_mut().flatten() {
+            if p.info.pid != 1 && p.info.run == RunState::Running {
+                p.info.pending |= SIGINT_BIT;
+                p.info.parked = false;
+                any = true;
+            }
+        }
+        any
+    }
+
     /// Whether the guest is parked reading the interactive terminal with
     /// nothing buffered — i.e. the command the user typed has finished and the
     /// shell wants the next line. A [`Pumped::Blocked`] that is *not* this is

@@ -8,10 +8,9 @@
 //! picks a working source per platform:
 //!
 //! * native: `SystemTime`, as before;
-//! * wasm32 with the `wasm` feature: JavaScript's `Date.now()` via a
-//!   hand-declared wasm-bindgen import (millisecond resolution — the guest
-//!   ABI reports nanoseconds, but a browser tab has no better source without
-//!   `performance.now()` origin gymnastics);
+//! * wasm32 with the `wasm` feature: JavaScript's `performance.now()` via a
+//!   hand-declared wasm-bindgen import (sub-millisecond), anchored to the
+//!   wall clock with one `Date.now()` reading for `CLOCK_REALTIME`;
 //! * wasm32 without `wasm` (no JS bindings linked): a monotonic fake clock
 //!   ticking 1 ms per read — wrong but total, so nothing can panic.
 
@@ -115,30 +114,48 @@ mod imp {
 
 #[cfg(all(target_arch = "wasm32", feature = "wasm"))]
 mod imp {
+    use std::sync::OnceLock;
     use std::time::Duration;
     use wasm_bindgen::prelude::*;
 
     #[wasm_bindgen]
     extern "C" {
-        /// `Date.now()` — milliseconds since the UNIX epoch.
+        /// `Date.now()` — milliseconds since the UNIX epoch (whole ms).
         #[wasm_bindgen(js_namespace = Date, js_name = now)]
         fn date_now() -> f64;
+        /// `performance.now()` — monotonic milliseconds since page load, with
+        /// sub-millisecond resolution (browsers coarsen it to 5-100 µs).
+        #[wasm_bindgen(js_namespace = performance, js_name = now)]
+        fn perf_now() -> f64;
+    }
+
+    fn from_ms(ms: f64) -> Duration {
+        Duration::from_nanos((ms.max(0.0) * 1e6) as u64)
+    }
+
+    /// `Date.now() - performance.now()`, taken once: the wall-clock time of
+    /// the monotonic origin. Realtime is this plus `performance.now()`, so it
+    /// keeps the monotonic clock's sub-millisecond resolution (`Date.now()`
+    /// alone made every guest timing — ping's RTTs — whole milliseconds).
+    fn epoch_offset_ms() -> f64 {
+        static OFFSET: OnceLock<f64> = OnceLock::new();
+        *OFFSET.get_or_init(|| date_now() - perf_now())
     }
 
     pub fn now_unix() -> Duration {
-        Duration::from_millis(date_now() as u64)
+        from_ms(epoch_offset_ms() + perf_now())
     }
 
-    // The browser has no CPU/monotonic clock we cheaply reach here; the wall
-    // clock is total and non-panicking, which is all the demo needs.
     pub fn now_monotonic() -> Duration {
-        now_unix()
+        from_ms(perf_now())
     }
+    // No per-process CPU clock in a tab; the monotonic clock is total and
+    // non-panicking, which is all the demo needs.
     pub fn now_cpu_process() -> Duration {
-        now_unix()
+        now_monotonic()
     }
     pub fn now_cpu_thread() -> Duration {
-        now_unix()
+        now_monotonic()
     }
 }
 

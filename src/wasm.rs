@@ -351,6 +351,12 @@ mod browser {
             self.vm.close_stdin();
         }
 
+        /// Ctrl-C: send SIGINT to the running command (not the shell).
+        /// Returns whether a command was running; pump afterwards.
+        pub fn interrupt(&mut self) -> bool {
+            self.vm.interrupt()
+        }
+
         /// Run until the guest parks for input or exits; returns the bytes to
         /// write to the terminal (stdout then stderr). Call again after
         /// `write_stdin`.

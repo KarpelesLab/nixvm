@@ -281,11 +281,27 @@ async function handleInput(data) {
           xterm.write("\b \b");
         }
       } else if (code === 3) {
-        // Ctrl-C
+        // Ctrl-C: SIGINT to the running command (the shell itself is left
+        // alone, like an interactive shell). This terminal has no tty line
+        // discipline, so a ^C byte on stdin would just be data.
         writeRaw("^C\r\n");
         lineBuffer = "";
-        guestTerm.write_stdin(encoder.encode("\x03"));
-        await afterStdinChanged();
+        let wasRunning = false;
+        try {
+          wasRunning = guestTerm.interrupt();
+        } catch (err) {
+          surfaceGuestCrash(err);
+          break;
+        }
+        if (wasRunning || commandRunning) {
+          // Let it handle the signal; the prompt returns when the shell
+          // reads again.
+          commandRunning = true;
+          cancelPump();
+          runPump();
+        } else {
+          writePrompt();
+        }
       } else if (code === 4) {
         // Ctrl-D: EOF, only meaningful on an empty line.
         if (lineBuffer.length === 0) {
