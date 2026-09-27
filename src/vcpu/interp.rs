@@ -684,6 +684,34 @@ impl Aarch64Interp {
             };
         }
 
+        // ---- PMULL/PMULL2 (polynomial multiply long) ----
+        // Carry-less multiply: 8 byte lanes -> 8 halfwords (size 00), or one
+        // doubleword -> a 128-bit product (size 11, FEAT_PMULL — advertised
+        // in AT_HWCAP, and what OpenSSL's AES-GCM GHASH runs on). PMULL2
+        // (Q=1) takes the upper halves of the sources. Encodings from clang
+        // (`pmull v0.1q,v20.1d,v20.1d` -> 0x0ef4e280).
+        if instr & 0xBF20_FC00 == 0x0E20_E000 {
+            let upper = (instr >> 30) & 1 == 1;
+            let size = (instr >> 22) & 3;
+            let rm = reg_field(instr, 16);
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let half = |v: u128| if upper { (v >> 64) as u64 } else { v as u64 };
+            let (a, b) = (half(self.v[rn]), half(self.v[rm]));
+            self.v[rd] = match size {
+                0b00 => (0..8).fold(0u128, |acc, i| {
+                    let p = clmul64(
+                        u64::from((a >> (8 * i)) as u8),
+                        u64::from((b >> (8 * i)) as u8),
+                    );
+                    acc | (p << (16 * i))
+                }),
+                0b11 => clmul64(a, b),
+                _ => return Step::Illegal,
+            };
+            return Step::Next;
+        }
+
         // ---- Cryptographic AES / SHA (2-register): AESE/AESD/AESMC/
         // AESIMC, SHA1H/SHA1SU1/SHA256SU0 ----
         // Fixed bits verified against `clang -target aarch64-linux-gnu` +
@@ -1664,6 +1692,87 @@ impl Aarch64Interp {
             if post {
                 let total = nbytes * regs as u64;
                 let inc = if rm == 31 { total } else { self.read_x(rm) };
+                self.write_sp(rn, base.wrapping_add(inc));
+            }
+            return Step::Next;
+        }
+
+        // ---- LD1-4/ST1-4 (single structure) and LD1R-LD4R ----
+        // `ld1 {Vt.S}[i],[Xn]` and friends move one element to/from a lane,
+        // leaving the other lanes intact; LDnR loads one element and
+        // replicates it across the vector. N (1..4) consecutive registers take
+        // consecutive elements from memory. Crypto and compression code
+        // (OpenSSL, zlib's NEON paths — apk's TLS) uses these.
+        if (instr >> 31) & 1 == 0 && matches!((instr >> 23) & 0x7f, 0b001_1010 | 0b001_1011) {
+            let q = (instr >> 30) & 1;
+            let post = (instr >> 23) & 1 == 1;
+            let load = (instr >> 22) & 1 == 1;
+            let r = (instr >> 21) & 1;
+            let rm = reg_field(instr, 16);
+            let opcode = (instr >> 13) & 7;
+            let s_bit = (instr >> 12) & 1;
+            let size = (instr >> 10) & 3;
+            let rn = reg_field(instr, 5);
+            let rt = reg_field(instr, 0);
+            let selem = (((opcode & 1) << 1) | r) + 1;
+            // (element size log2, lane index); `None` for LDnR (replicate).
+            let lane: Option<(u32, u32)> = match opcode >> 1 {
+                0 => Some((0, (q << 3) | (s_bit << 2) | size)),
+                1 if size & 1 == 0 => Some((1, (q << 2) | (s_bit << 1) | (size >> 1))),
+                2 if size == 0 => Some((2, (q << 1) | s_bit)),
+                2 if size == 1 && s_bit == 0 => Some((3, q)),
+                3 if load && s_bit == 0 => None,
+                _ => return Step::Illegal,
+            };
+            let scale = lane.map_or(size, |(sc, _)| sc);
+            let ebytes = 1u64 << scale;
+            let ebits = 8 * ebytes as u32;
+            let emask = ones_u128(ebits);
+            let base = self.read_sp(rn);
+            for i in 0..selem {
+                let vt = ((rt as u32 + i) & 31) as usize;
+                let addr = base.wrapping_add(u64::from(i) * ebytes);
+                if load {
+                    let mut buf = [0u8; 8];
+                    if mem.read(addr, &mut buf[..ebytes as usize]).is_err() {
+                        return Step::Fault { addr, write: false };
+                    }
+                    let elem = u128::from(u64::from_le_bytes(buf));
+                    if let Some((_, index)) = lane {
+                        let sh = index * ebits;
+                        self.v[vt] = (self.v[vt] & !(emask << sh)) | (elem << sh);
+                    } else {
+                        // LDnR: replicate across the 64- or 128-bit vector.
+                        let width = if q == 1 { 128 } else { 64 };
+                        let mut val = 0u128;
+                        let mut sh = 0;
+                        while sh < width {
+                            val |= elem << sh;
+                            sh += ebits;
+                        }
+                        self.v[vt] = val;
+                    }
+                } else {
+                    let Some((_, index)) = lane else {
+                        return Step::Illegal;
+                    };
+                    let elem = (self.v[vt] >> (index * ebits)) & emask;
+                    self.note_store(addr, elem, ebytes as usize);
+                    let bytes = elem.to_le_bytes();
+                    if let Err(e) = mem.write_trap(addr, &bytes[..ebytes as usize]) {
+                        return Step::Fault {
+                            addr: e.fault_addr(),
+                            write: true,
+                        };
+                    }
+                }
+            }
+            if post {
+                let inc = if rm == 31 {
+                    u64::from(selem) * ebytes
+                } else {
+                    self.read_x(rm)
+                };
                 self.write_sp(rn, base.wrapping_add(inc));
             }
             return Step::Next;
@@ -3926,6 +4035,14 @@ fn crc32_step(crc: u32, byte: u8, poly: u32) -> u32 {
 }
 
 /// `n` low bits set, as a `u128`.
+/// Carry-less (GF(2) polynomial) product of two 64-bit values.
+fn clmul64(a: u64, b: u64) -> u128 {
+    let a = u128::from(a);
+    (0..64)
+        .filter(|i| (b >> i) & 1 == 1)
+        .fold(0u128, |acc, i| acc ^ (a << i))
+}
+
 fn ones_u128(n: u32) -> u128 {
     if n >= 128 {
         u128::MAX
@@ -5545,6 +5662,163 @@ mod tests {
         assert_eq!(c.v[0], 0x0101_0101_0101_0101_0101_0101_0101_0101u128);
         assert_eq!(c.v[1], 0x0202_0202_0202_0202_0202_0202_0202_0202u128);
         assert_eq!(c.x[2], base + 0x60, "post-index advanced by 2*16 bytes");
+    }
+
+    /// Coverage scan: execute every instruction word listed in
+    /// `NIXVM_SCAN_WORDS` (lines of `<hex word> <mnemonic …>`, e.g. from
+    /// `objdump -d` of a distro's binaries) on a scratch CPU and report the
+    /// mnemonics the decoder rejects or panics on. A way to find the
+    /// instructions real programs use that the interpreter lacks, all at
+    /// once. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "needs NIXVM_SCAN_WORDS"]
+    fn scan_instruction_coverage() {
+        let Ok(path) = std::env::var("NIXVM_SCAN_WORDS") else {
+            return;
+        };
+        let text = std::fs::read_to_string(path).unwrap();
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, 2 * PAGE_SIZE, Prot::rw()).unwrap();
+        let mut by_mnemonic: std::collections::BTreeMap<String, (usize, String, bool)> =
+            std::collections::BTreeMap::new();
+        std::panic::set_hook(Box::new(|_| {}));
+        for line in text.lines() {
+            let mut it = line.splitn(2, ' ');
+            let (Some(hex), Some(asm)) = (it.next(), it.next()) else {
+                continue;
+            };
+            let Ok(word) = u32::from_str_radix(hex, 16) else {
+                continue;
+            };
+            let mnemonic = asm.split_whitespace().next().unwrap_or("").to_string();
+            if mnemonic.is_empty() || mnemonic.starts_with('<') || mnemonic == "udf" {
+                continue; // data in .text, or a deliberate trap
+            }
+            let mut c = cpu();
+            for r in 0..31 {
+                c.x[r] = base + 0x100;
+            }
+            c.sp = base + 0x1000;
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                matches!(c.exec(word, &mut m), Step::Illegal)
+            }));
+            let (bad, panicked) = match res {
+                Ok(illegal) => (illegal, false),
+                Err(_) => (true, true),
+            };
+            if bad {
+                let e = by_mnemonic
+                    .entry(mnemonic)
+                    .or_insert((0, line.to_string(), false));
+                e.0 += 1;
+                e.2 |= panicked;
+            }
+        }
+        let _ = std::panic::take_hook();
+        for (mn, (n, example, panicked)) in &by_mnemonic {
+            let p = if *panicked { " PANIC" } else { "" };
+            println!("{n:6} {mn:12}{p}  e.g. {example}");
+        }
+        println!("{} mnemonics unsupported", by_mnemonic.len());
+    }
+
+    #[test]
+    fn neon_pmull_carryless_multiply() {
+        let (mut c, mut m) = (cpu(), scratch());
+        // 64x64: x^63 * x^63 = x^126, and (x+1)^2 = x^2+1 (no carries).
+        c.v[20] = (3u128 << 64) | (1u128 << 63);
+        c.exec(0x0ef4_e280, &mut m); // pmull v0.1q, v20.1d, v20.1d
+        assert_eq!(c.v[0], 1u128 << 126);
+        c.exec(0x4ef4_e282, &mut m); // pmull2 v2.1q, v20.2d, v20.2d
+        assert_eq!(c.v[2], 5);
+        // A GHASH-sized check against a reference carry-less multiply.
+        let (a, b) = (0x8765_4321_0fed_cba9u64, 0xdead_beef_cafe_f00du64);
+        let mut want = 0u128;
+        for i in 0..64 {
+            if (b >> i) & 1 == 1 {
+                want ^= u128::from(a) << i;
+            }
+        }
+        c.v[20] = u128::from(a);
+        c.v[21] = u128::from(b);
+        c.exec(0x0ef5_e280, &mut m); // pmull v0.1q, v20.1d, v21.1d
+        assert_eq!(c.v[0], want);
+        // 8x8 lanes: 0x03*0x03 = 0x05, 0xff*0x02 = 0x1fe.
+        c.v[2] = 0x0000_0000_0000_ff03u128 | (0x0000_0000_0000_0003u128 << 64);
+        c.v[3] = 0x0000_0000_0000_0203u128 | (0x0000_0000_0000_0003u128 << 64);
+        c.exec(0x0e23_e041, &mut m); // pmull v1.8h, v2.8b, v3.8b
+        assert_eq!(c.v[1], 0x01fe_0005u128);
+        c.exec(0x4e23_e041, &mut m); // pmull2 v1.8h, v2.16b, v3.16b
+        assert_eq!(c.v[1], 0x0005u128);
+    }
+
+    #[test]
+    fn neon_single_structure_lanes_and_replicate() {
+        // `ld1 {v1.s}[0],[x0]` stopped apk's TLS on aarch64 ("Illegal
+        // instruction"). Encodings from clang; memory holds bytes 0x10.. at x0.
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let data: Vec<u8> = (0x10..0x30).collect();
+        m.write(base, &data).unwrap();
+        let mut c = cpu();
+        let ones = u128::MAX;
+
+        // ld1 {v1.s}[0],[x0]: lane 0 loaded, lanes 1..3 kept.
+        c.x[0] = base;
+        c.v[1] = ones;
+        assert!(matches!(c.exec(0x0d40_8001, &mut m), Step::Next));
+        assert_eq!(c.v[1], (ones << 32) | 0x1312_1110);
+        // ld1 {v1.s}[3],[x0],#4: lane 3, post-index by 4.
+        assert!(matches!(c.exec(0x4ddf_9001, &mut m), Step::Next));
+        assert_eq!(c.v[1] >> 96, 0x1312_1110);
+        assert_eq!(c.x[0], base + 4);
+        // ld1 {v3.b}[9],[x0],x4: byte lane 9, post-index by register.
+        c.x[4] = 3;
+        c.v[3] = 0;
+        assert!(matches!(c.exec(0x4dc4_0403, &mut m), Step::Next));
+        assert_eq!(c.v[3], 0x14u128 << 72);
+        assert_eq!(c.x[0], base + 7);
+        // ld1 {v4.d}[1],[x0]: 64-bit lane 1.
+        c.x[0] = base;
+        c.v[4] = 0xAAAA;
+        assert!(matches!(c.exec(0x4d40_8404, &mut m), Step::Next));
+        assert_eq!(c.v[4], (0x1716_1514_1312_1110u128 << 64) | 0xAAAA);
+        // st1 {v2.h}[5],[x1]: stores halfword lane 5 only.
+        c.x[1] = base + 0x100;
+        c.v[2] = 0xBEEFu128 << 80;
+        assert!(matches!(c.exec(0x4d00_4822, &mut m), Step::Next));
+        let mut out = [0u8; 4];
+        m.read(base + 0x100, &mut out).unwrap();
+        assert_eq!(out, [0xEF, 0xBE, 0, 0]);
+        // ld1r {v5.4s},[x0]: replicate across all four lanes.
+        assert!(matches!(c.exec(0x4d40_c805, &mut m), Step::Next));
+        assert_eq!(c.v[5], 0x1312_1110_1312_1110_1312_1110_1312_1110u128);
+        // ld1r {v6.8b},[x0],#1: 64-bit replicate zeroes the upper half.
+        c.v[6] = ones;
+        assert!(matches!(c.exec(0x0ddf_c006, &mut m), Step::Next));
+        assert_eq!(c.v[6], 0x1010_1010_1010_1010u128);
+        assert_eq!(c.x[0], base + 1);
+        // ld2 {v7.s,v8.s}[1],[x0]: consecutive elements to consecutive regs.
+        c.x[0] = base;
+        c.v[7] = 0;
+        c.v[8] = 0;
+        assert!(matches!(c.exec(0x0d60_9007, &mut m), Step::Next));
+        assert_eq!(c.v[7], 0x1312_1110u128 << 32);
+        assert_eq!(c.v[8], 0x1716_1514u128 << 32);
+        // st2 {v7.s,v8.s}[1],[x1],#8: writes both lanes back, post-index 8.
+        c.x[1] = base + 0x200;
+        assert!(matches!(c.exec(0x0dbf_9027, &mut m), Step::Next));
+        let mut out = [0u8; 8];
+        m.read(base + 0x200, &mut out).unwrap();
+        assert_eq!(out, [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17]);
+        assert_eq!(c.x[1], base + 0x208);
+        // ld4r {v10-v13.16b},[x0]: four bytes, each replicated into its reg.
+        assert!(matches!(c.exec(0x4d60_e00a, &mut m), Step::Next));
+        for (i, b) in [0x10u8, 0x11, 0x12, 0x13].iter().enumerate() {
+            assert_eq!(c.v[10 + i], u128::from_le_bytes([*b; 16]));
+        }
     }
 
     /// Pack four `f32` lanes into a 128-bit vector register value (lane 0 low).

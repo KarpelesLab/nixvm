@@ -343,3 +343,126 @@ fn ping_over_tunnel_and_loopback() {
         "loopback answered: {out:?}"
     );
 }
+
+/// The real network path of the browser demo, natively: packets go through
+/// grouterd's WebSocket tunnel via `scripts/tunnel-bridge.mjs`. Runs DNS +
+/// HTTP (`apk update`) and ping against the live internet. Gated on
+/// `NIXVM_TUNNEL_BRIDGE` (the bridge's `host:port`) and `NIXVM_ALPINE_TAR`;
+/// each run consumes one (rationed) tunnel token.
+#[cfg(all(feature = "fstool", feature = "tunnel"))]
+#[test]
+fn tunnel_live_apk_update() {
+    use nixvm::tunnel::{Lease, Tunnel};
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    let (Ok(bridge), Ok(tar_path)) = (
+        std::env::var("NIXVM_TUNNEL_BRIDGE"),
+        std::env::var("NIXVM_ALPINE_TAR"),
+    ) else {
+        eprintln!("NIXVM_TUNNEL_BRIDGE/NIXVM_ALPINE_TAR not set; skipping live tunnel test");
+        return;
+    };
+    let mut link = std::net::TcpStream::connect(&bridge).expect("connect to tunnel-bridge");
+
+    // Read one [kind][len][bytes] frame (blocking).
+    fn read_frame(s: &mut std::net::TcpStream) -> Option<(u8, Vec<u8>)> {
+        let mut hdr = [0u8; 5];
+        s.read_exact(&mut hdr).ok()?;
+        let mut b = vec![0u8; u32::from_be_bytes(hdr[1..5].try_into().unwrap()) as usize];
+        s.read_exact(&mut b).ok()?;
+        Some((hdr[0], b))
+    }
+    // A JSON string field of the hello (it is tiny and flat).
+    fn field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+        let at = json.find(&format!("\"{key}\":\""))? + key.len() + 4;
+        Some(&json[at..at + json[at..].find('"')?])
+    }
+
+    let (kind, hello) = read_frame(&mut link).expect("hello");
+    assert_eq!(kind, 0);
+    let hello = String::from_utf8(hello).unwrap();
+    eprintln!("hello: {hello}");
+    let v4 = field(&hello, "ipv4").map(|a| (a.parse().unwrap(), 10));
+    let v6 = field(&hello, "ipv6").map(|r| {
+        let net: std::net::Ipv6Addr = r.split('/').next().unwrap().parse().unwrap();
+        (std::net::Ipv6Addr::from(u128::from(net) | 1), 64)
+    });
+    let net = Tunnel::new();
+    net.up(Lease { v4, v6, mtu: 1400 });
+
+    let tar = std::fs::read(&tar_path).expect("read Alpine tar");
+    let mut vm = Vm::boot_squashfs_net(
+        &tar,
+        vec!["/bin/busybox".to_string(), "sh".to_string()],
+        256 * 1024 * 1024,
+        net.clone(),
+    )
+    .expect("boot with a tunnel");
+    let _ = drain(&mut vm);
+
+    // Inbound frames arrive on a reader thread (the test plays the page's
+    // event loop: pump, flush packets, feed arrivals, tick every 100 ms).
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut reader = link.try_clone().unwrap();
+    std::thread::spawn(move || {
+        while let Some((1, p)) = read_frame(&mut reader) {
+            if tx.send(p).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut run = |cmd: &[u8], secs: u64| -> String {
+        vm.write_stdin(cmd);
+        let mut out = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut last_tick = Instant::now();
+        loop {
+            let step = vm.pump().expect("pump");
+            out.extend_from_slice(&step.stdout);
+            out.extend_from_slice(&step.stderr);
+            for p in net.take_outbound() {
+                let mut f = vec![1u8];
+                f.extend_from_slice(&(p.len() as u32).to_be_bytes());
+                f.extend_from_slice(&p);
+                link.write_all(&f).unwrap();
+            }
+            while let Ok(p) = rx.try_recv() {
+                net.inject(&p);
+            }
+            if last_tick.elapsed() >= Duration::from_millis(100) {
+                net.tick();
+                last_tick = Instant::now();
+            }
+            if vm.awaiting_input() && !net.has_outbound() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out: {}",
+                String::from_utf8_lossy(&out)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    };
+
+    let out = run(b"ping -c 2 1.1.1.1\n", 30);
+    eprintln!("--- ping ---\n{out}");
+    assert!(
+        out.contains("packets received") && !out.contains(" 0 packets received"),
+        "{out:?}"
+    );
+
+    let out = run(b"apk update; echo apk-exit-$?\n", 180);
+    eprintln!("--- apk update ---\n{out}");
+    assert!(out.contains("apk-exit-0"), "apk update succeeds: {out:?}");
+
+    let out = run(
+        b"wget -q -O - http://example.com | head -c 200; echo; echo wget-exit-$?\n",
+        60,
+    );
+    eprintln!("--- wget ---\n{out}");
+    assert!(out.contains("wget-exit-0"), "{out:?}");
+}
