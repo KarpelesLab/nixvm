@@ -30,7 +30,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use pktkit::vclient::{Client, ClientConfig, TcpConn, UdpConn};
 use pktkit::{IpPrefix, L3Device, Packet, Protocol, transport_checksum};
@@ -71,7 +71,18 @@ struct Inner {
     v4: Option<Arc<Client>>,
     v6: Option<Arc<Client>>,
     lease: Option<Lease>,
+    /// Open ICMP endpoints (guest raw/ping sockets), by family: each gets a
+    /// copy of every inbound ICMP packet. Dropped endpoints are pruned lazily.
+    icmp: Vec<(bool, Weak<IcmpQueue>)>,
+    /// IPv4 identification for the ICMP packets we build.
+    ip_id: u16,
 }
+
+/// Inbound ICMP packets waiting for one guest socket.
+type IcmpQueue = Mutex<VecDeque<Vec<u8>>>;
+
+/// Most inbound ICMP packets queued per endpoint before new ones are dropped.
+const MAX_ICMP_QUEUE: usize = 256;
 
 impl std::fmt::Debug for Tunnel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -141,12 +152,90 @@ impl Tunnel {
             };
             (client, lease.mtu)
         };
+        if is_icmp(packet) {
+            self.deliver_icmp(packet);
+            return;
+        }
         let Some(client) = client else { return };
         // Clamp the MSS a peer's SYN-ACK advertises, so what we send it fits
         // the link too (our own SYN is clamped on the way out).
         let mut packet = packet.to_vec();
         clamp_mss(&mut packet, mtu);
         let _ = client.send(Packet::from_slice(&packet));
+    }
+
+    /// Hand inbound ICMP `packet` to every open ICMP endpoint of its family.
+    fn deliver_icmp(&self, packet: &[u8]) {
+        let v6 = packet[0] >> 4 == 6;
+        let mut inner = self.inner.lock().unwrap();
+        inner.icmp.retain(|(_, w)| w.strong_count() > 0);
+        for (fam, w) in &inner.icmp {
+            if *fam == v6
+                && let Some(q) = w.upgrade()
+            {
+                let mut q = q.lock().unwrap();
+                if q.len() < MAX_ICMP_QUEUE {
+                    q.push_back(packet.to_vec());
+                }
+            }
+        }
+    }
+
+    /// Wrap ICMP message `msg` in an IP packet from our address to `dst` and
+    /// queue it for the transport (computing the ICMPv6 checksum).
+    fn send_icmp(&self, msg: &[u8], dst: IpAddr) -> io::Result<usize> {
+        let unreachable = || io::Error::new(io::ErrorKind::NetworkUnreachable, "no route");
+        let mut inner = self.inner.lock().unwrap();
+        let lease = inner.lease.ok_or_else(unreachable)?;
+        let pkt = match dst {
+            IpAddr::V4(d) => {
+                let (src, _) = lease.v4.ok_or_else(unreachable)?;
+                inner.ip_id = inner.ip_id.wrapping_add(1);
+                let total = 20 + msg.len();
+                let mut p = Vec::with_capacity(total);
+                p.extend_from_slice(&[0x45, 0]);
+                p.extend_from_slice(&u16::try_from(total).map_err(|_| too_big())?.to_be_bytes());
+                p.extend_from_slice(&inner.ip_id.to_be_bytes());
+                p.extend_from_slice(&[0, 0, 64, 1, 0, 0]); // no frag, TTL 64, ICMP
+                p.extend_from_slice(&src.octets());
+                p.extend_from_slice(&d.octets());
+                let sum = pktkit::checksum(&p[..20]);
+                p[10..12].copy_from_slice(&sum.to_be_bytes());
+                p.extend_from_slice(msg);
+                p
+            }
+            IpAddr::V6(d) => {
+                let (src, _) = lease.v6.ok_or_else(unreachable)?;
+                if msg.len() < 4 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "short ICMPv6"));
+                }
+                let mut body = msg.to_vec();
+                body[2..4].fill(0);
+                let sum = transport_checksum(Protocol::ICMPV6, src.into(), d.into(), &body);
+                body[2..4].copy_from_slice(&sum.to_be_bytes());
+                let mut p = Vec::with_capacity(40 + body.len());
+                p.extend_from_slice(&[0x60, 0, 0, 0]);
+                p.extend_from_slice(
+                    &u16::try_from(body.len())
+                        .map_err(|_| too_big())?
+                        .to_be_bytes(),
+                );
+                p.extend_from_slice(&[58, 64]); // next header ICMPv6, hop limit 64
+                p.extend_from_slice(&src.octets());
+                p.extend_from_slice(&d.octets());
+                p.extend_from_slice(&body);
+                p
+            }
+        };
+        if pkt.len() > usize::from(lease.mtu) {
+            return Err(too_big());
+        }
+        drop(inner);
+        let mut q = self.outbound.lock().unwrap();
+        if q.len() < MAX_OUTBOUND {
+            q.push_back(pkt);
+        }
+        Ok(msg.len())
     }
 
     /// Packets to send over the transport, oldest first.
@@ -239,6 +328,64 @@ impl Egress for Tunnel {
             tunnel: self.clone(),
             socks: HashMap::new(),
         }))
+    }
+
+    fn open_icmp(&self, v6: bool) -> io::Result<Box<dyn HostDgram>> {
+        let queue = Arc::new(IcmpQueue::default());
+        self.inner
+            .lock()
+            .unwrap()
+            .icmp
+            .push((v6, Arc::downgrade(&queue)));
+        Ok(Box::new(TunnelIcmp {
+            tunnel: self.clone(),
+            queue,
+        }))
+    }
+}
+
+fn too_big() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "packet exceeds the link MTU")
+}
+
+/// Whether IP `packet` carries ICMP (IPv4 protocol 1, IPv6 next header 58).
+fn is_icmp(packet: &[u8]) -> bool {
+    match packet.first().map(|b| b >> 4) {
+        Some(4) => packet.len() >= 20 && packet[9] == 1,
+        Some(6) => packet.len() >= 40 && packet[6] == 58,
+        _ => false,
+    }
+}
+
+/// A guest ICMP socket's endpoint on the tunnel (see [`Egress::open_icmp`]).
+struct TunnelIcmp {
+    tunnel: Tunnel,
+    queue: Arc<IcmpQueue>,
+}
+
+impl std::fmt::Debug for TunnelIcmp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TunnelIcmp").finish_non_exhaustive()
+    }
+}
+
+impl HostDgram for TunnelIcmp {
+    fn send_to(&mut self, buf: &[u8], ip: [u8; 16], v6: bool, _port: u16) -> io::Result<usize> {
+        self.tunnel.send_icmp(buf, sockaddr(ip, v6, 0).ip())
+    }
+
+    fn recv_from(&mut self) -> io::Result<Option<Datagram>> {
+        let Some(pkt) = self.queue.lock().unwrap().pop_front() else {
+            return Ok(None);
+        };
+        let (ip, v6) = if pkt[0] >> 4 == 6 {
+            (<[u8; 16]>::try_from(&pkt[8..24]).unwrap(), true)
+        } else {
+            let mut ip = [0u8; 16];
+            ip[..4].copy_from_slice(&pkt[12..16]);
+            (ip, false)
+        };
+        Ok(Some((ip, v6, 0, pkt)))
     }
 }
 
@@ -546,6 +693,42 @@ mod tests {
             assert!(p.len() <= 1400, "server sent a {}-byte packet", p.len());
         }
         drop(conn);
+    }
+
+    #[test]
+    fn icmp_echo_goes_out_and_replies_come_back() {
+        let t = Tunnel::new();
+        t.up(lease4(2));
+        let mut sock = t.open_icmp(false).unwrap();
+        let mut dst = [0u8; 16];
+        dst[..4].copy_from_slice(&[8, 8, 8, 8]);
+        // Echo request, id 0x1234 seq 1, checksum left to the guest (zero here).
+        let echo = [8u8, 0, 0, 0, 0x12, 0x34, 0, 1, b'h', b'i'];
+        assert_eq!(sock.send_to(&echo, dst, false, 0).unwrap(), echo.len());
+        let out = t.take_outbound();
+        assert_eq!(out.len(), 1);
+        let p = &out[0];
+        assert_eq!(
+            (p[0], p[9], &p[12..16], &p[16..20]),
+            (0x45, 1, &[10, 0, 0, 2][..], &[8, 8, 8, 8][..])
+        );
+        assert_eq!(pktkit::checksum(&p[..20]), 0, "valid IPv4 header checksum");
+        assert_eq!(&p[20..], &echo);
+        // A reply (addresses swapped, type 0) reaches the endpoint whole.
+        let mut reply = p.clone();
+        reply[12..16].copy_from_slice(&[8, 8, 8, 8]);
+        reply[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        reply[20] = 0;
+        t.inject(&reply);
+        let (from, v6, _, got) = sock.recv_from().unwrap().expect("reply");
+        assert_eq!((&from[..4], v6), (&[8, 8, 8, 8][..], false));
+        assert_eq!(got, reply);
+        // Link down: unreachable.
+        t.down();
+        assert_eq!(
+            sock.send_to(&echo, dst, false, 0).unwrap_err().kind(),
+            io::ErrorKind::NetworkUnreachable
+        );
     }
 
     #[test]

@@ -85,6 +85,8 @@ impl Errno {
     const ENOTCONN: Errno = Errno(107);
     /// `socket(AF_NETLINK, _, protocol)` with an unsupported `protocol`.
     const EPROTONOSUPPORT: Errno = Errno(93);
+    /// An ICMP message too large for the link MTU.
+    const EMSGSIZE: Errno = Errno(90);
     /// A routable connect with no egress backend installed (loopback-only VM).
     const ENETUNREACH: Errno = Errno(101);
     /// A host `connect_tcp` that timed out.
@@ -97,6 +99,71 @@ impl Errno {
     const EISCONN: Errno = Errno(106);
     /// A host socket read/write errored (connection reset).
     const ECONNRESET: Errno = Errno(104);
+}
+
+/// Shape an inbound ICMP IP packet for ICMP socket `icmp`: a raw IPv4 socket
+/// reads the whole packet, raw IPv6 and ping sockets the ICMP message alone;
+/// a ping socket only takes echo replies carrying its identifier. `None`
+/// drops it (not for this socket, or malformed).
+fn shape_icmp(icmp: Icmp, pkt: Vec<u8>) -> Option<Vec<u8>> {
+    let v6 = pkt.first()? >> 4 == 6;
+    let hl = if v6 {
+        40
+    } else {
+        usize::from(pkt[0] & 0xf) * 4
+    };
+    let msg = pkt.get(hl..).filter(|m| m.len() >= 8)?;
+    if !icmp.raw {
+        let reply = if v6 { 129 } else { 0 };
+        if msg[0] != reply || msg[4..6] != icmp.ident.to_be_bytes() {
+            return None;
+        }
+    }
+    Some(if icmp.raw && !v6 { pkt } else { msg.to_vec() })
+}
+
+/// Recompute an ICMPv4 message's checksum in place (RFC 792: over the whole
+/// message, checksum field zeroed).
+fn set_icmp4_checksum(msg: &mut [u8]) {
+    msg[2..4].fill(0);
+    let sum = inet_checksum(msg);
+    msg[2..4].copy_from_slice(&sum.to_be_bytes());
+}
+
+/// The RFC 1071 Internet checksum of `data`.
+fn inet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = data
+        .chunks(2)
+        .map(|c| u32::from(u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)])))
+        .sum();
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// An IP packet carrying ICMP `msg` from local address `a` to itself — how a
+/// loopback echo reply arrives (TTL/hop limit 64).
+fn loopback_ip_packet(a: InetAddr, msg: &[u8]) -> Vec<u8> {
+    let ip = if a.is_any() { loopback_ip(a.v6) } else { a.ip };
+    let mut p = Vec::with_capacity(40 + msg.len());
+    if a.v6 {
+        p.extend_from_slice(&[0x60, 0, 0, 0]);
+        p.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+        p.extend_from_slice(&[58, 64]);
+        p.extend_from_slice(&ip);
+        p.extend_from_slice(&ip);
+    } else {
+        p.extend_from_slice(&[0x45, 0]);
+        p.extend_from_slice(&((20 + msg.len()) as u16).to_be_bytes());
+        p.extend_from_slice(&[0, 0, 0, 0, 64, 1, 0, 0]);
+        p.extend_from_slice(&ip[..4]);
+        p.extend_from_slice(&ip[..4]);
+        let sum = inet_checksum(&p[..20]);
+        p[10..12].copy_from_slice(&sum.to_be_bytes());
+    }
+    p.extend_from_slice(msg);
+    p
 }
 
 /// The errno a failed host connect maps to: the ones guest clients branch on
@@ -125,7 +192,9 @@ const NETLINK_ROUTE: u64 = 0;
 
 const SOL_SOCKET: u64 = 1;
 const IPPROTO_IP: u64 = 0;
+const IPPROTO_ICMP: u64 = 1;
 const IPPROTO_TCP: u64 = 6;
+const IPPROTO_ICMPV6: u64 = 58;
 const IPPROTO_IPV6: u64 = 41;
 
 // `SOL_SOCKET` option names (asm-generic/socket.h).
@@ -227,6 +296,8 @@ pub(super) struct Net {
     /// connections to *routable* addresses onto real host sockets. Installed
     /// by [`Kernel::set_egress`].
     egress: Option<Box<dyn Egress>>,
+    /// Last echo identifier handed to a ping socket.
+    ping_ident: u16,
 }
 
 impl std::fmt::Debug for Net {
@@ -237,6 +308,7 @@ impl std::fmt::Debug for Net {
             .field("dgram_ports", &self.dgram_ports)
             .field("dgram_paths", &self.dgram_paths)
             .field("egress", &self.egress.is_some())
+            .field("ping_ident", &self.ping_ident)
             .finish()
     }
 }
@@ -459,6 +531,21 @@ struct Dgram {
     /// sends go out through it and inbound host datagrams are drained into
     /// `queue` on recv. `None` = pure in-VM datagram socket.
     host: Option<Box<dyn HostDgram>>,
+    /// Set for an ICMP socket (raw, or a `SOCK_DGRAM` "ping" socket): datagrams
+    /// are ICMP messages, carried by the egress backend's ICMP endpoint (in
+    /// `host`) or answered locally for a loopback echo.
+    icmp: Option<Icmp>,
+}
+
+/// What kind of ICMP socket a [`Dgram`] is.
+#[derive(Debug, Clone, Copy)]
+struct Icmp {
+    /// `SOCK_RAW`: the guest writes whole ICMP messages and reads every ICMP
+    /// packet (IPv4 ones with their IP header, as Linux delivers them).
+    /// Otherwise a ping socket: only echo requests out — stamped with `ident`
+    /// — and only the matching echo replies in, without IP header.
+    raw: bool,
+    ident: u16,
 }
 
 impl std::fmt::Debug for Dgram {
@@ -469,6 +556,7 @@ impl std::fmt::Debug for Dgram {
             .field("pair_peer", &self.pair_peer)
             .field("queue", &self.queue)
             .field("host", &self.host.is_some())
+            .field("icmp", &self.icmp)
             .finish()
     }
 }
@@ -702,12 +790,52 @@ impl Kernel {
             return err(Errno::EAFNOSUPPORT);
         }
         let base_type = sotype & 0xf;
+        let nonblock = sotype & SOCK_NONBLOCK != 0;
+        // ICMP: a raw socket (`ping` as root), or a `SOCK_DGRAM` ping socket
+        // (unprivileged ping). The only raw protocol modeled is ICMP.
+        let icmp_proto = if domain == AF_INET6 {
+            IPPROTO_ICMPV6
+        } else {
+            IPPROTO_ICMP
+        };
+        if domain != AF_UNIX
+            && (base_type == SOCK_RAW || (base_type == SOCK_DGRAM && protocol == icmp_proto))
+        {
+            if protocol != icmp_proto {
+                return err(Errno::EPROTONOSUPPORT);
+            }
+            net.ping_ident = net.ping_ident.wrapping_add(1);
+            let icmp = Icmp {
+                raw: base_type == SOCK_RAW,
+                ident: net.ping_ident,
+            };
+            // Open the backend endpoint now, so a raw socket sees replies (and
+            // other ICMP) whether or not it has sent; without one, only
+            // loopback echoes are answered.
+            let host = net
+                .egress
+                .as_ref()
+                .and_then(|e| e.open_icmp(domain == AF_INET6).ok());
+            let idx = net.socks.len();
+            net.socks.push(Sock {
+                domain,
+                kind: Kind::Dgram(Dgram {
+                    icmp: Some(icmp),
+                    host,
+                    ..Dgram::default()
+                }),
+                nonblock,
+                opts: SockOpts::default(),
+            });
+            let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
+            cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
+            return i64::from(fd);
+        }
         // Stream and datagram are supported for every domain (including AF_UNIX
         // datagram, which syslog's /dev/log uses); other types aren't.
         if base_type != SOCK_STREAM && base_type != SOCK_DGRAM {
             return err(Errno::EOPNOTSUPP);
         }
-        let nonblock = sotype & SOCK_NONBLOCK != 0;
         let kind = if base_type == SOCK_DGRAM {
             Kind::Dgram(Dgram::default())
         } else {
@@ -1422,6 +1550,10 @@ impl Kernel {
         let value: u32 = if level == SOL_SOCKET {
             match optname {
                 SO_TYPE => match &net.socks[sock].kind {
+                    Kind::Dgram(Dgram {
+                        icmp: Some(Icmp { raw: true, .. }),
+                        ..
+                    }) => SOCK_RAW as u32,
                     Kind::Dgram(_) => SOCK_DGRAM as u32,
                     Kind::Netlink(nl) => nl.sotype as u32,
                     _ => SOCK_STREAM as u32,
@@ -1564,6 +1696,12 @@ impl Kernel {
         if !matches!(net.socks[sock].kind, Kind::Dgram(_)) {
             return err(Errno::EINVAL); // real errno: EOPNOTSUPP/EISCONN
         }
+        if matches!(
+            net.socks[sock].kind,
+            Kind::Dgram(Dgram { icmp: Some(_), .. })
+        ) {
+            return self.icmp_send(net, sock, data, dest);
+        }
         // A routable destination (DNS, chiefly) goes out through a real host
         // UDP socket when egress is enabled; without egress it's unreachable.
         if !dest.valid_bind() {
@@ -1689,6 +1827,67 @@ impl Kernel {
         Some(mask)
     }
 
+    /// Send ICMP message `data` from ICMP socket `sock` to `dest`. A ping socket
+    /// only sends echo requests and stamps them with its identifier (and, for
+    /// IPv4, the checksum). An echo to a local address is answered here, as
+    /// the loopback interface would; anything else goes to the egress
+    /// backend's ICMP endpoint.
+    #[allow(clippy::unused_self)]
+    fn icmp_send(&self, net: &mut Net, sock: usize, data: &[u8], dest: InetAddr) -> i64 {
+        let Kind::Dgram(d) = &mut net.socks[sock].kind else {
+            return err(Errno::EINVAL);
+        };
+        let Some(icmp) = d.icmp else {
+            return err(Errno::EINVAL);
+        };
+        let (echo_req, echo_reply) = if dest.v6 { (128u8, 129u8) } else { (8u8, 0u8) };
+        if data.len() < 8 {
+            return err(Errno::EINVAL);
+        }
+        let mut msg = data.to_vec();
+        if !icmp.raw {
+            if msg[0] != echo_req {
+                return err(Errno::EINVAL);
+            }
+            msg[4..6].copy_from_slice(&icmp.ident.to_be_bytes());
+            if !dest.v6 {
+                set_icmp4_checksum(&mut msg);
+            }
+        }
+        if dest.valid_bind() {
+            // Loopback: answer an echo request ourselves (and swallow the rest).
+            if msg[0] == echo_req {
+                let mut reply = msg;
+                reply[0] = echo_reply;
+                if !dest.v6 {
+                    set_icmp4_checksum(&mut reply);
+                }
+                let pkt = loopback_ip_packet(dest, &reply);
+                if let Some(p) = shape_icmp(icmp, pkt) {
+                    let src = InetAddr {
+                        v6: dest.v6,
+                        port: 0,
+                        ip: if dest.is_any() {
+                            loopback_ip(dest.v6)
+                        } else {
+                            dest.ip
+                        },
+                    };
+                    d.queue.push_back((src, p));
+                }
+            }
+            return data.len() as i64;
+        }
+        let Some(host) = d.host.as_mut() else {
+            return err(Errno::ENETUNREACH);
+        };
+        match host.send_to(&msg, dest.ip, dest.v6, 0) {
+            Ok(_) => data.len() as i64,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => err(Errno::EMSGSIZE),
+            Err(_) => err(Errno::ENETUNREACH),
+        }
+    }
+
     /// Send a datagram out through this socket's host UDP socket (opening it
     /// lazily on first use), for egress to a routable address.
     #[allow(clippy::unused_self)]
@@ -1730,10 +1929,20 @@ impl Kernel {
         };
         // Pull whatever is ready (non-blocking), then push into the queue —
         // collect first so the host borrow ends before the queue borrow.
+        let icmp = d.icmp;
         let mut arrived = Vec::new();
         for _ in 0..64 {
             match host.recv_from() {
                 Ok(Some((ip, v6, port, payload))) => {
+                    // An ICMP endpoint yields whole IP packets: shape each for
+                    // this socket (and drop what a ping socket doesn't want).
+                    let payload = match icmp {
+                        Some(i) => match shape_icmp(i, payload) {
+                            Some(p) => p,
+                            None => continue,
+                        },
+                        None => payload,
+                    };
                     arrived.push((InetAddr { v6, port, ip }, payload));
                 }
                 _ => break,
@@ -2496,6 +2705,17 @@ impl Kernel {
             let Some(peer) = peer else {
                 return err(Errno::ENOTCONN);
             };
+            if matches!(
+                net.socks[sock].kind,
+                Kind::Dgram(Dgram { icmp: Some(_), .. })
+            ) {
+                return self.icmp_send(net, sock, data, peer);
+            }
+            // A connected socket's routable peer is reached through egress,
+            // exactly like a `sendto` to it.
+            if !peer.valid_bind() {
+                return self.host_udp_send(net, sock, data, peer);
+            }
             let src = self.ensure_dgram_bound(net, sock);
             let key = route_key("udp", peer);
             if let Some(&tgt) = net.dgram_ports.get(&key)

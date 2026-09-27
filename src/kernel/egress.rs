@@ -81,6 +81,21 @@ pub trait Egress: Send + Debug {
     fn connect_tcp(&self, ip: [u8; 16], v6: bool, port: u16) -> io::Result<Box<dyn HostConn>>;
     /// Open a datagram socket for UDP egress.
     fn open_udp(&self) -> io::Result<Box<dyn HostDgram>>;
+    /// Open an ICMP (`v6`: ICMPv6) endpoint, for guest raw/ping sockets.
+    /// `send_to` takes one ICMP message (header + body; the port is ignored)
+    /// and sends it in an IP packet from our address — for ICMPv6 the
+    /// transport fills in the checksum, which needs the pseudo-header. Every
+    /// ICMP packet of that family that arrives is offered to every open
+    /// endpoint: `recv_from` yields `(source, v6, 0, the whole IP packet)`,
+    /// and the socket layer shapes it for the guest socket type. Unsupported
+    /// by default (a host needs privileges for raw ICMP).
+    fn open_icmp(&self, v6: bool) -> io::Result<Box<dyn HostDgram>> {
+        let _ = v6;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "ICMP egress not supported by this backend",
+        ))
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

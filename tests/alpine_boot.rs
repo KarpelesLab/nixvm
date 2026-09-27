@@ -240,3 +240,106 @@ fn squashfs_relative_symlinks_resolve_for_apk() {
     assert!(!out.contains("Symbolic link loop"), "symlink loop: {out:?}");
     assert!(out.contains("apk-tools"), "apk runs (loads libz): {out:?}");
 }
+
+/// busybox `ping` over the tunnel: the test plays the internet and answers
+/// every ICMP echo request the guest sends, then checks ping saw the replies.
+/// Also pings loopback, which the kernel answers itself. Gated on
+/// `NIXVM_ALPINE_TAR`.
+#[cfg(all(feature = "fstool", feature = "tunnel"))]
+#[test]
+fn ping_over_tunnel_and_loopback() {
+    use nixvm::tunnel::{Lease, Tunnel};
+    use std::net::Ipv4Addr;
+
+    fn csum(data: &[u8]) -> u16 {
+        let mut sum: u32 = data
+            .chunks(2)
+            .map(|c| u32::from(u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)])))
+            .sum();
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// Answer an IPv4 ICMP echo request with its echo reply.
+    fn echo_reply(p: &[u8]) -> Option<Vec<u8>> {
+        let hl = usize::from(p[0] & 0xf) * 4;
+        if p[0] >> 4 != 4 || p[9] != 1 || p.get(hl) != Some(&8) {
+            return None;
+        }
+        let mut r = p.to_vec();
+        r[12..16].copy_from_slice(&p[16..20]);
+        r[16..20].copy_from_slice(&p[12..16]);
+        r[8] = 57; // TTL as seen after a few hops
+        r[10..12].fill(0);
+        let s = csum(&r[..hl]);
+        r[10..12].copy_from_slice(&s.to_be_bytes());
+        r[hl] = 0; // echo reply
+        r[hl + 2..hl + 4].fill(0);
+        let s = csum(&r[hl..]);
+        r[hl + 2..hl + 4].copy_from_slice(&s.to_be_bytes());
+        Some(r)
+    }
+
+    let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
+        eprintln!("NIXVM_ALPINE_TAR not set; skipping ping test");
+        return;
+    };
+    let tar = std::fs::read(&tar_path).expect("read Alpine tar");
+    let net = Tunnel::new();
+    net.up(Lease {
+        v4: Some((Ipv4Addr::new(100, 64, 0, 2), 10)),
+        v6: None,
+        mtu: 1400,
+    });
+    let mut vm = Vm::boot_squashfs_net(
+        &tar,
+        vec!["/bin/busybox".to_string(), "sh".to_string()],
+        256 * 1024 * 1024,
+        net.clone(),
+    )
+    .expect("boot with a tunnel");
+    let _ = drain(&mut vm);
+
+    let mut run = |cmd: &[u8]| -> String {
+        vm.write_stdin(cmd);
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let step = vm.pump().expect("pump");
+            out.extend_from_slice(&step.stdout);
+            out.extend_from_slice(&step.stderr);
+            for p in net.take_outbound() {
+                if let Some(r) = echo_reply(&p) {
+                    net.inject(&r);
+                }
+            }
+            if vm.awaiting_input() && !net.has_outbound() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out: {}",
+                String::from_utf8_lossy(&out)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    };
+
+    let out = run(b"ping -c 2 8.8.8.8\n");
+    eprintln!("--- ping 8.8.8.8 ---\n{out}");
+    assert!(
+        out.contains("64 bytes from 8.8.8.8"),
+        "echo replies seen: {out:?}"
+    );
+    assert!(out.contains("2 packets received"), "both answered: {out:?}");
+
+    let out = run(b"ping -c 1 127.0.0.1\n");
+    eprintln!("--- ping 127.0.0.1 ---\n{out}");
+    assert!(
+        out.contains("1 packets received"),
+        "loopback answered: {out:?}"
+    );
+}
