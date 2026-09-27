@@ -74,8 +74,14 @@ tunnel = ["dep:pktkit"]
 # optional dependency, gated behind its feature; per-phase additions arrive
 # gated by the features above (object, kvm-ioctls, sha2, a fetch stack, …).
 # `gzip` lets us repack an Alpine .tar.gz minirootfs into an ext4 root image.
-fstool = { version = "0.4.20", optional = true, default-features = false, features = [
+# Since 0.4.28 each filesystem is its own feature (a `default-features = false`
+# build gets none and doesn't compile); enable the ones nixvm reads/builds:
+# ext2/3/4 root images, squashfs (the repacked overlay lower), tar.
+fstool = { version = "0.4.28", optional = true, default-features = false, features = [
     "gzip",
+    "ext",
+    "squashfs",
+    "tar",
 ] }
 # Blocking HTTP(S) client for downloading guest root images, gated behind the
 # `fetch` feature (see src/image.rs). Not linked into the default build.
