@@ -217,6 +217,15 @@ mod browser {
     /// xterm.write(out);
     /// // once !term.is_running(), term.exit_code() has the exit code
     /// ```
+    ///
+    /// Networking: the guest's sockets are carried over an IP-packet tunnel
+    /// (see `crate::tunnel`). The page opens the transport (grouterd's
+    /// WebSocket), calls `net_up` with the leased addresses from its hello,
+    /// feeds each received packet to `net_input`, sends every packet
+    /// `net_next_packet` yields, and calls `net_tick` about every 100 ms.
+    /// While `has_pending_work()` the guest is waiting on a timer or the
+    /// network and should be pumped again soon; `awaiting_input()` means the
+    /// last command finished and the shell wants the next line.
     //
     // NOTE: keep this doc comment free of `*/` — wasm-bindgen copies it verbatim
     // into the generated `pkg/nixvm.js` as a `/** … */` JSDoc block, and a `*/`
@@ -226,6 +235,9 @@ mod browser {
     #[derive(Debug)]
     pub struct Terminal {
         vm: crate::vm::Vm,
+        net: crate::tunnel::Tunnel,
+        /// Packets taken from `net`, handed out one per `net_next_packet`.
+        out: std::collections::VecDeque<Vec<u8>>,
     }
 
     #[wasm_bindgen]
@@ -247,9 +259,86 @@ mod browser {
             // Repack the tar into an in-memory squashfs (read-only lower) under a
             // writable tmpfs upper — the real copy-on-write overlay layout, so the
             // guest root stays compressed in RAM and decompresses on demand.
-            let vm = crate::vm::Vm::boot_squashfs(&tar, argv, MEM_BYTES)
+            let net = crate::tunnel::Tunnel::new();
+            let vm = crate::vm::Vm::boot_squashfs_net(&tar, argv, MEM_BYTES, net.clone())
                 .map_err(|e| JsError::new(&e))?;
-            Ok(Self { vm })
+            Ok(Self {
+                vm,
+                net,
+                out: std::collections::VecDeque::new(),
+            })
+        }
+
+        /// Bring the network link up with the addresses from the tunnel's
+        /// hello: `ipv4` (dotted quad) with its `ipv4_prefix` length, and/or
+        /// `ipv6`, the leased range (`"2001:db8:1:2::/64"`, of which the guest
+        /// takes `::1`). `mtu` bounds every packet the guest sends or asks for.
+        pub fn net_up(
+            &mut self,
+            ipv4: Option<String>,
+            ipv4_prefix: u8,
+            ipv6: Option<String>,
+            mtu: u16,
+        ) -> Result<(), JsError> {
+            let v4 = match ipv4.as_deref() {
+                Some(a) => Some((
+                    a.parse::<std::net::Ipv4Addr>()
+                        .map_err(|e| JsError::new(&format!("bad ipv4 {a:?}: {e}")))?,
+                    ipv4_prefix,
+                )),
+                None => None,
+            };
+            let v6 = match ipv6.as_deref() {
+                Some(r) => {
+                    let (addr, bits) = r.split_once('/').unwrap_or((r, "64"));
+                    let net = addr
+                        .parse::<std::net::Ipv6Addr>()
+                        .map_err(|e| JsError::new(&format!("bad ipv6 {r:?}: {e}")))?;
+                    let bits = bits.parse::<u8>().unwrap_or(64).min(128);
+                    Some((std::net::Ipv6Addr::from(u128::from(net) | 1), bits))
+                }
+                None => None,
+            };
+            self.net.up(crate::tunnel::Lease { v4, v6, mtu });
+            Ok(())
+        }
+
+        /// Take the network link down (the transport closed).
+        pub fn net_down(&mut self) {
+            self.net.down();
+        }
+
+        /// A packet received from the transport.
+        pub fn net_input(&mut self, packet: &[u8]) {
+            self.net.inject(packet);
+        }
+
+        /// The next packet to send over the transport, if any.
+        #[must_use]
+        pub fn net_next_packet(&mut self) -> Option<Vec<u8>> {
+            if self.out.is_empty() {
+                self.out.extend(self.net.take_outbound());
+            }
+            self.out.pop_front()
+        }
+
+        /// Run the network timers (TCP retransmits, delayed ACKs); call about
+        /// every 100 ms while the link is up.
+        pub fn net_tick(&mut self) {
+            self.net.tick();
+        }
+
+        /// Whether the shell finished the last command and wants input.
+        #[must_use]
+        pub fn awaiting_input(&self) -> bool {
+            self.vm.awaiting_input()
+        }
+
+        /// Whether the parked guest is waiting on a timer or the network and
+        /// should be pumped again soon.
+        #[must_use]
+        pub fn has_pending_work(&self) -> bool {
+            self.vm.has_pending_work()
         }
 
         /// Feed keystrokes to the guest's stdin.

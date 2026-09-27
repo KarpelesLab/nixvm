@@ -23,9 +23,18 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 // local echo), so *this component* does the line editing: it buffers the
 // current line, echoes typed characters to xterm itself, and only calls
 // down into the guest (`write_stdin` + `pump`) on Enter / Ctrl-C / Ctrl-D.
-// `pump()` runs the guest synchronously to completion of that input, so a
-// long-running command will briefly freeze the tab — that's a known,
-// accepted trade-off of running a Linux userland on the main thread.
+// `pump()` runs the guest synchronously until it parks, so a CPU-bound
+// command will briefly freeze the tab — that's a known, accepted trade-off
+// of running a Linux userland on the main thread. A guest parked on a timer
+// or the network is pumped again from a timer (and on every packet that
+// arrives) until the shell is back reading the terminal; only then is the
+// prompt shown.
+//
+// Networking: the guest's sockets go through nixvm's userspace TCP/IP stack
+// (pktkit), which speaks raw IP packets. We relay those over a WebSocket to
+// grouterd's tunnel endpoint: fetch a short-lived token, open
+// `wss://…/tunnel/<token>`, read the JSON hello (leased addresses, MTU), then
+// every binary message each way is one IP packet.
 // ---------------------------------------------------------------------------
 
 const PROMPT = "/ $ ";
@@ -38,6 +47,18 @@ const ARCHES = [
   { id: "aarch64", label: "arm64" },
   { id: "x86_64", label: "x86-64" },
 ];
+
+/// Where a tunnel token comes from, and where the tunnel is opened with it.
+const NET_TOKEN_URL = "https://ws.atonline.com/_special/rest/Network:jwt";
+const NET_TUNNEL_URL = "wss://grouterd.atonline.com/tunnel/";
+/// grouterd drops a tunnel after 5 minutes without traffic from us; a text
+/// message counts as traffic and is otherwise ignored.
+const NET_KEEPALIVE_MS = 60_000;
+/// TCP timers (retransmits, delayed ACKs) run on this period.
+const NET_TICK_MS = 100;
+/// Tunnel close codes that are not worth reconnecting after with the same
+/// session: another tunnel with our token replaced this one.
+const NET_CLOSE_REPLACED = 4002;
 
 const termEl = ref(null);
 const status = ref("idle");
@@ -54,6 +75,29 @@ const statusMessages = {
   error: "boot failed",
 };
 const statusText = computed(() => statusMessages[status.value] ?? status.value);
+
+// Network link state, shown in the toolbar: off | connecting | online | error.
+const netEnabled = ref(true);
+const netState = ref("off");
+const netAddr = ref("");
+const netLabel = computed(() => {
+  if (!netEnabled.value) return "net: off";
+  switch (netState.value) {
+    case "online":
+      return `net: ${netAddr.value}`;
+    case "connecting":
+      return "net: connecting…";
+    case "error":
+      return "net: offline (retrying)";
+    default:
+      return "net: off";
+  }
+});
+const netTitle = computed(() =>
+  netEnabled.value
+    ? "Guest networking via a WebSocket IP tunnel (grouterd). Click to disconnect."
+    : "Guest networking is off. Click to connect.",
+);
 const bootingPhases = new Set(["downloading", "decompressing", "loading", "booting"]);
 const rebootDisabled = computed(() => bootingPhases.has(status.value));
 const bootLabel = computed(() => (hasBooted.value ? "Reboot" : "Start"));
@@ -72,6 +116,10 @@ let cachedWasmModule = null;
 let lineBuffer = "";
 let atLineStart = true;
 let busy = false;
+// A command line was sent and the shell hasn't asked for the next one yet.
+let commandRunning = false;
+let pumpTimer = null;
+let pumpDue = 0;
 // Set once the wasm instance has trapped (panicked): the session is
 // unrecoverable and every further guest call would throw. Cleared on reboot.
 let guestDead = false;
@@ -131,6 +179,8 @@ function writeErrorBanner(msg) {
 function surfaceGuestCrash(err) {
   if (guestDead) return;
   guestDead = true;
+  netDisconnect();
+  cancelPump();
   status.value = "error";
   const detail = err?.message ?? String(err);
   writeErrorBanner(
@@ -138,27 +188,68 @@ function surfaceGuestCrash(err) {
   );
 }
 
-async function afterStdinChanged() {
-  await tick();
+// Pump the guest after `delay` ms (sooner requests win over later ones).
+function schedulePump(delay = 0) {
+  const due = performance.now() + delay;
+  if (pumpTimer !== null) {
+    if (pumpDue <= due) return;
+    clearTimeout(pumpTimer);
+  }
+  pumpDue = due;
+  pumpTimer = setTimeout(runPump, delay);
+}
+
+function cancelPump() {
+  if (pumpTimer !== null) clearTimeout(pumpTimer);
+  pumpTimer = null;
+}
+
+// Run the guest until it parks, show its output, send its packets, and
+// decide what's next: the prompt (the shell wants input), or another pump
+// soon (it's waiting on a timer or the network).
+function runPump() {
+  pumpTimer = null;
+  if (!guestTerm || guestDead || status.value !== "ready") return;
   let out;
+  let awaiting;
+  let pending;
   try {
     out = guestTerm.pump();
+    writeBytes(out);
+    flushNet();
+    if (!guestTerm.is_running()) {
+      const code = guestTerm.exit_code();
+      status.value = "exited";
+      commandRunning = false;
+      writeRaw(`\r\n[ shell exited with code ${code} — click Reboot to start a new session ]\r\n`);
+      return;
+    }
+    awaiting = guestTerm.awaiting_input();
+    pending = guestTerm.has_pending_work();
   } catch (err) {
     surfaceGuestCrash(err);
     return;
   }
-  writeBytes(out);
-  if (!guestTerm.is_running()) {
-    const code = guestTerm.exit_code();
-    status.value = "exited";
-    writeRaw(`\r\n[ shell exited with code ${code} — click Reboot to start a new session ]\r\n`);
-  } else {
+  if (commandRunning && awaiting) {
+    commandRunning = false;
     writePrompt();
   }
+  // Waiting on a timer / the network (foreground or background job): check
+  // back soon. Packets arriving also trigger an immediate pump.
+  if (pending) schedulePump(20);
+}
+
+async function afterStdinChanged() {
+  commandRunning = true;
+  await tick();
+  cancelPump();
+  runPump();
 }
 
 async function handleInput(data) {
   if (busy || guestDead || status.value !== "ready") return;
+  // While a command runs, typed lines go to it as input (and Ctrl-C to it as
+  // an interrupt); the prompt comes back once the shell is reading again.
   busy = true;
   try {
     for (const ch of data) {
@@ -202,6 +293,149 @@ async function handleInput(data) {
     }
   } finally {
     busy = false;
+  }
+}
+
+// ---- networking -------------------------------------------------------
+
+let ws = null;
+let netGen = 0; // bumped on every (re)connect/disconnect; stale callbacks bail
+let netTickTimer = null;
+let netKeepaliveTimer = null;
+let netRetryTimer = null;
+let netRetryDelay = 2000;
+
+// Send every packet the guest's stack has queued.
+function flushNet() {
+  if (!guestTerm || !ws || ws.readyState !== WebSocket.OPEN) return;
+  for (;;) {
+    const p = guestTerm.net_next_packet();
+    if (p === undefined || p === null) break;
+    ws.send(p);
+  }
+}
+
+function netStopTimers() {
+  clearInterval(netTickTimer);
+  clearInterval(netKeepaliveTimer);
+  clearTimeout(netRetryTimer);
+  netTickTimer = netKeepaliveTimer = netRetryTimer = null;
+}
+
+// Drop the tunnel (if any) and take the guest's link down.
+function netDisconnect() {
+  netGen++;
+  netStopTimers();
+  const sock = ws;
+  ws = null;
+  if (sock) {
+    sock.onopen = sock.onmessage = sock.onclose = sock.onerror = null;
+    try {
+      sock.close(1000);
+    } catch {
+      // already closed
+    }
+  }
+  try {
+    if (!guestDead) guestTerm?.net_down();
+  } catch (err) {
+    surfaceGuestCrash(err);
+  }
+  netState.value = "off";
+  netAddr.value = "";
+}
+
+function netRetryLater() {
+  netStopTimers();
+  if (!netEnabled.value || !guestTerm || guestDead) return;
+  netState.value = "error";
+  const delay = netRetryDelay;
+  netRetryDelay = Math.min(netRetryDelay * 2, 30_000);
+  netRetryTimer = setTimeout(() => netConnect(), delay);
+}
+
+async function netConnect() {
+  netDisconnect();
+  if (!netEnabled.value || !guestTerm || guestDead) return;
+  const gen = netGen;
+  netState.value = "connecting";
+  let token;
+  try {
+    const res = await fetch(NET_TOKEN_URL, { cache: "no-store" });
+    if (!res.ok) throw new Error(`token request failed: ${res.status}`);
+    const body = await res.json();
+    token = body?.data?.token;
+    if (!token) throw new Error("no token in response");
+  } catch (err) {
+    if (gen !== netGen) return;
+    console.warn("nixvm: network token:", err);
+    netRetryLater();
+    return;
+  }
+  if (gen !== netGen || !guestTerm) return;
+
+  const sock = new WebSocket(NET_TUNNEL_URL + encodeURIComponent(token));
+  sock.binaryType = "arraybuffer";
+  ws = sock;
+  let hello = false;
+  sock.onmessage = (ev) => {
+    if (gen !== netGen || !guestTerm || guestDead) return;
+    try {
+      if (typeof ev.data === "string") {
+        // The first text message is the hello: what we were leased.
+        if (hello) return;
+        hello = true;
+        const h = JSON.parse(ev.data);
+        guestTerm.net_up(h.ipv4 ?? undefined, h.ipv4_prefix ?? 32, h.ipv6 ?? undefined, h.mtu ?? 1400);
+        netAddr.value = h.ipv4 ?? h.ipv6 ?? "up";
+        netState.value = "online";
+        netRetryDelay = 2000;
+        netTickTimer = setInterval(() => {
+          try {
+            guestTerm?.net_tick();
+            flushNet();
+          } catch (err) {
+            surfaceGuestCrash(err);
+          }
+        }, NET_TICK_MS);
+        netKeepaliveTimer = setInterval(() => {
+          if (sock.readyState === WebSocket.OPEN) sock.send("keepalive");
+        }, NET_KEEPALIVE_MS);
+        return;
+      }
+      guestTerm.net_input(new Uint8Array(ev.data));
+      schedulePump(0);
+    } catch (err) {
+      surfaceGuestCrash(err);
+    }
+  };
+  sock.onclose = (ev) => {
+    if (gen !== netGen) return;
+    ws = null;
+    try {
+      if (!guestDead) guestTerm?.net_down();
+    } catch (err) {
+      surfaceGuestCrash(err);
+    }
+    netAddr.value = "";
+    if (ev.code === NET_CLOSE_REPLACED) {
+      netStopTimers();
+      netState.value = "off";
+      netEnabled.value = false;
+      return;
+    }
+    // Expired token, dropped connection, server restart: get a new token.
+    netRetryLater();
+  };
+}
+
+function toggleNet() {
+  netEnabled.value = !netEnabled.value;
+  if (netEnabled.value) {
+    netRetryDelay = 2000;
+    netConnect();
+  } else {
+    netDisconnect();
   }
 }
 
@@ -261,6 +495,7 @@ async function boot() {
     hasBooted.value = true;
     status.value = "ready";
     writePrompt();
+    netConnect();
   } catch (err) {
     status.value = "error";
     writeErrorBanner(`boot failed: ${err?.message ?? err}`);
@@ -269,6 +504,9 @@ async function boot() {
 
 async function reboot() {
   if (rebootDisabled.value) return;
+  netDisconnect();
+  cancelPump();
+  commandRunning = false;
   try {
     guestTerm?.free?.();
   } catch {
@@ -333,6 +571,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  netDisconnect();
+  cancelPump();
   resizeObserver?.disconnect();
   window.removeEventListener("resize", fit);
   try {
@@ -363,6 +603,15 @@ onBeforeUnmount(() => {
           {{ a.label }}
         </button>
       </div>
+      <button
+        class="net-btn"
+        :class="`is-${netEnabled ? netState : 'off'}`"
+        :title="netTitle"
+        :disabled="!hasBooted"
+        @click="toggleNet"
+      >
+        {{ netLabel }}
+      </button>
       <button class="reboot-btn" :disabled="rebootDisabled" @click="hasBooted ? reboot() : boot()">
         {{ bootLabel }}
       </button>
@@ -465,6 +714,39 @@ onBeforeUnmount(() => {
 }
 
 .arch-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.net-btn {
+  flex: none;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--panel-border);
+  border-radius: 0.4rem;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.8rem;
+  font-family: inherit;
+  cursor: pointer;
+  max-width: 14rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.net-btn.is-online {
+  color: #8ce99a;
+}
+
+.net-btn.is-connecting {
+  color: #ffd43b;
+}
+
+.net-btn.is-error {
+  color: var(--danger);
+}
+
+.net-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }

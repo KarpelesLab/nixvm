@@ -91,8 +91,24 @@ impl Errno {
     const ETIMEDOUT: Errno = Errno(110);
     /// A nonblocking TCP `connect` that has been started but not yet completed.
     const EINPROGRESS: Errno = Errno(115);
+    /// A second nonblocking `connect` while the first is still in progress.
+    const EALREADY: Errno = Errno(114);
+    /// `connect` on a socket that is already connected.
+    const EISCONN: Errno = Errno(106);
     /// A host socket read/write errored (connection reset).
     const ECONNRESET: Errno = Errno(104);
+}
+
+/// The errno a failed host connect maps to: the ones guest clients branch on
+/// (fall back to the next address, retry later), else "connection refused".
+fn connect_errno(e: &std::io::Error) -> i64 {
+    match e.kind() {
+        std::io::ErrorKind::TimedOut => err(Errno::ETIMEDOUT),
+        std::io::ErrorKind::NetworkUnreachable | std::io::ErrorKind::HostUnreachable => {
+            err(Errno::ENETUNREACH)
+        }
+        _ => err(Errno::ECONNREFUSED),
+    }
 }
 
 const AF_UNIX: u16 = 1;
@@ -332,6 +348,11 @@ struct HostSock {
     /// The guest's `shutdown(SHUT_WR)` has been forwarded to the host.
     wr_shut: bool,
     nonblock: bool,
+    /// A connect whose outcome the guest hasn't observed yet: the transport
+    /// returned with the handshake in flight ([`HostConn::poll_connect`]).
+    /// Cleared when a (re-trapped or repeated) `connect` or
+    /// `getsockopt(SO_ERROR)` reports the result.
+    connecting: bool,
 }
 
 // Only `peer` is meaningful in a dump; the boxed conn and flags are noise.
@@ -877,6 +898,29 @@ impl Kernel {
         let Some((sock, end)) = self.sock_of(cx, fd) else {
             return err(Errno::ENOTSOCK);
         };
+        // Already bridged to a host connection: this is the re-trap of a
+        // blocking connect waiting out its handshake, or the guest asking
+        // again after a nonblocking one — either way report its progress.
+        if let Kind::Host(h) = &mut net.socks[sock].kind {
+            if !h.connecting {
+                return err(Errno::EISCONN);
+            }
+            return match h.conn.poll_connect() {
+                Ok(false) if h.nonblock => err(Errno::EALREADY),
+                Ok(false) => {
+                    cx.block = true;
+                    0
+                }
+                Ok(true) => {
+                    h.connecting = false;
+                    0
+                }
+                Err(e) => {
+                    h.connecting = false;
+                    connect_errno(&e)
+                }
+            };
+        }
         let Some(target) = read_sockaddr(mem, addr, addrlen) else {
             return err(Errno::EINVAL);
         };
@@ -910,7 +954,7 @@ impl Kernel {
                 }
                 return 0;
             }
-            return self.connect_host(net, sock, end, dest);
+            return self.connect_host(net, cx, sock, end, dest);
         }
 
         if matches!(net.socks[sock].kind, Kind::Dgram(_)) {
@@ -980,10 +1024,19 @@ impl Kernel {
 
     /// Bridge a stream socket onto a real host connection to routable `dest`
     /// (egress). The socket must be an idle client end. Returns `0` on a
-    /// completed connection (the host `connect` is synchronous here), else a
-    /// negative errno.
+    /// completed connection, else a negative errno. A transport that returns
+    /// with the handshake still in flight leaves the socket `connecting`: a
+    /// nonblocking socket gets `EINPROGRESS`, a blocking one re-traps (see the
+    /// `Kind::Host` arm at the top of [`Self::sys_connect`]).
     #[allow(clippy::unused_self)]
-    fn connect_host(&self, net: &mut Net, sock: usize, end: usize, dest: InetAddr) -> i64 {
+    fn connect_host(
+        &self,
+        net: &mut Net,
+        cx: &mut ServiceCtx,
+        sock: usize,
+        end: usize,
+        dest: InetAddr,
+    ) -> i64 {
         if !matches!(&net.socks[sock].kind, Kind::Idle { .. } if end == 0) {
             return err(Errno::EINVAL);
         }
@@ -991,22 +1044,29 @@ impl Kernel {
             return err(Errno::ENETUNREACH);
         };
         match egress.connect_tcp(dest.ip, dest.v6, dest.port) {
-            Ok(conn) => {
+            Ok(mut conn) => {
                 let nonblock = net.socks[sock].nonblock;
+                let pending = match conn.poll_connect() {
+                    Ok(up) => !up,
+                    Err(e) => return connect_errno(&e),
+                };
                 net.socks[sock].kind = Kind::Host(HostSock {
                     conn,
                     peer: dest,
                     wr_shut: false,
                     nonblock,
+                    connecting: pending,
                 });
-                0
+                match (pending, nonblock) {
+                    (false, _) => 0,
+                    (true, true) => err(Errno::EINPROGRESS),
+                    (true, false) => {
+                        cx.block = true; // re-trap until the handshake resolves
+                        0
+                    }
+                }
             }
-            // Map the common connect failures to the errnos guest clients
-            // branch on; anything else is a generic "connection refused".
-            Err(e) => match e.kind() {
-                std::io::ErrorKind::TimedOut => err(Errno::ETIMEDOUT),
-                _ => err(Errno::ECONNREFUSED),
-            },
+            Err(e) => connect_errno(&e),
         }
     }
 
@@ -1318,6 +1378,20 @@ impl Kernel {
                     _ => SOCK_STREAM as u32,
                 },
                 SO_ERROR => {
+                    // A nonblocking host connect reports its outcome here once
+                    // it resolves (the guest polled for POLLOUT, then asks).
+                    if let Kind::Host(h) = &mut net.socks[sock].kind
+                        && h.connecting
+                    {
+                        match h.conn.poll_connect() {
+                            Ok(false) => {}
+                            Ok(true) => h.connecting = false,
+                            Err(e) => {
+                                h.connecting = false;
+                                net.socks[sock].opts.error = -connect_errno(&e) as i32;
+                            }
+                        }
+                    }
                     let e = net.socks[sock].opts.error;
                     net.socks[sock].opts.error = 0; // read-and-cleared
                     e as u32
@@ -1529,6 +1603,16 @@ impl Kernel {
         let Kind::Host(h) = &mut net.socks[sock].kind else {
             return None;
         };
+        if h.connecting {
+            // Mid-handshake: nothing to report yet; once it resolves the socket
+            // is writable (and, on failure, in error — SO_ERROR says which).
+            const POLLERR: u32 = 0x8;
+            match h.conn.poll_connect() {
+                Ok(false) => return Some(0),
+                Ok(true) => {}
+                Err(_) => return Some(POLLOUT | POLLERR),
+            }
+        }
         let mut mask = if h.wr_shut { 0 } else { POLLOUT };
         if h.conn.poll_readable() {
             mask |= POLLIN;

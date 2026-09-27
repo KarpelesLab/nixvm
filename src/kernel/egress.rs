@@ -12,15 +12,17 @@
 //!
 //! The trait boundary is deliberately narrow and transport-agnostic: the
 //! native implementation ([`HostEgress`], `std::net`) lives here behind
-//! `cfg(not(wasm32))`, and a future WebSocket/pktkit transport for the browser
-//! slots in as another `impl Egress` with no change to the socket layer.
+//! `cfg(not(wasm32))`, and the WebSocket/pktkit transport for the browser
+//! (`crate::tunnel`) is another `impl Egress`.
 //!
 //! Non-blocking is the contract. The kernel services syscalls on one thread,
 //! so a host read/write must never park it: `recv`/`send`/`recv_from` return
 //! `WouldBlock` and the kernel re-traps the guest syscall later (the same
 //! block-and-retry path an empty in-VM socket queue uses). Connection setup is
 //! the one exception — [`Egress::connect_tcp`] may block briefly (a bounded
-//! `connect_timeout`) since the guest is mid-`connect()` anyway.
+//! `connect_timeout`) since the guest is mid-`connect()` anyway — or, for a
+//! transport that can't block at all (the browser tunnel, `crate::tunnel`),
+//! return at once and report the handshake through [`HostConn::poll_connect`].
 
 use std::fmt::Debug;
 use std::io;
@@ -45,6 +47,16 @@ pub trait HostConn: Send + Debug {
     fn readable_len(&mut self) -> usize {
         usize::from(self.poll_readable())
     }
+    /// Whether the connection's handshake has completed: `Ok(true)` once it is
+    /// up, `Ok(false)` while still in progress, an error if it failed. A
+    /// transport whose [`Egress::connect_tcp`] returns before the handshake
+    /// finishes (a userspace TCP stack that must not block, like the wasm
+    /// tunnel) reports progress here; the socket layer turns it into a
+    /// blocking-connect re-trap or `EINPROGRESS`/`POLLOUT`/`SO_ERROR`. The
+    /// default suits transports that only return established connections.
+    fn poll_connect(&mut self) -> io::Result<bool> {
+        Ok(true)
+    }
 }
 
 /// One received datagram: `(source ip, v6, source port, payload)`.
@@ -62,7 +74,10 @@ pub trait HostDgram: Send + Debug {
 /// by the whole VM. The native impl is [`HostEgress`]; a browser transport
 /// (WebSocket relay / pktkit) will be another implementor.
 pub trait Egress: Send + Debug {
-    /// Open a stream connection to `(ip, v6, port)`. May block briefly.
+    /// Open a stream connection to `(ip, v6, port)`. May block briefly, or
+    /// return with the handshake still in flight (see
+    /// [`HostConn::poll_connect`]). A `NetworkUnreachable` error means there is
+    /// no route (the guest sees `ENETUNREACH`).
     fn connect_tcp(&self, ip: [u8; 16], v6: bool, port: u16) -> io::Result<Box<dyn HostConn>>;
     /// Open a datagram socket for UDP egress.
     fn open_udp(&self) -> io::Result<Box<dyn HostDgram>>;

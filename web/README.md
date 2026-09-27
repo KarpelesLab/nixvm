@@ -31,6 +31,21 @@ In CI (`.github/workflows/pages.yml`), both are copied into `web/dist/`
 *after* `vite build` runs, so they land alongside `index.html` and the
 built JS/CSS bundle in the final Pages artifact.
 
+## Networking
+
+The guest has internet access through an IP-packet tunnel. nixvm terminates
+guest sockets in pktkit's userspace TCP/IP stack (`src/tunnel.rs`); the page
+fetches a token from `https://ws.atonline.com/_special/rest/Network:jwt`,
+opens `wss://grouterd.atonline.com/tunnel/<token>`, and relays packets: the
+first text message is a JSON hello with the leased addresses and MTU, and
+every binary message after that (either way) is one IP packet. The toolbar's
+`net:` button shows the link state and turns it off/on.
+
+On wasm32 the pktkit crate reads its clock from `pktkit.now_ms` /
+`pktkit.unix_ms` imports, which the wasm-bindgen glue imports from the bare
+specifier `pktkit`. `index.html` maps that to `public/pktkit.js` with an
+import map.
+
 ## Local dev
 
 ```sh

@@ -13,7 +13,9 @@ import NixTerm from "./components/NixTerm.vue";
         server, no container, nothing installed. Pick a guest CPU
         architecture (arm64 or x86-64 — each runs on its own software CPU
         interpreter), press Start, and everything, including the shell you
-        type into, runs directly in this tab.
+        type into, runs directly in this tab. The guest even has internet
+        access (try <code>apk add curl</code>): its TCP/IP stack runs in the
+        sandbox too, and raw IP packets are relayed over a WebSocket tunnel.
       </p>
       <div class="links">
         <a href="https://github.com/KarpelesLab/nixvm" target="_blank" rel="noopener">

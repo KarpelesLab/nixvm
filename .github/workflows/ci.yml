@@ -55,6 +55,12 @@ jobs:
       - name: Test (fstool)
         run: cargo test --features fstool
 
+      - name: Clippy (tunnel networking, warnings denied)
+        run: cargo clippy --all-targets --features tunnel -- -D warnings
+
+      - name: Test (tunnel networking)
+        run: cargo test --features tunnel --lib tunnel
+
   wasm:
     name: wasm build guard
     runs-on: ubuntu-latest

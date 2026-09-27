@@ -19,6 +19,13 @@ use std::sync::{Arc, Mutex};
 /// Guest base address for the flat process address space.
 const GUEST_BASE: u64 = 0x1_0000;
 
+/// The optional network link [`Vm::finish`] takes; uninhabited without the
+/// `tunnel` feature, so `None` is the only value there.
+#[cfg(feature = "tunnel")]
+type Tunnel = crate::tunnel::Tunnel;
+#[cfg(not(feature = "tunnel"))]
+type Tunnel = std::convert::Infallible;
+
 /// A [`std::io::Write`] that appends into a shared byte buffer — used to
 /// capture guest fd 1/2 for the terminal.
 struct CaptureSink(Arc<Mutex<Vec<u8>>>);
@@ -47,6 +54,9 @@ pub struct Step {
 #[derive(Debug)]
 pub struct Vm {
     kernel: Kernel,
+    /// The guest's network link when booted with one ([`Vm::boot_squashfs_net`]).
+    #[cfg(feature = "tunnel")]
+    tunnel: Option<crate::tunnel::Tunnel>,
     stdout: Arc<Mutex<Vec<u8>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
     finished: Option<i32>,
@@ -65,7 +75,7 @@ impl Vm {
         let mut mounts = MountTable::new();
         mounts.mount("/", Box::new(TmpFs::new()));
         tar::extract_into(&mut mounts, tar_bytes);
-        Self::finish(mounts, argv, mem_bytes)
+        Self::finish(mounts, argv, mem_bytes, None)
     }
 
     /// Boot from a `.tar` root image mounted as a **read-only squashfs lower**
@@ -81,6 +91,33 @@ impl Vm {
         argv: Vec<String>,
         mem_bytes: u64,
     ) -> Result<Self, String> {
+        Self::boot_squashfs_with(tar_bytes, argv, mem_bytes, None)
+    }
+
+    /// [`Vm::boot_squashfs`] with the guest's network carried over `tunnel`:
+    /// it becomes the kernel's egress backend and the guest gets a
+    /// `/etc/resolv.conf`. The embedder moves packets through
+    /// [`Vm::tunnel`] (see [`crate::tunnel`]).
+    ///
+    /// # Errors
+    /// As [`Vm::boot_squashfs`].
+    #[cfg(all(feature = "fstool", feature = "tunnel"))]
+    pub fn boot_squashfs_net(
+        tar_bytes: &[u8],
+        argv: Vec<String>,
+        mem_bytes: u64,
+        tunnel: crate::tunnel::Tunnel,
+    ) -> Result<Self, String> {
+        Self::boot_squashfs_with(tar_bytes, argv, mem_bytes, Some(tunnel))
+    }
+
+    #[cfg(feature = "fstool")]
+    fn boot_squashfs_with(
+        tar_bytes: &[u8],
+        argv: Vec<String>,
+        mem_bytes: u64,
+        tunnel: Option<Tunnel>,
+    ) -> Result<Self, String> {
         use crate::fs::{FsToolMount, Overlay};
         let lower = FsToolMount::from_tar(tar_bytes)
             .map_err(|e| format!("build squashfs from rootfs tar: {e}"))?;
@@ -89,12 +126,17 @@ impl Vm {
             "/",
             Box::new(Overlay::new(Box::new(lower), Box::new(TmpFs::new()))),
         );
-        Self::finish(mounts, argv, mem_bytes)
+        Self::finish(mounts, argv, mem_bytes, tunnel)
     }
 
     /// Mount the synthetic filesystems onto `mounts`, load `argv[0]` (following
     /// its `PT_INTERP` linker for dynamic executables), and boot it interactively.
-    fn finish(mut mounts: MountTable, argv: Vec<String>, mem_bytes: u64) -> Result<Self, String> {
+    fn finish(
+        mut mounts: MountTable,
+        argv: Vec<String>,
+        mem_bytes: u64,
+        tunnel: Option<Tunnel>,
+    ) -> Result<Self, String> {
         if argv.is_empty() {
             return Err("empty argv".into());
         }
@@ -108,7 +150,7 @@ impl Vm {
         // With host egress enabled, give the guest resolver a nameserver
         // (a stock Alpine minirootfs ships no /etc/resolv.conf, so musl would
         // otherwise default to 127.0.0.1 and every lookup would fail).
-        if egress_enabled() {
+        if egress_enabled() || tunnel.is_some() {
             install_resolv_conf(&mut mounts);
         }
 
@@ -149,10 +191,16 @@ impl Vm {
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
         install_egress(&mut kernel);
+        #[cfg(feature = "tunnel")]
+        if let Some(t) = &tunnel {
+            kernel.set_egress(t.egress());
+        }
         kernel.boot(vcpu, mem);
 
         Ok(Self {
             kernel,
+            #[cfg(feature = "tunnel")]
+            tunnel,
             stdout,
             stderr,
             finished: None,
@@ -167,6 +215,27 @@ impl Vm {
     /// Signal end-of-input (Ctrl-D).
     pub fn close_stdin(&mut self) {
         self.kernel.close_stdin();
+    }
+
+    /// The guest's network link, when booted with one.
+    #[cfg(feature = "tunnel")]
+    #[must_use]
+    pub fn tunnel(&self) -> Option<&crate::tunnel::Tunnel> {
+        self.tunnel.as_ref()
+    }
+
+    /// Whether the guest is parked reading the terminal, i.e. the last command
+    /// finished and it wants input (see [`Kernel::awaiting_input`]).
+    #[must_use]
+    pub fn awaiting_input(&self) -> bool {
+        self.kernel.awaiting_input()
+    }
+
+    /// Whether a parked guest will progress without input — a timer or the
+    /// network — so the embedder should pump again soon.
+    #[must_use]
+    pub fn has_pending_work(&self) -> bool {
+        self.finished.is_none() && self.kernel.has_pending_work()
     }
 
     /// Whether pid 1 has exited (with its code).

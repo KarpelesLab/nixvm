@@ -57,11 +57,16 @@ targz = ["dep:compcol"]
 # `run_elf` via wasm-bindgen. Pulls in wasm-bindgen + console_error_panic_hook,
 # `targz` to unpack a `.tar.gz` root image in-process, and `fstool` to repack it
 # into an in-memory squashfs (read-only lower of a copy-on-write overlay).
-wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "targz", "fstool"]
+wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "targz", "fstool", "tunnel"]
 # HTTP(S) fetching of guest root images (src/image.rs). Off by default so the
 # core stays dependency-free and wasm-buildable; sha256 verification is
 # hand-rolled in image.rs so it needs no extra dep either way.
 fetch = ["dep:ureq"]
+# Guest networking over an L3 packet tunnel (src/tunnel.rs): guest sockets are
+# terminated by pktkit's userspace TCP/IP stack (`vclient`), which exchanges
+# raw IP packets with the embedder — the browser demo relays them over a
+# WebSocket to grouterd. Pure Rust, sans-I/O; builds for wasm32.
+tunnel = ["dep:pktkit"]
 
 [dependencies]
 # The core builds fully offline with no third-party deps. `fstool` is the first
@@ -79,6 +84,13 @@ ureq = { version = "2", optional = true }
 compcol = { version = "0.6", optional = true, default-features = false, features = [
     "std",
     "gzip",
+] }
+
+# Userspace TCP/IP (virtual TCP engine + client), gated behind `tunnel`. On
+# wasm32 its clock comes from `pktkit.now_ms`/`pktkit.unix_ms` host imports,
+# which web/index.html supplies through an import map (web/public/pktkit.js).
+pktkit = { version = "0.1.7", optional = true, default-features = false, features = [
+    "vclient",
 ] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

@@ -37,6 +37,8 @@ pub mod image;
 pub mod kernel;
 pub mod loader;
 pub mod sandbox;
+#[cfg(feature = "tunnel")]
+pub mod tunnel;
 pub mod vcpu;
 pub mod vm;
 #[cfg(feature = "wasm")]

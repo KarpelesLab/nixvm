@@ -1082,6 +1082,9 @@ pub(super) struct Shared {
     stdin_buf: VecDeque<u8>,
     /// Whether interactive stdin has been closed (EOF / Ctrl-D).
     stdin_closed: bool,
+    /// The last interactive-stdin read found the buffer empty and parked: the
+    /// guest is waiting for the user (see [`Kernel::awaiting_input`]).
+    stdin_waiting: bool,
     rng_state: u64,
     /// The tracked `RLIMIT_NOFILE` `(soft, hard)`. Programs (node/V8) binary-
     /// search `setrlimit` to raise it to the maximum, then loop over `[0,
@@ -1378,6 +1381,7 @@ impl Kernel {
                 mmap_areas: Vec::new(),
                 stdin_buf: VecDeque::new(),
                 stdin_closed: false,
+                stdin_waiting: false,
                 next_pid: 2,
                 watch_addr: std::env::var("NIXVM_WATCHCODE").ok().and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
                 watch_last: 0,
@@ -1637,6 +1641,27 @@ impl Kernel {
     /// Signal end-of-input on the interactive stdin (Ctrl-D).
     pub fn close_stdin(&mut self) {
         self.shared.get_mut().unwrap().stdin_closed = true;
+    }
+
+    /// Whether the guest is parked reading the interactive terminal with
+    /// nothing buffered — i.e. the command the user typed has finished and the
+    /// shell wants the next line. A [`Pumped::Blocked`] that is *not* this is
+    /// the guest waiting on something else (a timer, the network), and the
+    /// embedder should pump again later without prompting.
+    #[must_use]
+    pub fn awaiting_input(&self) -> bool {
+        let sh = self.shared.lock().unwrap();
+        sh.stdin_waiting && sh.stdin_buf.is_empty() && !sh.stdin_closed
+    }
+
+    /// Whether a parked guest will make progress without new input: some task
+    /// holds a timed wait, or a host-bridged socket may deliver data. The
+    /// single-threaded embedder (the browser) re-pumps on a timer while this
+    /// holds, since nothing wakes the cooperative loop from outside.
+    #[must_use]
+    pub fn has_pending_work(&self) -> bool {
+        self.shared.lock().unwrap().earliest_deadline().is_some()
+            || self.net.lock().unwrap().has_pending_host_io()
     }
 
     /// Seed the initial process (pid 1) without running it, for the incremental
@@ -4524,11 +4549,14 @@ impl Kernel {
                 // is empty and not yet closed, so the embedder can pump more.
                 if sh.stdin_buf.is_empty() {
                     if sh.stdin_closed {
+                        sh.stdin_waiting = false;
                         return 0; // EOF
                     }
+                    sh.stdin_waiting = true;
                     cx.block = true;
                     return 0;
                 }
+                sh.stdin_waiting = false;
                 let n = (count as usize).min(sh.stdin_buf.len());
                 let chunk: Vec<u8> = sh.stdin_buf.drain(..n).collect();
                 if mem.write(buf, &chunk).is_err() {

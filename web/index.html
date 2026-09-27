@@ -9,6 +9,11 @@
       content="nixvm boots a real Alpine Linux userland and runs an interactive shell entirely client-side in WebAssembly — no server, no container."
     />
     <link rel="icon" href="data:," />
+    <!-- pkg/nixvm.js (wasm-bindgen glue) imports the pktkit crate's clock from
+         the bare specifier "pktkit"; resolve it to our shim in public/. -->
+    <script type="importmap">
+      { "imports": { "pktkit": "./pktkit.js" } }
+    </script>
   </head>
   <body>
     <div id="app"></div>
