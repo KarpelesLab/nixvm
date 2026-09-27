@@ -109,6 +109,14 @@ fn boots_alpine_from_in_memory_squashfs_overlay() {
         out2.contains("hi"),
         "tmpfs upper is writable, got: {out2:?}"
     );
+    // A process killed by a signal must close its fds: the pipe's reader then
+    // sees EOF and the pipeline finishes (it used to hang forever).
+    vm.write_stdin(b"sh -c 'kill -9 $$' | wc -c; echo pipeline-done\n");
+    let out3 = drain(&mut vm);
+    assert!(
+        out3.contains("pipeline-done"),
+        "signal-killed writer's pipe reaches EOF, got: {out3:?}"
+    );
 }
 
 /// Live host-egress smoke test: boot Alpine with `NIXVM_NET=host` set and run

@@ -18,8 +18,8 @@
 //! A signal left at its default disposition still takes the default action.
 
 use super::{
-    ExitCause, Kernel, QueuedSig, RunState, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SIGSEGV,
-    SS_DISABLE, ServiceCtx, Shared, err, pgid_of,
+    Kernel, QueuedSig, RunState, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SIGSEGV, SS_DISABLE,
+    ServiceCtx, Shared, err, pgid_of,
 };
 use crate::abi::Arch;
 use crate::abi::errno::Errno;
@@ -545,7 +545,7 @@ impl Kernel {
                 // SIG_DFL: ignore the "ignored-by-default" set, else terminate.
                 _ if is_default_ignored(sig) => cx.cur.drain_rt(sig),
                 _ => {
-                    cx.cur.run = RunState::Zombie(ExitCause::Signaled(sig as i32));
+                    self.die_of_signal(cx, sig as u32, mem);
                     return false;
                 }
             }

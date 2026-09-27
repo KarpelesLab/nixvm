@@ -689,6 +689,56 @@ impl Arena {
         Some(new_top)
     }
 
+    /// Whether `[addr, addr+len)` lies entirely inside one freed range — i.e.
+    /// arena space nothing owns, which a caller may [`Arena::claim`].
+    fn is_free(&self, addr: u64, len: u64) -> bool {
+        let Some(end) = addr.checked_add(len) else {
+            return false;
+        };
+        self.free.iter().any(|&(a, l)| a <= addr && end <= a + l)
+    }
+
+    /// Take `[addr, addr+len)` out of the arena's free space because something
+    /// now occupies it without going through [`Arena::alloc`] (an in-place
+    /// `mremap` grow, a `MAP_FIXED` mapping). Otherwise a later `alloc` would
+    /// hand the same pages out again and the new mapping would zero-fill them
+    /// under their owner. Covers both the free list and the never-used bump
+    /// region below the cursor; ranges outside the arena are left alone.
+    fn claim(&mut self, addr: u64, len: u64) {
+        let Some(end) = addr.checked_add(len) else {
+            return;
+        };
+        if len == 0 {
+            return;
+        }
+        // Drop the overlap from every freed range, keeping any remainders.
+        let mut kept = Vec::with_capacity(self.free.len() + 1);
+        for &(a, l) in &self.free {
+            let e = a + l;
+            if e <= addr || a >= end {
+                kept.push((a, l));
+                continue;
+            }
+            if a < addr {
+                kept.push((a, addr - a));
+            }
+            if e > end {
+                kept.push((end, e - end));
+            }
+        }
+        self.free = kept;
+        // Inside the bump region: lower the cursor past the claimed range and
+        // keep whatever lies between it and the old cursor as free space.
+        if addr < self.cursor && end > self.floor {
+            let old = self.cursor;
+            self.cursor = addr.max(self.floor);
+            if end < old {
+                let pos = self.free.partition_point(|&(a, _)| a < end);
+                self.free.insert(pos, (end, old - end));
+            }
+        }
+    }
+
     /// Return `[addr, addr+len)` to the arena, coalescing with its neighbours.
     ///
     /// The guest is not trusted here: it may `munmap` an image segment, a
@@ -1954,7 +2004,7 @@ impl Kernel {
                         vcpu.pc()
                     );
                     self.dump_fault_context(vcpu, mem);
-                    cx.cur.run = RunState::Zombie(ExitCause::Signaled(SIGSEGV as i32));
+                    self.die_of_signal(cx, SIGSEGV as u32, mem);
                     Serviced::Ended
                 }
             }
@@ -1974,7 +2024,7 @@ impl Kernel {
                     cx.cur.pid,
                     hex.join(" ")
                 );
-                cx.cur.run = RunState::Zombie(ExitCause::Signaled(SIGILL as i32));
+                self.die_of_signal(cx, SIGILL as u32, mem);
                 Serviced::Ended
             }
             Exit::Halt => {
@@ -4069,6 +4119,20 @@ impl Kernel {
         code: i32,
         mem: &mut GuestMemory,
     ) -> i64 {
+        self.exit_task(sh, cx, ExitCause::Exited(code & 0xff), mem)
+    }
+
+    /// Tear down the current task and make it a zombie with `cause`: the
+    /// common tail of `exit`, `exit_group` and death by a fatal signal. Closes
+    /// its fds (so pipe/socket peers see EOF), releases its memory, wakes a
+    /// `CLONE_CHILD_CLEARTID` waiter, and notifies/reparents as below.
+    fn exit_task(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        cause: ExitCause,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         // Flush any un-munmap'd writable shared file mappings first. `sh` is
         // held; scope `vfs` to just the flush (sh→vfs order), dropping it before
         // the rest of teardown.
@@ -4103,7 +4167,7 @@ impl Kernel {
         if !self.has_cowaiter(sh, mm) {
             mem.release();
         }
-        cx.cur.run = RunState::Zombie(ExitCause::Exited(code & 0xff));
+        cx.cur.run = RunState::Zombie(cause);
         // The signal a terminating child sends its parent. A plain fork uses
         // SIGCHLD, but `clone` can request any signal (or none). For a process
         // (non-thread) it is the child's own `exit_signal`. A thread's individual
@@ -4184,6 +4248,27 @@ impl Kernel {
         code: i32,
         mem: &mut GuestMemory,
     ) -> i64 {
+        self.exit_group_with(sh, cx, ExitCause::Exited(code & 0xff), mem)
+    }
+
+    /// Terminate the current task's whole thread group with a fatal `sig`
+    /// (a default-action signal, or an unhandled fault): the same teardown as
+    /// `exit_group` — without it a killed process kept its fds open, so e.g. a
+    /// pipe's reader never saw EOF and the shell hung — recorded as
+    /// signal-terminated for `wait`. Must be called without `shared` held.
+    pub(super) fn die_of_signal(&self, cx: &mut ServiceCtx, sig: u32, mem: &mut GuestMemory) {
+        let mut sh = self.shared.lock().unwrap();
+        self.exit_group_with(&mut sh, cx, ExitCause::Signaled(sig as i32), mem);
+    }
+
+    /// `exit_group` with an explicit exit cause (see [`Self::die_of_signal`]).
+    fn exit_group_with(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        cause: ExitCause,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         // Flush any un-munmap'd writable shared file mappings first (sh→vfs,
         // scoped so the tail `sys_exit` can re-acquire vfs without a re-lock).
         if !cx.cur.shared_maps.is_empty() {
@@ -4191,7 +4276,6 @@ impl Kernel {
             self.flush_shared_maps(&mut vfs, cx, 0, 0, mem);
         }
         let tgid = cx.cur.tgid;
-        let status = code & 0xff;
         // Zombify every sibling and note the distinct fd-table ids they used.
         // Their `info.fds` are placeholders — the real tables live in
         // `file_tables` (each shared table drained once, below).
@@ -4204,7 +4288,7 @@ impl Kernel {
             if !files_ids.contains(&p.info.files) {
                 files_ids.push(p.info.files);
             }
-            p.info.run = RunState::Zombie(ExitCause::Exited(status));
+            p.info.run = RunState::Zombie(cause);
         }
         // Close each distinct table's fds (`bump_pipe` briefly takes `pipes`
         // for a pipe fd or `net` for a socket fd — after `sh`, which this holds
@@ -4222,7 +4306,7 @@ impl Kernel {
             self.bump_pipe(&fd, false);
         }
         // `cx.cur` is this task, taken out of the table for its slice.
-        self.sys_exit(sh, cx, code, mem)
+        self.exit_task(sh, cx, cause, mem)
     }
 
     /// `futex(uaddr, op, val, ...)` — the parking primitive under mutexes,
@@ -6850,6 +6934,8 @@ impl Kernel {
                     p += PAGE_SIZE;
                 }
             }
+            // A fixed placement inside the arena is no longer free space.
+            sh.arena(cx).claim(base, len);
             base
         } else {
             let Some(base) = sh.arena(cx).alloc(len) else {
@@ -8101,6 +8187,36 @@ mod tests {
             ),
             err(Errno::EBADF)
         );
+    }
+
+    #[test]
+    fn arena_claim_removes_space_from_reuse() {
+        const P: u64 = PAGE_SIZE;
+        let mut a = Arena::new(0x100 * P, 0x10 * P);
+        let x = a.alloc(4 * P).unwrap(); // [0xfc, 0x100)
+        let y = a.alloc(4 * P).unwrap(); // [0xf8, 0xfc)
+        a.free_range(x, 4 * P);
+        assert!(a.is_free(x + P, 2 * P));
+        // Claim the middle of the freed block: only its edges stay reusable.
+        a.claim(x + P, 2 * P);
+        assert!(!a.is_free(x + P, P));
+        assert!(a.is_free(x, P) && a.is_free(x + 3 * P, P));
+        for _ in 0..2 {
+            let z = a.alloc(P).unwrap();
+            assert!(z + P <= x + P || z >= x + 3 * P, "claimed pages not reused");
+        }
+        // A fixed placement below the cursor (never-used bump space): later
+        // allocations must not land on it either, and the gap stays usable.
+        let fixed = y - 8 * P;
+        a.claim(fixed, 2 * P);
+        let gap = a.alloc(6 * P).unwrap();
+        assert_eq!(
+            gap,
+            fixed + 2 * P,
+            "the gap above the fixed range is reused"
+        );
+        let below = a.alloc(P).unwrap();
+        assert!(below + P <= fixed, "the bump region continues below it");
     }
 
     #[test]

@@ -238,6 +238,13 @@ impl Vm {
         self.finished.is_none() && self.kernel.has_pending_work()
     }
 
+    /// Syscalls the guest attempted that nixvm doesn't implement: raw syscall
+    /// number -> attempt count (see [`Kernel::unsupported`]).
+    #[must_use]
+    pub fn unsupported_syscalls(&self) -> std::collections::BTreeMap<u64, u64> {
+        self.kernel.unsupported()
+    }
+
     /// Whether pid 1 has exited (with its code).
     #[must_use]
     pub fn exit_code(&self) -> Option<i32> {

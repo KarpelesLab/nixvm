@@ -9,10 +9,13 @@ use super::Sysno;
 #[allow(clippy::too_many_lines)] // a flat syscall-number match table
 pub fn decode(nr: u64) -> Sysno {
     match nr {
+        38 => Sysno::Renameat,
         63 => Sysno::Read,
         64 => Sysno::Write,
         56 => Sysno::Openat,
         57 => Sysno::Close,
+        163 => Sysno::Getrlimit,
+        164 => Sysno::Setrlimit,
         214 => Sysno::Brk,
         222 => Sysno::Mmap,
         215 => Sysno::Munmap,

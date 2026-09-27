@@ -106,6 +106,7 @@ impl Kernel {
             if mem.map(dst, new_size, Prot::rw()).is_err() {
                 return err(Errno::ENOMEM);
             }
+            sh.arena(cx).claim(dst, new_size);
             let copy = old_size.min(new_size);
             if let Ok(data) = mem.read_vec(old_addr, copy as usize) {
                 let _ = mem.write(dst, &data);
@@ -128,12 +129,17 @@ impl Kernel {
             return old_addr as i64;
         }
 
-        // Grow: first try to claim the following pages in place.
+        // Grow: first try to claim the following pages in place — only when
+        // they are freed arena space (so nothing else owns them, and the arena
+        // is told they are taken; an unmapped page above the arena may be the
+        // stack guard gap or an image's neighbour).
         let extra_start = old_addr + old_size;
         let extra_len = new_size - old_size;
-        if range_is_free(mem, extra_start, extra_start + extra_len)
+        if sh.arena(cx).is_free(extra_start, extra_len)
+            && range_is_free(mem, extra_start, extra_start + extra_len)
             && mem.map(extra_start, extra_len, Prot::rw()).is_ok()
         {
+            sh.arena(cx).claim(extra_start, extra_len);
             return old_addr as i64;
         }
 
@@ -296,25 +302,40 @@ mod tests {
     #[test]
     fn mremap_grow_in_place_keeps_address_and_new_pages_work() {
         let (k, mut mem, mut cx) = setup();
-        // A 2-page mapping with 2 free pages after it.
-        mem.map(0x1_0000, 2 * PAGE, Prot::rw()).unwrap();
+        let mut sh = k.shared.lock().unwrap();
+        // Two arena blocks, `lo` right below `hi` (the arena grows down); free
+        // `hi`, so `lo` can grow into it in place.
+        let hi = k.alloc_mmap(&mut sh, &mut cx, 2 * PAGE).unwrap();
+        mem.map(hi, 2 * PAGE, Prot::rw()).unwrap();
+        let lo = k.alloc_mmap(&mut sh, &mut cx, 2 * PAGE).unwrap();
+        mem.map(lo, 2 * PAGE, Prot::rw()).unwrap();
+        assert_eq!(lo + 2 * PAGE, hi);
+        mem.write_u64(lo, 0x1111).unwrap();
+        assert_eq!(k.sys_munmap(&mut sh, &mut cx, hi, 2 * PAGE, &mut mem), 0);
 
-        let ret = k.sys_mremap(
-            &mut k.shared.lock().unwrap(),
-            &mut cx,
-            0x1_0000,
-            2 * PAGE,
-            4 * PAGE,
-            0,
-            0,
-            &mut mem,
-        );
-        assert_eq!(ret, 0x1_0000, "grow-in-place returns the same address");
+        let ret = k.sys_mremap(&mut sh, &mut cx, lo, 2 * PAGE, 4 * PAGE, 0, 0, &mut mem);
+        assert_eq!(ret, lo as i64, "grow-in-place returns the same address");
+        mem.write_u64(hi, 0xabcd_ef01).unwrap();
+        assert_eq!(mem.read_u64(hi).unwrap(), 0xabcd_ef01, "grown pages usable");
 
-        // The freshly grown page is usable.
-        let grown = 0x1_0000 + 2 * PAGE;
-        mem.write_u64(grown, 0xabcd_ef01).unwrap();
-        assert_eq!(mem.read_u64(grown).unwrap(), 0xabcd_ef01);
+        // The regression: the arena must know those pages are taken again, or
+        // the next mmap gets them and zero-fills the grown buffer (musl's
+        // allocator then aborts on the wiped chunk header — apk update).
+        let next = k.alloc_mmap(&mut sh, &mut cx, 2 * PAGE).unwrap();
+        assert!(next + 2 * PAGE <= lo || next >= lo + 4 * PAGE, "no overlap");
+        assert_eq!(mem.read_u64(lo).unwrap(), 0x1111);
+    }
+
+    #[test]
+    fn mremap_grow_never_takes_pages_outside_the_arena() {
+        let (k, mut mem, mut cx) = setup();
+        let mut sh = k.shared.lock().unwrap();
+        // The topmost arena block: above it is not arena space (the stack guard
+        // gap in a real process), so growing must relocate, not extend.
+        let top = k.alloc_mmap(&mut sh, &mut cx, PAGE).unwrap();
+        mem.map(top, PAGE, Prot::rw()).unwrap();
+        let ret = k.sys_mremap(&mut sh, &mut cx, top, PAGE, 2 * PAGE, 0, 0, &mut mem);
+        assert_eq!(ret, err(Errno::ENOMEM), "no in-place grow past the arena");
     }
 
     #[test]

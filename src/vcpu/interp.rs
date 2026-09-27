@@ -1614,6 +1614,29 @@ impl Aarch64Interp {
             return self.ldst(addr, size, opc, rt, mem);
         }
 
+        // ---- SIMD/FP load/store register, register offset ----
+        // `str q0,[x1,x3]`, `ldr d3,[x5,w6,sxtw #3]`: the GP register-offset
+        // form above with V=1; opc<1> selects the 128-bit Q size.
+        if (instr >> 27) & 0x7 == 0b111
+            && (instr >> 24) & 0x3 == 0b00
+            && (instr >> 26) & 1 == 1
+            && (instr >> 21) & 1 == 1
+            && (instr >> 10) & 3 == 0b10
+        {
+            let size = (instr >> 30) & 3;
+            let opc = (instr >> 22) & 3;
+            let scale = if opc & 2 != 0 { 4 } else { size };
+            let rm = reg_field(instr, 16);
+            let option = (instr >> 13) & 7;
+            let shift = if (instr >> 12) & 1 == 1 { scale } else { 0 };
+            let rn = reg_field(instr, 5);
+            let rt = reg_field(instr, 0);
+            let addr = self
+                .read_sp(rn)
+                .wrapping_add(extend_reg(self.read_x(rm), option, shift));
+            return self.ldst_vec(addr, scale, opc & 1 == 1, rt, mem);
+        }
+
         // ---- SIMD/FP load/store register, unsigned immediate offset ----
         if (instr >> 27) & 0x7 == 0b111 && (instr >> 24) & 0x3 == 0b01 && (instr >> 26) & 1 == 1 {
             let size = (instr >> 30) & 3;
@@ -1809,6 +1832,18 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- DUP Vd, Vn.Ts[index] (scalar; alias MOV): copy one lane to a
+        // scalar register, zeroing the rest. `0101 1110 000 imm5 0000 01 Rn Rd`.
+        if instr & 0xFFE0_FC00 == 0x5E00_0400 {
+            let imm5 = (instr >> 16) & 0x1f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize = elem_bits(imm5);
+            let index = imm5 >> (esize / 8).trailing_zeros().wrapping_add(1);
+            self.v[rd] = (self.v[rn] >> (u128::from(index) * u128::from(esize))) & ones_u128(esize);
+            return Step::Next;
+        }
+
         // ---- DUP Vd.T, Vn.Ts[index] (replicate a vector lane across lanes) ----
         if (instr >> 21) & 0x1ff == 0b0_0111_0000 && (instr >> 10) & 0x3f == 0b00_0001 {
             let q = (instr >> 30) & 1;
@@ -1890,6 +1925,23 @@ impl Aarch64Interp {
             let mask = ones_u128(esize) << shift;
             let val = (u128::from(self.read_x(rn)) & ones_u128(esize)) << shift;
             self.v[rd] = (self.v[rd] & !mask) | val;
+            return Step::Next;
+        }
+
+        // ---- INS Vd.Ts[i], Vn.Ts[j] (MOV element: copy one lane to another) ----
+        // `0110 1110 000 imm5 0 imm4 1 Rn Rd`: imm5 gives the element size
+        // (lowest set bit) and destination index, imm4 the source index.
+        if instr & 0xFFE0_8400 == 0x6E00_0400 {
+            let imm5 = (instr >> 16) & 0x1f;
+            let imm4 = (instr >> 11) & 0xf;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let esize = elem_bits(imm5);
+            let size_log2 = (esize / 8).trailing_zeros();
+            let dst = u128::from(imm5 >> (size_log2 + 1)) * u128::from(esize);
+            let src = u128::from(imm4 >> size_log2) * u128::from(esize);
+            let elem = (self.v[rn] >> src) & ones_u128(esize);
+            self.v[rd] = (self.v[rd] & !(ones_u128(esize) << dst)) | (elem << dst);
             return Step::Next;
         }
 
@@ -5721,6 +5773,66 @@ mod tests {
             println!("{n:6} {mn:12}{p}  e.g. {example}");
         }
         println!("{} mnemonics unsupported", by_mnemonic.len());
+    }
+
+    #[test]
+    fn neon_dup_element_scalar() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[5] = (0xDEAD_BEEF_0000_0001u128 << 64) | 7;
+        c.v[30] = u128::MAX;
+        c.exec(0x5e18_04be, &mut m); // mov d30, v5.d[1]
+        assert_eq!(c.v[30], 0xDEAD_BEEF_0000_0001);
+    }
+
+    #[test]
+    fn simd_ldst_register_offset() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        c.x[1] = base;
+        c.x[3] = 0x40;
+        c.v[0] = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFFu128;
+        assert!(matches!(c.exec(0x3ca3_6820, &mut m), Step::Next)); // str q0,[x1,x3]
+        c.x[2] = base;
+        c.x[4] = 4; // lsl #4 -> +0x40
+        assert!(matches!(c.exec(0x3ce4_7841, &mut m), Step::Next)); // ldr q1,[x2,x4,lsl #4]
+        assert_eq!(c.v[1], c.v[0]);
+        c.x[5] = base + 0x48;
+        c.x[6] = u64::from((-1i32) as u32); // sxtw #3 -> -8
+        assert!(matches!(c.exec(0xfc66_d8a3, &mut m), Step::Next)); // ldr d3,[x5,w6,sxtw #3]
+        assert_eq!(c.v[3], 0x8899_AABB_CCDD_EEFF);
+        c.x[11] = base + 0x80;
+        c.x[0] = 1;
+        c.v[2] = 0x5a;
+        assert!(matches!(c.exec(0x3c20_6962, &mut m), Step::Next)); // str b2,[x11,x0]
+        let mut b = [0u8; 1];
+        m.read(base + 0x81, &mut b).unwrap();
+        assert_eq!(b[0], 0x5a);
+    }
+
+    #[test]
+    fn neon_ins_element() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = (0xAAAA_AAAA_AAAA_AAAAu128 << 64) | 0x1111;
+        c.v[2] = 0x2222;
+        c.exec(0x6e08_4422, &mut m); // mov v2.d[0], v1.d[1]
+        assert_eq!(c.v[2], 0xAAAA_AAAA_AAAA_AAAA);
+        c.v[0] = 0x0123_4567_89AB_CDEF;
+        c.exec(0x6e18_0401, &mut m); // mov v1.d[1], v0.d[0]
+        assert_eq!(c.v[1], (0x0123_4567_89AB_CDEFu128 << 64) | 0x1111);
+        c.v[3] = 0;
+        c.v[4] = 0x5555_5555u128 << 32;
+        c.exec(0x6e1c_2483, &mut m); // mov v3.s[3], v4.s[1]
+        assert_eq!(c.v[3], 0x5555_5555u128 << 96);
+        c.v[5] = 0;
+        c.v[6] = 0x7f;
+        c.exec(0x6e1f_04c5, &mut m); // mov v5.b[15], v6.b[0]
+        assert_eq!(c.v[5], 0x7fu128 << 120);
+        c.v[7] = u128::MAX;
+        c.v[8] = 0x1234u128 << 112;
+        c.exec(0x6e0a_7507, &mut m); // mov v7.h[2], v8.h[7]
+        assert_eq!(c.v[7], !(0xffffu128 << 32) | (0x1234u128 << 32));
     }
 
     #[test]
