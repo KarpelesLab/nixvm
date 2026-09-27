@@ -189,6 +189,7 @@ const XCR0_AVX: u64 = 0x7;
 /// tables' `NX` bit take effect, so non-executable pages actually fault.
 const EFER_LONG: u64 = 0xD01;
 
+#[allow(clippy::struct_excessive_bools)] // independent per-vcpu flags
 pub struct KvmVcpu {
     vm: Arc<Vm>,
     fd: super::vm::Fd,

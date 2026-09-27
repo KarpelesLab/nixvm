@@ -7,9 +7,9 @@
 //! vcpu. A guest `syscall` vectors to a `hlt; sysretq` trampoline whose `hlt`
 //! exits to the host as `KVM_EXIT_HLT` → [`crate::vcpu::Exit::Syscall`];
 //! accesses to unbacked guest-physical addresses become
-//! [`crate::vcpu::Exit::MemFault`]. All `unsafe` FFI lives in [`sys`]; the VM,
+//! [`crate::vcpu::Exit::MemFault`]. All `unsafe` FFI lives in `sys`; the VM,
 //! its guest-physical layout, and the control block (page tables, GDT,
-//! trampoline) in [`vm`].
+//! trampoline) in `vm`.
 //!
 //! Availability: creating the VM needs a readable+writable `/dev/kvm`, so a
 //! host without KVM (or a CI runner without the device) gets a graceful error

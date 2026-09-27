@@ -74,7 +74,7 @@ mod imp {
             let mut ts = Ts { sec: 0, nsec: 0 };
             // SAFETY: `ts` is a valid, writable `timespec`; `clk` is a fixed,
             // valid POSIX clock id. `clock_gettime` writes only `ts`.
-            (unsafe { clock_gettime(clk, &mut ts) } == 0)
+            (unsafe { clock_gettime(clk, &raw mut ts) } == 0)
                 .then(|| Duration::new(ts.sec.max(0) as u64, ts.nsec.clamp(0, 999_999_999) as u32))
         }
     }
