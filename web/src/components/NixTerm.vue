@@ -56,9 +56,18 @@ const NET_TUNNEL_URL = "wss://grouterd.atonline.com/tunnel/";
 const NET_KEEPALIVE_MS = 60_000;
 /// TCP timers (retransmits, delayed ACKs) run on this period.
 const NET_TICK_MS = 100;
-/// Tunnel close codes that are not worth reconnecting after with the same
-/// session: another tunnel with our token replaced this one.
+/// Tunnel close codes (grouterd): our token expired (get a new one), or
+/// another tunnel with our token replaced this one (don't fight it).
+const NET_CLOSE_EXPIRED = 4001;
 const NET_CLOSE_REPLACED = 4002;
+/// A token this close to expiring (ms) is replaced rather than reused.
+const NET_TOKEN_MARGIN_MS = 60_000;
+/// Consecutive tunnel attempts that die before the hello, with one token,
+/// before we suspect the token and fetch a new one.
+const NET_TOKEN_MAX_FAILS = 3;
+/// Where this tab keeps its token, so a reload reuses it: tokens are limited
+/// per day, and one is good for hours.
+const NET_TOKEN_KEY = "nixvm.net.token";
 
 const termEl = ref(null);
 const status = ref("idle");
@@ -76,9 +85,12 @@ const statusMessages = {
 };
 const statusText = computed(() => statusMessages[status.value] ?? status.value);
 
-// Network link state, shown in the toolbar: off | connecting | online | error.
+// Network link state, shown in the toolbar:
+// off | connecting | online | error | unavailable.
 const netEnabled = ref(true);
 const netState = ref("off");
+// The token API refused us (daily limit reached, or down): shown as a banner.
+const netUnavailable = ref(false);
 const netAddr = ref("");
 const netLabel = computed(() => {
   if (!netEnabled.value) return "net: off";
@@ -89,6 +101,8 @@ const netLabel = computed(() => {
       return "net: connecting…";
     case "error":
       return "net: offline (retrying)";
+    case "unavailable":
+      return "net: unavailable";
     default:
       return "net: off";
   }
@@ -305,6 +319,61 @@ let netKeepaliveTimer = null;
 let netRetryTimer = null;
 let netRetryDelay = 2000;
 
+// The tunnel token: `{ token, expires }` (expires in Unix seconds, from the
+// token API). Reused across reconnects until it nears expiry — tokens are
+// rationed per day, while one lasts hours.
+let netToken = loadNetToken();
+let netTokenFails = 0;
+
+function loadNetToken() {
+  try {
+    const t = JSON.parse(sessionStorage.getItem(NET_TOKEN_KEY) ?? "null");
+    return t && typeof t.token === "string" && Number.isFinite(t.expires) ? t : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveNetToken(t) {
+  netToken = t;
+  netTokenFails = 0;
+  try {
+    if (t) sessionStorage.setItem(NET_TOKEN_KEY, JSON.stringify(t));
+    else sessionStorage.removeItem(NET_TOKEN_KEY);
+  } catch {
+    // storage unavailable (private mode): the in-memory copy still works
+  }
+}
+
+function netTokenUsable() {
+  return netToken !== null && netToken.expires * 1000 - Date.now() > NET_TOKEN_MARGIN_MS;
+}
+
+/// A token for the tunnel: the cached one while it is good, else a new one.
+/// Resolves to the token string, or throws: `{ unavailable: true }` when the
+/// API answered with a refusal (daily limit, service off), a plain error when
+/// it couldn't be reached at all (offline — worth retrying).
+async function netGetToken() {
+  if (netTokenUsable()) return netToken.token;
+  saveNetToken(null);
+  const res = await fetch(NET_TOKEN_URL, { cache: "no-store" });
+  let body = null;
+  try {
+    body = await res.json();
+  } catch {
+    // not JSON: treated as a refusal below
+  }
+  const data = body?.data;
+  if (!res.ok || body?.result !== "success" || typeof data?.token !== "string") {
+    const why = body?.error ?? body?.message ?? `HTTP ${res.status}`;
+    throw Object.assign(new Error(`token API: ${why}`), { unavailable: true });
+  }
+  // Without an expiry, assume the documented two hours.
+  const expires = Number.isFinite(data.expires) ? data.expires : Date.now() / 1000 + 7200;
+  saveNetToken({ token: data.token, expires });
+  return data.token;
+}
+
 // Send every packet the guest's stack has queued.
 function flushNet() {
   if (!guestTerm || !ws || ws.readyState !== WebSocket.OPEN) return;
@@ -361,18 +430,23 @@ async function netConnect() {
   netState.value = "connecting";
   let token;
   try {
-    const res = await fetch(NET_TOKEN_URL, { cache: "no-store" });
-    if (!res.ok) throw new Error(`token request failed: ${res.status}`);
-    const body = await res.json();
-    token = body?.data?.token;
-    if (!token) throw new Error("no token in response");
+    token = await netGetToken();
   } catch (err) {
     if (gen !== netGen) return;
     console.warn("nixvm: network token:", err);
-    netRetryLater();
+    if (err?.unavailable) {
+      // Refused (e.g. today's free tokens are used up). Don't keep asking —
+      // that only burns quota; the banner / net button retries on demand.
+      netStopTimers();
+      netState.value = "unavailable";
+      netUnavailable.value = true;
+      return;
+    }
+    netRetryLater(); // couldn't reach the API (offline): back off, retry
     return;
   }
   if (gen !== netGen || !guestTerm) return;
+  netUnavailable.value = false;
 
   const sock = new WebSocket(NET_TUNNEL_URL + encodeURIComponent(token));
   sock.binaryType = "arraybuffer";
@@ -390,6 +464,7 @@ async function netConnect() {
         netAddr.value = h.ipv4 ?? h.ipv6 ?? "up";
         netState.value = "online";
         netRetryDelay = 2000;
+        netTokenFails = 0;
         netTickTimer = setInterval(() => {
           try {
             guestTerm?.net_tick();
@@ -424,19 +499,44 @@ async function netConnect() {
       netEnabled.value = false;
       return;
     }
-    // Expired token, dropped connection, server restart: get a new token.
+    if (ev.code === NET_CLOSE_EXPIRED) {
+      saveNetToken(null); // the next attempt fetches a fresh token
+    } else if (!hello && ++netTokenFails >= NET_TOKEN_MAX_FAILS) {
+      // Never got a hello with this token, repeatedly: it may have been
+      // refused (the browser hides the HTTP status), so try a fresh one.
+      saveNetToken(null);
+    }
+    // Dropped connection, server restart, expiry: reconnect, reusing the
+    // token while it's still good.
     netRetryLater();
   };
 }
 
 function toggleNet() {
+  // While refused, a click is "try again" rather than "turn off".
+  if (netEnabled.value && netState.value === "unavailable") {
+    netRetryNow();
+    return;
+  }
   netEnabled.value = !netEnabled.value;
+  if (!netEnabled.value) netUnavailable.value = false;
   if (netEnabled.value) {
     netRetryDelay = 2000;
     netConnect();
   } else {
     netDisconnect();
   }
+}
+
+function netRetryNow() {
+  netUnavailable.value = false;
+  netEnabled.value = true;
+  netRetryDelay = 2000;
+  netConnect();
+}
+
+function netDismissBanner() {
+  netUnavailable.value = false;
 }
 
 async function fetchRootfsTarGz(archId) {
@@ -616,6 +716,14 @@ onBeforeUnmount(() => {
         {{ bootLabel }}
       </button>
     </div>
+    <div v-if="netUnavailable" class="net-banner" role="status">
+      <span>
+        Network is not available for free right now — the shell still works,
+        just offline.
+      </span>
+      <button class="net-banner-btn" @click="netRetryNow">Retry</button>
+      <button class="net-banner-btn" aria-label="Dismiss" @click="netDismissBanner">✕</button>
+    </div>
     <div ref="termEl" class="term-container"></div>
   </div>
 </template>
@@ -742,8 +850,42 @@ onBeforeUnmount(() => {
   color: #ffd43b;
 }
 
-.net-btn.is-error {
+.net-btn.is-error,
+.net-btn.is-unavailable {
   color: var(--danger);
+}
+
+.net-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.7rem;
+  font-size: 0.85rem;
+  color: var(--fg);
+  background: color-mix(in srgb, #ffd43b 14%, var(--panel));
+  border: 1px solid color-mix(in srgb, #ffd43b 45%, var(--panel-border));
+  border-radius: 0.4rem;
+}
+
+.net-banner span {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.net-banner-btn {
+  flex: none;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--panel-border);
+  border-radius: 0.35rem;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.8rem;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.net-banner-btn:hover {
+  border-color: var(--accent);
 }
 
 .net-btn:disabled {
