@@ -327,9 +327,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pktkit"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ff9ad8216449898b06388e94e021061c374ad0394c44538572a72a890aa23d4"
+checksum = "01f3ef89323f0ff563314fe1da41cc1b5090fe98154191e2583df6eee60e1507"
 
 [[package]]
 name = "potential_utf"
