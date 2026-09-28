@@ -24,8 +24,10 @@ use std::time::{Duration, Instant};
 
 use nixvm::tunnel::{Lease, Tunnel};
 
-const HOST: &str = "dl-cdn.alpinelinux.org";
-const PATH: &str = "/alpine/v3.20/community/aarch64/APKINDEX.tar.gz";
+/// Default download: Alpine's community index from its CDN (Fastly).
+/// `NIXVM_TUNNEL_TARGETS=host/path,host/path…` compares several servers.
+const DEFAULT_TARGET: &str =
+    "dl-cdn.alpinelinux.org/alpine/v3.20/community/aarch64/APKINDEX.tar.gz";
 
 fn read_frame(s: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
     let mut hdr = [0u8; 5];
@@ -76,7 +78,7 @@ fn tunnel_download(
     net: &Tunnel,
     link: &mut TcpStream,
     rx: &mpsc::Receiver<Vec<u8>>,
-    ip: IpAddr,
+    (host, path, ip): (&str, &str, IpAddr),
     tick: Duration,
 ) -> (usize, f64, Vec<Seg>) {
     let IpAddr::V4(v4) = ip else {
@@ -92,7 +94,7 @@ fn tunnel_download(
     let mut sent_req = false;
     let mut got = 0usize;
     let mut last_tick = Instant::now();
-    let req = format!("GET {PATH} HTTP/1.0\r\nHost: {HOST}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     loop {
         if !sent_req && conn.poll_connect().unwrap() {
             assert_eq!(conn.send(req.as_bytes()).unwrap(), req.len());
@@ -140,8 +142,8 @@ fn tunnel_download(
             net.tick();
             last_tick = Instant::now();
         }
-        if start.elapsed() > Duration::from_secs(120) {
-            println!("  !! download stalled at {got} bytes after 120 s");
+        if start.elapsed() > Duration::from_secs(60) {
+            println!("  !! download stalled at {got} bytes after 60 s");
             break;
         }
     }
@@ -274,15 +276,22 @@ fn report(name: &str, bytes: usize, secs: f64, trace: &[Seg]) {
 
 /// Proxy-only check, no TCP involved: bursts of 1000-byte ICMP echoes to
 /// 1.1.1.1 through the tunnel; how many come back, and when.
-fn icmp_bursts(net: &Tunnel, link: &mut TcpStream, rx: &mpsc::Receiver<Vec<u8>>, target: [u8; 4]) {
+fn icmp_bursts(
+    net: &Tunnel,
+    link: &mut TcpStream,
+    rx: &mpsc::Receiver<Vec<u8>>,
+    target: [u8; 4],
+    payload: usize,
+    bursts: &[usize],
+) {
     let mut sock = net.egress().open_icmp(false).expect("icmp");
     let mut dst = [0u8; 16];
     dst[..4].copy_from_slice(&target);
-    for (round, n) in [(1u16, 5usize), (2, 20), (3, 60), (4, 150)] {
+    for (round, &n) in (1u16..).zip(bursts) {
         let start = Instant::now();
         for i in 0..n {
             let mut m = vec![8u8, 0, 0, 0, 0x4e, round as u8, (i >> 8) as u8, i as u8];
-            m.extend(std::iter::repeat_n(0xa5, 1000));
+            m.extend(std::iter::repeat_n(0xa5, payload));
             let sum = pktkit::checksum(&m);
             m[2..4].copy_from_slice(&sum.to_be_bytes());
             sock.send_to(&m, dst, false, 0).unwrap();
@@ -309,11 +318,65 @@ fn icmp_bursts(net: &Tunnel, link: &mut TcpStream, rx: &mpsc::Receiver<Vec<u8>>,
         let first = times.first().copied().unwrap_or(f64::NAN);
         let last = times.last().copied().unwrap_or(f64::NAN);
         println!(
-            "ICMP to {target:?}: burst of {n:3} x 1028 B (sent in {sent_ms:.1} ms): {} replies ({:.0}% lost), first at {first:.0} ms, last at {last:.0} ms",
+            "ICMP to {target:?}: burst of {n:3} x {} B IP (sent in {sent_ms:.1} ms): {} replies ({:.0}% lost), first at {first:.0} ms, last at {last:.0} ms, {:.1} ms/reply",
+            payload + 28,
             times.len(),
-            100.0 * (1.0 - times.len() as f64 / n as f64)
+            100.0 * (1.0 - times.len() as f64 / n as f64),
+            (last - first) / (times.len().max(2) - 1) as f64
         );
     }
+}
+
+/// Small pings sent 5 ms apart, each its own tunnel message: how long each
+/// takes to come back. Small writes trickling onto the carrier are what TCP
+/// ACKs look like; a Nagle + delayed-ACK interaction there shows up as most
+/// of them waiting tens of milliseconds.
+fn spaced_pings(net: &Tunnel, link: &mut TcpStream, rx: &mpsc::Receiver<Vec<u8>>) {
+    let mut sock = net.egress().open_icmp(false).expect("icmp");
+    let mut dst = [0u8; 16];
+    dst[..4].copy_from_slice(&[1, 1, 1, 1]);
+    let n = 20u16;
+    let start = Instant::now();
+    let mut sent_at = vec![0f64; usize::from(n)];
+    let mut rtts = vec![f64::NAN; usize::from(n)];
+    let mut next = 0u16;
+    while start.elapsed() < Duration::from_secs(3) {
+        let now_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if next < n && now_ms >= f64::from(next) * 5.0 {
+            let mut m = vec![8u8, 0, 0, 0, 0x50, 0x50, 0, next as u8];
+            m.extend(std::iter::repeat_n(0, 56));
+            let sum = pktkit::checksum(&m);
+            m[2..4].copy_from_slice(&sum.to_be_bytes());
+            sock.send_to(&m, dst, false, 0).unwrap();
+            for p in net.take_outbound() {
+                let mut f = vec![1u8];
+                f.extend_from_slice(&(p.len() as u32).to_be_bytes());
+                f.extend_from_slice(&p);
+                link.write_all(&f).unwrap();
+            }
+            sent_at[usize::from(next)] = now_ms;
+            next += 1;
+        }
+        if let Ok(p) = rx.recv_timeout(Duration::from_micros(200)) {
+            net.inject(&p);
+        }
+        while let Ok(Some((_, _, _, pkt))) = sock.recv_from() {
+            let hl = usize::from(pkt[0] & 0xf) * 4;
+            if pkt.get(hl) == Some(&0) && pkt.get(hl + 4) == Some(&0x50) {
+                let i = usize::from(pkt[hl + 7]);
+                if i < rtts.len() {
+                    rtts[i] = start.elapsed().as_secs_f64() * 1000.0 - sent_at[i];
+                }
+            }
+        }
+    }
+    println!(
+        "spaced pings (5 ms apart) RTT ms: {}",
+        rtts.iter()
+            .map(|r| format!("{r:.0}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
 }
 
 #[test]
@@ -322,29 +385,39 @@ fn tunnel_live_throughput() {
         eprintln!("NIXVM_TUNNEL_BRIDGE not set; skipping");
         return;
     };
-    let ip = (HOST, 80)
-        .to_socket_addrs()
-        .unwrap()
-        .find(std::net::SocketAddr::is_ipv4)
-        .unwrap()
-        .ip();
+    let targets: Vec<(String, String, IpAddr)> = std::env::var("NIXVM_TUNNEL_TARGETS")
+        .unwrap_or_else(|_| DEFAULT_TARGET.to_string())
+        .split(',')
+        .map(|t| {
+            let (host, path) = t.split_once('/').unwrap();
+            let ip = (host, 80)
+                .to_socket_addrs()
+                .unwrap()
+                .find(std::net::SocketAddr::is_ipv4)
+                .unwrap()
+                .ip();
+            (host.to_string(), format!("/{path}"), ip)
+        })
+        .collect();
 
-    // Baseline: the same download over the host's own network.
-    let t = Instant::now();
-    let mut s = TcpStream::connect((ip, 80)).unwrap();
-    write!(
-        s,
-        "GET {PATH} HTTP/1.0\r\nHost: {HOST}\r\nConnection: close\r\n\r\n"
-    )
-    .unwrap();
-    let mut body = Vec::new();
-    s.read_to_end(&mut body).unwrap();
-    report(
-        "host network (baseline)",
-        body.len(),
-        t.elapsed().as_secs_f64(),
-        &[],
-    );
+    // Baselines: the same downloads over the host's own network.
+    for (host, path, ip) in &targets {
+        let t = Instant::now();
+        let mut s = TcpStream::connect((*ip, 80)).unwrap();
+        write!(
+            s,
+            "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut body = Vec::new();
+        s.read_to_end(&mut body).unwrap();
+        report(
+            &format!("host network: {host} ({ip})"),
+            body.len(),
+            t.elapsed().as_secs_f64(),
+            &[],
+        );
+    }
 
     let mut link = TcpStream::connect(&bridge).expect("connect to tunnel-bridge");
     let (kind, hello) = read_frame(&mut link).expect("hello");
@@ -368,14 +441,25 @@ fn tunnel_live_throughput() {
     });
     let _ = link.set_nodelay(true);
 
-    let IpAddr::V4(cdn) = ip else { unreachable!() };
-    icmp_bursts(&net, &mut link, &rx, [1, 1, 1, 1]);
-    icmp_bursts(&net, &mut link, &rx, cdn.octets());
+    if std::env::var_os("NIXVM_SKIP_BURSTS").is_none() {
+        spaced_pings(&net, &mut link, &rx);
+        // Bursts at growing packet sizes (1400 B IP = the tunnel MTU, what
+        // a full TCP segment is), to the direct path (Cloudflare) and to each
+        // download server.
+        for payload in [500, 1000, 1372] {
+            icmp_bursts(&net, &mut link, &rx, [1, 1, 1, 1], payload, &[30]);
+            for (_, _, ip) in &targets {
+                let IpAddr::V4(v4) = ip else { continue };
+                icmp_bursts(&net, &mut link, &rx, v4.octets(), payload, &[30]);
+            }
+        }
+    }
     if std::env::var_os("NIXVM_SKIP_DOWNLOAD").is_some() {
         return;
     }
-
-    let tick = Duration::from_millis(10);
-    let (n, secs, trace) = tunnel_download(&net, &mut link, &rx, ip, tick);
-    report(&format!("tunnel + pktkit, tick {tick:?}"), n, secs, &trace);
+    for (host, path, ip) in &targets {
+        let tick = Duration::from_millis(10);
+        let (n, secs, trace) = tunnel_download(&net, &mut link, &rx, (host, path, *ip), tick);
+        report(&format!("tunnel: {host} ({ip})"), n, secs, &trace);
+    }
 }
