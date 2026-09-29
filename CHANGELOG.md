@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/KarpelesLab/nixvm/compare/v0.0.1...v0.0.2) - 2026-09-29
+
+### Other
+
+- pktkit 0.1.10
+- multi-target tunnel throughput test; bridge with a TCP_NODELAY switch
+- pktkit 0.1.8; add a live tunnel throughput diagnostic
+- Ctrl-C interrupts the running command; sub-millisecond guest clocks
+- arm64 guest fixes: apk update over HTTPS works (NEON, mremap, renameat, kills)
+- *(aarch64)* NEON single-structure loads/stores, PMULL; coverage scanner
+- ICMP sockets (ping) over the tunnel, answered locally on loopback
+- use the guest arch's O_DIRECTORY/O_NOFOLLOW (fixes arm64 symlinks)
+
 ## [0.0.1](https://github.com/KarpelesLab/nixvm/compare/v0.0.0...v0.0.1) - 2026-09-27
 
 ### Fixed
