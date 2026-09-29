@@ -52,6 +52,8 @@ struct Seg {
     win: u16,
     len: usize,
     flags: u8,
+    /// The TCP checksum does not match the segment (inbound only).
+    bad_csum: bool,
 }
 
 fn parse_tcp(p: &[u8], t: f64, out: bool) -> Option<Seg> {
@@ -62,7 +64,16 @@ fn parse_tcp(p: &[u8], t: f64, out: bool) -> Option<Seg> {
     let total = usize::from(u16::from_be_bytes([p[2], p[3]]));
     let tcp = p.get(ihl..total)?;
     let doff = usize::from(tcp[12] >> 4) * 4;
+    let bad_csum = !out && {
+        let src = IpAddr::from(<[u8; 4]>::try_from(&p[12..16]).unwrap());
+        let dst = IpAddr::from(<[u8; 4]>::try_from(&p[16..20]).unwrap());
+        let mut z = tcp.to_vec();
+        z[16..18].fill(0);
+        pktkit::transport_checksum(pktkit::Protocol::TCP, src, dst, &z)
+            != u16::from_be_bytes([tcp[16], tcp[17]])
+    };
     Some(Seg {
+        bad_csum,
         t,
         out,
         seq: u32::from_be_bytes(tcp[4..8].try_into().unwrap()),
@@ -457,9 +468,35 @@ fn tunnel_live_throughput() {
     if std::env::var_os("NIXVM_SKIP_DOWNLOAD").is_some() {
         return;
     }
-    for (host, path, ip) in &targets {
-        let tick = Duration::from_millis(10);
-        let (n, secs, trace) = tunnel_download(&net, &mut link, &rx, (host, path, *ip), tick);
-        report(&format!("tunnel: {host} ({ip})"), n, secs, &trace);
+    // NIXVM_TUNNEL_MTUS=1400,700,440: repeat each download with the link MTU
+    // (so our SYN's MSS) at each size. A server's back-to-back segments that
+    // something upstream merges into one oversized packet (GRO) survive a
+    // 1500-byte limit only when the merged size fits — and then show up here
+    // as segments larger than the MSS we asked for.
+    let mtus: Vec<u16> = std::env::var("NIXVM_TUNNEL_MTUS")
+        .unwrap_or_else(|_| "1400".into())
+        .split(',')
+        .map(|m| m.parse().unwrap())
+        .collect();
+    for &mtu in &mtus {
+        net.up(Lease { v4, v6: None, mtu });
+        for (host, path, ip) in &targets {
+            let tick = Duration::from_millis(10);
+            let (n, secs, trace) = tunnel_download(&net, &mut link, &rx, (host, path, *ip), tick);
+            let oversized = trace
+                .iter()
+                .filter(|s| !s.out && s.len > usize::from(mtu - 40))
+                .count();
+            report(&format!("tunnel mtu {mtu}: {host} ({ip})"), n, secs, &trace);
+            let bad = trace.iter().filter(|s| s.bad_csum).count();
+            let bad_big = trace
+                .iter()
+                .filter(|s| s.bad_csum && s.len > usize::from(mtu - 40))
+                .count();
+            println!(
+                "  segments larger than our MSS ({}): {oversized}; bad TCP checksum: {bad} ({bad_big} of them oversized)",
+                mtu - 40
+            );
+        }
     }
 }
