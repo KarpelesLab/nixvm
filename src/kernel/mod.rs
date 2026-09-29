@@ -2336,7 +2336,7 @@ impl Kernel {
         step_start: u128,
     ) -> SliceStep {
         // Checkout under `sh`, then release it before servicing.
-        let (mut proc, mut cx) = {
+        let (mut proc, mut cx, out_pending, out_ppid) = {
             let mut sh = self.shared.lock().unwrap();
             let mut proc = sh.procs[i].take().expect("dispatched task is in the table");
             // Own the task's per-step servicing state. `yield_now`/`block`/
@@ -2346,8 +2346,18 @@ impl Kernel {
                 cur: std::mem::take(&mut proc.info),
                 ..ServiceCtx::default()
             };
+            // Leave a stand-in in the slot while the syscall is serviced
+            // outside the lock: other workers service theirs concurrently and
+            // must still see this task — a parent's `wait4` otherwise found a
+            // child mid-`exit` missing, got ECHILD, and exited early (the flaky
+            // smp_e2e sum); `kill` by pid and reparenting look it up too.
+            sh.procs[i] = Some(Process {
+                vcpu: None,
+                info: cx.cur.clone(),
+            });
             sh.check_out_files(&mut cx);
-            (proc, cx)
+            let (pending, ppid) = (cx.cur.pending, cx.cur.ppid);
+            (proc, cx, pending, ppid)
         };
         if cx.cur.alarm_deadline.is_some() {
             fire_alarm_if_due(&mut cx.cur, poll::now_ns());
@@ -2362,9 +2372,30 @@ impl Kernel {
         charge_vruntime(&mut cx.cur, delta);
         {
             let mut sh = self.shared.lock().unwrap();
+            // Fold in what other workers did to the stand-in meanwhile: signals
+            // posted to this task, and a new parent (ours exited and reparented
+            // us to init). Anything else on it was a copy of our own state.
+            if let Some(stand_in) = sh.procs[i].take() {
+                cx.cur.pending |= stand_in.info.pending & !out_pending;
+                if stand_in.info.ppid != out_ppid {
+                    cx.cur.ppid = stand_in.info.ppid;
+                }
+            }
             sh.check_in_files(&mut cx);
+            // A task that just exited: wake its parent again now that the
+            // zombie is visible. The exit's own wake-up went out while the
+            // stand-in still read "running", so a parent whose `wait4` ran in
+            // between parked on it and would otherwise wait for a stall retry.
+            let ppid = matches!(cx.cur.run, RunState::Zombie(_)).then_some(cx.cur.ppid);
             proc.info = cx.cur;
             sh.procs[i] = Some(proc);
+            if let Some(ppid) = ppid {
+                for p in sh.procs.iter_mut().flatten() {
+                    if p.info.pid == ppid {
+                        p.info.parked = false;
+                    }
+                }
+            }
         }
         match flow {
             Serviced::SetRet => {
