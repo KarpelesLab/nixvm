@@ -96,7 +96,7 @@ compcol = { version = "0.6", optional = true, default-features = false, features
 # Userspace TCP/IP (virtual TCP engine + client), gated behind `tunnel`. On
 # wasm32 its clock comes from `pktkit.now_ms`/`pktkit.unix_ms` host imports,
 # which web/index.html supplies through an import map (web/public/pktkit.js).
-pktkit = { version = "0.1.8", optional = true, default-features = false, features = [
+pktkit = { version = "0.1.10", optional = true, default-features = false, features = [
     "vclient",
 ] }
 
