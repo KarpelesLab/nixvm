@@ -44,6 +44,7 @@ fn field<'a>(json: &'a str, key: &str) -> Option<&'a str> {
 
 /// One traced TCP segment (IPv4 only — the download uses the v4 lease).
 #[derive(Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)] // independent per-segment observations
 struct Seg {
     t: f64, // ms since start
     out: bool,
@@ -54,6 +55,36 @@ struct Seg {
     flags: u8,
     /// The TCP checksum does not match the segment (inbound only).
     bad_csum: bool,
+    /// ...and it holds just the pseudo-header sum (a CHECKSUM_PARTIAL /
+    /// virtio NEEDS_CSUM packet whose checksum was never completed).
+    partial_csum: bool,
+    /// ...and it is the valid checksum of the first half alone (two segments
+    /// merged, the first one's checksum kept: receive offload coalescing).
+    first_half_csum: bool,
+}
+
+/// `NIXVM_DUMP_BAD=<file>`: append the first bad-checksum inbound packets,
+/// one hex line each, for offline analysis.
+fn dump_bad(p: &[u8]) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let Ok(path) = std::env::var("NIXVM_DUMP_BAD") else {
+        return;
+    };
+    if N.fetch_add(1, Ordering::Relaxed) >= 40 {
+        return;
+    }
+    let hex = p.iter().fold(String::new(), |mut h, b| {
+        use std::fmt::Write as _;
+        let _ = write!(h, "{b:02x}");
+        h
+    });
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(f, "{hex}").unwrap();
 }
 
 fn parse_tcp(p: &[u8], t: f64, out: bool) -> Option<Seg> {
@@ -64,16 +95,31 @@ fn parse_tcp(p: &[u8], t: f64, out: bool) -> Option<Seg> {
     let total = usize::from(u16::from_be_bytes([p[2], p[3]]));
     let tcp = p.get(ihl..total)?;
     let doff = usize::from(tcp[12] >> 4) * 4;
+    let src = IpAddr::from(<[u8; 4]>::try_from(&p[12..16]).unwrap());
+    let dst = IpAddr::from(<[u8; 4]>::try_from(&p[16..20]).unwrap());
+    let stored = u16::from_be_bytes([tcp[16], tcp[17]]);
     let bad_csum = !out && {
-        let src = IpAddr::from(<[u8; 4]>::try_from(&p[12..16]).unwrap());
-        let dst = IpAddr::from(<[u8; 4]>::try_from(&p[16..20]).unwrap());
         let mut z = tcp.to_vec();
         z[16..18].fill(0);
-        pktkit::transport_checksum(pktkit::Protocol::TCP, src, dst, &z)
-            != u16::from_be_bytes([tcp[16], tcp[17]])
+        pktkit::transport_checksum(pktkit::Protocol::TCP, src, dst, &z) != stored
+    };
+    if bad_csum {
+        dump_bad(p);
+    }
+    let partial_csum = bad_csum && {
+        let ph = pktkit::pseudo_header_checksum(pktkit::Protocol::TCP, src, dst, tcp.len() as u16);
+        stored == ph || stored == !ph
+    };
+    let first_half_csum = bad_csum && {
+        let half = doff + (tcp.len() - doff) / 2;
+        let mut z = tcp[..half].to_vec();
+        z[16..18].fill(0);
+        pktkit::transport_checksum(pktkit::Protocol::TCP, src, dst, &z) == stored
     };
     Some(Seg {
         bad_csum,
+        partial_csum,
+        first_half_csum,
         t,
         out,
         seq: u32::from_be_bytes(tcp[4..8].try_into().unwrap()),
@@ -489,12 +535,14 @@ fn tunnel_live_throughput() {
                 .count();
             report(&format!("tunnel mtu {mtu}: {host} ({ip})"), n, secs, &trace);
             let bad = trace.iter().filter(|s| s.bad_csum).count();
+            let partial = trace.iter().filter(|s| s.partial_csum).count();
+            let first_half = trace.iter().filter(|s| s.first_half_csum).count();
             let bad_big = trace
                 .iter()
                 .filter(|s| s.bad_csum && s.len > usize::from(mtu - 40))
                 .count();
             println!(
-                "  segments larger than our MSS ({}): {oversized}; bad TCP checksum: {bad} ({bad_big} of them oversized)",
+                "  segments larger than our MSS ({}): {oversized}; bad TCP checksum: {bad} ({bad_big} of them oversized, {partial} holding only the pseudo-header sum, {first_half} the first half's own checksum)",
                 mtu - 40
             );
         }
