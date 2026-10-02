@@ -97,12 +97,11 @@ const netAddr = ref("");
 const netExpires = ref(0);
 const netNow = ref(Date.now());
 
-/// "1h 52m", "52m", "45s" — what is left until `until` (Unix ms).
+/// "01:52:59" — what is left until `until` (Unix ms), as a clock.
 function remaining(until, now) {
   const s = Math.max(0, Math.floor((until - now) / 1000));
-  if (s >= 3600) return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
-  if (s >= 60) return `${Math.floor(s / 60)}m`;
-  return `${s}s`;
+  const two = (n) => String(n).padStart(2, "0");
+  return `${two(Math.floor(s / 3600))}:${two(Math.floor((s % 3600) / 60))}:${two(s % 60)}`;
 }
 
 const netLabel = computed(() => {
@@ -875,6 +874,9 @@ onBeforeUnmount(() => {
 
 .net-btn {
   flex: none;
+  /* Fixed-width digits: the countdown ticks every second without the
+     button's width jittering. */
+  font-variant-numeric: tabular-nums;
   background: var(--panel);
   color: var(--muted);
   border: 1px solid var(--panel-border);
