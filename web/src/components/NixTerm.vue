@@ -92,11 +92,26 @@ const netState = ref("off");
 // The token API refused us (daily limit reached, or down): shown as a banner.
 const netUnavailable = ref(false);
 const netAddr = ref("");
+// When the tunnel, and the IPv6 address leased with it, expires (Unix ms;
+// 0: unknown), and a clock ticking while online so the countdown updates.
+const netExpires = ref(0);
+const netNow = ref(Date.now());
+
+/// "1h 52m", "52m", "45s" — what is left until `until` (Unix ms).
+function remaining(until, now) {
+  const s = Math.max(0, Math.floor((until - now) / 1000));
+  if (s >= 3600) return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+  if (s >= 60) return `${Math.floor(s / 60)}m`;
+  return `${s}s`;
+}
+
 const netLabel = computed(() => {
   if (!netEnabled.value) return "net: off";
   switch (netState.value) {
     case "online":
-      return `net: ${netAddr.value}`;
+      return netExpires.value
+        ? `net: ${netAddr.value} · ${remaining(netExpires.value, netNow.value)}`
+        : `net: ${netAddr.value}`;
     case "connecting":
       return "net: connecting…";
     case "error":
@@ -109,8 +124,13 @@ const netLabel = computed(() => {
 });
 const netTitle = computed(() => {
   if (!netEnabled.value) return "Guest networking is off. Click to connect.";
-  const addr = netState.value === "online" && netAddr.value.includes(":") ? ` Guest IPv6: ${netAddr.value}.` : "";
-  return `Guest networking via a WebSocket IP tunnel (grouterd).${addr} Click to disconnect.`;
+  const online = netState.value === "online";
+  const addr = online && netAddr.value.includes(":") ? ` Guest IPv6: ${netAddr.value}.` : "";
+  const until =
+    online && netExpires.value
+      ? ` Valid until ${new Date(netExpires.value).toLocaleTimeString()} (then a new tunnel, and a new address).`
+      : "";
+  return `Guest networking via a WebSocket IP tunnel (grouterd).${addr}${until} Click to disconnect.`;
 });
 const bootingPhases = new Set(["downloading", "decompressing", "loading", "booting"]);
 const rebootDisabled = computed(() => bootingPhases.has(status.value));
@@ -333,6 +353,7 @@ let netGen = 0; // bumped on every (re)connect/disconnect; stale callbacks bail
 let netTickTimer = null;
 let netKeepaliveTimer = null;
 let netRetryTimer = null;
+let netClockTimer = null;
 let netRetryDelay = 2000;
 
 // The tunnel token: `{ token, expires }` (expires in Unix seconds, from the
@@ -404,7 +425,9 @@ function netStopTimers() {
   clearInterval(netTickTimer);
   clearInterval(netKeepaliveTimer);
   clearTimeout(netRetryTimer);
-  netTickTimer = netKeepaliveTimer = netRetryTimer = null;
+  clearInterval(netClockTimer);
+  netTickTimer = netKeepaliveTimer = netRetryTimer = netClockTimer = null;
+  netExpires.value = 0;
 }
 
 // Drop the tunnel (if any) and take the guest's link down.
@@ -480,6 +503,12 @@ async function netConnect() {
         // Show the guest's public IPv6 address. The IPv4 one is a NATed
         // inside address (the same for every client), so not shown.
         netAddr.value = guestTerm.net_ipv6() ?? "online";
+        // The address lasts as long as the tunnel: until `expires` (Unix s).
+        netExpires.value = Number.isFinite(h.expires) ? h.expires * 1000 : 0;
+        netNow.value = Date.now();
+        netClockTimer = setInterval(() => {
+          netNow.value = Date.now();
+        }, 1000);
         netState.value = "online";
         netRetryDelay = 2000;
         netTokenFails = 0;
@@ -854,7 +883,7 @@ onBeforeUnmount(() => {
   font-size: 0.8rem;
   font-family: inherit;
   cursor: pointer;
-  max-width: 14rem;
+  max-width: 24rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
