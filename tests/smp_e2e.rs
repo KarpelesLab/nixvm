@@ -266,9 +266,10 @@ fn smp_scheduling_matches_serial_fork_sum() {
     for iter in 0..15 {
         let (serial_code, serial_out, serial_kernel) = run_program(vaddr, &body, 1);
         assert_eq!(serial_code, EXPECTED_EXIT, "serial (ncpus=1) run {iter}");
-        assert!(serial_out.is_empty());
-        assert!(
-            serial_kernel.unsupported().is_empty(),
+        assert_eq!(serial_out.len(), 0);
+        assert_eq!(
+            serial_kernel.unsupported().len(),
+            0,
             "{:?}",
             serial_kernel.unsupported()
         );
@@ -278,9 +279,10 @@ fn smp_scheduling_matches_serial_fork_sum() {
             smp_code, EXPECTED_EXIT,
             "SMP (ncpus=4) run {iter} must agree with the serial scheduler"
         );
-        assert!(smp_out.is_empty());
-        assert!(
-            smp_kernel.unsupported().is_empty(),
+        assert_eq!(smp_out.len(), 0);
+        assert_eq!(
+            smp_kernel.unsupported().len(),
+            0,
             "{:?}",
             smp_kernel.unsupported()
         );

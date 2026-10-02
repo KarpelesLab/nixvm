@@ -211,11 +211,7 @@ fn write_and_exit() {
     let (code, out, kernel) = run_program(vaddr, &body);
     assert_eq!(code, 0);
     assert_eq!(&out, b"ok\n");
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }
 
 // ---- 2. arithmetic -> exit code ---------------------------------------------
@@ -235,12 +231,8 @@ fn arithmetic_into_exit_code() {
     let (code, out, kernel) = run_program(vaddr, &body);
 
     assert_eq!(code, 42, "7*6 should exit with status 42");
-    assert!(out.is_empty());
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(out.len(), 0);
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }
 
 // ---- 3. getpid / gettid ------------------------------------------------------
@@ -266,12 +258,8 @@ fn getpid_and_gettid_reflect_pid_one() {
         code, 2,
         "getpid() (tgid=1) + gettid() (pid=1) should exit with status 2"
     );
-    assert!(out.is_empty());
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(out.len(), 0);
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }
 
 // ---- 4. write from a computed buffer (loads/stores through guest memory) ---
@@ -320,11 +308,7 @@ fn write_from_computed_buffer() {
         &out, b"ok\n",
         "bytes stored via STRB should round-trip through write()"
     );
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }
 
 // ---- 5. brk + write (memory syscalls) ---------------------------------------
@@ -392,9 +376,5 @@ fn brk_then_write() {
         b"B",
         "byte stored into the brk-grown page should round-trip through write()"
     );
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }

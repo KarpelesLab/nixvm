@@ -1348,7 +1348,7 @@ mod tests {
     fn set_self_changes_cmdline() {
         let mut fs = ProcFs::new(1);
         // Placeholder cmdline is empty.
-        assert!(read_all(&mut fs, "self/cmdline").is_empty());
+        assert_eq!(read_all(&mut fs, "self/cmdline").len(), 0);
         fs.set_self(sample());
         assert_eq!(read_all(&mut fs, "self/cmdline"), b"prog\0--flag\0");
         assert_eq!(fs.readlink("self/exe").unwrap(), "/usr/bin/prog");
@@ -1519,7 +1519,7 @@ mod tests {
     #[test]
     fn self_auxv_is_empty_by_default() {
         let mut fs = ProcFs::new(1);
-        assert!(read_all(&mut fs, "self/auxv").is_empty());
+        assert_eq!(read_all(&mut fs, "self/auxv").len(), 0);
     }
 
     #[test]
@@ -1719,7 +1719,7 @@ mod tests {
                 .unwrap()
                 .contains("Filename")
         );
-        assert!(read_all(&mut fs, "modules").is_empty());
+        assert_eq!(read_all(&mut fs, "modules").len(), 0);
         assert!(
             String::from_utf8(read_all(&mut fs, "devices"))
                 .unwrap()
@@ -1814,9 +1814,9 @@ mod tests {
     fn new_top_level_files_present() {
         let mut fs = ProcFs::new(1);
         assert!(read_all(&mut fs, "kallsyms").starts_with(b"0000000000000000"));
-        assert!(read_all(&mut fs, "keys").is_empty());
-        assert!(read_all(&mut fs, "key-users").is_empty());
-        assert!(read_all(&mut fs, "locks").is_empty());
+        assert_eq!(read_all(&mut fs, "keys").len(), 0);
+        assert_eq!(read_all(&mut fs, "key-users").len(), 0);
+        assert_eq!(read_all(&mut fs, "locks").len(), 0);
         let vmstat = String::from_utf8(read_all(&mut fs, "vmstat")).unwrap();
         assert!(vmstat.contains("nr_free_pages"));
         let zoneinfo = String::from_utf8(read_all(&mut fs, "zoneinfo")).unwrap();

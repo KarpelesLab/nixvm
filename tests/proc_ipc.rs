@@ -279,12 +279,8 @@ fn fork_propagates_child_exit_code() {
         exit_code, CHILD_EXIT_CODE as i32,
         "parent's exit code must be the child's, via wait4"
     );
-    assert!(out.is_empty());
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(out.len(), 0);
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }
 
 // ---- 2. pipe IPC -------------------------------------------------------------
@@ -356,11 +352,7 @@ fn pipe_write_read_roundtrips_to_stdout() {
         &out, MSG,
         "bytes written into the pipe should read back unchanged and echo to stdout"
     );
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }
 
 // ---- 3. fork + pipe -----------------------------------------------------------
@@ -451,11 +443,7 @@ fn fork_pipe_parent_reads_child_writes_and_exits() {
         &out, MSG,
         "the parent should read exactly what the child wrote into the pipe"
     );
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }
 
 // ---- 4. mmap anonymous --------------------------------------------------------
@@ -515,10 +503,6 @@ fn mmap_anonymous_store_load_roundtrip() {
         exit_code, VALUE as i32,
         "byte stored into the mmap'd page should round-trip through a load"
     );
-    assert!(captured.lock().unwrap().is_empty());
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(captured.lock().unwrap().len(), 0);
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }

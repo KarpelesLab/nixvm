@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(bytes[18], 4);
         // Too-small buffer encodes nothing.
         let (empty, n) = encode_dirents(&entries, 0, 8);
-        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
         assert_eq!(n, 0);
     }
 }

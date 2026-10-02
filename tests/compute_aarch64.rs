@@ -455,12 +455,8 @@ fn integer_chain_with_summation_loop_exit_code() {
         exit_code, 17,
         "loop must sum 1..=10 to 55, then the SUB/MUL/UDIV/AND/ORR/EOR/LSL/LSR chain must fold it to 17"
     );
-    assert!(out.is_empty());
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(out.len(), 0);
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }
 
 // ---- 2. bitfield extract + conditional select/increment/compare ------------
@@ -501,12 +497,8 @@ fn bitfield_extract_and_conditional_chain_exit_code() {
         exit_code, 189,
         "UBFX/SBFX extraction feeding CMP/CCMP/CSEL/CSINC must fold to 189"
     );
-    assert!(out.is_empty());
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(out.len(), 0);
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }
 
 // ---- 3. scalar floating point -----------------------------------------------
@@ -542,12 +534,8 @@ fn scalar_fp_sqrt_chain_exit_code() {
         exit_code, 12,
         "sqrt(16)+3=7, 21/7=3, 3*4=12 must round-trip through SCVTF/FSQRT/FADD/FDIV/FMUL/FCVTZS"
     );
-    assert!(out.is_empty());
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(out.len(), 0);
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }
 
 // ---- 4. NEON vector build + arithmetic + across-lanes reduction ------------
@@ -586,12 +574,8 @@ fn neon_build_and_reduce_exit_code() {
         exit_code, 88,
         "DUP/MUL/INS/MOVI/ADD (vector) reduced via ADDV/UMOV must yield 88"
     );
-    assert!(out.is_empty());
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(out.len(), 0);
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }
 
 // ---- 5. LSE atomics: LDADD then CAS on a stack/code-segment word ------------
@@ -640,12 +624,8 @@ fn lse_atomics_ldadd_then_cas_exit_code() {
         exit_code, 77,
         "LDADD(10,+5)=15 then CAS(==15 -> 77) must leave 77 in memory"
     );
-    assert!(out.is_empty());
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(out.len(), 0);
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }
 
 // ---- 6. mmap'd page: store a multi-byte pattern, load it back at three ------
@@ -718,10 +698,6 @@ fn mmap_pattern_multi_width_load_exit_code() {
         exit_code, 23,
         "LDR x/LDRH/LDRB reading the same stored bytes at three widths, EORed, must yield 23"
     );
-    assert!(captured.lock().unwrap().is_empty());
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(captured.lock().unwrap().len(), 0);
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }

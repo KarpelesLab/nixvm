@@ -53,11 +53,7 @@ fn brk_grows_heap_and_memory_is_usable() {
 
     let code = kernel.run(vcpu, mem).unwrap();
     assert_eq!(code, 42, "value written to the brk-grown heap round-trips");
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
 }
 
 /// Regression: growing the heap must not zero the partial page the current

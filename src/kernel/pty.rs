@@ -615,7 +615,7 @@ mod tests {
         tm[12..16].copy_from_slice(&lflag.to_le_bytes());
         t.set_termios(n, tm);
         let (sigs, _) = t.master_write(n, b"\x03\n");
-        assert!(sigs.is_empty(), "no signal with ISIG off");
+        assert_eq!(sigs.len(), 0, "no signal with ISIG off");
         assert_eq!(t.slave_read(n, 64).unwrap(), b"\x03\n");
     }
 

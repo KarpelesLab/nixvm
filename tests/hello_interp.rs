@@ -82,8 +82,9 @@ fn hello_world_runs_and_exits() {
     assert_eq!(exit_code, 0, "guest should exit with status 0");
     assert_eq!(&*captured.lock().unwrap(), b"hi\n", "guest should print hi");
     // Nothing should have hit the unsupported ledger.
-    assert!(
-        kernel.unsupported().is_empty(),
+    assert_eq!(
+        kernel.unsupported().len(),
+        0,
         "unexpected: {:?}",
         kernel.unsupported()
     );

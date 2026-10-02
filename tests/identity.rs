@@ -28,11 +28,7 @@ fn run(program: &[u32], rw_page: Option<u64>) -> i32 {
     let vcpu = backend.new_vcpu(base, base + 250 * PAGE_SIZE).unwrap();
     let mut kernel = Kernel::new(Arch::Aarch64, MountTable::new());
     let code = kernel.run(vcpu, mem).unwrap();
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    assert_eq!(kernel.unsupported().len(), 0, "{:?}", kernel.unsupported());
     code
 }
 
