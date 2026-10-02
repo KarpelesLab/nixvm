@@ -303,6 +303,14 @@ mod browser {
             Ok(())
         }
 
+        /// The guest's public IPv6 address while the link is up (the one it
+        /// took from the leased range), if IPv6 was leased. The IPv4 address
+        /// is a shared, NATed inside address and not worth showing.
+        #[must_use]
+        pub fn net_ipv6(&self) -> Option<String> {
+            self.net.lease()?.v6.map(|(addr, _)| addr.to_string())
+        }
+
         /// Take the network link down (the transport closed).
         pub fn net_down(&mut self) {
             self.net.down();

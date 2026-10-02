@@ -107,11 +107,11 @@ const netLabel = computed(() => {
       return "net: off";
   }
 });
-const netTitle = computed(() =>
-  netEnabled.value
-    ? "Guest networking via a WebSocket IP tunnel (grouterd). Click to disconnect."
-    : "Guest networking is off. Click to connect.",
-);
+const netTitle = computed(() => {
+  if (!netEnabled.value) return "Guest networking is off. Click to connect.";
+  const addr = netState.value === "online" && netAddr.value.includes(":") ? ` Guest IPv6: ${netAddr.value}.` : "";
+  return `Guest networking via a WebSocket IP tunnel (grouterd).${addr} Click to disconnect.`;
+});
 const bootingPhases = new Set(["downloading", "decompressing", "loading", "booting"]);
 const rebootDisabled = computed(() => bootingPhases.has(status.value));
 const bootLabel = computed(() => (hasBooted.value ? "Reboot" : "Start"));
@@ -477,7 +477,9 @@ async function netConnect() {
         hello = true;
         const h = JSON.parse(ev.data);
         guestTerm.net_up(h.ipv4 ?? undefined, h.ipv4_prefix ?? 32, h.ipv6 ?? undefined, h.mtu ?? 1400);
-        netAddr.value = h.ipv4 ?? h.ipv6 ?? "up";
+        // Show the guest's public IPv6 address. The IPv4 one is a NATed
+        // inside address (the same for every client), so not shown.
+        netAddr.value = guestTerm.net_ipv6() ?? "online";
         netState.value = "online";
         netRetryDelay = 2000;
         netTokenFails = 0;
