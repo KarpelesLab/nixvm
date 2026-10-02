@@ -27,8 +27,9 @@ fn shell_survives_a_sequence_of_vfork_exec_commands() {
     for cmd in ["uname -a\n", "ls /\n", "uptime\n", "ls /\n", "echo alive\n"] {
         vm.write_stdin(cmd.as_bytes());
         let out = one_pump(&mut vm, cmd.trim_end());
-        assert!(
-            !out.is_empty(),
+        assert_ne!(
+            out.len(),
+            0,
             "command {cmd:?} produced no output (shell corrupted?)"
         );
     }

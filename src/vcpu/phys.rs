@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(phys.base(), 0);
         assert_eq!(phys.len() % FRAME_SZ, 0, "whole number of frames");
         assert!(phys.len() >= 2 * FRAME_SZ, "rounded up past one frame");
-        assert!(!phys.is_empty());
+        assert_ne!(phys.len(), 0);
         assert!(!phys.as_ptr().is_null());
         assert_eq!(phys.nframes(), phys.len() as u64 / FRAME);
     }

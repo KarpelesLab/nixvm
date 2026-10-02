@@ -1411,7 +1411,7 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(2));
 
         // The real host file must be untouched.
-        assert!(!fs::read_to_string("/etc/passwd").unwrap().is_empty());
+        assert_ne!(fs::read_to_string("/etc/passwd").unwrap().len(), 0);
     }
 
     #[test]

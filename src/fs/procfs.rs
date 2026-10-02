@@ -1824,7 +1824,7 @@ mod tests {
         let buddyinfo = String::from_utf8(read_all(&mut fs, "buddyinfo")).unwrap();
         assert!(buddyinfo.contains("Node 0"));
         let consoles = String::from_utf8(read_all(&mut fs, "consoles")).unwrap();
-        assert!(!consoles.is_empty());
+        assert_ne!(consoles.len(), 0);
     }
 
     #[test]
