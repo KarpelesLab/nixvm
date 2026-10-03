@@ -597,6 +597,14 @@ fn tunnel_live_throughput() {
         let node = field(&hello, "ipv6").map_or("?".to_string(), |v6| {
             v6.split(':').nth(2).unwrap_or("?").to_string()
         });
+        // NIXVM_WANT_NODE=d: only probe through that node (another node's
+        // session ends here, so the caller can reconnect and try again).
+        if let Ok(want) = std::env::var("NIXVM_WANT_NODE")
+            && want != node
+        {
+            println!("NODE MISMATCH: on node 0x{node}, wanted 0x{want}");
+            return;
+        }
         println!(
             "SYN probe via node 0x{node}: {n} sequential connections per target, port 443, 8 s each"
         );
