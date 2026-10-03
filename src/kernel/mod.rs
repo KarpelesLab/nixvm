@@ -3639,9 +3639,51 @@ impl Kernel {
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
     ) -> i64 {
-        let Some(elf) = self.read_file(vfs, abs) else {
-            return err(Errno::ENOENT);
+        // A `#!` script runs its interpreter instead (Linux's binfmt_script):
+        // argv becomes [interpreter, (its optional argument), script path,
+        // argv[1..]]. The interpreter may itself be a script, up to 4 levels
+        // deep (BINPRM_MAX_RECURSION), as on Linux. `comm` stays the script's
+        // name; `/proc/self/exe` is the interpreter that actually runs.
+        let script_name = abs.to_string();
+        let (mut abs, mut argv) = (abs.to_string(), argv);
+        let mut depth = 0;
+        let elf = loop {
+            let Some(data) = self.read_file(vfs, &abs) else {
+                return err(Errno::ENOENT);
+            };
+            if !data.starts_with(b"#!") {
+                break data;
+            }
+            depth += 1;
+            if depth > 4 {
+                return err(Errno::ELOOP);
+            }
+            // Only the first line counts, and only its first 256 bytes.
+            let head = &data[2..data.len().min(256)];
+            let line = head
+                .iter()
+                .position(|&b| b == b'\n')
+                .map_or(head, |n| &head[..n]);
+            let line = String::from_utf8_lossy(line);
+            let line = line.trim();
+            let (interp, arg) = match line.split_once([' ', '\t']) {
+                Some((i, a)) => (i, Some(a.trim()).filter(|a| !a.is_empty())),
+                None => (line, None),
+            };
+            if interp.is_empty() {
+                return err(Errno::ENOEXEC);
+            }
+            let Some(interp_abs) = self.resolve_exec(vfs, cx, interp) else {
+                return err(Errno::ENOENT);
+            };
+            let mut next = vec![interp.to_string()];
+            next.extend(arg.map(str::to_string));
+            next.push(abs.clone());
+            next.extend(argv.into_iter().skip(1));
+            argv = next;
+            abs = interp_abs;
         };
+        let abs = abs.as_str();
         // Reject an obviously non-ELF64 image *before* tearing down the current
         // one, so a bad `execve` leaves the process intact (real semantics) rather
         // than stranded on an empty address space.
@@ -3653,7 +3695,7 @@ impl Kernel {
         // program's basename (truncated to 15), which execve resets (a prior
         // PR_SET_NAME does not survive exec).
         cx.cur.cmdline = cmdline_bytes(&argv);
-        cx.cur.comm = comm_from_path(abs);
+        cx.cur.comm = comm_from_path(&script_name);
         let spec = ProcessSpec { argv, envp };
         // Point of no return. Record the new program image for `/proc/self/exe`.
         cx.cur.exe = abs.to_string();

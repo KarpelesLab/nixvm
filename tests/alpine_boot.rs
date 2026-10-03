@@ -117,6 +117,15 @@ fn boots_alpine_from_in_memory_squashfs_overlay() {
         out3.contains("pipeline-done"),
         "signal-killed writer's pipe reaches EOF, got: {out3:?}"
     );
+    // `execve` of a `#!` script runs its interpreter (apk runs every package's
+    // install scripts this way; they all failed with 127 before). `chroot`
+    // execs directly, without the shell's own ENOEXEC fallback.
+    vm.write_stdin(b"printf '#!/bin/sh -e\\necho shebang-$1\\n' > /tmp/s.sh; chmod +x /tmp/s.sh; chroot / /tmp/s.sh ok; echo exit-$?\n");
+    let out4 = drain(&mut vm);
+    assert!(
+        out4.contains("shebang-ok") && out4.contains("exit-0"),
+        "a #! script execs through its interpreter, got: {out4:?}"
+    );
 }
 
 /// Live host-egress smoke test: boot Alpine with `NIXVM_NET=host` set and run
