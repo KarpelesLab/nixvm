@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/KarpelesLab/nixvm/compare/v0.0.2...v0.0.3) - 2026-10-03
+
+### Other
+
+- NIXVM_WANT_NODE restricts the SYN probe to one grouterd node
+- SYN probe prints each failed flow (UTC start, destination, inside source port)
+- SYN probe (NIXVM_SYN_PROBE=n) in the tunnel throughput test
+- run `#!` scripts through their interpreter (fixes apk scripts)
+- keep the tab responsive while the guest computes (time-sliced pump)
+- assert_is_empty also covers the negated form (assert_ne!)
+- satisfy Rust 1.99's clippy::assert_is_empty
+- show the IPv6 validity as an HH:MM:SS countdown
+- show how long the guest's IPv6 address stays valid
+- show the guest's IPv6 address in the net button, not the NATed IPv4
+- pktkit 0.1.11
+- classify the tunnel's bad TCP checksums; dump raw packets
+- MSS sweep and inbound TCP checksum check in the tunnel throughput test
+- keep a task visible while its syscall is serviced (fixes flaky smp_e2e)
+
 ## [0.0.2](https://github.com/KarpelesLab/nixvm/compare/v0.0.1...v0.0.2) - 2026-09-29
 
 ### Other
