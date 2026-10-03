@@ -3629,7 +3629,12 @@ impl Aarch64Interp {
 
 impl Vcpu for Aarch64Interp {
     fn run(&mut self, mem: &mut GuestMemory) -> Result<Exit, VcpuError> {
-        for _ in 0..MAX_STEPS {
+        for i in 0..MAX_STEPS {
+            // The embedder's yield deadline (`Kernel::pump_for`), polled every
+            // 4096 instructions: a clock read per instruction would dominate.
+            if i & 4095 == 4095 && super::yield_due() {
+                return Ok(Exit::Interrupted);
+            }
             let Ok(instr) = mem.read_u32(self.pc) else {
                 return Ok(Exit::MemFault {
                     addr: self.pc,

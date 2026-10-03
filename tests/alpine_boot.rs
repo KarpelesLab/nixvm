@@ -512,3 +512,57 @@ fn tunnel_live_apk_update() {
     eprintln!("--- wget ---\n{out}");
     assert!(out.contains("wget-exit-0"), "{out:?}");
 }
+
+/// `Vm::pump_for` hands control back on time while the guest computes (the
+/// browser tab must not freeze during `apk`'s CPU-heavy work), and the
+/// computation still finishes across calls. Gated on `NIXVM_ALPINE_TAR`.
+#[cfg(feature = "fstool")]
+#[test]
+fn pump_for_yields_during_guest_computation() {
+    use std::time::{Duration, Instant};
+    let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
+        eprintln!("NIXVM_ALPINE_TAR not set; skipping pump_for test");
+        return;
+    };
+    let tar = std::fs::read(&tar_path).expect("read Alpine tar");
+    let mut vm = Vm::boot_squashfs(
+        &tar,
+        vec!["/bin/busybox".to_string(), "sh".to_string()],
+        256 * 1024 * 1024,
+    )
+    .expect("boot");
+    let _ = drain(&mut vm);
+    // A pure-CPU loop: no syscalls for long stretches.
+    vm.write_stdin(b"i=0; while [ $i -lt 3000 ]; do i=$((i+1)); done; echo loop-done\n");
+    let budget = Duration::from_millis(30);
+    let (mut out, mut busy_calls, mut longest) = (Vec::new(), 0, Duration::ZERO);
+    let start = Instant::now();
+    loop {
+        let t = Instant::now();
+        let step = vm.pump_for(budget).expect("pump_for");
+        longest = longest.max(t.elapsed());
+        out.extend_from_slice(&step.stdout);
+        busy_calls += usize::from(step.busy);
+        if !step.busy && vm.awaiting_input() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "loop never finished"
+        );
+    }
+    let out = String::from_utf8_lossy(&out);
+    eprintln!(
+        "pump_for: {busy_calls} busy returns, longest call {longest:?}, total {:?}",
+        start.elapsed()
+    );
+    assert!(
+        out.contains("loop-done"),
+        "the computation completes: {out:?}"
+    );
+    assert!(busy_calls > 0, "a long computation yields at least once");
+    assert!(
+        longest < Duration::from_millis(500),
+        "each call returns near its budget, longest {longest:?}"
+    );
+}

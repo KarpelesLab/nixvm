@@ -48,6 +48,8 @@ pub struct Step {
     pub stderr: Vec<u8>,
     /// `Some(code)` once pid 1 exited; `None` means it is parked for input.
     pub exit_code: Option<i32>,
+    /// [`Vm::pump_for`] ran out of time with the guest still computing.
+    pub busy: bool,
 }
 
 /// A booted, interactively-driven guest.
@@ -217,6 +219,29 @@ impl Vm {
         self.kernel.close_stdin();
     }
 
+    /// Like [`Vm::pump`] but returning after about `budget` even if the guest
+    /// is still computing (then [`Step::busy`] is set: pump again soon). For
+    /// a single-threaded embedder that must keep its event loop alive.
+    ///
+    /// # Errors
+    /// As [`Vm::pump`].
+    pub fn pump_for(&mut self, budget: std::time::Duration) -> Result<Step, String> {
+        let mut busy = false;
+        if self.finished.is_none() {
+            match self.kernel.pump_for(budget).map_err(|e| e.to_string())? {
+                Pumped::Exited(code) => self.finished = Some(code),
+                Pumped::Blocked => {}
+                Pumped::Busy => busy = true,
+            }
+        }
+        Ok(Step {
+            stdout: std::mem::take(&mut *self.stdout.lock().unwrap()),
+            stderr: std::mem::take(&mut *self.stderr.lock().unwrap()),
+            exit_code: self.finished,
+            busy,
+        })
+    }
+
     /// The guest's network link, when booted with one.
     #[cfg(feature = "tunnel")]
     #[must_use]
@@ -267,13 +292,14 @@ impl Vm {
         if self.finished.is_none() {
             match self.kernel.pump().map_err(|e| e.to_string())? {
                 Pumped::Exited(code) => self.finished = Some(code),
-                Pumped::Blocked => {}
+                Pumped::Blocked | Pumped::Busy => {}
             }
         }
         Ok(Step {
             stdout: std::mem::take(&mut *self.stdout.lock().unwrap()),
             stderr: std::mem::take(&mut *self.stderr.lock().unwrap()),
             exit_code: self.finished,
+            busy: false,
         })
     }
 }

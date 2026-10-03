@@ -4864,9 +4864,8 @@ impl Vcpu for X86Interp {
             }
             // Poll the wall clock only every QUANTUM_STRIDE instructions — a read
             // per instruction would swamp the interpreter's per-op cost.
-            if let Some(deadline) = deadline
-                && i & (QUANTUM_STRIDE - 1) == 0
-                && Instant::now() >= deadline
+            if i & (QUANTUM_STRIDE - 1) == 0
+                && (deadline.is_some_and(|d| Instant::now() >= d) || super::yield_due())
             {
                 return Ok(Exit::Interrupted);
             }

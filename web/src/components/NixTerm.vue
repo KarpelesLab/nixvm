@@ -221,6 +221,77 @@ function surfaceGuestCrash(err) {
   );
 }
 
+// ---- diagnostics (`?netdebug` in the page URL) ------------------------
+// Logs every tunnel packet, decoded, and a status line every 5 s, to the
+// browser console — what is needed to tell a stalled network from a stalled
+// guest when something hangs.
+const netDebug = new URLSearchParams(location.search).has("netdebug");
+const diag = { out: 0, in: 0, outB: 0, inB: 0, pumps: 0, lastPumpMs: 0, lastIn: 0, watchdogPumps: 0 };
+const diagT0 = performance.now();
+
+function describePacket(b) {
+  const hex = (x) => x.toString(16);
+  const v = b[0] >> 4;
+  if (v === 4 && b.length >= 20) {
+    const ihl = (b[0] & 15) * 4;
+    const proto = b[9];
+    const l4 = b.subarray(ihl);
+    let d = `v4 ${b.subarray(12, 16).join(".")} > ${b.subarray(16, 20).join(".")} proto ${proto}`;
+    const be16 = (o) => (l4[o] << 8) | l4[o + 1];
+    if (proto === 6 && l4.length >= 20) d += ` ${be16(0)}>${be16(2)} flags ${hex(l4[13])} len ${b.length - ihl - (l4[12] >> 4) * 4}`;
+    if (proto === 17 && l4.length >= 8) d += ` ${be16(0)}>${be16(2)} len ${be16(4) - 8}`;
+    if (proto === 1 && l4.length >= 1) d += ` icmp type ${l4[0]}`;
+    return d;
+  }
+  if (v === 6 && b.length >= 40) {
+    const w = (o) => hex((b[o] << 8) | b[o + 1]);
+    const addr = (o) => [...Array(8)].map((_, i) => w(o + 2 * i)).join(":");
+    const nh = b[6];
+    const l4 = b.subarray(40);
+    const be16 = (o) => (l4[o] << 8) | l4[o + 1];
+    let d = `v6 ${addr(8)} > ${addr(24)} nh ${nh}`;
+    if (nh === 6 && l4.length >= 20) d += ` ${be16(0)}>${be16(2)} flags ${hex(l4[13])} len ${b.length - 40 - (l4[12] >> 4) * 4}`;
+    if (nh === 17 && l4.length >= 8) d += ` ${be16(0)}>${be16(2)} len ${be16(4) - 8}`;
+    if (nh === 58 && l4.length >= 1) d += ` icmp6 type ${l4[0]}`;
+    return d;
+  }
+  return `?? ${b.length} B`;
+}
+
+function notePacket(dir, bytes) {
+  if (dir === "out") {
+    diag.out++;
+    diag.outB += bytes.length;
+  } else {
+    diag.in++;
+    diag.inB += bytes.length;
+    diag.lastIn = performance.now();
+  }
+  if (netDebug) {
+    const t = ((performance.now() - diagT0) / 1000).toFixed(3);
+    console.debug(`[net ${t}s] ${dir === "out" ? "->" : "<-"} ${describePacket(bytes)}`);
+  }
+}
+
+if (netDebug) {
+  console.info("nixvm: netdebug on — tunnel packets and a status line every 5 s are logged here");
+  setInterval(() => {
+    if (!guestTerm || guestDead) return;
+    let awaiting = "?";
+    let pending = "?";
+    try {
+      awaiting = guestTerm.awaiting_input();
+      pending = guestTerm.has_pending_work();
+    } catch {
+      // guest gone
+    }
+    const sinceIn = diag.lastIn ? `${((performance.now() - diag.lastIn) / 1000).toFixed(1)}s ago` : "never";
+    console.info(
+      `nixvm status: net ${netState.value} ws=${ws ? ws.readyState : "none"} | out ${diag.out} pkts ${diag.outB} B, in ${diag.in} pkts ${diag.inB} B, last in ${sinceIn} | pumps ${diag.pumps} (last ${diag.lastPumpMs.toFixed(1)} ms, watchdog ${diag.watchdogPumps}) | command running ${commandRunning}, awaiting input ${awaiting}, pending work ${pending}`,
+    );
+  }, 5000);
+}
+
 // Pump the guest after `delay` ms (sooner requests win over later ones).
 function schedulePump(delay = 0) {
   const due = performance.now() + delay;
@@ -247,7 +318,10 @@ function runPump() {
   let awaiting;
   let pending;
   try {
+    const started = performance.now();
     out = guestTerm.pump();
+    diag.pumps++;
+    diag.lastPumpMs = performance.now() - started;
     writeBytes(out);
     flushNet();
     if (!guestTerm.is_running()) {
@@ -259,6 +333,12 @@ function runPump() {
     }
     awaiting = guestTerm.awaiting_input();
     pending = guestTerm.has_pending_work();
+    if (guestTerm.is_busy()) {
+      // The guest is computing: its time slice ran out. Let the browser
+      // paint, handle input and the tunnel, then carry on right away.
+      schedulePump(0);
+      return;
+    }
   } catch (err) {
     surfaceGuestCrash(err);
     return;
@@ -269,7 +349,15 @@ function runPump() {
   }
   // Waiting on a timer / the network (foreground or background job): check
   // back soon. Packets arriving also trigger an immediate pump.
-  if (pending) schedulePump(20);
+  if (pending) {
+    schedulePump(20);
+  } else if (commandRunning && !awaiting) {
+    // A command is still running yet reports nothing to wait for: keep
+    // pumping slowly anyway, so a wake-up the guest's own bookkeeping misses
+    // can never leave the page waiting forever.
+    diag.watchdogPumps++;
+    schedulePump(250);
+  }
 }
 
 async function afterStdinChanged() {
@@ -416,6 +504,7 @@ function flushNet() {
   for (;;) {
     const p = guestTerm.net_next_packet();
     if (p === undefined || p === null) break;
+    notePacket("out", p);
     ws.send(p);
   }
 }
@@ -524,7 +613,9 @@ async function netConnect() {
         }, NET_KEEPALIVE_MS);
         return;
       }
-      guestTerm.net_input(new Uint8Array(ev.data));
+      const pkt = new Uint8Array(ev.data);
+      notePacket("in", pkt);
+      guestTerm.net_input(pkt);
       schedulePump(0);
     } catch (err) {
       surfaceGuestCrash(err);

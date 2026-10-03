@@ -75,6 +75,10 @@ mod browser {
     /// Decompression-bomb guard for the `.tar.gz` root image (a minirootfs is
     /// well under this uncompressed).
     const MAX_ROOTFS_BYTES: u64 = 512 * 1024 * 1024;
+    /// How long one `Terminal::pump` runs the guest before handing the tab
+    /// back to the browser: short enough to keep it responsive (a frame or
+    /// two), long enough that the hand-offs cost little.
+    const PUMP_SLICE: std::time::Duration = std::time::Duration::from_millis(30);
 
     /// A [`std::io::Write`] sink that appends into a shared, lock-guarded byte
     /// buffer. Used in place of the host's real stdout/stderr to capture guest
@@ -238,6 +242,9 @@ mod browser {
         net: crate::tunnel::Tunnel,
         /// Packets taken from `net`, handed out one per `net_next_packet`.
         out: std::collections::VecDeque<Vec<u8>>,
+        /// The last `pump` ran out of its time slice with the guest still
+        /// computing (see `is_busy`).
+        busy: bool,
     }
 
     #[wasm_bindgen]
@@ -266,6 +273,7 @@ mod browser {
                 vm,
                 net,
                 out: std::collections::VecDeque::new(),
+                busy: false,
             })
         }
 
@@ -370,14 +378,29 @@ mod browser {
         /// `write_stdin`.
         #[must_use]
         pub fn pump(&mut self) -> Vec<u8> {
-            match self.vm.pump() {
+            // A short slice, then back to the page: the guest shares the tab's
+            // only thread with the UI, its timers and the network tunnel, so a
+            // compute-heavy command (apk verifying an index) must not freeze it.
+            match self.vm.pump_for(PUMP_SLICE) {
                 Ok(step) => {
+                    self.busy = step.busy;
                     let mut out = step.stdout;
                     out.extend_from_slice(&step.stderr);
                     out
                 }
-                Err(_) => Vec::new(),
+                Err(_) => {
+                    self.busy = false;
+                    Vec::new()
+                }
             }
+        }
+
+        /// Whether the last `pump` returned because its time slice ran out
+        /// while the guest was still computing: pump again soon (after
+        /// yielding to the browser), and don't treat it as waiting for input.
+        #[must_use]
+        pub fn is_busy(&self) -> bool {
+            self.busy
         }
 
         /// Whether the guest is still running (has not exited).

@@ -455,6 +455,10 @@ pub enum Pumped {
     /// Every runnable task is parked waiting for input; feed stdin and pump
     /// again to resume (e.g. the shell is blocked on a `read` of its terminal).
     Blocked,
+    /// [`Kernel::pump_for`]'s time budget ran out with work still to do: the
+    /// guest is computing. Pump again soon (after letting the embedder's
+    /// event loop run).
+    Busy,
 }
 
 /// The result of servicing one guest exit, telling the scheduler what to do
@@ -1629,6 +1633,10 @@ impl Kernel {
     fn serial_sweep(&self) -> Result<bool, VcpuError> {
         let mut progressed = false;
         loop {
+            // The embedder's time budget (`pump_for`) is spent: hand back.
+            if crate::vcpu::yield_due() {
+                return Ok(progressed);
+            }
             // Pick the least-vruntime runnable task and check it out (slot → `None`,
             // fd table into `cx`), releasing `sh` before running the slice so the
             // slice's syscalls can take their own per-handler locks.
@@ -1791,9 +1799,34 @@ impl Kernel {
     /// with no progress is reported as [`Pumped::Blocked`] (needs input), not a
     /// deadlock error.
     pub fn pump(&self) -> Result<Pumped, VcpuError> {
+        self.pump_inner()
+    }
+
+    /// [`Kernel::pump`] with a time budget: return [`Pumped::Busy`] once
+    /// `budget` has elapsed even though the guest could keep running, so a
+    /// single-threaded embedder (the browser tab, whose UI, timers and
+    /// WebSocket all share the thread) is never frozen by a compute-heavy
+    /// guest. The running vcpu notices the deadline within a few thousand
+    /// instructions; its task stays runnable and resumes on the next call.
+    pub fn pump_for(&self, budget: std::time::Duration) -> Result<Pumped, VcpuError> {
+        crate::vcpu::set_yield_deadline(Some(crate::clock::now_monotonic() + budget));
+        let r = self.pump_inner();
+        crate::vcpu::set_yield_deadline(None);
+        r
+    }
+
+    fn pump_inner(&self) -> Result<Pumped, VcpuError> {
         loop {
             if let Some(code) = self.shared.lock().unwrap().pid1_code() {
                 return Ok(Pumped::Exited(code));
+            }
+            if crate::vcpu::yield_due() {
+                let sh = self.shared.lock().unwrap();
+                return Ok(if sh.any_running() {
+                    Pumped::Busy
+                } else {
+                    Pumped::Exited(sh.pid1_code().unwrap_or(0))
+                });
             }
             if self.serial_sweep()? {
                 continue;
@@ -1872,6 +1905,11 @@ impl Kernel {
             // worker it is spinning on starves. The task stays runnable (not
             // parked) — `cx.block` is clear — so the next sweep resumes it.
             if self.slice_cap != 0 && cx.slice_syscalls >= self.slice_cap {
+                return Ok(progressed);
+            }
+            // The embedder's time budget (`pump_for`) is spent: end the slice
+            // with the task still runnable.
+            if crate::vcpu::yield_due() {
                 return Ok(progressed);
             }
         }

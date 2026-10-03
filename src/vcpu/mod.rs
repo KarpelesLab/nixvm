@@ -65,6 +65,27 @@ pub(crate) fn preempt_quantum() -> Option<std::time::Duration> {
     }
 }
 
+thread_local! {
+    /// When this thread's embedder wants control back (monotonic ns; 0 = no
+    /// deadline). Set by [`crate::kernel::Kernel::pump_for`] so a single-
+    /// threaded embedder (the browser tab) gets its event loop back while the
+    /// guest is still computing.
+    static YIELD_AT_NS: std::cell::Cell<u128> = const { std::cell::Cell::new(0) };
+}
+
+/// Ask this thread's running vcpu to hand control back once the monotonic
+/// clock passes `at` (`None` clears it).
+pub(crate) fn set_yield_deadline(at: Option<std::time::Duration>) {
+    YIELD_AT_NS.with(|c| c.set(at.map_or(0, |d| d.as_nanos().max(1))));
+}
+
+/// Whether this thread's yield deadline (if any) has passed. Interpreters
+/// poll it every few thousand instructions and return [`Exit::Interrupted`].
+pub(crate) fn yield_due() -> bool {
+    let at = YIELD_AT_NS.with(std::cell::Cell::get);
+    at != 0 && crate::clock::now_monotonic().as_nanos() >= at
+}
+
 /// Why [`Vcpu::run`] returned control to the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
