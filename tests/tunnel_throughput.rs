@@ -436,6 +436,70 @@ fn spaced_pings(net: &Tunnel, link: &mut TcpStream, rx: &mpsc::Receiver<Vec<u8>>
     );
 }
 
+/// `n` fresh TCP connections in a row to `ip`:443: does each handshake
+/// complete, how fast, and after how many SYN retransmissions. A path that
+/// drops a whole flow (every retransmission of the same SYN) shows up as a
+/// connection that never completes while its neighbours do.
+fn syn_probe(
+    net: &Tunnel,
+    link: &mut TcpStream,
+    rx: &mpsc::Receiver<Vec<u8>>,
+    host: &str,
+    ip: IpAddr,
+    n: u16,
+) {
+    use std::fmt::Write as _;
+    let IpAddr::V4(v4) = ip else { return };
+    let mut ipb = [0u8; 16];
+    ipb[..4].copy_from_slice(&v4.octets());
+    let egress = net.egress();
+    let mut ok = 0;
+    let mut line = String::new();
+    for _ in 0..n {
+        let mut conn = egress.connect_tcp(ipb, false, 443).expect("connect");
+        let start = Instant::now();
+        let mut syns = 0;
+        let mut last_tick = Instant::now();
+        let result = loop {
+            for p in net.take_outbound() {
+                if p[0] >> 4 == 4 && p[9] == 6 && p[33] & 0x02 != 0 {
+                    syns += 1;
+                }
+                let mut f = vec![1u8];
+                f.extend_from_slice(&(p.len() as u32).to_be_bytes());
+                f.extend_from_slice(&p);
+                link.write_all(&f).unwrap();
+            }
+            match conn.poll_connect() {
+                Ok(true) => break Some(start.elapsed()),
+                Err(_) => break None,
+                Ok(false) => {}
+            }
+            if start.elapsed() > Duration::from_secs(8) {
+                break None;
+            }
+            while let Ok(p) = rx.recv_timeout(Duration::from_millis(2)) {
+                net.inject(&p);
+            }
+            if last_tick.elapsed() >= Duration::from_millis(100) {
+                net.tick();
+                last_tick = Instant::now();
+            }
+        };
+        match result {
+            Some(d) => {
+                ok += 1;
+                let _ = write!(line, " {:.0}ms/{}syn", d.as_secs_f64() * 1000.0, syns);
+            }
+            None => {
+                let _ = write!(line, " FAIL/{syns}syn");
+            }
+        }
+        drop(conn);
+    }
+    println!("  {host} ({ip}): {ok}/{n} handshakes completed:{line}");
+}
+
 #[test]
 fn tunnel_live_throughput() {
     let Ok(bridge) = std::env::var("NIXVM_TUNNEL_BRIDGE") else {
@@ -498,6 +562,21 @@ fn tunnel_live_throughput() {
     });
     let _ = link.set_nodelay(true);
 
+    if let Some(n) = std::env::var("NIXVM_SYN_PROBE")
+        .ok()
+        .and_then(|n| n.parse::<u16>().ok())
+    {
+        let node = field(&hello, "ipv6").map_or("?".to_string(), |v6| {
+            v6.split(':').nth(2).unwrap_or("?").to_string()
+        });
+        println!(
+            "SYN probe via node 0x{node}: {n} sequential connections per target, port 443, 8 s each"
+        );
+        for (host, _, ip) in &targets {
+            syn_probe(&net, &mut link, &rx, host, *ip, n);
+        }
+        return;
+    }
     if std::env::var_os("NIXVM_SKIP_BURSTS").is_none() {
         spaced_pings(&net, &mut link, &rx);
         // Bursts at growing packet sizes (1400 B IP = the tunnel MTU, what
