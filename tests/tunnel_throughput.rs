@@ -458,12 +458,18 @@ fn syn_probe(
     for _ in 0..n {
         let mut conn = egress.connect_tcp(ipb, false, 443).expect("connect");
         let start = Instant::now();
+        let started_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut sport = 0u16;
         let mut syns = 0;
         let mut last_tick = Instant::now();
         let result = loop {
             for p in net.take_outbound() {
                 if p[0] >> 4 == 4 && p[9] == 6 && p[33] & 0x02 != 0 {
                     syns += 1;
+                    sport = u16::from_be_bytes([p[20], p[21]]);
                 }
                 let mut f = vec![1u8];
                 f.extend_from_slice(&(p.len() as u32).to_be_bytes());
@@ -486,18 +492,40 @@ fn syn_probe(
                 last_tick = Instant::now();
             }
         };
-        match result {
-            Some(d) => {
-                ok += 1;
-                let _ = write!(line, " {:.0}ms/{}syn", d.as_secs_f64() * 1000.0, syns);
-            }
-            None => {
-                let _ = write!(line, " FAIL/{syns}syn");
-            }
+        if let Some(d) = result {
+            ok += 1;
+            let _ = write!(line, " {:.0}ms/{}syn", d.as_secs_f64() * 1000.0, syns);
+        } else {
+            let _ = write!(line, " FAIL/{syns}syn");
+            println!(
+                "  FAILED FLOW: start {} UTC, dst {ip}:443, inside src port {sport}, {syns} SYNs over 8 s",
+                utc(started_unix)
+            );
         }
         drop(conn);
     }
     println!("  {host} ({ip}): {ok}/{n} handshakes completed:{line}");
+}
+
+/// Unix seconds as `YYYY-MM-DD HH:MM:SS` (UTC), without a date crate.
+fn utc(secs: u64) -> String {
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 #[test]
