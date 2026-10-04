@@ -14,6 +14,9 @@
 //! * Legacy-SSE 128-bit memory operands must be 16-byte aligned (`#GP`)
 //!   except for the explicitly unaligned forms (`MOVUPS`, `MOVDQU`, …).
 //! * `RCPPS`/`RSQRTPS` reproduce the hardware 12-bit estimate tables.
+//!
+//! The SSE3..SSE4.2 extensions live in `sse/sse4.rs`, the VEX encodings
+//! (AVX, AVX2, FMA, F16C, BMI1/BMI2) in `sse/avx.rs`.
 
 #![allow(clippy::match_same_arms, clippy::single_match_else)]
 
@@ -23,10 +26,11 @@ use crate::vcpu::softfloat::{
     self as sf, Class, FMT32, FMT64, Fp, INEXACT, INVALID, Mx, Op, Round,
 };
 
+mod avx;
 mod sse4;
 
-/// SSE3 (`ADDSUB*`, `HADD*`/`HSUB*`, `MOV*DUP`, `LDDQU`, `FISTTP`) — not yet
-/// advertised, so these encodings are `#UD`.
+/// SSE3 (`ADDSUB*`, `HADD*`/`HSUB*`, `MOV*DUP`, `LDDQU`, `FISTTP`): these
+/// encodings are `#UD` while the switch is off.
 pub(super) const SSE3: bool = true;
 
 /// The mandatory-prefix class of a SIMD opcode.

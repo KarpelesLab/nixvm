@@ -79,6 +79,12 @@ pub struct Fmt {
     pub emin: i32,
 }
 
+/// IEEE binary16 (`F16C`'s half precision).
+pub const FMT16: Fmt = Fmt {
+    prec: 11,
+    emax: 15,
+    emin: -14,
+};
 pub const FMT32: Fmt = Fmt {
     prec: 24,
     emax: 127,
@@ -221,6 +227,24 @@ pub fn msb(sig: u128) -> u32 {
 // ---- unpack: format bits -> Fp (exact) ---------------------------------------
 
 #[must_use]
+pub fn unpack_f16(bits: u16) -> Fp {
+    let sign = bits >> 15 != 0;
+    let e = (bits >> 10) & 0x1f;
+    let mant = u128::from(bits & 0x3ff);
+    match e {
+        0x1f if mant == 0 => Fp::inf(sign),
+        0x1f => Fp {
+            sign,
+            class: Class::Nan,
+            sig: mant << 53,
+            exp: 0,
+        },
+        0 => Fp::finite(sign, mant, -24),
+        _ => Fp::finite(sign, mant | (1 << 10), i32::from(e) - 25),
+    }
+}
+
+#[must_use]
 pub fn unpack_f32(bits: u32) -> Fp {
     let sign = bits >> 31 != 0;
     let e = (bits >> 23) & 0xff;
@@ -305,6 +329,25 @@ fn justify(v: &Fp, prec: u32) -> (u128, i32) {
         v.sig >> (m - (prec - 1))
     };
     (sig, e)
+}
+
+/// Pack a value already rounded to [`FMT16`].
+#[must_use]
+pub fn pack_f16(v: &Fp) -> u16 {
+    let s = u16::from(v.sign) << 15;
+    match v.class {
+        Class::Zero => s,
+        Class::Inf => s | 0x7c00,
+        Class::Nan => s | 0x7c00 | ((v.sig >> 53) as u16 & 0x3ff),
+        Class::Finite => {
+            let (sig, e) = justify(v, 11);
+            if e < FMT16.emin {
+                s | ((v.sig << (v.exp + 24)) as u16 & 0x3ff)
+            } else {
+                s | (((e + 15) as u16) << 10) | (sig as u16 & 0x3ff)
+            }
+        }
+    }
 }
 
 #[must_use]
@@ -607,6 +650,76 @@ fn add_finite(a: Fp, b: Fp, fmt: Fmt, mode: Round) -> Rounded {
         // well below the rounding position.
         let diff = ((big - small) << 1) - u128::from(sticky);
         round(hsign, diff, he - 127, sticky, fmt, mode)
+    }
+}
+
+/// The exact sum of two finite nonzero values with significands of at most
+/// 107 bits each, rounded once. Like [`add_finite`], but with the operands
+/// justified to bit 126 directly: a wide product's low bits all survive the
+/// alignment (an operand shifted far enough to lose bits is too small to
+/// cancel the other below the rounding position).
+#[allow(clippy::too_many_arguments)]
+fn add_wide(
+    asign: bool,
+    asig: u128,
+    aexp: i32,
+    bsign: bool,
+    bsig: u128,
+    bexp: i32,
+    fmt: Fmt,
+    mode: Round,
+) -> Rounded {
+    let (ma, mb) = (msb(asig), msb(bsig));
+    let (sa, ea) = (asig << (126 - ma), aexp + ma as i32);
+    let (sb, eb) = (bsig << (126 - mb), bexp + mb as i32);
+    let (big, he, hsign, ls, le, lsign) = if ea >= eb {
+        (sa, ea, asign, sb, eb, bsign)
+    } else {
+        (sb, eb, bsign, sa, ea, asign)
+    };
+    let d = (he - le) as u32;
+    let (small, sticky) = shr_sticky(ls, d);
+    if hsign == lsign {
+        round(hsign, big + small, he - 126, sticky, fmt, mode)
+    } else if d == 0 {
+        match big.cmp(&small) {
+            core::cmp::Ordering::Equal => Rounded::exact(Fp::zero(mode == Round::Down)),
+            core::cmp::Ordering::Greater => round(hsign, big - small, he - 126, false, fmt, mode),
+            core::cmp::Ordering::Less => round(lsign, small - big, he - 126, false, fmt, mode),
+        }
+    } else {
+        let diff = ((big - small) << 1) - u128::from(sticky);
+        round(hsign, diff, he - 127, sticky, fmt, mode)
+    }
+}
+
+/// The fused `a · b + c` for non-NaN operands of at most 53-bit precision,
+/// rounded once: `∞ · 0` (or `∞ − ∞`) is invalid, and an exactly-zero sum
+/// takes its sign from the IEEE rules (`−0` only toward `−∞`, or from two
+/// zeros of that sign).
+#[must_use]
+pub fn fma(a: Fp, b: Fp, c: Fp, fmt: Fmt, mode: Round) -> Rounded {
+    use Class::{Finite, Inf, Nan, Zero};
+    let psign = a.sign ^ b.sign;
+    match (a.class, b.class) {
+        (Inf, Zero) | (Zero, Inf) => return Rounded::invalid(),
+        (Inf, _) | (_, Inf) => {
+            return if c.class == Inf && c.sign != psign {
+                Rounded::invalid()
+            } else {
+                Rounded::exact(Fp::inf(psign))
+            };
+        }
+        (Zero, _) | (_, Zero) => return add(Fp::zero(psign), c, fmt, mode),
+        (Finite, Finite) => {}
+        _ => return Rounded::invalid(),
+    }
+    let (ps, pe) = (a.sig * b.sig, a.exp + b.exp);
+    match c.class {
+        Inf => Rounded::exact(c),
+        Zero => round(psign, ps, pe, false, fmt, mode),
+        Finite => add_wide(psign, ps, pe, c.sign, c.sig, c.exp, fmt, mode),
+        Nan => Rounded::invalid(),
     }
 }
 

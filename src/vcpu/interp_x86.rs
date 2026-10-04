@@ -4,7 +4,7 @@
 //! of fixed 4-byte ones).
 //!
 //! It implements the complete user-mode (CPL 3) instruction set of the CPU it
-//! advertises through `CPUID` (see [`X86Interp::cpuid`]) and the loader's
+//! advertises through `CPUID` (see `X86Interp::cpuid`) and the loader's
 //! `AT_HWCAP` —
 //!
 //! * **general purpose**: every integer instruction valid in 64-bit mode, in
@@ -27,14 +27,20 @@
 //!   `DAZ`/`FTZ` and exception flags, and the x86-64-v2 extensions **SSE3,
 //!   SSSE3, SSE4.1, SSE4.2** (`interp_x86/sse/sse4.rs`: incl. `PCMPxSTRx`,
 //!   `CRC32`, `ROUND*`, `DPPS`, …).
+//! * the x86-64-v3 extensions (`interp_x86/sse/avx.rs`): **AVX/AVX2** (the
+//!   VEX encodings, 256-bit YMM state, gathers, permutes, masked moves),
+//!   **FMA** (fused, one rounding), **F16C**, **BMI1/BMI2**, and `LZCNT`/
+//!   `TZCNT`/`MOVBE`, with `XSAVE`/`XRSTOR`/`XGETBV` managing the x87/SSE/AVX
+//!   state components.
 //! * `CPUID`, `RDTSC`/`RDTSCP`, `RDRAND`, `CMPXCHG16B`, `POPCNT`,
 //!   `FXSAVE`/`FXRSTOR`, `LAHF`/`SAHF`, fences/prefetches/`CLFLUSH`, and
 //!   `SYSCALL`.
 //!
-//! Instructions outside the advertised feature set (AVX, BMI, `MOVBE`, …)
-//! decode as `#UD`, exactly as on a CPU without them. The `0x66`/`0xF2`/
-//! `0xF3` prefixes select among SIMD opcode variants ("mandatory prefixes")
-//! when an SSE opcode follows, and operand size / `REP` otherwise.
+//! Instructions outside the advertised feature set (AVX-512, AES-NI,
+//! `PCLMULQDQ`, SHA, ADX, `RDSEED`, TSX, …) decode as `#UD`, exactly as on a
+//! CPU without them. The `0x66`/`0xF2`/`0xF3` prefixes select among SIMD
+//! opcode variants ("mandatory prefixes") when an SSE opcode follows, and
+//! operand size / `REP` otherwise.
 
 // Opcode dispatch: many arms legitimately share a body (aliases, groups),
 // and the register-vs-memory ModRM split reads best as a `match`.
@@ -103,10 +109,43 @@ const RFLAGS_SYS_MASK: u32 = (1 << 14) | (1 << 18) | (1 << 21);
 const USER_CS: u16 = 0x33;
 const USER_SS: u16 = 0x2b;
 
+/// The x86-64-v3 extensions. Each switch gates both execution (`#UD` while
+/// off, as on a CPU without the feature) and the `CPUID` bit advertising it.
+/// `AVX` also covers `XSAVE`/`XRSTOR`/`XGETBV` and the YMM state (`OSXSAVE`,
+/// `XCR0` = x87|SSE|AVX).
+const AVX: bool = true;
+const AVX2: bool = true;
+const FMA: bool = true;
+const F16C: bool = true;
+const BMI1: bool = true;
+const BMI2: bool = true;
+/// `LZCNT` (AMD's "ABM" bit, `0x8000_0001` `ECX` 5).
+const LZCNT: bool = true;
+const MOVBE: bool = true;
+
+/// The `XCR0` state components `XSAVE` manages (and `XGETBV` reports).
+const XCR0: u64 = if AVX { 0b111 } else { 0b11 };
+
 /// `CPUID` leaf 1 `ECX`: SSE3 (0), SSSE3 (9), CX16 (13), SSE4.1 (19), SSE4.2
 /// (20), POPCNT (23), RDRAND (30) — with LAHF-SAHF (`0x8000_0001` `ECX`) the
-/// whole x86-64-v2 level.
-const CPUID1_ECX: u32 = 1 | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23) | (1 << 30);
+/// whole x86-64-v2 level — plus, from x86-64-v3, FMA (12), MOVBE (22),
+/// XSAVE (26), OSXSAVE (27), AVX (28) and F16C (29).
+const CPUID1_ECX: u32 = 1
+    | (1 << 9)
+    | (1 << 13)
+    | (1 << 19)
+    | (1 << 20)
+    | (1 << 23)
+    | (1 << 30)
+    | ((FMA as u32) << 12)
+    | ((MOVBE as u32) << 22)
+    | ((AVX as u32) << 26)
+    | ((AVX as u32) << 27)
+    | ((AVX as u32) << 28)
+    | ((F16C as u32) << 29);
+
+/// `CPUID` leaf 7 (subleaf 0) `EBX`: BMI1 (3), AVX2 (5), BMI2 (8).
+const CPUID7_EBX: u32 = ((BMI1 as u32) << 3) | ((AVX2 as u32) << 5) | ((BMI2 as u32) << 8);
 
 /// `CPUID` leaf 1 `EDX`: FPU (0), PSE (3), TSC (4), MSR (5), PAE (6), CX8
 /// (8), PGE (13), CMOV (15), CLFSH (19), MMX (23), FXSR (24), SSE (25), SSE2
@@ -452,6 +491,9 @@ struct X86Interp {
     /// xmm0..xmm15, in the standard ModRM/REX numbering (extended the same
     /// way as `gpr` via `REX.R`/`REX.B`).
     xmm: [u128; 16],
+    /// The upper halves (bits 255:128) of ymm0..ymm15. Legacy SSE writes
+    /// leave them alone; VEX-encoded writes of an XMM destination zero them.
+    ymm_hi: [u128; 16],
     rip: u64,
     flags: Flags,
     /// The direction flag: `false` (`CLD`) advances string-op pointers
@@ -543,6 +585,7 @@ impl X86Interp {
         Self {
             gpr,
             xmm: [0u128; 16],
+            ymm_hi: [0u128; 16],
             rip: entry,
             flags: Flags::default(),
             df: false,
@@ -1620,6 +1663,48 @@ impl X86Interp {
         self.next(end)
     }
 
+    /// `LZCNT`/`TZCNT Gv, Ev` (`F3 0F BD`/`BC`): the count of leading/
+    /// trailing zero bits (the operand width for zero). `CF` = (source ==
+    /// 0), `ZF` = (count == 0); the other flags are undefined (cleared here).
+    fn lzcnt_tzcnt(&mut self, mem: &GuestMemory, pc: u64, p: Pfx, lead: bool) -> Step {
+        let width = p.width();
+        let (m, end) = fetch!(self.modrm(pc, p.rex));
+        let src = fetch!(self.read_operand(mem, self.op_of(m.kind, end), width));
+        let n = if src == 0 {
+            width
+        } else if lead {
+            src.leading_zeros() - (64 - width)
+        } else {
+            src.trailing_zeros()
+        };
+        self.set_reg(m.reg, u64::from(n), width);
+        self.flags = Flags {
+            cf: src == 0,
+            zf: n == 0,
+            ..Flags::default()
+        };
+        self.next(end)
+    }
+
+    /// `MOVBE` (`0F 38 F0`/`F1`, memory only): a byte-swapping load/store.
+    fn movbe(&mut self, mem: &mut GuestMemory, pc: u64, p: Pfx, store: bool) -> Step {
+        let width = p.width();
+        let (m, end) = fetch!(self.modrm(pc, p.rex));
+        let a = fetch!(self.mem_only(m.kind, end));
+        let swap = |v: u64| match width {
+            16 => u64::from((v as u16).swap_bytes()),
+            32 => u64::from((v as u32).swap_bytes()),
+            _ => v.swap_bytes(),
+        };
+        if store {
+            fetch!(self.write_mem(mem, a, swap(self.gpr[m.reg]), width));
+        } else {
+            let v = fetch!(Self::read_mem(mem, a, width));
+            self.set_reg(m.reg, swap(v), width);
+        }
+        self.next(end)
+    }
+
     /// `POPCNT Gv, Ev` (`F3 0F B8`): `ZF` = (source == 0), other flags cleared.
     fn popcnt(&mut self, mem: &GuestMemory, pc: u64, p: Pfx) -> Step {
         let width = p.width();
@@ -1799,7 +1884,12 @@ impl X86Interp {
         let (eax, ebx, ecx, edx): (u32, u32, u32, u32) = match leaf {
             // Max standard leaf + the "GenuineIntel" vendor string, split
             // EBX/EDX/ECX = "Genu"/"ineI"/"ntel".
-            0 => (7, 0x756E_6547, 0x6C65_746E, 0x4965_6E69),
+            0 => (
+                if AVX { 0xD } else { 7 },
+                0x756E_6547,
+                0x6C65_746E,
+                0x4965_6E69,
+            ),
             // EAX = family 6 signature; EBX = 1 logical processor, 64-byte
             // CLFLUSH line; ECX/EDX = the feature words.
             1 => (0x0007_06A1, 0x0001_0800, CPUID1_ECX, CPUID1_EDX),
@@ -1807,11 +1897,20 @@ impl X86Interp {
             // cache-size probes (memcpy non-temporal thresholds) see sane
             // values.
             4 => cache_leaf(sub),
-            // Structured extended features (leaf 7): none.
+            // Structured extended features (leaf 7, subleaf 0 — the only one).
+            7 if sub == 0 => (0, CPUID7_EBX, 0, 0),
+            // XSAVE state components: XCR0's bits, the standard-format area
+            // size (legacy region + header + AVX = 832 bytes), and the AVX
+            // component's size/offset. No XSAVEOPT/XSAVEC/XSAVES (subleaf 1).
+            0xD if AVX => match sub {
+                0 => (XCR0 as u32, 0x340, 0x340, 0),
+                2 => (0x100, 0x240, 0, 0),
+                _ => (0, 0, 0, 0),
+            },
             0x8000_0000 => (0x8000_0008, 0, 0, 0),
             // LAHF/SAHF in 64-bit mode (ECX bit 0); SYSCALL (EDX 11), NX (20),
             // RDTSCP (27), LM (29).
-            0x8000_0001 => (0, 0, 0x1, 0x2810_0800),
+            0x8000_0001 => (0, 0, 0x1 | (u32::from(LZCNT) << 5), 0x2810_0800),
             0x8000_0002..=0x8000_0004 => Self::cpuid_brand_leaf(leaf),
             // 48-bit virtual / 46-bit physical address sizes.
             0x8000_0008 => (0x0000_302e, 0, 0, 0),
@@ -2439,7 +2538,9 @@ impl X86Interp {
             0xFE => self.group4(mem, pc, p),
             0xFF => self.group5(mem, pc, p),
             0x0F => self.exec_0f(mem, pc, p),
-            // 06/07/0E/16/17/1E/1F/27/2F/37/3F/60-62/82/9A/C4/C5/CE/D4-D6/EA:
+            // VEX (LES/LDS don't exist in 64-bit mode).
+            0xC4 | 0xC5 => self.exec_vex(mem, pc, p, op),
+            // 06/07/0E/16/17/1E/1F/27/2F/37/3F/60-62/82/9A/CE/D4-D6/EA:
             // invalid in 64-bit mode.
             _ => Step::Illegal,
         }
@@ -2588,8 +2689,10 @@ impl X86Interp {
                 self.next(end)
             }
             0xB8 if p.rep == 1 => self.popcnt(mem, pc, p),
-            // BSF/BSR — and, under F3, TZCNT/LZCNT on CPUs with BMI1/ABM,
-            // which this one doesn't advertise: there the F3 is ignored.
+            // TZCNT/LZCNT (F3, with BMI1/LZCNT) — on a CPU without them
+            // the F3 is ignored and these are BSF/BSR.
+            0xBC if p.rep == 1 && BMI1 => self.lzcnt_tzcnt(mem, pc, p, false),
+            0xBD if p.rep == 1 && LZCNT => self.lzcnt_tzcnt(mem, pc, p, true),
             0xBC => self.bit_scan(mem, pc, p, false),
             0xBD => self.bit_scan(mem, pc, p, true),
             0xC0 => self.xadd(mem, pc, p, 8),
@@ -2616,6 +2719,9 @@ impl X86Interp {
             }
             0x38 => {
                 let (op3, pc) = fetch!(self.fetch8(pc));
+                if MOVBE && matches!(op3, 0xF0 | 0xF1) && p.rep == 0 {
+                    return self.movbe(mem, pc, p, op3 == 0xF1);
+                }
                 self.exec_0f38(mem, pc, p, op3)
             }
             0x3A => {
@@ -2634,9 +2740,9 @@ impl X86Interp {
     /// which Linux's UMIP emulation answers with fixed dummy values (a zero
     /// limit and a kernel-half base for the tables, the usual CR0 bits for
     /// `SMSW`); the privileged forms (`LGDT`/`LIDT`/`LMSW`/`INVLPG`/
-    /// `SWAPGS`) raise `#GP`. `XGETBV` needs CR4.OSXSAVE, which a CPU that
-    /// doesn't advertise XSAVE never sets, and `MONITOR`/`MWAIT`, `CLAC`/
-    /// `STAC`, `XTEST`, `RDPKRU`, … aren't available: `#UD`.
+    /// `SWAPGS`) raise `#GP`. `XGETBV` reads `XCR0` (with XSAVE; `XSETBV` is
+    /// privileged); `MONITOR`/`MWAIT`, `CLAC`/`STAC`, `XTEST`, `RDPKRU`, …
+    /// aren't available: `#UD`.
     fn group7(&mut self, mem: &mut GuestMemory, pc: u64, p: Pfx) -> Step {
         const UMIP_GDT_BASE: u64 = 0xffff_ffff_fffe_0000;
         const UMIP_IDT_BASE: u64 = 0xffff_ffff_ffff_0000;
@@ -2678,14 +2784,25 @@ impl X86Interp {
                 Step::Trap(Trap::Protection)
             }
             (7, RmKind::Reg(_)) if b == 0xF8 => Step::Trap(Trap::Protection), // SWAPGS
+            (2, RmKind::Reg(_)) if AVX && b == 0xD0 => {
+                // XGETBV: only XCR0 exists (ECX = 1, XINUSE, isn't supported).
+                if self.gpr[RCX] as u32 != 0 {
+                    return Step::Trap(Trap::Protection);
+                }
+                self.gpr[RAX] = XCR0 & 0xffff_ffff;
+                self.gpr[RDX] = XCR0 >> 32;
+                self.next(end)
+            }
+            (2, RmKind::Reg(_)) if AVX && b == 0xD1 => Step::Trap(Trap::Protection), // XSETBV
             _ => Step::Illegal,
         }
     }
 
     /// Group 15 (`0F AE`): `FXSAVE`/`FXRSTOR` (`/0`/`/1`), `LDMXCSR`/`STMXCSR`
     /// (`/2`/`/3`), `CLFLUSH` (`/7` memory), and the fences `LFENCE`/
-    /// `MFENCE`/`SFENCE` (`/5`/`/6`/`/7` register). `XSAVE*`/`FSGSBASE` and
-    /// the other forms aren't advertised and are `#UD`.
+    /// `MFENCE`/`SFENCE` (`/5`/`/6`/`/7` register), and with AVX `XSAVE`/
+    /// `XRSTOR` (`/4`/`/5`). `XSAVEOPT`/`XSAVEC`, `FSGSBASE` and the other
+    /// forms aren't advertised and are `#UD`.
     fn group15(&mut self, mem: &mut GuestMemory, pc: u64, p: Pfx) -> Step {
         let (m, end) = fetch!(self.modrm(pc, p.rex));
         // (F3 0F AE selects the FSGSBASE group, not advertised; a 66 is
@@ -2714,6 +2831,19 @@ impl X86Interp {
                 }
                 self.next(end)
             }
+            (_, 4 | 5) if AVX => {
+                let a = fetch!(self.mem_only(m.kind, end));
+                if a & 63 != 0 {
+                    return Step::Trap(Trap::Protection);
+                }
+                let rfbm = ((self.gpr[RDX] << 32) | (self.gpr[RAX] & 0xffff_ffff)) & XCR0;
+                if m.ext() == 4 {
+                    fetch!(self.xsave(mem, a, rfbm, p.rex.w));
+                } else {
+                    fetch!(self.xrstor(mem, a, rfbm, p.rex.w));
+                }
+                self.next(end)
+            }
             (_, 2) => {
                 let a = fetch!(self.mem_only(m.kind, end));
                 let v = fetch!(Self::read_mem(mem, a, 32)) as u32;
@@ -2736,6 +2866,83 @@ impl X86Interp {
             }
             _ => Step::Illegal,
         }
+    }
+
+    /// `XSAVE` (standard format) of the components in `rfbm` to the 64-byte
+    /// aligned `a`: the x87 and SSE parts of the legacy region (`MXCSR` with
+    /// either SSE or AVX), the AVX upper halves at offset 576, and the
+    /// header's `XSTATE_BV` — bits outside `rfbm` unchanged, those inside set
+    /// (every component counts as in use). Bytes 416..512 of the legacy
+    /// region and the rest of the header are not written.
+    fn xsave(&mut self, mem: &mut GuestMemory, a: u64, rfbm: u64, rex_w: bool) -> Result<(), Step> {
+        let img = self.fxsave_image(rex_w);
+        let bv = Self::read_mem(mem, a + 512, 64)?;
+        if rfbm & 1 != 0 {
+            self.store(mem, a, &img[..24])?;
+            self.store(mem, a + 32, &img[32..160])?;
+        }
+        if rfbm & 6 != 0 {
+            self.store(mem, a + 24, &img[24..32])?;
+        }
+        if rfbm & 2 != 0 {
+            self.store(mem, a + 160, &img[160..416])?;
+        }
+        if rfbm & 4 != 0 {
+            let mut hi = [0u8; 256];
+            for (i, v) in self.ymm_hi.iter().enumerate() {
+                hi[16 * i..16 * i + 16].copy_from_slice(&v.to_le_bytes());
+            }
+            self.store(mem, a + 576, &hi)?;
+        }
+        self.write_mem(mem, a + 512, bv | rfbm, 64)
+    }
+
+    /// `XRSTOR` (standard format) of the components in `rfbm` from `a`: each
+    /// is loaded if its `XSTATE_BV` bit is set, else put in its initial state
+    /// (x87: `FNINIT` and zeroed registers; SSE/AVX: zero). `MXCSR` is loaded
+    /// whenever SSE or AVX is requested. `#GP` for a compacted or malformed
+    /// header, `XSTATE_BV` bits outside `XCR0`, or reserved `MXCSR` bits.
+    fn xrstor(&mut self, mem: &GuestMemory, a: u64, rfbm: u64, rex_w: bool) -> Result<(), Step> {
+        let mut area = [0u8; 832];
+        mem.read(a, &mut area).map_err(|_| rd_fault(a))?;
+        let bv = u64::from_le_bytes(area[512..520].try_into().unwrap());
+        if bv & !XCR0 != 0 || area[520..576].iter().any(|&b| b != 0) {
+            return Err(Step::Trap(Trap::Protection));
+        }
+        let mut img = self.fxsave_image(rex_w);
+        if rfbm & 1 != 0 {
+            if bv & 1 != 0 {
+                img[..24].copy_from_slice(&area[..24]);
+                img[32..160].copy_from_slice(&area[32..160]);
+            } else {
+                img[..24].fill(0);
+                img[..2].copy_from_slice(&0x037Fu16.to_le_bytes());
+                img[32..160].fill(0);
+            }
+        }
+        if rfbm & 6 != 0 {
+            img[24..28].copy_from_slice(&area[24..28]);
+        }
+        if rfbm & 2 != 0 {
+            if bv & 2 != 0 {
+                img[160..416].copy_from_slice(&area[160..416]);
+            } else {
+                img[160..416].fill(0);
+            }
+        }
+        if !self.fxrstor_image(&img, rex_w) {
+            return Err(Step::Trap(Trap::Protection));
+        }
+        if rfbm & 4 != 0 {
+            for (i, v) in self.ymm_hi.iter_mut().enumerate() {
+                *v = if bv & 4 != 0 {
+                    u128::from_le_bytes(area[576 + 16 * i..592 + 16 * i].try_into().unwrap())
+                } else {
+                    0
+                };
+            }
+        }
+        Ok(())
     }
 
     /// The 512-byte `FXSAVE` image of the x87/MMX/SSE state (Intel SDM Vol. 1
@@ -2935,6 +3142,7 @@ impl Vcpu for X86Interp {
     fn reset(&mut self, entry: u64, sp: u64) {
         self.gpr = [0; 16];
         self.xmm = [0; 16];
+        self.ymm_hi = [0; 16];
         self.gpr[RSP] = sp;
         self.rip = entry;
         self.flags = Flags::default();
@@ -3804,7 +4012,7 @@ mod tests {
         // cpuid (0F A2)
         m.write_init(CODE, &[0x0F, 0xA2]).unwrap();
         cpu.exec(&mut m);
-        assert_eq!(cpu.gpr[RAX] as u32, 7, "max standard leaf");
+        assert_eq!(cpu.gpr[RAX] as u32, 0xD, "max standard leaf (XSAVE)");
         let mut vendor = Vec::new();
         vendor.extend_from_slice(&(cpu.gpr[RBX] as u32).to_le_bytes());
         vendor.extend_from_slice(&(cpu.gpr[RDX] as u32).to_le_bytes());
@@ -5243,8 +5451,8 @@ mod tests {
     /// named by `NIXVM_SCAN_X86` (lines of `hexbytes mnemonic operands`, e.g.
     /// from `llvm-objdump -d -M intel` over a corpus) once, from a sane state
     /// with every GPR pointing into mapped memory, and report the encodings
-    /// that decode as `#UD` (grouped by mnemonic). `v`-prefixed (VEX/EVEX)
-    /// mnemonics and other above-baseline extensions are listed separately.
+    /// that decode as `#UD` (grouped by mnemonic). EVEX-encoded (AVX-512)
+    /// mnemonics are only counted.
     #[test]
     #[ignore = "corpus coverage report; run with NIXVM_SCAN_X86=<words file>"]
     fn scan_instruction_coverage() {
@@ -5257,7 +5465,7 @@ mod tests {
         let mut m = GuestMemory::new(base, 64 * page);
         m.map(base, 64 * page, Prot::rwx()).unwrap();
         let code = base + 32 * page;
-        let mut by_mnemonic: std::collections::BTreeMap<String, (usize, String, bool)> =
+        let mut by_mnemonic: std::collections::BTreeMap<String, (usize, String, bool, bool)> =
             std::collections::BTreeMap::new();
         let mut total = 0usize;
         std::panic::set_hook(Box::new(|_| {}));
@@ -5293,30 +5501,32 @@ mod tests {
                 Err(_) => (true, true),
             };
             if bad {
+                let evex = bytes
+                    .iter()
+                    .find(|b| !matches!(b, 0x26 | 0x2E | 0x36 | 0x3E | 0x64..=0x67 | 0xF2 | 0xF3))
+                    == Some(&0x62);
                 let e = by_mnemonic
                     .entry(mnemonic)
-                    .or_insert((0, line.to_string(), false));
+                    .or_insert((0, line.to_string(), false, evex));
                 e.0 += 1;
                 e.2 |= panicked;
             }
         }
         let _ = std::panic::take_hook();
-        let above = |mn: &str| {
-            mn.starts_with('v') || mn.starts_with("kmov") || mn.starts_with('k') && mn.len() > 4
-        };
-        let mut n_base = 0;
-        for (mn, (n, example, panicked)) in &by_mnemonic {
-            if above(mn) {
+        let (mut n_listed, mut n_enc, mut n_evex) = (0, 0, 0);
+        for (mn, (n, example, panicked, evex)) in &by_mnemonic {
+            if *evex {
+                n_evex += 1;
                 continue;
             }
-            n_base += 1;
+            n_listed += 1;
+            n_enc += n;
             let p = if *panicked { " PANIC" } else { "" };
             println!("{n:6} {mn:14}{p}  e.g. {example}");
         }
-        let above_list: Vec<&String> = by_mnemonic.keys().filter(|m| above(m)).collect();
         println!(
-            "{total} encodings scanned; {n_base} non-VEX mnemonics with #UD encodings; {} VEX/EVEX mnemonics (not advertised)",
-            above_list.len()
+            "{total} encodings scanned; {n_listed} non-EVEX mnemonics with #UD encodings \
+             ({n_enc} encodings); {n_evex} EVEX (AVX-512) mnemonics"
         );
     }
 

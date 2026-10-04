@@ -9,7 +9,7 @@ use crate::vcpu::GuestMemory;
 use crate::vcpu::interp_x86::{Flags, Pfx, RAX, RCX, RDX, RmKind, Step, X86Interp, fetch};
 use crate::vcpu::softfloat::{self as sf, Mx, Op, Round};
 
-/// SSSE3 and SSE4.1/SSE4.2 — not yet advertised, so `#UD` while false.
+/// SSSE3 and SSE4.1/SSE4.2: `#UD` while a switch is off.
 pub(in crate::vcpu::interp_x86) const SSSE3: bool = true;
 pub(in crate::vcpu::interp_x86) const SSE41: bool = true;
 pub(in crate::vcpu::interp_x86) const SSE42: bool = true;

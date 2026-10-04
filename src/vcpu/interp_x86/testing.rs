@@ -8,13 +8,14 @@ use crate::vcpu::GuestMemory;
 
 /// The architectural state a differential case loads and compares: the GPRs
 /// (`RAX..R15` in encoding order), `RIP`, `RFLAGS`, and the x87/MMX/SSE state
-/// as a 512-byte `FXSAVE64` image.
+/// as a 512-byte `FXSAVE64` image, plus the upper halves of the YMM registers.
 #[derive(Clone, Debug)]
 pub struct CpuState {
     pub gpr: [u64; 16],
     pub rip: u64,
     pub rflags: u64,
     pub fxsave: [u8; 512],
+    pub ymm_hi: [u128; 16],
     pub fs_base: u64,
     pub gs_base: u64,
 }
@@ -26,6 +27,7 @@ impl Default for CpuState {
             rip: 0,
             rflags: 0x202,
             fxsave: [0; 512],
+            ymm_hi: [0; 16],
             fs_base: 0,
             gs_base: 0,
         }
@@ -62,6 +64,7 @@ pub fn step(mem: &mut GuestMemory, st: &mut CpuState) -> Outcome {
     if !cpu.fxrstor_image(&st.fxsave, true) {
         return Outcome::Signal(11);
     }
+    cpu.ymm_hi = st.ymm_hi;
     let out = match cpu.exec(mem) {
         Step::Next | Step::Branched => Outcome::Done,
         Step::Syscall => Outcome::Syscall,
@@ -73,5 +76,6 @@ pub fn step(mem: &mut GuestMemory, st: &mut CpuState) -> Outcome {
     st.rip = cpu.rip;
     st.rflags = cpu.rflags_word();
     st.fxsave = cpu.fxsave_image(true);
+    st.ymm_hi = cpu.ymm_hi;
     out
 }
