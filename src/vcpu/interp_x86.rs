@@ -4774,6 +4774,39 @@ mod tests {
     }
 
     #[test]
+    fn address_size_prefix_and_segmented_rip_relative() {
+        let mut m = mem();
+        m.write_init(0x1_2000, &7u32.to_le_bytes()).unwrap();
+        // mov eax, [ebx+4] with 0x67: rbx's upper half is ignored.
+        let (c, _) = run_with(&mut m, &[0x67, 0x8B, 0x43, 0x04], |c| {
+            c.gpr[RBX] = 0xdead_0000_0001_1ffc;
+        });
+        assert_eq!(c.gpr[RAX], 7);
+        // lea eax, [ecx+edx] under 0x67 wraps at 32 bits.
+        let (c, _) = run_with(&mut m, &[0x67, 0x8D, 0x04, 0x11], |c| {
+            c.gpr[RCX] = 0xffff_ffff;
+            c.gpr[RDX] = 2;
+        });
+        assert_eq!(c.gpr[RAX], 1);
+        // rep stosb under 0x67 uses ECX/EDI.
+        let (c, _) = run_with(&mut m, &[0x67, 0xF3, 0xAA], |c| {
+            c.gpr[RCX] = 0xffff_ffff_0000_0003;
+            c.gpr[RDI] = 0xffff_ffff_0001_3000;
+            c.gpr[RAX] = 0x55;
+        });
+        assert_eq!(c.gpr[RCX], 0);
+        assert_eq!(c.gpr[RDI], 0x1_3003);
+        assert_eq!(m.read_vec(0x1_3000, 4).unwrap(), vec![0x55, 0x55, 0x55, 0]);
+        // fs: on a RIP-relative operand adds the fs base too.
+        m.write_init(0x4000 + CODE + 7, &0x1234u16.to_le_bytes())
+            .unwrap();
+        let (c, _) = run_with(&mut m, &[0x64, 0x8B, 0x05, 0, 0, 0, 0], |c| {
+            c.fs_base = 0x4000;
+        });
+        assert_eq!(c.gpr[RAX] & 0xffff, 0x1234);
+    }
+
+    #[test]
     fn alu_accumulator_imm_forms() {
         let mut m = mem();
         let mut cpu = X86Interp::new(CODE, STACK);
