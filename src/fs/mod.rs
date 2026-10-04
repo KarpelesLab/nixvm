@@ -181,6 +181,34 @@ pub trait MountFs: std::fmt::Debug + Send {
         Err(io::Error::from_raw_os_error(95)) // EOPNOTSUPP
     }
 
+    // ---- extended attributes ----
+    //
+    // The kernel validates names (namespace prefix, length) and value sizes and
+    // checks that the node exists before calling these, so a backend only
+    // stores and retrieves. The defaults describe a filesystem with no xattr
+    // support at all — what Linux's procfs/sysfs/devpts answer: a lookup or
+    // update is `EOPNOTSUPP`, while a listing is simply empty (`listxattr` on
+    // such a filesystem returns 0, so `getfattr -d`/`cp -a`/`tar --xattrs`
+    // walk it without complaint).
+
+    /// The value of attribute `name` on `rel`; `ENODATA` if it is not set.
+    fn getxattr(&mut self, _rel: &str, _name: &str) -> io::Result<Vec<u8>> {
+        Err(io::Error::from_raw_os_error(95)) // EOPNOTSUPP
+    }
+    /// Set attribute `name` on `rel` (create-or-replace; the kernel enforces
+    /// `XATTR_CREATE`/`XATTR_REPLACE` against [`MountFs::getxattr`] first).
+    fn setxattr(&mut self, _rel: &str, _name: &str, _value: &[u8]) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(95)) // EOPNOTSUPP
+    }
+    /// Every attribute name set on `rel`.
+    fn listxattr(&mut self, _rel: &str) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    /// Remove attribute `name` from `rel`; `ENODATA` if it is not set.
+    fn removexattr(&mut self, _rel: &str, _name: &str) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(95)) // EOPNOTSUPP
+    }
+
     /// Downcast hook for the one backend ([`ProcFs`]) whose `self/` files the
     /// kernel refreshes from live task state before each read. Every other
     /// backend keeps the default (`None`).

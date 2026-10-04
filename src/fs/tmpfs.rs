@@ -16,8 +16,11 @@ const S_IFREG: u32 = 0o100_000;
 const S_IFLNK: u32 = 0o120_000;
 const S_IFIFO: u32 = 0o010_000;
 
-/// Per-node metadata common to every node kind: identity, owner, and the
-/// access/modification timestamps `utimensat`/`chown` mutate.
+/// Per-node metadata common to every node kind: identity, owner, the
+/// access/modification timestamps `utimensat`/`chown` mutate, and the node's
+/// extended attributes. Living in the node, the attributes follow it through a
+/// `rename` and vanish with it on `unlink` — the inode semantics a path-keyed
+/// side table would get wrong.
 #[derive(Debug)]
 struct Meta {
     inode: u64,
@@ -25,6 +28,7 @@ struct Meta {
     gid: u32,
     atime: i64,
     mtime: i64,
+    xattrs: BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -96,6 +100,7 @@ impl TmpFs {
                     gid: 0,
                     atime: 0,
                     mtime: 0,
+                    xattrs: BTreeMap::new(),
                 },
             },
         );
@@ -120,6 +125,7 @@ impl TmpFs {
             gid: 0,
             atime: now,
             mtime: now,
+            xattrs: BTreeMap::new(),
         }
     }
 
@@ -190,6 +196,9 @@ fn einval() -> io::Error {
 }
 fn enotempty() -> io::Error {
     io::Error::from_raw_os_error(39)
+}
+fn enodata() -> io::Error {
+    io::Error::from_raw_os_error(61)
 }
 
 /// Current wall-clock time as Unix seconds, for `mtime` on write
@@ -451,6 +460,33 @@ impl MountFs for TmpFs {
             }
             None => Err(enoent()),
         }
+    }
+
+    fn getxattr(&mut self, rel: &str, name: &str) -> io::Result<Vec<u8>> {
+        let node = self.nodes.get(rel).ok_or_else(enoent)?;
+        node.meta().xattrs.get(name).cloned().ok_or_else(enodata)
+    }
+
+    fn setxattr(&mut self, rel: &str, name: &str, value: &[u8]) -> io::Result<()> {
+        let node = self.nodes.get_mut(rel).ok_or_else(enoent)?;
+        node.meta_mut()
+            .xattrs
+            .insert(name.to_string(), value.to_vec());
+        Ok(())
+    }
+
+    fn listxattr(&mut self, rel: &str) -> io::Result<Vec<String>> {
+        let node = self.nodes.get(rel).ok_or_else(enoent)?;
+        Ok(node.meta().xattrs.keys().cloned().collect())
+    }
+
+    fn removexattr(&mut self, rel: &str, name: &str) -> io::Result<()> {
+        let node = self.nodes.get_mut(rel).ok_or_else(enoent)?;
+        node.meta_mut()
+            .xattrs
+            .remove(name)
+            .map(drop)
+            .ok_or_else(enodata)
     }
 
     fn symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {

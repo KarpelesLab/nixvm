@@ -278,6 +278,30 @@ impl MountFs for FsToolMount {
         self.read_only
     }
 
+    // Image filesystems (squashfs/ext4) support xattrs, but their stored
+    // attributes are not surfaced through fstool's read path: report every
+    // attribute as absent (ENODATA, not EOPNOTSUPP — the filesystem *has*
+    // xattr support, so `getfattr`/`tar --xattrs` see "none set"), and refuse
+    // updates the way the mount would (EROFS when read-only).
+    fn getxattr(&mut self, rel: &str, _name: &str) -> io::Result<Vec<u8>> {
+        if self.stat(rel).is_none() {
+            return Err(enoent());
+        }
+        Err(io::Error::from_raw_os_error(61)) // ENODATA
+    }
+
+    fn setxattr(&mut self, _rel: &str, _name: &str, _value: &[u8]) -> io::Result<()> {
+        Err(if self.read_only {
+            erofs()
+        } else {
+            io::Error::from_raw_os_error(95) // EOPNOTSUPP
+        })
+    }
+
+    fn removexattr(&mut self, rel: &str, name: &str) -> io::Result<()> {
+        self.setxattr(rel, name, &[])
+    }
+
     fn stat(&mut self, rel: &str) -> Option<Attrs> {
         let a = self.fs.getattr(&mut *self.dev, Path::new(&abs(rel))).ok()?;
         let kind = map_kind(a.kind);

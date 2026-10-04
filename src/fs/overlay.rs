@@ -120,7 +120,41 @@ impl Overlay {
                 self.upper.write_at(rel, 0, &data)?;
             }
         }
+        self.copy_up_xattrs(rel);
         Ok(())
+    }
+
+    /// Carry `rel`'s lower-layer extended attributes onto its fresh upper copy
+    /// (Linux overlayfs copies xattrs up with the data), so e.g. a `security.
+    /// capability` on a base-image binary survives the first write to it.
+    fn copy_up_xattrs(&mut self, rel: &str) {
+        let Ok(names) = self.lower.listxattr(rel) else {
+            return;
+        };
+        for name in names {
+            if let Ok(v) = self.lower.getxattr(rel, &name) {
+                let _ = self.upper.setxattr(rel, &name, &v);
+            }
+        }
+    }
+
+    /// Make `rel` itself writable in the upper layer, *without* dragging a
+    /// lower directory's whole subtree up (which [`Self::copy_up`] does so a
+    /// `rename` moves the contents): a metadata-only change to a directory only
+    /// needs the directory node, and the merged `readdir` still shows the
+    /// lower children beneath it.
+    fn copy_up_node(&mut self, rel: &str) -> io::Result<()> {
+        if self.upper.stat(rel).is_some() {
+            return Ok(());
+        }
+        match self.lower.stat(rel) {
+            Some(a) if a.kind == NodeKind::Dir => {
+                self.ensure_dir_in_upper(rel);
+                self.copy_up_xattrs(rel);
+                Ok(())
+            }
+            _ => self.copy_up(rel),
+        }
     }
 }
 
@@ -153,6 +187,9 @@ fn eisdir() -> io::Error {
 }
 fn einval() -> io::Error {
     io::Error::from_raw_os_error(22)
+}
+fn enodata() -> io::Error {
+    io::Error::from_raw_os_error(61)
 }
 fn enotempty() -> io::Error {
     io::Error::from_raw_os_error(39)
@@ -296,6 +333,54 @@ impl MountFs for Overlay {
         }
         self.copy_up(rel)?;
         self.upper.set_owner(rel, uid, gid)
+    }
+
+    fn getxattr(&mut self, rel: &str, name: &str) -> io::Result<Vec<u8>> {
+        if self.is_whited(rel) {
+            return Err(enoent());
+        }
+        if self.upper.stat(rel).is_some() {
+            return self.upper.getxattr(rel, name);
+        }
+        // The merged filesystem supports xattrs even where the lower layer
+        // doesn't: an attribute it can't produce is simply absent.
+        match self.lower.getxattr(rel, name) {
+            Err(e) if e.raw_os_error() == Some(95) => Err(enodata()),
+            r => r,
+        }
+    }
+
+    fn setxattr(&mut self, rel: &str, name: &str, value: &[u8]) -> io::Result<()> {
+        if self.stat(rel).is_none() {
+            return Err(enoent());
+        }
+        self.copy_up_node(rel)?;
+        self.upper.setxattr(rel, name, value)
+    }
+
+    fn listxattr(&mut self, rel: &str) -> io::Result<Vec<String>> {
+        if self.is_whited(rel) {
+            return Err(enoent());
+        }
+        if self.upper.stat(rel).is_some() {
+            self.upper.listxattr(rel)
+        } else {
+            Ok(self.lower.listxattr(rel).unwrap_or_default())
+        }
+    }
+
+    fn removexattr(&mut self, rel: &str, name: &str) -> io::Result<()> {
+        if self.stat(rel).is_none() {
+            return Err(enoent());
+        }
+        if self.upper.stat(rel).is_none() {
+            // Lower-only: nothing to remove unless the lower node carries it.
+            if self.lower.getxattr(rel, name).is_err() {
+                return Err(enodata());
+            }
+            self.copy_up_node(rel)?;
+        }
+        self.upper.removexattr(rel, name)
     }
 
     fn symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {
@@ -580,5 +665,36 @@ mod tests {
             .map(|e| e.name)
             .collect();
         assert_eq!(names, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn xattrs_copy_up_only_the_node_and_carry_lower_attributes() {
+        let mut lower = TmpFs::new();
+        lower.create("f", 0o644).unwrap();
+        lower.setxattr("f", "user.a", b"1").unwrap();
+        lower.mkdir("d", 0o755).unwrap();
+        lower.create("d/x", 0o644).unwrap();
+        let mut o = Overlay::new(Box::new(lower), Box::new(TmpFs::new()));
+        // A lower attribute is visible; an absent one is ENODATA.
+        assert_eq!(o.getxattr("f", "user.a").unwrap(), b"1");
+        assert_eq!(
+            o.getxattr("f", "user.b").unwrap_err().raw_os_error(),
+            Some(61)
+        );
+        // Setting a second attribute copies the file up *with* the first.
+        o.setxattr("f", "user.b", b"2").unwrap();
+        let mut names = o.listxattr("f").unwrap();
+        names.sort();
+        assert_eq!(names, vec!["user.a".to_string(), "user.b".to_string()]);
+        // Tagging a lower directory doesn't copy its children up.
+        o.setxattr("d", "user.c", b"3").unwrap();
+        assert!(o.upper.stat("d").is_some());
+        assert!(o.upper.stat("d/x").is_none(), "child stays lower-only");
+        assert_eq!(o.readdir("d").unwrap().len(), 1, "merged view keeps it");
+        o.removexattr("d", "user.c").unwrap();
+        assert_eq!(
+            o.removexattr("d", "user.c").unwrap_err().raw_os_error(),
+            Some(61)
+        );
     }
 }

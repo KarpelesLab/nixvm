@@ -38,8 +38,11 @@ mod pty;
 mod signal;
 mod stat;
 mod sys_misc;
+#[cfg(test)]
+mod testutil;
 mod time;
 mod unavailable;
+mod xattr;
 
 pub use fd::{Fd, FdTable};
 use net::Net;
@@ -2683,7 +2686,23 @@ impl Kernel {
             | Sysno::Faccessat
             | Sysno::Faccessat2
             | Sysno::Access
-            | Sysno::Msync => {
+            | Sysno::Msync
+            | Sysno::Getxattr
+            | Sysno::Lgetxattr
+            | Sysno::Fgetxattr
+            | Sysno::Getxattrat
+            | Sysno::Setxattr
+            | Sysno::Lsetxattr
+            | Sysno::Fsetxattr
+            | Sysno::Setxattrat
+            | Sysno::Listxattr
+            | Sysno::Llistxattr
+            | Sysno::Flistxattr
+            | Sysno::Listxattrat
+            | Sysno::Removexattr
+            | Sysno::Lremovexattr
+            | Sysno::Fremovexattr
+            | Sysno::Removexattrat => {
                 let mut vfs = self.vfs.lock().unwrap();
                 self.dispatch_vfs(&mut vfs, cx, sys, args, mem)
             }
@@ -3027,6 +3046,52 @@ impl Kernel {
             }
             Sysno::Access => self.sys_faccessat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
             Sysno::Msync => self.sys_msync(vfs, cx, args[0], args[1], args[2], mem),
+            // Extended attributes: the path / no-follow / fd / *at spellings all
+            // lower onto one handler per operation (see `xattr.rs`).
+            Sysno::Getxattr | Sysno::Lgetxattr | Sysno::Fgetxattr => {
+                let t = xattr_target(sys, args[0]);
+                self.sys_getxattr(vfs, cx, &t, args[1], args[2], args[3], mem)
+            }
+            Sysno::Setxattr | Sysno::Lsetxattr | Sysno::Fsetxattr => {
+                let t = xattr_target(sys, args[0]);
+                self.sys_setxattr(vfs, cx, &t, args[1], args[2], args[3], args[4], mem)
+            }
+            Sysno::Listxattr | Sysno::Llistxattr | Sysno::Flistxattr => {
+                let t = xattr_target(sys, args[0]);
+                self.sys_listxattr(vfs, cx, &t, args[1], args[2], mem)
+            }
+            Sysno::Removexattr | Sysno::Lremovexattr | Sysno::Fremovexattr => {
+                let t = xattr_target(sys, args[0]);
+                self.sys_removexattr(vfs, cx, &t, args[1], mem)
+            }
+            // (dirfd, path, at_flags, name, struct xattr_args *, usize)
+            Sysno::Getxattrat | Sysno::Setxattrat => {
+                let t = match xattr::XattrTarget::at(args[0], args[1], args[2]) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                let (value, size, flags) = match Self::read_xattr_args(mem, args[4], args[5]) {
+                    Ok(a) => a,
+                    Err(e) => return e,
+                };
+                if sys == Sysno::Setxattrat {
+                    self.sys_setxattr(vfs, cx, &t, args[3], value, size, flags, mem)
+                } else if flags != 0 {
+                    err(Errno::EINVAL) // getxattrat takes no flags
+                } else {
+                    self.sys_getxattr(vfs, cx, &t, args[3], value, size, mem)
+                }
+            }
+            // (dirfd, path, at_flags, list, size)
+            Sysno::Listxattrat => match xattr::XattrTarget::at(args[0], args[1], args[2]) {
+                Ok(t) => self.sys_listxattr(vfs, cx, &t, args[3], args[4], mem),
+                Err(e) => e,
+            },
+            // (dirfd, path, at_flags, name)
+            Sysno::Removexattrat => match xattr::XattrTarget::at(args[0], args[1], args[2]) {
+                Ok(t) => self.sys_removexattr(vfs, cx, &t, args[3], mem),
+                Err(e) => e,
+            },
             // Unreachable: `dispatch_impl` only routes the syscalls above here.
             _ => unreachable!("dispatch_vfs: {sys:?} is not a vfs-only syscall"),
         }
@@ -3143,8 +3208,6 @@ impl Kernel {
                     err(Errno::EBADF)
                 }
             }
-            // No extended attributes: report "no such attribute".
-            Sysno::Getxattr | Sysno::Lgetxattr | Sysno::Fgetxattr => err(Errno::ENODATA),
             Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], mem),
             Sysno::Ioctl => self.sys_ioctl(cx, args[0], args[1], args[2], mem),
             Sysno::Fcntl => self.sys_fcntl(cx, args[0], args[1], args[2], mem),
@@ -7757,6 +7820,20 @@ fn rusage_bytes(cpu_ns: u128) -> [u8; 144] {
 /// Encode an errno as a negative syscall return.
 const fn err(e: Errno) -> i64 {
     -(e.0 as i64)
+}
+
+/// The [`xattr::XattrTarget`] of a non-`at` xattr syscall: the `f*` forms name
+/// a descriptor, the `l*` forms a path whose final symlink is not followed.
+fn xattr_target(sys: Sysno, arg0: u64) -> xattr::XattrTarget {
+    match sys {
+        Sysno::Fgetxattr | Sysno::Fsetxattr | Sysno::Flistxattr | Sysno::Fremovexattr => {
+            xattr::XattrTarget::Fd(arg0 as i32)
+        }
+        Sysno::Lgetxattr | Sysno::Lsetxattr | Sysno::Llistxattr | Sysno::Lremovexattr => {
+            xattr::XattrTarget::path(arg0, true)
+        }
+        _ => xattr::XattrTarget::path(arg0, false),
+    }
 }
 
 /// Read a NUL-terminated path string from guest memory.

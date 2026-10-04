@@ -279,6 +279,32 @@ impl MountTable {
         fs.symlink(target, &rel)
     }
 
+    /// Extended attribute `name` of the node at `abs_path` (see
+    /// [`MountFs::getxattr`]). Like the other per-node operations the final
+    /// component is not followed — the kernel decides follow vs. no-follow.
+    pub fn getxattr(&mut self, abs_path: &str, name: &str) -> io::Result<Vec<u8>> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.getxattr(&rel, name)
+    }
+
+    /// Set extended attribute `name` on the node at `abs_path`.
+    pub fn setxattr(&mut self, abs_path: &str, name: &str, value: &[u8]) -> io::Result<()> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.setxattr(&rel, name, value)
+    }
+
+    /// Every extended-attribute name on the node at `abs_path`.
+    pub fn listxattr(&mut self, abs_path: &str) -> io::Result<Vec<String>> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.listxattr(&rel)
+    }
+
+    /// Remove extended attribute `name` from the node at `abs_path`.
+    pub fn removexattr(&mut self, abs_path: &str, name: &str) -> io::Result<()> {
+        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.removexattr(&rel, name)
+    }
+
     /// Rename within a single backend. Cross-mount renames return `EXDEV`.
     pub fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
         let from = self.canonical(from);
