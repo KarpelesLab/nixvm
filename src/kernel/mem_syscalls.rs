@@ -58,14 +58,20 @@ fn range_is_free(mem: &GuestMemory, start: u64, end: u64) -> bool {
 
 impl Kernel {
     /// `mremap(old_addr, old_size, new_size, flags, new_addr)` — resize an
-    /// existing anonymous mapping.
+    /// existing mapping.
     ///
     /// Shrinking unmaps the tail and keeps the base. Growing tries to claim the
     /// following pages in place; if they are free it succeeds at the same
     /// address. When that is not possible and `MREMAP_MAYMOVE` is set, a fresh
-    /// region is taken from the `mmap` arena, the old bytes are copied over, and
-    /// the old range is unmapped (best-effort relocate).
-    #[allow(clippy::too_many_arguments)]
+    /// region is taken from the `mmap` arena (or `new_addr` with
+    /// `MREMAP_FIXED`) and the pages move there: a *shared* mapping's frames
+    /// are remapped (so it keeps sharing with its other mappers), private
+    /// pages are copied. The mapping keeps its protection, a writable shared
+    /// file mapping's write-back follows it, and `MREMAP_DONTUNMAP` leaves the
+    /// old range mapped (empty). Linux's argument checks apply: page-aligned
+    /// addresses, known flags, `FIXED`/`DONTUNMAP` only with `MAYMOVE`,
+    /// `DONTUNMAP` without resizing, non-overlapping `FIXED` ranges.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) fn sys_mremap(
         &self,
         sh: &mut Shared,
@@ -77,12 +83,21 @@ impl Kernel {
         new_addr: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        if old_size == 0 || new_size == 0 {
+        const MREMAP_DONTUNMAP: u64 = 4;
+        if old_size == 0 || new_size == 0 || !old_addr.is_multiple_of(PAGE_SIZE) {
             return err(Errno::EINVAL);
         }
-        let old_addr = page_down(old_addr);
+        if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
+            || (flags & (MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 && flags & MREMAP_MAYMOVE == 0)
+        {
+            return err(Errno::EINVAL);
+        }
         let old_size = page_up(old_size);
         let new_size = page_up(new_size);
+        let dontunmap = flags & MREMAP_DONTUNMAP != 0;
+        if dontunmap && old_size != new_size {
+            return err(Errno::EINVAL);
+        }
 
         // The source must actually be mapped; Linux answers EFAULT otherwise.
         // musl's `pthread_getattr_np` finds the main thread's stack extent by
@@ -93,32 +108,28 @@ impl Kernel {
         if !range_is_mapped(mem, old_addr, old_addr + old_size) {
             return err(Errno::EFAULT);
         }
+        let prot = mem.page_prot(old_addr).unwrap_or(Prot::rw());
 
-        // MREMAP_FIXED: relocate to a caller-chosen address (only valid with
-        // MREMAP_MAYMOVE), clobbering whatever sits at the destination. We honor
-        // the requested target exactly rather than picking our own arena slot.
         if flags & MREMAP_FIXED != 0 {
-            if flags & MREMAP_MAYMOVE == 0 {
+            if !new_addr.is_multiple_of(PAGE_SIZE) {
                 return err(Errno::EINVAL);
             }
-            let dst = page_down(new_addr);
-            // `map` drops any existing backing at the destination (zero-fills).
-            if mem.map(dst, new_size, Prot::rw()).is_err() {
-                return err(Errno::ENOMEM);
+            if new_addr < old_addr + old_size && old_addr < new_addr + new_size {
+                return err(Errno::EINVAL); // overlapping ranges
             }
-            sh.arena(cx).claim(dst, new_size);
-            let copy = old_size.min(new_size);
-            if let Ok(data) = mem.read_vec(old_addr, copy as usize) {
-                let _ = mem.write(dst, &data);
+            sh.arena(cx).claim(new_addr, new_size);
+            if let Err(e) = self.mremap_move(
+                cx, old_addr, old_size, new_addr, new_size, prot, dontunmap, mem,
+            ) {
+                return e;
             }
-            let _ = mem.unmap(old_addr, old_size);
-            // The old block returns to the arena so it can be reused (see the
-            // MAYMOVE relocate path below for why this matters).
-            sh.arena(cx).free_range(old_addr, old_size);
-            return dst as i64;
+            if !dontunmap {
+                sh.arena(cx).free_range(old_addr, old_size);
+            }
+            return new_addr as i64;
         }
 
-        if new_size <= old_size {
+        if new_size <= old_size && !dontunmap {
             // Shrink (or no-op): drop the tail, keep the base. The tail goes
             // back to the arena — leaking it here would bleed the arena dry in
             // a guest that resizes buffers in a loop.
@@ -135,9 +146,10 @@ impl Kernel {
         // stack guard gap or an image's neighbour).
         let extra_start = old_addr + old_size;
         let extra_len = new_size - old_size;
-        if sh.arena(cx).is_free(extra_start, extra_len)
+        if !dontunmap
+            && sh.arena(cx).is_free(extra_start, extra_len)
             && range_is_free(mem, extra_start, extra_start + extra_len)
-            && mem.map(extra_start, extra_len, Prot::rw()).is_ok()
+            && mem.map(extra_start, extra_len, prot).is_ok()
         {
             sh.arena(cx).claim(extra_start, extra_len);
             return old_addr as i64;
@@ -150,20 +162,66 @@ impl Kernel {
         let Some(base) = self.alloc_mmap(sh, cx, new_size) else {
             return err(Errno::ENOMEM);
         };
-        if mem.map(base, new_size, Prot::rw()).is_err() {
-            return err(Errno::ENOMEM);
+        if let Err(e) =
+            self.mremap_move(cx, old_addr, old_size, base, new_size, prot, dontunmap, mem)
+        {
+            return e;
         }
-        // Copy the old contents forward (best-effort: needs READ on the source).
-        if let Ok(data) = mem.read_vec(old_addr, old_size as usize) {
-            let _ = mem.write(base, &data);
-        }
-        let _ = mem.unmap(old_addr, old_size);
         // The old block is ours again — without this, every relocating mremap
         // leaks its source and the arena runs out (Bun resizes buffers by the
         // thousand, which exhausted it and turned every later allocation into a
         // NULL the guest promptly dereferenced).
-        sh.arena(cx).free_range(old_addr, old_size);
+        if !dontunmap {
+            sh.arena(cx).free_range(old_addr, old_size);
+        }
         base as i64
+    }
+
+    /// Move `[old, old + old_size)` to `[new, new + new_size)` with `prot`:
+    /// shared pages by remapping their frames, private ones by copying; then
+    /// unmap the source (or, `dontunmap`, leave it mapped and empty). Keeps a
+    /// writable shared file mapping's write-back pointed at its new home.
+    #[allow(clippy::too_many_arguments, clippy::unused_self)]
+    fn mremap_move(
+        &self,
+        cx: &mut ServiceCtx,
+        old: u64,
+        old_size: u64,
+        new: u64,
+        new_size: u64,
+        prot: Prot,
+        dontunmap: bool,
+        mem: &mut GuestMemory,
+    ) -> Result<(), i64> {
+        let keep = old_size.min(new_size);
+        if let Some(frames) = mem.shared_frames(old, keep) {
+            mem.map_frames(new, &frames, prot)
+                .map_err(|_| err(Errno::ENOMEM))?;
+            if new_size > keep {
+                mem.map_shared_anon(new + keep, new_size - keep, prot)
+                    .map_err(|_| err(Errno::ENOMEM))?;
+            }
+        } else {
+            mem.map(new, new_size, prot)
+                .map_err(|_| err(Errno::ENOMEM))?;
+            // Copy the contents forward (a write-only source can't be read
+            // through the guest view; init writes ignore protection).
+            if let Ok(data) = mem.read_vec(old, keep as usize) {
+                let _ = mem.write_init(new, &data);
+            }
+        }
+        if dontunmap {
+            let _ = mem.map(old, old_size, prot);
+        } else {
+            let _ = mem.unmap(old, old_size);
+        }
+        for m in &mut cx.cur.shared_maps {
+            if m.base == old {
+                m.base = new;
+                m.len = m.len.min(new_size);
+            }
+        }
+        Ok(())
     }
 
     /// `madvise(addr, len, advice)`. After Linux's checks — a page-aligned
@@ -459,6 +517,129 @@ mod tests {
         // Content moved to the destination; the source is unmapped.
         assert_eq!(mem.read_u64(dst).unwrap(), 0x7777);
         assert!(matches!(mem.read_u64(0x1_0000), Err(MemError::Unmapped(_))));
+    }
+
+    #[test]
+    fn mremap_validates_arguments_like_linux() {
+        let (k, mut mem, mut cx) = setup();
+        mem.map(0x1_0000, 2 * PAGE, Prot::rw()).unwrap();
+        let mut go = |old: u64, os: u64, ns: u64, fl: u64, na: u64, mem: &mut GuestMemory| {
+            k.sys_mremap(
+                &mut k.shared.lock().unwrap(),
+                &mut cx,
+                old,
+                os,
+                ns,
+                fl,
+                na,
+                mem,
+            )
+        };
+        let inval = -i64::from(Errno::EINVAL.0);
+        assert_eq!(
+            go(0x1_0010, PAGE, PAGE, 0, 0, &mut mem),
+            inval,
+            "unaligned old_addr"
+        );
+        assert_eq!(
+            go(0x1_0000, PAGE, PAGE, 0x80, 0, &mut mem),
+            inval,
+            "unknown flag"
+        );
+        assert_eq!(
+            go(0x1_0000, PAGE, PAGE, MREMAP_FIXED, 0x1_8000, &mut mem),
+            inval,
+            "FIXED w/o MAYMOVE"
+        );
+        assert_eq!(
+            go(0x1_0000, PAGE, 2 * PAGE, 1 | 4, 0, &mut mem),
+            inval,
+            "DONTUNMAP resizing"
+        );
+        assert_eq!(
+            go(
+                0x1_0000,
+                PAGE,
+                PAGE,
+                MREMAP_MAYMOVE | MREMAP_FIXED,
+                0x1_1000 - PAGE / 2,
+                &mut mem
+            ),
+            inval,
+            "unaligned new_addr"
+        );
+        assert_eq!(
+            go(
+                0x1_0000,
+                2 * PAGE,
+                2 * PAGE,
+                MREMAP_MAYMOVE | MREMAP_FIXED,
+                0x1_1000,
+                &mut mem
+            ),
+            inval,
+            "overlapping FIXED ranges"
+        );
+    }
+
+    #[test]
+    fn mremap_keeps_protection_and_shared_frames() {
+        let (k, mut mem, mut cx) = setup();
+        // A read-only private page keeps PROT_READ at its new home.
+        mem.map(0x1_0000, PAGE, Prot::rw()).unwrap();
+        mem.write_u64(0x1_0000, 0x55).unwrap();
+        mem.protect(0x1_0000, PAGE, Prot::READ).unwrap();
+        let dst = 0x1_8000;
+        let fl = MREMAP_MAYMOVE | MREMAP_FIXED;
+        let ret = k.sys_mremap(
+            &mut k.shared.lock().unwrap(),
+            &mut cx,
+            0x1_0000,
+            PAGE,
+            PAGE,
+            fl,
+            dst,
+            &mut mem,
+        );
+        assert_eq!(ret, dst as i64);
+        assert_eq!(mem.page_prot(dst), Some(Prot::READ));
+        assert_eq!(mem.read_u64(dst).unwrap(), 0x55);
+
+        // A shared page moves by frame: the new address aliases the same
+        // physical memory (what a forked sibling still maps), not a copy.
+        mem.map_shared_anon(0x1_2000, PAGE, Prot::rw()).unwrap();
+        mem.write_u64(0x1_2000, 0x99).unwrap();
+        let pa = mem.shared_phys(0x1_2000).unwrap();
+        let dst2 = 0x1_a000;
+        let ret = k.sys_mremap(
+            &mut k.shared.lock().unwrap(),
+            &mut cx,
+            0x1_2000,
+            PAGE,
+            PAGE,
+            fl,
+            dst2,
+            &mut mem,
+        );
+        assert_eq!(ret, dst2 as i64);
+        assert_eq!(mem.shared_phys(dst2), Some(pa));
+        assert_eq!(mem.read_u64(dst2).unwrap(), 0x99);
+
+        // DONTUNMAP leaves the source mapped, empty.
+        let dst3 = 0x1_c000;
+        let ret = k.sys_mremap(
+            &mut k.shared.lock().unwrap(),
+            &mut cx,
+            dst,
+            PAGE,
+            PAGE,
+            MREMAP_MAYMOVE | 4 | MREMAP_FIXED,
+            dst3,
+            &mut mem,
+        );
+        assert_eq!(ret, dst3 as i64);
+        assert_eq!(mem.read_u64(dst3).unwrap(), 0x55);
+        assert_eq!(mem.read_u64(dst).unwrap(), 0);
     }
 
     #[test]

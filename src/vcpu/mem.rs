@@ -507,6 +507,21 @@ impl GuestMemory {
         self.fa.lock().unwrap().refcount(frame)
     }
 
+    /// The frames behind `[addr, addr + len)` if *every* page there is a
+    /// shared page with a frame installed (a `MAP_SHARED` region, a SysV
+    /// segment): what `mremap` moves instead of copying, so the moved mapping
+    /// still shares memory with the other mappers. `None` otherwise.
+    #[must_use]
+    pub fn shared_frames(&self, addr: u64, len: u64) -> Option<Vec<u64>> {
+        let mut out = Vec::new();
+        let mut p = addr;
+        while p < addr.checked_add(len)? {
+            out.push(self.shared_phys(p)? & !(PAGE_SIZE - 1));
+            p += PAGE_SIZE;
+        }
+        Some(out)
+    }
+
     /// The physical address behind `addr` if its page is a *shared* page — one
     /// aliased across address spaces (`MAP_SHARED`, a SysV segment) — else
     /// `None`. This is what a process-shared futex is keyed by: two processes
