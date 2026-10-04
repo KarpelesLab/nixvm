@@ -2676,4 +2676,40 @@ mod tests {
         c.exec(0xC802_7C23, &mut m); // stxr w2, x3, [x1]
         assert_eq!(c.x[2], 1);
     }
+
+    /// Regressions from real programs: perl's `add d1, d1, d2` (scalar
+    /// integer ADD on a D register) and ripgrep's `uaddlp v5.8h, v5.16b`.
+    #[test]
+    fn scalar_add_and_uaddlp_from_real_programs() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[1] = (0xdead_u128 << 64) | u128::from(u64::MAX);
+        c.v[2] = 2;
+        assert!(matches!(c.exec(0x5EE2_8421, &mut m), Step::Next)); // add d1, d1, d2
+        assert_eq!(c.v[1], 1, "wraps, and the upper half is zeroed");
+        c.v[5] = u128::from_le_bytes([1, 2, 255, 255, 0, 0, 7, 9, 10, 20, 30, 40, 128, 128, 1, 0]);
+        assert!(matches!(c.exec(0x6E20_28A5, &mut m), Step::Next)); // uaddlp v5.8h, v5.16b
+        let lanes: Vec<u16> = (0..8).map(|i| (c.v[5] >> (16 * i)) as u16).collect();
+        assert_eq!(lanes, [3, 510, 0, 16, 30, 70, 256, 1]);
+    }
+
+    /// Regression from a Go binary's startup (yq): `sri v4.4s, v30.4s, #20`.
+    #[test]
+    fn sri_from_go_runtime() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[4] = 0xFFFF_FFFF_1234_5678_0000_0000_AAAA_AAAA;
+        c.v[30] = 0x8000_0000_FFFF_FFFF_1234_5678_0000_0001;
+        assert!(matches!(c.exec(0x6F2C_47C4, &mut m), Step::Next));
+        // Each lane keeps its top 20 bits and takes n >> 20 below them.
+        let expect = |d: u32, n: u32| (d & !(u32::MAX >> 20)) | (n >> 20);
+        let lanes: Vec<u32> = (0..4).map(|i| (c.v[4] >> (32 * i)) as u32).collect();
+        assert_eq!(
+            lanes,
+            [
+                expect(0xAAAA_AAAA, 1),
+                expect(0, 0x1234_5678),
+                expect(0x1234_5678, 0xFFFF_FFFF),
+                expect(0xFFFF_FFFF, 0x8000_0000)
+            ]
+        );
+    }
 }
