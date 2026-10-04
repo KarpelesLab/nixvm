@@ -33,6 +33,7 @@ mod fd;
 mod fs_ext;
 mod ipc;
 mod mem_syscalls;
+mod mqueue;
 mod net;
 mod path;
 mod poll;
@@ -2828,7 +2829,11 @@ impl Kernel {
             | Sysno::InotifyInit1
             | Sysno::InotifyInit
             | Sysno::Signalfd4
-            | Sysno::Signalfd => {
+            | Sysno::Signalfd
+            | Sysno::MqOpen
+            | Sysno::MqUnlink
+            | Sysno::MqNotify
+            | Sysno::MqGetsetattr => {
                 let mut pf = self.pollfds.lock().unwrap();
                 self.dispatch_pollfds(&mut pf, cx, sys, args, mem)
             }
@@ -2935,6 +2940,12 @@ impl Kernel {
             Sysno::Signalfd4 => {
                 self.sys_signalfd4(pf, cx, i64::from(args[0] as i32), args[1], args[3], mem)
             }
+            // POSIX message queues (see `mqueue.rs`); send/receive also signal
+            // and wake, so they run under `sh` instead.
+            Sysno::MqOpen => self.sys_mq_open(pf, cx, args, mem),
+            Sysno::MqUnlink => self.sys_mq_unlink(pf, args[0], mem),
+            Sysno::MqNotify => self.sys_mq_notify(pf, cx, args[0], args[1], mem),
+            Sysno::MqGetsetattr => self.sys_mq_getsetattr(pf, cx, args[0], args[1], args[2], mem),
             // Legacy x86-64 `signalfd(fd, mask, sizemask)`: signalfd4 with no flags.
             Sysno::Signalfd => {
                 self.sys_signalfd4(pf, cx, i64::from(args[0] as i32), args[1], 0, mem)
@@ -3237,6 +3248,8 @@ impl Kernel {
             Sysno::TimerGettime => self.sys_timer_gettime(sh, cx, args[0], args[1], mem),
             Sysno::TimerGetoverrun => self.sys_timer_getoverrun(sh, cx, args[0]),
             Sysno::TimerDelete => self.sys_timer_delete(sh, cx, args[0]),
+            Sysno::MqTimedsend => self.sys_mq_timedsend(sh, cx, args, mem),
+            Sysno::MqTimedreceive => self.sys_mq_timedreceive(sh, cx, args, mem),
             // System V IPC (see `ipc.rs`).
             Sysno::Msgget => self.sys_msgget(sh, cx, args[0], args[1]),
             Sysno::Msgsnd => self.sys_msgsnd(sh, cx, args, mem),
@@ -7166,6 +7179,19 @@ impl Kernel {
             ) => stat::char_device_attrs(),
             Some(Fd::PipeRead(_) | Fd::PipeWrite(_)) => stat::fifo_attrs(),
             Some(Fd::Socket { .. }) => stat::socket_attrs(),
+            // A message queue is a regular file on the mqueue filesystem.
+            Some(Fd::Mqueue { q, .. }) => Attrs {
+                kind: NodeKind::File,
+                size: 0,
+                mode: 0o100_600,
+                uid: 0,
+                gid: 0,
+                atime: 0,
+                mtime: 0,
+                inode: 0x4d51_0000 + *q as u64,
+                nlink: 1,
+                rdev: 0,
+            },
             None => return err(Errno::EBADF),
         };
         write_stat_or_fault(mem, statbuf, &attrs, self.arch)

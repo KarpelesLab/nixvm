@@ -51,6 +51,10 @@ pub(super) struct PollFds {
     pub(super) signalfds: Vec<SignalFdInst>,
     /// `CLONE_PIDFD` process descriptors, indexed by [`Fd::Pidfd`].
     pub(super) pidfds: Vec<PidfdInst>,
+    /// POSIX message queues, indexed by [`Fd::Mqueue`]'s `q`.
+    pub(super) mqueues: Vec<super::mqueue::MqInst>,
+    /// The message-queue namespace: name (without the leading `/`) → queue.
+    pub(super) mq_names: BTreeMap<String, usize>,
 }
 
 /// One `CLONE_PIDFD` process descriptor: the pid it refers to and whether that
@@ -361,6 +365,8 @@ impl Kernel {
                     0
                 }
             }
+            // A message queue: readable with a message, writable with room.
+            Fd::Mqueue { q, .. } => pf.mq_ready(q),
             // Nested epoll readiness is not modeled.
             Fd::Epoll(_) => 0,
             // Pseudo-terminal ends — `ptys` is the innermost lock (after

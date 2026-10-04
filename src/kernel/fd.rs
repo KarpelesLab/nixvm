@@ -54,6 +54,12 @@ pub enum Fd {
     PtyMaster(usize),
     /// A slave end of pseudo-terminal `index` (`/dev/pts/index`).
     PtySlave(usize),
+    /// A POSIX message-queue descriptor (`mq_open`): queue `q` in the poll
+    /// subsystem's table, opened with `flags` (`O_ACCMODE | O_NONBLOCK`).
+    Mqueue {
+        q: usize,
+        flags: u64,
+    },
 }
 
 /// Maps small integer descriptors to [`Fd`]s, allocating the lowest free number.

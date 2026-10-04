@@ -647,6 +647,7 @@ fn fd_link_target(fd: &Fd) -> String {
         Fd::Epoll(_) => "anon_inode:[eventpoll]".to_string(),
         Fd::PtyMaster(_) => "/dev/ptmx".to_string(),
         Fd::PtySlave(i) => format!("/dev/pts/{i}"),
+        Fd::Mqueue { q, .. } => format!("mqueue:[{q}]"),
     }
 }
 
