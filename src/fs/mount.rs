@@ -279,6 +279,15 @@ impl MountTable {
         fs.symlink(target, &rel)
     }
 
+    /// The mount point whose backend serves `abs_path` (after resolving the
+    /// symlinks among its directories) — what `RESOLVE_NO_XDEV` and
+    /// `st_dev`-style "same filesystem?" checks compare.
+    pub fn mount_point_of(&mut self, abs_path: &str) -> Option<String> {
+        let abs = self.canonical(abs_path);
+        let i = self.best_mount(&abs)?;
+        Some(self.mounts[i].point.clone())
+    }
+
     /// Extended attribute `name` of the node at `abs_path` (see
     /// [`MountFs::getxattr`]). Like the other per-node operations the final
     /// component is not followed — the kernel decides follow vs. no-follow.

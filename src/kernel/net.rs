@@ -2363,6 +2363,26 @@ impl Kernel {
         let _ = mem.write(msg + 40, &(cmsg_len as u64).to_le_bytes());
     }
 
+    /// Receive up to `cap` bytes from socket `fd` into a host `Vec` — the
+    /// byte-level `recv` that `splice` (socket → pipe) needs. Any SCM_RIGHTS
+    /// fds riding the bytes are released (a splice carries no ancillary data,
+    /// like a plain `read`). An empty `Ok` with `cx.block` set means "would
+    /// block"; an empty `Ok` without it is EOF.
+    pub(super) fn recv_fd_bytes(
+        &self,
+        net: &mut Net,
+        cx: &mut ServiceCtx,
+        fd: u64,
+        cap: u64,
+        flags: u64,
+    ) -> Result<Vec<u8>, i64> {
+        let (_, data, _, fds) = self.recv_message(net, cx, fd, cap, flags)?;
+        for f in &fds {
+            self.scm_ref(net, f, false);
+        }
+        Ok(data)
+    }
+
     /// Receive one message's bytes (up to `cap`) from socket `fd` into a host
     /// `Vec`, returning the source address (datagram) and out `msg_flags`. The
     /// shared core of `recvmsg`, factored out of `recvfrom` so both can drive

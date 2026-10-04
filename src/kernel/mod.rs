@@ -36,6 +36,7 @@ mod path;
 mod poll;
 mod pty;
 mod signal;
+mod splice;
 mod stat;
 mod sys_misc;
 #[cfg(test)]
@@ -2614,6 +2615,13 @@ impl Kernel {
             Sysno::Read => self.sys_read(cx, args[0], args[1], args[2], mem),
             Sysno::Readv => self.sys_readv(cx, args[0], args[1], args[2], mem),
             Sysno::Writev => self.sys_writev(cx, args[0], args[1], args[2], mem),
+            // Self-locking: these move bytes between two fds of arbitrary kinds
+            // and take the non-pipe side's lock, then `pipes`, themselves.
+            Sysno::Splice => self.sys_splice(cx, args, mem),
+            Sysno::Tee => self.sys_tee(cx, args[0], args[1], args[2], args[3]),
+            Sysno::Vmsplice => self.sys_vmsplice(cx, args[0], args[1], args[2], args[3], mem),
+            Sysno::Preadv2 => self.sys_rwv2(cx, args, false, mem),
+            Sysno::Pwritev2 => self.sys_rwv2(cx, args, true, mem),
             // both: sh THEN vfs, held together for atomicity.
             Sysno::Mmap => {
                 let mut sh = self.shared.lock().unwrap();
@@ -2702,7 +2710,9 @@ impl Kernel {
             | Sysno::Removexattr
             | Sysno::Lremovexattr
             | Sysno::Fremovexattr
-            | Sysno::Removexattrat => {
+            | Sysno::Removexattrat
+            | Sysno::Openat2
+            | Sysno::Cachestat => {
                 let mut vfs = self.vfs.lock().unwrap();
                 self.dispatch_vfs(&mut vfs, cx, sys, args, mem)
             }
@@ -2889,6 +2899,18 @@ impl Kernel {
                 self.sys_openat(vfs, cx, args[0] as i64, args[1], args[2], args[3], mem)
             }
             Sysno::Open => self.sys_openat(vfs, cx, AT_FDCWD, args[0], args[1], args[2], mem),
+            Sysno::Openat2 => self.sys_openat2(
+                vfs,
+                cx,
+                i64::from(args[0] as i32),
+                args[1],
+                args[2],
+                args[3],
+                mem,
+            ),
+            Sysno::Cachestat => {
+                self.sys_cachestat(vfs, cx, args[0], args[1], args[2], args[3], mem)
+            }
             Sysno::Creat => {
                 const O_WRONLY_CREAT_TRUNC: u64 = 0o1101;
                 self.sys_openat(
@@ -6513,20 +6535,13 @@ impl Kernel {
         mode: u64,
         mem: &GuestMemory,
     ) -> i64 {
-        const O_CREAT: u64 = 0o100;
-        const O_EXCL: u64 = 0o200;
-        const O_TRUNC: u64 = 0o1000;
         const O_TMPFILE: u64 = 0o20000000; // the __O_TMPFILE bit (both arches)
-        // O_DIRECTORY/O_NOFOLLOW are arch-specific: arm64 (asm-generic) uses
+        // (O_DIRECTORY/O_NOFOLLOW are arch-specific: arm64 (asm-generic) uses
         // 0o40000/0o100000, and its 0o200000/0o400000 are O_DIRECT/O_LARGEFILE
         // — the x86-64 values. musl ORs O_LARGEFILE into every open, so using
         // the x86 values for an arm64 guest made every open through a symlink
-        // fail with ELOOP (e.g. the dynamic linker loading libz.so.1).
-        let (o_directory, o_nofollow): (u64, u64) = match self.arch {
-            Arch::X86_64 => (0o200000, 0o400000),
-            Arch::Aarch64 => (0o40000, 0o100000),
-        };
-        const O_ACCMODE: u64 = 0o3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+        // fail with ELOOP (e.g. the dynamic linker loading libz.so.1). See
+        // `open_path`.)
 
         // Anonymous temp files (O_TMPFILE) need inode-based fds; nixvm's are
         // path-based, so a real backing file would be lost. Report "unsupported"
@@ -6539,9 +6554,33 @@ impl Kernel {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
+        self.open_path(vfs, cx, dirfd, &rel, flags, mode)
+    }
+
+    /// The body of [`Self::sys_openat`] once the path is in hand: resolve `rel`
+    /// against `dirfd` and open it. Shared with `openat2`, which resolves the
+    /// path itself (to apply its `RESOLVE_*` restrictions) and passes the
+    /// result here as an absolute path.
+    pub(super) fn open_path(
+        &self,
+        vfs: &mut MountTable,
+        cx: &mut ServiceCtx,
+        dirfd: i64,
+        rel: &str,
+        flags: u64,
+        mode: u64,
+    ) -> i64 {
+        const O_CREAT: u64 = 0o100;
+        const O_EXCL: u64 = 0o200;
+        const O_TRUNC: u64 = 0o1000;
+        let (o_directory, o_nofollow): (u64, u64) = match self.arch {
+            Arch::X86_64 => (0o200000, 0o400000),
+            Arch::Aarch64 => (0o40000, 0o100000),
+        };
+        const O_ACCMODE: u64 = 0o3;
         // A trailing slash on the guest path demands a directory target.
         let had_slash = rel.len() > 1 && rel.ends_with('/');
-        let resolved = self.resolve_path(cx, dirfd, &rel);
+        let resolved = self.resolve_path(cx, dirfd, rel);
         // O_NOFOLLOW: if the final component is itself a symlink, fail with ELOOP
         // rather than following it (a security check `open`ers rely on). Checked
         // against the *unfollowed* path; intermediate symlinks still resolve.
