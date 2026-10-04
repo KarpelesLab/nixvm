@@ -62,6 +62,10 @@ pub use fd::{Fd, FdTable, FileOffset};
 use net::Net;
 use poll::{EventFdInst, PidfdInst, PollFds};
 
+/// The most one `read`/`write` transfers (`MAX_RW_COUNT`, `INT_MAX` rounded
+/// down to a page); larger requests are short transfers, as on Linux.
+const MAX_RW_COUNT: u64 = 0x7fff_f000;
+
 /// `dirfd` value meaning "resolve relative to the current working directory".
 const AT_FDCWD: i64 = -100;
 /// Max symlink hops before `ELOOP` (matches Linux's `MAXSYMLINKS`).
@@ -5591,17 +5595,50 @@ impl Kernel {
         if !readable {
             return err(Errno::EBADF); // fd opened O_WRONLY
         }
-        let mut tmp = vec![0u8; count as usize];
-        match self.vfs_read(vfs, &path, ofs.get(), &mut tmp) {
-            Ok(n) => {
-                if mem.write(buf, &tmp[..n]).is_err() {
-                    return err(Errno::EFAULT);
-                }
-                ofs.add(n as u64);
-                n as i64
-            }
-            Err(e) => io_errno(&e),
+        let r = self.read_file_chunked(vfs, &path, ofs.get(), buf, count, mem);
+        if r > 0 {
+            ofs.add(r as u64);
         }
+        r
+    }
+
+    /// Read up to `count` bytes of `path` at `off` into guest `buf`, in
+    /// bounded host chunks (a guest asking for `SSIZE_MAX` bytes must not
+    /// make the host allocate that), stopping at EOF. Returns the bytes read,
+    /// `EFAULT` if the buffer faults before anything was read.
+    fn read_file_chunked(
+        &self,
+        vfs: &mut MountTable,
+        path: &str,
+        off: u64,
+        buf: u64,
+        count: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        const CHUNK: u64 = 1 << 20;
+        let count = count.min(MAX_RW_COUNT);
+        let mut total = 0u64;
+        while total < count {
+            let want = (count - total).min(CHUNK);
+            let mut tmp = vec![0u8; want as usize];
+            let n = match self.vfs_read(vfs, path, off + total, &mut tmp) {
+                Ok(n) => n,
+                Err(e) if total == 0 => return io_errno(&e),
+                Err(_) => break,
+            };
+            if mem.write(buf + total, &tmp[..n]).is_err() {
+                return if total > 0 {
+                    total as i64
+                } else {
+                    err(Errno::EFAULT)
+                };
+            }
+            total += n as u64;
+            if (n as u64) < want {
+                break; // EOF
+            }
+        }
+        total as i64
     }
 
     /// The non-`File`, non-`Socket`, non-`PipeRead`, non-`Eventfd`/`Timerfd`
@@ -5640,7 +5677,7 @@ impl Kernel {
                 n as i64
             }
             Some(Fd::Stdin) => {
-                let mut tmp = vec![0u8; count as usize];
+                let mut tmp = vec![0u8; count.min(1 << 20) as usize];
                 match sh.stdin.read(&mut tmp) {
                     Ok(n) => {
                         if mem.write(buf, &tmp[..n]).is_err() {
@@ -5735,16 +5772,7 @@ impl Kernel {
         if !readable {
             return err(Errno::EBADF); // fd opened O_WRONLY
         }
-        let mut tmp = vec![0u8; count as usize];
-        match self.vfs_read(vfs, &path, offset, &mut tmp) {
-            Ok(n) => {
-                if mem.write(buf, &tmp[..n]).is_err() {
-                    return err(Errno::EFAULT);
-                }
-                n as i64
-            }
-            Err(e) => io_errno(&e),
-        }
+        self.read_file_chunked(vfs, &path, offset, buf, count, mem)
     }
 
     /// `pwrite64(fd, buf, count, offset)` — write at `offset` without moving
@@ -5967,7 +5995,10 @@ impl Kernel {
         if !readable {
             return err(Errno::EBADF); // source opened O_WRONLY
         }
-        let mut buf = vec![0u8; count as usize];
+        // No more than the source holds past `start` (callers commonly pass
+        // SIZE_MAX), and no more than MAX_RW_COUNT.
+        let avail = vfs.stat(&path).map_or(0, |a| a.size.saturating_sub(start));
+        let mut buf = vec![0u8; count.min(avail).min(MAX_RW_COUNT) as usize];
         let n = match self.vfs_read(vfs, &path, start, &mut buf) {
             Ok(n) => n,
             Err(e) => return io_errno(&e),
@@ -6048,7 +6079,11 @@ impl Kernel {
         } else {
             in_pos
         };
-        let mut buf = vec![0u8; len as usize];
+        // coreutils `cp` passes SIZE_MAX: bound by what the source holds.
+        let avail = vfs
+            .stat(&in_path)
+            .map_or(0, |a| a.size.saturating_sub(in_off));
+        let mut buf = vec![0u8; len.min(avail).min(MAX_RW_COUNT) as usize];
         let n = match self.vfs_read(vfs, &in_path, in_off, &mut buf) {
             Ok(n) => n,
             Err(e) => return io_errno(&e),
@@ -7700,7 +7735,10 @@ impl Kernel {
             // Fill the mapping from the file: a zero-initialized page-sized
             // buffer, with the file's bytes (from `offset`, up to EOF) copied
             // over the front; the tail past EOF stays zero, as mmap requires.
-            let mut data = vec![0u8; len as usize];
+            // Only the file's bytes need a host buffer; the mapping's pages
+            // past EOF are already zero.
+            let file_len = vfs.stat(&path).map_or(0, |a| a.size.saturating_sub(offset));
+            let mut data = vec![0u8; len.min(file_len) as usize];
             let mut got = 0usize;
             while got < data.len() {
                 match vfs.read_at(&path, offset + got as u64, &mut data[got..]) {
@@ -7874,7 +7912,8 @@ impl Kernel {
         {
             return err(Errno::EINVAL);
         }
-        let len = len.min(i32::MAX as u64);
+        // Linux returns at most 32 MiB - 1 per call.
+        let len = len.min((1 << 25) - 1);
         if sh.rng_state == 0 {
             let now = match crate::clock::now_unix().as_nanos() as u64 {
                 0 => 0x9E37_79B9_7F4A_7C15,

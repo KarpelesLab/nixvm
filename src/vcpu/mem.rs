@@ -803,6 +803,10 @@ impl GuestMemory {
 
     /// Read `len` bytes into a fresh `Vec` (requires `READ`).
     pub fn read_vec(&self, addr: u64, len: usize) -> Result<Vec<u8>, MemError> {
+        // Validate before allocating: a guest-supplied length (a write of
+        // SSIZE_MAX bytes from a bogus pointer) must fault, not make the host
+        // try to allocate it.
+        self.check(addr, len, Prot::READ)?;
         let mut v = vec![0u8; len];
         self.read(addr, &mut v)?;
         Ok(v)

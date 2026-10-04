@@ -1211,4 +1211,100 @@ mod tests {
             e(Errno::EINVAL)
         );
     }
+
+    #[test]
+    fn huge_counts_are_bounded_not_allocated() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let (path, buf) = (BASE, BASE + 0x1000);
+        put_str(&mut mem, path, "/small");
+        let fd = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Openat,
+            [AT_FDCWD, path, 0o102, 0o644, 0, 0],
+        ) as u64;
+        mem.write(buf, b"tiny").unwrap();
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Pwrite64,
+                [fd, buf, 4, 0, 0, 0]
+            ),
+            4
+        );
+        // read(fd, buf, SSIZE_MAX) on a 4-byte file: 4, without trying to
+        // allocate SSIZE_MAX host bytes.
+        let huge = i64::MAX as u64;
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Read,
+                [fd, buf, huge, 0, 0, 0]
+            ),
+            4
+        );
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Pread64,
+                [fd, buf, huge, 0, 0, 0]
+            ),
+            4
+        );
+        // write of a huge count from memory that isn't there: EFAULT.
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [fd, buf, huge, 0, 0, 0]
+            ),
+            e(Errno::EFAULT)
+        );
+        // copy_file_range with SIZE_MAX copies what there is.
+        put_str(&mut mem, path, "/dst");
+        let d = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Openat,
+            [AT_FDCWD, path, 0o102, 0o644, 0, 0],
+        ) as u64;
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Lseek,
+                [fd, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::CopyFileRange,
+                [fd, 0, d, 0, u64::MAX >> 1, 0]
+            ),
+            4
+        );
+    }
 }
