@@ -2992,6 +2992,15 @@ fn write_sockaddr(
                 port: 0,
                 ip: [0; 16],
             }),
+            // Netlink replies come from the kernel: a full `sockaddr_nl`
+            // (family, pad, nl_pid 0 = the kernel, nl_groups 0). busybox `ip`
+            // rejects anything but its 12-byte size ("sender address length
+            // == 2").
+            AF_NETLINK => {
+                let mut b = vec![0u8; 12];
+                b[0..2].copy_from_slice(&AF_NETLINK.to_le_bytes());
+                b
+            }
             _ => domain.to_le_bytes().to_vec(),
         },
     };
