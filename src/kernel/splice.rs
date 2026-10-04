@@ -161,7 +161,7 @@ impl Kernel {
                     }
                     let n = (len as usize).min(pipes[i].buf.len());
                     let data: Vec<u8> = pipes[i].buf.iter().take(n).copied().collect();
-                    let w = match vfs.write_at(&path, pos, &data) {
+                    let w = match self.vfs_write(&mut vfs, &path, pos, &data) {
                         Ok(w) => w,
                         Err(e) => return io_errno(&e),
                     };
@@ -230,7 +230,7 @@ impl Kernel {
                             return err(Errno::EPIPE);
                         }
                         let mut buf = vec![0u8; cap];
-                        let n = match vfs.read_at(&path, pos, &mut buf) {
+                        let n = match self.vfs_read(&mut vfs, &path, pos, &mut buf) {
                             Ok(n) => n,
                             Err(e) => return io_errno(&e),
                         };

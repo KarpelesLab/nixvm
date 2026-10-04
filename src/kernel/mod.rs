@@ -36,6 +36,7 @@ mod ipc;
 mod mem_syscalls;
 mod mqueue;
 mod net;
+mod pagecache;
 mod path;
 mod poll;
 mod procx;
@@ -1209,6 +1210,9 @@ pub struct Kernel {
     /// A leaf lock: nothing else is ever acquired while it is held, so any
     /// handler may record into it whatever locks it already holds.
     unsupported_sub: Mutex<BTreeMap<(&'static str, u64), u64>>,
+    /// The page cache behind `MAP_SHARED` file mappings (see [`pagecache`]).
+    /// A leaf lock taken after `vfs`; nothing is acquired while it is held.
+    page_cache: Mutex<pagecache::PageCache>,
 }
 
 /// All kernel state mutated while a syscall is serviced, behind [`Kernel`]'s
@@ -1523,6 +1527,7 @@ impl Kernel {
             pollfds: Mutex::new(PollFds::default()),
             ptys: Mutex::new(pty::Ptys::default()),
             unsupported_sub: Mutex::new(BTreeMap::new()),
+            page_cache: Mutex::new(pagecache::PageCache::default()),
             shared: Mutex::new(Shared {
                 stdin: Box::new(std::io::stdin()),
                 stdout: Box::new(std::io::stdout()),
@@ -4114,6 +4119,7 @@ impl Kernel {
         // their frames to the shared pool) and rebuild within the SAME pool, so
         // the one KVM memslot stays valid and the process just gets a new cr3.
         mem.exec_reset();
+        self.pc_gc(mem);
         let loaded = if let Some(interp) = interp_path(&elf) {
             let Some(interp_elf) = self.read_file(vfs, &interp) else {
                 return err(Errno::ENOENT); // interpreter missing
@@ -4723,6 +4729,7 @@ impl Kernel {
         if !self.has_cowaiter(sh, mm) {
             sh.ipc.detach_mm(mm, mem);
             mem.release();
+            self.pc_gc(mem);
         }
         // The thread group's last task applies its SEM_UNDO adjustments (and
         // wakes anyone those unblock).
@@ -5079,7 +5086,7 @@ impl Kernel {
         } else {
             offset
         };
-        match vfs.write_at(&path, write_off, &data) {
+        match self.vfs_write(vfs, &path, write_off, &data) {
             Ok(n) => {
                 if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32) {
                     *offset = write_off + n as u64;
@@ -5379,7 +5386,7 @@ impl Kernel {
             return err(Errno::EBADF); // fd opened O_WRONLY
         }
         let mut tmp = vec![0u8; count as usize];
-        match vfs.read_at(&path, offset, &mut tmp) {
+        match self.vfs_read(vfs, &path, offset, &mut tmp) {
             Ok(n) => {
                 if mem.write(buf, &tmp[..n]).is_err() {
                     return err(Errno::EFAULT);
@@ -5525,7 +5532,7 @@ impl Kernel {
             return err(Errno::EBADF); // fd opened O_WRONLY
         }
         let mut tmp = vec![0u8; count as usize];
-        match vfs.read_at(&path, offset, &mut tmp) {
+        match self.vfs_read(vfs, &path, offset, &mut tmp) {
             Ok(n) => {
                 if mem.write(buf, &tmp[..n]).is_err() {
                     return err(Errno::EFAULT);
@@ -5558,7 +5565,7 @@ impl Kernel {
         let Ok(data) = mem.read_vec(buf, count as usize) else {
             return err(Errno::EFAULT);
         };
-        match vfs.write_at(&path, offset, &data) {
+        match self.vfs_write(vfs, &path, offset, &data) {
             Ok(n) => n as i64,
             Err(e) => io_errno(&e),
         }
@@ -5645,7 +5652,7 @@ impl Kernel {
         if !writable {
             return err(Errno::EBADF); // ftruncate needs an fd open for writing
         }
-        match vfs.truncate(&path, len) {
+        match self.vfs_truncate(vfs, &path, len) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
         }
@@ -5664,7 +5671,7 @@ impl Kernel {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(cx, AT_FDCWD, &rel);
-        match vfs.truncate(&abs, len) {
+        match self.vfs_truncate(vfs, &abs, len) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
         }
@@ -5704,7 +5711,7 @@ impl Kernel {
                 return 0;
             }
             let zeros = vec![0u8; (end - offset) as usize];
-            return match vfs.write_at(&path, offset, &zeros) {
+            return match self.vfs_write(vfs, &path, offset, &zeros) {
                 Ok(_) => 0,
                 Err(e) => io_errno(&e),
             };
@@ -5757,7 +5764,7 @@ impl Kernel {
             return err(Errno::EBADF); // source opened O_WRONLY
         }
         let mut buf = vec![0u8; count as usize];
-        let n = match vfs.read_at(&path, start, &mut buf) {
+        let n = match self.vfs_read(vfs, &path, start, &mut buf) {
             Ok(n) => n,
             Err(e) => return io_errno(&e),
         };
@@ -5767,7 +5774,7 @@ impl Kernel {
             Some(Fd::File {
                 writable: false, ..
             }) => err(Errno::EBADF), // out fd is O_RDONLY
-            Some(Fd::File { path, offset, .. }) => match vfs.write_at(&path, offset, &buf) {
+            Some(Fd::File { path, offset, .. }) => match self.vfs_write(vfs, &path, offset, &buf) {
                 Ok(w) => {
                     if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(out_fd as i32) {
                         *offset += w as u64;
@@ -5837,7 +5844,7 @@ impl Kernel {
             in_pos
         };
         let mut buf = vec![0u8; len as usize];
-        let n = match vfs.read_at(&in_path, in_off, &mut buf) {
+        let n = match self.vfs_read(vfs, &in_path, in_off, &mut buf) {
             Ok(n) => n,
             Err(e) => return io_errno(&e),
         };
@@ -5859,7 +5866,7 @@ impl Kernel {
         } else {
             out_pos
         };
-        let w = match vfs.write_at(&out_path, out_off, &buf) {
+        let w = match self.vfs_write(vfs, &out_path, out_off, &buf) {
             Ok(w) => w,
             Err(e) => return io_errno(&e),
         };
@@ -6775,7 +6782,7 @@ impl Kernel {
                 return err(Errno::EEXIST);
             }
             Some(_) if flags & O_TRUNC != 0 => {
-                let _ = vfs.truncate(&abs, 0);
+                let _ = self.vfs_truncate(vfs, &abs, 0);
             }
             Some(_) => {}
         }
@@ -7336,12 +7343,15 @@ impl Kernel {
     /// `mmap(addr, len, prot, flags, fd, off)`.
     ///
     /// Anonymous mappings carve from the downward-growing arena (or land at a
-    /// `MAP_FIXED` address). File-backed mappings additionally copy the file's
-    /// bytes from `off` into the fresh, zero-filled region — the mechanism the
-    /// dynamic linker uses to map `ld-musl` and the shared libraries. We give
-    /// every file mapping private (copy) semantics: `MAP_SHARED` writes are not
-    /// flushed back to the backing file (documented limitation), which is
-    /// correct for the read-only/executable maps loaders create.
+    /// `MAP_FIXED` address). A private (`MAP_PRIVATE`) file mapping copies the
+    /// file's bytes from `off` into the fresh, zero-filled region — the
+    /// mechanism the dynamic linker uses to map `ld-musl` and the shared
+    /// libraries. A `MAP_SHARED` file mapping instead maps the file's pages
+    /// from the shared page cache ([`pagecache`]), so every mapper — and a
+    /// fork child — shares one copy that `read`/`write` stay coherent with; a
+    /// writable one is also written back to the file on `munmap`/`msync`/exit.
+    /// `MAP_SHARED` of `/dev/zero` is a fresh shared anonymous region, as on
+    /// Linux.
     #[allow(clippy::unused_self)]
     fn sys_mmap(
         &self,
@@ -7370,6 +7380,10 @@ impl Kernel {
         // fd fails before we disturb the address space.
         let file_src = if flags & MAP_ANONYMOUS == 0 {
             match cx.cur.fds.get(fd as i32) {
+                // A shared mapping of /dev/zero is anonymous shared memory.
+                Some(Fd::File { path, .. }) if path == "/dev/zero" && flags & MAP_SHARED != 0 => {
+                    None
+                }
                 Some(Fd::File { path, .. }) => Some(path.clone()),
                 Some(_) => return err(Errno::EACCES), // mmap of pipe/socket/dir
                 None => return err(Errno::EBADF),
@@ -7377,6 +7391,9 @@ impl Kernel {
         } else {
             None
         };
+        if file_src.is_some() && !offset.is_multiple_of(PAGE_SIZE) {
+            return err(Errno::EINVAL);
+        }
 
         let noreplace = flags & MAP_FIXED_NOREPLACE != 0 && addr != 0;
         let base = if (flags & MAP_FIXED != 0 || noreplace) && addr != 0 {
@@ -7409,6 +7426,23 @@ impl Kernel {
         // copy-on-write copy. Everything else is an ordinary (demand-paged) map.
         let shared_anon =
             file_src.is_none() && flags & MAP_SHARED != 0 && prot.contains(Prot::WRITE);
+        // A shared file mapping maps the page cache's frames for the file.
+        if flags & MAP_SHARED != 0
+            && let Some(path) = file_src
+        {
+            if let Err(e) = self.pc_map_shared(vfs, mem, &path, offset, base, len, prot) {
+                return e;
+            }
+            if prot.contains(Prot::WRITE) {
+                cx.cur.shared_maps.push(SharedMap {
+                    base,
+                    len,
+                    path,
+                    offset,
+                });
+            }
+            return base as i64;
+        }
         let mapped = if shared_anon {
             mem.map_shared_anon(base, len, prot)
         } else {
@@ -7430,20 +7464,12 @@ impl Kernel {
                     _ => break, // EOF or read error: leave the rest zero-filled
                 }
             }
+            // A private mapping snapshots the file as a reader would see it.
+            self.pc_after_read(vfs, &path, offset, &mut data[..got]);
             // write_init bypasses page protection, so a read/exec-only mapping
             // (the common code-segment case) is still populated correctly.
             if mem.write_init(base, &data).is_err() {
                 return err(Errno::ENOMEM);
-            }
-            // A writable MAP_SHARED file mapping must have the guest's later
-            // stores flushed back to the file (on munmap/msync/exit).
-            if flags & MAP_SHARED != 0 && prot.contains(Prot::WRITE) {
-                cx.cur.shared_maps.push(SharedMap {
-                    base,
-                    len,
-                    path,
-                    offset,
-                });
             }
         }
         base as i64
@@ -7521,8 +7547,10 @@ impl Kernel {
             self.flush_shared_maps(&mut vfs, cx, base, len, mem);
         }
         let _ = mem.unmap(base, len);
-        // Unmapping a SysV shared-memory attachment detaches it.
+        // Unmapping a SysV shared-memory attachment detaches it, and a shared
+        // file page nobody maps any more leaves the page cache.
         sh.ipc.unmapped(cx.cur.mm, base, len, mem);
+        self.pc_gc(mem);
         // Give the range back to the arena so it can be handed out again — a
         // guest that cycles mappings (a JS engine's JIT/heap blocks) would
         // otherwise exhaust the arena while most of it sat free.

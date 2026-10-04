@@ -464,23 +464,12 @@ impl GuestMemory {
         }
     }
 
-    /// Read `buf.len()` bytes at byte `off` of the frame list `frames` (one
-    /// frame per page, as [`Self::alloc_frames`] returns) straight from the
-    /// pool, with no address space involved.
-    pub fn read_frames(&self, frames: &[u64], off: u64, buf: &mut [u8]) {
-        let mut done = 0usize;
-        while done < buf.len() {
-            let cur = off + done as u64;
-            let Some(&frame) = frames.get((cur / PAGE_SIZE) as usize) else {
-                buf[done..].fill(0);
-                return;
-            };
-            let in_page = (cur % PAGE_SIZE) as usize;
-            let n = (buf.len() - done).min(PS - in_page);
-            self.phys
-                .read(frame + in_page as u64, &mut buf[done..done + n]);
-            done += n;
-        }
+    /// How many owners hold `frame` right now — every mapping of it plus any
+    /// outside owner (a SysV segment, the shared-file page cache). An outside
+    /// owner seeing 1 knows no address space maps the frame any more.
+    #[must_use]
+    pub fn frame_refcount(&self, frame: u64) -> u32 {
+        self.fa.lock().unwrap().refcount(frame)
     }
 
     /// The physical address behind `addr` if its page is a *shared* page — one
