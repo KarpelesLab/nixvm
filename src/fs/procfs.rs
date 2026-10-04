@@ -497,6 +497,9 @@ pub struct ProcData {
     /// Raw `self/auxv` bytes (pairs of `(type, value)` `u64`s on a real
     /// kernel); empty is a valid, minimal rendering.
     pub auxv: Vec<u8>,
+    /// The guest architecture `cpuinfo` describes; `None` until the kernel
+    /// says (then the build's own architecture is assumed).
+    pub arch: Option<crate::abi::Arch>,
 }
 
 impl Default for ProcData {
@@ -519,6 +522,7 @@ impl Default for ProcData {
             fds: Vec::new(),
             nproc: 1,
             auxv: Vec::new(),
+            arch: None,
         }
     }
 }
@@ -536,6 +540,10 @@ pub struct ProcSelf {
     pub ppid: u32,
     /// Open descriptors as `(fd number, symlink target)`, backing `self/fd/`.
     pub fds: Vec<(u32, String)>,
+    /// The task's saved auxiliary vector (`self/auxv`).
+    pub auxv: Vec<u8>,
+    /// The guest architecture (selects the `cpuinfo` shape and features).
+    pub arch: Option<crate::abi::Arch>,
 }
 
 /// The synthesized `/proc` backend.
@@ -585,6 +593,10 @@ impl ProcFs {
         d.pid = live.pid;
         d.ppid = live.ppid;
         d.fds = live.fds;
+        d.auxv = live.auxv;
+        if live.arch.is_some() {
+            d.arch = live.arch;
+        }
         d.argv0 = d
             .cmdline
             .split(|&b| b == 0)
@@ -617,7 +629,9 @@ impl ProcFs {
     /// regular file (a directory, a symlink, or unknown).
     fn content(&self, rel: &str) -> Option<Vec<u8>> {
         match rel {
-            "cpuinfo" => return Some(cpuinfo_body(self.data.nproc).into_bytes()),
+            "cpuinfo" => {
+                return Some(cpuinfo_body(self.data.nproc, self.data.arch).into_bytes());
+            }
             "stat" => return Some(stat_body(self.data.nproc).into_bytes()),
             _ => {}
         }
@@ -762,20 +776,119 @@ fn static_content(rel: &str) -> Option<&'static [u8]> {
 
 /// Render `cpuinfo`, one block per core, matching the injected `nproc`
 /// (never fewer than one core).
-fn cpuinfo_body(nproc: usize) -> String {
+fn cpuinfo_body(nproc: usize, arch: Option<crate::abi::Arch>) -> String {
+    let arch = arch.unwrap_or(if cfg!(target_arch = "x86_64") {
+        crate::abi::Arch::X86_64
+    } else {
+        crate::abi::Arch::Aarch64
+    });
     let mut out = String::new();
     for i in 0..nproc.max(1) {
-        write_cpuinfo_block(&mut out, i);
+        write_cpuinfo_block(&mut out, i, arch);
     }
     out
 }
 
-/// Append one core's block to `cpuinfo`. The fields track the build's own
-/// target architecture — the ISA nixvm's interpreter actually executes on —
-/// falling back to the aarch64 shape (matching this backend's long-standing
-/// default) on anything else.
-fn write_cpuinfo_block(out: &mut String, i: usize) {
-    if cfg!(target_arch = "x86_64") {
+/// arm64 `/proc/cpuinfo` feature names, indexed by `AT_HWCAP` bit
+/// (`hwcap_str[]` in `arch/arm64/kernel/cpuinfo.c`).
+const AARCH64_HWCAP_NAMES: [&str; 32] = [
+    "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32", "atomics", "fphp",
+    "asimdhp", "cpuid", "asimdrdm", "jscvt", "fcma", "lrcpc", "dcpop", "sha3", "sm3", "sm4",
+    "asimddp", "sha512", "sve", "asimdfhm", "dit", "uscat", "ilrcpc", "flagm", "ssbs", "sb",
+    "paca", "pacg",
+];
+
+/// arm64 `/proc/cpuinfo` feature names, indexed by `AT_HWCAP2` bit.
+const AARCH64_HWCAP2_NAMES: [&str; 64] = [
+    "dcpodp",
+    "sve2",
+    "sveaes",
+    "svepmull",
+    "svebitperm",
+    "svesha3",
+    "svesm4",
+    "flagm2",
+    "frint",
+    "svei8mm",
+    "svef32mm",
+    "svef64mm",
+    "svebf16",
+    "i8mm",
+    "bf16",
+    "dgh",
+    "rng",
+    "bti",
+    "mte",
+    "ecv",
+    "afp",
+    "rpres",
+    "mte3",
+    "sme",
+    "smei16i64",
+    "smef64f64",
+    "smei8i32",
+    "smef16f32",
+    "smeb16f32",
+    "smef32f32",
+    "smefa64",
+    "wfxt",
+    "ebf16",
+    "sveebf16",
+    "cssc",
+    "rprfm",
+    "sve2p1",
+    "sme2",
+    "sme2p1",
+    "smei16i32",
+    "smebi32i32",
+    "smeb16b16",
+    "smef16f16",
+    "mops",
+    "hbc",
+    "sveb16b16",
+    "lrcpc3",
+    "lse128",
+    "fpmr",
+    "lut",
+    "faminmax",
+    "f8cvt",
+    "f8fma",
+    "f8dp4",
+    "f8dp2",
+    "f8e4m3",
+    "f8e5m2",
+    "smelutv2",
+    "smef8f16",
+    "smef8f32",
+    "smesf8fma",
+    "smesf8dp4",
+    "smesf8dp2",
+    "poe",
+];
+
+/// The arm64 `Features` line: every capability the loader puts in
+/// `AT_HWCAP`/`AT_HWCAP2` (see [`crate::loader::hwcaps`]), named as Linux
+/// names them, in Linux's order.
+fn aarch64_features() -> String {
+    let (hwcap, hwcap2) = crate::loader::hwcaps(crate::abi::Arch::Aarch64);
+    let names = AARCH64_HWCAP_NAMES
+        .iter()
+        .enumerate()
+        .filter(|&(bit, _)| hwcap >> bit & 1 == 1)
+        .chain(
+            AARCH64_HWCAP2_NAMES
+                .iter()
+                .enumerate()
+                .filter(|&(bit, _)| hwcap2 >> bit & 1 == 1),
+        )
+        .map(|(_, n)| *n);
+    names.collect::<Vec<_>>().join(" ")
+}
+
+/// Append one core's block to `cpuinfo`, in the shape of the guest's
+/// architecture.
+fn write_cpuinfo_block(out: &mut String, i: usize, arch: crate::abi::Arch) {
+    if arch == crate::abi::Arch::X86_64 {
         let _ = write!(
             out,
             "processor\t: {i}\n\
@@ -793,13 +906,13 @@ fn write_cpuinfo_block(out: &mut String, i: usize) {
             out,
             "processor\t: {i}\n\
              BogoMIPS\t: 100.00\n\
-             Features\t: fp asimd aes pmull sha1 sha2 crc32 atomics fphp asimdhp \
-             cpuid asimdrdm lrcpc dcpop asimddp\n\
+             Features\t: {}\n\
              CPU implementer\t: 0x41\n\
              CPU architecture: 8\n\
              CPU variant\t: 0x0\n\
              CPU part\t: 0xd08\n\
-             CPU revision\t: 0\n\n"
+             CPU revision\t: 0\n\n",
+            aarch64_features()
         );
     }
 }
@@ -1308,6 +1421,7 @@ mod tests {
             ],
             nproc: 4,
             auxv: Vec::new(),
+            arch: None,
         }
     }
 
@@ -1369,7 +1483,10 @@ mod tests {
             pid: 7,
             ppid: 3,
             fds: vec![(0, "/dev/null".to_string()), (3, "pipe:[9]".to_string())],
+            auxv: vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0],
+            arch: None,
         });
+        assert_eq!(read_all(&mut fs, "self/auxv").len(), 16);
         assert_eq!(read_all(&mut fs, "self/comm"), b"myprog\n");
         assert_eq!(read_all(&mut fs, "self/cmdline"), b"/bin/myprog\0-x\0");
         assert_eq!(fs.readlink("self/exe").unwrap(), "/bin/myprog");
@@ -1748,6 +1865,28 @@ mod tests {
         let mut fs = ProcFs::new(1);
         let text = String::from_utf8(read_all(&mut fs, "cpuinfo")).unwrap();
         assert!(text.contains("Features") || text.contains("flags"));
+    }
+
+    /// The arm64 `Features` line names exactly the `AT_HWCAP`/`AT_HWCAP2`
+    /// bits the loader advertises.
+    #[test]
+    fn aarch64_cpuinfo_features_match_hwcaps() {
+        let mut fs = ProcFs::new(1);
+        fs.data.arch = Some(crate::abi::Arch::Aarch64);
+        let text = String::from_utf8(read_all(&mut fs, "cpuinfo")).unwrap();
+        let line = text.lines().find(|l| l.starts_with("Features")).unwrap();
+        let names: Vec<&str> = line.split(':').nth(1).unwrap().split_whitespace().collect();
+        let (hwcap, hwcap2) = crate::loader::hwcaps(crate::abi::Arch::Aarch64);
+        assert_eq!(
+            names.len(),
+            (hwcap.count_ones() + hwcap2.count_ones()) as usize
+        );
+        for n in [
+            "fp", "asimd", "atomics", "sha3", "sb", "dcpodp", "i8mm", "bf16",
+        ] {
+            assert!(names.contains(&n), "{n} missing from {line}");
+        }
+        assert!(!names.contains(&"sve"), "sve is not advertised");
     }
 
     /// Checks the `8-4-4-4-12` hex shape `proc(5)` documents for

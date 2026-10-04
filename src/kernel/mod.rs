@@ -1922,6 +1922,7 @@ impl Kernel {
         info.tgid = 1;
         info.mm = sh.spaces.len();
         info.run = RunState::Running;
+        info.auxv = crate::loader::read_auxv(&mem, vcpu.sp());
         // Check the initial fd table (the standard streams) into slot 0; the
         // scheduler checks it out into `cur.fds` for each slice.
         info.files = sh.file_tables.len();

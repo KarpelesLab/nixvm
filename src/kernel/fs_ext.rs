@@ -190,6 +190,8 @@ impl Kernel {
             pid: cx.cur.pid as u32,
             ppid: cx.cur.ppid as u32,
             fds,
+            auxv: cx.cur.auxv.clone(),
+            arch: Some(self.arch),
         }
     }
 
