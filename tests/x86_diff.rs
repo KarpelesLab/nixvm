@@ -1912,6 +1912,49 @@ fn known_differences(case: &Case, sw_sig: i32, hw_sig: i32) -> Option<Ignore> {
     })
 }
 
+/// Whether the host CPU has `FEAT_AFP`. Without it (M1/M2, e.g. GitHub's
+/// macOS runners), Rosetta can't produce x86's negative default NaN (it
+/// returns Arm's positive one) and its `RCPPS`/`RSQRTPS` estimates differ
+/// from a newer host's.
+fn host_has_afp() -> bool {
+    static AFP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AFP.get_or_init(|| {
+        std::process::Command::new("sysctl")
+            .args(["-n", "hw.optional.arm.FEAT_AFP"])
+            .output()
+            .is_ok_and(|o| o.stdout.starts_with(b"1"))
+    })
+}
+
+/// On a host without `FEAT_AFP` (see [`host_has_afp`]), accept in the
+/// interpreter's register `a` what such a Rosetta can't match in `b`: a NaN
+/// lane differing only in its sign, and an `RCP`/`RSQRT` estimate within the
+/// SDM's error bound (`1.5 * 2^-12` relative, so two compliant estimates are
+/// within `2^-11` of each other).
+fn older_rosetta_lanes(case: &Case, a: &mut u128, b: u128) {
+    let estimate = matches!(case.spec.op, [0x0F, 0x52 | 0x53]);
+    for lane in 0..2 {
+        let sh = 64 * lane;
+        let (x, y) = ((*a >> sh) as u64, (b >> sh) as u64);
+        if f64::from_bits(x).is_nan() && f64::from_bits(y).is_nan() && x ^ y == 1 << 63 {
+            *a = (*a & !(u128::from(u64::MAX) << sh)) | (u128::from(y) << sh);
+        }
+    }
+    for lane in 0..4 {
+        let sh = 32 * lane;
+        let (x, y) = ((*a >> sh) as u32, (b >> sh) as u32);
+        let (fx, fy) = (f32::from_bits(x), f32::from_bits(y));
+        let nan_sign = fx.is_nan() && fy.is_nan() && x ^ y == 1 << 31;
+        let close = estimate
+            && fx.is_finite()
+            && fy.is_finite()
+            && (fx - fy).abs() <= fy.abs() * (2.0f32).powi(-11);
+        if nan_sign || close {
+            *a = (*a & !(u128::from(u32::MAX) << sh)) | (u128::from(y) << sh);
+        }
+    }
+}
+
 fn compare(
     case: &Case,
     sw_out: Outcome,
@@ -1988,12 +2031,23 @@ fn compare(
             }
         }
     }
+    let mut sw_ymm = sw.ymm_hi;
+    if !host_has_afp() {
+        for i in 0..16 {
+            let o = 160 + 16 * i;
+            let mut a = u128::from_le_bytes(sfx[o..o + 16].try_into().unwrap());
+            let b = u128::from_le_bytes(hfx[o..o + 16].try_into().unwrap());
+            older_rosetta_lanes(case, &mut a, b);
+            sfx[o..o + 16].copy_from_slice(&a.to_le_bytes());
+            older_rosetta_lanes(case, &mut sw_ymm[i], hw.ymm_hi[i]);
+        }
+    }
     diffs.extend(describe_fx_diff(&sfx, &hfx));
     for i in 0..16 {
-        if sw.ymm_hi[i] != hw.ymm_hi[i] {
+        if sw_ymm[i] != hw.ymm_hi[i] {
             diffs.push(format!(
                 "ymm{i}.hi {:032x} vs {:032x}",
-                sw.ymm_hi[i], hw.ymm_hi[i]
+                sw_ymm[i], hw.ymm_hi[i]
             ));
         }
     }
