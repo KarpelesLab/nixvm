@@ -270,6 +270,15 @@ impl Vm {
         self.kernel.unsupported()
     }
 
+    /// Subcommands of known syscalls that no handler recognized — `ioctl`
+    /// requests, `fcntl`/`prctl` commands, socket options, … — as
+    /// `(syscall name, subcommand) -> attempt count` (see
+    /// [`Kernel::unsupported_subcommands`]).
+    #[must_use]
+    pub fn unsupported_subcommands(&self) -> std::collections::BTreeMap<(&'static str, u64), u64> {
+        self.kernel.unsupported_subcommands()
+    }
+
     /// Ctrl-C: interrupt the running command (see [`Kernel::interrupt`]).
     /// Returns whether a command was running. Pump afterwards.
     pub fn interrupt(&mut self) -> bool {

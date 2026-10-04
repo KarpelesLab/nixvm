@@ -224,9 +224,51 @@ pub fn encode_dirents(
     (out, i)
 }
 
+/// Encode x86-64 legacy `getdents` records (`struct linux_dirent`) for
+/// `entries[pos..]` into at most `cap` bytes — `d_ino(8) d_off(8) d_reclen(2)
+/// d_name(len+1)`, padded to 8, with `d_type` in the record's *last* byte (the
+/// layout predates `linux_dirent64`, which moved the type before the name).
+/// Returns the encoded bytes and the index of the first unencoded entry.
+pub fn encode_dirents_legacy(
+    entries: &[(String, NodeKind, u64)],
+    pos: usize,
+    cap: usize,
+) -> (Vec<u8>, usize) {
+    let mut out = Vec::new();
+    let mut i = pos;
+    while i < entries.len() {
+        let (name, kind, ino) = &entries[i];
+        // 18-byte header, the NUL-terminated name, and one trailing type byte.
+        let reclen = (18 + name.len() + 2).div_ceil(8) * 8;
+        if out.len() + reclen > cap {
+            break;
+        }
+        let start = out.len();
+        out.resize(start + reclen, 0);
+        out[start..start + 8].copy_from_slice(&ino.to_le_bytes());
+        out[start + 8..start + 16].copy_from_slice(&((i + 1) as i64).to_le_bytes());
+        out[start + 16..start + 18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        out[start + 18..start + 18 + name.len()].copy_from_slice(name.as_bytes());
+        out[start + reclen - 1] = d_type(*kind);
+        i += 1;
+    }
+    (out, i)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_dirents_put_the_type_in_the_last_byte() {
+        let entries = vec![("abc".to_string(), NodeKind::Dir, 7)];
+        let (b, n) = encode_dirents_legacy(&entries, 0, 4096);
+        assert_eq!(n, 1);
+        assert_eq!(b.len(), 24); // 18 + "abc\0" + type, rounded to 8
+        assert_eq!(u16::from_le_bytes([b[16], b[17]]), 24);
+        assert_eq!(&b[18..22], b"abc\0");
+        assert_eq!(b[23], 4); // DT_DIR
+    }
 
     #[test]
     fn stat_size_and_mode() {

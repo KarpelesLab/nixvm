@@ -39,6 +39,7 @@ mod signal;
 mod stat;
 mod sys_misc;
 mod time;
+mod unavailable;
 
 pub use fd::{Fd, FdTable};
 use net::Net;
@@ -1132,6 +1133,15 @@ pub struct Kernel {
     /// Pseudo-terminals (/dev/ptmx + /dev/pts/N). Innermost data lock like
     /// `pipes`; opened/read/written/polled independently of `sh`.
     ptys: Mutex<pty::Ptys>,
+    /// Subcommands of *known* syscalls that no handler recognized — an
+    /// `ioctl` request, `fcntl`/`prctl` command, socket option, … — keyed by
+    /// `(syscall name, subcommand)` with a hit count. The sibling of
+    /// [`Shared::unsupported`] one level down: a syscall can be decoded and
+    /// handled yet still be asked for something nobody implemented, and this is
+    /// what makes such gaps visible after a run ([`Kernel::unsupported_subcommands`]).
+    /// A leaf lock: nothing else is ever acquired while it is held, so any
+    /// handler may record into it whatever locks it already holds.
+    unsupported_sub: Mutex<BTreeMap<(&'static str, u64), u64>>,
 }
 
 /// All kernel state mutated while a syscall is serviced, behind [`Kernel`]'s
@@ -1435,6 +1445,7 @@ impl Kernel {
             pipes: Mutex::new(Vec::new()),
             pollfds: Mutex::new(PollFds::default()),
             ptys: Mutex::new(pty::Ptys::default()),
+            unsupported_sub: Mutex::new(BTreeMap::new()),
             shared: Mutex::new(Shared {
                 stdin: Box::new(std::io::stdin()),
                 stdout: Box::new(std::io::stdout()),
@@ -2639,6 +2650,7 @@ impl Kernel {
             | Sysno::Stat
             | Sysno::Lstat
             | Sysno::Getdents64
+            | Sysno::Getdents
             | Sysno::Chdir
             | Sysno::Fchdir
             | Sysno::Statfs
@@ -2651,7 +2663,11 @@ impl Kernel {
             | Sysno::Unlinkat
             | Sysno::Unlink
             | Sysno::Utimensat
+            | Sysno::Utime
+            | Sysno::Utimes
+            | Sysno::Futimesat
             | Sysno::Fchmodat
+            | Sysno::Fchmodat2
             | Sysno::Chmod
             | Sysno::Fchmod
             | Sysno::Fchownat
@@ -2700,6 +2716,12 @@ impl Kernel {
                 let mut pipes = self.pipes.lock().unwrap();
                 self.sys_pipe2(&mut pipes, cx, args[0], args[1], mem)
             }
+            // Legacy x86-64 `pipe(fds)`: no flags argument at all — the second
+            // register holds whatever the caller left there.
+            Sysno::Pipe => {
+                let mut pipes = self.pipes.lock().unwrap();
+                self.sys_pipe2(&mut pipes, cx, args[0], 0, mem)
+            }
             // pollfds-only: the pure eventfd/timerfd/epoll-setup syscalls, holding
             // ONLY `pollfds` (the innermost/last lock) via `dispatch_pollfds` —
             // no sh, no vfs, no net, no pipes may be taken below it.
@@ -2712,7 +2734,9 @@ impl Kernel {
             | Sysno::EpollCreate1
             | Sysno::EpollCtl
             | Sysno::InotifyInit1
-            | Sysno::Signalfd4 => {
+            | Sysno::InotifyInit
+            | Sysno::Signalfd4
+            | Sysno::Signalfd => {
                 let mut pf = self.pollfds.lock().unwrap();
                 self.dispatch_pollfds(&mut pf, cx, sys, args, mem)
             }
@@ -2813,10 +2837,15 @@ impl Kernel {
             // inotify gets an eventfd-backed descriptor that never becomes
             // readable (no filesystem events delivered — a safe degradation).
             Sysno::InotifyInit1 => self.sys_inotify_init1(pf, cx, args[0]),
+            Sysno::InotifyInit => self.sys_inotify_init1(pf, cx, 0),
             // signalfd4(fd, mask, sizemask, flags): a real signal-reading fd. The
             // `fd` is a 32-bit int (`-1` = create), read via `as i32`.
             Sysno::Signalfd4 => {
                 self.sys_signalfd4(pf, cx, i64::from(args[0] as i32), args[1], args[3], mem)
+            }
+            // Legacy x86-64 `signalfd(fd, mask, sizemask)`: signalfd4 with no flags.
+            Sysno::Signalfd => {
+                self.sys_signalfd4(pf, cx, i64::from(args[0] as i32), args[1], 0, mem)
             }
             // Unreachable: `dispatch_impl` only routes the syscalls above here.
             _ => unreachable!("dispatch_pollfds: {sys:?} is not a pollfds-only syscall"),
@@ -2891,7 +2920,10 @@ impl Kernel {
                     mem,
                 )
             }
-            Sysno::Getdents64 => self.sys_getdents64(vfs, cx, args[0], args[1], args[2], mem),
+            Sysno::Getdents64 => {
+                self.sys_getdents64(vfs, cx, args[0], args[1], args[2], false, mem)
+            }
+            Sysno::Getdents => self.sys_getdents64(vfs, cx, args[0], args[1], args[2], true, mem),
             Sysno::Chdir => self.sys_chdir(vfs, cx, args[0], mem),
             Sysno::Fchdir => self.sys_fchdir(vfs, cx, args[0]),
             Sysno::Statfs => self.sys_statfs(vfs, cx, args[0], args[1], mem),
@@ -2909,12 +2941,36 @@ impl Kernel {
             Sysno::Utimensat => {
                 self.sys_utimensat(vfs, cx, args[0] as i64, args[1], args[2], args[3], mem)
             }
+            // The pre-`utimensat` x86-64 spellings: `utime` takes a `struct
+            // utimbuf` (whole seconds), `utimes`/`futimesat` a `timeval[2]`.
+            Sysno::Utime => self.sys_utimes_legacy(vfs, cx, AT_FDCWD, args[0], args[1], true, mem),
+            Sysno::Utimes => {
+                self.sys_utimes_legacy(vfs, cx, AT_FDCWD, args[0], args[1], false, mem)
+            }
+            Sysno::Futimesat => self.sys_utimes_legacy(
+                vfs,
+                cx,
+                i64::from(args[0] as i32),
+                args[1],
+                args[2],
+                false,
+                mem,
+            ),
             // legacy chmod(path, mode) vs fchmodat(dirfd, path, mode, flags).
             Sysno::Chmod => self.sys_fchmodat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
             Sysno::Fchmodat => {
                 self.sys_fchmodat(vfs, cx, i64::from(args[0] as i32), args[1], args[2], mem)
             }
             Sysno::Fchmod => self.sys_fchmod(vfs, cx, args[0], args[1]),
+            Sysno::Fchmodat2 => self.sys_fchmodat2(
+                vfs,
+                cx,
+                i64::from(args[0] as i32),
+                args[1],
+                args[2],
+                args[3],
+                mem,
+            ),
             // chown follows symlinks; lchown acts on the link (AT_SYMLINK_NOFOLLOW=0x100).
             Sysno::Chown => self.sys_fchownat(vfs, cx, AT_FDCWD, args[0], args[1], args[2], 0, mem),
             Sysno::Lchown => {
@@ -3257,6 +3313,11 @@ impl Kernel {
             | Sysno::Getgroups
             | Sysno::Membarrier => 0,
             _ => {
+                // Known-but-refused syscalls answer their documented errno and
+                // stay out of the unknown ledger.
+                if let Some(ret) = self.sys_unavailable(sys, args) {
+                    return ret;
+                }
                 *sh.unsupported.entry(raw).or_default() += 1;
                 err(Errno::ENOSYS)
             }
@@ -6092,8 +6153,17 @@ impl Kernel {
                     err(Errno::EFAULT)
                 }
             }
-            // Terminal and unrecognized requests: not a tty.
-            _ => err(Errno::ENOTTY),
+            // Terminal requests on a non-terminal are a legitimate ENOTTY
+            // (that is how `isatty` answers); anything else is a request no
+            // handler knows — record it so the gap is visible, then answer
+            // ENOTTY as Linux does for an fd type without that ioctl.
+            _ => {
+                // Type 'T' (0x54) is the terminal ioctl space.
+                if (req >> 8) & 0xff != 0x54 {
+                    self.note_unsupported("ioctl", u64::from(req));
+                }
+                err(Errno::ENOTTY)
+            }
         }
     }
 
@@ -6229,7 +6299,10 @@ impl Kernel {
                     err(Errno::EFAULT)
                 }
             }
-            _ => err(Errno::ENOTTY),
+            _ => {
+                self.note_unsupported("ioctl(pty)", u64::from(req));
+                err(Errno::ENOTTY)
+            }
         }
     }
 
@@ -6782,6 +6855,11 @@ impl Kernel {
 
     /// `getdents64(fd, buf, count)`.
     #[allow(clippy::unused_self)]
+    ///
+    /// `legacy` selects x86-64's original `getdents` record layout
+    /// (`linux_dirent`: no `d_type` after `d_reclen`, the type in the record's
+    /// last byte instead) — the directory walk is otherwise identical.
+    #[allow(clippy::too_many_arguments)]
     fn sys_getdents64(
         &self,
         vfs: &mut MountTable,
@@ -6789,6 +6867,7 @@ impl Kernel {
         fd: u64,
         buf: u64,
         count: u64,
+        legacy: bool,
         mem: &mut GuestMemory,
     ) -> i64 {
         let (path, pos) = match cx.cur.fds.get(fd as i32) {
@@ -6805,7 +6884,11 @@ impl Kernel {
         ];
         all.extend(entries.into_iter().map(|e| (e.name, e.kind, e.inode)));
 
-        let (bytes, consumed) = stat::encode_dirents(&all, pos, count as usize);
+        let (bytes, consumed) = if legacy {
+            stat::encode_dirents_legacy(&all, pos, count as usize)
+        } else {
+            stat::encode_dirents(&all, pos, count as usize)
+        };
         if bytes.is_empty() && pos < all.len() {
             return err(Errno::EINVAL);
         }
@@ -7307,6 +7390,25 @@ impl Kernel {
     #[must_use]
     pub fn unsupported(&self) -> BTreeMap<u64, u64> {
         self.shared.lock().unwrap().unsupported.clone()
+    }
+
+    /// Subcommands of known syscalls that fell through every handler (see
+    /// [`Kernel::unsupported_sub`]): `(syscall name, subcommand) -> count`.
+    #[must_use]
+    pub fn unsupported_subcommands(&self) -> BTreeMap<(&'static str, u64), u64> {
+        self.unsupported_sub.lock().unwrap().clone()
+    }
+
+    /// Record that `syscall` was asked for subcommand `sub` (an ioctl request,
+    /// fcntl/prctl command, sockopt `level << 32 | name`, …) that no handler
+    /// recognizes. Safe to call with any other lock held (leaf lock).
+    pub(super) fn note_unsupported(&self, syscall: &'static str, sub: u64) {
+        *self
+            .unsupported_sub
+            .lock()
+            .unwrap()
+            .entry((syscall, sub))
+            .or_default() += 1;
     }
 }
 

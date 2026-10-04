@@ -90,12 +90,8 @@ impl Errno {
     const ENOTCONN: Errno = Errno(107);
     /// `socket(AF_NETLINK, _, protocol)` with an unsupported `protocol`.
     const EPROTONOSUPPORT: Errno = Errno(93);
-    /// An ICMP message too large for the link MTU.
-    const EMSGSIZE: Errno = Errno(90);
     /// A routable connect with no egress backend installed (loopback-only VM).
     const ENETUNREACH: Errno = Errno(101);
-    /// A host `connect_tcp` that timed out.
-    const ETIMEDOUT: Errno = Errno(110);
     /// A nonblocking TCP `connect` that has been started but not yet completed.
     const EINPROGRESS: Errno = Errno(115);
     /// A second nonblocking `connect` while the first is still in progress.

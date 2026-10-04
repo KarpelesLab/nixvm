@@ -222,7 +222,6 @@ impl Kernel {
         flags: u64,
         mem: &GuestMemory,
     ) -> i64 {
-        const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
         // Decode the timespec at `times + off` into a `SetTime`.
         let read_field = |off: u64| -> Option<crate::fs::SetTime> {
             const UTIME_NOW: u64 = 0x3fff_ffff;
@@ -249,6 +248,86 @@ impl Kernel {
             };
             (a, m)
         };
+        self.set_times_at(vfs, cx, dirfd, pathptr, atime, mtime, flags, mem)
+    }
+
+    /// The legacy x86-64 timestamp setters, lowered onto [`Self::set_times_at`]:
+    /// `utime(path, struct utimbuf *)` (`utimbuf` = `{ actime, modtime }` in
+    /// whole seconds; `utimbuf == true`) and `utimes`/`futimesat(dirfd, path,
+    /// struct timeval[2])`. A NULL times pointer means "now" for both, and a
+    /// `tv_usec` outside `0..1_000_000` is `EINVAL`, as Linux checks. Both
+    /// follow symlinks (there is no `AT_SYMLINK_NOFOLLOW` spelling).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn sys_utimes_legacy(
+        &self,
+        vfs: &mut MountTable,
+        cx: &mut ServiceCtx,
+        dirfd: i64,
+        pathptr: u64,
+        times: u64,
+        utimbuf: bool,
+        mem: &GuestMemory,
+    ) -> i64 {
+        use crate::fs::SetTime;
+        let (atime, mtime) = if times == 0 {
+            (SetTime::Now, SetTime::Now)
+        } else if utimbuf {
+            let (Ok(a), Ok(m)) = (mem.read_u64(times), mem.read_u64(times + 8)) else {
+                return err(Errno::EFAULT);
+            };
+            (
+                SetTime::Set {
+                    sec: a as i64,
+                    nsec: 0,
+                },
+                SetTime::Set {
+                    sec: m as i64,
+                    nsec: 0,
+                },
+            )
+        } else {
+            let mut tv = [0i64; 4];
+            for (i, slot) in tv.iter_mut().enumerate() {
+                let Ok(v) = mem.read_u64(times + 8 * i as u64) else {
+                    return err(Errno::EFAULT);
+                };
+                *slot = v as i64;
+            }
+            if !(0..1_000_000).contains(&tv[1]) || !(0..1_000_000).contains(&tv[3]) {
+                return err(Errno::EINVAL);
+            }
+            (
+                SetTime::Set {
+                    sec: tv[0],
+                    nsec: tv[1] * 1000,
+                },
+                SetTime::Set {
+                    sec: tv[2],
+                    nsec: tv[3] * 1000,
+                },
+            )
+        };
+        if pathptr == 0 {
+            return err(Errno::EFAULT); // only utimensat accepts a NULL path
+        }
+        self.set_times_at(vfs, cx, dirfd, pathptr, atime, mtime, 0, mem)
+    }
+
+    /// Resolve `(dirfd, pathptr, flags)` like `utimensat` does and store the
+    /// decoded timestamps. A NULL `pathptr` targets `dirfd` itself (`futimens`).
+    #[allow(clippy::too_many_arguments)]
+    fn set_times_at(
+        &self,
+        vfs: &mut MountTable,
+        cx: &mut ServiceCtx,
+        dirfd: i64,
+        pathptr: u64,
+        atime: crate::fs::SetTime,
+        mtime: crate::fs::SetTime,
+        flags: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
         // A NULL path means dirfd *is* the file (futimens); otherwise resolve.
         let abs = if pathptr == 0 {
             match cx.cur.fds.get(dirfd as i32) {
@@ -297,6 +376,52 @@ impl Kernel {
         match vfs.set_mode(&abs, mode as u32) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
+        }
+    }
+
+    /// `fchmodat2(dirfd, path, mode, flags)` — `fchmodat` with the flags the
+    /// original syscall ignored. `AT_SYMLINK_NOFOLLOW` acts on the final
+    /// component itself: a symlink's own mode can't be changed on Linux, so that
+    /// is `EOPNOTSUPP`, while a non-link is chmod'ed normally. `AT_EMPTY_PATH`
+    /// with an empty path targets `dirfd` (like `fchmod`). Any other flag bit is
+    /// `EINVAL`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn sys_fchmodat2(
+        &self,
+        vfs: &mut MountTable,
+        cx: &mut ServiceCtx,
+        dirfd: i64,
+        pathptr: u64,
+        mode: u64,
+        flags: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+            return err(Errno::EINVAL);
+        }
+        let Some(rel) = read_path(mem, pathptr) else {
+            return err(Errno::EFAULT);
+        };
+        if rel.is_empty() {
+            return if flags & AT_EMPTY_PATH != 0 {
+                self.sys_fchmod(vfs, cx, dirfd as u64, mode)
+            } else {
+                err(Errno::ENOENT)
+            };
+        }
+        if flags & AT_SYMLINK_NOFOLLOW == 0 {
+            return self.sys_fchmodat(vfs, cx, dirfd, pathptr, mode, mem);
+        }
+        let abs = self.resolve_path(cx, dirfd, &rel);
+        match vfs.stat(&abs) {
+            None => err(Errno::ENOENT),
+            Some(a) if a.kind == crate::fs::NodeKind::Symlink => err(Errno::EOPNOTSUPP),
+            Some(_) => match vfs.set_mode(&abs, mode as u32) {
+                Ok(()) => 0,
+                Err(e) => io_errno(&e),
+            },
         }
     }
 
