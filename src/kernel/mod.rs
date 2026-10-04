@@ -31,6 +31,7 @@ mod attrs;
 pub mod egress;
 mod fd;
 mod fs_ext;
+mod futex;
 mod ipc;
 mod mem_syscalls;
 mod mqueue;
@@ -121,7 +122,17 @@ struct ProcInfo {
     clear_child_tid: u64,
     /// When `Some((mm, uaddr))`, this task is parked in `FUTEX_WAIT` on that
     /// address; cleared when woken.
-    futex_wait: Option<(usize, u64)>,
+    futex_wait: Option<futex::FutexKey>,
+    /// The `FUTEX_WAIT_BITSET` mask of the current wait (all ones for a plain
+    /// wait); a wake only releases waiters whose mask intersects its own.
+    futex_bitset: u32,
+    /// `futex_waitv`: every word the task is parked on (empty otherwise); a
+    /// wake on any of them releases it, recording which in `futex_waitv_idx`.
+    futex_waitv: Vec<futex::FutexKey>,
+    futex_waitv_idx: usize,
+    /// The current futex wait is a PI lock wait (`FUTEX_LOCK_PI`): only
+    /// `FUTEX_UNLOCK_PI` (which hands over ownership) releases it.
+    futex_pi: bool,
     /// Set by `FUTEX_WAKE` to release a parked waiter on its next slice.
     futex_woken: bool,
     run: RunState,
@@ -323,6 +334,10 @@ impl Default for ProcInfo {
             fs: 0,
             clear_child_tid: 0,
             futex_wait: None,
+            futex_bitset: u32::MAX,
+            futex_waitv: Vec::new(),
+            futex_waitv_idx: 0,
+            futex_pi: false,
             futex_woken: false,
             run: RunState::Running,
             continued: false,
@@ -2043,6 +2058,8 @@ impl Kernel {
                         // task. (`wake_deadline` is cleared below since the
                         // syscall no longer blocks.)
                         cx.cur.futex_wait = None;
+                        cx.cur.futex_waitv.clear();
+                        cx.cur.futex_pi = false;
                         cx.cur.futex_woken = false;
                     }
                 }
@@ -3348,6 +3365,10 @@ impl Kernel {
             Sysno::Ioctl => self.sys_ioctl(cx, args[0], args[1], args[2], mem),
             Sysno::Fcntl => self.sys_fcntl(cx, args[0], args[1], args[2], mem),
             Sysno::Futex => self.sys_futex(sh, cx, args, mem),
+            Sysno::FutexWaitv => self.sys_futex_waitv(sh, cx, args, mem),
+            Sysno::FutexWake => self.sys_futex2_wake(sh, cx, args, mem),
+            Sysno::FutexWait => self.sys_futex2_wait(sh, cx, args, mem),
+            Sysno::FutexRequeue => self.sys_futex2_requeue(sh, cx, args, mem),
             // Event-notification / readiness scans. `sh` stays held (outermost)
             // by this dispatcher; each scan additionally acquires
             // net → pipes → pollfds internally (order sh → net → pipes →
@@ -3696,6 +3717,8 @@ impl Kernel {
         info.pid = pid;
         info.run = RunState::Running;
         info.futex_wait = None;
+        info.futex_waitv = Vec::new();
+        info.futex_pi = false;
         info.futex_woken = false;
         // Per-task state a new task starts without (Linux: "the child's set of
         // pending signals is initially empty"; interval timers, alarms and
@@ -4675,7 +4698,9 @@ impl Kernel {
         let mm = cx.cur.mm;
         if ctid != 0 {
             let _ = mem.write(ctid, &0u32.to_le_bytes());
-            self.futex_wake(sh, mm, ctid, i32::MAX);
+            // The kernel's CLONE_CHILD_CLEARTID wake is a shared-key wake.
+            let key = Self::futex_key(cx, mem, ctid, false);
+            Self::futex_wake_key(sh, key, i64::from(i32::MAX), u32::MAX);
         }
         // Only close the fds when this is the last user of the shared table: a
         // thread exiting while siblings live must leave the (`CLONE_FILES`)
@@ -4851,174 +4876,6 @@ impl Kernel {
         }
         // `cx.cur` is this task, taken out of the table for its slice.
         self.exit_task(sh, cx, cause, mem)
-    }
-
-    /// `futex(uaddr, op, val, ...)` — the parking primitive under mutexes,
-    /// condvars, and `pthread_join`.
-    ///
-    /// `FUTEX_WAIT`: if `*uaddr != val` the caller is already past the wait, so
-    /// return `EAGAIN` immediately. Otherwise the caller parks — but only if
-    /// another task could ever wake it; when this is the sole runnable task
-    /// (the common single-threaded-musl case) parking would just deadlock, so
-    /// we report a spurious wake (return 0) instead. A parked task re-traps the
-    /// same `futex` on each slice (its PC never advanced) and returns once
-    /// `FUTEX_WAKE` flips its `futex_woken` flag — decoupled from the value, as
-    /// real futexes require. `FUTEX_WAKE` releases up to `val` parked waiters on
-    /// `(mm, uaddr)`.
-    fn sys_futex(
-        &self,
-        sh: &mut Shared,
-        cx: &mut ServiceCtx,
-        args: &[u64; 6],
-        mem: &GuestMemory,
-    ) -> i64 {
-        const FUTEX_WAIT: u64 = 0;
-        const FUTEX_WAKE: u64 = 1;
-        const FUTEX_REQUEUE: u64 = 3;
-        const FUTEX_CMP_REQUEUE: u64 = 4;
-        const FUTEX_WAIT_BITSET: u64 = 9;
-        const FUTEX_WAKE_BITSET: u64 = 10;
-        let uaddr = args[0];
-        let op = args[1] & 0x7f; // strip FUTEX_PRIVATE_FLAG / CLOCK_REALTIME
-        let val = args[2] as u32;
-        let mm = cx.cur.mm;
-        match op {
-            FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-                // Woken by an explicit FUTEX_WAKE (directly, or after being
-                // requeued to another address by a condvar signal): consume it,
-                // regardless of which address the wake targeted.
-                if cx.cur.futex_woken {
-                    cx.cur.futex_wait = None;
-                    cx.cur.futex_woken = false;
-                    return 0;
-                }
-                // Parked on a *different* address than this call names — i.e.
-                // requeued (pthread_cond_signal moved us from the condvar futex
-                // to the mutex futex). Stay parked; only an explicit wake on the
-                // requeue target releases us, so don't re-compare this address's
-                // value (which would spuriously return EAGAIN and desync the
-                // condvar wait).
-                if matches!(cx.cur.futex_wait, Some(w) if w != (mm, uaddr)) {
-                    cx.block = true;
-                    return 0;
-                }
-                // Fresh wait, or a re-check on the same address. Re-read the
-                // word: if it no longer equals `val`, the wait is over (this is
-                // what makes a "lost" plain wake safe — an unlock that changed
-                // the word is caught here). A real futex compares atomically at
-                // wait time; we compare on every re-run.
-                match mem.read_u32(uaddr) {
-                    Ok(cur) if cur != val => {
-                        cx.cur.futex_wait = None;
-                        cx.cur.futex_woken = false;
-                        err(Errno::EAGAIN)
-                    }
-                    Ok(_) if !self.has_cowaiter(sh, mm) => {
-                        // No sibling shares this address space, so no one can
-                        // ever `FUTEX_WAKE` us — parking would be a false
-                        // deadlock. Report a spurious wake instead (permitted by
-                        // the futex contract; the caller re-checks its predicate
-                        // and loops). This is the common single-threaded-musl
-                        // case; a real thread group takes the parking path.
-                        cx.cur.futex_wait = None;
-                        cx.cur.futex_woken = false;
-                        0
-                    }
-                    Ok(_) => {
-                        cx.cur.futex_wait = Some((mm, uaddr));
-                        cx.cur.futex_woken = false;
-                        cx.block = true;
-                        0
-                    }
-                    Err(_) => err(Errno::EFAULT),
-                }
-            }
-            FUTEX_WAKE | FUTEX_WAKE_BITSET => self.futex_wake(sh, mm, uaddr, val as i32),
-            // Requeue: wake up to `val` waiters on `uaddr`, then move up to
-            // `val2` of the rest to wait on `uaddr2` instead. This is how
-            // musl's pthread_cond_signal/broadcast hand a woken thread off to
-            // the mutex — without it the condvar futex keeps the waiters and
-            // the later mutex wake finds no one (the deadlock node hit).
-            FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
-                if op == FUTEX_CMP_REQUEUE {
-                    let expected = args[5] as u32;
-                    match mem.read_u32(uaddr) {
-                        Ok(cur) if cur != expected => return err(Errno::EAGAIN),
-                        Err(_) => return err(Errno::EFAULT),
-                        Ok(_) => {}
-                    }
-                }
-                let nr_wake = i64::from(val);
-                let nr_requeue = args[3] as i64;
-                let uaddr2 = args[4];
-                self.futex_requeue(sh, mm, uaddr, uaddr2, nr_wake, nr_requeue)
-            }
-            _ => 0,
-        }
-    }
-
-    /// Whether any *other* live task shares this address space (`mm`) and could
-    /// therefore issue a `FUTEX_WAKE` against it. `self.cur` is out of the table
-    /// during its slice, so a scan of `sh.procs` sees only the siblings.
-    #[allow(clippy::unused_self)]
-    fn has_cowaiter(&self, sh: &mut Shared, mm: usize) -> bool {
-        sh.procs
-            .iter()
-            .flatten()
-            .any(|p| p.info.mm == mm && !matches!(p.info.run, RunState::Zombie(_)))
-    }
-
-    /// Wake up to `nr_wake` waiters on `(mm, uaddr)`, then requeue up to
-    /// `nr_requeue` of the remaining waiters to wait on `(mm, uaddr2)`. Returns
-    /// the number of waiters woken (Linux's `FUTEX_REQUEUE` return value).
-    #[allow(clippy::unused_self)]
-    fn futex_requeue(
-        &self,
-        sh: &mut Shared,
-        mm: usize,
-        uaddr: u64,
-        uaddr2: u64,
-        nr_wake: i64,
-        nr_requeue: i64,
-    ) -> i64 {
-        let mut woken = 0i64;
-        let mut requeued = 0i64;
-        for p in sh.procs.iter_mut().flatten() {
-            if p.info.futex_wait != Some((mm, uaddr)) || p.info.futex_woken {
-                continue;
-            }
-            if woken < nr_wake {
-                p.info.futex_woken = true;
-                p.info.parked = false;
-                woken += 1;
-            } else if requeued < nr_requeue {
-                // Move it to the new address; it stays parked until an explicit
-                // wake on `uaddr2`.
-                p.info.futex_wait = Some((mm, uaddr2));
-                requeued += 1;
-            } else {
-                break;
-            }
-        }
-        woken
-    }
-
-    /// Release up to `n` tasks parked in `FUTEX_WAIT` on `(mm, uaddr)`; returns
-    /// how many were woken.
-    #[allow(clippy::unused_self)]
-    fn futex_wake(&self, sh: &mut Shared, mm: usize, uaddr: u64, n: i32) -> i64 {
-        let mut woken = 0i64;
-        for p in sh.procs.iter_mut().flatten() {
-            if woken >= i64::from(n) {
-                break;
-            }
-            if p.info.futex_wait == Some((mm, uaddr)) && !p.info.futex_woken {
-                p.info.futex_woken = true;
-                p.info.parked = false; // make it runnable so the sweep re-runs it
-                woken += 1;
-            }
-        }
-        woken
     }
 
     // ---- files & fds ------------------------------------------------------
@@ -10200,7 +10057,7 @@ mod tests {
         let uaddr = 0x1_0000;
         // A sibling parked in FUTEX_WAIT on (mm 0, uaddr).
         let mut waiter = make_proc(2, 1, 0, true);
-        waiter.info.futex_wait = Some((0, uaddr));
+        waiter.info.futex_wait = Some(futex::FutexKey::Private(0, uaddr));
         k.shared.lock().unwrap().procs.push(Some(waiter));
 
         // FUTEX_WAKE(uaddr, op=1, val=1) wakes exactly one waiter.
@@ -10371,7 +10228,7 @@ mod tests {
         );
         assert_eq!(r, 0);
         assert!(cx.block, "caller parks awaiting a wake");
-        assert_eq!(cx.cur.futex_wait, Some((0, uaddr)));
+        assert_eq!(cx.cur.futex_wait, Some(futex::FutexKey::Private(0, uaddr)));
     }
 
     #[test]

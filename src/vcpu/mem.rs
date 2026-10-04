@@ -483,6 +483,20 @@ impl GuestMemory {
         }
     }
 
+    /// The physical address behind `addr` if its page is a *shared* page — one
+    /// aliased across address spaces (`MAP_SHARED`, a SysV segment) — else
+    /// `None`. This is what a process-shared futex is keyed by: two processes
+    /// waiting and waking on the same shared word see the same physical
+    /// address even when it is mapped at different virtual addresses.
+    #[must_use]
+    pub fn shared_phys(&self, addr: u64) -> Option<u64> {
+        let p = self.page_index(addr)?;
+        if !self.mapped[p] || !self.shared_anon[p] {
+            return None;
+        }
+        self.space.translate(addr, &self.phys).map(|t| t.paddr)
+    }
+
     /// Map `frames` (one per page) at `addr` with `prot`, *sharing* them: each
     /// page takes its own reference on its frame, is tagged shared like a
     /// `MAP_SHARED | MAP_ANONYMOUS` page (writable at any refcount, aliased —
