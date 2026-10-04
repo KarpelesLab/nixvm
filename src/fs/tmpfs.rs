@@ -6,7 +6,7 @@
 //! keeps `readdir` (children of a directory) and subtree `rename` simple.
 //!
 //! Regular files are *inodes*: a path entry names a file by inode number and
-//! the data, mode, owner, timestamps and xattrs live in [`TmpFs::files`], so
+//! the data, mode, owner, timestamps and xattrs live in `TmpFs::files`, so
 //! several names can share one file — real hard links (`link(2)`), with
 //! `st_nlink` counting the names and the file freed when the last name goes.
 //! (`git clone` of a local repository verifies that its hard-linked objects
@@ -53,7 +53,7 @@ enum Node {
     Dir {
         meta: Meta,
     },
-    /// A regular file: its inode in [`TmpFs::files`].
+    /// A regular file: its inode in `TmpFs::files`.
     File {
         ino: u64,
     },

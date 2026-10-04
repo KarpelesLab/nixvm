@@ -14,7 +14,7 @@
 //! LSE atomics. Anything else is UNDEFINED, as it would be on such a core, and
 //! surfaces as [`Exit::IllegalInstruction`] (`SIGILL`).
 //!
-//! [`Aarch64Interp::exec`] dispatches on the top-level `op0` field (bits 28:25)
+//! `Aarch64Interp::exec` dispatches on the top-level `op0` field (bits 28:25)
 //! to one module per ARM ARM encoding group:
 //!
 //! * `alu` — data processing (immediate and register)

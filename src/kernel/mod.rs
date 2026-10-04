@@ -8007,7 +8007,7 @@ impl Kernel {
     }
 
     /// Subcommands of known syscalls that fell through every handler (see
-    /// [`Kernel::unsupported_sub`]): `(syscall name, subcommand) -> count`.
+    /// `Kernel::unsupported_sub`): `(syscall name, subcommand) -> count`.
     #[must_use]
     pub fn unsupported_subcommands(&self) -> BTreeMap<(&'static str, u64), u64> {
         self.unsupported_sub.lock().unwrap().clone()
