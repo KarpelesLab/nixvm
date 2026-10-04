@@ -1506,6 +1506,12 @@ const GPR_NAMES: [&str; 16] = [
 /// The mismatch-grouping key: the opcode bytes plus ModRM.reg (the opcode
 /// extension of group encodings) and the register-vs-memory form.
 fn group_key(case: &Case) -> String {
+    if !std::env::var("NIXVM_X86_DIFF_HEX")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return hex(&case.code);
+    }
     let mut k = String::new();
     if case.spec.mand != 0 {
         k.push_str(&format!("{:02X} ", case.spec.mand));
@@ -1574,11 +1580,32 @@ fn interpreter_matches_real_x86() {
     let mut total_bad = 0u64;
     let mut crashes = 0u64;
     let mut skipped = 0u64;
-    for _ in 0..cases {
+    // NIXVM_X86_DIFF_HEX=0f77,660f77,…: run just these encodings.
+    let fixed: Vec<Vec<u8>> = std::env::var("NIXVM_X86_DIFF_HEX")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|h| !h.is_empty())
+        .map(|h| {
+            (0..h.len() / 2)
+                .map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap())
+                .collect()
+        })
+        .collect();
+    for case_no in 0..cases {
         let spec = rng.pick(&chosen);
         let mut case = gen_case(&mut rng, spec, oracle.insn_addr);
         while rosetta_unsupported(&case) {
             case = gen_case(&mut rng, spec, oracle.insn_addr);
+        }
+        if !fixed.is_empty() {
+            // Probe mode: a listed encoding, with every GPR but RSP pointing
+            // into the data window (so any memory form is addressable).
+            case.code = fixed[(case_no % fixed.len() as u64) as usize].clone();
+            for (r, v) in case.st.gpr.iter_mut().enumerate() {
+                if r != 4 {
+                    *v = DATA + 0x800 + rng.below(0x40) * 16;
+                }
+            }
         }
         let Some(hw) = oracle.run(&case.code, &case.st, &case.data, case.spec.cat == Cat::Mmx)
         else {

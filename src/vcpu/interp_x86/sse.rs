@@ -799,7 +799,7 @@ impl X86Interp {
                 }
                 self.next(end)
             }
-            (0x77, Mp::None) => {
+            (0x77, Mp::None | Mp::P66) => {
                 // EMMS: all tags empty.
                 if self.fpu_pending() {
                     return Step::Trap(Trap::X87);

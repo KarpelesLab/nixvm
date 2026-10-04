@@ -2458,25 +2458,7 @@ impl X86Interp {
             // SLDT/STR/LLDT/LTR/VERR/VERW (group 6): system instructions
             // (UMIP blocks the stores at CPL 3).
             0x00 => Step::Trap(Trap::Protection),
-            0x01 => {
-                // Group 7: only RDTSCP is reachable from user mode here.
-                let (b, end) = fetch!(self.fetch8(pc));
-                match b {
-                    0xF9 => {
-                        // RDTSCP: like RDTSC, plus ECX = TSC_AUX (cpu 0).
-                        let t = self.rdtsc_tick();
-                        self.gpr[RAX] = t & 0xffff_ffff;
-                        self.gpr[RDX] = t >> 32;
-                        self.gpr[RCX] = 0;
-                        self.next(end)
-                    }
-                    // XGETBV needs CR4.OSXSAVE, which a CPU that doesn't
-                    // advertise XSAVE never sets; MONITOR/MWAIT, CLAC/STAC,
-                    // XTEST, RDPKRU, … aren't available either.
-                    0xC0..=0xFF => Step::Illegal,
-                    _ => Step::Trap(Trap::Protection),
-                }
-            }
+            0x01 => self.group7(mem, pc, p),
             // LAR/LSL, CLTS, INVD, WBINVD, MOV CR/DR, WRMSR, RDMSR, RDPMC,
             // SYSENTER/SYSEXIT, SYSRET: privileged/descriptor-table access.
             0x02 | 0x03 | 0x06 | 0x07 | 0x08 | 0x09 | 0x20..=0x23 | 0x30 | 0x32..=0x35 => {
@@ -2612,7 +2594,7 @@ impl X86Interp {
             0xBD => self.bit_scan(mem, pc, p, true),
             0xC0 => self.xadd(mem, pc, p, 8),
             0xC1 => self.xadd(mem, pc, p, width),
-            0xC3 if p.rep == 0 && !p.opsize => {
+            0xC3 if p.rep == 0 => {
                 // MOVNTI Md/q, Gd/q (memory only): an ordinary store here.
                 let (m, end) = fetch!(self.modrm(pc, p.rex));
                 let a = fetch!(self.mem_only(m.kind, end));
@@ -2648,13 +2630,67 @@ impl X86Interp {
         }
     }
 
+    /// Group 7 (`0F 01`). From user mode: `RDTSCP`; `SGDT`/`SIDT`/`SMSW`,
+    /// which Linux's UMIP emulation answers with fixed dummy values (a zero
+    /// limit and a kernel-half base for the tables, the usual CR0 bits for
+    /// `SMSW`); the privileged forms (`LGDT`/`LIDT`/`LMSW`/`INVLPG`/
+    /// `SWAPGS`) raise `#GP`. `XGETBV` needs CR4.OSXSAVE, which a CPU that
+    /// doesn't advertise XSAVE never sets, and `MONITOR`/`MWAIT`, `CLAC`/
+    /// `STAC`, `XTEST`, `RDPKRU`, … aren't available: `#UD`.
+    fn group7(&mut self, mem: &mut GuestMemory, pc: u64, p: Pfx) -> Step {
+        const UMIP_GDT_BASE: u64 = 0xffff_ffff_fffe_0000;
+        const UMIP_IDT_BASE: u64 = 0xffff_ffff_ffff_0000;
+        const UMIP_CR0: u64 = 0x8005_0033;
+        let (b, _) = fetch!(self.fetch8(pc));
+        let (m, end) = fetch!(self.modrm(pc, p.rex));
+        match (m.ext(), m.kind) {
+            (0 | 1, RmKind::Mem(_) | RmKind::MemRip(_)) => {
+                // SGDT/SIDT m: 2-byte limit, 8-byte base.
+                let a = fetch!(self.mem_only(m.kind, end));
+                let base = if m.ext() == 0 {
+                    UMIP_GDT_BASE
+                } else {
+                    UMIP_IDT_BASE
+                };
+                let mut img = [0u8; 10];
+                img[2..].copy_from_slice(&base.to_le_bytes());
+                fetch!(self.store(mem, a, &img));
+                self.next(end)
+            }
+            (4, RmKind::Reg(r)) => {
+                self.set_reg(r, UMIP_CR0, p.width());
+                self.next(end)
+            }
+            (4, _) => {
+                let a = fetch!(self.mem_only(m.kind, end));
+                fetch!(self.write_mem(mem, a, UMIP_CR0, 16));
+                self.next(end)
+            }
+            (7, RmKind::Reg(_)) if b == 0xF9 => {
+                // RDTSCP: like RDTSC, plus ECX = TSC_AUX (cpu 0).
+                let t = self.rdtsc_tick();
+                self.gpr[RAX] = t & 0xffff_ffff;
+                self.gpr[RDX] = t >> 32;
+                self.gpr[RCX] = 0;
+                self.next(end)
+            }
+            (6, _) | (2 | 3 | 7, RmKind::Mem(_) | RmKind::MemRip(_)) => {
+                Step::Trap(Trap::Protection)
+            }
+            (7, RmKind::Reg(_)) if b == 0xF8 => Step::Trap(Trap::Protection), // SWAPGS
+            _ => Step::Illegal,
+        }
+    }
+
     /// Group 15 (`0F AE`): `FXSAVE`/`FXRSTOR` (`/0`/`/1`), `LDMXCSR`/`STMXCSR`
     /// (`/2`/`/3`), `CLFLUSH` (`/7` memory), and the fences `LFENCE`/
     /// `MFENCE`/`SFENCE` (`/5`/`/6`/`/7` register). `XSAVE*`/`FSGSBASE` and
     /// the other forms aren't advertised and are `#UD`.
     fn group15(&mut self, mem: &mut GuestMemory, pc: u64, p: Pfx) -> Step {
         let (m, end) = fetch!(self.modrm(pc, p.rex));
-        if p.rep != 0 || p.opsize {
+        // (F3 0F AE selects the FSGSBASE group, not advertised; a 66 is
+        // ignored, as on hardware — 66 0F AE /7 is CLFLUSHOPT.)
+        if p.rep != 0 {
             return Step::Illegal;
         }
         match (m.kind, m.ext()) {
