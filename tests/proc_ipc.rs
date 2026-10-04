@@ -448,14 +448,14 @@ fn fork_pipe_parent_reads_child_writes_and_exits() {
 
 // ---- 4. mmap anonymous --------------------------------------------------------
 //
-// Program: `mmap(NULL, PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_ANONYMOUS, -1, 0)`,
+// Program: `mmap(NULL, PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)`,
 // store a byte into the mapping, load it back, exit with that byte. Needs an
 // explicit mmap arena (host-side setup via `Kernel::set_mmap_area`, mirroring
 // `src/bin/run-elf.rs`), so this test doesn't use the shared `run_program`.
 
 #[test]
 fn mmap_anonymous_store_load_roundtrip() {
-    const MAP_ANONYMOUS: u32 = 0x20;
+    const MAP_ANONYMOUS: u32 = 0x20 | 0x02; // with MAP_PRIVATE: a map type is required
     const PROT_RW: u32 = 0x3; // PROT_READ | PROT_WRITE
     const VALUE: u32 = 0x2A; // 42
     let vaddr = 0x1_0000u64;

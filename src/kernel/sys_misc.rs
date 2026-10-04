@@ -270,6 +270,159 @@ impl Kernel {
     }
 }
 
+impl Kernel {
+    /// `setgroups(size, list)`: replace the supplementary groups — root only
+    /// (`EPERM`), at most `NGROUPS_MAX` (65536) of them (`EINVAL`).
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_setgroups(
+        &self,
+        cx: &mut ServiceCtx,
+        size: u64,
+        list: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        if cx.cur.creds.euid != 0 {
+            return err(Errno::EPERM);
+        }
+        if size > 65536 {
+            return err(Errno::EINVAL);
+        }
+        if size == 0 {
+            cx.cur.groups.clear();
+            return 0;
+        }
+        let Ok(raw) = mem.read_vec(list, size as usize * 4) else {
+            return err(Errno::EFAULT);
+        };
+        cx.cur.groups = raw
+            .chunks(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        0
+    }
+
+    /// `getgroups(size, list)`: the supplementary groups; `size == 0` asks
+    /// only for the count, a too-small `size` is `EINVAL`.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_getgroups(
+        &self,
+        cx: &ServiceCtx,
+        size: u64,
+        list: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        let n = cx.cur.groups.len();
+        if size == 0 {
+            return n as i64;
+        }
+        // An int: a "negative" size (top bit of the low 32) is EINVAL too.
+        if size as u32 > i32::MAX as u32 || (size as usize) < n {
+            return err(Errno::EINVAL);
+        }
+        let b: Vec<u8> = cx.cur.groups.iter().flat_map(|g| g.to_le_bytes()).collect();
+        if mem.write(list, &b).is_err() {
+            return err(Errno::EFAULT);
+        }
+        n as i64
+    }
+
+    /// `syslog(type, buf, len)` — the kernel log. There is no kernel ring
+    /// buffer: reads return nothing, the buffer size is reported, the console
+    /// controls are accepted. Unknown actions are `EINVAL`; everything but the
+    /// harmless size/unread queries needs root.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_syslog(
+        &self,
+        cx: &ServiceCtx,
+        action: u64,
+        _buf: u64,
+        len: u64,
+        _mem: &GuestMemory,
+    ) -> i64 {
+        const READ: u64 = 2;
+        const READ_ALL: u64 = 3;
+        const READ_CLEAR: u64 = 4;
+        const SIZE_BUFFER: u64 = 10;
+        let action = action as i32;
+        if !(0..=10).contains(&action) {
+            return err(Errno::EINVAL);
+        }
+        let action = action as u64;
+        if cx.cur.creds.euid != 0 && !matches!(action, READ_ALL | SIZE_BUFFER) {
+            return err(Errno::EPERM);
+        }
+        match action {
+            READ | READ_ALL | READ_CLEAR if len as u32 > i32::MAX as u32 => err(Errno::EINVAL),
+            SIZE_BUFFER => 1 << 17,
+            // Nothing unread, nothing to read, console controls accepted.
+            _ => 0,
+        }
+    }
+
+    /// x86-64 `arch_prctl(code, addr)`: the FS/GS bases and the CPUID and
+    /// XSAVE-component controls. `ARCH_SET_FS` installs the TLS register; the
+    /// user GS base isn't modeled by the CPU, so `ARCH_SET_GS` is refused
+    /// (`EINVAL`) rather than silently ignored; CPUID faulting isn't
+    /// available (`ENODEV` to enable it); the XSAVE queries report x87+SSE.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_arch_prctl(
+        &self,
+        cx: &mut ServiceCtx,
+        code: u64,
+        addr: u64,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        const ARCH_SET_GS: u64 = 0x1001;
+        const ARCH_SET_FS: u64 = 0x1002;
+        const ARCH_GET_FS: u64 = 0x1003;
+        const ARCH_GET_GS: u64 = 0x1004;
+        const ARCH_GET_CPUID: u64 = 0x1011;
+        const ARCH_SET_CPUID: u64 = 0x1012;
+        const ARCH_GET_XCOMP_SUPP: u64 = 0x1021;
+        const ARCH_GET_XCOMP_PERM: u64 = 0x1022;
+        const ARCH_REQ_XCOMP_PERM: u64 = 0x1023;
+        const XFEATURES_X87_SSE: u64 = 3;
+        let put = |mem: &mut GuestMemory, v: u64| {
+            if mem.write_u64(addr, v).is_ok() {
+                0
+            } else {
+                err(Errno::EFAULT)
+            }
+        };
+        match code {
+            ARCH_SET_FS => {
+                vcpu.set_tls(addr);
+                cx.cur.fs_base = addr;
+                0
+            }
+            ARCH_GET_FS => put(mem, cx.cur.fs_base),
+            ARCH_GET_GS => put(mem, 0),
+            ARCH_GET_CPUID => 1,
+            ARCH_SET_CPUID => {
+                if addr == 1 {
+                    0
+                } else {
+                    err(Errno::ENODEV)
+                }
+            }
+            ARCH_GET_XCOMP_SUPP | ARCH_GET_XCOMP_PERM => put(mem, XFEATURES_X87_SSE),
+            ARCH_REQ_XCOMP_PERM => {
+                if addr < 2 {
+                    0
+                } else {
+                    err(Errno::EOPNOTSUPP)
+                }
+            }
+            ARCH_SET_GS => err(Errno::EINVAL),
+            other => {
+                self.note_unsupported("arch_prctl", other);
+                err(Errno::EINVAL)
+            }
+        }
+    }
+}
+
 /// `sched_getaffinity(pid, size, mask)` — report a single online CPU (bit 0),
 /// returning the number of bytes written (`min(size, 8)`).
 pub(super) fn sys_sched_getaffinity(bits: u64, size: u64, mask: u64, mem: &mut GuestMemory) -> i64 {

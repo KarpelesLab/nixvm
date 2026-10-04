@@ -1740,4 +1740,162 @@ mod tests {
             0x0040_0000
         );
     }
+
+    #[test]
+    fn groups_mounts_and_syslog() {
+        use super::super::testutil::put_str;
+        let (k, mut mem, mut v, mut cx) = setup();
+        // Supplementary groups round-trip; a too-small getgroups is EINVAL.
+        mem.write(BASE, &[5, 0, 0, 0, 7, 0, 0, 0]).unwrap();
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Setgroups,
+                [2, BASE, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Getgroups,
+                [0, 0, 0, 0, 0, 0]
+            ),
+            2
+        );
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Getgroups,
+                [1, BASE + 0x10, 0, 0, 0, 0]
+            ),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Getgroups,
+                [8, BASE + 0x10, 0, 0, 0, 0]
+            ),
+            2
+        );
+        assert_eq!(mem.read_u32(BASE + 0x14).unwrap(), 7);
+        // mount -t tmpfs over a directory, write in it, umount: gone.
+        let (dir, ty, file) = (BASE + 0x100, BASE + 0x200, BASE + 0x300);
+        put_str(&mut mem, dir, "/mnt");
+        put_str(&mut mem, ty, "tmpfs");
+        put_str(&mut mem, file, "/mnt/f");
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Mkdirat,
+                [(-100i64) as u64, dir, 0o755, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Mount,
+                [0, dir, ty, 0, 0, 0]
+            ),
+            0
+        );
+        let fd = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Openat,
+            [(-100i64) as u64, file, 0o102, 0o600, 0, 0],
+        );
+        assert!(fd >= 0);
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Umount2,
+                [dir, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Openat,
+                [(-100i64) as u64, file, 0, 0, 0, 0]
+            ),
+            e(Errno::ENOENT)
+        );
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Umount2,
+                [dir, 0, 0, 0, 0, 0]
+            ),
+            e(Errno::EINVAL)
+        );
+        // A block-device filesystem has nothing to mount.
+        put_str(&mut mem, ty, "ext4");
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Mount,
+                [0, dir, ty, 0, 0, 0]
+            ),
+            e(Errno::ENODEV)
+        );
+        // syslog: the buffer size, no unknown actions.
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Syslog,
+                [10, 0, 0, 0, 0, 0]
+            ),
+            1 << 17
+        );
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Syslog,
+                [11, 0, 0, 0, 0, 0]
+            ),
+            e(Errno::EINVAL)
+        );
+    }
 }

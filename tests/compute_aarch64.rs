@@ -631,7 +631,7 @@ fn lse_atomics_ldadd_then_cas_exit_code() {
 // ---- 6. mmap'd page: store a multi-byte pattern, load it back at three ------
 //        widths, fold with EOR
 //
-// `mmap(NULL,PAGE_SIZE,PROT_RW,MAP_ANONYMOUS,...)` gives a fresh page (needs
+// `mmap(NULL,PAGE_SIZE,PROT_RW,MAP_PRIVATE|MAP_ANONYMOUS,...)` gives a fresh page (needs
 // the explicit host-side mmap arena from `Kernel::set_mmap_area`, mirroring
 // `src/bin/run-elf.rs`). Eight `STRB`s write the bytes `0x10..=0x17` at
 // offsets `0..=7`. `LDR x1,[base]` reads all 8 bytes back as one 64-bit
@@ -643,7 +643,7 @@ fn lse_atomics_ldadd_then_cas_exit_code() {
 
 #[test]
 fn mmap_pattern_multi_width_load_exit_code() {
-    const MAP_ANONYMOUS: u32 = 0x20;
+    const MAP_ANONYMOUS: u32 = 0x20 | 0x02; // with MAP_PRIVATE: a map type is required
     const PROT_RW: u32 = 0x3; // PROT_READ | PROT_WRITE
     let vaddr = 0x1_0000u64;
 

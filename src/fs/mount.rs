@@ -12,6 +12,9 @@ struct Mount {
     /// Absolute mount point, e.g. "/", "/work", "/proc".
     point: String,
     fs: Box<dyn MountFs>,
+    /// Mounted at runtime by the guest (`mount(2)`), so `umount(2)` may
+    /// remove it; the embedder's mounts are permanent.
+    guest: bool,
 }
 
 impl std::fmt::Debug for Mount {
@@ -44,7 +47,33 @@ impl MountTable {
         self.mounts.push(Mount {
             point: normalize(&point.into()),
             fs,
+            guest: false,
         });
+    }
+
+    /// Mount `fs` at `point` on the guest's behalf (`mount(2)`); it stacks
+    /// over whatever was there and can be removed with [`Self::unmount`].
+    pub fn mount_guest(&mut self, point: &str, fs: Box<dyn MountFs>) {
+        self.mounts.push(Mount {
+            point: normalize(point),
+            fs,
+            guest: true,
+        });
+    }
+
+    /// Remove the most recent mount at exactly `point`: `Ok` if a guest mount
+    /// went, `EBUSY` for one of the embedder's (the VM's own /proc, /dev, …),
+    /// `EINVAL` if nothing is mounted there.
+    pub fn unmount(&mut self, point: &str) -> io::Result<()> {
+        let point = normalize(point);
+        match self.mounts.iter().rposition(|m| m.point == point) {
+            Some(i) if self.mounts[i].guest => {
+                self.mounts.remove(i);
+                Ok(())
+            }
+            Some(_) => Err(io::Error::from_raw_os_error(16)), // EBUSY
+            None => Err(io::Error::from_raw_os_error(22)),    // EINVAL
+        }
     }
 
     /// Index of the longest-prefix mount owning `abs_path`.

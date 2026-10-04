@@ -292,6 +292,11 @@ struct ProcInfo {
     /// The System V semaphore this task is parked on in `semop`:
     /// `(semid, semnum, waiting-for-zero)` — what `GETNCNT`/`GETZCNT` count.
     sem_wait: Option<(i32, u16, bool)>,
+    /// Supplementary group ids (`setgroups`/`getgroups`).
+    groups: Vec<u32>,
+    /// x86-64: the FS base last installed (`arch_prctl(ARCH_SET_FS)` or
+    /// `CLONE_SETTLS`), reported by `ARCH_GET_FS`.
+    fs_base: u64,
     /// Assorted `prctl` state (see [`prctl`]).
     pr: prctl::PrctlState,
     /// seccomp mode and filters (see [`seccomp`]); inherited by children,
@@ -385,6 +390,8 @@ impl Default for ProcInfo {
             robust_list: 0,
             caps: None,
             sem_wait: None,
+            groups: Vec::new(),
+            fs_base: 0,
             pr: prctl::PrctlState::default(),
             seccomp: seccomp::SeccompState::default(),
             creds: Creds::default(),
@@ -2806,6 +2813,8 @@ impl Kernel {
             | Sysno::Faccessat2
             | Sysno::Access
             | Sysno::Msync
+            | Sysno::Mount
+            | Sysno::Umount2
             | Sysno::Getxattr
             | Sysno::Lgetxattr
             | Sysno::Fgetxattr
@@ -3171,6 +3180,8 @@ impl Kernel {
             }
             Sysno::Access => self.sys_faccessat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
             Sysno::Msync => self.sys_msync(vfs, cx, args[0], args[1], args[2], mem),
+            Sysno::Mount => self.sys_mount(vfs, cx, args, mem),
+            Sysno::Umount2 => self.sys_umount2(vfs, cx, args[0], args[1], mem),
             // Extended attributes: the path / no-follow / fd / *at spellings all
             // lower onto one handler per operation (see `xattr.rs`).
             Sysno::Getxattr | Sysno::Lgetxattr | Sysno::Fgetxattr => {
@@ -3658,15 +3669,7 @@ impl Kernel {
             // register (FS.base; aarch64 uses the MSR-like TPIDR_EL0 via
             // CLONE_SETTLS instead, so this arm only ever fires for x86-64).
             // The GS and GET_* subcommands aren't modeled.
-            Sysno::ArchPrctl => {
-                const ARCH_SET_FS: u64 = 0x1002;
-                if args[0] == ARCH_SET_FS {
-                    vcpu.set_tls(args[1]);
-                    0
-                } else {
-                    err(Errno::EINVAL)
-                }
-            }
+            Sysno::ArchPrctl => self.sys_arch_prctl(cx, args[0], args[1], vcpu, mem),
             // Succeed as root / no-op: uid queries, signal setup, robust list,
             // permission/ownership/timestamp changes, socket options, clock
             // adjustment (TIME_OK), and scheduling/process-attr setters — none
@@ -3678,20 +3681,24 @@ impl Kernel {
             // the fd-taking members (fsync/fdatasync/syncfs/sync_file_range) are
             // handled separately below so a bad fd reports EBADF.
             | Sysno::Sync
-            | Sysno::Readahead
-            | Sysno::Fadvise64
-            // No supplementary-group model: setgroups succeeds as a no-op.
-            | Sysno::Setgroups
-            // Namespacing/mount ops we accept but don't model (no real jail
-            // layering yet): chroot, mount, umount2 succeed as no-ops.
+            // chroot is accepted without confining path resolution (a per-
+            // process root isn't modeled — documented limitation).
             | Sysno::Chroot
-            | Sysno::Mount
-            | Sysno::Umount2
-            // syslog: accept and drop (no kernel ring buffer to read).
-            | Sysno::Syslog
-            | Sysno::InotifyRmWatch
-            // getgroups: no supplementary groups (count 0).
-            | Sysno::Getgroups => 0,
+            | Sysno::InotifyRmWatch => 0,
+            Sysno::Setgroups => self.sys_setgroups(cx, args[0], args[1], mem),
+            Sysno::Getgroups => self.sys_getgroups(cx, args[0], args[1], mem),
+            Sysno::Syslog => self.sys_syslog(cx, args[0], args[1], args[2], mem),
+            // readahead(fd, off, count) / fadvise64(fd, off, len, advice):
+            // hints with nothing to act on in memory, after Linux's checks.
+            Sysno::Readahead | Sysno::Fadvise64 => match cx.cur.fds.get(args[0] as i32) {
+                None => err(Errno::EBADF),
+                Some(Fd::PipeRead(_) | Fd::PipeWrite(_)) if sys == Sysno::Fadvise64 => {
+                    err(Errno::ESPIPE)
+                }
+                Some(Fd::File { .. }) if sys == Sysno::Readahead || args[3] <= 5 => 0,
+                Some(Fd::Dir { .. }) if sys == Sysno::Fadvise64 && args[3] <= 5 => 0,
+                _ => err(Errno::EINVAL),
+            },
             _ => {
                 // Known-but-refused syscalls answer their documented errno and
                 // stay out of the unknown ledger.
@@ -4017,6 +4024,7 @@ impl Kernel {
         }
         if flags & CLONE_SETTLS != 0 {
             child_vcpu.set_tls(tls);
+            info.fs_base = tls;
         }
         child_vcpu.set_syscall_ret(0); // child returns 0 and advances past the svc
         // A copy-on-write fork (`mem.fork()`) downgraded *this* (parent) address

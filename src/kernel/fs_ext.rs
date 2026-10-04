@@ -18,6 +18,95 @@ use super::{AT_FDCWD, Fd, Kernel, ServiceCtx, Shared, err, io_errno, read_path, 
 const AT_REMOVEDIR: u64 = 0x200;
 
 impl Kernel {
+    /// `mount(source, target, fstype, flags, data)`. The in-memory pseudo
+    /// filesystems really mount (`tmpfs`/`ramfs`, `proc`, `sysfs`,
+    /// `devtmpfs`), stacking over the target directory until `umount`; the
+    /// remount/bind/move/propagation variants and the kernel's other virtual
+    /// filesystems (`devpts`, `mqueue`, `cgroup2`, `debugfs`, `binfmt_misc`,
+    /// …, which nixvm already provides or doesn't model) are accepted as
+    /// no-ops; a filesystem that needs a block device (`ext4`, `vfat`, …) is
+    /// `ENODEV` — there are none. Root only (`EPERM`); the target must be an
+    /// existing directory.
+    pub(super) fn sys_mount(
+        &self,
+        vfs: &mut MountTable,
+        cx: &mut ServiceCtx,
+        a: &[u64; 6],
+        mem: &GuestMemory,
+    ) -> i64 {
+        const MS_REMOUNT: u64 = 32;
+        const MS_BIND: u64 = 4096;
+        const MS_MOVE: u64 = 8192;
+        const MS_PROPAGATION: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+        let (target, fstype, flags) = (a[1], a[2], a[3]);
+        if cx.cur.creds.euid != 0 {
+            return err(Errno::EPERM);
+        }
+        let Some(rel) = read_path(mem, target) else {
+            return err(Errno::EFAULT);
+        };
+        let abs = match self.follow_or_eloop(vfs, &self.resolve_path(cx, AT_FDCWD, &rel)) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        match vfs.stat(&abs) {
+            Some(st) if st.kind == NodeKind::Dir => {}
+            Some(_) if flags & MS_BIND != 0 => {}
+            Some(_) => return err(Errno::ENOTDIR),
+            None => return err(Errno::ENOENT),
+        }
+        if flags & (MS_REMOUNT | MS_BIND | MS_MOVE | MS_PROPAGATION) != 0 {
+            return 0;
+        }
+        let fstype = if fstype == 0 {
+            String::new()
+        } else {
+            match mem.read_cstr(fstype, 64) {
+                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                Err(_) => return err(Errno::EFAULT),
+            }
+        };
+        let fs: Box<dyn crate::fs::MountFs> = match fstype.as_str() {
+            "tmpfs" | "ramfs" => Box::new(crate::fs::TmpFs::new()),
+            "proc" => Box::new(crate::fs::ProcFs::new(self.ncpus)),
+            "sysfs" => Box::new(crate::fs::SysFs::new(self.ncpus)),
+            "devtmpfs" => Box::new(crate::fs::DevFs::new()),
+            "devpts" | "mqueue" | "cgroup" | "cgroup2" | "securityfs" | "debugfs" | "tracefs"
+            | "bpf" | "fusectl" | "configfs" | "pstore" | "efivarfs" | "binfmt_misc"
+            | "hugetlbfs" | "autofs" | "rpc_pipefs" | "nsfs" => return 0,
+            _ => return err(Errno::ENODEV),
+        };
+        vfs.mount_guest(&abs, fs);
+        0
+    }
+
+    /// `umount2(target, flags)`: remove a mount made with `mount(2)`; the
+    /// VM's own mounts are busy (`EBUSY`), a non-mount-point `EINVAL`.
+    pub(super) fn sys_umount2(
+        &self,
+        vfs: &mut MountTable,
+        cx: &mut ServiceCtx,
+        target: u64,
+        flags: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        // MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW.
+        if flags & !0xf != 0 || (flags & 4 != 0 && flags & 3 != 0) {
+            return err(Errno::EINVAL);
+        }
+        if cx.cur.creds.euid != 0 {
+            return err(Errno::EPERM);
+        }
+        let Some(rel) = read_path(mem, target) else {
+            return err(Errno::EFAULT);
+        };
+        let abs = self.resolve_path(cx, AT_FDCWD, &rel);
+        match vfs.unmount(&abs) {
+            Ok(()) => 0,
+            Err(e) => io_errno(&e),
+        }
+    }
+
     /// `statfs(path, buf)` — write a plausible `struct statfs` for the
     /// filesystem containing `path`.
     pub(super) fn sys_statfs(
