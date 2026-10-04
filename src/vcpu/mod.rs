@@ -97,6 +97,16 @@ pub enum Exit {
     MemFault { addr: u64, write: bool },
     /// The guest executed an illegal/undefined instruction.
     IllegalInstruction { pc: u64 },
+    /// The guest executed a software breakpoint: arm64 `BRK #imm` (`code` =
+    /// the 16-bit immediate) or x86 `int3` (`code` = 0). Linux answers with
+    /// `SIGTRAP` (`TRAP_BRKPT` on arm64, `SI_KERNEL` on x86-64) and leaves
+    /// the pc on the arm64 `BRK` (after the x86 `int3`).
+    Breakpoint { pc: u64, code: u64 },
+    /// An alignment fault: a misaligned SP-based access or PC (arm64's SP/PC
+    /// alignment checks), or an atomic/ordered access crossing its
+    /// single-copy-atomicity granule. Linux answers with `SIGBUS`
+    /// (`BUS_ADRALN`, `si_addr` = `addr`), not `SIGSEGV`.
+    Misaligned { addr: u64, write: bool },
     /// The host asked the vcpu to stop (another thread wants to run, or a
     /// deadline/signal fired). The kernel decides what to do next.
     Interrupted,

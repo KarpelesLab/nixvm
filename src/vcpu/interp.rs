@@ -87,6 +87,16 @@ enum Step {
     /// advances it via [`Vcpu::set_syscall_ret`].
     Syscall,
     Illegal,
+    /// `BRK #imm` — a software breakpoint (`SIGTRAP`); `pc` stays on it.
+    Breakpoint {
+        imm: u16,
+    },
+    /// An alignment fault (`SIGBUS`/`BUS_ADRALN`): misaligned SP base, or an
+    /// atomic/ordered access crossing its 16-byte granule.
+    Misaligned {
+        addr: u64,
+        write: bool,
+    },
     /// A load/store touched bad guest memory.
     Fault {
         addr: u64,
@@ -357,9 +367,17 @@ impl Vcpu for Aarch64Interp {
                 None
             };
             let Some(instr) = fetched else {
-                return Ok(Exit::MemFault {
-                    addr: self.pc,
-                    write: false,
+                // A misaligned PC is a PC alignment fault (SIGBUS).
+                return Ok(if self.pc & 3 == 0 {
+                    Exit::MemFault {
+                        addr: self.pc,
+                        write: false,
+                    }
+                } else {
+                    Exit::Misaligned {
+                        addr: self.pc,
+                        write: false,
+                    }
                 });
             };
             match self.exec(instr, mem) {
@@ -368,6 +386,13 @@ impl Vcpu for Aarch64Interp {
                 Step::Syscall => return Ok(Exit::Syscall),
                 Step::Illegal => return Ok(Exit::IllegalInstruction { pc: self.pc }),
                 Step::Fault { addr, write } => return Ok(Exit::MemFault { addr, write }),
+                Step::Breakpoint { imm } => {
+                    return Ok(Exit::Breakpoint {
+                        pc: self.pc,
+                        code: u64::from(imm),
+                    });
+                }
+                Step::Misaligned { addr, write } => return Ok(Exit::Misaligned { addr, write }),
             }
         }
         Ok(Exit::Interrupted)
@@ -515,8 +540,12 @@ pub fn a64_step(state: &mut A64State, instr: u32, mem: &mut GuestMemory) -> A64S
         }
         Step::Branched => A64Step::Branched,
         Step::Syscall => A64Step::Syscall,
-        Step::Illegal => A64Step::Illegal,
-        Step::Fault { addr, write } => A64Step::Fault { addr, write },
+        // The harness compares against native signals only coarsely: a
+        // breakpoint is "not executed", an alignment fault is a fault.
+        Step::Illegal | Step::Breakpoint { .. } => A64Step::Illegal,
+        Step::Fault { addr, write } | Step::Misaligned { addr, write } => {
+            A64Step::Fault { addr, write }
+        }
     };
     state.x = c.x;
     state.sp = c.sp;
@@ -2586,7 +2615,6 @@ mod tests {
             0xD503_42DF,    // msr daifset, #2
             0xD508_751F,    // ic iallu
             0xD508_7620,    // dc ivac, x0
-            0xD420_0000,    // brk #0
             0xD400_0002,    // hvc #0
             0xD53B_9D00,    // mrs x0, pmccntr_el0
             0xD53B_2400,    // mrs x0, rndr (FEAT_RNG not advertised)
@@ -2603,6 +2631,21 @@ mod tests {
                 "{word:#010x} should be UNDEFINED at EL0"
             );
         }
+    }
+
+    /// `BRK #imm` is a breakpoint (SIGTRAP), not an undefined instruction;
+    /// its immediate is reported and the pc stays on it.
+    #[test]
+    fn brk_is_a_breakpoint_with_its_immediate() {
+        let (mut c, mut m) = (cpu(), scratch());
+        assert!(matches!(
+            c.exec(0xD420_0000, &mut m),
+            Step::Breakpoint { imm: 0 }
+        ));
+        assert!(matches!(
+            c.exec(0xD43E_8000, &mut m), // brk #0xf400
+            Step::Breakpoint { imm: 0xf400 }
+        ));
     }
 
     /// The ID registers Linux emulates for EL0 agree with `AT_HWCAP`.

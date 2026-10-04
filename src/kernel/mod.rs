@@ -252,6 +252,15 @@ struct ProcInfo {
     /// The full launch command line (`/proc/self/cmdline`): the task's `argv`
     /// joined by NULs, exactly as the kernel presents it. Set at `execve`/boot.
     cmdline: Vec<u8>,
+    /// The auxiliary vector the image was started with (`/proc/self/auxv`,
+    /// Linux's `mm->saved_auxv`): raw `(type, value)` words through
+    /// `AT_NULL`, captured at `execve`/boot and inherited across `fork`.
+    auxv: Vec<u8>,
+    /// arm64: the address of this image's `rt_sigreturn` trampoline page —
+    /// what Linux's vDSO `__kernel_rt_sigreturn` provides to handlers
+    /// installed without `SA_RESTORER` (Go's). Mapped on first need, 0 until
+    /// then; inherited across `fork` (the page is copied), reset by `execve`.
+    sigtramp: u64,
     /// `PR_SET_NO_NEW_PRIVS` latch (sandboxing setups set and re-check it).
     no_new_privs: bool,
     /// `PR_SET_PDEATHSIG`: signal to send when the parent dies (stored/reported;
@@ -381,6 +390,8 @@ impl Default for ProcInfo {
             exe: String::new(),
             comm: String::new(),
             cmdline: Vec::new(),
+            auxv: Vec::new(),
+            sigtramp: 0,
             no_new_privs: false,
             pdeathsig: 0,
             dumpable: 1,
@@ -585,6 +596,8 @@ const SA_RESETHAND: u64 = 0x8000_0000;
 const SIGRTMIN: u64 = 32;
 /// The synchronous fault signals this kernel can deliver to a handler.
 const SIGILL: u64 = 4;
+const SIGTRAP: u64 = 5;
+const SIGBUS: u64 = 7;
 const SIGSEGV: u64 = 11;
 /// Posted when an `ITIMER_REAL` (`alarm`/`setitimer`) deadline passes.
 const SIGALRM: u64 = 14;
@@ -2196,7 +2209,18 @@ impl Kernel {
                     // the faulting instruction. Never true for the interpreter or
                     // the serial path, which are always coherent with `mem`.
                     Serviced::Resume
-                } else if self.deliver_fault_signal(cx, SIGSEGV, addr, vcpu, mem) {
+                } else if self.deliver_fault_signal(
+                    cx,
+                    signal::Fault::segv(
+                        self.arch,
+                        addr,
+                        write,
+                        mem.page_prot(addr).is_some(),
+                        addr == vcpu.pc(),
+                    ),
+                    vcpu,
+                    mem,
+                ) {
                     // The guest caught it (JIT trap handler): run the handler.
                     Serviced::Resume
                 } else {
@@ -2215,7 +2239,7 @@ impl Kernel {
                 // is identifiable from the report alone (the pc is under a
                 // load bias for PIEs/`ld-musl`, so it can't be looked up in
                 // the on-disk ELF directly).
-                if self.deliver_fault_signal(cx, SIGILL, pc, vcpu, mem) {
+                if self.deliver_fault_signal(cx, signal::Fault::ill(self.arch, pc), vcpu, mem) {
                     return Serviced::Resume; // guest's SIGILL handler (JIT trap)
                 }
                 let bytes = mem.read_vec(pc, 16).unwrap_or_default();
@@ -2227,6 +2251,31 @@ impl Kernel {
                     hex.join(" ")
                 );
                 self.die_of_signal(cx, SIGILL as u32, mem);
+                Serviced::Ended
+            }
+            Exit::Breakpoint { pc, .. } => {
+                // `BRK`/`int3`: SIGTRAP (a debugger-less process dies of it with
+                // a core, like Linux; a guest handler — Go, sanitizers — runs).
+                if self.deliver_fault_signal(cx, signal::Fault::brk(self.arch, pc), vcpu, mem) {
+                    return Serviced::Resume;
+                }
+                eprintln!("[fault] pid {} breakpoint trap at {pc:#x}", cx.cur.pid);
+                self.dump_fault_context(vcpu, mem);
+                self.die_of_signal(cx, SIGTRAP as u32, mem);
+                Serviced::Ended
+            }
+            Exit::Misaligned { addr, write } => {
+                let fault = signal::Fault::misaligned(self.arch, addr, write, vcpu.pc(), vcpu.sp());
+                if self.deliver_fault_signal(cx, fault, vcpu, mem) {
+                    return Serviced::Resume;
+                }
+                eprintln!(
+                    "[fault] pid {} alignment fault at {addr:#x} (write={write}, pc={:#x})",
+                    cx.cur.pid,
+                    vcpu.pc()
+                );
+                self.dump_fault_context(vcpu, mem);
+                self.die_of_signal(cx, SIGBUS as u32, mem);
                 Serviced::Ended
             }
             Exit::Halt => {
@@ -4262,6 +4311,8 @@ impl Kernel {
             return err(Errno::ENOEXEC);
         };
         vcpu.reset(img.entry, img.stack_pointer);
+        cx.cur.auxv = crate::loader::read_auxv(mem, img.stack_pointer);
+        cx.cur.sigtramp = 0;
         let mid = page_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
         cx.cur.brk = img.program_break;
         cx.cur.heap_start = img.program_break;
@@ -11008,6 +11059,8 @@ mod tests {
         let mut vcpu = backend.new_vcpu(0x1_1111, 0x1_3000).unwrap();
         vcpu.set_reg(3, 0xdead); // rbx (callee-saved) — must survive the handler
         vcpu.set_reg(0, 0x1234); // rax
+        let xmm: Vec<u8> = (0..=255u8).collect(); // XMM0..15, distinctive
+        vcpu.set_simd_state(&xmm);
         let (orig_pc, orig_sp) = (vcpu.pc(), vcpu.sp());
 
         let (mut k, mut mem, _v, mut cx) = setup();
@@ -11022,7 +11075,12 @@ mod tests {
         };
 
         // Deliver SIGSEGV (fault addr 0xcafe) → the vcpu enters the handler.
-        assert!(k.deliver_fault_signal(&mut cx, 11, 0xcafe, vcpu.as_mut(), &mut mem));
+        assert!(k.deliver_fault_signal(
+            &mut cx,
+            signal::Fault::segv(k.arch, 0xcafe, false, false, false),
+            vcpu.as_mut(),
+            &mut mem
+        ));
         assert_eq!(vcpu.pc(), 0x2_0000, "pc → handler");
         assert_eq!(vcpu.reg(7), 11, "rdi = signum");
         let frame = vcpu.sp();
@@ -11043,14 +11101,23 @@ mod tests {
             "SIGSEGV blocked in handler"
         );
 
-        // The handler clobbers rbx; rt_sigreturn must restore it.
+        // uc_mcontext.fpstate → a 64-byte-aligned fxsave image above the
+        // frame with the XMM file at +160.
+        let fpstate = mem.read_u64(frame + 8 + 40 + 23 * 8).unwrap();
+        assert!(fpstate > frame && fpstate % 64 == 0, "fpstate {fpstate:#x}");
+        assert_eq!(mem.read_vec(fpstate + 160, 256).unwrap(), xmm);
+        assert_eq!(mem.read_u32(fpstate + 24).unwrap(), 0x1f80, "mxcsr");
+
+        // The handler clobbers rbx and the XMM file; rt_sigreturn restores them.
         vcpu.set_reg(3, 0);
+        vcpu.set_simd_state(&[0u8; 256]);
         vcpu.set_sp(frame + 8); // as if the restorer's `ret` popped pretcode
         k.sys_rt_sigreturn(&mut cx, vcpu.as_mut(), &mem);
         assert_eq!(vcpu.pc(), orig_pc, "pc restored");
         assert_eq!(vcpu.sp(), orig_sp, "rsp restored");
         assert_eq!(vcpu.reg(3), 0xdead, "rbx restored");
         assert_eq!(vcpu.reg(0), 0x1234, "rax restored");
+        assert_eq!(vcpu.simd_state(), xmm, "XMM restored");
         assert_eq!(cx.cur.blocked, 0, "signal mask restored");
     }
 
@@ -11217,6 +11284,15 @@ mod tests {
         vcpu.set_reg(19, 0xdead); // x19 (callee-saved) — must survive the handler
         vcpu.set_reg(0, 0x1234); // x0
         vcpu.set_rflags(1 << 30); // PSTATE.Z set — must round-trip
+        // FP/SIMD state: FPCR rounding mode, a cumulative FPSR flag, and
+        // distinctive V registers — all must survive the handler.
+        let mut simd = vec![0u8; 520];
+        simd[0..4].copy_from_slice(&0x10u32.to_le_bytes()); // FPSR.IXC
+        simd[4..8].copy_from_slice(&0x0040_0000u32.to_le_bytes()); // FPCR.RMode = +inf
+        for (i, b) in simd[8..].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        vcpu.set_simd_state(&simd);
         let (orig_pc, orig_sp, orig_pstate) = (vcpu.pc(), vcpu.sp(), vcpu.rflags());
 
         let (k, mut mem, _v, mut cx) = setup(); // setup() is already Arch::Aarch64
@@ -11224,13 +11300,18 @@ mod tests {
         cx.cur.mm = 0;
         cx.cur.handlers[11] = SigAction {
             handler: 0x2_0000,
-            flags: 0,
+            flags: 0x0400_0000, // SA_RESTORER
             restorer: 0x2_1000,
             mask: 0,
         };
 
         // Deliver SIGSEGV (fault addr 0xcafe) → the vcpu enters the aarch64 handler.
-        assert!(k.deliver_fault_signal(&mut cx, 11, 0xcafe, vcpu.as_mut(), &mut mem));
+        assert!(k.deliver_fault_signal(
+            &mut cx,
+            signal::Fault::segv(k.arch, 0xcafe, false, false, false),
+            vcpu.as_mut(),
+            &mut mem
+        ));
         assert_eq!(vcpu.pc(), 0x2_0000, "pc → handler");
         assert_eq!(vcpu.reg(0), 11, "x0 = signum");
         assert_eq!(vcpu.reg(30), 0x2_1000, "x30 = sa_restorer");
@@ -11239,15 +11320,37 @@ mod tests {
         assert_eq!(vcpu.reg(2), frame + 128, "x2 = &ucontext");
         // siginfo at the frame base carries si_signo and the fault address.
         assert_eq!(mem.read_u32(frame).unwrap(), 11, "si_signo");
+        assert_eq!(mem.read_u32(frame + 8).unwrap(), 1, "si_code SEGV_MAPERR");
+        assert_eq!(mem.read_u64(frame + 16).unwrap(), 0xcafe, "si_addr");
         assert_eq!(
             cx.cur.blocked & (1 << 10),
             1 << 10,
             "SIGSEGV blocked in handler"
         );
+        // uc_mcontext at +176 (the UAPI offset musl/glibc/Go compile in).
+        let mctx = frame + 128 + 176;
+        assert_eq!(mem.read_u64(mctx).unwrap(), 0xcafe, "fault_address");
+        assert_eq!(mem.read_u64(mctx + 8 + 19 * 8).unwrap(), 0xdead, "regs[19]");
+        assert_eq!(mem.read_u64(mctx + 264).unwrap(), orig_pc, "pc");
+        // __reserved: fpsimd_context, esr_context (data abort, level-3
+        // translation fault), then the null terminator.
+        let rec = mctx + 288;
+        assert_eq!(mem.read_u32(rec).unwrap(), 0x4650_8001, "FPSIMD_MAGIC");
+        assert_eq!(mem.read_u32(rec + 4).unwrap(), 528);
+        assert_eq!(mem.read_vec(rec + 8, 520).unwrap(), simd, "fpsr/fpcr/vregs");
+        assert_eq!(mem.read_u32(rec + 528).unwrap(), 0x4553_5201, "ESR_MAGIC");
+        assert_eq!(
+            mem.read_u64(rec + 536).unwrap() >> 26,
+            0x24,
+            "EC = DABT_LOW"
+        );
+        assert_eq!(mem.read_u64(rec + 544).unwrap(), 0, "terminator");
 
-        // The handler clobbers x19, sp, and the flags; rt_sigreturn restores them.
+        // The handler clobbers x19, sp, the flags and the FP state;
+        // rt_sigreturn restores them.
         vcpu.set_reg(19, 0);
         vcpu.set_rflags(0);
+        vcpu.set_simd_state(&[0u8; 520]);
         // sp still points at the frame base (the restorer trampoline doesn't move it).
         k.sys_rt_sigreturn(&mut cx, vcpu.as_mut(), &mem);
         assert_eq!(vcpu.pc(), orig_pc, "pc restored");
@@ -11265,7 +11368,12 @@ mod tests {
         let mut vcpu = backend.new_vcpu(0x1_1111, 0x1_3000).unwrap();
         let (k, mut mem, _v, mut cx) = setup();
         // SIG_DFL for SIGSEGV: not deliverable (stays a fatal fault).
-        assert!(!k.deliver_fault_signal(&mut cx, 11, 0, vcpu.as_mut(), &mut mem));
+        assert!(!k.deliver_fault_signal(
+            &mut cx,
+            signal::Fault::segv(k.arch, 0, false, false, false),
+            vcpu.as_mut(),
+            &mut mem
+        ));
     }
 
     #[test]
