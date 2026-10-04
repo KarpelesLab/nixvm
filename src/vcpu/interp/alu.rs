@@ -235,10 +235,10 @@ impl Aarch64Interp {
             return Step::Next;
         }
         match (instr >> 21) & 0xf {
-            // ADC/ADCS/SBC/SBCS. (Nonzero bits 15:10 are FlagM's RMIF/SETF.)
+            // ADC/ADCS/SBC/SBCS; RMIF and SETF8/SETF16 (FEAT_FlagM).
             0b0000 => {
                 if (instr >> 10) & 0x3f != 0 {
-                    return Step::Illegal;
+                    return self.exec_flagm(instr);
                 }
                 let sub = (instr >> 30) & 1 == 1;
                 let a = self.read_x(rn);
@@ -372,6 +372,32 @@ impl Aarch64Interp {
             _ => return Step::Illegal,
         }
         Step::Next
+    }
+
+    /// `RMIF` (rotate a register right, insert selected bits into NZCV) and
+    /// `SETF8`/`SETF16` (flags from an 8/16-bit value), FEAT_FlagM.
+    fn exec_flagm(&mut self, instr: u32) -> Step {
+        let rn = reg_field(instr, 5);
+        if instr & 0xFFE0_7C10 == 0xBA00_0400 {
+            // RMIF Xn, #shift, #mask
+            let v = self.read_x(rn).rotate_right((instr >> 15) & 0x3f);
+            let mask = instr & 0xf;
+            let cur = self.flags.nzcv();
+            let new = (cur & !mask) | (v as u32 & mask);
+            self.flags = Flags::from_nzcv(new);
+            return Step::Next;
+        }
+        if instr & 0xFFFF_BC1F == 0x3A00_080D {
+            // SETF8 / SETF16 Wn
+            let bits = if (instr >> 14) & 1 == 1 { 16 } else { 8 };
+            let v = self.read_x(rn);
+            let top = (v >> (bits - 1)) & 1 == 1;
+            self.flags.n = top;
+            self.flags.z = v & ones(bits) == 0;
+            self.flags.v = ((v >> bits) & 1 == 1) != top;
+            return Step::Next;
+        }
+        Step::Illegal
     }
 
     /// Set N and Z from a logical result, clearing C and V (`ANDS`/`BICS`).

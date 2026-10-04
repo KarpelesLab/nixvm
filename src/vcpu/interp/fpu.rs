@@ -322,6 +322,19 @@ fn process_nans3(
     None
 }
 
+/// `FPConvertNaN` of an already-quiet NaN between formats: keep the sign and
+/// the most significant payload bits.
+fn nan_convert(q: u64, from: Fmt, to: Fmt) -> u64 {
+    let sign = q & from.sign_bit() != 0;
+    let payload = q & from.frac_mask() & !(1 << (from.f - 1));
+    let p = if to.f >= from.f {
+        payload << (to.f - from.f)
+    } else {
+        payload >> (from.f - to.f)
+    };
+    to.signed(sign, (to.max_biased() << to.f) | (1 << (to.f - 1)) | p)
+}
+
 // ---- rounding --------------------------------------------------------------
 
 /// How a truncation's discarded part compares with half an ULP.
@@ -734,12 +747,43 @@ pub(crate) fn mul_add(addend: u64, op1: u64, op2: u64, fmt: Fmt, env: &mut Env) 
             }
         }
     }
+    mul_add_mixed(addend, op1, op2, fmt, fmt, env)
+}
+
+/// [`mul_add`] with the multiplicands in format `ofmt` and the addend/result
+/// in `fmt` — `FPMulAddH` (FHM's `FMLAL`: half products accumulated in
+/// single precision) when they differ. A NaN operand of the narrower format
+/// propagates via `FPConvertNaN`.
+pub(crate) fn mul_add_mixed(
+    addend: u64,
+    op1: u64,
+    op2: u64,
+    fmt: Fmt,
+    ofmt: Fmt,
+    env: &mut Env,
+) -> u64 {
     let ua = unpack(addend, fmt, env);
-    let u1 = unpack(op1, fmt, env);
-    let u2 = unpack(op2, fmt, env);
+    let u1 = unpack(op1, ofmt, env);
+    let u2 = unpack(op2, ofmt, env);
     let inf_zero = (u1.kind == Kind::Inf && u2.kind == Kind::Zero)
         || (u1.kind == Kind::Zero && u2.kind == Kind::Inf);
-    let nan = process_nans3(addend, &ua, op1, &u1, op2, &u2, fmt, env);
+    let nan = if fmt == ofmt {
+        process_nans3(addend, &ua, op1, &u1, op2, &u2, fmt, env)
+    } else {
+        let ops = [(addend, ua, fmt), (op1, u1, ofmt), (op2, u2, ofmt)];
+        let pick = ops
+            .iter()
+            .find(|o| o.1.kind == Kind::SNaN)
+            .or_else(|| ops.iter().find(|o| o.1.kind == Kind::QNaN));
+        pick.map(|&(bits, u, f)| {
+            let q = process_nan(bits, u.kind, f, env);
+            if f == fmt || env.dn() {
+                if env.dn() { fmt.default_nan() } else { q }
+            } else {
+                nan_convert(q, f, fmt)
+            }
+        })
+    };
     if ua.kind == Kind::QNaN && inf_zero {
         env.raise(IOC);
         return fmt.default_nan();
@@ -975,6 +1019,116 @@ pub(crate) fn round_int(a: u64, mode: Rounding, exact: bool, fmt: Fmt, env: &mut
     }
 }
 
+/// `FPRoundIntN` (`FRINT32*`/`FRINT64*`): round to an integral value that
+/// fits a signed `intsize`-bit integer; NaN, infinity and out-of-range
+/// values become `-2^(intsize-1)` with `IOC`. Inexact always raises `IXC`.
+pub(crate) fn round_int_n(a: u64, mode: Rounding, intsize: u32, fmt: Fmt, env: &mut Env) -> u64 {
+    let ua = unpack(a, fmt, env);
+    let min_int = fmt.normal(true, intsize as i32 - 1, 0);
+    match ua.kind {
+        Kind::QNaN | Kind::SNaN | Kind::Inf => {
+            env.raise(IOC);
+            min_int
+        }
+        Kind::Zero => fmt.zero(ua.sign),
+        Kind::Finite => {
+            let (mag, rest) = if ua.exp >= 0 {
+                if 64 - ua.mant.leading_zeros() as i32 + ua.exp > 70 {
+                    env.raise(IOC);
+                    return min_int;
+                }
+                (u128::from(ua.mant) << ua.exp as u32, Rest::Exact)
+            } else {
+                shift_rest(u128::from(ua.mant), -ua.exp, false)
+            };
+            let mut mag = mag;
+            if rounds_up(mode, ua.sign, mag & 1 == 1, rest) {
+                mag += 1;
+            }
+            let limit = 1u128 << (intsize - 1);
+            if (ua.sign && mag > limit) || (!ua.sign && mag >= limit) {
+                env.raise(IOC);
+                return min_int;
+            }
+            if rest != Rest::Exact {
+                env.raise(IXC);
+            }
+            if mag == 0 {
+                fmt.zero(ua.sign)
+            } else {
+                let mut scratch = *env;
+                round_full(
+                    ua.sign,
+                    mag,
+                    0,
+                    false,
+                    fmt,
+                    Rounding::Zero,
+                    false,
+                    false,
+                    &mut scratch,
+                )
+            }
+        }
+    }
+}
+
+/// `FPToFixedJS` (`FJCVTZS`): double to int32 with JavaScript `ToInt32`
+/// semantics (truncate, wrap modulo 2^32). Returns the result and the `Z`
+/// flag (set when the conversion was exact and in range).
+pub(crate) fn to_js(a: u64, env: &mut Env) -> (u32, bool) {
+    let ua = unpack(a, D, env);
+    let mut z = true;
+    match ua.kind {
+        Kind::QNaN | Kind::SNaN => {
+            env.raise(IOC);
+            return (0, false);
+        }
+        Kind::Inf => {
+            env.raise(IOC);
+            return (0, false);
+        }
+        Kind::Zero => {
+            // -0.0, and a subnormal flushed to zero, are not exact.
+            let exact = !ua.sign && a & D.frac_mask() == 0;
+            return (0, exact);
+        }
+        Kind::Finite => {}
+    }
+    // Truncated magnitude (saturated far out of range: only its low 32 bits
+    // and whether it exceeds 2^31 matter) and whether a fraction was dropped.
+    let (int, inexact): (u128, bool) = if ua.exp >= 0 {
+        let e = ua.exp as u32;
+        if e >= 64 {
+            (1u128 << 64, false) // low 32 bits are zero, far out of range
+        } else {
+            (u128::from(ua.mant) << e, false)
+        }
+    } else {
+        let sh = (-ua.exp) as u32;
+        if sh >= 64 {
+            (0, true)
+        } else {
+            (u128::from(ua.mant >> sh), ua.mant & ((1u64 << sh) - 1) != 0)
+        }
+    };
+    let low = int as u32;
+    let limit = if ua.sign {
+        1u128 << 31
+    } else {
+        (1u128 << 31) - 1
+    };
+    let result = if ua.sign { low.wrapping_neg() } else { low };
+    if int > limit {
+        env.raise(IOC);
+        z = false;
+    } else if inexact {
+        env.raise(IXC);
+        z = false;
+    }
+    (result, z)
+}
+
 /// `FPToFixed`: convert to a `bits`-wide (signed or unsigned) integer scaled
 /// by `2^fbits`, saturating (with `IOC`) on overflow or NaN.
 pub(crate) fn to_fixed(
@@ -1183,6 +1337,107 @@ pub(crate) fn convert(a: u64, from: Fmt, to: Fmt, mode: Rounding, env: &mut Env)
             )
         }
     }
+}
+
+// ---- BFloat16 --------------------------------------------------------------------
+
+/// The BFloat16 format (`FEAT_BF16`): single precision's exponent range with
+/// a 7-bit fraction.
+pub(crate) const BF: Fmt = Fmt { e: 8, f: 7 };
+
+/// `BFUnpack`: a single-precision operand of the BF16 arithmetic, with
+/// subnormals flushed and every NaN treated as quiet.
+fn bf_unpack(bits: u64) -> Un {
+    let sign = bits & S.sign_bit() != 0;
+    let be = (bits >> 23) & 0xff;
+    let frac = bits & S.frac_mask();
+    let (kind, mant, exp) = match be {
+        0 => (Kind::Zero, 0, 0),
+        0xff if frac == 0 => (Kind::Inf, 0, 0),
+        0xff => (Kind::QNaN, 0, 0),
+        _ => (Kind::Finite, frac | (1 << 23), be as i32 - 150),
+    };
+    Un {
+        kind,
+        sign,
+        mant,
+        exp,
+    }
+}
+
+/// `BFRound`: round to single precision with round-to-odd, flushing tiny
+/// results to zero and overflowing to infinity; never raises exceptions.
+fn bf_round(sign: bool, sig: u128, exp: i32, sticky: bool) -> u64 {
+    let e = exp + 127 - sig.leading_zeros() as i32;
+    if e < S.min_exp() {
+        return S.zero(sign);
+    }
+    if e > 127 {
+        return S.infinity(sign);
+    }
+    let mut scratch = Env { fpcr: 0, fpsr: 0 };
+    round_full(
+        sign,
+        sig,
+        exp,
+        sticky,
+        S,
+        Rounding::Odd,
+        true,
+        false,
+        &mut scratch,
+    )
+}
+
+/// `BFMul`: single-precision product of two single-precision values under the
+/// BF16 rules.
+fn bf_mul(a: u64, b: u64) -> u64 {
+    let (ua, ub) = (bf_unpack(a), bf_unpack(b));
+    let sign = ua.sign ^ ub.sign;
+    match (ua.kind, ub.kind) {
+        (Kind::QNaN, _) | (_, Kind::QNaN) => S.default_nan(),
+        (Kind::Inf, Kind::Zero) | (Kind::Zero, Kind::Inf) => S.default_nan(),
+        (Kind::Inf, _) | (_, Kind::Inf) => S.infinity(sign),
+        (Kind::Zero, _) | (_, Kind::Zero) => S.zero(sign),
+        _ => bf_round(
+            sign,
+            u128::from(ua.mant) * u128::from(ub.mant),
+            ua.exp + ub.exp,
+            false,
+        ),
+    }
+}
+
+/// `BFAdd`: single-precision sum under the BF16 rules.
+fn bf_add(a: u64, b: u64) -> u64 {
+    let (ua, ub) = (bf_unpack(a), bf_unpack(b));
+    match (ua.kind, ub.kind) {
+        (Kind::QNaN, _) | (_, Kind::QNaN) => S.default_nan(),
+        (Kind::Inf, Kind::Inf) if ua.sign != ub.sign => S.default_nan(),
+        (Kind::Inf, _) => S.infinity(ua.sign),
+        (_, Kind::Inf) => S.infinity(ub.sign),
+        (Kind::Zero, Kind::Zero) if ua.sign == ub.sign => S.zero(ua.sign),
+        (Kind::Zero, Kind::Zero) => S.zero(false),
+        (Kind::Zero, _) => bf_round(ub.sign, u128::from(ub.mant), ub.exp, false),
+        (_, Kind::Zero) => bf_round(ua.sign, u128::from(ua.mant), ua.exp, false),
+        _ => match add_exact(
+            ua.sign,
+            u128::from(ua.mant),
+            ua.exp,
+            ub.sign,
+            u128::from(ub.mant),
+            ub.exp,
+        ) {
+            None => S.zero(false),
+            Some((s, m, e, st)) => bf_round(s, m, e, st),
+        },
+    }
+}
+
+/// `BFDotAdd`: `addend + a0·b0 + a1·b1` with BF16 inputs (`BFDOT`/`BFMMLA`).
+pub(crate) fn bf_dot_add(addend: u64, a0: u64, a1: u64, b0: u64, b1: u64) -> u64 {
+    let prod = bf_add(bf_mul(a0 << 16, b0 << 16), bf_mul(a1 << 16, b1 << 16));
+    bf_add(addend, prod)
 }
 
 // ---- estimates -------------------------------------------------------------------

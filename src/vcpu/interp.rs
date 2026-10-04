@@ -37,6 +37,7 @@ mod fp;
 mod fpu;
 mod ldst;
 mod simd;
+mod simd_ext;
 
 use crate::abi::Arch;
 
@@ -153,6 +154,9 @@ struct Aarch64Interp {
     /// since the load-exclusive" is exactly what a still-open monitor means.
     excl_monitor: bool,
     excl_addr: u64,
+    /// `PSTATE.DIT` (data-independent timing; FEAT_DIT). Only stored — this
+    /// interpreter's timing doesn't depend on data either way.
+    dit: bool,
 }
 
 impl Aarch64Interp {
@@ -172,6 +176,7 @@ impl Aarch64Interp {
                 .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
             excl_monitor: false,
             excl_addr: 0,
+            dit: false,
         }
     }
 
@@ -335,10 +340,11 @@ impl Vcpu for Aarch64Interp {
     /// Signal delivery saves this into `uc_mcontext.pstate`; `rt_sigreturn`
     /// restores it via [`Self::set_rflags`].
     fn rflags(&self) -> u64 {
-        u64::from(self.flags.nzcv()) << 28
+        (u64::from(self.flags.nzcv()) << 28) | (u64::from(self.dit) << 24)
     }
     fn set_rflags(&mut self, value: u64) {
         self.flags = Flags::from_nzcv((value >> 28) as u32);
+        self.dit = (value >> 24) & 1 == 1;
     }
     /// The FP/SIMD state in the layout of Linux's `struct fpsimd_context`
     /// minus its 8-byte header: `fpsr` (u32), `fpcr` (u32), then `vregs[32]`
@@ -382,6 +388,7 @@ impl Vcpu for Aarch64Interp {
         self.fpsr = 0;
         self.flags = Flags::default();
         self.excl_monitor = false;
+        self.dit = false;
     }
 }
 
@@ -2493,5 +2500,105 @@ mod tests {
     /// byte-order fixup needed.
     fn pack4(w: &[u32; 64], i: usize) -> u128 {
         pack_u32_lanes([w[i], w[i + 1], w[i + 2], w[i + 3]])
+    }
+
+    /// What EL0 code under Linux may not touch must SIGILL, as on hardware:
+    /// `DAIF` (UMA clear), `MSR` (immediate), set/way-free EL1 cache ops,
+    /// debug/hypervisor calls, the PMU and physical counter, unimplemented
+    /// feature registers, and non-emulated parts of the ID space.
+    #[test]
+    fn el0_inaccessible_system_instructions_are_undefined() {
+        let (mut c, mut m) = (cpu(), scratch());
+        for word in [
+            0xD53B_4220u32, // mrs x0, daif
+            0xD503_42DF,    // msr daifset, #2
+            0xD508_751F,    // ic iallu
+            0xD508_7620,    // dc ivac, x0
+            0xD420_0000,    // brk #0
+            0xD400_0002,    // hvc #0
+            0xD53B_9D00,    // mrs x0, pmccntr_el0
+            0xD53B_2400,    // mrs x0, rndr (FEAT_RNG not advertised)
+            0xD53B_E020,    // mrs x0, cntpct_el0
+            0xD538_0020,    // mrs x0, s3_0_c0_c0_1 (not emulated)
+            0xD538_4240,    // mrs x0, currentel
+            0xD538_0800,    // mrs x0, s3_0_c0_c8_0 (outside the ID space)
+            0xD51B_D060,    // msr tpidrro_el0, x0 (read-only at EL0)
+            0xD503_31FF,    // sb with CRm != 0 (unallocated)
+            0x0000_0001,    // udf #1
+        ] {
+            assert!(
+                matches!(c.exec(word, &mut m), Step::Illegal),
+                "{word:#010x} should be UNDEFINED at EL0"
+            );
+        }
+    }
+
+    /// The ID registers Linux emulates for EL0 agree with `AT_HWCAP`.
+    #[test]
+    fn id_registers_match_advertised_features() {
+        let (mut c, mut m) = (cpu(), scratch());
+        let mut mrs = |word: u32| {
+            assert!(matches!(c.exec(word, &mut m), Step::Next));
+            c.x[0]
+        };
+        // AES=2 (with PMULL), SHA1=1, SHA2=1, CRC32=1, Atomic=2.
+        assert_eq!(mrs(0xD538_0600), 0x0021_1120); // id_aa64isar0_el1
+        assert_eq!(mrs(0xD538_0620), 0); // id_aa64isar1_el1
+        assert_eq!(mrs(0xD538_0400), 0x11); // id_aa64pfr0_el1
+        assert_eq!(mrs(0xD538_0000), 0x410F_D0C0); // midr_el1
+        assert_eq!(mrs(0xD538_0700), 0xFF00_0000); // id_aa64mmfr0_el1
+        assert_eq!(mrs(0xD53B_00E0), 4); // dczid_el0: 64-byte DC ZVA
+    }
+
+    /// Hint-space instructions from extensions this CPU lacks (PAuth, BTI)
+    /// are architecturally NOPs and must leave every register alone.
+    #[test]
+    fn unimplemented_hints_are_nops() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[30] = 0x1234_5678;
+        c.x[16] = 0xabcd;
+        for word in [
+            0xD503_233Fu32,
+            0xD503_23BF,
+            0xD503_245F,
+            0xD503_20FF,
+            0xD503_201F,
+        ] {
+            assert!(matches!(c.exec(word, &mut m), Step::Next));
+        }
+        assert_eq!((c.x[30], c.x[16]), (0x1234_5678, 0xabcd));
+    }
+
+    #[test]
+    fn nzcv_fpcr_fpsr_roundtrip_and_masking() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.x[1] = 0xA000_0000; // N and C
+        c.exec(0xD51B_4201, &mut m); // msr nzcv, x1
+        assert!(c.flags.n && !c.flags.z && c.flags.c && !c.flags.v);
+        c.exec(0xD53B_4202, &mut m); // mrs x2, nzcv
+        assert_eq!(c.x[2], 0xA000_0000);
+        // FPCR keeps only AHP/DN/FZ/RMode; FPSR only QC/IDC/IXC..IOC.
+        c.x[1] = u64::MAX;
+        c.exec(0xD51B_4401, &mut m); // msr fpcr, x1
+        c.exec(0xD53B_4402, &mut m); // mrs x2, fpcr
+        assert_eq!(c.x[2], 0x07C0_0000);
+        c.exec(0xD51B_4421, &mut m); // msr fpsr, x1
+        c.exec(0xD53B_4422, &mut m); // mrs x2, fpsr
+        assert_eq!(c.x[2], 0x0800_009F);
+    }
+
+    /// `CLREX` closes the exclusive monitor, so a following store-exclusive
+    /// fails.
+    #[test]
+    fn clrex_breaks_an_exclusive_pair() {
+        let base = 0x1_0000u64;
+        let mut m = GuestMemory::new(base, 4 * PAGE_SIZE);
+        m.map(base, PAGE_SIZE, Prot::rw()).unwrap();
+        let mut c = cpu();
+        c.x[1] = base + 0x40;
+        c.exec(0xC85F_7C20, &mut m); // ldxr x0, [x1]
+        c.exec(0xD503_3F5F, &mut m); // clrex
+        c.exec(0xC802_7C23, &mut m); // stxr w2, x3, [x1]
+        assert_eq!(c.x[2], 1);
     }
 }

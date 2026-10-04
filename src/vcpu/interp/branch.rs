@@ -111,9 +111,16 @@ impl Aarch64Interp {
             0b00 => {
                 let op1 = (instr >> 16) & 7;
                 let crn = (instr >> 12) & 0xf;
+                let crm = (instr >> 8) & 0xf;
                 let op2 = (instr >> 5) & 7;
-                if l != 0 || op1 != 0b011 || rt != 31 {
-                    return Step::Illegal; // MSR (immediate), WFET/WFIT, …
+                if l != 0 || rt != 31 {
+                    return Step::Illegal; // WFET/WFIT, …
+                }
+                if crn == 0b0100 {
+                    return self.exec_msr_imm(op1, crm, op2);
+                }
+                if op1 != 0b011 {
+                    return Step::Illegal;
                 }
                 match crn {
                     // HINT space: NOP, YIELD, WFE, WFI, SEV, SEVL, and every
@@ -132,7 +139,8 @@ impl Aarch64Interp {
                             self.invalidate_fetch(); // ISB
                             Step::Next
                         }
-                        _ => Step::Illegal, // SB, DSB nXS, TCOMMIT
+                        0b111 if crm == 0 => Step::Next, // SB (FEAT_SB)
+                        _ => Step::Illegal,              // DSB nXS, TCOMMIT
                     },
                     _ => Step::Illegal,
                 }
@@ -158,6 +166,38 @@ impl Aarch64Interp {
         }
     }
 
+    /// `MSR` (immediate) / the PSTATE-flag instructions (`CRn = 0100`): only
+    /// `CFINV` (FEAT_FlagM), `XAFLAG`/`AXFLAG` (FEAT_FlagM2) and `MSR DIT`
+    /// are permitted at EL0 on this CPU (`DAIFSet`/`DAIFClr` trap: UMA is
+    /// clear; the rest are EL1-only or unimplemented).
+    fn exec_msr_imm(&mut self, op1: u32, crm: u32, op2: u32) -> Step {
+        let f = self.flags;
+        match (op1, op2) {
+            (0b000, 0b000) if crm == 0 => self.flags.c = !f.c, // CFINV
+            (0b000, 0b001) if crm == 0 => {
+                // XAFLAG: external (IEEE-style) to Arm flag format.
+                self.flags = Flags {
+                    n: !f.c && !f.z,
+                    z: f.z && f.c,
+                    c: f.c || f.z,
+                    v: !f.c && f.z,
+                };
+            }
+            (0b000, 0b010) if crm == 0 => {
+                // AXFLAG
+                self.flags = Flags {
+                    n: false,
+                    z: f.z || f.v,
+                    c: f.c && !f.v,
+                    v: false,
+                };
+            }
+            (0b011, 0b010) => self.dit = crm & 1 == 1, // MSR DIT, #imm
+            _ => return Step::Illegal,
+        }
+        Step::Next
+    }
+
     /// `SYS` (op0 = 1): the EL0-permitted cache maintenance operations.
     fn exec_sys(&mut self, instr: u32, mem: &mut GuestMemory) -> Step {
         let rt = reg_field(instr, 0);
@@ -179,7 +219,8 @@ impl Aarch64Interp {
                 self.invalidate_fetch();
                 Step::Next
             }
-            SYS_DC_CVAC | SYS_DC_CVAU | SYS_DC_CIVAC => Step::Next,
+            // DC CVAP / DC CVADP: FEAT_DPB / FEAT_DPB2.
+            SYS_DC_CVAC | SYS_DC_CVAU | SYS_DC_CIVAC | SYS_DC_CVAP | SYS_DC_CVADP => Step::Next,
             _ => Step::Illegal,
         }
     }
@@ -190,6 +231,7 @@ impl Aarch64Interp {
     pub(super) fn read_sysreg(&mut self, key: u32) -> Option<u64> {
         Some(match key {
             NZCV => u64::from(self.flags.nzcv()) << 28,
+            DIT => u64::from(self.dit) << 24,
             FPCR => self.fpcr,
             FPSR => self.fpsr,
             TPIDR_EL0 => self.tpidr,
@@ -224,6 +266,7 @@ impl Aarch64Interp {
     pub(super) fn write_sysreg(&mut self, key: u32, value: u64) -> bool {
         match key {
             NZCV => self.flags = Flags::from_nzcv((value >> 28) as u32),
+            DIT => self.dit = (value >> 24) & 1 == 1,
             // FPCR: only the fields this CPU implements are writable (AHP, DN,
             // FZ, RMode; FZ16 and the trap enables are RES0 without FEAT_FP16
             // / trapping support).
@@ -241,6 +284,7 @@ const fn sysreg(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
     (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
 }
 const NZCV: u32 = sysreg(3, 3, 4, 2, 0);
+const DIT: u32 = sysreg(3, 3, 4, 2, 5);
 const FPCR: u32 = sysreg(3, 3, 4, 4, 0);
 const FPSR: u32 = sysreg(3, 3, 4, 4, 1);
 const TPIDR_EL0: u32 = sysreg(3, 3, 13, 0, 2);
@@ -304,3 +348,5 @@ const SYS_DC_CVAC: u32 = sys_op(3, 7, 10, 1);
 const SYS_DC_CVAU: u32 = sys_op(3, 7, 11, 1);
 const SYS_DC_CIVAC: u32 = sys_op(3, 7, 14, 1);
 const SYS_IC_IVAU: u32 = sys_op(3, 7, 5, 1);
+const SYS_DC_CVAP: u32 = sys_op(3, 7, 12, 1);
+const SYS_DC_CVADP: u32 = sys_op(3, 7, 13, 1);

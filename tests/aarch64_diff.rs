@@ -585,6 +585,22 @@ fn classify(word: u32) -> (Class, u32) {
             0b110 if word & 0xFE1F_FC1F == 0xD61F_0000 && (word >> 21) & 0xf <= 2 => {
                 (Class::BranchReg, word)
             }
+            // System instructions safe to run natively: CFINV/XAFLAG/AXFLAG,
+            // SB/DSB/DMB/ISB, and MRS/MSR of NZCV/FPSR plus MRS FPCR.
+            0b110
+                if matches!(word, 0xD500_401F | 0xD500_403F | 0xD500_405F | 0xD503_30FF)
+                    || word & 0xFFFF_F0DF == 0xD503_309F =>
+            {
+                (Class::Plain, word)
+            }
+            0b110
+                if matches!(
+                    word & 0xFFFF_FFE0,
+                    0xD53B_4200 | 0xD51B_4200 | 0xD53B_4420 | 0xD51B_4420 | 0xD53B_4400
+                ) =>
+            {
+                (Class::Plain, word)
+            }
             _ => (Class::Skip, word),
         };
     }
@@ -778,6 +794,8 @@ fn run_words(words: &[(u32, String)], iters: u64, seed: u64) -> Report {
         skipped: 0,
     };
     let mut data = vec![0u8; DATA_LEN];
+    // Optionally misalign base registers (exercises alignment faults).
+    let misalign = std::env::var_os("NIXVM_DIFF_MISALIGN").is_some();
     for (word, asm) in words {
         let mnemonic = asm.split_whitespace().next().unwrap_or("?").to_string();
         let (class, word) = classify(*word);
@@ -830,7 +848,10 @@ fn run_words(words: &[(u32, String)], iters: u64, seed: u64) -> Report {
                 // Base register into the data region (16-byte aligned for
                 // exclusives/atomics), index register small.
                 let rn = ((word >> 5) & 0x1f) as usize;
-                let base = data_base + DATA_BASE_OFF + 16 * rng.below(64);
+                let mut base = data_base + DATA_BASE_OFF + 16 * rng.below(64);
+                if misalign && rng.chance(50) {
+                    base += rng.below(16);
+                }
                 if rn == 31 {
                     st.sp = base;
                 } else {
@@ -1040,4 +1061,40 @@ fn rejected_encodings_are_undefined() {
         eprintln!("{:011b}: {n} accepted, e.g. {}", top, ex.join(" "));
     }
     eprintln!("{total} rejected-by-llvm words accepted by the interpreter");
+}
+
+/// Coverage scan: write every word of `NIXVM_SCAN_WORDS` (`<hex> <asm>`
+/// lines) that the interpreter treats as UNDEFINED to `NIXVM_SCAN_OUT`.
+#[test]
+fn scan_undefined_words() {
+    let (Ok(path), Ok(out)) = (
+        std::env::var("NIXVM_SCAN_WORDS"),
+        std::env::var("NIXVM_SCAN_OUT"),
+    ) else {
+        return;
+    };
+    let text = std::fs::read_to_string(path).unwrap();
+    let base = 0x10_0000u64;
+    let mut mem = GuestMemory::new(base, 0x10_0000);
+    mem.map(base, 0x10_0000, Prot::rw()).unwrap();
+    let mut undefined = String::new();
+    for line in text.lines() {
+        let Some((hex, _)) = line.split_once(' ') else {
+            continue;
+        };
+        let Ok(word) = u32::from_str_radix(hex, 16) else {
+            continue;
+        };
+        let mut st = A64State::default();
+        for x in &mut st.x {
+            *x = base + 0x8000;
+        }
+        st.sp = base + 0x8000;
+        st.pc = base;
+        if a64_step(&mut st, word, &mut mem) == A64Step::Illegal {
+            undefined.push_str(line);
+            undefined.push('\n');
+        }
+    }
+    std::fs::write(out, undefined).unwrap();
 }

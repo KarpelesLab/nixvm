@@ -57,6 +57,21 @@ fn fp_op(size: u32, opc: u32) -> Option<(u32, bool)> {
 impl Aarch64Interp {
     pub(super) fn exec_ldst(&mut self, instr: u32, mem: &mut GuestMemory) -> Step {
         let vector = (instr >> 26) & 1 == 1;
+        // SP alignment check (SCTLR_EL1.SA0, set by Linux): any access based
+        // on a misaligned SP faults. (The literal form has no base register;
+        // prefetches — PRFM unsigned-offset/register and PRFUM, the two
+        // masks below — never fault.)
+        if (instr >> 5) & 0x1f == 31
+            && self.sp & 15 != 0
+            && !((instr >> 28) & 3 == 0b01 && (instr >> 24) & 1 == 0)
+            && instr & 0xFFC0_0000 != 0xF980_0000
+            && instr & 0xFFC0_0000 != 0xF880_0000
+        {
+            return Step::Fault {
+                addr: self.sp,
+                write: false,
+            };
+        }
         match (instr >> 28) & 3 {
             0b00 => {
                 if vector {
@@ -70,8 +85,10 @@ impl Aarch64Interp {
             0b01 => {
                 if (instr >> 24) & 1 == 0 {
                     self.exec_literal(instr, mem)
+                } else if !vector && (instr >> 21) & 1 == 0 && (instr >> 10) & 3 == 0 {
+                    self.exec_rcpc2(instr, mem)
                 } else {
-                    Step::Illegal // LDAPUR/STLUR (RCPC2), MOPS
+                    Step::Illegal // MOPS, RCPC3 SIMD forms
                 }
             }
             0b10 => self.exec_pair(instr, mem),
@@ -333,6 +350,22 @@ impl Aarch64Interp {
         let rn = reg_field(instr, 5);
         let rt = reg_field(instr, 0);
         let addr = self.read_sp(rn);
+        // Ordered/atomic accesses must not cross a 16-byte boundary (FEAT_LSE2
+        // single-copy atomicity; real cores raise an alignment fault).
+        let bytes = if o1 == 1 && (o2 == 1 || size < 2) {
+            if o2 == 1 {
+                1u64 << size
+            } else {
+                8 << (size & 1)
+            } // CAS / CASP
+        } else if o1 == 1 {
+            2u64 << size // LDXP/STXP
+        } else {
+            1u64 << size
+        };
+        if crosses_granule(addr, bytes) {
+            return Step::Fault { addr, write: !load };
+        }
         match (o2, o1) {
             (0, 0) => {
                 // LDXR/LDAXR/STXR/STLXR (B/H/W/X).
@@ -418,6 +451,29 @@ impl Aarch64Interp {
         }
     }
 
+    /// `STLUR*`/`LDAPUR*` (FEAT_LRCPC2): release/acquire-RCpc accesses with
+    /// an unscaled signed 9-bit offset (`size 011001 opc 0 imm9 00 Rn Rt`).
+    fn exec_rcpc2(&mut self, instr: u32, mem: &mut GuestMemory) -> Step {
+        let size = instr >> 30;
+        let opc = (instr >> 22) & 3;
+        let rt = reg_field(instr, 0);
+        let imm9 = sign_extend(u64::from((instr >> 12) & 0x1ff), 9);
+        let addr = self.read_sp(reg_field(instr, 5)).wrapping_add(imm9 as u64);
+        if crosses_granule(addr, 1 << size) {
+            return Step::Fault {
+                addr,
+                write: opc == 0,
+            };
+        }
+        match (size, opc) {
+            (_, 0b00) => self.store_x(addr, size, rt, mem),
+            (_, 0b01) => self.load_x(addr, size, rt, 0, mem),
+            (0b00..=0b10, 0b10) => self.load_x(addr, size, rt, 64, mem),
+            (0b00 | 0b01, 0b11) => self.load_x(addr, size, rt, 32, mem),
+            _ => Step::Illegal,
+        }
+    }
+
     /// Open the exclusive monitor on `addr` (`LDXR`/`LDAXR`/`LDXP`/`LDAXP`).
     fn open_monitor(&mut self, addr: u64) {
         self.excl_monitor = true;
@@ -442,10 +498,17 @@ impl Aarch64Interp {
         let o3 = (instr >> 15) & 1;
         let opc = (instr >> 12) & 7;
         let addr = self.read_sp(rn);
+        if crosses_granule(addr, nbytes as u64) {
+            return Step::Fault { addr, write: true };
+        }
         match (o3, opc) {
             (0, _) => self.ld_op(addr, nbytes, rs, rt, opc, mem),
             (1, 0) => self.swp(addr, nbytes, rs, rt, mem),
-            _ => Step::Illegal, // LDAPR (RCPC), LD64B/ST64B, …
+            // LDAPR/LDAPRB/LDAPRH (FEAT_LRCPC): A=1, R=0, Rs=11111.
+            (1, 0b100) if (instr >> 22) & 3 == 0b10 && rs == 31 => {
+                self.load_x(addr, instr >> 30, rt, 0, mem)
+            }
+            _ => Step::Illegal, // LD64B/ST64B, …
         }
     }
 
@@ -779,6 +842,13 @@ enum Addr {
     Post(i64),
     /// `[Xn, Rm{, extend {#amount}}]`
     Register,
+}
+
+/// Whether an access of `bytes` at `addr` crosses a 16-byte boundary, which
+/// faults for ordered/atomic accesses.
+#[inline]
+fn crosses_granule(addr: u64, bytes: u64) -> bool {
+    (addr & 15) + bytes > 16
 }
 
 /// Read `nbytes` (1, 2, 4 or 8) little-endian bytes, zero-extended; `None` on

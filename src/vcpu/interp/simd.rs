@@ -131,7 +131,7 @@ impl Aarch64Interp {
             return self.exec_fp(instr);
         }
         if instr >> 31 != 0 {
-            return Step::Illegal; // SHA-512/SHA-3/SM3/SM4, …
+            return self.crypto_ext(instr); // SHA-512/SHA-3
         }
         let bit10 = (instr >> 10) & 1 == 1;
         let bit21 = (instr >> 21) & 1 == 1;
@@ -176,7 +176,10 @@ impl Aarch64Interp {
             if (instr >> 15) & 1 == 0 && (instr >> 21) & 7 == 0 {
                 return self.simd_copy(instr, scalar);
             }
-            return Step::Illegal; // three-same extra / FP16
+            if (instr >> 15) & 1 == 1 {
+                return self.simd_three_same_extra(instr, scalar);
+            }
+            return Step::Illegal; // FP16 three same
         }
         if (instr >> 15) & 1 != 0 {
             return Step::Illegal;
@@ -407,11 +410,15 @@ impl Aarch64Interp {
             };
             x
         };
-        if matches!(
-            key,
-            0b0_0101 | 0b0_1011 | 0b0_1100 | 0b0_1101 | 0b1_0001 | 0b1_1001 | 0b1_1011 | 0b1_1111
-        ) {
-            return Step::Illegal; // FMLAL/FMLSL (FHM) and unallocated
+        if matches!(key, 0b0_0101 | 0b0_1101 | 0b1_0001 | 0b1_1001) {
+            // FMLAL/FMLSL/FMLAL2/FMLSL2 (FEAT_FHM): size<0> must be 0.
+            if scalar || sz != 0 {
+                return Step::Illegal;
+            }
+            return self.simd_fhm(instr, a_bit == 1, u == 1);
+        }
+        if matches!(key, 0b0_1011 | 0b0_1100 | 0b1_1011 | 0b1_1111) {
+            return Step::Illegal;
         }
         let (rd, rn, rm) = (
             reg_field(instr, 0),
@@ -789,8 +796,26 @@ impl Aarch64Interp {
         let size = (instr >> 22) & 3;
         let opcode = (instr >> 12) & 0x1f;
         let (rd, rn) = (reg_field(instr, 0), reg_field(instr, 5));
+        if size == 2 && u == 0 && opcode == 0b10110 && !scalar {
+            // BFCVTN/BFCVTN2 (FEAT_BF16)
+            let mut env = self.fpenv();
+            let mode = env.rounding();
+            let n = self.v[rn];
+            let mut r = 0u128;
+            for i in 0..4 {
+                let x = fpu::convert(elem(n, i, 32), S, fpu::BF, mode, &mut env);
+                r |= u128::from(x) << (16 * i);
+            }
+            self.set_fpenv(env);
+            self.v[rd] = if q {
+                (self.v[rd] & u128::from(u64::MAX)) | (r << 64)
+            } else {
+                r
+            };
+            return Step::Next;
+        }
         if size >= 2 {
-            return Step::Illegal; // BFCVTN (BF16) and unallocated
+            return Step::Illegal;
         }
         let sz = size & 1;
         let (n, d) = (self.v[rn], self.v[rd]);
@@ -866,6 +891,8 @@ impl Aarch64Interp {
             // U=0 a=0: FRINTN FRINTM FCVTNS FCVTMS FCVTAS SCVTF
             0b0_0_11000 | 0b0_0_11001 => (true, false),
             0b0_0_11010..=0b0_0_11101 => (true, true),
+            // FRINT32Z/FRINT64Z (U=0), FRINT32X/FRINT64X (U=1): FEAT_FRINTTS
+            0b0_0_11110 | 0b0_0_11111 | 0b1_0_11110 | 0b1_0_11111 => (true, false),
             // U=0 a=1: FCMGT0 FCMEQ0 FCMLT0 FABS FRINTP FRINTZ FCVTPS FCVTZS
             // URECPE FRECPE FRECPX
             0b0_1_01100..=0b0_1_01110 => (true, true),
@@ -912,6 +939,10 @@ impl Aarch64Interp {
                 0b1_0_11000 => fpu::round_int(x, Rounding::TieAway, false, fmt, e),
                 0b1_0_11001 => fpu::round_int(x, rm, true, fmt, e),
                 0b1_1_11001 => fpu::round_int(x, rm, false, fmt, e),
+                0b0_0_11110 => fpu::round_int_n(x, Rounding::Zero, 32, fmt, e),
+                0b0_0_11111 => fpu::round_int_n(x, Rounding::Zero, 64, fmt, e),
+                0b1_0_11110 => fpu::round_int_n(x, rm, 32, fmt, e),
+                0b1_0_11111 => fpu::round_int_n(x, rm, 64, fmt, e),
                 0b0_0_11010 | 0b1_0_11010 => {
                     fpu::to_fixed(x, fmt, 0, unsigned, esize, Rounding::TieEven, e)
                 }
@@ -1326,6 +1357,9 @@ impl Aarch64Interp {
         let opcode = (instr >> 12) & 0xf;
         let h = (instr >> 11) & 1;
         let (rd, rn) = (reg_field(instr, 0), reg_field(instr, 5));
+        if let Some(step) = self.simd_by_elem_ext(instr, scalar) {
+            return step;
+        }
         let key = (u << 4) | opcode;
         let fp = matches!(key, 0b0_0001 | 0b0_0101 | 0b0_1001 | 0b1_1001);
         if fp {

@@ -208,6 +208,15 @@ impl Aarch64Interp {
         let rn = reg_field(instr, 5);
         let ftype = (instr >> 22) & 3;
         let opcode = (instr >> 15) & 0x3f;
+        if ftype == 0b01 && opcode == 0b000110 {
+            // BFCVT Hd, Sn (FEAT_BF16)
+            let mut env = self.fpenv();
+            let mode = env.rounding();
+            let r = fpu::convert(self.vreg(rn, S), S, fpu::BF, mode, &mut env);
+            self.set_fpenv(env);
+            self.set_vreg(rd, r, H);
+            return Step::Next;
+        }
         if opcode & 0b111100 == 0b000100 {
             // FCVT between half, single and double.
             let from = match ftype {
@@ -255,6 +264,16 @@ impl Aarch64Interp {
                     _ => return Step::Illegal,
                 };
                 fpu::round_int(a, mode, exact, fmt, &mut env)
+            }
+            // FRINT32Z/FRINT32X/FRINT64Z/FRINT64X (FEAT_FRINTTS)
+            0b010000..=0b010011 => {
+                let mode = if opcode & 1 == 0 {
+                    Rounding::Zero
+                } else {
+                    env.rounding()
+                };
+                let intsize = if opcode & 2 == 0 { 32 } else { 64 };
+                fpu::round_int_n(a, mode, intsize, fmt, &mut env)
             }
             _ => return Step::Illegal,
         };
@@ -331,6 +350,14 @@ impl Aarch64Interp {
                     let r = self.read_x(rn);
                     self.set_vreg(rd, r, fmt);
                 }
+            }
+            (0b11, 0b110) if !sf && ftype == 0b01 => {
+                // FJCVTZS (FEAT_JSCVT): JavaScript ToInt32; Z reports exactness.
+                let mut env = self.fpenv();
+                let (r, z) = fpu::to_js(self.vreg(rn, D), &mut env);
+                self.set_fpenv(env);
+                self.write_x(rd, u64::from(r));
+                self.flags = Flags::from_nzcv(u32::from(z) << 2);
             }
             (0b01, 0b110 | 0b111) => {
                 // FMOV Xd, Vn.D[1] / FMOV Vd.D[1], Xn
