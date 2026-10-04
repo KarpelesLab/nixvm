@@ -484,7 +484,8 @@ fn specs() -> Vec<OpSpec> {
             if mand == 0 && mmx_ops.contains(&o) {
                 continue; // an MMX instruction: the Mmx category runs it in MMX mode
             }
-            // SSE3 (not advertised): MOVSLDUP/MOVSHDUP/MOVDDUP.
+            // (The SSE3 MOVSLDUP/MOVSHDUP/MOVDDUP forms are listed with the v2
+            // extensions below.)
             if matches!((mand, o), (0xF3 | 0xF2, 0x12) | (0xF3, 0x16)) {
                 continue;
             }
@@ -501,6 +502,89 @@ fn specs() -> Vec<OpSpec> {
         mem: Some(false),
         ..op(Sse, &TWO[0xF7], true, None)
     }); // MASKMOVDQU
+
+    // ---- x86-64-v2: SSE3, SSSE3, SSE4.1, SSE4.2 ----
+    static T38: [[u8; 3]; 256] = {
+        let mut t = [[0u8; 3]; 256];
+        let mut i = 0;
+        while i < 256 {
+            t[i] = [0x0F, 0x38, i as u8];
+            i += 1;
+        }
+        t
+    };
+    static T3A: [[u8; 3]; 256] = {
+        let mut t = [[0u8; 3]; 256];
+        let mut i = 0;
+        while i < 256 {
+            t[i] = [0x0F, 0x3A, i as u8];
+            i += 1;
+        }
+        t
+    };
+    for (mand, o) in [
+        (0x66u8, 0xD0usize),
+        (0xF2, 0xD0),
+        (0x66, 0x7C),
+        (0xF2, 0x7C),
+        (0x66, 0x7D),
+        (0xF2, 0x7D),
+        (0xF3, 0x12),
+        (0xF3, 0x16),
+        (0xF2, 0x12),
+    ] {
+        v.push(OpSpec {
+            mand,
+            ..op(Sse, &TWO[o], true, None)
+        });
+    }
+    v.push(OpSpec {
+        mand: 0xF2,
+        mem: Some(true),
+        ..op(Sse, &TWO[0xF0], true, None)
+    }); // LDDQU
+    for o in (0x00..=0x0B).chain(0x1C..=0x1E) {
+        v.push(op(Mmx, &T38[o], true, None));
+        v.push(OpSpec {
+            mand: 0x66,
+            ..op(Sse, &T38[o], true, None)
+        });
+    }
+    v.push(op(Mmx, &T3A[0x0F], true, B));
+    v.push(OpSpec {
+        mand: 0x66,
+        ..op(Sse, &T3A[0x0F], true, B)
+    });
+    for o in [
+        0x10usize, 0x14, 0x15, 0x17, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x28, 0x29, 0x2B, 0x30,
+        0x31, 0x32, 0x33, 0x34, 0x35, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40,
+        0x41,
+    ] {
+        v.push(OpSpec {
+            mand: 0x66,
+            ..op(Sse, &T38[o], true, None)
+        });
+    }
+    v.push(OpSpec {
+        mand: 0x66,
+        mem: Some(true),
+        ..op(Sse, &T38[0x2A], true, None)
+    }); // MOVNTDQA
+    for o in [
+        0x08usize, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x14, 0x15, 0x16, 0x17, 0x20, 0x21, 0x22,
+        0x40, 0x41, 0x42, 0x60, 0x61, 0x62, 0x63,
+    ] {
+        v.push(OpSpec {
+            mand: 0x66,
+            ..op(Sse, &T3A[o], true, B)
+        });
+    }
+    for o in [0xF0usize, 0xF1] {
+        v.push(OpSpec {
+            mand: 0xF2,
+            ..op(Int, &T38[o], true, None)
+        });
+    } // CRC32
     v
 }
 
@@ -1102,12 +1186,12 @@ fn rosetta_unsupported(case: &Case) -> bool {
     let reg_form = m >> 6 == 3;
     let ext = (m >> 3) & 7;
     match case.spec.op {
-        [0xD9] => reg_form && ext == 3,                              // FSTP1
-        [0xDC] => reg_form && (ext == 2 || ext == 3),                // FCOM2/FCOMP3
-        [0xDD] => ext == 1,             // FXCH4 (register), FISTTP (memory)
-        [0xDE] => reg_form && ext == 2, // FCOMP5
-        [0xDF] => (reg_form && ext <= 3) || (!reg_form && ext == 1), // FFREEP/FXCH7/FSTP8/9, FISTTP
-        [0xDB] => (reg_form && ext == 4 && matches!(m & 7, 0 | 1 | 4)) || (!reg_form && ext == 1),
+        [0xD9] => reg_form && ext == 3,                               // FSTP1
+        [0xDC] => reg_form && (ext == 2 || ext == 3),                 // FCOM2/FCOMP3
+        [0xDD] => reg_form && ext == 1,                               // FXCH4
+        [0xDE] => reg_form && ext == 2,                               // FCOMP5
+        [0xDF] => reg_form && ext <= 3,                               // FFREEP/FXCH7/FSTP8/9
+        [0xDB] => reg_form && ext == 4 && matches!(m & 7, 0 | 1 | 4), // FNENI/FNDISI/FNSETPM
         _ => false,
     }
 }
@@ -1260,6 +1344,8 @@ fn known_differences(case: &Case, sw_sig: i32, hw_sig: i32) -> Option<Ignore> {
         // CMPXCHG: Rosetta computes the comparison as dest - accumulator; the
         // SDM (and real CPUs) use accumulator - dest. Only ZF agrees.
         [0x0F, 0xB0 | 0xB1] => CF | PF | AF | SF | OF,
+        // PTEST: Rosetta leaves AF/OF/PF/SF; the SDM clears them.
+        [0x0F, 0x38, 0x17] => PF | AF | SF | OF,
         _ => 0,
     };
     Some(Ignore {

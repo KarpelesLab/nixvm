@@ -25,9 +25,11 @@ use crate::vcpu::softfloat::{
     self as sf, Class, FMT32, FMT64, Fp, INEXACT, INVALID, Mx, Op, Round,
 };
 
+mod sse4;
+
 /// SSE3 (`ADDSUB*`, `HADD*`/`HSUB*`, `MOV*DUP`, `LDDQU`, `FISTTP`) — not yet
 /// advertised, so these encodings are `#UD`.
-pub(super) const SSE3: bool = false;
+pub(super) const SSE3: bool = true;
 
 /// The mandatory-prefix class of a SIMD opcode.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -667,6 +669,9 @@ impl X86Interp {
     #[allow(clippy::too_many_lines)]
     pub(super) fn exec_simd(&mut self, mem: &mut GuestMemory, pc: u64, p: Pfx, op: u8) -> Step {
         let mp = mp(p);
+        if let Some(s) = self.exec_sse3(mem, pc, p, op) {
+            return s;
+        }
         // ---- the packed-integer ops: MMX (no prefix) and SSE2 (66) forms ----
         let int_form = matches!(op, 0x60..=0x6B | 0x74..=0x76)
             || (op >= 0xD1 && !matches!(op, 0xD6 | 0xD7 | 0xE6 | 0xE7 | 0xF7 | 0xFF))
@@ -930,18 +935,6 @@ impl X86Interp {
             (0xE6, Mp::P66 | Mp::F3 | Mp::F2) => self.cvt_e6(mem, pc, p, mp),
             _ => Step::Illegal,
         }
-    }
-
-    /// The SSSE3/SSE4 three-byte map `0F 38` — not advertised (yet): `#UD`.
-    #[allow(clippy::unused_self)]
-    pub(super) fn exec_0f38(&mut self, _mem: &mut GuestMemory, _pc: u64, _p: Pfx, _op: u8) -> Step {
-        Step::Illegal
-    }
-
-    /// The SSSE3/SSE4 three-byte map `0F 3A` — not advertised (yet): `#UD`.
-    #[allow(clippy::unused_self)]
-    pub(super) fn exec_0f3a(&mut self, _mem: &mut GuestMemory, _pc: u64, _p: Pfx, _op: u8) -> Step {
-        Step::Illegal
     }
 
     // ---- moves -----------------------------------------------------------------------

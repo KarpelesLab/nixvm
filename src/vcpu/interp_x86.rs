@@ -24,7 +24,9 @@
 //!   and transcendentals computed in extended precision
 //!   (`interp_x86/x87math.rs`).
 //! * **MMX, SSE, SSE2** (`interp_x86/sse.rs`), with `MXCSR` rounding,
-//!   `DAZ`/`FTZ` and exception flags.
+//!   `DAZ`/`FTZ` and exception flags, and the x86-64-v2 extensions **SSE3,
+//!   SSSE3, SSE4.1, SSE4.2** (`interp_x86/sse/sse4.rs`: incl. `PCMPxSTRx`,
+//!   `CRC32`, `ROUND*`, `DPPS`, …).
 //! * `CPUID`, `RDTSC`/`RDTSCP`, `RDRAND`, `CMPXCHG16B`, `POPCNT`,
 //!   `FXSAVE`/`FXRSTOR`, `LAHF`/`SAHF`, fences/prefetches/`CLFLUSH`, and
 //!   `SYSCALL`.
@@ -97,8 +99,10 @@ const RFLAGS_SYS_MASK: u32 = (1 << 14) | (1 << 18) | (1 << 21);
 const USER_CS: u16 = 0x33;
 const USER_SS: u16 = 0x2b;
 
-/// `CPUID` leaf 1 `ECX`: CX16 (13), POPCNT (23), RDRAND (30).
-const CPUID1_ECX: u32 = (1 << 13) | (1 << 23) | (1 << 30);
+/// `CPUID` leaf 1 `ECX`: SSE3 (0), SSSE3 (9), CX16 (13), SSE4.1 (19), SSE4.2
+/// (20), POPCNT (23), RDRAND (30) — with LAHF-SAHF (`0x8000_0001` `ECX`) the
+/// whole x86-64-v2 level.
+const CPUID1_ECX: u32 = 1 | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 23) | (1 << 30);
 
 /// `CPUID` leaf 1 `EDX`: FPU (0), PSE (3), TSC (4), MSR (5), PAE (6), CX8
 /// (8), PGE (13), CMOV (15), CLFSH (19), MMX (23), FXSR (24), SSE (25), SSE2
@@ -4981,7 +4985,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "SSSE3/SSE4.1: not advertised until phase 2"]
     fn palignr_concatenates_and_shifts() {
         let mut m = mem();
         let mut cpu = X86Interp::new(CODE, STACK);
@@ -4995,7 +4998,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "SSSE3/SSE4.1: not advertised until phase 2"]
     fn ptest_sets_zf_and_cf() {
         let mut m = mem();
         let mut cpu = X86Interp::new(CODE, STACK);
@@ -5507,6 +5509,38 @@ mod tests {
         assert!(matches!(s, Step::Next));
         let (_, s) = run_with(&mut m, &[0xF3, 0x0F, 0x58, 0x00], |c| c.gpr[RAX] = 0x1_2002); // addss m32
         assert!(matches!(s, Step::Next));
+    }
+
+    #[test]
+    fn crc32c_and_pcmpistri() {
+        let mut m = mem();
+        // crc32 eax, byte ptr [rbx] over "123456789" = 0xE3069283 (CRC-32C).
+        let p = 0x1_2000u64;
+        m.write_init(p, b"123456789").unwrap();
+        let mut code = Vec::new();
+        for _ in 0..9 {
+            code.extend_from_slice(&[0xF2, 0x0F, 0x38, 0xF0, 0x03, 0x48, 0xFF, 0xC3]); // crc32 eax,[rbx]; inc rbx
+        }
+        m.write_init(CODE, &code).unwrap();
+        let mut c = X86Interp::new(CODE, STACK);
+        c.gpr[RAX] = 0xffff_ffff;
+        c.gpr[RBX] = p;
+        for _ in 0..18 {
+            c.exec(&mut m);
+        }
+        assert_eq!(c.gpr[RAX] as u32 ^ 0xffff_ffff, 0xE306_9283);
+        // pcmpistri xmm0, xmm1, 0x0C (unsigned bytes, equal ordered): find
+        // "lo" in "hello world".
+        let mut needle = [0u8; 16];
+        needle[..2].copy_from_slice(b"lo");
+        let mut hay = [0u8; 16];
+        hay[..11].copy_from_slice(b"hello world");
+        let (c, _) = run_with(&mut m, &[0x66, 0x0F, 0x3A, 0x63, 0xC1, 0x0C], |c| {
+            c.xmm[0] = u128::from_le_bytes(needle);
+            c.xmm[1] = u128::from_le_bytes(hay);
+        });
+        assert_eq!(c.gpr[RCX], 3);
+        assert!(c.flags.cf && c.flags.zf && c.flags.sf);
     }
 
     #[test]
