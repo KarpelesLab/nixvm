@@ -15,8 +15,9 @@
 //! later (we simply don't advance the guest PC), which the interpreter turns
 //! back into the same syscall on the next slice.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Write};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use crate::abi::Arch;
@@ -36,6 +37,7 @@ mod ipc;
 mod mem_syscalls;
 mod mqueue;
 mod net;
+mod orphan;
 mod pagecache;
 mod path;
 mod poll;
@@ -1213,6 +1215,10 @@ pub struct Kernel {
     /// The page cache behind `MAP_SHARED` file mappings (see [`pagecache`]).
     /// A leaf lock taken after `vfs`; nothing is acquired while it is held.
     page_cache: Mutex<pagecache::PageCache>,
+    /// Open-but-unlinked files, by their hidden path (see [`orphan`]). A leaf
+    /// lock; the counter mints the hidden names.
+    orphans: Mutex<BTreeSet<String>>,
+    orphan_seq: AtomicU64,
 }
 
 /// All kernel state mutated while a syscall is serviced, behind [`Kernel`]'s
@@ -1528,6 +1534,8 @@ impl Kernel {
             ptys: Mutex::new(pty::Ptys::default()),
             unsupported_sub: Mutex::new(BTreeMap::new()),
             page_cache: Mutex::new(pagecache::PageCache::default()),
+            orphans: Mutex::new(BTreeSet::new()),
+            orphan_seq: AtomicU64::new(0),
             shared: Mutex::new(Shared {
                 stdin: Box::new(std::io::stdin()),
                 stdout: Box::new(std::io::stdout()),
@@ -2757,8 +2765,6 @@ impl Kernel {
             | Sysno::Symlink
             | Sysno::Mkdirat
             | Sysno::Mkdir
-            | Sysno::Unlinkat
-            | Sysno::Unlink
             | Sysno::Utimensat
             | Sysno::Utime
             | Sysno::Utimes
@@ -2773,10 +2779,6 @@ impl Kernel {
             | Sysno::Lchown
             | Sysno::Mknod
             | Sysno::Mknodat
-            | Sysno::Rmdir
-            | Sysno::Renameat
-            | Sysno::Renameat2
-            | Sysno::Rename
             | Sysno::Faccessat
             | Sysno::Faccessat2
             | Sysno::Access
@@ -2801,6 +2803,18 @@ impl Kernel {
             | Sysno::Cachestat => {
                 let mut vfs = self.vfs.lock().unwrap();
                 self.dispatch_vfs(&mut vfs, cx, sys, args, mem)
+            }
+            // Namespace changes: sh THEN vfs, so an unlink/rename can see every
+            // task's descriptors and keep open files alive (see `orphan.rs`).
+            Sysno::Unlinkat
+            | Sysno::Unlink
+            | Sysno::Rmdir
+            | Sysno::Renameat
+            | Sysno::Renameat2
+            | Sysno::Rename => {
+                let mut sh = self.shared.lock().unwrap();
+                let mut vfs = self.vfs.lock().unwrap();
+                self.dispatch_namespace(&mut sh, &mut vfs, cx, sys, args, mem)
             }
             // net-only: the pure socket syscalls, holding ONLY `net` (the last
             // lock) via `dispatch_net` — no sh, no vfs may be taken below it.
@@ -3074,7 +3088,6 @@ impl Kernel {
             Sysno::Symlink => self.sys_symlinkat(vfs, cx, args[0], AT_FDCWD, args[1], mem),
             Sysno::Mkdirat => self.sys_mkdirat(vfs, cx, args[0] as i64, args[1], args[2], mem),
             Sysno::Mkdir => self.sys_mkdirat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
-            Sysno::Unlinkat => self.sys_unlinkat(vfs, cx, args[0] as i64, args[1], args[2], mem),
             Sysno::Utimensat => {
                 self.sys_utimensat(vfs, cx, args[0] as i64, args[1], args[2], args[3], mem)
             }
@@ -3130,35 +3143,6 @@ impl Kernel {
             Sysno::Mknodat => {
                 self.sys_mknodat(vfs, cx, i64::from(args[0] as i32), args[1], args[2], mem)
             }
-            Sysno::Unlink => self.sys_unlinkat(vfs, cx, AT_FDCWD, args[0], 0, mem),
-            Sysno::Rmdir => {
-                const AT_REMOVEDIR: u64 = 0x200;
-                self.sys_unlinkat(vfs, cx, AT_FDCWD, args[0], AT_REMOVEDIR, mem)
-            }
-            // renameat has no flags; renameat2's flags are arg 4.
-            Sysno::Renameat => self.sys_renameat(
-                vfs,
-                cx,
-                args[0] as i64,
-                args[1],
-                args[2] as i64,
-                args[3],
-                0,
-                mem,
-            ),
-            Sysno::Renameat2 => self.sys_renameat(
-                vfs,
-                cx,
-                args[0] as i64,
-                args[1],
-                args[2] as i64,
-                args[3],
-                args[4],
-                mem,
-            ),
-            Sysno::Rename => {
-                self.sys_renameat(vfs, cx, AT_FDCWD, args[0], AT_FDCWD, args[1], 0, mem)
-            }
             Sysno::Faccessat | Sysno::Faccessat2 => {
                 self.sys_faccessat(vfs, cx, args[0] as i64, args[1], args[2], mem)
             }
@@ -3212,6 +3196,44 @@ impl Kernel {
             },
             // Unreachable: `dispatch_impl` only routes the syscalls above here.
             _ => unreachable!("dispatch_vfs: {sys:?} is not a vfs-only syscall"),
+        }
+    }
+
+    /// The namespace-changing file syscalls (`unlink`/`rmdir`/`rename` and
+    /// their `*at` forms), called with `sh` then `vfs` held: they consult every
+    /// task's descriptor table to keep open files reachable (see `orphan.rs`).
+    fn dispatch_namespace(
+        &self,
+        sh: &mut Shared,
+        vfs: &mut MountTable,
+        cx: &mut ServiceCtx,
+        sys: Sysno,
+        args: &[u64; 6],
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        const AT_REMOVEDIR: u64 = 0x200;
+        match sys {
+            Sysno::Unlinkat => {
+                self.sys_unlink_keep_open(sh, vfs, cx, args[0] as i64, args[1], args[2], mem)
+            }
+            Sysno::Unlink => self.sys_unlink_keep_open(sh, vfs, cx, AT_FDCWD, args[0], 0, mem),
+            Sysno::Rmdir => self.sys_unlinkat(vfs, cx, AT_FDCWD, args[0], AT_REMOVEDIR, mem),
+            // renameat has no flags; renameat2's flags are arg 4.
+            Sysno::Renameat | Sysno::Renameat2 => self.sys_rename_keep_open(
+                sh,
+                vfs,
+                cx,
+                args[0] as i64,
+                args[1],
+                args[2] as i64,
+                args[3],
+                if sys == Sysno::Renameat2 { args[4] } else { 0 },
+                mem,
+            ),
+            Sysno::Rename => {
+                self.sys_rename_keep_open(sh, vfs, cx, AT_FDCWD, args[0], AT_FDCWD, args[1], 0, mem)
+            }
+            _ => unreachable!("dispatch_namespace: {sys:?} is not a namespace syscall"),
         }
     }
 
@@ -3305,8 +3327,17 @@ impl Kernel {
             // The guest does not own the host clock: refuse to set it. ptrace
             // is refused too (no debugging surface).
             Sysno::Settimeofday | Sysno::ClockSettime | Sysno::Ptrace => err(Errno::EPERM),
-            Sysno::Close => self.sys_close(cx, args[0] as i32),
-            Sysno::CloseRange => self.sys_close_range(cx, args[0], args[1]),
+            // Closing the last descriptor of an unlinked file deletes it.
+            Sysno::Close => {
+                let r = self.sys_close(cx, args[0] as i32);
+                self.reap_orphans_locked(sh, cx);
+                r
+            }
+            Sysno::CloseRange => {
+                let r = self.sys_close_range(cx, args[0], args[1]);
+                self.reap_orphans_locked(sh, cx);
+                r
+            }
             // Credentials: the VM starts as root but a process may drop
             // privileges; the ids are tracked per task (see `Creds`).
             Sysno::Getuid => i64::from(cx.cur.creds.ruid),
@@ -3399,8 +3430,15 @@ impl Kernel {
             }
             Sysno::Dup => self.sys_dup(cx, args[0]),
             // dup2 has no flags (pass 0); dup3's 3rd arg is O_CLOEXEC.
-            Sysno::Dup2 => self.sys_dup2(cx, args[0], args[1], 0, false),
-            Sysno::Dup3 => self.sys_dup2(cx, args[0], args[1], args[2], true),
+            Sysno::Dup2 | Sysno::Dup3 => {
+                let r = if sys == Sysno::Dup3 {
+                    self.sys_dup2(cx, args[0], args[1], args[2], true)
+                } else {
+                    self.sys_dup2(cx, args[0], args[1], 0, false)
+                };
+                self.reap_orphans_locked(sh, cx);
+                r
+            }
             Sysno::Clone => self.sys_clone(sh, cx, args, vcpu, mem),
             // x86-64's legacy spellings of clone: `fork` is
             // `clone(SIGCHLD, ...)`, `vfork` is `clone(CLONE_VM|CLONE_VFORK|
@@ -4096,6 +4134,7 @@ impl Kernel {
         for fd in cx.cur.fds.close_cloexec() {
             self.bump_pipe(&fd, false);
         }
+        self.reap_orphans(sh, cx, vfs);
         // POSIX timers are destroyed by execve (an ITIMER_REAL survives it), as
         // are the per-image registrations: rseq, the robust list, mseal seals
         // and membarrier registrations (they describe the old address space).
@@ -4722,6 +4761,7 @@ impl Kernel {
             for fd in cx.cur.fds.drain() {
                 self.bump_pipe(&fd, false);
             }
+            self.reap_orphans_locked(sh, cx);
         }
         // Last task of this address space: return its frames to the shared pool
         // (page tables + private data pages), so a long-lived process tree does
@@ -5905,6 +5945,10 @@ impl Kernel {
         };
         let old_abs = self.resolve_path(cx, olddirfd, &orel);
         let new_abs = self.resolve_path(cx, newdirfd, &nrel);
+        // Naming an unnamed (O_TMPFILE) or unlinked file moves it into place.
+        if let Some(r) = self.link_orphan(vfs, cx, &old_abs, &new_abs) {
+            return r;
+        }
         let Some(attrs) = vfs.stat(&old_abs) else {
             return err(Errno::ENOENT);
         };
@@ -6665,21 +6709,12 @@ impl Kernel {
         mode: u64,
         mem: &GuestMemory,
     ) -> i64 {
-        const O_TMPFILE: u64 = 0o20000000; // the __O_TMPFILE bit (both arches)
         // (O_DIRECTORY/O_NOFOLLOW are arch-specific: arm64 (asm-generic) uses
         // 0o40000/0o100000, and its 0o200000/0o400000 are O_DIRECT/O_LARGEFILE
         // — the x86-64 values. musl ORs O_LARGEFILE into every open, so using
         // the x86 values for an arm64 guest made every open through a symlink
         // fail with ELOOP (e.g. the dynamic linker loading libz.so.1). See
         // `open_path`.)
-
-        // Anonymous temp files (O_TMPFILE) need inode-based fds; nixvm's are
-        // path-based, so a real backing file would be lost. Report "unsupported"
-        // (as a filesystem without O_TMPFILE support does) so libc/programs fall
-        // back to mkstemp+unlink rather than getting a silently broken fd.
-        if flags & O_TMPFILE != 0 {
-            return err(Errno::EOPNOTSUPP);
-        }
 
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
@@ -6711,6 +6746,16 @@ impl Kernel {
         // A trailing slash on the guest path demands a directory target.
         let had_slash = rel.len() > 1 && rel.ends_with('/');
         let resolved = self.resolve_path(cx, dirfd, rel);
+        // O_TMPFILE (the __O_TMPFILE bit, same on both arches): an unnamed file
+        // in the directory `rel` names (see `orphan.rs`).
+        const O_TMPFILE: u64 = 0o20000000;
+        if flags & O_TMPFILE != 0 {
+            let dir = match self.follow_or_eloop(vfs, &resolved) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            return self.open_tmpfile(vfs, cx, &dir, flags, mode);
+        }
         // O_NOFOLLOW: if the final component is itself a symlink, fail with ELOOP
         // rather than following it (a security check `open`ers rely on). Checked
         // against the *unfollowed* path; intermediate symlinks still resolve.
@@ -7127,7 +7172,12 @@ impl Kernel {
             (".".into(), NodeKind::Dir, 1),
             ("..".into(), NodeKind::Dir, 1),
         ];
-        all.extend(entries.into_iter().map(|e| (e.name, e.kind, e.inode)));
+        all.extend(
+            entries
+                .into_iter()
+                .filter(|e| !e.name.starts_with(orphan::ORPHAN_PREFIX))
+                .map(|e| (e.name, e.kind, e.inode)),
+        );
 
         let (bytes, consumed) = if legacy {
             stat::encode_dirents_legacy(&all, pos, count as usize)
