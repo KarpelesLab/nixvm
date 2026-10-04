@@ -30,7 +30,6 @@
 use super::x87math;
 use super::{
     F80, Flags, GuestMemory, ModRm, Pfx, RAX, RmKind, Step, Trap, X86Interp, fetch, rd_fault,
-    wr_fault,
 };
 use crate::vcpu::softfloat::{
     self as sf, Class, DENORMAL, DIVZERO, FMT32, FMT64, FMT80, Fp, INVALID, Round, Rounded,
@@ -579,8 +578,7 @@ impl X86Interp {
         }
         // A faulting store leaves the FPU state untouched (the instruction
         // restarts after the page fault).
-        mem.write_trap(addr, &bits.to_le_bytes()[..n])
-            .map_err(|e| wr_fault(&e))?;
+        self.store(mem, addr, &bits.to_le_bytes()[..n])?;
         self.x87_flags(flags);
         if pop {
             self.fpu_pop();
@@ -780,9 +778,9 @@ impl X86Interp {
                 self.fpu_cw |= 0x3f;
                 Step::Next
             }
-            (0xD9, 7) => match mem.write_trap(addr, &self.fpu_cw.to_le_bytes()) {
+            (0xD9, 7) => match self.store(mem, addr, &self.fpu_cw.to_le_bytes()) {
                 Ok(()) => Step::Next,
-                Err(e) => wr_fault(&e),
+                Err(e) => e,
             },
             (0xDB, 0) => load(self, mem, MemFmt::I32),
             (0xDB, 1) if super::sse::SSE3 => store(self, mem, MemFmt::I32, true, true),
@@ -804,9 +802,9 @@ impl X86Interp {
                 }
                 Err(e) => e,
             },
-            (0xDD, 7) => match mem.write_trap(addr, &self.fpu_sw().to_le_bytes()) {
+            (0xDD, 7) => match self.store(mem, addr, &self.fpu_sw().to_le_bytes()) {
                 Ok(()) => Step::Next,
-                Err(e) => wr_fault(&e),
+                Err(e) => e,
             },
             (0xDF, 0) => load(self, mem, MemFmt::I16),
             (0xDF, 1) if super::sse::SSE3 => store(self, mem, MemFmt::I16, true, true),
@@ -1115,9 +1113,9 @@ impl X86Interp {
         self.set_full_tag(w(2));
     }
 
-    fn fnstenv(&self, mem: &mut GuestMemory, addr: u64, small: bool) -> Result<(), Step> {
-        mem.write_trap(addr, &self.env_bytes(small))
-            .map_err(|e| wr_fault(&e))
+    fn fnstenv(&mut self, mem: &mut GuestMemory, addr: u64, small: bool) -> Result<(), Step> {
+        let env = self.env_bytes(small);
+        self.store(mem, addr, &env)
     }
 
     fn fldenv(&mut self, mem: &GuestMemory, addr: u64, small: bool) -> Result<(), Step> {
@@ -1129,12 +1127,12 @@ impl X86Interp {
     }
 
     /// `FNSAVE`: the environment followed by `ST(0)..ST(7)` (10 bytes each).
-    fn fnsave(&self, mem: &mut GuestMemory, addr: u64, small: bool) -> Result<(), Step> {
+    fn fnsave(&mut self, mem: &mut GuestMemory, addr: u64, small: bool) -> Result<(), Step> {
         let mut out = self.env_bytes(small);
         for i in 0..8 {
             out.extend_from_slice(&self.st_get(i).0.to_le_bytes()[..10]);
         }
-        mem.write_trap(addr, &out).map_err(|e| wr_fault(&e))
+        self.store(mem, addr, &out)
     }
 
     fn frstor(&mut self, mem: &GuestMemory, addr: u64, small: bool) -> Result<(), Step> {
@@ -1208,8 +1206,8 @@ impl X86Interp {
                 }
             }
         };
-        if let Err(e) = mem.write_trap(addr, &bytes) {
-            return wr_fault(&e);
+        if let Err(e) = self.store(mem, addr, &bytes) {
+            return e;
         }
         if self.x87_flags(flags) {
             self.fpu_pop();

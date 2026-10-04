@@ -524,7 +524,7 @@ impl X86Interp {
                     }
                     _ => {
                         let a = self.lin(self.ea_of(m.kind, end).unwrap_or(0));
-                        fetch!(Self::write_mem(mem, a, val, w));
+                        fetch!(self.write_mem(mem, a, val, w));
                     }
                 }
                 self.next(end)

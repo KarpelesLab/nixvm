@@ -70,6 +70,10 @@ const MAX_INSN_LEN: usize = 15;
 /// Guest page size (for instruction fetches that straddle a page boundary).
 const PAGE: u64 = super::mem::PAGE_SIZE;
 
+/// [`X86Interp::code_page`] when no page is cached (not page-aligned, so it
+/// never matches a real page).
+const NO_PAGE: u64 = u64::MAX;
+
 // ---- x86-64 GPR indices (the standard ModRM/REX numbering) ----
 const RAX: usize = 0;
 const RCX: usize = 1;
@@ -478,6 +482,15 @@ struct X86Interp {
     /// translating every byte.
     ibuf: [u8; 16],
     ilen: u8,
+    /// A copy of the executable page instructions are currently being fetched
+    /// from (its base in `code_page`, [`NO_PAGE`] when none): straight-line
+    /// code then decodes without a permission check and page walk per
+    /// instruction. Valid only within one [`Vcpu::run`] (the kernel may
+    /// remap/rewrite memory between runs); every guest store through
+    /// [`X86Interp::store`] that touches the page drops it, so self-modifying
+    /// code stays coherent.
+    code_page: u64,
+    code: Box<[u8; PAGE as usize]>,
     /// The x87 register stack, physically indexed (`R0..R7`; `ST(i)` lives at
     /// `st[(fpu_top + i) & 7]` — see [`X86Interp::st_get`]). Each register
     /// holds a true 80-bit extended-precision value (its `m80` encoding); the
@@ -540,6 +553,8 @@ impl X86Interp {
             seg_base: 0,
             ibuf: [0; 16],
             ilen: 0,
+            code_page: NO_PAGE,
+            code: Box::new([0; PAGE as usize]),
             st: [F80(0); 8],
             fpu_top: 0,
             fpu_c0: false,
@@ -577,6 +592,22 @@ impl X86Interp {
     /// like hardware).
     fn fill_ibuf(&mut self, mem: &GuestMemory) -> Result<(), Step> {
         let rip = self.rip;
+        let page = rip & !(PAGE - 1);
+        let off = (rip - page) as usize;
+        if page != self.code_page {
+            // NX: an instruction fetch requires EXEC on the page at rip.
+            if !mem.can_exec(rip) {
+                return Err(rd_fault(rip));
+            }
+            if mem.read(page, &mut self.code[..]).is_ok() {
+                self.code_page = page;
+            }
+        }
+        if page == self.code_page && off + MAX_INSN_LEN <= PAGE as usize {
+            self.ibuf[..MAX_INSN_LEN].copy_from_slice(&self.code[off..off + MAX_INSN_LEN]);
+            self.ilen = MAX_INSN_LEN as u8;
+            return Ok(());
+        }
         // NX: an instruction fetch requires EXEC on the page at rip. Jumping
         // to a non-executable page (the stack, a data buffer) faults here
         // rather than running whatever bytes are there.
@@ -824,10 +855,25 @@ impl X86Interp {
         Ok(u64::from_le_bytes(b))
     }
 
-    fn write_mem(mem: &mut GuestMemory, a: u64, val: u64, width: u32) -> Result<(), Step> {
+    fn write_mem(
+        &mut self,
+        mem: &mut GuestMemory,
+        a: u64,
+        val: u64,
+        width: u32,
+    ) -> Result<(), Step> {
         let n = (width / 8) as usize;
-        mem.write_trap(a, &val.to_le_bytes()[..n])
-            .map_err(|e| wr_fault(&e))
+        self.store(mem, a, &val.to_le_bytes()[..n])
+    }
+
+    /// Every guest store goes through here: it keeps the decoded-code page
+    /// cache ([`X86Interp::code_page`]) coherent with self-modifying code.
+    fn store(&mut self, mem: &mut GuestMemory, a: u64, bytes: &[u8]) -> Result<(), Step> {
+        let last = a.wrapping_add(bytes.len().max(1) as u64 - 1);
+        if a.wrapping_sub(self.code_page) < PAGE || last.wrapping_sub(self.code_page) < PAGE {
+            self.code_page = NO_PAGE;
+        }
+        mem.write_trap(a, bytes).map_err(|e| wr_fault(&e))
     }
 
     fn read_operand(&self, mem: &GuestMemory, op: Operand, width: u32) -> Result<u64, Step> {
@@ -859,7 +905,7 @@ impl X86Interp {
                 self.gpr[r] = (self.gpr[r] & !0xff00u64) | ((val & 0xff) << 8);
                 Ok(())
             }
-            Operand::Mem(a) => Self::write_mem(mem, a, val, width),
+            Operand::Mem(a) => self.write_mem(mem, a, val, width),
         }
     }
 
@@ -877,7 +923,7 @@ impl X86Interp {
     /// Push a `width`-bit value (16 or 64).
     fn push_w(&mut self, mem: &mut GuestMemory, val: u64, width: u32) -> Result<(), Step> {
         let sp = self.gpr[RSP].wrapping_sub(u64::from(width / 8));
-        Self::write_mem(mem, sp, val, width)?;
+        self.write_mem(mem, sp, val, width)?;
         self.gpr[RSP] = sp;
         Ok(())
     }
@@ -1654,10 +1700,7 @@ impl X86Interp {
                     } else {
                         cur
                     };
-                    fetch!(
-                        mem.write_trap(addr, &new.to_le_bytes())
-                            .map_err(|e| wr_fault(&e))
-                    );
+                    fetch!(self.store(mem, addr, &new.to_le_bytes()));
                     if !eq {
                         self.gpr[RAX] = cur as u64;
                         self.gpr[RDX] = (cur >> 64) as u64;
@@ -1672,7 +1715,7 @@ impl X86Interp {
                     } else {
                         cur
                     };
-                    fetch!(Self::write_mem(mem, addr, new, 64));
+                    fetch!(self.write_mem(mem, addr, new, 64));
                     if !eq {
                         self.gpr[RAX] = mask_w(cur, 32);
                         self.gpr[RDX] = cur >> 32;
@@ -1716,7 +1759,7 @@ impl X86Interp {
         // Work on a local stack pointer so a fault leaves the architectural
         // state untouched.
         let mut sp = self.gpr[RSP].wrapping_sub(step);
-        fetch!(Self::write_mem(mem, sp, rbp, w));
+        fetch!(self.write_mem(mem, sp, rbp, w));
         let frame = sp;
         if level > 0 {
             let mut bp = rbp;
@@ -1725,10 +1768,10 @@ impl X86Interp {
                 let addr = if w == 16 { bp & 0xffff } else { bp };
                 let v = fetch!(Self::read_mem(mem, addr, w));
                 sp = sp.wrapping_sub(step);
-                fetch!(Self::write_mem(mem, sp, v, w));
+                fetch!(self.write_mem(mem, sp, v, w));
             }
             sp = sp.wrapping_sub(step);
-            fetch!(Self::write_mem(mem, sp, frame, w));
+            fetch!(self.write_mem(mem, sp, frame, w));
         }
         self.set_reg(RBP, frame, w);
         self.gpr[RSP] = sp.wrapping_sub(u64::from(size));
@@ -1890,7 +1933,7 @@ impl X86Interp {
                 self.string_op(mem, end, p.rep, false, |c, mem| {
                     let s = src_seg.wrapping_add(c.sreg(RSI));
                     let v = Self::read_mem(mem, s, width)?;
-                    Self::write_mem(mem, c.sreg(RDI), v, width)?;
+                    c.write_mem(mem, c.sreg(RDI), v, width)?;
                     c.advance(RSI, n);
                     c.advance(RDI, n);
                     Ok(())
@@ -1907,7 +1950,7 @@ impl X86Interp {
                 }
                 let v = mask_w(self.gpr[RAX], width);
                 self.string_op(mem, end, p.rep, false, |c, mem| {
-                    Self::write_mem(mem, c.sreg(RDI), v, width)?;
+                    c.write_mem(mem, c.sreg(RDI), v, width)?;
                     c.advance(RDI, n);
                     Ok(())
                 })
@@ -1958,7 +2001,7 @@ impl X86Interp {
                 return None;
             }
             let k = n as usize;
-            if mem.read(s, &mut buf[..k]).is_err() || mem.write_trap(d, &buf[..k]).is_err() {
+            if mem.read(s, &mut buf[..k]).is_err() || self.store(mem, d, &buf[..k]).is_err() {
                 return None;
             }
             self.gpr[RSI] = self.gpr[RSI].wrapping_add(n);
@@ -1977,7 +2020,7 @@ impl X86Interp {
         while self.gpr[RCX] != 0 {
             let d = self.gpr[RDI];
             let n = self.gpr[RCX].min(PAGE - (d & (PAGE - 1)));
-            if mem.write_trap(d, &buf[..n as usize]).is_err() {
+            if self.store(mem, d, &buf[..n as usize]).is_err() {
                 return None;
             }
             self.gpr[RDI] = d.wrapping_add(n);
@@ -2015,9 +2058,17 @@ impl X86Interp {
             }
     }
 
+    /// Execute one instruction, outside a [`Vcpu::run`] loop (unit tests, the
+    /// differential-testing hook): memory may have changed behind our back, so
+    /// the code-page cache is dropped first.
+    fn exec(&mut self, mem: &mut GuestMemory) -> Step {
+        self.code_page = NO_PAGE;
+        self.step(mem)
+    }
+
     /// Execute one instruction.
     #[allow(clippy::too_many_lines)]
-    fn exec(&mut self, mem: &mut GuestMemory) -> Step {
+    fn step(&mut self, mem: &mut GuestMemory) -> Step {
         if let Err(s) = self.fill_ibuf(mem) {
             return s;
         }
@@ -2268,7 +2319,7 @@ impl X86Interp {
                     let v = fetch!(Self::read_mem(mem, a, w));
                     self.set_reg(RAX, v, w);
                 } else {
-                    fetch!(Self::write_mem(mem, a, self.gpr[RAX], w));
+                    fetch!(self.write_mem(mem, a, self.gpr[RAX], w));
                 }
                 self.next(end)
             }
@@ -2566,7 +2617,7 @@ impl X86Interp {
                 let (m, end) = fetch!(self.modrm(pc, p.rex));
                 let a = fetch!(self.mem_only(m.kind, end));
                 let w = if p.rex.w { 64 } else { 32 };
-                fetch!(Self::write_mem(mem, a, self.gpr[m.reg], w));
+                fetch!(self.write_mem(mem, a, self.gpr[m.reg], w));
                 self.next(end)
             }
             0xC7 => self.group9(mem, pc, p),
@@ -2617,7 +2668,7 @@ impl X86Interp {
                 if m.ext() == 0 {
                     // Bytes 464..512 belong to software: FXSAVE leaves them.
                     let img = self.fxsave_image(p.rex.w);
-                    fetch!(mem.write_trap(a, &img[..464]).map_err(|e| wr_fault(&e)));
+                    fetch!(self.store(mem, a, &img[..464]));
                 } else {
                     let mut img = [0u8; 512];
                     fetch!(mem.read(a, &mut img).map_err(|_| rd_fault(a)));
@@ -2638,7 +2689,7 @@ impl X86Interp {
             }
             (_, 3) => {
                 let a = fetch!(self.mem_only(m.kind, end));
-                fetch!(Self::write_mem(mem, a, u64::from(self.mxcsr), 32));
+                fetch!(self.write_mem(mem, a, u64::from(self.mxcsr), 32));
                 self.next(end)
             }
             (_, 7) => {
@@ -2738,8 +2789,10 @@ impl Vcpu for X86Interp {
         // starve its siblings; expiring the quantum ends the slice as
         // Interrupted (the scheduler keeps the task runnable and resumes it).
         let deadline = self.quantum.map(|q| Instant::now() + q);
+        // The kernel may have remapped or rewritten memory since the last run.
+        self.code_page = NO_PAGE;
         for i in 0..MAX_STEPS {
-            match self.exec(mem) {
+            match self.step(mem) {
                 Step::Next | Step::Branched => {}
                 Step::Syscall => return Ok(Exit::Syscall),
                 Step::Illegal => return Ok(Exit::IllegalInstruction { pc: self.rip }),
@@ -5509,6 +5562,20 @@ mod tests {
         assert!(matches!(s, Step::Next));
         let (_, s) = run_with(&mut m, &[0xF3, 0x0F, 0x58, 0x00], |c| c.gpr[RAX] = 0x1_2002); // addss m32
         assert!(matches!(s, Step::Next));
+    }
+
+    #[test]
+    fn self_modifying_code_is_seen_within_a_run() {
+        // mov byte [rip+0], 0x90 rewrites the following int3 into a nop
+        // before it executes; the code-page cache must not serve the stale
+        // byte. Then syscall ends the run.
+        let mut m = mem();
+        m.write_init(CODE, &[0xC6, 0x05, 0, 0, 0, 0, 0x90, 0xCC, 0x0F, 0x05])
+            .unwrap();
+        let mut c = X86Interp::new(CODE, STACK);
+        c.quantum = None;
+        assert_eq!(c.run(&mut m).unwrap(), Exit::Syscall);
+        assert_eq!(c.rip, CODE + 8);
     }
 
     #[test]

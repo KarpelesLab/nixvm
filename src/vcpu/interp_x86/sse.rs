@@ -17,9 +17,7 @@
 
 #![allow(clippy::match_same_arms, clippy::single_match_else)]
 
-use super::{
-    Flags, GuestMemory, ModRm, Pfx, RDI, RmKind, Step, Trap, X86Interp, fetch, rd_fault, wr_fault,
-};
+use super::{Flags, GuestMemory, ModRm, Pfx, RDI, RmKind, Step, Trap, X86Interp, fetch, rd_fault};
 use crate::vcpu::softfloat::F80;
 use crate::vcpu::softfloat::{
     self as sf, Class, FMT32, FMT64, Fp, INEXACT, INVALID, Mx, Op, Round,
@@ -607,6 +605,7 @@ impl X86Interp {
     }
 
     fn mem_write(
+        &mut self,
         mem: &mut GuestMemory,
         addr: u64,
         v: u128,
@@ -616,8 +615,7 @@ impl X86Interp {
         if align > 1 && addr & (align - 1) != 0 {
             return Err(Step::Trap(Trap::Protection));
         }
-        mem.write_trap(addr, &v.to_le_bytes()[..n])
-            .map_err(|e| wr_fault(&e))
+        self.store(mem, addr, &v.to_le_bytes()[..n])
     }
 
     /// An `xmm/m128` source (aligned unless `unaligned`), or for scalar forms
@@ -709,7 +707,7 @@ impl X86Interp {
                 // MOVNTPS/MOVNTPD/MOVNTDQ m128, xmm (memory only, aligned).
                 let (m, end) = fetch!(self.modrm(pc, p.rex));
                 let a = fetch!(self.mem_only(m.kind, end));
-                fetch!(Self::mem_write(mem, a, self.xmm[m.reg], 16, 16));
+                fetch!(self.mem_write(mem, a, self.xmm[m.reg], 16, 16));
                 self.next(end)
             }
             (0xE7, Mp::None) => {
@@ -717,13 +715,7 @@ impl X86Interp {
                 let (m, end) = fetch!(self.modrm(pc, p.rex));
                 let a = fetch!(self.mem_only(m.kind, end));
                 fetch!(self.mmx_enter());
-                fetch!(Self::mem_write(
-                    mem,
-                    a,
-                    u128::from(self.mm_get(m.reg)),
-                    8,
-                    1
-                ));
+                fetch!(self.mem_write(mem, a, u128::from(self.mm_get(m.reg)), 8, 1));
                 self.next(end)
             }
             (0x6E, Mp::None | Mp::P66) => {
@@ -767,7 +759,7 @@ impl X86Interp {
                     RmKind::Reg(r) => self.xmm[r] = v,
                     _ => {
                         let a = self.lin(self.ea_of(m.kind, end).unwrap_or(0));
-                        fetch!(Self::mem_write(mem, a, v, 8, 1));
+                        fetch!(self.mem_write(mem, a, v, 8, 1));
                     }
                 }
                 self.next(end)
@@ -801,7 +793,7 @@ impl X86Interp {
                         RmKind::Reg(r) => self.mm_set(r, v),
                         _ => {
                             let a = self.lin(self.ea_of(m.kind, end).unwrap_or(0));
-                            fetch!(Self::mem_write(mem, a, u128::from(v), 8, 1));
+                            fetch!(self.mem_write(mem, a, u128::from(v), 8, 1));
                         }
                     }
                 }
@@ -974,7 +966,7 @@ impl X86Interp {
             }
             (_, true) => {
                 let a = self.lin(self.ea_of(m.kind, end).unwrap_or(0));
-                fetch!(Self::mem_write(mem, a, self.xmm[m.reg], 16, al));
+                fetch!(self.mem_write(mem, a, self.xmm[m.reg], 16, al));
             }
         }
         self.next(end)
@@ -1006,7 +998,7 @@ impl X86Interp {
             }
             (_, true) => {
                 let a = self.lin(self.ea_of(m.kind, end).unwrap_or(0));
-                fetch!(Self::mem_write(mem, a, self.xmm[m.reg], n, 1));
+                fetch!(self.mem_write(mem, a, self.xmm[m.reg], n, 1));
             }
         }
         self.next(end)
@@ -1048,7 +1040,7 @@ impl X86Interp {
                 // MOVLPS/MOVLPD/MOVHPS/MOVHPD m64, xmm.
                 let x = self.xmm[m.reg];
                 let v = if high { x >> 64 } else { x & LO };
-                fetch!(Self::mem_write(mem, a, v, 8, 1));
+                fetch!(self.mem_write(mem, a, v, 8, 1));
             }
             (Mp::F3, false, _) if SSE3 => {
                 // MOVSLDUP (12) / MOVSHDUP (16).
@@ -1089,8 +1081,8 @@ impl X86Interp {
         for i in 0..n {
             if (mask >> (8 * i + 7)) & 1 != 0 {
                 let a = base.wrapping_add(i as u64);
-                if let Err(e) = mem.write_trap(a, &[(data >> (8 * i)) as u8]) {
-                    return wr_fault(&e);
+                if let Err(e) = self.store(mem, a, &[(data >> (8 * i)) as u8]) {
+                    return e;
                 }
             }
         }
