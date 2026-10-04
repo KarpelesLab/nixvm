@@ -34,6 +34,7 @@ mod mem_syscalls;
 mod net;
 mod path;
 mod poll;
+mod ptimer;
 mod pty;
 mod signal;
 mod splice;
@@ -245,6 +246,11 @@ struct ProcInfo {
     /// signal number; the `pending` bit for an RT signal mirrors "its queue is
     /// non-empty".
     rt_queue: BTreeMap<u32, VecDeque<QueuedSig>>,
+    /// POSIX timers (`timer_create`) whose expirations are delivered to this
+    /// task — see [`ptimer`]. Like `ITIMER_REAL` they wake the task at their
+    /// deadline ([`ProcInfo::timer_deadline`]); unlike it, neither `fork`
+    /// children nor new threads inherit them, and `execve` deletes them.
+    ptimers: Vec<ptimer::PosixTimer>,
 }
 
 /// The subset of `siginfo_t` a queued/sent signal carries beyond its number,
@@ -321,6 +327,7 @@ impl Default for ProcInfo {
             dumpable: 1,
             queued_siginfo: [None; NSIG_SLOTS],
             rt_queue: BTreeMap::new(),
+            ptimers: Vec::new(),
             creds: Creds::default(),
             sched_policy: 0, // SCHED_OTHER
             sched_priority: 0,
@@ -346,6 +353,17 @@ struct Creds {
 }
 
 impl ProcInfo {
+    /// The earliest real-time timer deadline this task holds — its
+    /// `ITIMER_REAL` (`alarm`/`setitimer`) or any armed POSIX timer — which the
+    /// schedulers sleep until / wake the task at, like [`Self::wake_deadline`].
+    fn timer_deadline(&self) -> Option<u128> {
+        self.ptimers
+            .iter()
+            .filter_map(|t| t.deadline)
+            .chain(self.alarm_deadline)
+            .min()
+    }
+
     /// Record the siginfo for a just-posted signal. Real-time signals (`>=
     /// SIGRTMIN`) append to their FIFO queue (each delivery is distinct);
     /// standard signals coalesce, keeping the newest info.
@@ -1276,7 +1294,7 @@ impl Shared {
             .iter()
             .flatten()
             .filter(|p| p.info.run == RunState::Running)
-            .flat_map(|p| [p.info.wake_deadline, p.info.alarm_deadline])
+            .flat_map(|p| [p.info.wake_deadline, p.info.timer_deadline()])
             .flatten()
             .min()
         else {
@@ -1329,7 +1347,7 @@ impl Shared {
             .iter()
             .flatten()
             .filter(|p| p.info.run == RunState::Running)
-            .flat_map(|p| [p.info.wake_deadline, p.info.alarm_deadline])
+            .flat_map(|p| [p.info.wake_deadline, p.info.timer_deadline()])
             .flatten()
             .min()
     }
@@ -1883,10 +1901,11 @@ impl Kernel {
             // stops accruing, so this tracks CPU rather than wall time.
             let step_start = crate::clock::now_monotonic().as_nanos();
             let exit = vcpu.run(mem)?;
-            // Fire a due ITIMER_REAL before servicing, so a blocking syscall this
-            // step sees SIGALRM pending and is interrupted.
-            if cx.cur.alarm_deadline.is_some() {
-                fire_alarm_if_due(&mut cx.cur, poll::now_ns());
+            // Fire a due ITIMER_REAL / POSIX timer before servicing, so a
+            // blocking syscall this step sees its signal pending and is
+            // interrupted.
+            if cx.cur.alarm_deadline.is_some() || !cx.cur.ptimers.is_empty() {
+                fire_timers_if_due(&mut cx.cur, poll::now_ns());
             }
             let flow = self.service(cx, exit, vcpu.as_mut(), mem);
             let delta = crate::clock::now_monotonic()
@@ -2412,8 +2431,8 @@ impl Kernel {
             let (pending, ppid) = (cx.cur.pending, cx.cur.ppid);
             (proc, cx, pending, ppid)
         };
-        if cx.cur.alarm_deadline.is_some() {
-            fire_alarm_if_due(&mut cx.cur, poll::now_ns());
+        if cx.cur.alarm_deadline.is_some() || !cx.cur.ptimers.is_empty() {
+            fire_timers_if_due(&mut cx.cur, poll::now_ns());
         }
         let flow = self.service(&mut cx, exit, vcpu, mem);
         // Charge this step's wall time (run + service) to the task's CPU total,
@@ -3162,6 +3181,14 @@ impl Kernel {
             // flags (TIMER_ABSTIME).
             // Real-time timers (ITIMER_REAL) → SIGALRM.
             Sysno::Alarm => self.sys_alarm(cx, args[0]),
+            // POSIX timers (see `ptimer.rs`).
+            Sysno::TimerCreate => self.sys_timer_create(sh, cx, args[0], args[1], args[2], mem),
+            Sysno::TimerSettime => {
+                self.sys_timer_settime(sh, cx, args[0], args[1], args[2], args[3], mem)
+            }
+            Sysno::TimerGettime => self.sys_timer_gettime(sh, cx, args[0], args[1], mem),
+            Sysno::TimerGetoverrun => self.sys_timer_getoverrun(sh, cx, args[0]),
+            Sysno::TimerDelete => self.sys_timer_delete(sh, cx, args[0]),
             Sysno::Setitimer => self.sys_setitimer(cx, args[0], args[1], args[2], mem),
             Sysno::Getitimer => self.sys_getitimer(cx, args[0], args[1], mem),
             Sysno::Nanosleep => self.sys_nanosleep(cx, 0, 0, args[0], args[1], mem),
@@ -3525,6 +3552,19 @@ impl Kernel {
         info.run = RunState::Running;
         info.futex_wait = None;
         info.futex_woken = false;
+        // Per-task state a new task starts without (Linux: "the child's set of
+        // pending signals is initially empty"; interval timers, alarms and
+        // POSIX timers are not inherited by a fork child, and a new thread
+        // doesn't get a second copy of the process's timers — a clone of them
+        // would fire every expiration twice).
+        info.pending = 0;
+        info.queued_siginfo = [None; NSIG_SLOTS];
+        info.rt_queue = BTreeMap::new();
+        info.sigsuspend_prev = None;
+        info.wake_deadline = None;
+        info.alarm_deadline = None;
+        info.alarm_interval_ns = 0;
+        info.ptimers = Vec::new();
         // A child inherits the parent's *process group*, so resolve the `pgid == 0`
         // ("group leader = self") sentinel to the parent's effective pgid here.
         // Left as 0 it would default to the child's *own* pid (`pgid_of`), putting
@@ -3862,6 +3902,16 @@ impl Kernel {
         // into the program it launches.
         for fd in cx.cur.fds.close_cloexec() {
             self.bump_pipe(&fd, false);
+        }
+        // POSIX timers are destroyed by execve (an ITIMER_REAL survives it).
+        cx.cur.ptimers.clear();
+        // Writable shared file mappings die with the old image: flush them to
+        // their files now (their bytes are the source of truth) and forget them,
+        // or the exit-time flush would write whatever the *new* image later
+        // maps at those addresses back over the files.
+        if !cx.cur.shared_maps.is_empty() {
+            self.flush_shared_maps(vfs, cx, 0, 0, mem);
+            cx.cur.shared_maps.clear();
         }
         // Replace the image *in place*: tear down the old page tables (returning
         // their frames to the shared pool) and rebuild within the SAME pool, so
@@ -7817,6 +7867,15 @@ fn process_cpu_ns(sh: &Shared, cx: &ServiceCtx) -> u128 {
             .filter(|p| p.info.tgid == tgid)
             .map(|p| p.info.cpu_ns)
             .sum::<u128>()
+}
+
+/// Fire every real-time timer of `info` due at `now`: `ITIMER_REAL` and the
+/// POSIX timers (see [`ptimer::fire_ptimers`]).
+fn fire_timers_if_due(info: &mut ProcInfo, now: u128) {
+    fire_alarm_if_due(info, now);
+    if !info.ptimers.is_empty() {
+        ptimer::fire_ptimers(info, now);
+    }
 }
 
 /// Post `SIGALRM` to `info` if its `ITIMER_REAL` deadline has passed at `now`
