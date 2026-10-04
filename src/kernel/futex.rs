@@ -748,9 +748,9 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         let (word, ts) = (BASE, BASE + 0x100);
         mem.write(word, &5u32.to_le_bytes()).unwrap();
-        // Relative timeout of 0 ns: already expired.
+        // A 30 ms relative timeout.
         mem.write(ts, &[0u8; 16]).unwrap();
-        mem.write(ts + 8, &1u64.to_le_bytes()).unwrap();
+        mem.write(ts + 8, &30_000_000u64.to_le_bytes()).unwrap();
         // First run seeds the deadline and parks (a sibling could wake it)…
         add_thread(&k);
         assert_eq!(
@@ -765,7 +765,7 @@ mod tests {
             0
         );
         assert!(cx.block);
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::sleep(std::time::Duration::from_millis(40));
         // …and the re-trap after the deadline reports ETIMEDOUT.
         cx.block = false;
         assert_eq!(

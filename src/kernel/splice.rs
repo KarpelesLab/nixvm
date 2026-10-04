@@ -150,7 +150,7 @@ impl Kernel {
                     if cx.cur.fds.is_append(fd_out as i32) {
                         return err(Errno::EINVAL);
                     }
-                    let pos = match read_off(off_out, offset) {
+                    let pos = match read_off(off_out, offset.get()) {
                         Ok(p) => p,
                         Err(e) => return e,
                     };
@@ -219,7 +219,7 @@ impl Kernel {
                         if !readable {
                             return err(Errno::EBADF);
                         }
-                        let pos = match read_off(off_in, offset) {
+                        let pos = match read_off(off_in, offset.get()) {
                             Ok(p) => p,
                             Err(e) => return e,
                         };
@@ -279,7 +279,7 @@ impl Kernel {
         if ptr != 0 {
             let _ = mem.write_u64(ptr, pos + n);
         } else if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32) {
-            *offset = pos + n;
+            offset.set(pos + n);
         }
     }
 
@@ -398,7 +398,7 @@ impl Kernel {
                 && off == -1
                 && let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32)
             {
-                *offset = eof + n as u64;
+                offset.set(eof + n as u64);
             }
             return n;
         }

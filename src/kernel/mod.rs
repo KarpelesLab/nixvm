@@ -54,7 +54,7 @@ mod time;
 mod unavailable;
 mod xattr;
 
-pub use fd::{Fd, FdTable};
+pub use fd::{Fd, FdTable, FileOffset};
 use net::Net;
 use poll::{EventFdInst, PidfdInst, PollFds};
 
@@ -4679,7 +4679,7 @@ impl Kernel {
         }
         i64::from(cx.cur.fds.alloc(Fd::File {
             path,
-            offset: 0,
+            offset: FileOffset::new(0),
             readable: true,
             writable: true,
         }))
@@ -5106,13 +5106,14 @@ impl Kernel {
     ) -> i64 {
         let Some(Fd::File {
             path,
-            offset,
+            offset: ofs,
             writable,
             ..
         }) = cx.cur.fds.get(fd as i32).cloned()
         else {
             return err(Errno::EBADF);
         };
+        let offset = ofs.get();
         if !writable {
             return err(Errno::EBADF); // fd opened O_RDONLY
         }
@@ -5128,9 +5129,7 @@ impl Kernel {
         };
         match self.vfs_write(vfs, &path, write_off, &data) {
             Ok(n) => {
-                if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32) {
-                    *offset = write_off + n as u64;
-                }
+                ofs.set(write_off + n as u64);
                 n as i64
             }
             Err(e) => io_errno(&e),
@@ -5415,7 +5414,7 @@ impl Kernel {
     ) -> i64 {
         let Some(Fd::File {
             path,
-            offset,
+            offset: ofs,
             readable,
             ..
         }) = cx.cur.fds.get(fd as i32).cloned()
@@ -5426,14 +5425,12 @@ impl Kernel {
             return err(Errno::EBADF); // fd opened O_WRONLY
         }
         let mut tmp = vec![0u8; count as usize];
-        match self.vfs_read(vfs, &path, offset, &mut tmp) {
+        match self.vfs_read(vfs, &path, ofs.get(), &mut tmp) {
             Ok(n) => {
                 if mem.write(buf, &tmp[..n]).is_err() {
                     return err(Errno::EFAULT);
                 }
-                if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32) {
-                    *offset += n as u64;
-                }
+                ofs.add(n as u64);
                 n as i64
             }
             Err(e) => io_errno(&e),
@@ -5793,7 +5790,7 @@ impl Kernel {
             }
         } else {
             match cx.cur.fds.get(in_fd as i32) {
-                Some(Fd::File { offset, .. }) => *offset,
+                Some(Fd::File { offset, .. }) => offset.get(),
                 _ => return err(Errno::EINVAL),
             }
         };
@@ -5814,15 +5811,15 @@ impl Kernel {
             Some(Fd::File {
                 writable: false, ..
             }) => err(Errno::EBADF), // out fd is O_RDONLY
-            Some(Fd::File { path, offset, .. }) => match self.vfs_write(vfs, &path, offset, &buf) {
-                Ok(w) => {
-                    if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(out_fd as i32) {
-                        *offset += w as u64;
+            Some(Fd::File { path, offset, .. }) => {
+                match self.vfs_write(vfs, &path, offset.get(), &buf) {
+                    Ok(w) => {
+                        offset.add(w as u64);
+                        w as i64
                     }
-                    w as i64
+                    Err(e) => io_errno(&e),
                 }
-                Err(e) => io_errno(&e),
-            },
+            }
             Some(Fd::Stdout) => sh
                 .stdout
                 .write_all(&buf)
@@ -5850,7 +5847,7 @@ impl Kernel {
         if use_ptr {
             let _ = mem.write_u64(offset_ptr, start + advanced);
         } else if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(in_fd as i32) {
-            *offset += advanced;
+            offset.add(advanced);
         }
         written
     }
@@ -5875,6 +5872,7 @@ impl Kernel {
         else {
             return err(Errno::EBADF);
         };
+        let in_pos = in_pos.get();
         if !in_r {
             return err(Errno::EBADF); // source opened O_WRONLY
         }
@@ -5898,6 +5896,7 @@ impl Kernel {
         else {
             return err(Errno::EBADF);
         };
+        let out_pos = out_pos.get();
         if !out_w {
             return err(Errno::EBADF); // destination opened O_RDONLY
         }
@@ -5914,12 +5913,12 @@ impl Kernel {
         if off_in_p != 0 {
             let _ = mem.write_u64(off_in_p, in_off + w as u64);
         } else if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd_in as i32) {
-            *offset += w as u64;
+            offset.add(w as u64);
         }
         if off_out_p != 0 {
             let _ = mem.write_u64(off_out_p, out_off + w as u64);
         } else if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd_out as i32) {
-            *offset += w as u64;
+            offset.add(w as u64);
         }
         w as i64
     }
@@ -6849,7 +6848,7 @@ impl Kernel {
         } else {
             cx.cur.fds.alloc(Fd::File {
                 path: abs,
-                offset: 0,
+                offset: FileOffset::new(0),
                 readable: flags & O_ACCMODE != 1, // not O_WRONLY
                 writable: flags & O_ACCMODE != 0, // O_WRONLY or O_RDWR
             })
@@ -7010,7 +7009,7 @@ impl Kernel {
             return newpos;
         }
         let (cur, path) = match cx.cur.fds.get(fd as i32) {
-            Some(Fd::File { path, offset, .. }) => (*offset, path.clone()),
+            Some(Fd::File { path, offset, .. }) => (offset.get(), path.clone()),
             _ => return err(Errno::ESPIPE),
         };
         let size = vfs.stat(&path).map_or(0, |a| a.size);
@@ -7028,7 +7027,7 @@ impl Kernel {
                 size
             };
             if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32) {
-                *offset = pos;
+                offset.set(pos);
             }
             return pos as i64;
         }
@@ -7043,7 +7042,7 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32) {
-            *offset = newpos as u64;
+            offset.set(newpos as u64);
         }
         newpos
     }

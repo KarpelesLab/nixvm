@@ -282,7 +282,7 @@ impl Kernel {
         self.orphans.lock().unwrap().insert(hidden.clone());
         let fd = cx.cur.fds.alloc(Fd::File {
             path: hidden,
-            offset: 0,
+            offset: super::FileOffset::new(0),
             readable: flags & O_ACCMODE == 2,
             writable: true,
         });
@@ -567,5 +567,111 @@ mod tests {
         );
         let o = k.orphans.lock().unwrap().iter().next().cloned().unwrap();
         assert!(o.starts_with("/dev/shm/.nixvm-orphan-"), "{o}");
+    }
+
+    #[test]
+    fn dup_and_fork_copies_share_the_file_offset() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let (path, buf) = (BASE, BASE + 0x1000);
+        put_str(&mut mem, path, "/o");
+        let fd = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Openat,
+            [AT_FDCWD, path, 0o102, 0o600, 0, 0],
+        ) as u64;
+        let d = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Dup,
+            [fd, 0, 0, 0, 0, 0],
+        ) as u64;
+        mem.write(buf, b"abc").unwrap();
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [fd, buf, 3, 0, 0, 0]
+            ),
+            3
+        );
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Write,
+                [d, buf, 3, 0, 0, 0]
+            ),
+            3
+        );
+        // Both wrote at the shared position: 6 bytes, and both see it.
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Lseek,
+                [fd, 0, 1, 0, 0, 0]
+            ),
+            6
+        );
+        // A forked table's copy shares it too (the table is cloned).
+        let child = cx.cur.fds.clone();
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Lseek,
+                [d, 1, 0, 0, 0, 0]
+            ),
+            1
+        );
+        let Some(super::Fd::File { offset, .. }) = child.get(fd as i32) else {
+            panic!("not a file");
+        };
+        assert_eq!(offset.get(), 1);
+        // kcmp(KCMP_FILE) sees the dup as the same file, a fresh open as not.
+        let other = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Openat,
+            [AT_FDCWD, path, 2, 0, 0, 0],
+        ) as u64;
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Kcmp,
+                [1, 1, 0, fd, d, 0]
+            ),
+            0
+        );
+        assert_ne!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Kcmp,
+                [1, 1, 0, fd, other, 0]
+            ),
+            0
+        );
     }
 }

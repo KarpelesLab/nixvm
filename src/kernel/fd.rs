@@ -1,6 +1,47 @@
 //! The per-process file-descriptor table.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The file position of an *open file description*. Shared — not copied —
+/// by every descriptor that refers to the same open file: a `dup`, a
+/// `fork` child's inherited descriptor, an `SCM_RIGHTS` copy. So when a
+/// shell runs `{ cmd1; cmd2; } > out`, each child's writes advance the one
+/// position its siblings and parent continue from, instead of every writer
+/// starting over at offset 0 and clobbering the previous output. A fresh
+/// `open` makes a new one. The pointer identity doubles as the description's
+/// identity (`kcmp(KCMP_FILE)`, `F_DUPFD_QUERY`, `flock` ownership).
+#[derive(Debug, Clone)]
+pub struct FileOffset(Arc<AtomicU64>);
+
+impl FileOffset {
+    /// A new open file description positioned at `pos`.
+    #[must_use]
+    pub fn new(pos: u64) -> Self {
+        Self(Arc::new(AtomicU64::new(pos)))
+    }
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+    pub fn set(&self, pos: u64) {
+        self.0.store(pos, Ordering::Relaxed);
+    }
+    pub fn add(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::Relaxed);
+    }
+    /// Whether two descriptors share this open file description.
+    #[must_use]
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    /// A stable identity for the open file description.
+    #[must_use]
+    pub fn id(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+}
 
 /// What a guest file descriptor points at.
 ///
@@ -14,7 +55,8 @@ pub enum Fd {
     /// An open path in the [`crate::fs::MountTable`], with the current offset.
     File {
         path: String,
-        offset: u64,
+        /// The (shared) position of the open file description.
+        offset: FileOffset,
         /// Whether the open access mode permits reading (`O_RDONLY`/`O_RDWR`).
         /// A `read`/`pread` on a write-only fd must fail `EBADF`.
         readable: bool,

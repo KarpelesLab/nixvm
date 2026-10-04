@@ -233,8 +233,8 @@ impl Kernel {
         ) else {
             return err(Errno::ESRCH);
         };
-        // An fd's identity: its kind and the object it names. Descriptors here
-        // are values (a dup copies them), so equal objects mean "same file".
+        // An fd's identity: a regular file by its open file description (shared
+        // by dups and fork children), anything else by the object it names.
         let fd_key = |p: &ProcInfo, fd: u64| -> Option<String> {
             let table = if p.pid == cx.cur.pid || p.files == cx.cur.files {
                 Some(&cx.cur.fds)
@@ -242,7 +242,7 @@ impl Kernel {
                 sh.file_tables.get(p.files).and_then(Option::as_ref)
             }?;
             Some(match table.get(fd as i32)? {
-                Fd::File { path, .. } => format!("file:{path}"),
+                Fd::File { offset, .. } => format!("file:{:x}", offset.id()),
                 Fd::Dir { path, .. } => format!("dir:{path}"),
                 other => format!("{other:?}"),
             })
