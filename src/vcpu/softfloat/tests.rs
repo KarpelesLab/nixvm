@@ -58,6 +58,71 @@ fn rand_f32(rng: &mut Rng) -> u32 {
     }
 }
 
+/// An SSE environment with no DAZ/FTZ.
+fn mx(mode: Round) -> Mx {
+    Mx {
+        mode,
+        daz: false,
+        ftz: false,
+    }
+}
+
+fn f64_sqrt(a: u64, mode: Round) -> (u64, u32) {
+    let (v, f) = sse_sqrt(unpack_f64(a), FMT64, mx(mode));
+    (pack_f64(&v), f)
+}
+
+fn f32_sqrt(a: u32, mode: Round) -> (u32, u32) {
+    let (v, f) = sse_sqrt(unpack_f32(a), FMT32, mx(mode));
+    (pack_f32(&v), f)
+}
+
+fn i64_to_f64(v: i64, mode: Round) -> (u64, u32) {
+    let r = round_fp(from_int(v), FMT64, mode);
+    (pack_f64(&r.v), r.flags)
+}
+
+fn i64_to_f32(v: i64, mode: Round) -> (u32, u32) {
+    let r = round_fp(from_int(v), FMT32, mode);
+    (pack_f32(&r.v), r.flags)
+}
+
+fn f64_to_f32(a: u64, mode: Round) -> (u32, u32) {
+    let r = round_fp(unpack_f64(a), FMT32, mode);
+    (pack_f32(&r.v), r.flags)
+}
+
+fn f32_to_f64(a: u32) -> u64 {
+    pack_f64(&unpack_f32(a))
+}
+
+fn f64_to_i64(a: u64, mode: Round) -> i64 {
+    let v = unpack_f64(a);
+    if v.is_nan() {
+        return i64::MIN;
+    }
+    to_int(v, 64, mode).map_or(i64::MIN, |(i, _, _)| i)
+}
+
+fn f80_from(x: f64) -> F80 {
+    F80::from_f64(x.to_bits())
+}
+
+fn f80_to_f64(x: F80) -> u64 {
+    pack_f64(&round_fp(x.unpack(), FMT64, Round::Nearest).v)
+}
+
+fn f80_op(a: F80, b: F80, op: Op) -> F80 {
+    let (a, b) = (a.unpack(), b.unpack());
+    let r = match op {
+        Op::Add => add(a, b, FMT80, Round::Nearest),
+        Op::Sub => add(a, b.neg(), FMT80, Round::Nearest),
+        Op::Mul => mul(a, b, FMT80, Round::Nearest),
+        Op::Div => div(a, b, FMT80, Round::Nearest),
+    };
+    F80::pack(&r.v)
+}
+
 /// Iterations for the random sweeps; bump via `NIXVM_SF_ITERS` for a heavy run.
 fn iters() -> u64 {
     std::env::var("NIXVM_SF_ITERS")
@@ -93,7 +158,7 @@ fn f64_arith_matches_native_rne() {
             (Op::Mul, fa * fb),
             (Op::Div, fa / fb),
         ] {
-            let (soft, _) = f64_op(a, b, op, Round::Nearest);
+            let (soft, _) = f64_op(a, b, op, mx(Round::Nearest));
             assert!(
                 same_f64(soft, native),
                 "f64 {op:?}: a={a:#018x} b={b:#018x} soft={soft:#018x} native={:#018x}",
@@ -117,7 +182,7 @@ fn f32_arith_matches_native_rne() {
             (Op::Mul, fa * fb),
             (Op::Div, fa / fb),
         ] {
-            let (soft, _) = f32_op(a, b, op, Round::Nearest);
+            let (soft, _) = f32_op(a, b, op, mx(Round::Nearest));
             assert!(
                 same_f32(soft, native),
                 "f32 {op:?}: a={a:#010x} b={b:#010x} soft={soft:#010x} native={:#010x}",
@@ -181,10 +246,10 @@ fn directed_rounding_one_third() {
     // 1/3 in each mode, hand-verified against the exact f64 neighbours.
     let one = 1.0f64.to_bits();
     let three = 3.0f64.to_bits();
-    let rne = f64_op(one, three, Op::Div, Round::Nearest).0;
-    let down = f64_op(one, three, Op::Div, Round::Down).0;
-    let up = f64_op(one, three, Op::Div, Round::Up).0;
-    let zero = f64_op(one, three, Op::Div, Round::Zero).0;
+    let rne = f64_op(one, three, Op::Div, mx(Round::Nearest)).0;
+    let down = f64_op(one, three, Op::Div, mx(Round::Down)).0;
+    let up = f64_op(one, three, Op::Div, mx(Round::Up)).0;
+    let zero = f64_op(one, three, Op::Div, mx(Round::Zero)).0;
     // 1/3's exact tail is < 0.5 ulp, so RNE rounds *down*: nearest == down ==
     // zero, and up is one ulp above.
     assert_eq!(rne, down);
@@ -199,9 +264,9 @@ fn directed_rounding_negative_and_flags() {
     // -1/3: signs flip which directed mode rounds away.
     let a = (-1.0f64).to_bits();
     let three = 3.0f64.to_bits();
-    let up = f64_op(a, three, Op::Div, Round::Up).0; // toward +inf: toward zero for negatives
-    let down = f64_op(a, three, Op::Div, Round::Down).0; // toward -inf: away from zero
-    let zero = f64_op(a, three, Op::Div, Round::Zero).0;
+    let up = f64_op(a, three, Op::Div, mx(Round::Up)).0; // toward +inf: toward zero for negatives
+    let down = f64_op(a, three, Op::Div, mx(Round::Down)).0; // toward -inf: away from zero
+    let zero = f64_op(a, three, Op::Div, mx(Round::Zero)).0;
     assert_eq!(up, zero, "negative: toward +inf == toward zero");
     assert_eq!(
         down,
@@ -210,12 +275,22 @@ fn directed_rounding_negative_and_flags() {
     );
 
     // Inexact flag is set for 1/3; exact ops don't set it.
-    let (_, f_inexact) = f64_op(1.0f64.to_bits(), three, Op::Div, Round::Nearest);
+    let (_, f_inexact) = f64_op(1.0f64.to_bits(), three, Op::Div, mx(Round::Nearest));
     assert!(f_inexact & INEXACT != 0);
-    let (_, f_exact) = f64_op(1.0f64.to_bits(), 2.0f64.to_bits(), Op::Div, Round::Nearest);
+    let (_, f_exact) = f64_op(
+        1.0f64.to_bits(),
+        2.0f64.to_bits(),
+        Op::Div,
+        mx(Round::Nearest),
+    );
     assert!(f_exact & INEXACT == 0, "0.5 is exact");
     // Division by zero flags DIVZERO and yields signed infinity.
-    let (q, f) = f64_op(1.0f64.to_bits(), 0.0f64.to_bits(), Op::Div, Round::Nearest);
+    let (q, f) = f64_op(
+        1.0f64.to_bits(),
+        0.0f64.to_bits(),
+        Op::Div,
+        mx(Round::Nearest),
+    );
     assert!(f & DIVZERO != 0);
     assert_eq!(q, f64::INFINITY.to_bits());
 }
@@ -225,13 +300,19 @@ fn overflow_respects_direction() {
     let big = f64::MAX.to_bits();
     // MAX + MAX overflows: RNE -> +inf; toward zero -> stays MAX.
     assert_eq!(
-        f64_op(big, big, Op::Add, Round::Nearest).0,
+        f64_op(big, big, Op::Add, mx(Round::Nearest)).0,
         f64::INFINITY.to_bits()
     );
-    assert_eq!(f64_op(big, big, Op::Add, Round::Zero).0, f64::MAX.to_bits());
+    assert_eq!(
+        f64_op(big, big, Op::Add, mx(Round::Zero)).0,
+        f64::MAX.to_bits()
+    );
     // Toward -inf keeps MAX for a positive overflow.
-    assert_eq!(f64_op(big, big, Op::Add, Round::Down).0, f64::MAX.to_bits());
-    let (_, f) = f64_op(big, big, Op::Add, Round::Nearest);
+    assert_eq!(
+        f64_op(big, big, Op::Add, mx(Round::Down)).0,
+        f64::MAX.to_bits()
+    );
+    let (_, f) = f64_op(big, big, Op::Add, mx(Round::Nearest));
     assert_eq!(f & (OVERFLOW | INEXACT), OVERFLOW | INEXACT);
 }
 
@@ -269,9 +350,9 @@ fn f32_directed_rounding_matches_reference() {
             } else {
                 (rne, next_f32(rne, f32::INFINITY))
             };
-            let down = f32::from_bits(f32_op(a, b, op, Round::Down).0);
-            let up = f32::from_bits(f32_op(a, b, op, Round::Up).0);
-            let zero = f32::from_bits(f32_op(a, b, op, Round::Zero).0);
+            let down = f32::from_bits(f32_op(a, b, op, mx(Round::Down)).0);
+            let up = f32::from_bits(f32_op(a, b, op, mx(Round::Up)).0);
+            let zero = f32::from_bits(f32_op(a, b, op, mx(Round::Zero)).0);
             assert_eq!(
                 down.to_bits(),
                 down_ref.to_bits(),
@@ -309,7 +390,7 @@ fn f80_round_trips_and_computes() {
     let mut rng = Rng(0x0f0f_0f0f_1111_2222);
     for _ in 0..iters() {
         let a = rand_f64(&mut rng);
-        let back = F80::from_f64(a).to_f64_round(Round::Nearest).0;
+        let back = f80_to_f64(F80::from_f64(a));
         assert!(
             same_f64(back, f64::from_bits(a)),
             "f80 round-trip {a:#018x}"
@@ -317,11 +398,11 @@ fn f80_round_trips_and_computes() {
     }
     // A computation carrying more than 53 bits: (1 + 2^-60) done at 80-bit and
     // narrowed back to f64 keeps the extra bit that pure-f64 would have lost.
-    let one = F80::from_f64_val(1.0);
-    let tiny = F80::from_f64_val(2f64.powi(-60));
-    let (sum, _) = one.add(tiny, Round::Nearest); // exact at 80-bit (64-bit sig)
-    let (sub, _) = sum.sub(one, Round::Nearest); // recovers 2^-60 exactly
-    assert_eq!(sub.to_f64_round(Round::Nearest).0, 2f64.powi(-60).to_bits());
+    let one = f80_from(1.0);
+    let tiny = f80_from(2f64.powi(-60));
+    let sum = f80_op(one, tiny, Op::Add); // exact at 80-bit (64-bit sig)
+    let sub = f80_op(sum, one, Op::Sub); // recovers 2^-60 exactly
+    assert_eq!(f80_to_f64(sub), 2f64.powi(-60).to_bits());
 }
 
 #[test]
@@ -335,15 +416,18 @@ fn f80_matches_f64_for_exact_ops() {
         // Integers < 2^26: sum and product are exact in f64 (< 2^53) and f80.
         let a = (rng.next() % (1 << 26)) as i64 - (1 << 25);
         let b = (rng.next() % (1 << 26)) as i64 - (1 << 25);
-        let (xa, xb) = (F80::from_f64_val(a as f64), F80::from_f64_val(b as f64));
-        let mul = xa.mul(xb, Round::Nearest).0.to_f64_round(Round::Nearest).0;
+        let (xa, xb) = (f80_from(a as f64), f80_from(b as f64));
+        let mul = f80_to_f64(f80_op(xa, xb, Op::Mul));
         assert_eq!(mul, ((a * b) as f64).to_bits(), "f80 mul {a}*{b}");
-        let add = xa.add(xb, Round::Nearest).0.to_f64_round(Round::Nearest).0;
+        let add = f80_to_f64(f80_op(xa, xb, Op::Add));
         assert_eq!(add, ((a + b) as f64).to_bits(), "f80 add {a}+{b}");
-        let sub = xa.sub(xb, Round::Nearest).0.to_f64_round(Round::Nearest).0;
+        let sub = f80_to_f64(f80_op(xa, xb, Op::Sub));
         assert_eq!(sub, ((a - b) as f64).to_bits(), "f80 sub {a}-{b}");
     }
     // A division that is exact at 80-bit: x/1 and (a*b)/b recover a.
-    let seven = F80::from_f64_val(7.0);
-    assert_eq!(seven.div(F80::from_f64_val(1.0), Round::Nearest).0, seven);
+    let seven = f80_from(7.0);
+    assert_eq!(f80_op(seven, f80_from(1.0), Op::Div), seven);
+    // Denormal round trip through the 80-bit format and arithmetic on it.
+    let d = f80_from(f64::from_bits(1));
+    assert_eq!(f80_to_f64(f80_op(d, f80_from(2.0), Op::Mul)), 2);
 }

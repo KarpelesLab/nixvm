@@ -132,9 +132,9 @@ const HWCAP2_AARCH64: u64 = (1 << 0)  // DCPODP
     | (1 << 13)  // I8MM
     | (1 << 14); // BF16
 
-/// x86-64 `HWCAP` bits: the loader mirrors the low, universally-present
-/// subset of the CPUID leaf-1 `EDX` feature word the Linux kernel exposes via
-/// `AT_HWCAP` on that arch (`arch/x86/include/asm/elf.h`).
+/// x86-64 `HWCAP` bits: exactly the CPUID leaf-1 `EDX` feature word the
+/// software CPU reports (`interp_x86`'s `CPUID1_EDX`), which is what the Linux
+/// kernel exposes via `AT_HWCAP` on that arch (`arch/x86/include/asm/elf.h`).
 const HWCAP_X86_64: u64 = (1 << 0)   // FPU
     | (1 << 3)   // PSE
     | (1 << 4)   // TSC
@@ -143,6 +143,7 @@ const HWCAP_X86_64: u64 = (1 << 0)   // FPU
     | (1 << 8)   // CX8
     | (1 << 13)  // PGE
     | (1 << 15)  // CMOV
+    | (1 << 19)  // CLFSH
     | (1 << 23)  // MMX
     | (1 << 24)  // FXSR
     | (1 << 25)  // SSE
