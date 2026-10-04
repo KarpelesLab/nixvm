@@ -6037,7 +6037,8 @@ impl Kernel {
         // Interface queries (`SIOCGIF*`) operate on any socket fd.
         if net::is_iface_ioctl(req) {
             return if matches!(f, Fd::Socket { .. }) {
-                net::iface_ioctl(req, arg, mem)
+                let link = self.net.lock().unwrap().link();
+                net::iface_ioctl(req, arg, mem, link.as_ref())
             } else {
                 err(Errno::ENOTTY)
             };

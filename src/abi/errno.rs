@@ -65,5 +65,6 @@ errnos! {
     ENOTSOCK = 88,
     EOPNOTSUPP = 95,
     EAFNOSUPPORT = 97,
+    EADDRNOTAVAIL = 99,
     ECONNREFUSED = 111,
 }

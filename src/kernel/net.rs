@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
-use super::egress::{Egress, HostConn, HostDgram};
+use super::egress::{Egress, HostConn, HostDgram, Link};
 use super::{Fd, Kernel, ServiceCtx, err};
 
 /// One received message: `(source address, payload, out `msg_flags`,
@@ -34,6 +34,11 @@ type RecvMsg = (Option<Addr>, Vec<u8>, u64, Vec<Fd>);
 impl Net {
     pub(super) fn set_egress(&mut self, egress: Box<dyn Egress>) {
         self.egress = Some(egress);
+    }
+
+    /// The egress backend's guest interface (`tun0`), while it is up.
+    pub(super) fn link(&self) -> Option<Link> {
+        self.egress.as_ref().and_then(|e| e.link())
     }
 
     /// Set the `O_NONBLOCK` state of socket `sock` (end `end`) — the `fcntl`
@@ -240,12 +245,13 @@ const CMSG_HDR_LEN: usize = 16;
 
 // `NETLINK_ROUTE` (rtnetlink) message types this module answers
 // (linux/rtnetlink.h). Only enough of the protocol to let guest tools
-// enumerate the always-up loopback interface: `RTM_GETLINK`/`RTM_GETADDR`
-// dumps, and a minimal `RTM_GETROUTE` reply.
+// enumerate the interfaces (`lo`, plus `tun0` while the egress backend
+// provides a link): `RTM_GETLINK`/`RTM_GETADDR`/`RTM_GETROUTE` dumps.
 const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
+const RTM_NEWROUTE: u16 = 24;
 const RTM_GETROUTE: u16 = 26;
 /// Generic netlink control messages (linux/netlink.h): an error/ACK, and the
 /// end-of-dump marker.
@@ -260,26 +266,54 @@ const NLM_F_DUMP: u16 = 0x100 | 0x200;
 
 /// `ifinfomsg.ifi_type` for the loopback device (linux/if_arp.h).
 const ARPHRD_LOOPBACK: u16 = 772;
-// `ifinfomsg.ifi_flags` / `IFF_*` bits (linux/if.h) set on `lo`.
+/// `ifinfomsg.ifi_type` for a link without hardware addresses (a tun device).
+const ARPHRD_NONE: u16 = 0xfffe;
+// `ifinfomsg.ifi_flags` / `IFF_*` bits (linux/if.h).
 const IFF_UP: u32 = 0x1;
 const IFF_LOOPBACK: u32 = 0x8;
+const IFF_POINTOPOINT: u32 = 0x10;
 const IFF_RUNNING: u32 = 0x40;
+const IFF_NOARP: u32 = 0x80;
+const IFF_MULTICAST: u32 = 0x1000;
+const IFF_LOWER_UP: u32 = 0x1_0000;
 
 // `IFLA_*` rtattr types (linux/if_link.h) filled in on the `RTM_NEWLINK` reply.
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_IFNAME: u16 = 3;
 const IFLA_MTU: u16 = 4;
+const IFLA_QDISC: u16 = 6;
+const IFLA_TXQLEN: u16 = 13;
+const IFLA_OPERSTATE: u16 = 16;
+/// `IFLA_OPERSTATE` values (linux/if.h): `lo` reports "unknown".
+const IF_OPER_UNKNOWN: u8 = 0;
+const IF_OPER_UP: u8 = 6;
+
+// `RTA_*` rtattr types and `rtmsg` field values (linux/rtnetlink.h) for the
+// `RTM_NEWROUTE` replies.
+const RTA_DST: u16 = 1;
+const RTA_OIF: u16 = 4;
+const RTA_PREFSRC: u16 = 7;
+const RTA_TABLE: u16 = 15;
+const RT_TABLE_MAIN: u8 = 254;
+const RTPROT_KERNEL: u8 = 2;
+const RTPROT_STATIC: u8 = 4;
+const RTN_UNICAST: u8 = 1;
+const RT_SCOPE_UNIVERSE: u8 = 0;
+const RT_SCOPE_LINK: u8 = 253;
 
 // `IFA_*` rtattr types (linux/if_addr.h) filled in on the `RTM_NEWADDR` reply.
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const IFA_LABEL: u16 = 3;
+/// `ifaddrmsg.ifa_flags` bit (linux/if_addr.h): a static, not leased, address.
+const IFA_F_PERMANENT: u8 = 0x80;
 /// `RT_SCOPE_HOST` (linux/rtnetlink.h): the scope of an address that is only
 /// valid on this host, e.g. `127.0.0.1`.
 const RT_SCOPE_HOST: u8 = 254;
-/// The loopback interface's fixed `ifindex`: this module models exactly one
-/// interface, so it never needs to be anything but `1`.
+/// The loopback interface's fixed `ifindex`.
 const LOOPBACK_IFINDEX: i32 = 1;
+/// `tun0`'s `ifindex`, while the egress backend provides a link.
+const TUN_IFINDEX: i32 = 2;
 
 /// The kernel's socket table plus the AF_UNIX/AF_INET(6) address registries.
 #[derive(Default)]
@@ -2787,27 +2821,71 @@ impl Kernel {
             orig_hdr.copy_from_slice(hdr);
             let want_ack = nlmsg_flags & NLM_F_ACK != 0;
             let dump = nlmsg_flags & NLM_F_DUMP == NLM_F_DUMP;
+            // The family the request asks about (the first byte of its
+            // `rtgenmsg`/`ifaddrmsg`/`rtmsg`); `AF_UNSPEC` (0) means all.
+            let family = if nlmsg_len > 16 {
+                data.get(offset + 16).copied().map_or(0, u16::from)
+            } else {
+                0
+            };
+            let wants = |f: u16| family == 0 || family == f;
+            let link = net.link();
+            let done = || encode_nlmsg(NLMSG_DONE, 0, nlmsg_seq, pid, &0i32.to_le_bytes());
 
             let replies: Vec<Vec<u8>> = if nlmsg_type == RTM_GETLINK && dump {
-                vec![
-                    build_rtm_newlink(nlmsg_seq, pid),
-                    encode_nlmsg(NLMSG_DONE, 0, nlmsg_seq, pid, &0i32.to_le_bytes()),
-                ]
+                let mut r: Vec<Vec<u8>> = ifaces(link.as_ref())
+                    .iter()
+                    .map(|i| build_rtm_newlink(nlmsg_seq, pid, i))
+                    .collect();
+                r.push(done());
+                r
             } else if nlmsg_type == RTM_GETADDR && dump {
-                vec![
-                    build_rtm_newaddr_v4(nlmsg_seq, pid),
-                    build_rtm_newaddr_v6(nlmsg_seq, pid),
-                    encode_nlmsg(NLMSG_DONE, 0, nlmsg_seq, pid, &0i32.to_le_bytes()),
-                ]
+                let mut r = Vec::new();
+                for i in ifaces(link.as_ref()) {
+                    if let Some((ip, len)) = i.v4.filter(|_| wants(AF_INET)) {
+                        r.push(build_rtm_newaddr(nlmsg_seq, pid, &i, AF_INET, &ip, len));
+                    }
+                    if let Some((ip, len)) = i.v6.filter(|_| wants(AF_INET6)) {
+                        r.push(build_rtm_newaddr(nlmsg_seq, pid, &i, AF_INET6, &ip, len));
+                    }
+                }
+                r.push(done());
+                r
+            } else if nlmsg_type == RTM_GETROUTE && dump {
+                // The main table: `tun0`'s on-link prefixes and the default
+                // routes through it (loopback routes live in the local table).
+                let mut r = Vec::new();
+                if let Some(l) = &link {
+                    if let Some((ip, len)) = l.v4.filter(|_| wants(AF_INET)) {
+                        let net = mask_prefix(&ip, len);
+                        let fam = AF_INET;
+                        r.push(build_rtm_newroute(nlmsg_seq, pid, fam, None, None));
+                        r.push(build_rtm_newroute(
+                            nlmsg_seq,
+                            pid,
+                            fam,
+                            Some((&net, len)),
+                            Some(&ip),
+                        ));
+                    }
+                    if let Some((ip, len)) = l.v6.filter(|_| wants(AF_INET6)) {
+                        let net = mask_prefix(&ip, len);
+                        let fam = AF_INET6;
+                        r.push(build_rtm_newroute(
+                            nlmsg_seq,
+                            pid,
+                            fam,
+                            Some((&net, len)),
+                            None,
+                        ));
+                        r.push(build_rtm_newroute(nlmsg_seq, pid, fam, None, None));
+                    }
+                }
+                r.push(done());
+                r
             } else if nlmsg_type == RTM_GETROUTE {
-                // No routes beyond the implicit loopback one: just end the dump.
-                vec![encode_nlmsg(
-                    NLMSG_DONE,
-                    0,
-                    nlmsg_seq,
-                    pid,
-                    &0i32.to_le_bytes(),
-                )]
+                // A route lookup (`ip route get`) isn't modelled: no answer.
+                vec![done()]
             } else if want_ack {
                 vec![encode_nlmsgerr(0, &orig_hdr, nlmsg_seq, pid)]
             } else {
@@ -3072,65 +3150,169 @@ fn encode_nlmsgerr(error: i32, orig_hdr: &[u8; 16], seq: u32, pid: u32) -> Vec<u
     encode_nlmsg(NLMSG_ERROR, 0, seq, pid, &payload)
 }
 
-/// `RTM_NEWLINK` describing the single, always-up loopback interface: index
-/// `1`, `ARPHRD_LOOPBACK`, `IFF_UP|IFF_LOOPBACK|IFF_RUNNING`, plus
-/// `IFLA_IFNAME="lo"`, `IFLA_MTU=65536`, and a 6-zero-byte `IFLA_ADDRESS`.
-fn build_rtm_newlink(seq: u32, pid: u32) -> Vec<u8> {
-    let flags = IFF_UP | IFF_LOOPBACK | IFF_RUNNING;
+/// One guest-visible network interface, as netlink dumps and `SIOCGIF*`
+/// ioctls describe it.
+struct Iface {
+    name: &'static str,
+    index: i32,
+    /// `ifi_type` / the hardware address family (`ARPHRD_*`).
+    hwtype: u16,
+    flags: u32,
+    mtu: u32,
+    txqlen: u32,
+    operstate: u8,
+    v4: Option<([u8; 4], u8)>,
+    v6: Option<([u8; 16], u8)>,
+}
+
+/// The guest's interfaces: the always-up `lo`, then `tun0` while the egress
+/// backend provides a link (`link`).
+fn ifaces(link: Option<&Link>) -> Vec<Iface> {
+    let mut v = vec![Iface {
+        name: "lo",
+        index: LOOPBACK_IFINDEX,
+        hwtype: ARPHRD_LOOPBACK,
+        flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_LOWER_UP,
+        mtu: 65_536,
+        txqlen: 1000,
+        operstate: IF_OPER_UNKNOWN,
+        v4: Some(([127, 0, 0, 1], 8)),
+        v6: Some((loopback_ip(true), 128)),
+    }];
+    if let Some(l) = link {
+        v.push(Iface {
+            name: "tun0",
+            index: TUN_IFINDEX,
+            hwtype: ARPHRD_NONE,
+            flags: IFF_UP
+                | IFF_POINTOPOINT
+                | IFF_RUNNING
+                | IFF_NOARP
+                | IFF_MULTICAST
+                | IFF_LOWER_UP,
+            mtu: l.mtu,
+            txqlen: 500,
+            operstate: IF_OPER_UP,
+            v4: l.v4,
+            v6: l.v6,
+        });
+    }
+    v
+}
+
+/// `ip` with all but its first `len` bits cleared: the network of a prefix.
+fn mask_prefix<const N: usize>(ip: &[u8; N], len: u8) -> [u8; N] {
+    let mut out = [0u8; N];
+    for (i, (o, b)) in out.iter_mut().zip(ip).enumerate() {
+        let keep = (usize::from(len)).saturating_sub(i * 8).min(8);
+        *o = if keep == 0 {
+            0
+        } else {
+            b & (0xffu8 << (8 - keep))
+        };
+    }
+    out
+}
+
+/// `RTM_NEWLINK` describing interface `i`.
+fn build_rtm_newlink(seq: u32, pid: u32, i: &Iface) -> Vec<u8> {
     let mut payload = vec![0u8; 16]; // struct ifinfomsg
-    payload[2..4].copy_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
-    payload[4..8].copy_from_slice(&LOOPBACK_IFINDEX.to_le_bytes());
-    payload[8..12].copy_from_slice(&flags.to_le_bytes());
-    payload.extend(encode_rtattr(IFLA_IFNAME, b"lo\0"));
-    payload.extend(encode_rtattr(IFLA_MTU, &65_536u32.to_le_bytes()));
-    payload.extend(encode_rtattr(IFLA_ADDRESS, &[0u8; 6]));
+    payload[2..4].copy_from_slice(&i.hwtype.to_le_bytes());
+    payload[4..8].copy_from_slice(&i.index.to_le_bytes());
+    payload[8..12].copy_from_slice(&i.flags.to_le_bytes());
+    let mut name = i.name.as_bytes().to_vec();
+    name.push(0);
+    payload.extend(encode_rtattr(IFLA_IFNAME, &name));
+    payload.extend(encode_rtattr(IFLA_MTU, &i.mtu.to_le_bytes()));
+    payload.extend(encode_rtattr(IFLA_TXQLEN, &i.txqlen.to_le_bytes()));
+    payload.extend(encode_rtattr(IFLA_QDISC, b"noqueue\0"));
+    payload.extend(encode_rtattr(IFLA_OPERSTATE, &[i.operstate]));
+    if i.hwtype == ARPHRD_LOOPBACK {
+        payload.extend(encode_rtattr(IFLA_ADDRESS, &[0u8; 6]));
+    }
     encode_nlmsg(RTM_NEWLINK, 0, seq, pid, &payload)
 }
 
-/// `RTM_NEWADDR` for `127.0.0.1/8` on `lo`.
-fn build_rtm_newaddr_v4(seq: u32, pid: u32) -> Vec<u8> {
+/// `RTM_NEWADDR` for address `ip`/`len` (family `family`) on interface `i`.
+fn build_rtm_newaddr(seq: u32, pid: u32, i: &Iface, family: u16, ip: &[u8], len: u8) -> Vec<u8> {
     let mut payload = vec![0u8; 8]; // struct ifaddrmsg
-    payload[0] = AF_INET as u8;
-    payload[1] = 8; // ifa_prefixlen
-    payload[3] = RT_SCOPE_HOST;
-    payload[4..8].copy_from_slice(&(LOOPBACK_IFINDEX as u32).to_le_bytes());
-    let ip = [127u8, 0, 0, 1];
-    payload.extend(encode_rtattr(IFA_ADDRESS, &ip));
-    payload.extend(encode_rtattr(IFA_LOCAL, &ip));
-    payload.extend(encode_rtattr(IFA_LABEL, b"lo\0"));
+    payload[0] = family as u8;
+    payload[1] = len; // ifa_prefixlen
+    payload[2] = IFA_F_PERMANENT; // no lifetime: not "dynamic"
+    payload[3] = if i.index == LOOPBACK_IFINDEX {
+        RT_SCOPE_HOST
+    } else {
+        RT_SCOPE_UNIVERSE
+    };
+    payload[4..8].copy_from_slice(&(i.index as u32).to_le_bytes());
+    payload.extend(encode_rtattr(IFA_ADDRESS, ip));
+    payload.extend(encode_rtattr(IFA_LOCAL, ip));
+    if family == AF_INET {
+        let mut label = i.name.as_bytes().to_vec();
+        label.push(0);
+        payload.extend(encode_rtattr(IFA_LABEL, &label));
+    }
     encode_nlmsg(RTM_NEWADDR, 0, seq, pid, &payload)
 }
 
-/// `RTM_NEWADDR` for `::1/128` on `lo`.
-fn build_rtm_newaddr_v6(seq: u32, pid: u32) -> Vec<u8> {
-    let mut payload = vec![0u8; 8]; // struct ifaddrmsg
-    payload[0] = AF_INET6 as u8;
-    payload[1] = 128; // ifa_prefixlen
-    payload[4..8].copy_from_slice(&(LOOPBACK_IFINDEX as u32).to_le_bytes());
-    let ip = loopback_ip(true);
-    payload.extend(encode_rtattr(IFA_ADDRESS, &ip));
-    payload.extend(encode_rtattr(IFA_LOCAL, &ip));
-    payload.extend(encode_rtattr(IFA_LABEL, b"lo\0"));
-    encode_nlmsg(RTM_NEWADDR, 0, seq, pid, &payload)
+/// `RTM_NEWROUTE` in the main table via `tun0`: to `dst` (network, prefix
+/// length) — an on-link kernel route — or, with `dst` `None`, the default
+/// route. `src` is the preferred source address, if any.
+fn build_rtm_newroute(
+    seq: u32,
+    pid: u32,
+    family: u16,
+    dst: Option<(&[u8], u8)>,
+    src: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut payload = vec![0u8; 12]; // struct rtmsg
+    payload[0] = family as u8;
+    payload[1] = dst.map_or(0, |(_, len)| len); // rtm_dst_len
+    payload[4] = RT_TABLE_MAIN;
+    payload[5] = if dst.is_some() {
+        RTPROT_KERNEL
+    } else {
+        RTPROT_STATIC
+    };
+    // IPv4 routes without a gateway are on-link; IPv6 ones are global.
+    payload[6] = if family == AF_INET {
+        RT_SCOPE_LINK
+    } else {
+        RT_SCOPE_UNIVERSE
+    };
+    payload[7] = RTN_UNICAST;
+    payload.extend(encode_rtattr(
+        RTA_TABLE,
+        &u32::from(RT_TABLE_MAIN).to_le_bytes(),
+    ));
+    if let Some((net, _)) = dst {
+        payload.extend(encode_rtattr(RTA_DST, net));
+    }
+    if let Some(src) = src {
+        payload.extend(encode_rtattr(RTA_PREFSRC, src));
+    }
+    payload.extend(encode_rtattr(RTA_OIF, &(TUN_IFINDEX as u32).to_le_bytes()));
+    encode_nlmsg(RTM_NEWROUTE, 0, seq, pid, &payload)
 }
 
-/// Interface-query ioctls (`SIOCGIF*`) for nixvm's single loopback interface —
-/// the same `lo` (index 1, `IFF_UP|LOOPBACK|RUNNING`, MTU 65536, `127.0.0.1`)
-/// the netlink dump reports. They operate on a `struct ifreq` (a 16-byte name
-/// then a 24-byte union) at `arg`, except `SIOCGIFCONF` which uses `struct
-/// ifconf`. A name-keyed query for anything but `lo` is `ENODEV`. Returns 0 on
-/// success or a negative errno; the caller has already checked `arg`'s fd is a
-/// socket.
-pub(super) fn iface_ioctl(req: u32, arg: u64, mem: &mut GuestMemory) -> i64 {
+/// Interface-query ioctls (`SIOCGIF*`) for the guest's interfaces — the same
+/// `lo` and `tun0` (see [`ifaces`]) the netlink dump reports. They operate on
+/// a `struct ifreq` (a 16-byte name then a 24-byte union) at `arg`, except
+/// `SIOCGIFCONF` which uses `struct ifconf`. A query for an unknown interface
+/// is `ENODEV`. Returns 0 on success or a negative errno; the caller has
+/// already checked `arg`'s fd is a socket.
+pub(super) fn iface_ioctl(req: u32, arg: u64, mem: &mut GuestMemory, link: Option<&Link>) -> i64 {
     const SIOCGIFNAME: u32 = 0x8910;
     const SIOCGIFCONF: u32 = 0x8912;
     const SIOCGIFFLAGS: u32 = 0x8913;
     const SIOCGIFADDR: u32 = 0x8915;
+    const SIOCGIFDSTADDR: u32 = 0x8917;
     const SIOCGIFBRDADDR: u32 = 0x8919;
     const SIOCGIFNETMASK: u32 = 0x891b;
     const SIOCGIFMTU: u32 = 0x8921;
     const SIOCGIFHWADDR: u32 = 0x8927;
     const SIOCGIFINDEX: u32 = 0x8933;
+    const SIOCGIFTXQLEN: u32 = 0x8942;
     const IFR_UNION: u64 = 16; // offset of the union after `char ifr_name[16]`
     const IFREQ_SZ: u32 = 40;
 
@@ -3141,67 +3323,87 @@ pub(super) fn iface_ioctl(req: u32, arg: u64, mem: &mut GuestMemory) -> i64 {
         sa[4..8].copy_from_slice(&ip);
         mem.write(arg + IFR_UNION, &sa).is_ok()
     };
+    let all = ifaces(link);
 
     if req == SIOCGIFCONF {
-        // struct ifconf { int ifc_len; /*4 pad*/ char* ifc_buf; }
+        // struct ifconf { int ifc_len; /*4 pad*/ char* ifc_buf; } — one ifreq
+        // per interface with an IPv4 address.
         let (Ok(len), Ok(buf)) = (mem.read_u32(arg), mem.read_u64(arg + 8)) else {
             return err(Errno::EFAULT);
         };
-        if buf == 0 || len < IFREQ_SZ {
-            // Report the buffer size one `lo` ifreq needs.
-            let _ = mem.write(arg, &IFREQ_SZ.to_le_bytes());
+        let with_v4: Vec<&Iface> = all.iter().filter(|i| i.v4.is_some()).collect();
+        let need = IFREQ_SZ * with_v4.len() as u32;
+        if buf == 0 {
+            // Report the buffer size the list needs.
+            let _ = mem.write(arg, &need.to_le_bytes());
             return 0;
         }
-        let mut e = [0u8; IFREQ_SZ as usize];
-        e[0..2].copy_from_slice(b"lo");
-        e[16..18].copy_from_slice(&AF_INET.to_le_bytes());
-        e[20..24].copy_from_slice(&[127, 0, 0, 1]);
-        if mem.write(buf, &e).is_err() {
-            return err(Errno::EFAULT);
+        let fit = with_v4.iter().take((len / IFREQ_SZ) as usize);
+        let mut written = 0u32;
+        for i in fit {
+            let mut e = [0u8; IFREQ_SZ as usize];
+            e[..i.name.len()].copy_from_slice(i.name.as_bytes());
+            e[16..18].copy_from_slice(&AF_INET.to_le_bytes());
+            e[20..24].copy_from_slice(&i.v4.map_or([0; 4], |(ip, _)| ip));
+            if mem.write(buf + u64::from(written), &e).is_err() {
+                return err(Errno::EFAULT);
+            }
+            written += IFREQ_SZ;
         }
-        let _ = mem.write(arg, &IFREQ_SZ.to_le_bytes());
+        let _ = mem.write(arg, &written.to_le_bytes());
         return 0;
     }
     if req == SIOCGIFNAME {
-        // Keyed by ifr_ifindex; only index 1 (`lo`) exists.
+        // Keyed by ifr_ifindex.
         let Ok(idx) = mem.read_u32(arg + IFR_UNION) else {
             return err(Errno::EFAULT);
         };
-        if idx != LOOPBACK_IFINDEX as u32 {
+        let Some(i) = all.iter().find(|i| i.index as u32 == idx) else {
             return err(Errno::ENODEV);
-        }
+        };
         let mut name = [0u8; 16];
-        name[0..2].copy_from_slice(b"lo");
+        name[..i.name.len()].copy_from_slice(i.name.as_bytes());
         return if mem.write(arg, &name).is_ok() {
             0
         } else {
             err(Errno::EFAULT)
         };
     }
-    // The remaining queries are keyed by ifr_name, which must be `lo`.
+    // The remaining queries are keyed by ifr_name.
     let Ok(name) = mem.read_vec(arg, 16) else {
         return err(Errno::EFAULT);
     };
     let end = name.iter().position(|&c| c == 0).unwrap_or(16);
-    if &name[..end] != b"lo" {
+    let Some(i) = all.iter().find(|i| i.name.as_bytes() == &name[..end]) else {
         return err(Errno::ENODEV);
-    }
+    };
+    let v4 = |mem: &mut GuestMemory, f: fn([u8; 4], u8) -> [u8; 4]| -> Option<bool> {
+        i.v4.map(|(ip, len)| put_sin(mem, f(ip, len)))
+    };
     let ok = match req {
-        SIOCGIFINDEX => mem
-            .write(arg + IFR_UNION, &LOOPBACK_IFINDEX.to_le_bytes())
-            .is_ok(),
+        SIOCGIFINDEX => mem.write(arg + IFR_UNION, &i.index.to_le_bytes()).is_ok(),
         SIOCGIFFLAGS => {
-            let flags = (IFF_UP | IFF_LOOPBACK | IFF_RUNNING) as u16;
+            // ifr_flags is a short: the low 16 flag bits.
+            let flags = i.flags as u16;
             mem.write(arg + IFR_UNION, &flags.to_le_bytes()).is_ok()
         }
-        SIOCGIFMTU => mem.write(arg + IFR_UNION, &65_536u32.to_le_bytes()).is_ok(),
-        SIOCGIFADDR => put_sin(mem, [127, 0, 0, 1]),
-        SIOCGIFNETMASK => put_sin(mem, [255, 0, 0, 0]),
-        SIOCGIFBRDADDR => put_sin(mem, [0, 0, 0, 0]),
+        SIOCGIFMTU => mem.write(arg + IFR_UNION, &i.mtu.to_le_bytes()).is_ok(),
+        SIOCGIFTXQLEN => mem.write(arg + IFR_UNION, &i.txqlen.to_le_bytes()).is_ok(),
+        SIOCGIFADDR => match v4(mem, |ip, _| ip) {
+            Some(ok) => ok,
+            None => return err(Errno::EADDRNOTAVAIL),
+        },
+        SIOCGIFNETMASK => match v4(mem, |_, len| {
+            (u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0)).to_be_bytes()
+        }) {
+            Some(ok) => ok,
+            None => return err(Errno::EADDRNOTAVAIL),
+        },
+        SIOCGIFBRDADDR | SIOCGIFDSTADDR => put_sin(mem, [0, 0, 0, 0]),
         SIOCGIFHWADDR => {
-            // sockaddr with sa_family = ARPHRD_LOOPBACK and a 6-byte zero MAC.
+            // sockaddr with sa_family = the ARPHRD type and a zero address.
             let mut sa = [0u8; 16];
-            sa[0..2].copy_from_slice(&ARPHRD_LOOPBACK.to_le_bytes());
+            sa[0..2].copy_from_slice(&i.hwtype.to_le_bytes());
             mem.write(arg + IFR_UNION, &sa).is_ok()
         }
         _ => return err(Errno::ENOTTY),
@@ -3213,7 +3415,17 @@ pub(super) fn iface_ioctl(req: u32, arg: u64, mem: &mut GuestMemory) -> i64 {
 pub(super) fn is_iface_ioctl(req: u32) -> bool {
     matches!(
         req,
-        0x8910 | 0x8912 | 0x8913 | 0x8915 | 0x8919 | 0x891b | 0x8921 | 0x8927 | 0x8933
+        0x8910
+            | 0x8912
+            | 0x8913
+            | 0x8915
+            | 0x8917
+            | 0x8919
+            | 0x891b
+            | 0x8921
+            | 0x8927
+            | 0x8933
+            | 0x8942
     )
 }
 
@@ -5123,6 +5335,109 @@ mod tests {
         let (ty, seq, _) = &msgs[1];
         assert_eq!(*ty, NLMSG_DONE);
         assert_eq!(*seq, 42);
+    }
+
+    /// An egress backend that only provides a link, to show `tun0`.
+    #[derive(Debug)]
+    struct LinkOnly;
+    impl Egress for LinkOnly {
+        fn connect_tcp(&self, _: [u8; 16], _: bool, _: u16) -> std::io::Result<Box<dyn HostConn>> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+        fn open_udp(&self) -> std::io::Result<Box<dyn HostDgram>> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+        fn link(&self) -> Option<Link> {
+            let mut v6 = [0u8; 16];
+            v6[..4].copy_from_slice(&[0x26, 0x05, 0x57, 0xc0]);
+            v6[15] = 1;
+            Some(Link {
+                mtu: 1400,
+                v4: Some(([100, 64, 0, 2], 10)),
+                v6: Some((v6, 64)),
+            })
+        }
+    }
+
+    #[test]
+    fn netlink_dumps_show_the_egress_link_as_tun0() {
+        let (mut k, mut mem, mut v, mut cx) = setup();
+        k.set_egress(Box::new(LinkOnly));
+        let fd = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Socket,
+            [
+                u64::from(AF_NETLINK),
+                SOCK_RAW | SOCK_NONBLOCK,
+                NETLINK_ROUTE,
+                0,
+                0,
+                0,
+            ],
+        ) as u64;
+        let mut dump = |ty: u16| {
+            let req = 0x1_1000;
+            write_nlmsghdr(&mut mem, req, ty, NLM_F_REQUEST | NLM_F_DUMP, 1);
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Sendto,
+                [fd, req, 16, 0, 0, 0],
+            );
+            let out = 0x1_2000;
+            let n = call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Recvfrom,
+                [fd, out, 4096, 0, 0, 0],
+            );
+            parse_nlmsgs(&mem.read_vec(out, n as usize).unwrap())
+        };
+
+        let links = dump(RTM_GETLINK);
+        let names: Vec<Vec<u8>> = links
+            .iter()
+            .filter(|(ty, ..)| *ty == RTM_NEWLINK)
+            .filter_map(|(_, _, p)| find_rtattr(p, 16, IFLA_IFNAME))
+            .collect();
+        assert_eq!(names, [b"lo\0".to_vec(), b"tun0\0".to_vec()]);
+
+        let addrs: Vec<Vec<u8>> = dump(RTM_GETADDR)
+            .iter()
+            .filter(|(ty, ..)| *ty == RTM_NEWADDR)
+            .filter_map(|(_, _, p)| find_rtattr(p, 8, IFA_LOCAL))
+            .collect();
+        assert!(addrs.contains(&vec![100, 64, 0, 2]), "{addrs:?}");
+        assert!(
+            addrs
+                .iter()
+                .any(|a| a.len() == 16 && a[..4] == [0x26, 0x05, 0x57, 0xc0])
+        );
+
+        // Per family: a default route and the on-link prefix.
+        let dsts: Vec<Option<Vec<u8>>> = dump(RTM_GETROUTE)
+            .iter()
+            .filter(|(ty, ..)| *ty == RTM_NEWROUTE)
+            .map(|(_, _, p)| find_rtattr(p, 12, RTA_DST))
+            .collect();
+        assert_eq!(dsts.len(), 4, "{dsts:?}");
+        assert!(dsts.contains(&Some(vec![100, 64, 0, 0])));
+        assert_eq!(dsts.iter().filter(|d| d.is_none()).count(), 2);
+    }
+
+    #[test]
+    fn mask_prefix_clears_host_bits() {
+        assert_eq!(mask_prefix(&[100, 64, 0, 2], 10), [100, 64, 0, 0]);
+        assert_eq!(mask_prefix(&[100, 127, 255, 255], 10), [100, 64, 0, 0]);
+        assert_eq!(mask_prefix(&[10, 1, 2, 3], 0), [0, 0, 0, 0]);
+        assert_eq!(mask_prefix(&[10, 1, 2, 3], 32), [10, 1, 2, 3]);
     }
 
     #[test]

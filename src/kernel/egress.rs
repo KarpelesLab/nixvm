@@ -70,6 +70,18 @@ pub trait HostDgram: Send + Debug {
     fn recv_from(&mut self) -> io::Result<Option<Datagram>>;
 }
 
+/// The guest-visible network interface an [`Egress`] provides, shown to the
+/// guest as `tun0` (by `ip addr`, `ip route`, `ifconfig`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Link {
+    /// The interface MTU.
+    pub mtu: u32,
+    /// The guest's IPv4 address and prefix length, if it has one.
+    pub v4: Option<([u8; 4], u8)>,
+    /// The guest's IPv6 address and prefix length, if it has one.
+    pub v6: Option<([u8; 16], u8)>,
+}
+
 /// Opens host-side connections for the guest. One installed instance is shared
 /// by the whole VM. The native impl is [`HostEgress`]; a browser transport
 /// (WebSocket relay / pktkit) will be another implementor.
@@ -95,6 +107,11 @@ pub trait Egress: Send + Debug {
             io::ErrorKind::Unsupported,
             "ICMP egress not supported by this backend",
         ))
+    }
+    /// The interface this backend gives the guest, while it is up. `None` (the
+    /// default) shows only `lo`, as when the host's own network is used.
+    fn link(&self) -> Option<Link> {
+        None
     }
 }
 

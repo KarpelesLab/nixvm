@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex, Weak};
 use pktkit::vclient::{Client, ClientConfig, TcpConn, UdpConn};
 use pktkit::{IpPrefix, L3Device, Packet, Protocol, transport_checksum};
 
-use crate::kernel::egress::{Datagram, Egress, HostConn, HostDgram};
+use crate::kernel::egress::{Datagram, Egress, HostConn, HostDgram, Link};
 
 /// Most packets buffered for the transport before new ones are dropped: a
 /// transport that stopped draining (a dead WebSocket) must not grow this
@@ -341,6 +341,15 @@ impl Egress for Tunnel {
             tunnel: self.clone(),
             queue,
         }))
+    }
+
+    fn link(&self) -> Option<Link> {
+        let lease = self.lease()?;
+        Some(Link {
+            mtu: u32::from(lease.mtu),
+            v4: lease.v4.map(|(ip, len)| (ip.octets(), len)),
+            v6: lease.v6.map(|(ip, len)| (ip.octets(), len)),
+        })
     }
 }
 
