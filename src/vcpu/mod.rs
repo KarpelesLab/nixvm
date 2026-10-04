@@ -282,6 +282,19 @@ pub trait Vcpu: Send {
     /// on the post-syscall user instruction at no privilege level.
     fn settle_syscall_return(&mut self) {}
 
+    /// Whether an [`Exit::Interrupted`] left the vcpu at a user-mode
+    /// instruction boundary, where the kernel may deliver a pending
+    /// asynchronous signal (build a frame from the live registers and redirect
+    /// the pc) as Linux does on any return to user mode — not only at syscall
+    /// returns. A compute loop that never makes a syscall (a `SIGALRM`-driven
+    /// benchmark, Go's `SIGURG` goroutine preemption) depends on it. True for
+    /// the interpreters, which only stop between guest instructions; the
+    /// hardware backends may be interrupted inside their trampolines and
+    /// answer `false`, deferring delivery to the next syscall.
+    fn async_signal_boundary(&self) -> bool {
+        true
+    }
+
     /// One-time vDSO clock calibration: read the guest TSC frequency and its
     /// current value and correlate it with the host wall clock, so the guest's
     /// `vdso` can compute `clock_gettime` from `rdtsc` with no syscall. `None`

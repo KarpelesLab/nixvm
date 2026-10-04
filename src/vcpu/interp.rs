@@ -354,10 +354,18 @@ impl Vcpu for Aarch64Interp {
         self.excl_monitor = false;
         // Memory may have changed while the kernel (or another vcpu) ran.
         self.fetch.clear();
+        // Time-based preemption (`NIXVM_QUANTUM_MS`): a syscall-free hot loop
+        // still hands control back, so siblings run and pending signals
+        // (`alarm`, Go's SIGURG preemption) reach it.
+        let deadline = super::preempt_quantum().map(|q| crate::clock::now_monotonic() + q);
         for i in 0..MAX_STEPS {
-            // The embedder's yield deadline (`Kernel::pump_for`), polled every
-            // 4096 instructions: a clock read per instruction would dominate.
-            if i & 4095 == 4095 && super::yield_due() {
+            // The quantum and the embedder's yield deadline
+            // (`Kernel::pump_for`), polled every 4096 instructions: a clock
+            // read per instruction would dominate.
+            if i & 4095 == 4095
+                && (super::yield_due()
+                    || deadline.is_some_and(|d| crate::clock::now_monotonic() >= d))
+            {
                 return Ok(Exit::Interrupted);
             }
             // A misaligned PC is a PC alignment fault (SIGBUS on Linux).

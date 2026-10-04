@@ -195,6 +195,12 @@ impl HvfVcpu {
 }
 
 impl Vcpu for HvfVcpu {
+    /// A cancelled run may stop in the EL1 stub; signals wait for the next
+    /// syscall boundary.
+    fn async_signal_boundary(&self) -> bool {
+        false
+    }
+
     fn run(&mut self, mem: &mut GuestMemory) -> Result<Exit, VcpuError> {
         self.reconcile(mem)?;
         // SAFETY: created on and run from the same (serial-scheduler) thread.

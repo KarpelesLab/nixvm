@@ -1478,6 +1478,20 @@ impl Shared {
     /// call — the callers loop — gives least-vruntime-first, proportional-share
     /// scheduling instead of the old fixed pid-table order.
     fn pick_serial_runnable(&mut self) -> Option<usize> {
+        // A parked task whose timed wait (or timer) has expired is runnable
+        // again: it re-traps its syscall and sees the timeout. Without this a
+        // compute-bound sibling keeps every sleeper parked (only a full stall
+        // re-checks them) — Go's sysmon never woke from its `usleep`, so
+        // goroutines were never preempted.
+        let now = poll::now_ns();
+        for p in self.procs.iter_mut().flatten() {
+            if p.info.parked
+                && (p.info.wake_deadline.is_some_and(|d| d <= now)
+                    || p.info.timer_deadline().is_some_and(|d| d <= now))
+            {
+                p.info.parked = false;
+            }
+        }
         let floor = self.min_vruntime;
         let best = (0..self.procs.len())
             .filter(|&i| {
@@ -2013,6 +2027,11 @@ impl Kernel {
             // stops accruing, so this tracks CPU rather than wall time.
             let step_start = crate::clock::now_monotonic().as_nanos();
             let exit = vcpu.run(mem)?;
+            // A time-quantum interrupt (mid-compute preemption) ends the slice,
+            // as on the SMP path: otherwise a syscall-free hot loop keeps the
+            // single CPU forever and its siblings — Go's sysmon, the thread a
+            // `kill` woke, a timer's sleeper — never run.
+            let is_interrupt = matches!(exit, Exit::Interrupted);
             // Fire a due ITIMER_REAL / POSIX timer before servicing, so a
             // blocking syscall this step sees its signal pending and is
             // interrupted.
@@ -2041,6 +2060,7 @@ impl Kernel {
                         return Ok(true);
                     }
                 }
+                Serviced::Resume if is_interrupt => return Ok(true),
                 Serviced::Resume => progressed = true,
                 Serviced::Blocked => return Ok(progressed),
                 Serviced::Ended => return Ok(true),
@@ -2173,7 +2193,27 @@ impl Kernel {
                     Serviced::SetRet
                 }
             }
-            Exit::Interrupted => Serviced::Resume,
+            Exit::Interrupted => {
+                // Between two guest instructions: deliver what is pending, as
+                // Linux does on every return to user mode, so a signal reaches
+                // a loop that makes no syscalls (an `alarm()`-bounded
+                // benchmark, Go's SIGURG preemption). Nothing is restarted
+                // here — clear the flag a previous syscall may have left.
+                if cx.cur.pending & !cx.cur.blocked != 0 && vcpu.async_signal_boundary() {
+                    cx.restart_syscall = false;
+                    self.deliver_pending_signals(cx, vcpu, mem);
+                    if mem.take_tlb_dirty() {
+                        vcpu.flush_tlb();
+                    }
+                    if let RunState::Zombie(_) = cx.cur.run {
+                        return Serviced::Ended;
+                    }
+                    if let RunState::Stopped(_) = cx.cur.run {
+                        return Serviced::Blocked;
+                    }
+                }
+                Serviced::Resume
+            }
             Exit::MemFault { addr, write } => {
                 // A fault on a mapped-but-unbacked page is demand paging: mint the
                 // frame and re-run the access (the software mirror of a hardware
@@ -11447,7 +11487,157 @@ mod tests {
         assert_eq!(vcpu.reg(19), 0xdead, "x19 restored");
         assert_eq!(vcpu.reg(0), 0x1234, "x0 restored");
         assert_eq!(vcpu.rflags(), orig_pstate, "pstate (NZCV) restored");
+        assert_eq!(vcpu.simd_state(), simd, "FP/SIMD state restored");
         assert_eq!(cx.cur.blocked, 0, "signal mask restored");
+    }
+
+    #[test]
+    fn aarch64_trap_kinds_carry_linux_si_codes() {
+        use crate::vcpu::Backend;
+        let backend = crate::vcpu::interp::InterpBackend::new(Arch::Aarch64).unwrap();
+        let (k, mut mem, _v, mut cx) = setup();
+        mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
+        for sig in [5, 7] {
+            cx.cur.handlers[sig] = SigAction {
+                handler: 0x2_0000,
+                flags: SA_NODEFER,
+                restorer: 0x2_1000,
+                mask: 0,
+            };
+        }
+        // BRK: SIGTRAP / TRAP_BRKPT at the BRK, no esr_context.
+        let mut vcpu = backend.new_vcpu(0x1_1110, 0x1_3000).unwrap();
+        let f = signal::Fault::brk(k.arch, 0x1_1110);
+        assert!(k.deliver_fault_signal(&mut cx, f, vcpu.as_mut(), &mut mem));
+        // No SA_RESTORER: lr is the mapped `rt_sigreturn` trampoline
+        // (`mov x8, #139; svc #0`), Linux's vDSO sigtramp.
+        let tramp = vcpu.reg(30);
+        assert_eq!(mem.read_u32(tramp).unwrap(), 0xd280_1168);
+        assert_eq!(mem.read_u32(tramp + 4).unwrap(), 0xd400_0001);
+        assert!(mem.page_prot(tramp).unwrap().contains(Prot::EXEC));
+        let frame = vcpu.sp();
+        assert_eq!(mem.read_u32(frame).unwrap(), 5);
+        assert_eq!(mem.read_u32(frame + 8).unwrap(), 1, "TRAP_BRKPT");
+        assert_eq!(mem.read_u64(frame + 16).unwrap(), 0x1_1110);
+        let rec = frame + 128 + 176 + 288 + 528;
+        assert_eq!(mem.read_u64(rec).unwrap(), 0, "no esr_context");
+        // SP alignment: SIGBUS / BUS_ADRALN with an SP-alignment syndrome.
+        let mut vcpu = backend.new_vcpu(0x1_1110, 0x1_3008).unwrap();
+        let f = signal::Fault::misaligned(k.arch, 0x1_3008, false, 0x1_1110, 0x1_3008);
+        assert!(k.deliver_fault_signal(&mut cx, f, vcpu.as_mut(), &mut mem));
+        let frame = vcpu.sp();
+        assert_eq!(mem.read_u32(frame).unwrap(), 7);
+        assert_eq!(mem.read_u32(frame + 8).unwrap(), 1, "BUS_ADRALN");
+        assert_eq!(mem.read_u64(frame + 16).unwrap(), 0x1_3008);
+        let rec = frame + 128 + 176 + 288 + 528;
+        assert_eq!(mem.read_u32(rec).unwrap(), 0x4553_5201);
+        assert_eq!(
+            mem.read_u64(rec + 8).unwrap() >> 26,
+            0x26,
+            "EC = SP alignment"
+        );
+    }
+
+    /// A pending signal is delivered when a compute slice is preempted
+    /// (`Exit::Interrupted`), not only at a syscall: the handler runs with the
+    /// interrupted pc saved, and the slice reports a plain resume.
+    #[test]
+    fn interrupted_slice_delivers_pending_signal() {
+        use crate::vcpu::Backend;
+        let backend = crate::vcpu::interp::InterpBackend::new(Arch::Aarch64).unwrap();
+        let mut vcpu = backend.new_vcpu(0x1_1230, 0x1_3000).unwrap();
+        let (k, mut mem, _v, mut cx) = setup();
+        cx.cur.handlers[14] = SigAction {
+            handler: 0x2_0000,
+            flags: 0x0400_0000, // SA_RESTORER
+            restorer: 0x2_1000,
+            mask: 0,
+        };
+        // Blocked: stays pending, the guest just resumes.
+        cx.cur.pending = 1 << 13;
+        cx.cur.blocked = 1 << 13;
+        let r = k.service(&mut cx, Exit::Interrupted, vcpu.as_mut(), &mut mem);
+        assert!(matches!(r, Serviced::Resume));
+        assert_eq!(vcpu.pc(), 0x1_1230);
+        // Unblocked: delivered right at the preemption point.
+        cx.cur.blocked = 0;
+        let r = k.service(&mut cx, Exit::Interrupted, vcpu.as_mut(), &mut mem);
+        assert!(matches!(r, Serviced::Resume));
+        assert_eq!(vcpu.pc(), 0x2_0000, "pc → SIGALRM handler");
+        assert_eq!(vcpu.reg(0), 14);
+        assert_eq!(cx.cur.pending, 0);
+        let mctx = vcpu.sp() + 128 + 176;
+        assert_eq!(mem.read_u64(mctx + 264).unwrap(), 0x1_1230, "saved pc");
+    }
+
+    /// A parked task whose timed wait expired is runnable again even while
+    /// another task is runnable (the serial scheduler used to re-check
+    /// sleepers only when everything stalled).
+    #[test]
+    fn serial_pick_wakes_expired_sleepers() {
+        let (mut k, _mem, _v, _cx) = setup();
+        let sh = k.shared.get_mut().unwrap();
+        sh.procs.clear();
+        for (pid, parked, deadline) in [(1, false, None), (2, true, Some(1)), (3, true, None)] {
+            let info = ProcInfo {
+                pid,
+                run: RunState::Running,
+                parked,
+                wake_deadline: deadline,
+                vruntime: if pid == 1 { 1_000_000 } else { 0 },
+                ..ProcInfo::default()
+            };
+            sh.procs.push(Some(Process {
+                vcpu: Some(Box::new(DummyVcpu)),
+                info,
+            }));
+        }
+        assert_eq!(
+            sh.pick_serial_runnable(),
+            Some(1),
+            "the expired sleeper (lowest vruntime)"
+        );
+        assert!(!sh.procs[1].as_ref().unwrap().info.parked);
+        assert!(
+            sh.procs[2].as_ref().unwrap().info.parked,
+            "an untimed wait stays parked"
+        );
+    }
+
+    /// `/dev/tty` is the controlling terminal: the console (with working
+    /// termios ioctls) for an interactive session, the stdio pty when there is
+    /// one, and ENXIO when the process has no terminal at all.
+    #[test]
+    fn dev_tty_opens_the_controlling_terminal() {
+        let (mut k, mut mem, mut v, mut cx) = setup();
+        let path = 0x1_0000;
+        mem.write_init(path, b"/dev/tty\0").unwrap();
+        let open = [AT_FDCWD as u64, path, 2, 0, 0, 0]; // O_RDWR
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, open),
+            err(Errno::ENXIO),
+            "no controlling terminal"
+        );
+        k.set_interactive(true);
+        let fd = call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, open);
+        assert!(fd >= 3);
+        assert!(matches!(cx.cur.fds.get(fd as i32), Some(Fd::Tty)));
+        // tcgetattr / tcsetattr (echo off) / tcgetattr round-trip.
+        let t = 0x1_1000;
+        let tcgets = [fd as u64, 0x5401, t, 0, 0, 0];
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Ioctl, tcgets), 0);
+        let lflag = mem.read_u32(t + 12).unwrap();
+        assert_ne!(lflag & 0o10, 0, "ECHO on by default");
+        mem.write(t + 12, &(lflag & !0o10).to_le_bytes()).unwrap();
+        let tcsets = [fd as u64, 0x5402, t, 0, 0, 0];
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Ioctl, tcsets), 0);
+        mem.write(t + 12, &0u32.to_le_bytes()).unwrap();
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Ioctl, tcgets), 0);
+        assert_eq!(mem.read_u32(t + 12).unwrap(), lflag & !0o10);
+        // Stdio on a pty: /dev/tty is that pty's slave.
+        cx.cur.fds.insert(0, Fd::PtySlave(0));
+        let fd = call(&k, &mut cx, &mut mem, &mut v, Sysno::Openat, open);
+        assert!(matches!(cx.cur.fds.get(fd as i32), Some(Fd::PtySlave(0))));
     }
 
     #[test]
