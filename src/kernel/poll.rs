@@ -307,8 +307,9 @@ impl Kernel {
             // Host stdin readiness isn't tracked; assume data may be waiting.
             Fd::Stdin => POLLIN,
             Fd::Stdout | Fd::Stderr => POLLOUT,
-            // Regular files/dirs never block in this kernel.
-            Fd::File { .. } | Fd::Dir { .. } => POLLIN | POLLOUT,
+            // Regular files/dirs never block in this kernel; the console
+            // terminal is treated alike (input readiness isn't tracked).
+            Fd::File { .. } | Fd::Dir { .. } | Fd::Tty => POLLIN | POLLOUT,
             // A host-bridged socket gets a precise readable answer (a peek);
             // in-VM loopback sockets stay best-effort always-ready, since
             // their queues aren't observable from here.

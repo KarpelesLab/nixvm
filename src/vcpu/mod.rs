@@ -97,6 +97,16 @@ pub enum Exit {
     MemFault { addr: u64, write: bool },
     /// The guest executed an illegal/undefined instruction.
     IllegalInstruction { pc: u64 },
+    /// The guest executed a software breakpoint: arm64 `BRK #imm` (`code` =
+    /// the 16-bit immediate) or x86 `int3` (`code` = 0). Linux answers with
+    /// `SIGTRAP` (`TRAP_BRKPT` on arm64, `SI_KERNEL` on x86-64) and leaves
+    /// the pc on the arm64 `BRK` (after the x86 `int3`).
+    Breakpoint { pc: u64, code: u64 },
+    /// An alignment fault: a misaligned SP-based access or PC (arm64's SP/PC
+    /// alignment checks), or an atomic/ordered access crossing its
+    /// single-copy-atomicity granule. Linux answers with `SIGBUS`
+    /// (`BUS_ADRALN`, `si_addr` = `addr`), not `SIGSEGV`.
+    Misaligned { addr: u64, write: bool },
     /// The host asked the vcpu to stop (another thread wants to run, or a
     /// deadline/signal fired). The kernel decides what to do next.
     Interrupted,
@@ -271,6 +281,19 @@ pub trait Vcpu: Send {
     /// A no-op for the interpreter, which has no trampoline — its pc already sits
     /// on the post-syscall user instruction at no privilege level.
     fn settle_syscall_return(&mut self) {}
+
+    /// Whether an [`Exit::Interrupted`] left the vcpu at a user-mode
+    /// instruction boundary, where the kernel may deliver a pending
+    /// asynchronous signal (build a frame from the live registers and redirect
+    /// the pc) as Linux does on any return to user mode — not only at syscall
+    /// returns. A compute loop that never makes a syscall (a `SIGALRM`-driven
+    /// benchmark, Go's `SIGURG` goroutine preemption) depends on it. True for
+    /// the interpreters, which only stop between guest instructions; the
+    /// hardware backends may be interrupted inside their trampolines and
+    /// answer `false`, deferring delivery to the next syscall.
+    fn async_signal_boundary(&self) -> bool {
+        true
+    }
 
     /// One-time vDSO clock calibration: read the guest TSC frequency and its
     /// current value and correlate it with the host wall clock, so the guest's

@@ -185,7 +185,7 @@ impl Kernel {
                     }
                     w
                 }
-                Fd::Stdout | Fd::Stderr => {
+                Fd::Stdout | Fd::Stderr | Fd::Tty => {
                     let mut sh = self.shared.lock().unwrap();
                     let mut pipes = self.pipes.lock().unwrap();
                     if let PipeState::Done(r) = Self::pipe_src_state(&pipes, cx, i, nonblock) {
@@ -193,7 +193,7 @@ impl Kernel {
                     }
                     let n = (len as usize).min(pipes[i].buf.len());
                     let data: Vec<u8> = pipes[i].buf.drain(..n).collect();
-                    let sink: &mut dyn Write = if matches!(fout, Fd::Stdout) {
+                    let sink: &mut dyn Write = if matches!(fout, Fd::Stdout | Fd::Tty) {
                         &mut sh.stdout
                     } else {
                         &mut sh.stderr

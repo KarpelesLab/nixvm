@@ -18,12 +18,16 @@
 //! A signal left at its default disposition still takes the default action.
 
 use super::{
-    Kernel, QueuedSig, RunState, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SIGSEGV, SS_DISABLE,
-    ServiceCtx, Shared, err, pgid_of,
+    Kernel, QueuedSig, RunState, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SIGBUS, SIGILL, SIGSEGV,
+    SIGTRAP, SS_DISABLE, ServiceCtx, Shared, err, pgid_of,
 };
 use crate::abi::Arch;
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
+use crate::vcpu::mem::{PAGE_SIZE, Prot};
+
+/// `sigaction` flag: `sa_restorer` holds the handler's return trampoline.
+const SA_RESTORER: u64 = 0x0400_0000;
 
 /// The mode-specific `siginfo_t` fields [`Kernel::push_sigframe`] writes past
 /// the common `si_signo`/`si_errno`/`si_code` header. A fault sets `addr`
@@ -41,6 +45,135 @@ struct SiFields {
     uid: u64,
     /// `si_value` — the `sigqueue` payload (async signals).
     value: u64,
+    /// A synchronous fault: the `_sigfault` arm (`si_addr`) is written, and
+    /// the arch fault detail below goes into the machine context.
+    fault: bool,
+    /// x86-64 `uc_mcontext.trapno` (#PF 14, #UD 6, #BP 3, …).
+    trapno: u64,
+    /// x86-64 `uc_mcontext.err` — the page-fault error code.
+    err: u64,
+    /// arm64 `ESR_EL1` syndrome, reported in an `esr_context` record when
+    /// nonzero (Linux emits one only for faults that set `fault_code`: data
+    /// and instruction aborts, SP/PC alignment).
+    esr: u64,
+}
+
+/// A synchronous fault the running instruction raised, as Linux would report
+/// it: the signal, `si_code`, `si_addr`, and the per-arch syndrome fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Fault {
+    pub(super) sig: u64,
+    pub(super) code: u64,
+    pub(super) addr: u64,
+    pub(super) trapno: u64,
+    pub(super) err: u64,
+    pub(super) esr: u64,
+}
+
+// `si_code`s (`asm-generic/siginfo.h`).
+const ILL_ILLOPC: u64 = 1;
+const ILL_ILLOPN: u64 = 2;
+const TRAP_BRKPT: u64 = 1;
+const BUS_ADRALN: u64 = 1;
+const SEGV_MAPERR: u64 = 1;
+const SEGV_ACCERR: u64 = 2;
+const SI_KERNEL: u64 = 0x80;
+
+impl Fault {
+    /// A memory fault at `addr`: `SIGSEGV` with `SEGV_MAPERR` when nothing is
+    /// mapped there, `SEGV_ACCERR` when the page exists but forbids the
+    /// access. `ifetch` marks an instruction fetch (arm64 instruction abort,
+    /// x86 #PF with the I/D bit).
+    pub(super) fn segv(arch: Arch, addr: u64, write: bool, mapped: bool, ifetch: bool) -> Self {
+        let code = if mapped { SEGV_ACCERR } else { SEGV_MAPERR };
+        match arch {
+            Arch::Aarch64 => {
+                // Data abort (EC 0x24) or instruction abort (EC 0x20) from
+                // EL0, IL set; WnR for a write; FSC translation (0x07) or
+                // permission (0x0F) fault at level 3.
+                let ec: u64 = if ifetch { 0x20 } else { 0x24 };
+                let fsc: u64 = if mapped { 0x0F } else { 0x07 };
+                let wnr = u64::from(write && !ifetch) << 6;
+                Self {
+                    sig: SIGSEGV,
+                    code,
+                    addr,
+                    esr: (ec << 26) | (1 << 25) | wnr | fsc,
+                    ..Self::default()
+                }
+            }
+            Arch::X86_64 => Self {
+                sig: SIGSEGV,
+                code,
+                addr,
+                trapno: 14,
+                // #PF error code: P (protection), W/R, U/S (user), I/D.
+                err: u64::from(mapped) | (u64::from(write) << 1) | 4 | (u64::from(ifetch) << 4),
+                ..Self::default()
+            },
+        }
+    }
+
+    /// An undefined instruction at `pc`: `SIGILL`, `ILL_ILLOPC` on arm64
+    /// (`do_el0_undef`), `ILL_ILLOPN` with trapno #UD on x86-64.
+    pub(super) fn ill(arch: Arch, pc: u64) -> Self {
+        match arch {
+            Arch::Aarch64 => Self {
+                sig: SIGILL,
+                code: ILL_ILLOPC,
+                addr: pc,
+                ..Self::default()
+            },
+            Arch::X86_64 => Self {
+                sig: SIGILL,
+                code: ILL_ILLOPN,
+                addr: pc,
+                trapno: 6,
+                ..Self::default()
+            },
+        }
+    }
+
+    /// A software breakpoint: `SIGTRAP` — arm64 `BRK` is `TRAP_BRKPT` with
+    /// `si_addr` = the `BRK` (no `esr_context`: `send_user_sigtrap` sets no
+    /// fault code); x86-64 `int3` is `SI_KERNEL` with trapno #BP and no
+    /// address.
+    pub(super) fn brk(arch: Arch, pc: u64) -> Self {
+        match arch {
+            Arch::Aarch64 => Self {
+                sig: SIGTRAP,
+                code: TRAP_BRKPT,
+                addr: pc,
+                ..Self::default()
+            },
+            Arch::X86_64 => Self {
+                sig: SIGTRAP,
+                code: SI_KERNEL,
+                trapno: 3,
+                ..Self::default()
+            },
+        }
+    }
+
+    /// An alignment fault at `addr`: `SIGBUS`/`BUS_ADRALN`. On arm64 the
+    /// syndrome is the SP (EC 0x26) or PC (EC 0x22) alignment exception, or a
+    /// data abort with the alignment FSC (0x21); x86-64 reports #AC (17).
+    pub(super) fn misaligned(arch: Arch, addr: u64, write: bool, pc: u64, sp: u64) -> Self {
+        let esr = match arch {
+            Arch::Aarch64 if addr == pc => (0x22 << 26) | (1 << 25),
+            Arch::Aarch64 if addr == sp => (0x26 << 26) | (1 << 25),
+            Arch::Aarch64 => (0x24 << 26) | (1 << 25) | (u64::from(write) << 6) | 0x21,
+            Arch::X86_64 => 0,
+        };
+        Self {
+            sig: SIGBUS,
+            code: BUS_ADRALN,
+            addr,
+            trapno: if arch == Arch::X86_64 { 17 } else { 0 },
+            esr,
+            ..Self::default()
+        }
+    }
 }
 
 /// `SIG_DFL`: take the default action for the signal.
@@ -639,11 +772,11 @@ impl Kernel {
     pub(super) fn deliver_fault_signal(
         &self,
         cx: &mut ServiceCtx,
-        sig: u64,
-        fault_addr: u64,
+        fault: Fault,
         vcpu: &mut dyn crate::vcpu::Vcpu,
         mem: &mut GuestMemory,
     ) -> bool {
+        let sig = fault.sig;
         // Debug escape hatch: skip delivery so a fault is fatal and the kernel
         // dumps its context (used to inspect a stack overflow that a guest
         // handler would otherwise catch and hide).
@@ -662,23 +795,18 @@ impl Kernel {
         if cx.cur.blocked & (1u64 << (sig - 1)) != 0 {
             return false;
         }
-        // trapno #PF(14)/#UD(6), si_code SEGV_MAPERR(1), si_addr = fault_addr,
-        // and the handler's uc_sigmask is the *current* blocked mask (restored
-        // by rt_sigreturn) — the fault path's original behavior, unchanged.
+        // The handler's uc_sigmask is the *current* blocked mask (restored by
+        // rt_sigreturn).
         let si = SiFields {
-            code: 1,
-            addr: fault_addr,
+            code: fault.code,
+            addr: fault.addr,
+            fault: true,
+            trapno: fault.trapno,
+            err: fault.err,
+            esr: fault.esr,
             ..SiFields::default()
-        }; // SEGV_MAPERR
-        self.push_sigframe(
-            cx,
-            sig,
-            if sig == SIGSEGV { 14 } else { 6 },
-            si,
-            cx.cur.blocked,
-            vcpu,
-            mem,
-        )
+        };
+        self.push_sigframe(cx, sig, si, cx.cur.blocked, vcpu, mem)
     }
 
     /// Deliver an *asynchronous* signal (posted by `kill`/`tgkill`/on-exit
@@ -737,22 +865,27 @@ impl Kernel {
             pid: u64::from(q.pid as u32),
             uid: u64::from(q.uid),
             value: q.value,
+            ..SiFields::default()
         });
-        self.push_sigframe(cx, sig, 0, si, restore, vcpu, mem)
+        self.push_sigframe(cx, sig, si, restore, vcpu, mem)
     }
 
     /// Build the x86-64 `rt_sigframe` for `sig` on the (alternate or interrupted)
     /// stack, block the handler's mask, and point the vcpu at the handler. Shared
-    /// by fault and async delivery; the two differ only in `trapno`/`si_code`/
-    /// `si_addr` (the `uc_mcontext` #PF fields and siginfo) and in `restore_mask`
-    /// (the `uc_sigmask` a later `rt_sigreturn` restores). Returns `true` when the
-    /// frame was built and the vcpu redirected.
-    #[allow(clippy::unused_self, clippy::too_many_arguments)]
+    /// by fault and async delivery; the two differ only in the fault detail
+    /// (`trapno`/`err`/`cr2` in `uc_mcontext`, `si_code`/`si_addr` in the
+    /// siginfo) and in `restore_mask` (the `uc_sigmask` a later `rt_sigreturn`
+    /// restores). Returns `true` when the frame was built and the vcpu
+    /// redirected.
+    ///
+    /// As on Linux (`get_sigframe`), the FPU state goes first, directly below
+    /// the red zone and 64-byte aligned, as a legacy `fxsave` image that
+    /// `uc_mcontext.fpstate` points at; the frame itself goes below it.
+    #[allow(clippy::too_many_lines)]
     fn push_sigframe(
         &self,
         cx: &mut ServiceCtx,
         sig: u64,
-        trapno: u64,
         si: SiFields,
         restore_mask: u64,
         vcpu: &mut dyn crate::vcpu::Vcpu,
@@ -775,10 +908,30 @@ impl Kernel {
             cur_sp - 128 // red zone
         };
 
+        // FPU state: a 512-byte `fxsave` image (no XSAVE header — `sw_reserved`
+        // magic1 stays 0, so readers treat it as legacy FXSR state, and so does
+        // our `rt_sigreturn`). Only the XMM file is modelled by the backends
+        // that expose SIMD state; x87 and MXCSR are saved at their defaults.
+        let simd = vcpu.simd_state();
+        let (fpstate, below) = if simd.len() >= 256 {
+            let fp = (base - FXSAVE_SIZE) & !63;
+            let mut img = [0u8; FXSAVE_SIZE as usize];
+            img[0..2].copy_from_slice(&0x037fu16.to_le_bytes()); // fcw
+            img[24..28].copy_from_slice(&0x1f80u32.to_le_bytes()); // mxcsr
+            img[28..32].copy_from_slice(&0xffffu32.to_le_bytes()); // mxcsr_mask
+            img[160..416].copy_from_slice(&simd[..256]); // xmm0..15
+            if mem.write(fp, &img).is_err() {
+                return false;
+            }
+            (fp, fp)
+        } else {
+            (0, base)
+        };
+
         // Frame layout: reserve the whole frame, then 16-align so that at the
         // handler's first instruction rsp+8 is 16-aligned (as after a `call`).
         let frame_size = UC_OFF + UCONTEXT_SIZE + SIGINFO_SIZE;
-        let frame = ((base - frame_size) & !15) - 8;
+        let frame = ((below - frame_size) & !15) - 8;
 
         // Saved register file → uc_mcontext.gregs.
         let mut wrote_ok = true;
@@ -786,7 +939,9 @@ impl Kernel {
             wrote_ok &= mem.write(frame + off, &v.to_le_bytes()).is_ok();
         };
         put(0, act.restorer); // pretcode
-        put(UC_OFF, 0); // uc_flags
+        // uc_flags: UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS, as Linux's 64-bit
+        // frames (no UC_FP_XSTATE: the FPU image is legacy fxsave).
+        put(UC_OFF, 0x6);
         put(UC_OFF + 8, 0); // uc_link
         put(UC_OFF + 16, alt_sp); // uc_stack.ss_sp
         put(UC_OFF + 24, alt_flags); // ss_flags (+ padded size)
@@ -798,28 +953,34 @@ impl Kernel {
                 REG_RSP => cur_sp,
                 REG_RIP => vcpu.pc(),
                 REG_EFL => vcpu.rflags(),
-                REG_CSGSFS => 0x0033, // CS=0x33 (user code); gs/fs 0
-                19 => 0,              // err
-                20 => trapno,         // trapno (#PF / #UD; 0 for async)
-                21 => 0,              // oldmask
-                22 => si_addr,        // cr2 — the faulting address (0 for async)
+                // cs=0x33 (user code), gs=fs=0, ss=0x2b (UC_SIGCONTEXT_SS).
+                REG_CSGSFS => 0x002b_0000_0000_0033,
+                19 => si.err,       // err (#PF error code)
+                20 => si.trapno,    // trapno (#PF / #UD / #BP; 0 for async)
+                21 => restore_mask, // oldmask
+                22 => {
+                    if si.fault {
+                        si_addr
+                    } else {
+                        0
+                    }
+                } // cr2
                 _ => vcpu.reg(gpr),
             };
             put(MCTX_OFF + (i as u64) * 8, v);
         }
-        // uc_mcontext.fpstate pointer: none saved (0) — handlers that only
-        // inspect the fault don't touch it.
-        put(MCTX_OFF + (GREG_COUNT as u64) * 8, 0);
+        put(MCTX_OFF + (GREG_COUNT as u64) * 8, fpstate); // uc_mcontext.fpstate
         put(UC_OFF + 296, restore_mask); // uc_sigmask (kernel 8-byte)
 
         // siginfo: si_signo, si_errno, si_code, then the mode-specific union at
-        // offset 16. A fault carries si_addr there (SIGSEGV/SIGILL); an async
-        // signal carries the sending pid/uid and the sigqueue value instead
-        // (the `_sigfault` and `_rt` arms of the `_sifields` union overlap).
+        // offset 16. A fault carries si_addr there (SIGSEGV/SIGILL/SIGBUS); an
+        // async signal carries the sending pid/uid and the sigqueue value
+        // instead (the `_sigfault` and `_rt` arms of the `_sifields` union
+        // overlap).
         let si_base = frame + UC_OFF + UCONTEXT_SIZE;
         put(si_base - frame, sig & 0xffff_ffff); // si_signo (si_errno = 0)
         put(si_base - frame + 8, si_code & 0xffff_ffff); // si_code
-        if trapno != 0 {
+        if si.fault {
             put(si_base - frame + 16, si_addr); // _sigfault: si_addr
         } else {
             // _rt: si_pid @16, si_uid @20, si_value @24 (8-byte union).
@@ -852,24 +1013,30 @@ impl Kernel {
         vcpu.set_reg(0, 0); // rax cleared, per the SysV entry convention
         vcpu.set_sp(frame);
         vcpu.set_pc(act.handler);
-        // Block the handler's mask, and this signal too *unless* SA_NODEFER —
-        // without honoring SA_NODEFER a handler that re-raises its own signal
-        // could never re-enter, and (with our redelivery loop) deadlocks.
+        Self::enter_handler_mask(cx, sig);
+        true
+    }
+
+    /// Block the handler's mask on entry, and the signal itself *unless*
+    /// `SA_NODEFER` — without honoring SA_NODEFER a handler that re-raises its
+    /// own signal could never re-enter, and (with our redelivery loop)
+    /// deadlocks. `SA_RESETHAND` (one-shot) resets the disposition to SIG_DFL
+    /// on entry, so a second delivery takes the default action (`signal()`).
+    fn enter_handler_mask(cx: &mut ServiceCtx, sig: u64) {
+        let act = cx.cur.handlers[sig as usize];
         cx.cur.blocked |= act.mask;
         if act.flags & SA_NODEFER == 0 {
             cx.cur.blocked |= 1u64 << (sig - 1);
         }
-        // SA_RESETHAND (one-shot): reset the disposition to SIG_DFL on entry, so
-        // a second delivery takes the default action (classic `signal()`).
         if act.flags & SA_RESETHAND != 0 {
             cx.cur.handlers[sig as usize] = super::SigAction::default();
         }
-        true
     }
 
     /// `rt_sigreturn` — restore the context the handler was entered with. The
     /// frame is at `rsp - 8` (the handler's trampoline `ret`'d off `pretcode`),
-    /// so `uc_mcontext` is at a fixed offset below the current `rsp`.
+    /// so `uc_mcontext` is at a fixed offset below the current `rsp`. The FPU
+    /// image `uc_mcontext.fpstate` points at (if any) restores the XMM file.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_rt_sigreturn(
         &self,
@@ -899,6 +1066,13 @@ impl Kernel {
         vcpu.set_sp(read(REG_RSP));
         vcpu.set_rflags(read(REG_EFL));
         vcpu.set_pc(read(REG_RIP));
+        // The FPU image (a NULL fpstate means "no FPU state", as on Linux).
+        let fpstate = read(GREG_COUNT);
+        if fpstate != 0
+            && let Ok(xmm) = mem.read_vec(fpstate + 160, 256)
+        {
+            vcpu.set_simd_state(&xmm);
+        }
         // Restore the signal mask the handler ran under (uc_sigmask).
         let uc = mctx.wrapping_sub(MCTX_OFF - UC_OFF);
         if let Ok(mask) = mem.read_u64(uc + 296) {
@@ -909,13 +1083,21 @@ impl Kernel {
     /// Build the aarch64 `rt_sigframe` on the (alternate or interrupted) stack,
     /// block the handler's mask, and point the vcpu at the handler. The aarch64
     /// ABI is the mirror of the x86-64 [`Self::push_sigframe`]: the frame is
-    /// `{ siginfo_t info; struct ucontext uc; }` (siginfo *first*), the handler
-    /// is entered with `x0=signo`, `x1=&info`, `x2=&uc`, `x30(lr)=sa_restorer`,
-    /// `sp=frame`, and `pc=handler` (SysV/AAPCS64), and the saved GPRs/sp/pc/
-    /// pstate live in `uc.uc_mcontext` (a `struct sigcontext`). Offsets are the
-    /// arm64 UAPI (`asm/sigcontext.h`, `asm/ucontext.h`): within the ucontext
-    /// `uc_mcontext` is at +168; within the sigcontext `regs[0]` is at +8, `sp`
-    /// at +256, `pc` at +264, `pstate` at +272.
+    /// `{ siginfo_t info; struct ucontext uc; }` (siginfo *first*) with the
+    /// unwinder's `frame_record` above it, the handler is entered with
+    /// `x0=signo`, `x1=&info`, `x2=&uc`, `x29=&frame_record`,
+    /// `x30(lr)=sa_restorer`, `sp=frame`, and `pc=handler` (AAPCS64), and the
+    /// saved GPRs/sp/pc/pstate live in `uc.uc_mcontext` (a `struct
+    /// sigcontext`). Offsets are the arm64 UAPI (`asm/sigcontext.h`,
+    /// `asm/ucontext.h`): `uc_mcontext` is at +176 within the ucontext (the
+    /// sigcontext is 16-byte aligned), and within the sigcontext `regs[0]` is
+    /// at +8, `sp` at +256, `pc` at +264, `pstate` at +272 and `__reserved` at
+    /// +288.
+    ///
+    /// `__reserved` carries the records Linux's `setup_sigframe` writes: an
+    /// `fpsimd_context` (FPSR, FPCR, V0–V31 — Go's SIGURG preemption and any
+    /// handler doing FP math depend on it being restored), an `esr_context`
+    /// when the fault has a syndrome, and the null terminator.
     #[allow(clippy::unused_self)]
     fn push_sigframe_aarch64(
         &self,
@@ -937,12 +1119,12 @@ impl Kernel {
             cur_sp
         };
 
-        // frame = { siginfo(128) ; ucontext } followed by a 16-byte frame record
-        // (fp,lr) for the unwinder. 16-align the whole thing.
-        let frame = (base - AA64_FRAME_SIZE) & !15;
+        // As `get_sigframe`: the 16-byte frame record (fp, lr) first, then the
+        // `rt_sigframe` 16-aligned below it.
+        let frame_record = (base - 16) & !15;
+        let frame = (frame_record - AA64_SIGFRAME_SIZE) & !15;
         let uc = frame + AA64_SIGINFO_SIZE;
         let mctx = uc + AA64_UC_MCONTEXT_OFF; // struct sigcontext
-        let frame_record = uc + AA64_UC_SIZE;
 
         let mut ok = true;
         let mut put = |addr: u64, v: u64| {
@@ -952,14 +1134,14 @@ impl Kernel {
         // A fault carries si_addr; an async signal carries si_pid/si_uid/si_value.
         put(frame, sig & 0xffff_ffff); // si_signo (si_errno = high 32 = 0)
         put(frame + 8, si.code & 0xffff_ffff); // si_code
-        if si.addr != 0 {
+        if si.fault {
             put(frame + 16, si.addr); // _sigfault: si_addr
         } else {
             put(frame + 16, (si.pid & 0xffff_ffff) | (si.uid << 32)); // _rt: si_pid/si_uid
             put(frame + 24, si.value); // si_value
         }
         // ucontext: uc_flags@0, uc_link@8, uc_stack{ss_sp@16,ss_flags@24,ss_size@32},
-        // uc_sigmask@40 (kernel 8-byte set), then uc_mcontext at +168.
+        // uc_sigmask@40 (kernel 8-byte set), then uc_mcontext at +176.
         put(uc, 0); // uc_flags
         put(uc + 8, 0); // uc_link
         put(uc + 16, alt_sp); // uc_stack.ss_sp
@@ -967,20 +1149,35 @@ impl Kernel {
         put(uc + 32, alt_size); // ss_size
         put(uc + 40, restore_mask); // uc_sigmask
         // uc_mcontext (struct sigcontext): fault_address@0, regs[0..31]@8, sp@256,
-        // pc@264, pstate@272, then a 4K __reserved area for FP/SIMD context.
-        put(mctx, si.addr); // fault_address
+        // pc@264, pstate@272, then the 4K __reserved record area at @288.
+        put(mctx, if si.fault { si.addr } else { 0 }); // fault_address
         for i in 0..31u64 {
             put(mctx + 8 + i * 8, vcpu.reg(i as usize)); // x0..x30
         }
         put(mctx + 256, cur_sp); // sp
         put(mctx + 264, vcpu.pc()); // pc
         put(mctx + 272, vcpu.rflags()); // pstate (NZCV)
-        // __reserved: leave a null terminator record (magic=0, size=0) so anything
-        // walking the FP/SIMD context list stops immediately (we save no fpsimd).
-        put(mctx + 280, 0);
-        // Unwinder frame record after the ucontext: fp = caller's x29, lr = restorer.
+        let mut rec = mctx + AA64_RESERVED_OFF;
+        let simd = vcpu.simd_state();
+        if simd.len() >= FPSIMD_PAYLOAD as usize {
+            // struct fpsimd_context: head{magic,size} then fpsr, fpcr, vregs.
+            put(rec, FPSIMD_MAGIC | (FPSIMD_CONTEXT_SIZE << 32));
+            let payload = simd[..FPSIMD_PAYLOAD as usize].as_chunks::<8>().0;
+            for (i, word) in payload.iter().enumerate() {
+                put(rec + 8 + 8 * i as u64, u64::from_le_bytes(*word));
+            }
+            rec += FPSIMD_CONTEXT_SIZE;
+        }
+        if si.fault && si.esr != 0 {
+            put(rec, ESR_MAGIC | (ESR_CONTEXT_SIZE << 32)); // struct esr_context
+            put(rec + 8, si.esr);
+            rec += ESR_CONTEXT_SIZE;
+        }
+        put(rec, 0); // terminator: magic = 0, size = 0
+        put(rec + 8, 0);
+        // Unwinder frame record (`next_frame`): the interrupted x29/x30.
         put(frame_record, vcpu.reg(29));
-        put(frame_record + 8, act.restorer);
+        put(frame_record + 8, vcpu.reg(30));
 
         if !ok {
             return false; // couldn't build the frame (guest stack unusable)
@@ -996,29 +1193,58 @@ impl Kernel {
                 hb,
             );
         }
+        // The return path: `sa_restorer` with SA_RESTORER, else the
+        // `rt_sigreturn` trampoline (Linux's vDSO sigtramp).
+        let restorer = if act.flags & SA_RESTORER != 0 && act.restorer != 0 {
+            act.restorer
+        } else {
+            match self.aa64_sigtramp(cx, mem) {
+                Some(t) => t,
+                None => return false,
+            }
+        };
         // Enter the handler: AAPCS64 argument regs, lr = restorer, sp/pc redirected.
         vcpu.set_reg(0, sig); // x0 = signo
         vcpu.set_reg(1, frame); // x1 = &siginfo
         vcpu.set_reg(2, uc); // x2 = &ucontext
         vcpu.set_reg(29, frame_record); // x29 = fp
-        vcpu.set_reg(30, act.restorer); // x30 = lr = sa_restorer
+        vcpu.set_reg(30, restorer); // x30 = lr
         vcpu.set_sp(frame);
         vcpu.set_pc(act.handler);
-        // Block the handler's mask, plus this signal unless SA_NODEFER.
-        cx.cur.blocked |= act.mask;
-        if act.flags & SA_NODEFER == 0 {
-            cx.cur.blocked |= 1u64 << (sig - 1);
-        }
-        if act.flags & SA_RESETHAND != 0 {
-            cx.cur.handlers[sig as usize] = super::SigAction::default();
-        }
+        Self::enter_handler_mask(cx, sig);
         true
+    }
+
+    /// The arm64 `rt_sigreturn` trampoline (`mov x8, #139; svc #0`) for
+    /// handlers installed without `SA_RESTORER`: Linux points their `lr` at
+    /// the vDSO's `__kernel_rt_sigreturn`; nixvm maps an equivalent
+    /// read+exec page into the address space the first time one is needed.
+    fn aa64_sigtramp(&self, cx: &mut ServiceCtx, mem: &mut GuestMemory) -> Option<u64> {
+        const TRAMP: [u8; 8] = [0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4];
+        let t = cx.cur.sigtramp;
+        if t != 0
+            && mem.page_prot(t).is_some_and(|p| p.contains(Prot::EXEC))
+            && mem.read_vec(t, 8).is_ok_and(|b| b == TRAMP)
+        {
+            return Some(t);
+        }
+        let page = {
+            let mut sh = self.shared.lock().unwrap();
+            sh.arena(cx).alloc(PAGE_SIZE)?
+        };
+        mem.map(page, PAGE_SIZE, Prot::rx()).ok()?;
+        mem.write_init(page, &TRAMP).ok()?;
+        cx.cur.sigtramp = page;
+        Some(page)
     }
 
     /// aarch64 `rt_sigreturn` — the mirror of [`Self::sys_rt_sigreturn`]. The
     /// restorer trampoline (`mov x8,#139; svc #0`) never touched `sp`, so it still
     /// points at the `rt_sigframe` base; restore the GPRs/sp/pc/pstate and the
-    /// signal mask from `uc.uc_mcontext` / `uc.uc_sigmask`.
+    /// signal mask from `uc.uc_mcontext` / `uc.uc_sigmask`, and the FP/SIMD
+    /// registers from the `fpsimd_context` record in `__reserved` (walked like
+    /// Linux's `parse_user_sigframe`: records until the null terminator,
+    /// unknown ones skipped by size).
     #[allow(clippy::unused_self)]
     fn sys_rt_sigreturn_aarch64(
         &self,
@@ -1037,23 +1263,53 @@ impl Kernel {
         vcpu.set_rflags(read(mctx + 272)); // pstate before pc, order is immaterial
         vcpu.set_pc(read(mctx + 264));
         cx.cur.blocked = read(uc + 40); // uc_sigmask
+        let (mut off, end) = (AA64_RESERVED_OFF, AA64_RESERVED_OFF + 4096);
+        while off + 8 <= end {
+            let head = read(mctx + off);
+            let (magic, size) = (head & 0xffff_ffff, head >> 32);
+            if magic == 0 || size < 8 || size % 16 != 0 || off + size > end {
+                break;
+            }
+            if magic == FPSIMD_MAGIC && size == FPSIMD_CONTEXT_SIZE {
+                if let Ok(state) = mem.read_vec(mctx + off + 8, FPSIMD_PAYLOAD as usize) {
+                    vcpu.set_simd_state(&state);
+                }
+                break;
+            }
+            off += size;
+        }
     }
 }
+
+/// `sizeof(struct _fpstate)` without XSAVE extensions — the legacy `fxsave`
+/// image an x86-64 frame's `uc_mcontext.fpstate` points at.
+const FXSAVE_SIZE: u64 = 512;
 
 // aarch64 signal-frame geometry (arm64 UAPI `asm/sigcontext.h` + `asm/ucontext.h`).
 /// `sizeof(siginfo_t)` — the frame's leading member.
 const AA64_SIGINFO_SIZE: u64 = 128;
 /// Byte offset of `uc_mcontext` (a `struct sigcontext`) within `struct ucontext`:
 /// uc_flags(8)+uc_link(8)+uc_stack(24)=40, uc_sigmask + `__unused` padding fills
-/// to a 1024-bit set (128 bytes) → 40 + 128 = 168.
-const AA64_UC_MCONTEXT_OFF: u64 = 168;
-/// `sizeof(struct sigcontext)`: fault_address(8)+regs[31](248)+sp(8)+pc(8)+
-/// pstate(8)=280, plus the 4096-byte `__reserved` FP/SIMD area.
-const AA64_SIGCONTEXT_SIZE: u64 = 280 + 4096;
-/// `sizeof(struct ucontext)`.
-const AA64_UC_SIZE: u64 = AA64_UC_MCONTEXT_OFF + AA64_SIGCONTEXT_SIZE;
-/// Whole frame: siginfo + ucontext + a 16-byte unwinder frame record (fp,lr).
-const AA64_FRAME_SIZE: u64 = AA64_SIGINFO_SIZE + AA64_UC_SIZE + 16;
+/// to a 1024-bit set (128 bytes) → 168, rounded up to the sigcontext's 16-byte
+/// alignment (its `__reserved` is `__aligned(16)`) → 176.
+const AA64_UC_MCONTEXT_OFF: u64 = 176;
+/// Offset of `__reserved` within the sigcontext: fault_address(8)+regs[31](248)
+/// +sp(8)+pc(8)+pstate(8)=280, rounded to 16.
+const AA64_RESERVED_OFF: u64 = 288;
+/// `sizeof(struct sigcontext)`: the fixed part plus the 4096-byte `__reserved`.
+const AA64_SIGCONTEXT_SIZE: u64 = AA64_RESERVED_OFF + 4096;
+/// `sizeof(struct rt_sigframe)` = siginfo + ucontext.
+const AA64_SIGFRAME_SIZE: u64 = AA64_SIGINFO_SIZE + AA64_UC_MCONTEXT_OFF + AA64_SIGCONTEXT_SIZE;
+/// `FPSIMD_MAGIC` and `sizeof(struct fpsimd_context)` (8 head + fpsr + fpcr +
+/// 32 × 16 vregs, 16-aligned).
+const FPSIMD_MAGIC: u64 = 0x4650_8001;
+const FPSIMD_CONTEXT_SIZE: u64 = 528;
+/// The record past its 8-byte head: fpsr(4) + fpcr(4) + vregs(512) — exactly
+/// the layout [`crate::vcpu::Vcpu::simd_state`] returns on arm64.
+const FPSIMD_PAYLOAD: u64 = 520;
+/// `ESR_MAGIC` and `sizeof(struct esr_context)`.
+const ESR_MAGIC: u64 = 0x4553_5201;
+const ESR_CONTEXT_SIZE: u64 = 16;
 
 /// Signals whose default disposition is to be ignored.
 fn is_default_ignored(sig: u64) -> bool {

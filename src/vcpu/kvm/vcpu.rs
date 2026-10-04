@@ -1004,6 +1004,12 @@ impl Vcpu for KvmVcpu {
         self.in_syscall = false;
     }
 
+    /// A KVM exit may land inside the syscall/exception trampolines (CPL0);
+    /// signals wait for the next syscall boundary.
+    fn async_signal_boundary(&self) -> bool {
+        false
+    }
+
     fn flush_tlb(&mut self) {
         // Arm the cr3-reload dance in `run_once` (a plain same-cr3 `KVM_SET_SREGS`
         // does not flush), so a host-side page-table change (fork's parent CoW

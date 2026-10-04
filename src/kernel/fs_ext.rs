@@ -190,6 +190,8 @@ impl Kernel {
             pid: cx.cur.pid as u32,
             ppid: cx.cur.ppid as u32,
             fds,
+            auxv: cx.cur.auxv.clone(),
+            arch: Some(self.arch),
         }
     }
 
@@ -727,6 +729,7 @@ fn fd_link_target(fd: &Fd) -> String {
     match fd {
         Fd::File { path, .. } | Fd::Dir { path, .. } => path.clone(),
         Fd::Stdin | Fd::Stdout | Fd::Stderr => "/dev/null".to_string(),
+        Fd::Tty => "/dev/tty".to_string(),
         Fd::PipeRead(i) | Fd::PipeWrite(i) => format!("pipe:[{i}]"),
         Fd::Socket { sock, .. } => format!("socket:[{sock}]"),
         Fd::Eventfd(_) => "anon_inode:[eventfd]".to_string(),

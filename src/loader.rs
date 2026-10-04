@@ -695,6 +695,52 @@ fn seg_prot(flags: u32) -> Prot {
 
 // ---- initial stack -------------------------------------------------------
 
+/// The `AT_HWCAP`/`AT_HWCAP2` words a process of `arch` is given — the one
+/// source `/proc/cpuinfo`'s feature line is derived from, so the two can't
+/// drift apart.
+#[must_use]
+pub fn hwcaps(arch: crate::abi::Arch) -> (u64, u64) {
+    match arch {
+        crate::abi::Arch::X86_64 => (HWCAP_X86_64, HWCAP2_NONE),
+        crate::abi::Arch::Aarch64 => (HWCAP_AARCH64, HWCAP2_AARCH64),
+    }
+}
+
+/// Copy the auxiliary vector out of a freshly built initial stack (`sp` at
+/// `argc`): the `(type, value)` pairs through `AT_NULL`, as raw little-endian
+/// words — what Linux saves at `execve` and serves as `/proc/self/auxv`.
+/// Empty if the stack can't be walked.
+#[must_use]
+pub fn read_auxv(mem: &GuestMemory, sp: u64) -> Vec<u8> {
+    let word = |a: u64| mem.read_u64(a).ok();
+    let Some(argc) = word(sp) else {
+        return Vec::new();
+    };
+    // Skip argc, argv[argc], its NULL, then envp through its NULL.
+    let mut p = sp + 8 * (argc.min(1 << 20) + 2);
+    for _ in 0..(1 << 20) {
+        match word(p) {
+            Some(0) => break,
+            Some(_) => p += 8,
+            None => return Vec::new(),
+        }
+    }
+    p += 8;
+    let mut out = Vec::new();
+    for _ in 0..256 {
+        let (Some(tag), Some(val)) = (word(p), word(p + 8)) else {
+            return Vec::new();
+        };
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&val.to_le_bytes());
+        if tag == AT_NULL {
+            break;
+        }
+        p += 16;
+    }
+    out
+}
+
 /// `AT_HWCAP`/`AT_HWCAP2` masks and `AT_PLATFORM` string for `e_machine`.
 /// Defaults to aarch64 for any value other than `EM_X86_64` (in practice only
 /// `EM_AARCH64`, the only other machine `Ehdr::parse` accepts).
@@ -1211,6 +1257,15 @@ mod tests {
         // AT_PLATFORM points at the arch name string.
         let platform_addr = found_platform.expect("AT_PLATFORM present");
         assert_eq!(mem.read_cstr(platform_addr, 16).unwrap(), b"aarch64");
+        // `read_auxv` (what /proc/self/auxv serves) captures the same vector,
+        // through AT_NULL.
+        let saved = read_auxv(&mem, sp);
+        assert_eq!(
+            saved,
+            mem.read_vec(aux_start, (a + 16 - aux_start) as usize)
+                .unwrap()
+        );
+        assert_eq!(hwcap, hwcaps(crate::abi::Arch::Aarch64).0);
     }
 
     #[test]

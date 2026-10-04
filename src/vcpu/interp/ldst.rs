@@ -67,7 +67,7 @@ impl Aarch64Interp {
             && instr & 0xFFC0_0000 != 0xF980_0000
             && instr & 0xFFC0_0000 != 0xF880_0000
         {
-            return Step::Fault {
+            return Step::Misaligned {
                 addr: self.sp,
                 write: false,
             };
@@ -373,7 +373,7 @@ impl Aarch64Interp {
             1u64 << size
         };
         if crosses_granule(addr, bytes) {
-            return Step::Fault { addr, write: !load };
+            return Step::Misaligned { addr, write: !load };
         }
         match (o2, o1) {
             (0, 0) => {
@@ -472,7 +472,7 @@ impl Aarch64Interp {
             return Step::Illegal;
         }
         if crosses_granule(addr, 1 << size) {
-            return Step::Fault {
+            return Step::Misaligned {
                 addr,
                 write: opc == 0,
             };
@@ -515,7 +515,7 @@ impl Aarch64Interp {
         }
         let addr = self.read_sp(rn);
         if crosses_granule(addr, nbytes as u64) {
-            return Step::Fault {
+            return Step::Misaligned {
                 addr,
                 write: !ldapr,
             };

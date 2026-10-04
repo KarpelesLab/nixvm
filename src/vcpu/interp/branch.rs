@@ -68,10 +68,13 @@ impl Aarch64Interp {
                 0b00 => {
                     // Exception generation: only SVC reaches the kernel. HVC/
                     // SMC/HLT/DCPSn are UNDEFINED at EL0; BRK is a debug
-                    // exception (SIGTRAP on Linux — reported as an illegal
-                    // instruction here, since there's no separate exit).
+                    // exception (SIGTRAP/TRAP_BRKPT on Linux).
                     if instr & 0xFFE0_001F == 0xD400_0001 {
                         Step::Syscall
+                    } else if instr & 0xFFE0_001F == 0xD420_0000 {
+                        Step::Breakpoint {
+                            imm: ((instr >> 5) & 0xffff) as u16,
+                        }
                     } else {
                         Step::Illegal
                     }
