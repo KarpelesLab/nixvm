@@ -576,6 +576,19 @@ impl Kernel {
         if !sh.sealed.is_empty() && Self::is_sealed(sh, cx, addr, len) {
             return err(Errno::EPERM);
         }
+        // PR_SET_MDWE: no writable+executable pages, and no gaining exec.
+        if cx.cur.pr.mdwe & super::prctl::MDWE_REFUSE_EXEC_GAIN != 0 && prot & 4 != 0 {
+            if prot & 2 != 0 {
+                return err(Errno::EACCES);
+            }
+            let mut p = addr - addr % PAGE_SIZE;
+            while p < addr.saturating_add(len) {
+                if mem.page_prot(p).is_some_and(|q| q.0 & 4 == 0) {
+                    return err(Errno::EACCES);
+                }
+                p += PAGE_SIZE;
+            }
+        }
         self.sys_mprotect(addr, len, prot, mem)
     }
 

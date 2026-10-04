@@ -42,9 +42,11 @@ mod orphan;
 mod pagecache;
 mod path;
 mod poll;
+mod prctl;
 mod procx;
 mod ptimer;
 mod pty;
+mod seccomp;
 mod signal;
 mod splice;
 mod stat;
@@ -289,6 +291,11 @@ struct ProcInfo {
     /// The System V semaphore this task is parked on in `semop`:
     /// `(semid, semnum, waiting-for-zero)` — what `GETNCNT`/`GETZCNT` count.
     sem_wait: Option<(i32, u16, bool)>,
+    /// Assorted `prctl` state (see [`prctl`]).
+    pr: prctl::PrctlState,
+    /// seccomp mode and filters (see [`seccomp`]); inherited by children,
+    /// kept across `execve`.
+    seccomp: seccomp::SeccompState,
 }
 
 /// The subset of `siginfo_t` a queued/sent signal carries beyond its number,
@@ -377,6 +384,8 @@ impl Default for ProcInfo {
             robust_list: 0,
             caps: None,
             sem_wait: None,
+            pr: prctl::PrctlState::default(),
+            seccomp: seccomp::SeccompState::default(),
             creds: Creds::default(),
             sched_policy: 0, // SCHED_OTHER
             sched_priority: 0,
@@ -2051,7 +2060,16 @@ impl Kernel {
                 // No lock is held here: `dispatch` acquires exactly the lock(s)
                 // each handler needs (sh before vfs). This is what lets other
                 // workers service their own syscalls concurrently (step B2).
-                let mut ret = self.dispatch(cx, sys, raw, &args, vcpu, mem);
+                // seccomp filters see every syscall before it runs.
+                let verdict = if cx.cur.seccomp.active() {
+                    self.seccomp_check(cx, sys, raw, &args, vcpu.pc(), mem)
+                } else {
+                    None
+                };
+                let mut ret = match verdict {
+                    Some(r) => r,
+                    None => self.dispatch(cx, sys, raw, &args, vcpu, mem),
+                };
                 // A syscall that wants to block but has a signal with a real
                 // handler pending must not park — POSIX requires it to either
                 // restart after the handler (`SA_RESTART`) or fail with `-EINTR`,
@@ -3572,6 +3590,7 @@ impl Kernel {
             Sysno::SetRobustList => self.sys_robust_list(sh, cx, args, false, mem),
             Sysno::GetRobustList => self.sys_robust_list(sh, cx, args, true, mem),
             Sysno::Unshare => self.sys_unshare(sh, cx, args[0]),
+            Sysno::Seccomp => self.sys_seccomp(sh, cx, args[0], args[1], args[2], mem),
             Sysno::Setns => self.sys_setns(cx, args[0], args[1]),
             Sysno::Ustat => self.sys_ustat(args[1], mem),
             Sysno::Sysfs => self.sys_sysfs(args[0], args[1], args[2], mem),
@@ -3792,6 +3811,12 @@ impl Kernel {
         info.robust_list = 0;
         if flags & CLONE_VM != 0 {
             info.rseq = None;
+        }
+        // The parent-death signal is cleared for a fork child, and being a
+        // child subreaper is a property of the process, not inherited.
+        info.pdeathsig = 0;
+        if !is_thread {
+            info.pr.child_subreaper = false;
         }
         // A child inherits the parent's *process group*, so resolve the `pgid == 0`
         // ("group leader = self") sentinel to the parent's effective pgid here.
@@ -4884,6 +4909,23 @@ impl Kernel {
         // current task, so this covers both exit paths.
         let ppid = cx.cur.ppid;
         let me = cx.cur.pid;
+        // Orphans go to the nearest living ancestor that declared itself a
+        // child subreaper (PR_SET_CHILD_SUBREAPER), else to init.
+        let new_parent = {
+            let mut up = cx.cur.ppid;
+            let mut found = 1;
+            for _ in 0..64 {
+                let Some(p) = sh.procs.iter().flatten().find(|p| p.info.pid == up) else {
+                    break;
+                };
+                if p.info.pr.child_subreaper && !matches!(p.info.run, RunState::Zombie(_)) {
+                    found = up;
+                    break;
+                }
+                up = p.info.ppid;
+            }
+            found
+        };
         for slot in sh.procs.iter_mut().flatten() {
             if slot.info.pid == ppid {
                 if (1..=64).contains(&exit_sig) {
@@ -4891,12 +4933,12 @@ impl Kernel {
                 }
                 slot.info.parked = false;
             }
-            // Reparent our children to init (pid 1): an orphan must not keep its
-            // dead parent's pid as `getppid()`, and its eventual zombie must be
-            // reaped by init rather than stranding forever. A child that armed
-            // PR_SET_PDEATHSIG gets that signal now that its parent has died.
+            // Reparent our children (to a subreaper or init): an orphan must
+            // not keep its dead parent's pid as `getppid()`, and its eventual
+            // zombie must be reaped rather than stranding forever. A child that
+            // armed PR_SET_PDEATHSIG gets that signal now that its parent died.
             if slot.info.ppid == me && slot.info.pid != me {
-                slot.info.ppid = 1;
+                slot.info.ppid = new_parent;
                 let ds = slot.info.pdeathsig;
                 if (1..=64).contains(&ds) {
                     slot.info.pending |= 1u64 << (ds - 1);
