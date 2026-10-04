@@ -3422,7 +3422,30 @@ impl Kernel {
                     err(Errno::EBADF)
                 }
             }
-            Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], mem),
+            Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], args[2], mem),
+            // mlock/munlock/mlock2(addr, len[, flags]): nothing is ever paged
+            // out, so locking is a no-op — after Linux's checks: the range must
+            // be mapped (ENOMEM), mlock2 takes only MLOCK_ONFAULT, and mlockall
+            // needs MCL_CURRENT and/or MCL_FUTURE (MCL_ONFAULT alone is EINVAL).
+            Sysno::Mlock2 if args[2] & !1 != 0 => err(Errno::EINVAL),
+            Sysno::Mlock | Sysno::Munlock | Sysno::Mlock2 => {
+                let (start, end) = (page_down(args[0]), args[0].saturating_add(args[1]));
+                let mut p = start;
+                while p < end {
+                    if mem.page_prot(p).is_none() {
+                        return err(Errno::ENOMEM);
+                    }
+                    p += PAGE_SIZE;
+                }
+                0
+            }
+            Sysno::Mlockall => {
+                if args[0] & !7 != 0 || args[0] & 3 == 0 {
+                    err(Errno::EINVAL)
+                } else {
+                    0
+                }
+            }
             Sysno::Ioctl => self.sys_ioctl(cx, args[0], args[1], args[2], mem),
             Sysno::Fcntl => self.sys_fcntl(sh, cx, args[0], args[1], args[2], mem),
             Sysno::Flock => self.sys_flock(sh, cx, args[0], args[1]),
@@ -3481,9 +3504,18 @@ impl Kernel {
             Sysno::Execve => self.sys_execve(sh, cx, args[0], args[1], args[2], vcpu, mem),
             // `pid` is a 32-bit int: `as i32 as i64` sign-extends a `-1` the guest
             // passed as a zero-extended `0xFFFF_FFFF` (else `waitpid(-1)` breaks).
+            // WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WALL | __WCLONE.
+            Sysno::Wait4 if args[2] & !(1 | 2 | 8 | 0xe000_0000) != 0 => err(Errno::EINVAL),
             Sysno::Wait4 => self.sys_wait4(sh, cx, i64::from(args[0] as i32), args[1], args[2], args[3], mem),
             Sysno::Exit => self.sys_exit(sh, cx, args[0] as i32, mem),
             Sysno::ExitGroup => self.sys_exit_group(sh, cx, args[0] as i32, mem),
+            // The rt_sig* calls take the kernel sigset size, which must be 8.
+            Sysno::RtSigaction | Sysno::RtSigprocmask | Sysno::RtSigtimedwait
+                if args[3] != 8 =>
+            {
+                err(Errno::EINVAL)
+            }
+            Sysno::RtSigsuspend if args[1] != 8 => err(Errno::EINVAL),
             Sysno::RtSigaction => self.sys_rt_sigaction(cx, args[0], args[1], args[2], mem),
             Sysno::Sigaltstack => self.sys_sigaltstack(cx, args[0], args[1], mem),
             Sysno::RtSigreturn => {
@@ -3614,6 +3646,9 @@ impl Kernel {
             Sysno::PkeyFree | Sysno::RemapFilePages => err(Errno::EINVAL),
             Sysno::Prlimit64 => self.sys_prlimit64(sh, args[1], args[2], args[3], mem),
             Sysno::Getrlimit => self.sys_getrlimit(sh, args[0], args[1], mem),
+            // setrlimit(resource, rlim) is prlimit64 on the caller without the
+            // old-value output (so RLIMIT_NOFILE is tracked either way).
+            Sysno::Setrlimit => self.sys_prlimit64(sh, args[0], args[1], 0, mem),
             Sysno::Prctl => self.sys_prctl(cx, args, mem),
             // getpriority returns the kernel ABI value 20 - nice (glibc converts
             // it back to the nice value); setpriority records the nice.
@@ -3636,13 +3671,8 @@ impl Kernel {
             // permission/ownership/timestamp changes, socket options, clock
             // adjustment (TIME_OK), and scheduling/process-attr setters — none
             // modeled yet.
-            // Locking/sync setters: all no-ops.
-            | Sysno::Mlock
-            | Sysno::Mlock2
-            | Sysno::Munlock
-            | Sysno::Mlockall
+            // Locking/sync setters: no-ops (there is no swap to keep pages from).
             | Sysno::Munlockall
-            | Sysno::Setrlimit
             // Sync family: nothing is durably backed (in-memory / host
             // passthrough), so there's nothing to flush. `sync()` takes no fd;
             // the fd-taking members (fsync/fdatasync/syncfs/sync_file_range) are
@@ -3710,8 +3740,12 @@ impl Kernel {
         // Legacy `clone` packs the child's termination signal into the low byte
         // of `flags`, and `CLONE_PIDFD` reuses the `parent_tid` pointer as the
         // pidfd output (so it is mutually exclusive with `CLONE_PARENT_SETTID`,
-        // which also writes through `parent_tid`). `clone3` splits both out; we
-        // lower legacy to the same normalized [`CloneArgs`].
+        // which also writes through `parent_tid` — EINVAL together, as on
+        // Linux). `clone3` splits both out; we lower legacy to the same
+        // normalized [`CloneArgs`].
+        if flags & CLONE_PIDFD != 0 && flags & CLONE_PARENT_SETTID != 0 {
+            return err(Errno::EINVAL);
+        }
         let ca = CloneArgs {
             flags: flags & !0xff,
             stack_ptr: stack,
@@ -3749,6 +3783,15 @@ impl Kernel {
         // (`CLONE_ALL_FLAGS` already spans the two clone3-only flags, so a valid
         // `CLONE_INTO_CGROUP`/`CLONE_CLEAR_SIGHAND` is not caught here.)
         if flags & !CLONE_ALL_FLAGS != 0 {
+            return err(Errno::EINVAL);
+        }
+        // Linux's copy_process() consistency rules: a new mount or user
+        // namespace can't share the fs context; a thread shares the handler
+        // table, and a shared handler table needs a shared address space.
+        if (flags & CLONE_FS != 0 && flags & (CLONE_NEWNS | CLONE_NEWUSER) != 0)
+            || (flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0)
+            || (flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0)
+        {
             return err(Errno::EINVAL);
         }
         // `vfork` (CLONE_VM | CLONE_VFORK, no CLONE_THREAD) asks to *borrow* the
@@ -6442,6 +6485,13 @@ impl Kernel {
         const FIOCLEX: u32 = 0x5451;
         const FIONCLEX: u32 = 0x5450;
         const FIOASYNC: u32 = 0x5452;
+        const FIGETBSZ: u32 = 2;
+        const FIOQSIZE: u32 = 0x5460;
+        const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+        const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+        const FS_IOC_GETVERSION: u32 = 0x8008_7601;
+        const FS_IOC_FSGETXATTR: u32 = 0x801c_581f;
+        const FS_IOC_FSSETXATTR: u32 = 0x401c_5820;
         const FIONREAD: u32 = 0x541B; // == SIOCINQ
         const SIOCOUTQ: u32 = 0x5411;
         let Some(f) = cx.cur.fds.get(fd as i32).cloned() else {
@@ -6486,12 +6536,48 @@ impl Kernel {
                 self.fd_set_nonblock(&f, on);
                 0
             }
-            // Set/clear close-on-exec. nixvm does not track the flag separately
-            // (as `fcntl(F_SETFD)` doesn't either), so this is an accepted no-op.
-            //
+            // Set/clear close-on-exec, as fcntl(F_SETFD) does.
+            FIOCLEX | FIONCLEX => {
+                cx.cur.fds.set_cloexec(fd as i32, req == FIOCLEX);
+                0
+            }
             // `FIOASYNC` (signal-driven I/O): accepted, but no `SIGIO` is ever
             // sent — callers (nginx's master/worker channel) also poll the fd.
-            FIOCLEX | FIONCLEX | FIOASYNC => 0,
+            FIOASYNC => 0,
+            // File-only queries: FIGETBSZ (block size), FIOQSIZE (size), and
+            // the ext2-style attribute ioctls `lsattr`/`chattr`/`cp -a` use:
+            // no attribute flags are set and none can be (EOPNOTSUPP, as
+            // tmpfs answers for the flags it lacks); the fsxattr form reads
+            // all-zero.
+            FIGETBSZ | FIOQSIZE | FS_IOC_GETFLAGS | FS_IOC_SETFLAGS | FS_IOC_GETVERSION
+            | FS_IOC_FSGETXATTR | FS_IOC_FSSETXATTR => {
+                let path = match &f {
+                    Fd::File { path, .. } | Fd::Dir { path, .. } => path.clone(),
+                    _ => return err(Errno::ENOTTY),
+                };
+                let out: Vec<u8> = match req {
+                    FIGETBSZ => 4096u32.to_le_bytes().to_vec(),
+                    FIOQSIZE => {
+                        let size = self.vfs.lock().unwrap().stat(&path).map_or(0, |a| a.size);
+                        size.to_le_bytes().to_vec()
+                    }
+                    FS_IOC_SETFLAGS => {
+                        return match mem.read_u32(arg) {
+                            Ok(0) => 0,
+                            Ok(_) => err(Errno::EOPNOTSUPP),
+                            Err(_) => err(Errno::EFAULT),
+                        };
+                    }
+                    FS_IOC_FSSETXATTR => return 0,
+                    FS_IOC_FSGETXATTR => vec![0u8; 28],
+                    _ => 0u32.to_le_bytes().to_vec(), // GETFLAGS / GETVERSION
+                };
+                if mem.write(arg, &out).is_ok() {
+                    0
+                } else {
+                    err(Errno::EFAULT)
+                }
+            }
             // Bytes available to read, written as an `int` at `arg`.
             FIONREAD => {
                 let bytes = match &f {
@@ -7476,10 +7562,52 @@ impl Kernel {
         // with EEXIST instead of clobbering an existing mapping in the range.
         const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 
+        const MAP_TYPE: u64 = 0x0f;
+        const MAP_SHARED_VALIDATE: u64 = 0x03;
+        const MAP_SYNC: u64 = 0x8_0000;
+        // Every flag Linux defines outside the map type (incl. the hugetlb
+        // size field and x86's MAP_32BIT).
+        const MAP_KNOWN: u64 = 0x10
+            | 0x20
+            | 0x40
+            | 0x100
+            | 0x800
+            | 0x1000
+            | 0x2000
+            | 0x4000
+            | 0x8000
+            | 0x1_0000
+            | 0x2_0000
+            | 0x4_0000
+            | 0x8_0000
+            | 0x10_0000
+            | 0x400_0000
+            | (0x3f << 26);
         let (addr, len, prot, flags) = (a[0], a[1], a[2], a[3]);
         let (fd, offset) = (a[4], a[5]);
         if len == 0 {
             return err(Errno::EINVAL);
+        }
+        // Exactly one of MAP_SHARED / MAP_PRIVATE / MAP_SHARED_VALIDATE; the
+        // validating type refuses flags it doesn't know (and MAP_SYNC, which
+        // needs DAX storage) with EOPNOTSUPP.
+        match flags & MAP_TYPE {
+            1 | 2 => {}
+            MAP_SHARED_VALIDATE => {
+                if flags & !(MAP_TYPE | MAP_KNOWN) != 0 || flags & MAP_SYNC != 0 {
+                    return err(Errno::EOPNOTSUPP);
+                }
+            }
+            _ => return err(Errno::EINVAL),
+        }
+        // PROT_READ|WRITE|EXEC, PROT_SEM, PROT_GROWSDOWN/UP, and arm64's
+        // PROT_BTI/PROT_MTE.
+        if prot & !(0x3f | 0x0100_0000 | 0x0200_0000) != 0 {
+            return err(Errno::EINVAL);
+        }
+        // PR_SET_MDWE: never writable and executable at once.
+        if cx.cur.pr.mdwe & prctl::MDWE_REFUSE_EXEC_GAIN != 0 && prot & 6 == 6 {
+            return err(Errno::EACCES);
         }
         let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
         let prot = Prot((prot as u8) & 0x7);
@@ -7715,13 +7843,36 @@ impl Kernel {
 
     /// `getrandom(buf, len, flags)`.
     #[allow(clippy::unused_self)]
-    fn sys_getrandom(&self, sh: &mut Shared, buf: u64, len: u64, mem: &mut GuestMemory) -> i64 {
+    ///
+    /// The flags are validated (`GRND_NONBLOCK`, `GRND_RANDOM`,
+    /// `GRND_INSECURE`; `RANDOM` with `INSECURE` is `EINVAL`); the pool is
+    /// always "initialized", so none of them changes the output. The
+    /// generator is reseeded from the host's entropy (`/dev/urandom`) when one
+    /// is available, so guest keys and nonces aren't predictable from the
+    /// boot time.
+    fn sys_getrandom(
+        &self,
+        sh: &mut Shared,
+        buf: u64,
+        len: u64,
+        flags: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        const GRND_NONBLOCK: u64 = 1;
+        const GRND_RANDOM: u64 = 2;
+        const GRND_INSECURE: u64 = 4;
+        if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0
+            || flags & (GRND_RANDOM | GRND_INSECURE) == GRND_RANDOM | GRND_INSECURE
+        {
+            return err(Errno::EINVAL);
+        }
+        let len = len.min(i32::MAX as u64);
         if sh.rng_state == 0 {
             let now = match crate::clock::now_unix().as_nanos() as u64 {
                 0 => 0x9E37_79B9_7F4A_7C15,
                 n => n,
             };
-            sh.rng_state = now | 1;
+            sh.rng_state = (now ^ host_entropy()) | 1;
         }
         let mut out = vec![0u8; len as usize];
         for chunk in out.chunks_mut(8) {
@@ -8137,6 +8288,21 @@ fn rusage_bytes(cpu_ns: u128) -> [u8; 144] {
     ru[0..8].copy_from_slice(&((cpu_ns / 1_000_000_000) as i64).to_le_bytes());
     ru[8..16].copy_from_slice(&((cpu_ns % 1_000_000_000 / 1_000) as i64).to_le_bytes());
     ru
+}
+
+/// 64 bits from the host's entropy pool, or 0 where there is none (wasm).
+fn host_entropy() -> u64 {
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    {
+        let mut b = [0u8; 8];
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut b))
+            .is_ok()
+        {
+            return u64::from_le_bytes(b);
+        }
+    }
+    0
 }
 
 /// Encode an errno as a negative syscall return.
@@ -9678,7 +9844,7 @@ mod tests {
             &mut mem,
             &mut v,
             Sysno::Clone,
-            [CLONE_VM | CLONE_THREAD, 0, 0, 0, 0, 0],
+            [CLONE_VM | CLONE_THREAD | 0x800, 0, 0, 0, 0, 0],
         );
         let tmm = k
             .shared
@@ -9732,7 +9898,7 @@ mod tests {
     fn clone_thread_shares_tgid_and_address_space() {
         let (k, mut mem, mut v, mut cx) = setup();
         // CLONE_VM | CLONE_THREAD | CLONE_SETTLS
-        let flags = 0x0000_0100 | 0x0001_0000 | 0x0008_0000;
+        let flags = 0x0000_0100 | 0x0000_0800 | 0x0001_0000 | 0x0008_0000;
         let tid = call(
             &k,
             &mut cx,
@@ -9817,7 +9983,7 @@ mod tests {
             &mut mem,
             &mut v,
             Sysno::Clone,
-            [0x0000_0100 | 0x0001_0000, 0, 0, 0, 0, 0],
+            [0x0000_0100 | 0x0000_0800 | 0x0001_0000, 0, 0, 0, 0, 0],
         );
         let sh = k.shared.lock().unwrap();
         let sig = |pid: i64| {
@@ -10369,7 +10535,7 @@ mod tests {
 
     #[test]
     fn mmap_file_backed_copies_file_contents() {
-        const MAP_FIXED: u64 = 0x10;
+        const MAP_FIXED: u64 = 0x10 | 0x02; // with MAP_PRIVATE: a map type is required
         const PROT_READ: u64 = 0x1;
         let (k, mut mem, mut v, mut cx) = setup();
         let path = 0x1_0000;
@@ -10415,7 +10581,7 @@ mod tests {
 
     #[test]
     fn mmap_file_backed_zero_fills_past_eof() {
-        const MAP_FIXED: u64 = 0x10;
+        const MAP_FIXED: u64 = 0x10 | 0x02; // with MAP_PRIVATE: a map type is required
         let (k, mut mem, mut v, mut cx) = setup();
         let path = 0x1_0000;
         let content = 0x1_1000;
@@ -10455,7 +10621,7 @@ mod tests {
 
     #[test]
     fn mmap_bad_and_nonfile_fd_rejected() {
-        const MAP_FIXED: u64 = 0x10;
+        const MAP_FIXED: u64 = 0x10 | 0x02; // with MAP_PRIVATE: a map type is required
         let (k, mut mem, mut v, mut cx) = setup();
         // No such fd -> EBADF.
         assert_eq!(

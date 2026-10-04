@@ -166,9 +166,23 @@ impl Kernel {
         base as i64
     }
 
-    /// `madvise(addr, len, advice)` — advisory, so always succeeds. `MADV_DONTNEED`
-    /// is honored by zeroing the mapped pages so the guest sees fresh zero pages;
-    /// every other advice is ignored.
+    /// `madvise(addr, len, advice)`. After Linux's checks — a page-aligned
+    /// `addr`, a known `advice` (`EINVAL`), and for the advice that acts on
+    /// pages a fully mapped range (`ENOMEM`) — the advice that changes what
+    /// the guest observes is honored:
+    /// - `MADV_DONTNEED`/`MADV_FREE`: private anonymous pages read back as
+    ///   zero (`FREE` may legally keep contents; zeroing is the conservative
+    ///   answer); shared pages keep their contents, as Linux refaults them from
+    ///   the shared object; file-backed (ELF) pages keep theirs too.
+    /// - `MADV_REMOVE`: punches the backing out of shared memory (zeros).
+    /// - `MADV_DONTFORK`/`MADV_WIPEONFORK` (and `DOFORK`/`KEEPONFORK`): the
+    ///   fork policy, applied by the next `fork` (glibc's `arc4random` and
+    ///   OpenSSL rely on WIPEONFORK so a child never reuses the parent's
+    ///   random state).
+    ///
+    /// Everything else is a hint with nothing to act on in memory that is
+    /// never paged out: accepted. `MADV_GUARD_INSTALL` (6.13) is `EINVAL`, as
+    /// on kernels without it.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_madvise(
         &self,
@@ -177,31 +191,62 @@ impl Kernel {
         advice: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        if advice == MADV_DONTNEED && len != 0 {
-            let start = page_down(addr);
-            let end = page_up(addr + len);
-            // Linux refuses to discard a range with holes: an unmapped page
-            // anywhere in it makes the whole call fail with ENOMEM, discarding
-            // nothing. musl's allocator relies on this to detect gaps.
-            if !range_is_mapped(mem, start, end) {
-                return err(Errno::ENOMEM);
-            }
-            let mut p = start;
-            let zero = [0u8; PAGE_SIZE as usize];
-            while p < end {
-                // File-backed (ELF-segment) pages must keep their contents: on
-                // Linux MADV_DONTNEED discards the private copy and the next
-                // access reloads the file, so an unmodified page is unchanged.
-                // Zeroing them would wipe read-only data a runtime lazily
-                // re-reads (Bun's embedded bytecode lives in such a segment).
-                if !mem.is_file_backed(p) {
-                    // Only mapped, writable pages take zeros; ignore the rest.
-                    let _ = mem.write(p, &zero);
-                }
-                p += PAGE_SIZE;
-            }
+        const MADV_FREE: u64 = 8;
+        const MADV_REMOVE: u64 = 9;
+        const MADV_DONTFORK: u64 = 10;
+        const MADV_DOFORK: u64 = 11;
+        const MADV_WIPEONFORK: u64 = 18;
+        const MADV_KEEPONFORK: u64 = 19;
+        // NORMAL..DONTNEED, FREE..DODUMP, WIPEONFORK..COLLAPSE, HWPOISON,
+        // SOFT_OFFLINE.
+        let known = matches!(advice, 0..=4 | 8..=25 | 100 | 101);
+        if !known || !addr.is_multiple_of(PAGE_SIZE) {
+            return err(Errno::EINVAL);
         }
-        0
+        if len == 0 {
+            return 0;
+        }
+        let start = addr;
+        let end = page_up(addr.saturating_add(len));
+        // Linux refuses advice over a range with holes: an unmapped page
+        // anywhere in it makes the call fail with ENOMEM. musl's allocator
+        // relies on this to detect gaps.
+        if !range_is_mapped(mem, start, end) {
+            return err(Errno::ENOMEM);
+        }
+        match advice {
+            MADV_DONTNEED | MADV_FREE | MADV_REMOVE => {
+                let zero = [0u8; PAGE_SIZE as usize];
+                let mut p = start;
+                while p < end {
+                    // File-backed (ELF-segment) pages keep their contents: on
+                    // Linux MADV_DONTNEED discards the private copy and the
+                    // next access reloads the file (Bun's embedded bytecode
+                    // lives in such a segment). Shared pages are refaulted
+                    // from the shared object, so they keep theirs too — except
+                    // under MADV_REMOVE, which frees that backing.
+                    let shared = mem.shared_phys(p).is_some();
+                    if !mem.is_file_backed(p) && (!shared || advice == MADV_REMOVE) {
+                        // Only mapped, writable pages take zeros; ignore the rest.
+                        let _ = mem.write(p, &zero);
+                    }
+                    p += PAGE_SIZE;
+                }
+                0
+            }
+            MADV_DONTFORK | MADV_DOFORK | MADV_WIPEONFORK | MADV_KEEPONFORK => {
+                let policy = match advice {
+                    MADV_DONTFORK => crate::vcpu::mem::FORK_DONT,
+                    MADV_WIPEONFORK => crate::vcpu::mem::FORK_WIPE,
+                    _ => 0,
+                };
+                match mem.set_fork_policy(start, end - start, policy) {
+                    Ok(()) => 0,
+                    Err(_) => err(Errno::ENOMEM),
+                }
+            }
+            _ => 0,
+        }
     }
 
     /// `mincore(addr, len, vec)` — report per-page residency. Bit 0 of each byte
@@ -515,7 +560,6 @@ mod tests {
             Sysno::Mlock,
             Sysno::Mlock2,
             Sysno::Munlock,
-            Sysno::Mlockall,
             Sysno::Munlockall,
             Sysno::Msync,
         ] {
@@ -525,5 +569,59 @@ mod tests {
                 "{s:?}"
             );
         }
+        // mlockall needs MCL_CURRENT and/or MCL_FUTURE; MCL_ONFAULT alone or
+        // nothing at all is EINVAL, as are unknown bits.
+        let ml = |k: &Kernel, cx: &mut ServiceCtx, mem: &mut GuestMemory, f: u64| {
+            k.dispatch(
+                cx,
+                Sysno::Mlockall,
+                0,
+                &[f, 0, 0, 0, 0, 0],
+                &mut DummyVcpu,
+                mem,
+            )
+        };
+        assert_eq!(ml(&k, &mut cx, &mut mem, 1 | 2), 0);
+        assert_eq!(ml(&k, &mut cx, &mut mem, 0), err(Errno::EINVAL));
+        assert_eq!(ml(&k, &mut cx, &mut mem, 4), err(Errno::EINVAL));
+        assert_eq!(ml(&k, &mut cx, &mut mem, 8 | 1), err(Errno::EINVAL));
+        // mlock over an unmapped range is ENOMEM; mlock2's only flag is ONFAULT.
+        let r = k.dispatch(
+            &mut cx,
+            Sysno::Mlock,
+            0,
+            &[0x7_0000, 4096, 0, 0, 0, 0],
+            &mut v,
+            &mut mem,
+        );
+        assert_eq!(r, err(Errno::ENOMEM));
+        let r = k.dispatch(
+            &mut cx,
+            Sysno::Mlock2,
+            0,
+            &[0, 0, 2, 0, 0, 0],
+            &mut v,
+            &mut mem,
+        );
+        assert_eq!(r, err(Errno::EINVAL));
+        // madvise: unknown advice / unaligned address are EINVAL.
+        let r = k.dispatch(
+            &mut cx,
+            Sysno::Madvise,
+            0,
+            &[0x1_0000, 4096, 77, 0, 0, 0],
+            &mut v,
+            &mut mem,
+        );
+        assert_eq!(r, err(Errno::EINVAL));
+        let r = k.dispatch(
+            &mut cx,
+            Sysno::Madvise,
+            0,
+            &[0x1_0001, 4096, 4, 0, 0, 0],
+            &mut v,
+            &mut mem,
+        );
+        assert_eq!(r, err(Errno::EINVAL));
     }
 }

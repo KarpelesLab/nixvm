@@ -118,6 +118,10 @@ pub struct GuestMemory {
     /// so parent and child see each other's stores — the standard shared-memory
     /// IPC primitive. `make_writable`/`leaf_prot` therefore never privatize them.
     shared_anon: Vec<bool>,
+    /// Pages with a `madvise` fork policy (sparse: almost always empty):
+    /// [`FORK_DONT`] (`MADV_DONTFORK` — absent from a fork child) or
+    /// [`FORK_WIPE`] (`MADV_WIPEONFORK` — zero-filled in a fork child).
+    fork_policy: std::collections::BTreeMap<usize, u8>,
     /// Set whenever a *present* page-table leaf is cleared or changed from the
     /// host (unmap, protect, copy-on-write privatize). A KVM vcpu running this
     /// address space must flush its TLB before its next run, or a stale entry
@@ -151,6 +155,11 @@ impl std::fmt::Debug for GuestMemory {
             .finish_non_exhaustive()
     }
 }
+
+/// [`GuestMemory::set_fork_policy`]: the page is not inherited by a fork child.
+pub const FORK_DONT: u8 = 1;
+/// [`GuestMemory::set_fork_policy`]: a fork child sees the page zero-filled.
+pub const FORK_WIPE: u8 = 2;
 
 const fn round_up(v: u64, align: u64) -> u64 {
     v.div_ceil(align) * align
@@ -227,6 +236,7 @@ impl GuestMemory {
             mapped: vec![false; npages],
             file_backed: vec![false; npages],
             shared_anon: vec![false; npages],
+            fork_policy: std::collections::BTreeMap::new(),
             tlb_dirty: false,
             kstack_pa,
             shared: false,
@@ -406,6 +416,31 @@ impl GuestMemory {
             self.prot[p] = prot;
             self.file_backed[p] = false;
             self.shared_anon[p] = false; // a fresh mapping is private until tagged
+            self.fork_policy.remove(&p);
+        }
+        Ok(())
+    }
+
+    /// Give the mapped pages of `[addr, addr + len)` a fork policy
+    /// ([`FORK_DONT`], [`FORK_WIPE`], or 0 to inherit normally) — the
+    /// `MADV_DONTFORK`/`MADV_WIPEONFORK` (and `DOFORK`/`KEEPONFORK`) advice.
+    /// `MemError::Unmapped` if any page in the range isn't mapped.
+    pub fn set_fork_policy(&mut self, addr: u64, len: u64, policy: u8) -> Result<(), MemError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let start = addr - addr % PAGE_SIZE;
+        let end = round_up(addr + len, PAGE_SIZE);
+        let (first, last) = self.page_range(start, (end - start) as usize)?;
+        if let Some(p) = (first..=last).find(|&p| !self.mapped[p]) {
+            return Err(MemError::Unmapped(self.page_base(p)));
+        }
+        for p in first..=last {
+            if policy == 0 {
+                self.fork_policy.remove(&p);
+            } else {
+                self.fork_policy.insert(p, policy);
+            }
         }
         Ok(())
     }
@@ -669,6 +704,7 @@ impl GuestMemory {
             self.prot[p] = Prot::NONE;
             self.file_backed[p] = false;
             self.shared_anon[p] = false;
+            self.fork_policy.remove(&p);
         }
         Ok(())
     }
@@ -980,9 +1016,31 @@ impl GuestMemory {
                     child.protect(va, self.prot[p], false, &self.phys);
                 }
             }
+            // madvise fork policies: drop the child's leaf (its reference to
+            // the parent's frame) for DONTFORK/WIPEONFORK pages — a WIPEONFORK
+            // page stays mapped and demand-faults a fresh zero frame. (The
+            // parent's own leaf was downgraded to copy-on-write by fork_cow; a
+            // now-unshared frame is simply made writable again on first store.)
+            for &p in self.fork_policy.keys() {
+                let va = self.base + (p as u64) * PAGE_SIZE;
+                if let Some(frame) = child.unmap(va, &mut fa, &self.phys) {
+                    fa.free(frame);
+                }
+            }
             (child, parent_kstack, child_kstack)
         };
         self.kstack_pa = parent_kstack;
+        let mut mapped = self.mapped.clone();
+        let mut shared_anon = self.shared_anon.clone();
+        let mut fork_policy = std::collections::BTreeMap::new();
+        for (&p, &policy) in &self.fork_policy {
+            shared_anon[p] = false;
+            if policy == FORK_DONT {
+                mapped[p] = false;
+            } else {
+                fork_policy.insert(p, policy);
+            }
+        }
         Self {
             base: self.base,
             size: self.size,
@@ -990,9 +1048,10 @@ impl GuestMemory {
             fa: Arc::clone(&self.fa),
             space: child_space,
             prot: self.prot.clone(),
-            mapped: self.mapped.clone(),
+            mapped,
             file_backed: self.file_backed.clone(),
-            shared_anon: self.shared_anon.clone(),
+            shared_anon,
+            fork_policy,
             tlb_dirty: false,
             kstack_pa: child_kstack,
             shared: self.shared,
@@ -1030,6 +1089,7 @@ impl GuestMemory {
         self.mapped.fill(false);
         self.file_backed.fill(false);
         self.shared_anon.fill(false);
+        self.fork_policy.clear();
     }
 
     // ---- fixed-width helpers --------------------------------------------
@@ -1247,6 +1307,34 @@ mod tests {
             !m.cow_fault(0x1_0000, true),
             "read-only page is a genuine fault"
         );
+    }
+
+    #[test]
+    fn fork_policies_wipe_or_drop_pages_in_the_child_only() {
+        let mut m = mem();
+        m.map(0x1_0000, 3 * PAGE_SIZE, Prot::rw()).unwrap();
+        for i in 0..3 {
+            m.write_u64(0x1_0000 + i * PAGE_SIZE, 0x1111 * (i + 1))
+                .unwrap();
+        }
+        m.set_fork_policy(0x1_0000, PAGE_SIZE, FORK_WIPE).unwrap();
+        m.set_fork_policy(0x1_0000 + PAGE_SIZE, PAGE_SIZE, FORK_DONT)
+            .unwrap();
+        assert!(
+            m.set_fork_policy(0x1_0000 + 9 * PAGE_SIZE, PAGE_SIZE, FORK_DONT)
+                .is_err()
+        );
+        let mut child = m.fork();
+        // WIPEONFORK: zero in the child, intact in the parent (still writable).
+        assert_eq!(child.read_u64(0x1_0000).unwrap(), 0);
+        assert_eq!(m.read_u64(0x1_0000).unwrap(), 0x1111);
+        m.write_u64(0x1_0000, 7).unwrap();
+        // DONTFORK: absent from the child.
+        assert!(child.read_u64(0x1_0000 + PAGE_SIZE).is_err());
+        assert_eq!(m.read_u64(0x1_0000 + PAGE_SIZE).unwrap(), 0x2222);
+        // An ordinary page is inherited.
+        assert_eq!(child.read_u64(0x1_0000 + 2 * PAGE_SIZE).unwrap(), 0x3333);
+        child.release();
     }
 
     #[test]
