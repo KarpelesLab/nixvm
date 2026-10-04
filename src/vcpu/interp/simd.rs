@@ -169,6 +169,8 @@ impl Aarch64Interp {
                     }
                 }
                 0b0100 => self.crypto_two_reg(instr, scalar),
+                // FP16 two-register misc (bits 22:17 = 111100)
+                0b1100 if (instr >> 22) & 1 == 1 => self.simd_fp_misc_fmt(instr, scalar, true),
                 _ => Step::Illegal,
             };
         }
@@ -179,7 +181,11 @@ impl Aarch64Interp {
             if (instr >> 15) & 1 == 1 {
                 return self.simd_three_same_extra(instr, scalar);
             }
-            return Step::Illegal; // FP16 three same
+            if (instr >> 21) & 3 == 0b10 && (instr >> 14) & 1 == 0 {
+                // FP16 three same: bits 22:21 = 10, bits 15:14 = 00.
+                return self.simd_fp_three_same_fmt(instr, scalar, true);
+            }
+            return Step::Illegal;
         }
         if (instr >> 15) & 1 != 0 {
             return Step::Illegal;
@@ -383,6 +389,12 @@ impl Aarch64Interp {
     }
 
     fn simd_fp_three_same(&mut self, instr: u32, scalar: bool) -> Step {
+        self.simd_fp_three_same_fmt(instr, scalar, false)
+    }
+
+    /// The FP three-same table, for single/double (`half == false`, format
+    /// from `sz`) or half precision (the FEAT_FP16 encoding).
+    pub(super) fn simd_fp_three_same_fmt(&mut self, instr: u32, scalar: bool, half: bool) -> Step {
         let q = (instr >> 30) & 1 == 1;
         let u = (instr >> 29) & 1;
         let a_bit = (instr >> 23) & 1;
@@ -403,13 +415,24 @@ impl Aarch64Interp {
             ) {
                 return Step::Illegal;
             }
-            if sz == 1 { (D, 64, 1) } else { (S, 32, 1) }
+            if half {
+                (H, 16, 1)
+            } else if sz == 1 {
+                (D, 64, 1)
+            } else {
+                (S, 32, 1)
+            }
+        } else if half {
+            (H, 16, if q { 8 } else { 4 })
         } else {
             let Some(x) = fp_vec(q, sz) else {
                 return Step::Illegal;
             };
             x
         };
+        if half && matches!(key, 0b0_0101 | 0b0_1101 | 0b1_0001 | 0b1_1001) {
+            return Step::Illegal;
+        }
         if matches!(key, 0b0_0101 | 0b0_1101 | 0b1_0001 | 0b1_1001) {
             // FMLAL/FMLSL/FMLAL2/FMLSL2 (FEAT_FHM): size<0> must be 0.
             if scalar || sz != 0 {
@@ -879,6 +902,12 @@ impl Aarch64Interp {
 
     /// Floating-point two-register miscellaneous (vector and scalar).
     fn simd_fp_misc(&mut self, instr: u32, scalar: bool) -> Step {
+        self.simd_fp_misc_fmt(instr, scalar, false)
+    }
+
+    /// The FP two-register-misc table, single/double or (`half`, the
+    /// FEAT_FP16 encoding with bits 22:17 = 111100) half precision.
+    pub(super) fn simd_fp_misc_fmt(&mut self, instr: u32, scalar: bool, half: bool) -> Step {
         let q = (instr >> 30) & 1 == 1;
         let u = (instr >> 29) & 1;
         let a = (instr >> 23) & 1;
@@ -914,7 +943,28 @@ impl Aarch64Interp {
         if !exists || (scalar && !scalar_ok) {
             return Step::Illegal;
         }
-        let (fmt, esize, lanes) = if scalar {
+        // No half-precision URECPE/URSQRTE/FRINT32*/FRINT64*.
+        if half
+            && matches!(
+                key,
+                0b0_1_11100 | 0b1_1_11100 | 0b0_0_11110 | 0b0_0_11111 | 0b1_0_11110 | 0b1_0_11111
+            )
+        {
+            return Step::Illegal;
+        }
+        let (fmt, esize, lanes) = if half {
+            (
+                H,
+                16,
+                if scalar {
+                    1
+                } else if q {
+                    8
+                } else {
+                    4
+                },
+            )
+        } else if scalar {
             if sz == 1 { (D, 64, 1) } else { (S, 32, 1) }
         } else {
             let Some(x) = fp_vec(q, sz) else {
@@ -989,9 +1039,24 @@ impl Aarch64Interp {
         let opcode = (instr >> 12) & 0x1f;
         let (rd, rn) = (reg_field(instr, 0), reg_field(instr, 5));
         let n = self.v[rn];
+        if (opcode == 0b01100 || opcode == 0b01111) && u == 0 {
+            // FMAXNMV/FMINNMV/FMAXV/FMINV, half precision (4H/8H).
+            if size & 1 != 0 {
+                return Step::Illegal;
+            }
+            let max = size >> 1 == 0;
+            let num = opcode == 0b01100;
+            let lanes = if q { 8 } else { 4 };
+            let vals: Vec<u64> = (0..lanes).map(|i| elem(n, i, 16)).collect();
+            let mut env = self.fpenv();
+            let r = reduce_minmax(&vals, max, num, H, &mut env);
+            self.set_fpenv(env);
+            self.v[rd] = u128::from(r);
+            return Step::Next;
+        }
         if opcode == 0b01100 || opcode == 0b01111 {
-            // FMAXNMV/FMINNMV/FMAXV/FMINV: 4S only (U=0 is FP16).
-            if u == 0 || size & 1 != 0 || !q {
+            // FMAXNMV/FMINNMV/FMAXV/FMINV: 4S only.
+            if size & 1 != 0 || !q {
                 return Step::Illegal;
             }
             let max = size >> 1 == 0;
@@ -1031,14 +1096,24 @@ impl Aarch64Interp {
         let opcode = (instr >> 12) & 0x1f;
         let (rd, rn) = (reg_field(instr, 0), reg_field(instr, 5));
         let n = self.v[rn];
-        if u == 0 {
-            if opcode != 0b11011 || size != 3 {
-                return Step::Illegal; // (U=0 FP forms are FP16)
+        if u == 0 && opcode == 0b11011 {
+            if size != 3 {
+                return Step::Illegal;
             }
             self.v[rd] = u128::from((n as u64).wrapping_add((n >> 64) as u64));
             return Step::Next;
         }
-        let (fmt, esize) = if size & 1 == 1 { (D, 64) } else { (S, 32) };
+        // U=0: half precision (sz must be 0); U=1: single/double.
+        let (fmt, esize) = if u == 0 {
+            if size & 1 != 0 {
+                return Step::Illegal;
+            }
+            (H, 16)
+        } else if size & 1 == 1 {
+            (D, 64)
+        } else {
+            (S, 32)
+        };
         let (a, b) = (elem(n, 0, esize), elem(n, 1, esize));
         let min = size >> 1 == 1;
         let mut env = self.fpenv();
@@ -1140,8 +1215,18 @@ impl Aarch64Interp {
         let o2 = (instr >> 11) & 1;
         let rd = reg_field(instr, 0);
         let imm8 = (((instr >> 16) & 7) << 5) | ((instr >> 5) & 0x1f);
-        if o2 != 0 || (cmode == 0b1111 && op == 1 && !q) {
-            return Step::Illegal; // FMOV (half) is FP16
+        if o2 != 0 {
+            // FMOV (vector, immediate), half precision (FEAT_FP16).
+            if cmode != 0b1111 || op != 0 {
+                return Step::Illegal;
+            }
+            let h = u128::from(vfp_expand_imm(imm8, H));
+            let r = (0..8).fold(0u128, |acc, i| acc | (h << (16 * i)));
+            self.set_vec(rd, r, q);
+            return Step::Next;
+        }
+        if cmode == 0b1111 && op == 1 && !q {
+            return Step::Illegal;
         }
         let imm = adv_simd_expand_imm(op, cmode, imm8);
         let imm128 = u128::from(imm) | (u128::from(imm) << 64);
@@ -1234,9 +1319,10 @@ impl Aarch64Interp {
         if matches!(opcode, 0b11100 | 0b11111) {
             // SCVTF/UCVTF/FCVTZS/FCVTZU (vector/scalar, fixed-point).
             let fmt = match esize {
+                16 => H,
                 32 => S,
                 64 => D,
-                _ => return Step::Illegal, // FP16 / reserved
+                _ => return Step::Illegal,
             };
             if !scalar && esize == 64 && !q {
                 return Step::Illegal;
@@ -1363,12 +1449,25 @@ impl Aarch64Interp {
         let key = (u << 4) | opcode;
         let fp = matches!(key, 0b0_0001 | 0b0_0101 | 0b0_1001 | 0b1_1001);
         if fp {
-            // FMLA/FMLS/FMUL/FMULX (by element), single or double.
-            if size < 2 {
-                return Step::Illegal; // FP16 / unallocated
+            // FMLA/FMLS/FMUL/FMULX (by element): half (size 00; index
+            // H:L:M, Rm in V0-V15), single or double.
+            if size == 1 {
+                return Step::Illegal;
             }
             let sz = size & 1;
-            let (fmt, esize, lanes) = if scalar {
+            let (fmt, esize, lanes) = if size == 0 {
+                (
+                    H,
+                    16,
+                    if scalar {
+                        1
+                    } else if q {
+                        8
+                    } else {
+                        4
+                    },
+                )
+            } else if scalar {
                 if sz == 1 { (D, 64, 1) } else { (S, 32, 1) }
             } else {
                 let Some(x) = fp_vec(q, sz) else {
@@ -1376,11 +1475,14 @@ impl Aarch64Interp {
                 };
                 x
             };
-            if sz == 1 && l == 1 {
+            if size == 3 && l == 1 {
                 return Step::Illegal;
             }
-            let index = if sz == 1 { h } else { (h << 1) | l };
-            let rm = reg_field(instr, 16);
+            let (index, rm) = match size {
+                0 => ((h << 2) | (l << 1) | m_bit, ((instr >> 16) & 0xf) as usize),
+                2 => ((h << 1) | l, reg_field(instr, 16)),
+                _ => (h, reg_field(instr, 16)),
+            };
             let b = elem(self.v[rm], index, esize);
             let (n, d) = (self.v[rn], self.v[rd]);
             let sign = 1u64 << (esize - 1);
@@ -1668,6 +1770,18 @@ impl Aarch64Interp {
         };
         Step::Next
     }
+}
+
+/// `Reduce` for the FP min/max across-lanes ops: a balanced tree of pairwise
+/// operations, as the ARM ARM defines (it matters for NaN propagation).
+fn reduce_minmax(vals: &[u64], max: bool, num: bool, fmt: Fmt, env: &mut fpu::Env) -> u64 {
+    if vals.len() == 1 {
+        return vals[0];
+    }
+    let (lo, hi) = vals.split_at(vals.len() / 2);
+    let a = reduce_minmax(lo, max, num, fmt, env);
+    let b = reduce_minmax(hi, max, num, fmt, env);
+    fpu::max_min(a, b, max, num, fmt, env)
 }
 
 /// `AdvSIMDExpandImm`: the 64-bit pattern for a modified-immediate `op`/

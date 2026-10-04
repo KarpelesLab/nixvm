@@ -428,7 +428,8 @@ impl Aarch64Interp {
                     return Some(Step::Illegal);
                 }
                 let (fmt, esize, index) = match size {
-                    2 if l == 0 && q => (S, 32u32, h),
+                    1 if q || h == 0 => (super::fpu::H, 16u32, (h << 1) | l),
+                    2 if l == 0 && q => (S, 32, h),
                     _ => return Some(Step::Illegal),
                 };
                 let rm = reg_field(instr, 16);
@@ -520,6 +521,7 @@ impl Aarch64Interp {
 /// The FP format of `FCMLA`/`FCADD`: half (FP16), single, or double (`Q`).
 fn fcma_fmt(size: u32, q: bool) -> Option<(Fmt, u32)> {
     match size {
+        1 => Some((super::fpu::H, 16)),
         2 => Some((S, 32)),
         3 if q => Some((D, 64)),
         _ => None,

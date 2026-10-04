@@ -350,6 +350,15 @@ impl Aarch64Interp {
         let rn = reg_field(instr, 5);
         let rt = reg_field(instr, 0);
         let addr = self.read_sp(rn);
+        let unallocated = match (o2, o1) {
+            (1, 0) => o0 == 0,                                             // LDLAR/STLLR
+            (1, 1) => rt2 != 31,                                           // CAS
+            (0, 1) if size < 2 => rs & 1 != 0 || rt & 1 != 0 || rt2 != 31, // CASP
+            _ => false,
+        };
+        if unallocated {
+            return Step::Illegal;
+        }
         // Ordered/atomic accesses must not cross a 16-byte boundary (FEAT_LSE2
         // single-copy atomicity; real cores raise an alignment fault).
         let bytes = if o1 == 1 && (o2 == 1 || size < 2) {
@@ -459,6 +468,9 @@ impl Aarch64Interp {
         let rt = reg_field(instr, 0);
         let imm9 = sign_extend(u64::from((instr >> 12) & 0x1ff), 9);
         let addr = self.read_sp(reg_field(instr, 5)).wrapping_add(imm9 as u64);
+        if opc >= 2 && (size == 3 || (size == 2 && opc == 3)) {
+            return Step::Illegal;
+        }
         if crosses_granule(addr, 1 << size) {
             return Step::Fault {
                 addr,
@@ -497,9 +509,16 @@ impl Aarch64Interp {
         let rt = reg_field(instr, 0);
         let o3 = (instr >> 15) & 1;
         let opc = (instr >> 12) & 7;
+        let ldapr = o3 == 1 && opc == 0b100 && (instr >> 22) & 3 == 0b10 && rs == 31;
+        if o3 == 1 && opc != 0 && !ldapr {
+            return Step::Illegal; // LD64B/ST64B, …
+        }
         let addr = self.read_sp(rn);
         if crosses_granule(addr, nbytes as u64) {
-            return Step::Fault { addr, write: true };
+            return Step::Fault {
+                addr,
+                write: !ldapr,
+            };
         }
         match (o3, opc) {
             (0, _) => self.ld_op(addr, nbytes, rs, rt, opc, mem),

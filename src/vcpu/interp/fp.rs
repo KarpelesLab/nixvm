@@ -13,12 +13,13 @@
 use super::fpu::{self, D, Fmt, H, Rounding, S};
 use super::{Aarch64Interp, Flags, Step, reg_field};
 
-/// The scalar format selected by an FP `ftype` field, if Armv8.0 arithmetic
-/// supports it (single or double).
+/// The scalar format selected by an FP `ftype` field: single, double, or
+/// half (FEAT_FP16).
 pub(super) fn arith_fmt(ftype: u32) -> Option<Fmt> {
     match ftype {
         0b00 => Some(S),
         0b01 => Some(D),
+        0b11 => Some(H),
         _ => None,
     }
 }
@@ -266,7 +267,7 @@ impl Aarch64Interp {
                 fpu::round_int(a, mode, exact, fmt, &mut env)
             }
             // FRINT32Z/FRINT32X/FRINT64Z/FRINT64X (FEAT_FRINTTS)
-            0b010000..=0b010011 => {
+            0b010000..=0b010011 if fmt != H => {
                 let mode = if opcode & 1 == 0 {
                     Rounding::Zero
                 } else {
@@ -337,10 +338,11 @@ impl Aarch64Interp {
                 self.set_vreg(rd, r, fmt);
             }
             (0b00, 0b110 | 0b111) => {
-                // FMOV Wd<->Sn / Xd<->Dn (half precision needs FEAT_FP16).
+                // FMOV Wd<->Sn / Xd<->Dn, and Wd/Xd<->Hn (FEAT_FP16).
                 let fmt = match (sf, ftype) {
                     (false, 0b00) => S,
                     (true, 0b01) => D,
+                    (_, 0b11) => H,
                     _ => return Step::Illegal,
                 };
                 if opcode == 0b110 {

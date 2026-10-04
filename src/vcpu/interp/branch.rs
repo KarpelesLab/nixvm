@@ -253,6 +253,8 @@ impl Aarch64Interp {
             ID_AA64ISAR0_EL1 => ID_AA64ISAR0_EL1_VAL,
             ID_AA64DFR0_EL1 => ID_AA64DFR0_EL1_VAL,
             ID_AA64MMFR0_EL1 => ID_AA64MMFR0_EL1_VAL,
+            ID_AA64ISAR1_EL1 => ID_AA64ISAR1_EL1_VAL,
+            ID_AA64MMFR2_EL1 => ID_AA64MMFR2_EL1_VAL,
             // The rest of the ID space (op0=3, op1=0, CRn=0, CRm=1..7) reads
             // as zero: AArch32 ID registers (no AArch32 at EL0), and the
             // AArch64 ones whose every user-visible field is "not
@@ -268,8 +270,8 @@ impl Aarch64Interp {
             NZCV => self.flags = Flags::from_nzcv((value >> 28) as u32),
             DIT => self.dit = (value >> 24) & 1 == 1,
             // FPCR: only the fields this CPU implements are writable (AHP, DN,
-            // FZ, RMode; FZ16 and the trap enables are RES0 without FEAT_FP16
-            // / trapping support).
+            // FZ, RMode, FZ16; the trap enables are RES0 without trapping
+            // support).
             FPCR => self.fpcr = value & FPCR_WRITABLE,
             FPSR => self.fpsr = value & FPSR_WRITABLE,
             TPIDR_EL0 => self.tpidr = value,
@@ -300,10 +302,12 @@ const ID_AA64PFR0_EL1: u32 = sysreg(3, 0, 0, 4, 0);
 const ID_AA64DFR0_EL1: u32 = sysreg(3, 0, 0, 5, 0);
 const ID_AA64ISAR0_EL1: u32 = sysreg(3, 0, 0, 6, 0);
 const ID_AA64MMFR0_EL1: u32 = sysreg(3, 0, 0, 7, 0);
+const ID_AA64ISAR1_EL1: u32 = sysreg(3, 0, 0, 6, 1);
+const ID_AA64MMFR2_EL1: u32 = sysreg(3, 0, 0, 7, 2);
 
 /// `FPCR` bits with an effect on this CPU: `AHP`(26) `DN`(25) `FZ`(24)
-/// `RMode`(23:22).
-const FPCR_WRITABLE: u64 = 0x07C0_0000;
+/// `RMode`(23:22) `FZ16`(19).
+const FPCR_WRITABLE: u64 = 0x07C8_0000;
 /// `FPSR`: `QC`(27), `IDC`(7) and the cumulative `IXC`/`UFC`/`OFC`/`DZC`/
 /// `IOC` (4:0); everything else is RES0 in AArch64.
 const FPSR_WRITABLE: u64 = 0x0800_009F;
@@ -326,12 +330,21 @@ const DC_ZVA_BLOCK_BYTES: u64 = 64;
 /// 1 GHz: `CNTVCT_EL0` ticks once per read, so the rate is nominal.
 const CNTFRQ_EL0_VAL: u64 = 1_000_000_000;
 /// `ID_AA64ISAR0_EL1` (Linux's sanitised EL0 view): `AES`=2 (AES + PMULL),
-/// `SHA1`=1, `SHA2`=1 (SHA-256), `CRC32`=1, `Atomic`=2 (LSE). Must agree with
-/// `HWCAP_AARCH64` in the loader.
-const ID_AA64ISAR0_EL1_VAL: u64 = 0x0021_1120;
-/// `ID_AA64PFR0_EL1`: `EL0`=`EL1`=1 (AArch64 only), `FP`=`AdvSIMD`=0
-/// (implemented, without half-precision arithmetic).
-const ID_AA64PFR0_EL1_VAL: u64 = 0x0000_0011;
+/// `SHA1`=1, `SHA2`=2 (SHA-256 + SHA-512), `CRC32`=1, `Atomic`=2 (LSE),
+/// `RDM`=1, `SHA3`=1, `DP`=1, `FHM`=1, `TS`=2 (FlagM + FlagM2); SM3/SM4,
+/// TME, TLB and RNDR absent. Must agree with `HWCAP_AARCH64`/`HWCAP2_AARCH64`
+/// in the loader.
+const ID_AA64ISAR0_EL1_VAL: u64 = 0x0021_1001_1021_2120;
+/// `ID_AA64ISAR1_EL1`: `DPB`=2 (DC CVAP + CVADP), `JSCVT`=1, `FCMA`=1,
+/// `LRCPC`=2 (LDAPR + LDAPUR/STLUR), `FRINTTS`=1, `SB`=1, `BF16`=1,
+/// `I8MM`=1; no pointer authentication.
+const ID_AA64ISAR1_EL1_VAL: u64 = 0x0010_1011_0021_1002;
+/// `ID_AA64PFR0_EL1`: `EL0`=`EL1`=1 (AArch64 only), `FP`=`AdvSIMD`=1
+/// (with half-precision arithmetic), `DIT`=1.
+const ID_AA64PFR0_EL1_VAL: u64 = 0x0001_0000_0011_0011;
+/// `ID_AA64MMFR2_EL1`: `AT`=1 — LSE2's unaligned single-copy atomicity
+/// (`HWCAP_USCAT`).
+const ID_AA64MMFR2_EL1_VAL: u64 = 1 << 32;
 /// `ID_AA64DFR0_EL1`: Linux exposes only `DebugVer`, as its safe value 6
 /// (Armv8 debug).
 const ID_AA64DFR0_EL1_VAL: u64 = 0x6;

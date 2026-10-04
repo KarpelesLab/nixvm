@@ -543,6 +543,9 @@ fn rand_state(rng: &mut Rng, pc: u64) -> A64State {
     if rng.chance(20) {
         fpcr |= 1 << 26; // AHP
     }
+    if rng.chance(20) {
+        fpcr |= 1 << 19; // FZ16
+    }
     s.fpcr = fpcr;
     s.fpsr = match rng.below(4) {
         0 | 1 => 0,

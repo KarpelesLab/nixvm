@@ -436,7 +436,7 @@ impl Vcpu for Aarch64Interp {
         }
         let word = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
         self.fpsr = u64::from(word(0)) & 0x0800_009F;
-        self.fpcr = u64::from(word(4)) & 0x07C0_0000;
+        self.fpcr = u64::from(word(4)) & 0x07C8_0000;
         for (i, v) in self.v.iter_mut().enumerate() {
             let off = 8 + i * 16;
             *v = u128::from_le_bytes(bytes[off..off + 16].try_into().unwrap());
@@ -2613,10 +2613,13 @@ mod tests {
             assert!(matches!(c.exec(word, &mut m), Step::Next));
             c.x[0]
         };
-        // AES=2 (with PMULL), SHA1=1, SHA2=1, CRC32=1, Atomic=2.
-        assert_eq!(mrs(0xD538_0600), 0x0021_1120); // id_aa64isar0_el1
-        assert_eq!(mrs(0xD538_0620), 0); // id_aa64isar1_el1
-        assert_eq!(mrs(0xD538_0400), 0x11); // id_aa64pfr0_el1
+        // AES=2 (with PMULL), SHA1=1, SHA2=2, CRC32=1, Atomic=2, RDM, SHA3,
+        // DP, FHM, TS=2.
+        assert_eq!(mrs(0xD538_0600), 0x0021_1001_1021_2120); // id_aa64isar0_el1
+        // DPB=2, JSCVT, FCMA, LRCPC=2, FRINTTS, SB, BF16, I8MM.
+        assert_eq!(mrs(0xD538_0620), 0x0010_1011_0021_1002); // id_aa64isar1_el1
+        assert_eq!(mrs(0xD538_0400), 0x0001_0000_0011_0011); // id_aa64pfr0_el1
+        assert_eq!(mrs(0xD538_0740), 1 << 32); // id_aa64mmfr2_el1: AT (LSE2)
         assert_eq!(mrs(0xD538_0000), 0x410F_D0C0); // midr_el1
         assert_eq!(mrs(0xD538_0700), 0xFF00_0000); // id_aa64mmfr0_el1
         assert_eq!(mrs(0xD53B_00E0), 4); // dczid_el0: 64-byte DC ZVA
@@ -2653,7 +2656,7 @@ mod tests {
         c.x[1] = u64::MAX;
         c.exec(0xD51B_4401, &mut m); // msr fpcr, x1
         c.exec(0xD53B_4402, &mut m); // mrs x2, fpcr
-        assert_eq!(c.x[2], 0x07C0_0000);
+        assert_eq!(c.x[2], 0x07C8_0000);
         c.exec(0xD51B_4421, &mut m); // msr fpsr, x1
         c.exec(0xD53B_4422, &mut m); // mrs x2, fpsr
         assert_eq!(c.x[2], 0x0800_009F);
