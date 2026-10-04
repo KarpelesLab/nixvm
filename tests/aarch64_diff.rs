@@ -767,6 +767,18 @@ impl Report {
     }
 }
 
+/// `FJCVTZS` of a nonzero subnormal flushed by `FPCR.FZ`: the current Arm
+/// ARM's `FPToFixedJS` reports it inexact (`Z = 0`, as the interpreter and
+/// an M4 do), but earlier silicon (the M1 GitHub's macOS runners use) sets
+/// `Z = 1`, as the original pseudocode did. Only `Z` may differ.
+fn fjcvtzs_flushed_z(word: u32, input: &A64State) -> bool {
+    let d = input.v[((word >> 5) & 0x1f) as usize] as u64;
+    word & 0xffff_fc00 == 0x1e7e_0000
+        && input.fpcr & (1 << 24) != 0
+        && d & 0x7ff0_0000_0000_0000 == 0
+        && d & 0x000f_ffff_ffff_ffff != 0
+}
+
 fn diff_states(
     word: u32,
     asm: &str,
@@ -792,7 +804,7 @@ fn diff_states(
             input.sp, nat.sp, emu.sp
         );
     }
-    if nat.nzcv != emu.nzcv {
+    if nat.nzcv != emu.nzcv && !fjcvtzs_flushed_z(word, input) {
         let _ = writeln!(
             out,
             "  nzcv: in={:x} native={:x} interp={:x}",
