@@ -17,22 +17,6 @@ use nixvm::vcpu::GuestMemory;
 use nixvm::vcpu::interp::InterpBackend;
 use nixvm::vcpu::mem::PAGE_SIZE;
 
-/// Read an entire file out of the mount table (for the dynamic linker lookup).
-fn read_mount_file(mounts: &mut MountTable, path: &str) -> Option<Vec<u8>> {
-    let size = mounts.stat(path)?.size as usize;
-    let mut buf = vec![0u8; size];
-    let mut off = 0;
-    while off < size {
-        match mounts.read_at(path, off as u64, &mut buf[off..]) {
-            Ok(0) => break,
-            Ok(n) => off += n,
-            Err(_) => return None,
-        }
-    }
-    buf.truncate(off);
-    Some(buf)
-}
-
 const GUEST_BASE: u64 = 0x1_0000;
 const MEM_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -85,7 +69,7 @@ fn main() {
     let spec = ProcessSpec { argv, envp };
     let loaded = if let Some(interp) = interp_path(&elf) {
         eprintln!("run-elf: dynamic executable, interpreter {interp}");
-        let Some(interp_elf) = read_mount_file(&mut mounts, &interp) else {
+        let Some(interp_elf) = mounts.read_file(&interp) else {
             eprintln!("run-elf: interpreter {interp} not found in the root");
             std::process::exit(1);
         };

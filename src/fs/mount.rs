@@ -115,6 +115,47 @@ impl MountTable {
         Some((self.mounts[i].fs.as_mut(), rel))
     }
 
+    /// `abs_path` with its final component's symlink chain followed — inside
+    /// this mount table, so an absolute target (`/bin/sh -> /bin/busybox`)
+    /// resolves against the guest root, never the host's. `None` for a loop
+    /// (more than 40 hops) or a dangling intermediate link.
+    pub fn follow(&mut self, abs_path: &str) -> Option<String> {
+        let mut p = normalize(abs_path);
+        for _ in 0..SYMLINK_MAX {
+            match self.stat(&p) {
+                Some(a) if a.kind == NodeKind::Symlink => {
+                    let target = self.readlink(&p).ok()?;
+                    p = if target.starts_with('/') {
+                        normalize(&target)
+                    } else {
+                        let dir = p.rfind('/').map_or("", |i| &p[..i]);
+                        normalize(&format!("{dir}/{target}"))
+                    };
+                }
+                _ => return Some(p),
+            }
+        }
+        None
+    }
+
+    /// Read a whole file, following symlinks as [`Self::follow`] does — how
+    /// the host side loads the initial program and its dynamic linker.
+    pub fn read_file(&mut self, abs_path: &str) -> Option<Vec<u8>> {
+        let path = self.follow(abs_path)?;
+        let size = self.stat(&path)?.size as usize;
+        let mut buf = vec![0u8; size];
+        let mut off = 0;
+        while off < size {
+            match self.read_at(&path, off as u64, &mut buf[off..]) {
+                Ok(0) => break,
+                Ok(n) => off += n,
+                Err(_) => return None,
+            }
+        }
+        buf.truncate(off);
+        Some(buf)
+    }
+
     pub fn stat(&mut self, abs_path: &str) -> Option<Attrs> {
         let (fs, rel) = self.resolve(abs_path)?;
         fs.stat(&rel)

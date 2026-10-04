@@ -61,9 +61,7 @@ fn x86_64_programs_run() {
             .mem_bytes(1 << 30)
             .env("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
             .env("HOME=/work")
-            // (`/bin/sh` is an absolute symlink, which the host-side ELF load
-            // of the initial command doesn't resolve inside the root.)
-            .command(["/bin/busybox", "sh", "-c", cmd])
+            .command(["/bin/sh", "-c", cmd])
             .run();
         let ok = match &status {
             Ok(code) => (*code == 0) != expect_fail,

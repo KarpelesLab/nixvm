@@ -91,8 +91,14 @@ pub struct Config {
     pub ncpus: usize,
     /// Guest memory ceiling in bytes.
     pub mem_bytes: u64,
-    /// Guest architecture (defaults to the host's native arch).
+    /// Guest architecture (defaults to the host's native arch). Unless set
+    /// explicitly ([`Config::arch_explicit`]), the PID-1 binary's ELF header
+    /// decides: an x86-64 root runs as x86-64 on any host.
     pub arch: Arch,
+    /// Whether [`Config::arch`] was chosen explicitly
+    /// ([`SandboxBuilder::arch`]); then a PID-1 binary for another
+    /// architecture is an error instead of switching the guest arch.
+    pub arch_explicit: bool,
     /// Force the software interpreter instead of the best hardware backend.
     /// Used by CI, the browser (wasm) target, and for portability.
     pub prefer_interp: bool,
@@ -144,6 +150,7 @@ impl Default for SandboxBuilder {
                     .map_or(1, |n| n.max(1)),
                 mem_bytes: DEFAULT_MEM_BYTES,
                 arch,
+                arch_explicit: false,
                 prefer_interp: false,
                 binds: Vec::new(),
                 env: Vec::new(),
@@ -257,10 +264,13 @@ impl SandboxBuilder {
         self
     }
 
-    /// Set the guest architecture.
+    /// Set the guest architecture (and the default root image's). Without
+    /// this, the architecture follows the PID-1 binary's ELF header.
     #[must_use]
     pub fn arch(mut self, arch: Arch) -> Self {
         self.config.arch = arch;
+        self.config.arch_explicit = true;
+        self.config.image.arch = arch;
         self
     }
 
@@ -310,13 +320,13 @@ impl Sandbox {
         preconfigure(&mut mounts);
 
         let (path, argv) = self.pid1_program(&mut mounts);
-        let elf = read_mount_file(&mut mounts, &path).ok_or_else(|| {
+        let elf = mounts.read_file(&path).ok_or_else(|| {
             Error::Config(format!(
                 "cannot read PID 1 `{path}` from the guest root (is the root populated?)"
             ))
         })?;
 
-        let arch = self.config.arch;
+        let arch = self.guest_arch(&elf, &path)?;
         let mut mem = GuestMemory::new_split(
             GUEST_BASE,
             GUEST_VSIZE,
@@ -328,7 +338,7 @@ impl Sandbox {
         };
         // Dynamic executables name their linker in PT_INTERP; load it alongside.
         let img = if let Some(interp) = interp_path(&elf) {
-            let interp_elf = read_mount_file(&mut mounts, &interp).ok_or_else(|| {
+            let interp_elf = mounts.read_file(&interp).ok_or_else(|| {
                 Error::Config(format!(
                     "{path}: dynamic linker `{interp}` not found in the guest root"
                 ))
@@ -341,7 +351,7 @@ impl Sandbox {
         };
         let mid = page_align_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
 
-        let backend = self.backend()?;
+        let backend = self.backend(arch)?;
         let vcpu = backend.new_vcpu(img.entry, img.stack_pointer)?;
 
         let mut kernel = Kernel::new(arch, mounts);
@@ -428,7 +438,7 @@ impl Sandbox {
     /// the target binary out of the guest root. Exposed now so it's testable
     /// and embeddable ahead of that.
     pub fn exec_elf(&self, elf: &[u8]) -> Result<i32, Error> {
-        let arch = self.config.arch;
+        let arch = self.guest_arch(elf, "ELF image")?;
         let mut mem = GuestMemory::new_split(
             GUEST_BASE,
             GUEST_VSIZE,
@@ -451,7 +461,7 @@ impl Sandbox {
         // meeting at a midpoint so the two arenas can't collide.
         let mid = page_align_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
 
-        let backend = self.backend()?;
+        let backend = self.backend(arch)?;
         let vcpu = backend.new_vcpu(img.entry, img.stack_pointer)?;
 
         let mut kernel = Kernel::new(arch, self.build_mounts()?);
@@ -468,11 +478,29 @@ impl Sandbox {
 
     /// Select the execution backend per config: the interpreter when forced,
     /// otherwise the best hardware backend for the host.
-    fn backend(&self) -> Result<Box<dyn Backend>, Error> {
+    fn backend(&self, arch: Arch) -> Result<Box<dyn Backend>, Error> {
         if self.config.prefer_interp {
-            Ok(Box::new(InterpBackend::new(self.config.arch)?))
+            Ok(Box::new(InterpBackend::new(arch)?))
         } else {
-            Ok(vcpu::select(self.config.arch)?)
+            Ok(vcpu::select(arch)?)
+        }
+    }
+
+    /// The guest architecture for PID 1's `elf`: its ELF machine, unless the
+    /// configuration fixed one explicitly — then a mismatch is an error (an
+    /// x86-64 binary can't run as an aarch64 guest). An unrecognised header
+    /// keeps the configured arch (the loader reports the real problem).
+    fn guest_arch(&self, elf: &[u8], what: &str) -> Result<Arch, Error> {
+        match Arch::from_elf(elf) {
+            Some(a) if a != self.config.arch && self.config.arch_explicit => {
+                Err(Error::Config(format!(
+                    "{what} is an {} binary, but the guest architecture is set to {}",
+                    a.as_str(),
+                    self.config.arch.as_str()
+                )))
+            }
+            Some(a) => Ok(a),
+            None => Ok(self.config.arch),
         }
     }
 
@@ -612,22 +640,6 @@ fn preconfigure(mounts: &mut MountTable) {
     }
 }
 
-/// Read an entire file out of the mount table (PID-1 binary lookup).
-fn read_mount_file(mounts: &mut MountTable, path: &str) -> Option<Vec<u8>> {
-    let size = mounts.stat(path)?.size as usize;
-    let mut buf = vec![0u8; size];
-    let mut off = 0;
-    while off < size {
-        match mounts.read_at(path, off as u64, &mut buf[off..]) {
-            Ok(0) => break,
-            Ok(n) => off += n,
-            Err(_) => return None,
-        }
-    }
-    buf.truncate(off);
-    Some(buf)
-}
-
 fn round_up_page(v: u64) -> u64 {
     v.div_ceil(PAGE_SIZE) * PAGE_SIZE
 }
@@ -733,6 +745,53 @@ mod tests {
             code, 42,
             "PID 1 read from the root and run to its exit code"
         );
+    }
+
+    /// PID 1 named through an *absolute* symlink (`/bin/sh -> /bin/busybox`)
+    /// resolves inside the guest root, not on the host.
+    #[cfg(unix)]
+    #[test]
+    fn pid1_through_an_absolute_symlink_resolves_in_the_root() {
+        let dir = temp_root("symlink");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/real"), build_exit_elf(42)).unwrap();
+        std::os::unix::fs::symlink("/bin/real", dir.join("bin/sh")).unwrap();
+        let code = Sandbox::builder()
+            .prefer_interp(true)
+            .root_dir(&dir)
+            .command(["/bin/sh"])
+            .run()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(code, 42);
+    }
+
+    /// Without `.arch()`, the guest arch follows PID 1's ELF header; pinning
+    /// a different one is a clear error.
+    #[cfg(unix)]
+    #[test]
+    fn guest_arch_follows_the_elf_unless_pinned() {
+        let dir = temp_root("arch");
+        std::fs::write(dir.join("init"), build_exit_elf(7)).unwrap();
+        let code = Sandbox::builder()
+            .prefer_interp(true)
+            .root_dir(&dir)
+            .command(["/init"])
+            .run()
+            .unwrap();
+        assert_eq!(code, 7, "an aarch64 PID 1 runs as aarch64 on any host");
+        let err = Sandbox::builder()
+            .arch(Arch::X86_64)
+            .prefer_interp(true)
+            .root_dir(&dir)
+            .command(["/init"])
+            .run()
+            .unwrap_err();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(matches!(err, Error::Config(m) if m.contains("aarch64 binary")));
+        assert_eq!(Arch::from_name("AMD64"), Some(Arch::X86_64));
+        assert_eq!(Arch::from_name("arm64"), Some(Arch::Aarch64));
+        assert_eq!(Arch::from_name("riscv64"), None);
     }
 
     #[cfg(unix)]

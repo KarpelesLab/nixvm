@@ -5,14 +5,14 @@
 //! later phase. Usage:
 //!
 //! ```text
-//! nixvm run [--mem <bytes>] [--workdir <dir>] -- <cmd> [args...]
+//! nixvm run [--mem <bytes>] [--workdir <dir>] [--root <dir>] [--arch <arch>] -- <cmd> [args...]
 //! nixvm shell
 //! nixvm version
 //! ```
 
 use std::process::ExitCode;
 
-use nixvm::Sandbox;
+use nixvm::{Arch, Sandbox};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -66,6 +66,14 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 builder = builder.root_dir(dir);
                 i += 2;
             }
+            Some("--arch") => {
+                let Some(arch) = args.get(i + 1).and_then(|s| Arch::from_name(s)) else {
+                    eprintln!("nixvm: --arch needs aarch64 (arm64) or x86_64 (amd64)");
+                    return ExitCode::FAILURE;
+                };
+                builder = builder.arch(arch);
+                i += 2;
+            }
             Some("--env" | "-e") => {
                 let Some(kv) = args.get(i + 1) else {
                     eprintln!("nixvm: --env needs KEY=VALUE");
@@ -109,11 +117,13 @@ fn print_usage() {
     eprintln!(
         "nixvm — a portable Linux syscall sandbox\n\n\
          USAGE:\n    \
-         nixvm run [--mem <size>] [--workdir <dir>] [--root <dir>]\n              \
+         nixvm run [--mem <size>] [--workdir <dir>] [--root <dir>] [--arch <arch>]\n              \
                    [--env KEY=VAL]... -- <cmd> [args...]\n    \
          nixvm shell\n    \
          nixvm version\n\n\
          The current directory is exposed inside the sandbox at /work.\n\
-         --root uses an extracted host rootfs directory as the guest root."
+         --root uses an extracted host rootfs directory as the guest root.\n\
+         The guest architecture follows the command's ELF binary (an x86_64\n\
+         root runs as x86_64 on any host); --arch aarch64|x86_64 pins it."
     );
 }
