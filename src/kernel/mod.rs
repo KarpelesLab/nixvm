@@ -31,6 +31,7 @@ mod attrs;
 pub mod egress;
 mod fd;
 mod fs_ext;
+mod ipc;
 mod mem_syscalls;
 mod net;
 mod path;
@@ -269,6 +270,9 @@ struct ProcInfo {
     /// Capability sets `[effective, permitted, inheritable]` after a
     /// `capset`; `None` = the default for the task's uid (see `attrs.rs`).
     caps: Option<[u64; 3]>,
+    /// The System V semaphore this task is parked on in `semop`:
+    /// `(semid, semnum, waiting-for-zero)` — what `GETNCNT`/`GETZCNT` count.
+    sem_wait: Option<(i32, u16, bool)>,
 }
 
 /// The subset of `siginfo_t` a queued/sent signal carries beyond its number,
@@ -352,6 +356,7 @@ impl Default for ProcInfo {
             personality: 0,
             robust_list: 0,
             caps: None,
+            sem_wait: None,
             creds: Creds::default(),
             sched_policy: 0, // SCHED_OTHER
             sched_priority: 0,
@@ -1262,6 +1267,8 @@ pub(super) struct Shared {
     /// `membarrier` registrations per address space (`MEMBARRIER_CMD_REGISTER_*`
     /// bits).
     membarrier: BTreeMap<usize, u64>,
+    /// The System V IPC namespace (message queues, semaphores, shared memory).
+    ipc: ipc::Ipc,
 }
 
 // The SMP scheduler ([`Kernel::schedule_smp`]) shares `&Kernel` across its worker
@@ -1527,6 +1534,7 @@ impl Kernel {
                 domainname: "(none)".to_string(),
                 sealed: Vec::new(),
                 membarrier: BTreeMap::new(),
+                ipc: ipc::Ipc::default(),
             }),
         }
     }
@@ -3229,6 +3237,19 @@ impl Kernel {
             Sysno::TimerGettime => self.sys_timer_gettime(sh, cx, args[0], args[1], mem),
             Sysno::TimerGetoverrun => self.sys_timer_getoverrun(sh, cx, args[0]),
             Sysno::TimerDelete => self.sys_timer_delete(sh, cx, args[0]),
+            // System V IPC (see `ipc.rs`).
+            Sysno::Msgget => self.sys_msgget(sh, cx, args[0], args[1]),
+            Sysno::Msgsnd => self.sys_msgsnd(sh, cx, args, mem),
+            Sysno::Msgrcv => self.sys_msgrcv(sh, cx, args, mem),
+            Sysno::Msgctl => self.sys_msgctl(sh, cx, args[0], args[1], args[2], mem),
+            Sysno::Semget => self.sys_semget(sh, cx, args[0], args[1], args[2]),
+            Sysno::Semop => self.sys_semtimedop(sh, cx, args, 0, mem),
+            Sysno::Semtimedop => self.sys_semtimedop(sh, cx, args, args[3], mem),
+            Sysno::Semctl => self.sys_semctl(sh, cx, args, mem),
+            Sysno::Shmget => self.sys_shmget(sh, cx, args[0], args[1], args[2], mem),
+            Sysno::Shmat => self.sys_shmat(sh, cx, args[0], args[1], args[2], mem),
+            Sysno::Shmdt => self.sys_shmdt(sh, cx, args[0], mem),
+            Sysno::Shmctl => self.sys_shmctl(sh, cx, args[0], args[1], args[2], mem),
             // Cross-process: pidfds, kcmp, process_vm_* (see `procx.rs`).
             Sysno::PidfdOpen => self.sys_pidfd_open(sh, cx, args[0], args[1]),
             Sysno::PidfdSendSignal => {
@@ -3823,6 +3844,8 @@ impl Kernel {
                 .map(|&(_, a, b)| (child_mm, a, b))
                 .collect();
             sh.sealed.extend(seals);
+            // ...as are SysV shared-memory attachments (the pages alias).
+            sh.ipc.fork_mm(cx.cur.mm, child_mm);
             // A forked address space inherits the parent's arena position (its
             // pages were copied); `CLONE_VM` threads instead share the parent's
             // `mmap_areas[mm]` entry and never reach here.
@@ -4041,6 +4064,8 @@ impl Kernel {
         let mm = cx.cur.mm;
         sh.sealed.retain(|s| s.0 != mm);
         sh.membarrier.remove(&mm);
+        // execve detaches every SysV shared-memory segment.
+        sh.ipc.detach_mm(mm, mem);
         // Writable shared file mappings die with the old image: flush them to
         // their files now (their bytes are the source of truth) and forget them,
         // or the exit-time flush would write whatever the *new* image later
@@ -4658,7 +4683,20 @@ impl Kernel {
         // (page tables + private data pages), so a long-lived process tree does
         // not accumulate dead processes' frames. Threads sharing the mm keep it.
         if !self.has_cowaiter(sh, mm) {
+            sh.ipc.detach_mm(mm, mem);
             mem.release();
+        }
+        // The thread group's last task applies its SEM_UNDO adjustments (and
+        // wakes anyone those unblock).
+        let tgid = cx.cur.tgid;
+        if !sh
+            .procs
+            .iter()
+            .flatten()
+            .any(|p| p.info.tgid == tgid && !matches!(p.info.run, RunState::Zombie(_)))
+            && sh.ipc.exit_group(tgid)
+        {
+            sh.unpark_all();
         }
         cx.cur.run = RunState::Zombie(cause);
         // The signal a terminating child sends its parent. A plain fork uses
@@ -7600,6 +7638,8 @@ impl Kernel {
             self.flush_shared_maps(&mut vfs, cx, base, len, mem);
         }
         let _ = mem.unmap(base, len);
+        // Unmapping a SysV shared-memory attachment detaches it.
+        sh.ipc.unmapped(cx.cur.mm, base, len, mem);
         // Give the range back to the arena so it can be handed out again — a
         // guest that cycles mappings (a JS engine's JIT/heap blocks) would
         // otherwise exhaust the arena while most of it sat free.

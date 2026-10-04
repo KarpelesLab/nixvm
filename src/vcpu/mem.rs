@@ -432,6 +432,98 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// Allocate `n` zeroed frames from the shared pool for an owner that lives
+    /// outside any one address space — a SysV shared-memory segment — each
+    /// carrying one reference held by that owner (drop it with
+    /// [`Self::release_frames`]). All-or-nothing: on exhaustion every frame
+    /// taken so far is returned and `None` comes back.
+    #[must_use]
+    pub fn alloc_frames(&self, n: usize) -> Option<Vec<u64>> {
+        let mut fa = self.fa.lock().unwrap();
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            if let Some(f) = fa.alloc(&self.phys) {
+                out.push(f);
+            } else {
+                for f in out {
+                    fa.free(f);
+                }
+                return None;
+            }
+        }
+        Some(out)
+    }
+
+    /// Drop the owner's reference to each of `frames` (see
+    /// [`Self::alloc_frames`]); a frame still mapped somewhere lives on until
+    /// its last mapping goes.
+    pub fn release_frames(&self, frames: &[u64]) {
+        let mut fa = self.fa.lock().unwrap();
+        for &f in frames {
+            fa.free(f);
+        }
+    }
+
+    /// Read `buf.len()` bytes at byte `off` of the frame list `frames` (one
+    /// frame per page, as [`Self::alloc_frames`] returns) straight from the
+    /// pool, with no address space involved.
+    pub fn read_frames(&self, frames: &[u64], off: u64, buf: &mut [u8]) {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let cur = off + done as u64;
+            let Some(&frame) = frames.get((cur / PAGE_SIZE) as usize) else {
+                buf[done..].fill(0);
+                return;
+            };
+            let in_page = (cur % PAGE_SIZE) as usize;
+            let n = (buf.len() - done).min(PS - in_page);
+            self.phys
+                .read(frame + in_page as u64, &mut buf[done..done + n]);
+            done += n;
+        }
+    }
+
+    /// Map `frames` (one per page) at `addr` with `prot`, *sharing* them: each
+    /// page takes its own reference on its frame, is tagged shared like a
+    /// `MAP_SHARED | MAP_ANONYMOUS` page (writable at any refcount, aliased —
+    /// not copied — across `fork`), and gives the reference back on
+    /// `unmap`/`exec`/exit. This is how a SysV shared-memory segment
+    /// (`shmat`) appears in several address spaces at once: every attachment
+    /// points at the same physical frames. Any existing mapping in the range is
+    /// replaced.
+    pub fn map_frames(&mut self, addr: u64, frames: &[u64], prot: Prot) -> Result<(), MemError> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        let len = frames.len() as u64 * PAGE_SIZE;
+        let (first, last) = self.page_range(addr, len as usize)?;
+        let mut fa = self.fa.lock().unwrap();
+        for (i, p) in (first..=last).enumerate() {
+            let va = self.page_base(p);
+            if self.mapped[p]
+                && let Some(old) = self.space.unmap(va, &mut fa, &self.phys)
+            {
+                fa.free(old);
+                self.tlb_dirty = true;
+            }
+            let frame = frames[i];
+            fa.incref(frame);
+            match self.space.map(va, frame, prot, false, &mut fa, &self.phys) {
+                Ok(Some(old)) => fa.free(old),
+                Ok(None) => {}
+                Err(_) => {
+                    fa.free(frame);
+                    return Err(MemError::Host("frame pool exhausted".into()));
+                }
+            }
+            self.mapped[p] = true;
+            self.prot[p] = prot;
+            self.file_backed[p] = false;
+            self.shared_anon[p] = true;
+        }
+        Ok(())
+    }
+
     /// Ensure the page at `va` has a backing frame installed (demand paging): a
     /// no-op if already backed, otherwise a fresh zeroed frame with `prot`. Returns
     /// `false` only on pool exhaustion. Associated fn over the disjoint
