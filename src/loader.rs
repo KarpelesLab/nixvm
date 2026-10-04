@@ -96,8 +96,9 @@ const AT_EXECFN: u64 = 31;
 // dereference memory that isn't a valid ELF header.
 
 /// aarch64 `HWCAP` bits (`arch/arm64/include/uapi/asm/hwcap.h`) the loader
-/// advertises: the baseline float/SIMD/crypto/atomics set a modern
-/// `-mcpu=generic` musl/glibc build's startup code may probe for.
+/// advertises: exactly the features the software interpreter implements (each
+/// verified against hardware by `tests/aarch64_diff.rs`). Keep in sync with
+/// the `ID_AA64*` register values in `src/vcpu/interp/branch.rs`.
 const HWCAP_AARCH64: u64 = (1 << 0)   // FP
     | (1 << 1)   // ASIMD
     | (1 << 3)   // AES
@@ -105,7 +106,31 @@ const HWCAP_AARCH64: u64 = (1 << 0)   // FP
     | (1 << 5)   // SHA1
     | (1 << 6)   // SHA2
     | (1 << 7)   // CRC32
-    | (1 << 8); // ATOMICS
+    | (1 << 8)   // ATOMICS
+    | (1 << 9)   // FPHP
+    | (1 << 10)  // ASIMDHP
+    | (1 << 11)  // CPUID (EL0 reads of the ID registers are emulated)
+    | (1 << 12)  // ASIMDRDM
+    | (1 << 13)  // JSCVT
+    | (1 << 14)  // FCMA
+    | (1 << 15)  // LRCPC
+    | (1 << 16)  // DCPOP
+    | (1 << 17)  // SHA3
+    | (1 << 20)  // ASIMDDP
+    | (1 << 21)  // SHA512
+    | (1 << 23)  // ASIMDFHM
+    | (1 << 24)  // DIT
+    | (1 << 25)  // USCAT (LSE2)
+    | (1 << 26)  // ILRCPC
+    | (1 << 27)  // FLAGM
+    | (1 << 29); // SB
+
+/// aarch64 `HWCAP2` bits: `DCPODP`, `FLAGM2`, `FRINT`, `I8MM`, `BF16`.
+const HWCAP2_AARCH64: u64 = (1 << 0)  // DCPODP
+    | (1 << 7)   // FLAGM2
+    | (1 << 8)   // FRINT
+    | (1 << 13)  // I8MM
+    | (1 << 14); // BF16
 
 /// x86-64 `HWCAP` bits: the loader mirrors the low, universally-present
 /// subset of the CPUID leaf-1 `EDX` feature word the Linux kernel exposes via
@@ -123,8 +148,7 @@ const HWCAP_X86_64: u64 = (1 << 0)   // FPU
     | (1 << 25)  // SSE
     | (1 << 26); // SSE2
 
-/// No extended (`HWCAP2`) feature is emulated, so both arches report none —
-/// safer than claiming e.g. SVE2/MTE/AVX512 support the interpreter lacks.
+/// x86-64 reports no `HWCAP2` features.
 const HWCAP2_NONE: u64 = 0;
 
 /// The initial thread's stack *reservation* (its growth limit), clamped so a
@@ -671,14 +695,14 @@ fn seg_prot(flags: u32) -> Prot {
 
 // ---- initial stack -------------------------------------------------------
 
-/// `AT_HWCAP` mask and `AT_PLATFORM` string for `e_machine`. Defaults to
-/// aarch64 for any value other than `EM_X86_64` (in practice only
+/// `AT_HWCAP`/`AT_HWCAP2` masks and `AT_PLATFORM` string for `e_machine`.
+/// Defaults to aarch64 for any value other than `EM_X86_64` (in practice only
 /// `EM_AARCH64`, the only other machine `Ehdr::parse` accepts).
-fn arch_hints(machine: u16) -> (u64, &'static str) {
+fn arch_hints(machine: u16) -> (u64, u64, &'static str) {
     if machine == EM_X86_64 {
-        (HWCAP_X86_64, "x86_64")
+        (HWCAP_X86_64, HWCAP2_NONE, "x86_64")
     } else {
-        (HWCAP_AARCH64, "aarch64")
+        (HWCAP_AARCH64, HWCAP2_AARCH64, "aarch64")
     }
 }
 
@@ -726,7 +750,7 @@ fn build_stack(
     let initial = INITIAL_STACK_MAP.min(size);
     mem.map(top - initial, initial, Prot::rw())?;
 
-    let (hwcap, platform_name) = arch_hints(ehdr.machine);
+    let (hwcap, hwcap2, platform_name) = arch_hints(ehdr.machine);
 
     // String blob: argv, then envp, then the AT_PLATFORM name, each
     // NUL-terminated, placed high.
@@ -780,7 +804,7 @@ fn build_stack(
         (AT_GID, 0),
         (AT_EGID, 0),
         (AT_HWCAP, hwcap),
-        (AT_HWCAP2, HWCAP2_NONE),
+        (AT_HWCAP2, hwcap2),
         (AT_CLKTCK, 100),
         (AT_SECURE, 0),
         (AT_RANDOM, random_addr),
