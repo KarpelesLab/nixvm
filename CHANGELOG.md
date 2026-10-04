@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/KarpelesLab/nixvm/compare/v0.0.3...v0.0.4) - 2026-10-04
+
+### Other
+
+- resolve PID 1 symlinks inside the guest root; pick the guest arch from the ELF
+- XSAVE signal frames with the full extended state; Linux fault signals
+- Merge branch 'worktree-agent-a3b22575688121458'
+- x86 interpreter: RORX requires VEX.vvvv = 1111; coverage scan checks invalid encodings too
+- x86_diff covers the YMM state, VEX (AVX/AVX2/FMA/F16C/BMI) and XSAVE
+- x86 interpreter: x86-64-v3 — AVX, AVX2, FMA, F16C, BMI1/2, LZCNT, MOVBE, XSAVE
+- x86 interpreter: factor SSE lane math into pure helpers; exact f64 fast path near underflow
+- x86 interpreter: unit-test 0x67 addressing, 32-bit string registers, fs: RIP-relative
+- x86 interpreter: group-7 UMIP spoofing, prefix-tolerant group 15/MOVNTI/EMMS
+- x86_diff covers branches (Jcc/LOOPcc/JrCXZ/JMP) via skippable filler
+- x86 interpreter: cache the executing code page within a run
+- x86 interpreter: x86-64-v2 (SSE3, SSSE3, SSE4.1, SSE4.2) and an e2e program test
+- x86-64 differential tester against real execution (Rosetta 2)
+- x86 interpreter: complete baseline ISA, true 80-bit x87, MMX, SSE/SSE2
+- Make nginx run: directory symlinks, NEON/FP gaps, socket and epoll lifetimes
+- show the tunnel as tun0 in ip addr/ip route/ifconfig
+- getsockname on netlink sockets returns a full sockaddr_nl (fixes `ip addr`)
+- clicking the net address copies it; on/off moves to a separate ⏻ toggle
+
 ## [0.0.3](https://github.com/KarpelesLab/nixvm/compare/v0.0.2...v0.0.3) - 2026-10-03
 
 ### Other
