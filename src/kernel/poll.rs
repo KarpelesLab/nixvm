@@ -114,6 +114,12 @@ struct EpollWatch {
     /// `EPOLLONESHOT`: once an event is reported the watch is disabled until
     /// re-armed by `EPOLL_CTL_MOD`, so a fd is handed to exactly one waiter.
     disarmed: bool,
+    /// The process (tgid) whose fd table the watched number belongs to. A
+    /// forked child inherits the epoll fd, but closing *its* copy of a watched
+    /// fd must not drop the parent's registration (Linux keeps it while any
+    /// reference to the file is open) — Ruby's fork child closes the inherited
+    /// timer eventfd, which otherwise left the parent's timer thread deaf.
+    owner: i32,
 }
 
 /// One `epoll_create1` instance: fd -> interest, keyed by the watched fd
@@ -670,11 +676,14 @@ impl Kernel {
     /// when its file is closed; keyed by fd number here, a stale one would
     /// make the next `EPOLL_CTL_ADD` of a reused number fail with `EEXIST`
     /// (nginx's second connection) and report events for the wrong file.
+    /// Only this process's own registrations go: one made by the parent of a
+    /// fork (on the shared instance) names the parent's still-open file.
     pub(super) fn epoll_forget(&self, cx: &ServiceCtx, fd: i32) {
         let mut pf = self.pollfds.lock().unwrap();
         for f in cx.cur.fds.values() {
             if let Fd::Epoll(idx) = f
                 && let Some(ep) = pf.epolls.get_mut(*idx)
+                && ep.interest.get(&fd).is_some_and(|w| w.owner == cx.cur.tgid)
             {
                 ep.interest.remove(&fd);
             }
@@ -719,6 +728,7 @@ impl Kernel {
                         data,
                         last_level: 0,
                         disarmed: false,
+                        owner: cx.cur.tgid,
                     },
                 );
                 0
@@ -737,6 +747,7 @@ impl Kernel {
                         data,
                         last_level: 0,
                         disarmed: false,
+                        owner: cx.cur.tgid,
                     },
                 );
                 0
@@ -1676,6 +1687,47 @@ mod tests {
         assert_eq!(n, 1);
         assert_eq!(mem.read_u32(out).unwrap() & 1, 1, "POLLIN reported");
         assert_eq!(mem.read_u64(out + 8).unwrap(), 0x1234_5678);
+    }
+
+    #[test]
+    fn fork_child_closing_watched_fd_keeps_parents_registration() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        cx.cur.tgid = 1;
+        let efd = call(&k, &mut cx, &mut mem, &mut v, Sysno::Eventfd2, [0; 6]) as u64;
+        let epfd = call(&k, &mut cx, &mut mem, &mut v, Sysno::EpollCreate1, [0; 6]) as u64;
+        let ev = 0x1_2000;
+        mem.write_init(ev, &1u32.to_le_bytes()).unwrap(); // EPOLLIN
+        mem.write_init(ev + 8, &7u64.to_le_bytes()).unwrap();
+        let ctl = [epfd, 1, efd, ev, 0, 0];
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::EpollCtl, ctl), 0);
+
+        // A forked child (its own copy of the fd table, the epoll instance
+        // shared) closes its copy of the eventfd: the parent's file is still
+        // open, so its registration stays.
+        let parent_fds = cx.cur.fds.clone();
+        cx.cur.tgid = 2;
+        let close = [efd, 0, 0, 0, 0, 0];
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Close, close), 0);
+        cx.cur.fds = parent_fds;
+        cx.cur.tgid = 1;
+
+        let one = 0x1_1000;
+        mem.write_init(one, &1u64.to_le_bytes()).unwrap();
+        let w = [efd, one, 8, 0, 0, 0];
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Write, w), 8);
+        let out = 0x1_3000;
+        let wait = [epfd, out, 4, 0, 0, 0];
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::EpollPwait, wait),
+            1
+        );
+        assert_eq!(mem.read_u64(out + 8).unwrap(), 7);
+
+        // The parent's own close does drop it: the reused number adds afresh.
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::Close, close), 0);
+        let again = call(&k, &mut cx, &mut mem, &mut v, Sysno::Eventfd2, [0; 6]) as u64;
+        assert_eq!(again, efd);
+        assert_eq!(call(&k, &mut cx, &mut mem, &mut v, Sysno::EpollCtl, ctl), 0);
     }
 
     #[test]
