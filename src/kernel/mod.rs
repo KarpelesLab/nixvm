@@ -4630,22 +4630,16 @@ impl Kernel {
         buf: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        const AT_EMPTY_PATH: u64 = 0x1000;
-        let Some(rel) = read_path(mem, path_ptr) else {
-            return err(Errno::EFAULT);
-        };
-        let attrs = if rel.is_empty() && flags & AT_EMPTY_PATH != 0 {
-            match cx.cur.fds.get(dirfd as i32) {
-                Some(Fd::File { path, .. } | Fd::Dir { path, .. }) => vfs.stat(&path.clone()),
-                Some(Fd::Stdin | Fd::Stdout | Fd::Stderr) => Some(stat::char_device_attrs()),
-                _ => None,
-            }
-        } else {
-            let abs = self.resolve_path(cx, dirfd, &rel);
-            vfs.stat(&abs)
-        };
-        let Some(a) = attrs else {
-            return err(Errno::ENOENT);
+        // AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH and the
+        // AT_STATX_SYNC_TYPE field (FORCE_SYNC / DONT_SYNC — nothing to sync).
+        const VALID_FLAGS: u64 = 0x100 | 0x800 | 0x1000 | 0x6000;
+        const AT_STATX_SYNC_TYPE: u64 = 0x6000;
+        if flags & !VALID_FLAGS != 0 || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE {
+            return err(Errno::EINVAL);
+        }
+        let a = match self.stat_at(vfs, cx, dirfd, path_ptr, flags, mem) {
+            Ok(a) => a,
+            Err(e) => return e,
         };
         let buf_bytes = stat::encode_statx(&a);
         if mem.write(buf, &buf_bytes).is_err() {
@@ -7056,12 +7050,23 @@ impl Kernel {
         statbuf: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        let attrs = match cx.cur.fds.get(fd as i32) {
+        match Self::fd_attrs(vfs, cx, fd as i32) {
+            Ok(attrs) => write_stat_or_fault(mem, statbuf, &attrs, self.arch),
+            Err(e) => e,
+        }
+    }
+
+    /// The metadata `fstat` reports for descriptor `fd` (`EBADF` if closed):
+    /// the node for a file/dir, a synthesized char device/FIFO/socket/mqueue
+    /// inode for the anonymous kinds. Shared by `fstat` and the
+    /// `AT_EMPTY_PATH` forms of `newfstatat`/`statx`.
+    fn fd_attrs(vfs: &mut MountTable, cx: &ServiceCtx, fd: i32) -> Result<Attrs, i64> {
+        Ok(match cx.cur.fds.get(fd) {
             Some(Fd::File { path, .. } | Fd::Dir { path, .. }) => {
                 let path = path.clone();
                 match vfs.stat(&path) {
                     Some(a) => a,
-                    None => return err(Errno::ENOENT),
+                    None => return Err(err(Errno::ENOENT)),
                 }
             }
             // A pty slave is the `/dev/pts/N` char device: resolve it through the
@@ -7100,9 +7105,55 @@ impl Kernel {
                 nlink: 1,
                 rdev: 0,
             },
-            None => return err(Errno::EBADF),
+            None => return Err(err(Errno::EBADF)),
+        })
+    }
+
+    /// Resolve the `(dirfd, path, flags)` of `newfstatat`/`statx` to the
+    /// metadata it names: `AT_EMPTY_PATH` with an empty (or, since 6.11,
+    /// NULL) path is `dirfd` itself (`AT_FDCWD` = the cwd); otherwise the path,
+    /// following a final symlink unless `AT_SYMLINK_NOFOLLOW`. A trailing slash
+    /// on a non-directory, or a non-directory along the way, is `ENOTDIR`.
+    fn stat_at(
+        &self,
+        vfs: &mut MountTable,
+        cx: &ServiceCtx,
+        dirfd: i64,
+        pathptr: u64,
+        flags: u64,
+        mem: &GuestMemory,
+    ) -> Result<Attrs, i64> {
+        const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        let rel = if pathptr == 0 && flags & AT_EMPTY_PATH != 0 {
+            String::new()
+        } else {
+            read_path(mem, pathptr).ok_or_else(|| err(Errno::EFAULT))?
         };
-        write_stat_or_fault(mem, statbuf, &attrs, self.arch)
+        if rel.is_empty() {
+            if flags & AT_EMPTY_PATH == 0 {
+                return Err(err(Errno::ENOENT));
+            }
+            if dirfd == AT_FDCWD {
+                return vfs.stat(&cx.cur.cwd).ok_or_else(|| err(Errno::ENOENT));
+            }
+            return Self::fd_attrs(vfs, cx, dirfd as i32);
+        }
+        let had_slash = rel.len() > 1 && rel.ends_with('/');
+        let mut abs = self.resolve_path(cx, dirfd, &rel);
+        if flags & AT_SYMLINK_NOFOLLOW == 0 {
+            abs = self.follow_or_eloop(vfs, &abs)?;
+        }
+        let Some(attrs) = vfs.stat(&abs) else {
+            if self.has_nondir_component(vfs, &abs) {
+                return Err(err(Errno::ENOTDIR));
+            }
+            return Err(err(Errno::ENOENT));
+        };
+        if had_slash && attrs.kind != NodeKind::Dir {
+            return Err(err(Errno::ENOTDIR));
+        }
+        Ok(attrs)
     }
 
     /// `newfstatat(dirfd, path, statbuf, flags)`.
@@ -7117,29 +7168,14 @@ impl Kernel {
         flags: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
-        let Some(rel) = read_path(mem, pathptr) else {
-            return err(Errno::EFAULT);
-        };
-        let had_slash = rel.len() > 1 && rel.ends_with('/');
-        let mut abs = self.resolve_path(cx, dirfd, &rel);
-        if flags & AT_SYMLINK_NOFOLLOW == 0 {
-            abs = match self.follow_or_eloop(vfs, &abs) {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
+        // AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH.
+        if flags & !(0x100 | 0x800 | 0x1000) != 0 {
+            return err(Errno::EINVAL);
         }
-        let Some(attrs) = vfs.stat(&abs) else {
-            if self.has_nondir_component(vfs, &abs) {
-                return err(Errno::ENOTDIR);
-            }
-            return err(Errno::ENOENT);
-        };
-        // A trailing slash on a non-directory target is ENOTDIR.
-        if had_slash && attrs.kind != NodeKind::Dir {
-            return err(Errno::ENOTDIR);
+        match self.stat_at(vfs, cx, dirfd, pathptr, flags, mem) {
+            Ok(attrs) => write_stat_or_fault(mem, statbuf, &attrs, self.arch),
+            Err(e) => e,
         }
-        write_stat_or_fault(mem, statbuf, &attrs, self.arch)
     }
 
     /// `getdents64(fd, buf, count)`.
