@@ -1,7 +1,8 @@
 //! Differential test: random x86-64 instructions executed by nixvm's software
 //! interpreter (`interp_x86`) and by a real x86-64 execution environment, with
 //! the complete architectural state compared afterwards — GPRs, `RFLAGS`, the
-//! x87/MMX/SSE state (as an `FXSAVE64` image) and an 8 KiB memory window.
+//! x87/MMX/SSE state (as an `FXSAVE64` image), the upper halves of the YMM
+//! registers and an 8 KiB memory window.
 //!
 //! The oracle is `tests/x86_oracle/harness.c`, compiled with
 //! `clang -arch x86_64` and run under Rosetta 2 (`arch -x86_64`) on Apple
@@ -93,6 +94,7 @@ struct HwResult {
     gpr: [u64; 16],
     rflags: u64,
     fx: [u8; 512],
+    ymm_hi: [u128; 16],
     data: Vec<u8>,
 }
 
@@ -196,6 +198,9 @@ impl Oracle {
         }
         w.write_all(&st.rflags.to_le_bytes()).ok()?;
         w.write_all(&st.fxsave).ok()?;
+        for v in st.ymm_hi {
+            w.write_all(&v.to_le_bytes()).ok()?;
+        }
         w.write_all(data).ok()?;
         w.flush().ok()?;
         let mut hdr = [0u8; 16];
@@ -206,6 +211,12 @@ impl Oracle {
         self.rx.read_exact(&mut f).ok()?;
         let mut fx = [0u8; 512];
         self.rx.read_exact(&mut fx).ok()?;
+        let mut y = [0u8; 256];
+        self.rx.read_exact(&mut y).ok()?;
+        let mut ymm_hi = [0u128; 16];
+        for (i, v) in ymm_hi.iter_mut().enumerate() {
+            *v = u128::from_le_bytes(y[16 * i..16 * i + 16].try_into().unwrap());
+        }
         let mut d = vec![0u8; DATA_LEN];
         self.rx.read_exact(&mut d).ok()?;
         let mut gpr = [0u64; 16];
@@ -217,6 +228,7 @@ impl Oracle {
             gpr,
             rflags: u64::from_le_bytes(f),
             fx,
+            ymm_hi,
             data: d,
         })
     }
@@ -251,6 +263,19 @@ enum Cat {
     X87,
     Mmx,
     Sse,
+    /// VEX-encoded SIMD (AVX, AVX2, FMA, F16C).
+    Avx,
+    /// VEX-encoded general-purpose (BMI1/BMI2), plus LZCNT/TZCNT/MOVBE.
+    Bmi,
+}
+
+/// How a VEX instruction is encoded: `VEX.W`/`VEX.L` fixed or random, and
+/// whether `VEX.vvvv` names a register (else it must be `1111`).
+#[derive(Clone, Copy, Debug)]
+struct VexSpec {
+    w: Option<bool>,
+    l: Option<bool>,
+    nds: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -266,6 +291,9 @@ struct OpSpec {
     mem: Option<bool>,
     /// Restrict ModRM.reg to this value (opcode extension).
     reg: Option<u8>,
+    /// VEX-encoded: `op` is then the logical opcode (`0F xx`, `0F 38 xx`,
+    /// `0F 3A xx`, selecting the map) and `mand` the implied prefix.
+    vex: Option<VexSpec>,
 }
 
 const fn op(cat: Cat, op: &'static [u8], modrm: bool, imm: Imm) -> OpSpec {
@@ -277,6 +305,28 @@ const fn op(cat: Cat, op: &'static [u8], modrm: bool, imm: Imm) -> OpSpec {
         mand: 0,
         mem: None,
         reg: None,
+        vex: None,
+    }
+}
+
+/// A VEX spec: `nds` = `vvvv` is a source, `l`/`w` fixed or random, `mem`
+/// restricts the r/m form.
+#[allow(clippy::too_many_arguments)]
+fn vx(
+    cat: Cat,
+    mand: u8,
+    opc: &'static [u8],
+    imm: bool,
+    nds: bool,
+    l: Option<bool>,
+    w: Option<bool>,
+    mem: Option<bool>,
+) -> OpSpec {
+    OpSpec {
+        mand,
+        mem,
+        vex: Some(VexSpec { w, l, nds }),
+        ..op(cat, opc, true, if imm { Imm::B } else { Imm::None })
     }
 }
 
@@ -436,7 +486,8 @@ fn specs() -> Vec<OpSpec> {
     });
     // FXSAVE/FXRSTOR, STMXCSR, CLFLUSH (memory) and the fences (register).
     // (LDMXCSR is unit-tested: Rosetta doesn't #GP on reserved bits and
-    // refuses to unmask exceptions; XSAVE/XRSTOR aren't advertised.)
+    // refuses to unmask exceptions; XSAVE/XRSTOR are generated with valid
+    // areas by gen_xstate.)
     // (FXRSTOR from random memory would mostly #GP or unmask exceptions,
     // which Rosetta doesn't model; it is unit-tested.)
     for r in [0u8, 3, 7] {
@@ -601,6 +652,222 @@ fn specs() -> Vec<OpSpec> {
             ..op(Int, &T38[o], true, None)
         });
     } // CRC32
+
+    // ---- x86-64-v3: AVX, AVX2, FMA, F16C (VEX) ----
+    let (l0, l1, w0, w1) = (Some(false), Some(true), Some(false), Some(true));
+    let (memo, rego) = (Some(true), Some(false));
+    let any = Option::<bool>::None;
+    // 0F map, 66 integer ops (NDS).
+    for o in (0x60..=0x6D)
+        .chain(0x74..=0x76)
+        .chain(0xD1..=0xD5)
+        .chain(0xD8..=0xE5)
+        .chain(0xE8..=0xEF)
+        .chain(0xF1..=0xF6)
+        .chain(0xF8..=0xFE)
+    {
+        v.push(vx(Avx, 0x66, &TWO[o], false, true, any, any, any));
+    }
+    for mand in [0u8, 0x66] {
+        for o in [
+            0x14, 0x15, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5C, 0x5D, 0x5E, 0x5F,
+        ] {
+            v.push(vx(Avx, mand, &TWO[o], false, true, any, any, any));
+        }
+        v.push(vx(Avx, mand, &TWO[0xC6], true, true, any, any, any));
+        v.push(vx(Avx, mand, &TWO[0xC2], true, true, any, any, any));
+        for o in [0x10, 0x11, 0x28, 0x29, 0x51, 0x2E, 0x2F] {
+            v.push(vx(Avx, mand, &TWO[o], false, false, any, any, any));
+        }
+        v.push(vx(Avx, mand, &TWO[0x2B], false, false, any, any, memo));
+        v.push(vx(Avx, mand, &TWO[0x50], false, false, any, any, rego));
+        v.push(vx(Avx, mand, &TWO[0x5B], false, false, any, any, any));
+        v.push(vx(Avx, mand, &TWO[0x5A], false, false, any, any, any));
+        for o in [0x12, 0x16] {
+            v.push(vx(
+                Avx,
+                mand,
+                &TWO[o],
+                false,
+                true,
+                l0,
+                any,
+                if mand == 0 { any } else { memo },
+            ));
+        }
+        for o in [0x13, 0x17] {
+            v.push(vx(Avx, mand, &TWO[o], false, false, l0, any, memo));
+        }
+    }
+    for mand in [0xF3u8, 0xF2] {
+        for o in [
+            0x51, 0x58, 0x59, 0x5A, 0x5C, 0x5D, 0x5E, 0x5F, 0x2A, 0x10, 0x11,
+        ] {
+            v.push(vx(Avx, mand, &TWO[o], false, true, any, any, any));
+        }
+        v.push(vx(Avx, mand, &TWO[0xC2], true, true, any, any, any));
+        for o in [0x2C, 0x2D] {
+            v.push(vx(Avx, mand, &TWO[o], false, false, any, any, any));
+        }
+    }
+    v.push(vx(Avx, 0xF3, &TWO[0x5B], false, false, any, any, any));
+    v.push(vx(Avx, 0, &TWO[0x52], false, false, any, any, any));
+    v.push(vx(Avx, 0, &TWO[0x53], false, false, any, any, any));
+    v.push(vx(Avx, 0xF3, &TWO[0x52], false, true, any, any, any));
+    v.push(vx(Avx, 0xF3, &TWO[0x53], false, true, any, any, any));
+    for mand in [0x66u8, 0xF2] {
+        for o in [0xD0, 0x7C, 0x7D] {
+            v.push(vx(Avx, mand, &TWO[o], false, true, any, any, any));
+        }
+    }
+    for mand in [0x66u8, 0xF3] {
+        v.push(vx(Avx, mand, &TWO[0x6F], false, false, any, any, any));
+        v.push(vx(Avx, mand, &TWO[0x7F], false, false, any, any, any));
+    }
+    for mand in [0x66u8, 0xF3, 0xF2] {
+        v.push(vx(Avx, mand, &TWO[0x70], true, false, any, any, any));
+        v.push(vx(Avx, mand, &TWO[0xE6], false, false, any, any, any));
+    }
+    v.push(vx(Avx, 0xF3, &TWO[0x12], false, false, any, any, any));
+    v.push(vx(Avx, 0xF3, &TWO[0x16], false, false, any, any, any));
+    v.push(vx(Avx, 0xF2, &TWO[0x12], false, false, any, any, any));
+    for o in [0x6E, 0x7E, 0xD6] {
+        v.push(vx(Avx, 0x66, &TWO[o], false, false, l0, any, any));
+    }
+    v.push(vx(Avx, 0xF3, &TWO[0x7E], false, false, l0, any, any));
+    for (o, exts) in [
+        (0x71usize, &[2u8, 4, 6][..]),
+        (0x72, &[2, 4, 6]),
+        (0x73, &[2, 3, 6, 7]),
+    ] {
+        for &r in exts {
+            v.push(OpSpec {
+                reg: Some(r),
+                ..vx(Avx, 0x66, &TWO[o], true, true, any, any, rego)
+            });
+        }
+    }
+    v.push(vx(Avx, 0x66, &TWO[0xC4], true, true, l0, any, any));
+    v.push(vx(Avx, 0x66, &TWO[0xC5], true, false, l0, any, rego));
+    v.push(vx(Avx, 0x66, &TWO[0xD7], false, false, any, any, rego));
+    v.push(vx(Avx, 0x66, &TWO[0xE7], false, false, any, any, memo));
+    v.push(vx(Avx, 0xF2, &TWO[0xF0], false, false, any, any, memo));
+    v.push(vx(Avx, 0x66, &TWO[0xF7], false, false, l0, any, rego));
+    v.push(OpSpec {
+        reg: Some(3),
+        ..vx(Avx, 0, &TWO[0xAE], false, false, l0, any, memo)
+    });
+    v.push(OpSpec {
+        modrm: false,
+        ..vx(Avx, 0, &TWO[0x77], false, false, any, any, any)
+    });
+    // 0F 38 map (66).
+    for o in (0x00..=0x0B).chain([0x28, 0x29, 0x2B]).chain(0x37..=0x40) {
+        v.push(vx(Avx, 0x66, &T38[o], false, true, any, any, any));
+    }
+    for o in (0x1C..=0x1E)
+        .chain(0x20..=0x25)
+        .chain(0x30..=0x35)
+        .chain([0x17])
+    {
+        v.push(vx(Avx, 0x66, &T38[o], false, false, any, any, any));
+    }
+    for o in [0x0C, 0x0D] {
+        v.push(vx(Avx, 0x66, &T38[o], false, true, any, w0, any));
+    }
+    for o in [0x0E, 0x0F, 0x13, 0x18, 0x58, 0x59, 0x78, 0x79] {
+        v.push(vx(Avx, 0x66, &T38[o], false, false, any, w0, any));
+    }
+    v.push(vx(Avx, 0x66, &T38[0x19], false, false, l1, w0, any));
+    v.push(vx(Avx, 0x66, &T38[0x1A], false, false, l1, w0, memo));
+    v.push(vx(Avx, 0x66, &T38[0x5A], false, false, l1, w0, memo));
+    v.push(vx(Avx, 0x66, &T38[0x16], false, true, l1, w0, any));
+    v.push(vx(Avx, 0x66, &T38[0x36], false, true, l1, w0, any));
+    v.push(vx(Avx, 0x66, &T38[0x2A], false, false, any, any, memo));
+    for o in [0x2C, 0x2D, 0x2E, 0x2F] {
+        v.push(vx(Avx, 0x66, &T38[o], false, true, any, w0, memo));
+    }
+    for o in [0x8C, 0x8E] {
+        v.push(vx(Avx, 0x66, &T38[o], false, true, any, any, memo));
+    }
+    v.push(vx(Avx, 0x66, &T38[0x41], false, false, l0, any, any));
+    v.push(vx(Avx, 0x66, &T38[0x45], false, true, any, any, any));
+    v.push(vx(Avx, 0x66, &T38[0x46], false, true, any, w0, any));
+    v.push(vx(Avx, 0x66, &T38[0x47], false, true, any, any, any));
+    for o in 0x90..=0x93 {
+        v.push(vx(Avx, 0x66, &T38[o], false, true, any, any, memo));
+    }
+    for o in (0x96..=0x9F).chain(0xA6..=0xAF).chain(0xB6..=0xBF) {
+        v.push(vx(Avx, 0x66, &T38[o], false, true, any, any, any));
+    }
+    // 0F 3A map (66, all with imm8).
+    for o in [0x00, 0x01] {
+        v.push(vx(Avx, 0x66, &T3A[o], true, false, l1, w1, any));
+    }
+    for o in [0x02, 0x4A, 0x4B, 0x4C] {
+        v.push(vx(Avx, 0x66, &T3A[o], true, true, any, w0, any));
+    }
+    for o in [0x04, 0x05, 0x1D] {
+        v.push(vx(Avx, 0x66, &T3A[o], true, false, any, w0, any));
+    }
+    for o in [0x06, 0x18, 0x38, 0x46] {
+        v.push(vx(Avx, 0x66, &T3A[o], true, true, l1, w0, any));
+    }
+    for o in [0x19, 0x39] {
+        v.push(vx(Avx, 0x66, &T3A[o], true, false, l1, w0, any));
+    }
+    for o in [0x08, 0x09] {
+        v.push(vx(Avx, 0x66, &T3A[o], true, false, any, any, any));
+    }
+    for o in [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x40, 0x42] {
+        v.push(vx(Avx, 0x66, &T3A[o], true, true, any, any, any));
+    }
+    for o in [0x14, 0x15, 0x16, 0x17, 0x60, 0x61, 0x62, 0x63] {
+        v.push(vx(Avx, 0x66, &T3A[o], true, false, l0, any, any));
+    }
+    for o in [0x20, 0x21, 0x22, 0x41] {
+        v.push(vx(Avx, 0x66, &T3A[o], true, true, l0, any, any));
+    }
+    // XSAVE/XRSTOR and XGETBV (see gen_xstate).
+    for r in [4u8, 5] {
+        v.push(OpSpec {
+            reg: Some(r),
+            mem: Some(true),
+            ..op(Avx, &TWO[0xAE], true, None)
+        });
+    }
+    v.push(OpSpec {
+        reg: Some(2),
+        ..op(Avx, &TWO[0x01], true, None)
+    });
+    // ---- BMI1/BMI2 (VEX, general purpose), LZCNT/TZCNT, MOVBE ----
+    v.push(vx(Bmi, 0, &T38[0xF2], false, true, l0, any, any));
+    for r in [1u8, 2, 3] {
+        v.push(OpSpec {
+            reg: Some(r),
+            ..vx(Bmi, 0, &T38[0xF3], false, true, l0, any, any)
+        });
+    }
+    for mand in [0u8, 0xF3, 0xF2] {
+        v.push(vx(Bmi, mand, &T38[0xF5], false, true, l0, any, any));
+    }
+    v.push(vx(Bmi, 0xF2, &T38[0xF6], false, true, l0, any, any));
+    for mand in [0u8, 0x66, 0xF3, 0xF2] {
+        v.push(vx(Bmi, mand, &T38[0xF7], false, true, l0, any, any));
+    }
+    v.push(vx(Bmi, 0xF2, &T3A[0xF0], true, false, l0, any, any));
+    for o in [0xBC, 0xBD] {
+        v.push(OpSpec {
+            mand: 0xF3,
+            ..op(Bmi, &TWO[o], true, None)
+        });
+    }
+    for o in [0xF0, 0xF1] {
+        v.push(OpSpec {
+            mem: Some(true),
+            ..op(Bmi, &T38[o], true, None)
+        });
+    }
     v
 }
 
@@ -795,6 +1062,10 @@ struct Case {
     st: CpuState,
     data: Vec<u8>,
     spec: OpSpec,
+    /// Where the ModRM byte is in `code` (when the opcode has one).
+    modrm_at: Option<usize>,
+    /// Memory bytes (address, length) not compared.
+    mem_ignore: Vec<(u64, usize)>,
 }
 
 /// Build the FXSAVE image for a random but valid x87/SSE state.
@@ -898,6 +1169,9 @@ fn lockable(spec: &OpSpec) -> bool {
 }
 
 fn gen_case(rng: &mut Rng, spec: &OpSpec, insn_addr: u64) -> Case {
+    if spec.cat == Cat::Avx && spec.vex.is_none() {
+        return gen_xstate(rng, spec, insn_addr);
+    }
     let mut st = CpuState::default();
     for r in &mut st.gpr {
         *r = int_value(rng);
@@ -912,6 +1186,9 @@ fn gen_case(rng: &mut Rng, spec: &OpSpec, insn_addr: u64) -> Case {
     let df = if rng.chance(1, 4) { 1 << 10 } else { 0 };
     st.rflags = 0x202 | status | df;
     st.fxsave = random_fx(rng, spec.cat);
+    for v in &mut st.ymm_hi {
+        *v = xmm_value(rng);
+    }
 
     let mut code = Vec::new();
     // Prefixes.
@@ -936,27 +1213,67 @@ fn gen_case(rng: &mut Rng, spec: &OpSpec, insn_addr: u64) -> Case {
     if rng.chance(1, 20) {
         code.push(*rng.pick(&[0x2Eu8, 0x3E, 0x26, 0x36]));
     }
-    if spec.mand != 0 {
-        if spec.mand != 0x66 && rng.chance(1, 8) {
-            code.push(0x66); // a 66 alongside F2/F3 is ignored
+    let (rex_w, rex_x, rex_b);
+    if let Some(vs) = spec.vex {
+        // VEX: R/X/B random (REX-like), W/L as the spec says or random,
+        // vvvv a random register or unused (1111).
+        let (map, opc) = match spec.op {
+            [0x0F, 0x38, o] => (2u8, *o),
+            [0x0F, 0x3A, o] => (3, *o),
+            [0x0F, o] => (1, *o),
+            _ => unreachable!("VEX spec opcode"),
+        };
+        let (r, x, b) = (rng.chance(1, 2), rng.chance(1, 2), rng.chance(1, 2));
+        let w = vs.w.unwrap_or_else(|| rng.chance(1, 2));
+        let l = vs.l.unwrap_or_else(|| rng.chance(1, 2));
+        let vvvv = if vs.nds { rng.below(16) as u8 } else { 0 };
+        let pp = match spec.mand {
+            0 => 0u8,
+            0x66 => 1,
+            0xF3 => 2,
+            _ => 3,
+        };
+        let tail = ((!vvvv & 15) << 3) | (u8::from(l) << 2) | pp;
+        if map == 1 && !w && !x && !b && rng.chance(1, 2) {
+            code.extend_from_slice(&[0xC5, (u8::from(!r) << 7) | tail]);
+        } else {
+            code.extend_from_slice(&[
+                0xC4,
+                (u8::from(!r) << 7) | (u8::from(!x) << 6) | (u8::from(!b) << 5) | map,
+                (u8::from(w) << 7) | tail,
+            ]);
         }
-        code.push(spec.mand);
-    }
-    let rex = if rng.chance(1, 2) {
-        0x40 | rng.below(16) as u8
+        code.push(opc);
+        (rex_w, rex_x, rex_b) = (w, x, b);
+        if spec.cat == Cat::Avx && map == 2 && (0x90..=0x93).contains(&opc) {
+            return gen_gather(rng, spec, code, st, (r, x, b, w, l), vvvv, insn_addr);
+        }
     } else {
-        0
-    };
-    let rex = if spec.op == [0x63] { rex | 0x48 } else { rex };
-    if rex != 0 {
-        code.push(rex);
+        if spec.mand != 0 {
+            if spec.mand != 0x66 && rng.chance(1, 8) {
+                code.push(0x66); // a 66 alongside F2/F3 is ignored
+            }
+            code.push(spec.mand);
+        }
+        let rex = if rng.chance(1, 2) {
+            0x40 | rng.below(16) as u8
+        } else {
+            0
+        };
+        let rex = if spec.op == [0x63] { rex | 0x48 } else { rex };
+        if rex != 0 {
+            code.push(rex);
+        }
+        rex_w = rex & 8 != 0;
+        (rex_x, rex_b) = (rex & 2 != 0, rex & 1 != 0);
+        code.extend_from_slice(spec.op);
     }
-    let rex_w = rex & 8 != 0;
-    let (rex_x, rex_b) = (rex & 2 != 0, rex & 1 != 0);
-    code.extend_from_slice(spec.op);
     let mut rip_disp_at = None;
-    let align = spec.cat == Cat::Sse && rng.chance(1, 2);
+    // (VPSRLVQ/VPSLLVQ counts must stay quadword-aligned: see below.)
+    let align = (matches!(spec.cat, Cat::Sse | Cat::Avx) && rng.chance(1, 2))
+        || (spec.vex.is_some() && matches!(spec.op, [0x0F, 0x38, 0x45 | 0x47]));
     let mut modrm_reg = 0u8;
+    let mut modrm_at = None;
     if spec.modrm {
         let mut modrm = rng.byte();
         if let Some(r) = spec.reg {
@@ -967,17 +1284,23 @@ fn gen_case(rng: &mut Rng, spec: &OpSpec, insn_addr: u64) -> Case {
             Some(false) => modrm |= 0xc0,
             _ => {}
         }
-        if spec.cat != Cat::Int && spec.mem.is_none() && rng.chance(1, 2) {
+        if !matches!(spec.cat, Cat::Int | Cat::Bmi) && spec.mem.is_none() && rng.chance(1, 2) {
             modrm |= 0xc0; // favour register forms for vector/x87 ops
         }
         modrm_reg = (modrm >> 3) & 7;
+        modrm_at = Some(code.len());
         code.push(modrm);
         let md = modrm >> 6;
         let rm = modrm & 7;
         if md != 3 {
-            // Half the SSE cases use 16-byte-aligned addresses, so aligned
-            // forms are compared too (Rosetta never raises #GP on misalignment).
-            let al: u64 = if align { !15 } else { !0 };
+            // Half the SSE/AVX cases use 16/32-byte-aligned addresses, so
+            // aligned forms are compared too (Rosetta never raises #GP on
+            // misalignment).
+            let al: u64 = match (align, spec.cat) {
+                (false, _) => !0,
+                (true, Cat::Avx) => !31,
+                _ => !15,
+            };
             let ptr = |rng: &mut Rng| (DATA + 0x800 + rng.below(0x800)) & al;
             if rm == 4 {
                 let sib = rng.byte();
@@ -1062,8 +1385,9 @@ fn gen_case(rng: &mut Rng, spec: &OpSpec, insn_addr: u64) -> Case {
         code.push(rng.byte());
     }
     if spec.op == [0x0F, 0xC2] {
+        // Legacy CMPccPS/PD: predicates 0..7 (Rosetta reads 5 bits); VEX: 0..31.
         let n = code.len();
-        code[n - 1] &= 7;
+        code[n - 1] &= if spec.vex.is_some() { 31 } else { 7 };
     }
     if matches!(spec.imm, Imm::Rel8 | Imm::Rel32) {
         // K fillers of `inc r15` (3 bytes); jump over j of them.
@@ -1086,7 +1410,11 @@ fn gen_case(rng: &mut Rng, spec: &OpSpec, insn_addr: u64) -> Case {
     if let Some(at) = rip_disp_at {
         let end = insn_addr + code.len() as u64;
         let target = DATA + 0x800 + rng.below(0x800);
-        let target = if align { target & !15 } else { target };
+        let target = match (align, spec.cat) {
+            (false, _) => target,
+            (true, Cat::Avx) => target & !31,
+            _ => target & !15,
+        };
         let d = target.wrapping_sub(end) as i64 as i32;
         code[at..at + 4].copy_from_slice(&d.to_le_bytes());
     }
@@ -1103,6 +1431,116 @@ fn gen_case(rng: &mut Rng, spec: &OpSpec, insn_addr: u64) -> Case {
         st.gpr[3] = DATA + 0x800 + rng.below(0x700);
     }
 
+    let mut data = random_data(rng);
+    if spec.vex.is_some() && matches!(spec.op, [0x0F, 0x38, 0x45 | 0x47]) && vex_w(&code) {
+        // VPSRLVQ/VPSLLVQ: Rosetta takes only the low 32 bits of each count
+        // (a count of 2^32 shifts by 0; the SDM zeroes the lane): keep every
+        // quadword's high half clear.
+        for i in 0..16 {
+            let o = 160 + 16 * i;
+            let x = u128::from_le_bytes(st.fxsave[o..o + 16].try_into().unwrap());
+            let m = 0x0000_0000_ffff_ffff_0000_0000_ffff_ffffu128;
+            st.fxsave[o..o + 16].copy_from_slice(&(x & m).to_le_bytes());
+            st.ymm_hi[i] &= m;
+        }
+        for q in data.chunks_mut(8) {
+            q[4..].fill(0);
+        }
+    }
+    st.rip = insn_addr;
+    Case {
+        code,
+        st,
+        data,
+        spec: *spec,
+        modrm_at,
+        mem_ignore: Vec::new(),
+    }
+}
+
+/// `XSAVE`/`XRSTOR` (`[rbx + disp8]`, usually 64-byte aligned, `REX.W`
+/// random) and `XGETBV` (`ECX` mostly 0). An `XRSTOR` area holds a valid
+/// image: masked exceptions, a random `XSTATE_BV`, a clean header.
+fn gen_xstate(rng: &mut Rng, spec: &OpSpec, insn_addr: u64) -> Case {
+    let mut st = CpuState::default();
+    for r in &mut st.gpr {
+        *r = int_value(rng);
+    }
+    st.gpr[4] = DATA + 0x1000 + rng.below(0x40) * 8;
+    st.rflags = 0x202 | (rng.next() & 0x8d5);
+    st.fxsave = random_fx(rng, Cat::X87);
+    // Rosetta's XSAVE area holds the x87 registers in physical order (the
+    // SDM: stack order, as FXSAVE): they agree at TOP = 0.
+    st.fxsave[3] &= !0x38;
+    for v in &mut st.ymm_hi {
+        *v = xmm_value(rng);
+    }
+    let mut data = random_data(rng);
+    let mut code = Vec::new();
+    let mut mem_ignore = Vec::new();
+    let ext = spec.reg.unwrap_or(0);
+    let modrm_at;
+    if ext == 2 {
+        code.extend_from_slice(&[0x0F, 0x01]);
+        modrm_at = Some(code.len());
+        code.push(0xD0);
+        if rng.chance(3, 4) {
+            st.gpr[1] = 0;
+        }
+    } else {
+        if rng.chance(1, 2) {
+            code.push(0x48);
+        }
+        code.extend_from_slice(&[0x0F, 0xAE]);
+        modrm_at = Some(code.len());
+        code.push(0x43 | (ext << 3)); // [rbx + disp8]
+        let disp = rng.below(2) * 64 + if rng.chance(1, 8) { rng.below(64) } else { 0 };
+        code.push(disp as u8);
+        let base = DATA + 0x800 + rng.below(0x10) * 64;
+        st.gpr[3] = base;
+        let addr = base + disp;
+        st.gpr[0] = if rng.chance(3, 4) {
+            rng.below(8)
+        } else {
+            int_value(rng)
+        };
+        st.gpr[2] = if rng.chance(3, 4) { 0 } else { int_value(rng) };
+        let off = (addr - DATA) as usize;
+        if ext == 5 {
+            let mut fx = random_fx(rng, Cat::X87);
+            fx[3] &= !0x38;
+            data[off..off + 512].copy_from_slice(&fx);
+            data[off + 512..off + 576].fill(0);
+            data[off + 512] = rng.below(8) as u8;
+        } else {
+            // Rosetta writes XSTATE_BV whole (RFBM | AVX) instead of
+            // merging RFBM's bits into the old value, and always writes
+            // MXCSR (the SDM: only with SSE or AVX in RFBM).
+            mem_ignore.push((addr + 512, 8));
+            if st.gpr[0] & 6 == 0 {
+                mem_ignore.push((addr + 24, 8));
+            }
+        }
+    }
+    st.rip = insn_addr;
+    Case {
+        code,
+        st,
+        data,
+        spec: *spec,
+        modrm_at,
+        mem_ignore,
+    }
+}
+
+/// `VEX.W` of a VEX-encoded case (the 2-byte form implies 0). (the 2-byte form implies 0).
+fn vex_w(code: &[u8]) -> bool {
+    let i = code.iter().position(|&b| b == 0xC4 || b == 0xC5).unwrap();
+    code[i] == 0xC4 && code[i + 2] & 0x80 != 0
+}
+
+/// Random data-window contents: float, x87 and integer chunks.
+fn random_data(rng: &mut Rng) -> Vec<u8> {
     let mut data = vec![0u8; DATA_LEN];
     let mut i = 0;
     while i < DATA_LEN {
@@ -1114,12 +1552,77 @@ fn gen_case(rng: &mut Rng, spec: &OpSpec, insn_addr: u64) -> Case {
         data[i..i + 16].copy_from_slice(&chunk.to_le_bytes());
         i += 16;
     }
+    data
+}
+
+/// A gather (`VEX 0F 38 90..93`) with a VSIB operand: a base register into
+/// the data window, an index vector of small offsets, and mostly distinct
+/// destination/index/mask registers (equal ones are `#UD`).
+fn gen_gather(
+    rng: &mut Rng,
+    spec: &OpSpec,
+    mut code: Vec<u8>,
+    mut st: CpuState,
+    (r, x, b, w, l): (bool, bool, bool, bool, bool),
+    vvvv: u8,
+    insn_addr: u64,
+) -> Case {
+    // (Equal destination/index/mask registers are #UD per the SDM, which
+    // Rosetta doesn't check: unit-tested instead.)
+    let mut dst = (rng.below(8) as u8) | (u8::from(r) << 3);
+    let mut idx = (rng.below(8) as u8) | (u8::from(x) << 3);
+    while idx == vvvv {
+        idx = ((idx + 1) & 7) | (u8::from(x) << 3);
+    }
+    while dst == vvvv || dst == idx {
+        dst = ((dst + 1) & 7) | (u8::from(r) << 3);
+    }
+    let md = rng.below(3) as u8;
+    let mut base = rng.below(8) as u8;
+    if base == 5 && md == 0 {
+        base = 3; // (no-base disp32 can't reach the window)
+    }
+    let base_r = base | (u8::from(b) << 3);
+    let scale = rng.below(4) as u8;
+    let modrm_at = Some(code.len());
+    code.push((md << 6) | ((dst & 7) << 3) | 4);
+    code.push((scale << 6) | ((idx & 7) << 3) | base);
+    match md {
+        1 => code.push(rng.byte() & 0x3f),
+        2 => code.extend_from_slice(&(rng.below(0x100) as i32).to_le_bytes()),
+        _ => {}
+    }
+    if base_r == 4 {
+        st.gpr[4] = DATA + 0x800 + rng.below(0x80) * 8;
+    } else {
+        st.gpr[usize::from(base_r)] = DATA + 0x800 + rng.below(0x400);
+    }
+    let _ = (w, l);
+    // Index lanes: small non-negative offsets (dword or qword lanes).
+    let qidx = spec.op[2] & 1 == 1;
+    let mut iv = [0u128; 2];
+    for (h, half) in iv.iter_mut().enumerate() {
+        let _ = h;
+        if qidx {
+            *half = u128::from(rng.below(0x40)) | (u128::from(rng.below(0x40)) << 64);
+        } else {
+            for k in 0..4 {
+                *half |= u128::from(rng.below(0x40)) << (32 * k);
+            }
+        }
+    }
+    let i = usize::from(idx);
+    st.fxsave[160 + 16 * i..176 + 16 * i].copy_from_slice(&iv[0].to_le_bytes());
+    st.ymm_hi[i] = iv[1];
+    let data = random_data(rng);
     st.rip = insn_addr;
     Case {
         code,
         st,
         data,
         spec: *spec,
+        modrm_at,
+        mem_ignore: Vec::new(),
     }
 }
 
@@ -1149,6 +1652,8 @@ struct Ignore {
     /// (Rosetta's transcendentals are occasionally 1 ulp off near halfway
     /// cases — checked against exact rational arithmetic).
     ulp: bool,
+    /// MXCSR exception-flag bits not compared.
+    mxcsr: u8,
 }
 
 fn describe_fx_diff(a: &[u8; 512], b: &[u8; 512]) -> Vec<String> {
@@ -1208,9 +1713,8 @@ fn describe_fx_diff(a: &[u8; 512], b: &[u8; 512]) -> Vec<String> {
     d
 }
 
-/// Valid encodings Rosetta raises #UD for (undocumented x87 aliases real
-/// CPUs execute, the 287-era no-ops) or that this CPU doesn't advertise but
-/// Rosetta runs (FISTTP: SSE3).
+/// Valid encodings Rosetta raises #UD for: the undocumented x87 aliases real
+/// CPUs execute, and the 287-era no-ops.
 fn rosetta_unsupported(case: &Case) -> bool {
     let Some(m) = modrm_of(case) else {
         return false;
@@ -1241,15 +1745,7 @@ fn signal_of(o: Outcome) -> i32 {
 /// The ModRM byte of a case (if its opcode has one) and the byte after the
 /// whole instruction's last byte position (for an imm8 count).
 fn modrm_of(case: &Case) -> Option<u8> {
-    if !case.spec.modrm {
-        return None;
-    }
-    let at = case
-        .code
-        .windows(case.spec.op.len())
-        .position(|w| w == case.spec.op)?
-        + case.spec.op.len();
-    case.code.get(at).copied()
+    case.code.get(case.modrm_at?).copied()
 }
 
 const CF: u64 = 1;
@@ -1272,7 +1768,8 @@ fn known_differences(case: &Case, sw_sig: i32, hw_sig: i32) -> Option<Ignore> {
     // and aligned SSE operands, and doesn't #GP on LDMXCSR reserved bits.
     if sw_sig == 11
         && hw_sig == 0
-        && (matches!(case.spec.cat, Cat::Sse | Cat::Mmx) || matches!(op, [0x0F, 0xC7 | 0xAE]))
+        && (matches!(case.spec.cat, Cat::Sse | Cat::Mmx | Cat::Avx)
+            || matches!(op, [0x0F, 0xC7 | 0xAE]))
     {
         return None;
     }
@@ -1317,12 +1814,24 @@ fn known_differences(case: &Case, sw_sig: i32, hw_sig: i32) -> Option<Ignore> {
                 flags: 0,
                 fsw: 0x200 | pe,
                 ulp: true,
+                mxcsr: 0,
             });
         }
     }
+    // VCVTPS2PH with an immediate rounding mode: Rosetta swaps round-down
+    // (01) and round-up (10).
+    if case.spec.vex.is_some()
+        && op == [0x0F, 0x3A, 0x1D]
+        && case
+            .code
+            .last()
+            .is_some_and(|&i| i & 4 == 0 && matches!(i & 3, 1 | 2))
+    {
+        return None;
+    }
     // MINSS/MAXSS…: Rosetta flushes a denormal result under FTZ; FTZ only
     // applies to results that underflow, which MIN/MAX never produce.
-    if case.spec.cat == Cat::Sse
+    if matches!(case.spec.cat, Cat::Sse | Cat::Avx)
         && matches!(op, [0x0F, 0x5D | 0x5F])
         && u32::from_le_bytes(case.st.fxsave[24..28].try_into().unwrap()) & 0x8000 != 0
     {
@@ -1350,7 +1859,7 @@ fn known_differences(case: &Case, sw_sig: i32, hw_sig: i32) -> Option<Ignore> {
         // DIV/IDIV: all flags undefined.
         [0xF6 | 0xF7] if ext >= 6 => CF | PF | AF | ZF | SF | OF,
         // BSF/BSR: all but ZF undefined.
-        [0x0F, 0xBC | 0xBD] => CF | PF | AF | SF | OF,
+        [0x0F, 0xBC | 0xBD] if case.spec.mand != 0xF3 => CF | PF | AF | SF | OF,
         // BT*: OF/SF/AF/PF undefined.
         [0x0F, 0xA3 | 0xAB | 0xB3 | 0xBB | 0xBA] => PF | AF | SF | OF,
         // Shifts/rotates: AF undefined; OF undefined for counts other than 1.
@@ -1376,14 +1885,30 @@ fn known_differences(case: &Case, sw_sig: i32, hw_sig: i32) -> Option<Ignore> {
         // CMPXCHG: Rosetta computes the comparison as dest - accumulator; the
         // SDM (and real CPUs) use accumulator - dest. Only ZF agrees.
         [0x0F, 0xB0 | 0xB1] => CF | PF | AF | SF | OF,
-        // PTEST: Rosetta leaves AF/OF/PF/SF; the SDM clears them.
-        [0x0F, 0x38, 0x17] => PF | AF | SF | OF,
+        // PTEST (VPTEST, VTESTPS/PD): Rosetta leaves AF/OF/PF/SF; the SDM
+        // clears them.
+        [0x0F, 0x38, 0x17 | 0x0E | 0x0F] => PF | AF | SF | OF,
+        // LZCNT/TZCNT: only CF/ZF are defined.
+        [0x0F, 0xBC | 0xBD] if case.spec.mand == 0xF3 => PF | AF | SF | OF,
+        // BMI: AF/PF undefined (BEXTR: SF too).
+        [0x0F, 0x38, 0xF2 | 0xF3 | 0xF5] if case.spec.vex.is_some() => PF | AF,
+        [0x0F, 0x38, 0xF7] if case.spec.vex.is_some() => PF | AF | SF,
         _ => 0,
+    };
+    // VFMADDSUB/VFMSUBADD: Rosetta raises the flags of both the adding and
+    // the subtracting computation in every lane.
+    let mxcsr = if case.spec.vex.is_some()
+        && matches!(op, [0x0F, 0x38, 0x96 | 0x97 | 0xA6 | 0xA7 | 0xB6 | 0xB7])
+    {
+        0x3d
+    } else {
+        0
     };
     Some(Ignore {
         flags,
         fsw: 0,
         ulp: false,
+        mxcsr,
     })
 }
 
@@ -1448,6 +1973,7 @@ fn compare(
     for x in [&mut sfx, &mut hfx] {
         x[2] &= !(ign.fsw as u8);
         x[3] &= !((ign.fsw >> 8) as u8);
+        x[24] &= !ign.mxcsr;
     }
     if ign.ulp {
         for i in 0..8 {
@@ -1463,30 +1989,40 @@ fn compare(
         }
     }
     diffs.extend(describe_fx_diff(&sfx, &hfx));
+    for i in 0..16 {
+        if sw.ymm_hi[i] != hw.ymm_hi[i] {
+            diffs.push(format!(
+                "ymm{i}.hi {:032x} vs {:032x}",
+                sw.ymm_hi[i], hw.ymm_hi[i]
+            ));
+        }
+    }
     // FXSAVE: the pointer fields (FOP/FIP/FDP, written as zero here) and the
     // reserved bytes are left unwritten by Rosetta.
-    let fxsave = case.spec.op == [0x0F, 0xAE] && modrm_of(case).is_some_and(|m| (m >> 3) & 7 == 0);
+    let fxsave = case.spec.op == [0x0F, 0xAE]
+        && case.spec.vex.is_none()
+        && modrm_of(case).is_some_and(|m| matches!((m >> 3) & 7, 0 | 4));
+    let ignored = |i: usize| {
+        case.mem_ignore
+            .iter()
+            .any(|&(a, n)| (a..a + n as u64).contains(&(DATA + i as u64)))
+    };
     // FNSTENV/FNSAVE: Rosetta tags every non-empty register "01" (zero)
     // instead of classifying it; only emptiness is comparable.
     let env = matches!(case.spec.op, [0xD9 | 0xDD])
         && modrm_of(case).is_some_and(|m| m >> 6 != 3 && (m >> 3) & 7 == 6);
     let tag_like =
         |x: u8, y: u8| (0..4).all(|k| ((x >> (2 * k)) & 3 == 3) == ((y >> (2 * k)) & 3 == 3));
-    let differs = sw_data
+    let bad: Vec<usize> = sw_data
         .iter()
         .zip(&hw.data)
-        .any(|(x, y)| x != y && !(fxsave && *x == 0) && !(env && tag_like(*x, *y)));
-    if differs {
-        let first = sw_data
-            .iter()
-            .zip(&hw.data)
-            .position(|(x, y)| x != y)
-            .unwrap();
-        let last = sw_data
-            .iter()
-            .zip(&hw.data)
-            .rposition(|(x, y)| x != y)
-            .unwrap();
+        .enumerate()
+        .filter(|&(i, (x, y))| {
+            !(x == y || ignored(i) || (fxsave && *x == 0) || (env && tag_like(*x, *y)))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if let (Some(&first), Some(&last)) = (bad.first(), bad.last()) {
         diffs.push(format!(
             "mem[{:#x}..={:#x}] interp {:02x?} hw {:02x?}",
             DATA + first as u64,
@@ -1513,21 +2049,8 @@ fn group_key(case: &Case) -> String {
         return hex(&case.code);
     }
     let mut k = String::new();
-    if case.spec.mand != 0 {
-        k.push_str(&format!("{:02X} ", case.spec.mand));
-    }
-    for b in case.spec.op {
-        k.push_str(&format!("{b:02X} "));
-    }
-    if case.spec.modrm {
-        // find the modrm byte: right after the opcode bytes
-        let at = case
-            .code
-            .windows(case.spec.op.len())
-            .position(|w| w == case.spec.op)
-            .unwrap()
-            + case.spec.op.len();
-        let m = case.code[at];
+    k.push_str(&group_key_spec(&case.spec));
+    if let Some(m) = modrm_of(case) {
         k.push_str(&format!(
             "/{} {}",
             (m >> 3) & 7,
@@ -1580,6 +2103,8 @@ fn interpreter_matches_real_x86() {
     let mut total_bad = 0u64;
     let mut crashes = 0u64;
     let mut skipped = 0u64;
+    // Compared cases by the signal real execution raised (0 = completed).
+    let mut signals: BTreeMap<i32, u64> = BTreeMap::new();
     // NIXVM_X86_DIFF_HEX=0f77,660f77,…: run just these encodings.
     let fixed: Vec<Vec<u8>> = std::env::var("NIXVM_X86_DIFF_HEX")
         .unwrap_or_default()
@@ -1633,6 +2158,7 @@ fn interpreter_matches_real_x86() {
             skipped += 1;
             continue;
         };
+        *signals.entry(hw.signo).or_insert(0u64) += 1;
         let diffs = compare(&case, out, &sw, &sw_data, &hw, ign);
         if !diffs.is_empty() {
             total_bad += 1;
@@ -1640,7 +2166,18 @@ fn interpreter_matches_real_x86() {
             e.0 += 1;
             if e.1.len() < 3 {
                 let mut line = format!("[{}] {}", hex(&case.code), diffs.join("; "));
-                if case.spec.cat == Cat::Sse {
+                if case.spec.cat == Cat::Avx && std::env::var_os("NIXVM_X86_DIFF_VERBOSE").is_some()
+                {
+                    for i in 0..16 {
+                        let o = 160 + 16 * i;
+                        let lo = u128::from_le_bytes(case.st.fxsave[o..o + 16].try_into().unwrap());
+                        line.push_str(&format!(
+                            "\n             ymm{i:<2} {:032x}_{lo:032x}",
+                            case.st.ymm_hi[i]
+                        ));
+                    }
+                }
+                if matches!(case.spec.cat, Cat::Sse | Cat::Avx) {
                     let fx = &case.st.fxsave;
                     line.push_str(&format!(
                         "
@@ -1672,7 +2209,7 @@ fn interpreter_matches_real_x86() {
     }
     println!(
         "{total_bad} of {cases} cases mismatched ({} groups); oracle crashed on {crashes}; \
-         {skipped} skipped as known Rosetta deviations",
+         {skipped} skipped as known Rosetta deviations; outcomes by signal {signals:?}",
         groups.len()
     );
     assert!(
@@ -1683,6 +2220,9 @@ fn interpreter_matches_real_x86() {
 
 fn group_key_spec(s: &OpSpec) -> String {
     let mut k = String::new();
+    if s.vex.is_some() {
+        k.push_str("V ");
+    }
     if s.mand != 0 {
         k.push_str(&format!("{:02X} ", s.mand));
     }
