@@ -27,6 +27,7 @@ use crate::loader::{ProcessSpec, interp_path, load_dynamic, load_static};
 use crate::vcpu::mem::{PAGE_SIZE, Prot};
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 
+mod attrs;
 pub mod egress;
 mod fd;
 mod fs_ext;
@@ -252,6 +253,22 @@ struct ProcInfo {
     /// deadline ([`ProcInfo::timer_deadline`]); unlike it, neither `fork`
     /// children nor new threads inherit them, and `execve` deletes them.
     ptimers: Vec<ptimer::PosixTimer>,
+    /// `ioprio_set` value (`class << 13 | level`); 0 = never set (reads back
+    /// as the nice-derived best-effort default).
+    ioprio: u16,
+    /// `set_mempolicy` mode and nodemask (node 0 is the only node).
+    mempolicy: (u16, u64),
+    /// Registered `rseq` area: `(address, length, signature)`. Per thread: a
+    /// new thread starts unregistered, a fork child keeps the registration
+    /// (same address in its copied memory), `execve` drops it.
+    rseq: Option<(u64, u32, u32)>,
+    /// `personality(2)` persona (0 = `PER_LINUX`).
+    personality: u32,
+    /// `set_robust_list` head (reported by `get_robust_list`).
+    robust_list: u64,
+    /// Capability sets `[effective, permitted, inheritable]` after a
+    /// `capset`; `None` = the default for the task's uid (see `attrs.rs`).
+    caps: Option<[u64; 3]>,
 }
 
 /// The subset of `siginfo_t` a queued/sent signal carries beyond its number,
@@ -329,6 +346,12 @@ impl Default for ProcInfo {
             queued_siginfo: [None; NSIG_SLOTS],
             rt_queue: BTreeMap::new(),
             ptimers: Vec::new(),
+            ioprio: 0,
+            mempolicy: (0, 0),
+            rseq: None,
+            personality: 0,
+            robust_list: 0,
+            caps: None,
             creds: Creds::default(),
             sched_policy: 0, // SCHED_OTHER
             sched_priority: 0,
@@ -1231,6 +1254,14 @@ pub(super) struct Shared {
     /// every syscall, and the last value seen there.
     watch_addr: Option<u64>,
     watch_last: u64,
+    /// `sethostname`/`setdomainname`: what `uname` reports.
+    hostname: String,
+    domainname: String,
+    /// `mseal`ed ranges: `(mm, start, end)`.
+    sealed: Vec<(usize, u64, u64)>,
+    /// `membarrier` registrations per address space (`MEMBARRIER_CMD_REGISTER_*`
+    /// bits).
+    membarrier: BTreeMap<usize, u64>,
 }
 
 // The SMP scheduler ([`Kernel::schedule_smp`]) shares `&Kernel` across its worker
@@ -1492,6 +1523,10 @@ impl Kernel {
                     .ok()
                     .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
                 watch_last: 0,
+                hostname: "nixvm".to_string(),
+                domainname: "(none)".to_string(),
+                sealed: Vec::new(),
+                membarrier: BTreeMap::new(),
             }),
         }
     }
@@ -3168,14 +3203,18 @@ impl Kernel {
                 0
             }
             Sysno::Brk => self.sys_brk(cx, args[0], mem),
+            // An `mseal`ed range can't be unmapped or remapped.
+            Sysno::Munmap | Sysno::Mremap if Self::is_sealed(sh, cx, args[0], args[1]) => {
+                err(Errno::EPERM)
+            }
             Sysno::Munmap => self.sys_munmap(sh, cx, args[0], args[1], mem),
-            Sysno::Mprotect => self.sys_mprotect(args[0], args[1], args[2], mem),
+            Sysno::Mprotect => self.sys_mprotect_sealed(sh, cx, args[0], args[1], args[2], mem),
             Sysno::Mremap => {
                 self.sys_mremap(sh, cx, args[0], args[1], args[2], args[3], args[4], mem)
             }
             Sysno::Madvise => self.sys_madvise(args[0], args[1], args[2], mem),
             Sysno::Mincore => self.sys_mincore(args[0], args[1], args[2], mem),
-            Sysno::Uname => self.sys_uname(args[0], mem),
+            Sysno::Uname => self.sys_uname(sh, args[0], mem),
             // ClockGettime/Gettimeofday/ClockGetres/Time are handled in the fast
             // `dispatch_impl` table (they never reach here). nanosleep's interval
             // is relative (no clock/flags); clock_nanosleep carries a clock id and
@@ -3370,7 +3409,77 @@ impl Kernel {
             Sysno::Sysinfo => sys_misc::sys_sysinfo(args[0], mem),
             Sysno::Times => self.sys_times(sh, cx, args[0], mem),
             Sysno::Getcpu => sys_misc::sys_getcpu(args[0], args[1], mem),
-            Sysno::Capget => sys_misc::sys_capget(args[1], mem),
+            Sysno::Capget => self.sys_capget(sh, cx, args[0], args[1], mem),
+            Sysno::Capset => self.sys_capset(cx, args[0], args[1], mem),
+            // Scheduling / I/O priority / NUMA / pkeys / sealing / rseq /
+            // membarrier / clock discipline / names / robust list / namespaces
+            // (see `attrs.rs`).
+            Sysno::SchedSetparam => self.sys_sched_setparam(sh, cx, args[0], args[1], mem),
+            Sysno::SchedRrGetInterval => self.sys_sched_rr_get_interval(sh, cx, args[0], args[1], mem),
+            Sysno::SchedSetattr => self.sys_sched_setattr(sh, cx, args[0], args[1], args[2], mem),
+            Sysno::SchedGetattr => {
+                self.sys_sched_getattr(sh, cx, args[0], args[1], args[2], args[3], mem)
+            }
+            Sysno::IoprioSet => self.sys_ioprio(sh, cx, args[0], args[1], Some(args[2])),
+            Sysno::IoprioGet => self.sys_ioprio(sh, cx, args[0], args[1], None),
+            Sysno::SetMempolicy => self.sys_set_mempolicy(cx, args[0], args[1], args[2], mem),
+            Sysno::GetMempolicy => {
+                self.sys_get_mempolicy(cx, args[0], args[1], args[2], args[3], args[4], mem)
+            }
+            Sysno::Mbind => self.sys_mbind(args, mem),
+            Sysno::MovePages => self.sys_move_pages(sh, cx, args, mem),
+            // migrate_pages(pid, maxnode, old, new): every page is already on
+            // the one node; the count of pages that could not move is 0.
+            Sysno::MigratePages => match (
+                attrs_check_pid(sh, cx, args[0]),
+                attrs_nodes_ok(mem, args[2], args[1]),
+                attrs_nodes_ok(mem, args[3], args[1]),
+            ) {
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => e,
+                _ => 0,
+            },
+            // set_mempolicy_home_node(start, len, home_node, flags): only node 0
+            // exists; ranges without an explicit bind policy are skipped (0).
+            Sysno::SetMempolicyHomeNode => {
+                if args[3] != 0 || args[2] != 0 || !args[0].is_multiple_of(PAGE_SIZE) {
+                    err(Errno::EINVAL)
+                } else {
+                    0
+                }
+            }
+            Sysno::PkeyAlloc => self.sys_pkey_alloc(args[0], args[1]),
+            Sysno::PkeyMprotect => self.sys_pkey_mprotect(sh, cx, args, mem),
+            Sysno::Mseal => self.sys_mseal(sh, cx, args[0], args[1], args[2], mem),
+            Sysno::Membarrier => self.sys_membarrier(sh, cx, args[0], args[1]),
+            Sysno::Rseq => self.sys_rseq(cx, args[0], args[1], args[2], args[3], mem),
+            Sysno::Adjtimex => self.sys_adjtimex(0, args[0], mem),
+            Sysno::ClockAdjtime => self.sys_adjtimex(args[0], args[1], mem),
+            Sysno::Personality => self.sys_personality(cx, args[0]),
+            Sysno::Sethostname => self.sys_setname(sh, cx, args[0], args[1], false, mem),
+            Sysno::Setdomainname => self.sys_setname(sh, cx, args[0], args[1], true, mem),
+            Sysno::SetRobustList => self.sys_robust_list(sh, cx, args, false, mem),
+            Sysno::GetRobustList => self.sys_robust_list(sh, cx, args, true, mem),
+            Sysno::Unshare => self.sys_unshare(sh, cx, args[0]),
+            Sysno::Setns => self.sys_setns(cx, args[0], args[1]),
+            Sysno::Ustat => self.sys_ustat(args[1], mem),
+            Sysno::Sysfs => self.sys_sysfs(args[0], args[1], args[2], mem),
+            // vhangup: hang up the controlling terminal — needs
+            // CAP_SYS_TTY_CONFIG; for root a no-op (the session's tty is the
+            // host's or an in-VM pty that the caller is about to reopen).
+            Sysno::Vhangup => {
+                if cx.cur.creds.euid == 0 {
+                    0
+                } else {
+                    err(Errno::EPERM)
+                }
+            }
+            Sysno::Iopl => self.sys_ioport(args, false),
+            Sysno::Ioperm => self.sys_ioport(args, true),
+            // pkey_free: no key was ever allocated. remap_file_pages: Linux
+            // emulates it only on MAP_SHARED file mappings (it is deprecated);
+            // nixvm's file mappings are private copies, so the call can only be
+            // refused as for any other mapping.
+            Sysno::PkeyFree | Sysno::RemapFilePages => err(Errno::EINVAL),
             Sysno::Prlimit64 => self.sys_prlimit64(sh, args[1], args[2], args[3], mem),
             Sysno::Getrlimit => self.sys_getrlimit(sh, args[0], args[1], mem),
             Sysno::Prctl => self.sys_prctl(cx, args, mem),
@@ -3395,9 +3504,6 @@ impl Kernel {
             // permission/ownership/timestamp changes, socket options, clock
             // adjustment (TIME_OK), and scheduling/process-attr setters — none
             // modeled yet.
-            Sysno::Adjtimex
-            | Sysno::ClockAdjtime
-            | Sysno::SetRobustList
             // Locking/sync setters: all no-ops.
             | Sysno::Mlock
             | Sysno::Mlock2
@@ -3405,10 +3511,6 @@ impl Kernel {
             | Sysno::Mlockall
             | Sysno::Munlockall
             | Sysno::Setrlimit
-            | Sysno::Personality
-            | Sysno::Sethostname
-            | Sysno::Setdomainname
-            | Sysno::Capset
             // flock: advisory whole-file locks. One kernel instance runs one
             // cooperating process tree and nothing else can touch the in-VM
             // files, so granting every request immediately is safe — apk
@@ -3430,14 +3532,9 @@ impl Kernel {
             | Sysno::Umount2
             // syslog: accept and drop (no kernel ring buffer to read).
             | Sysno::Syslog
-            // rseq: accept the registration; single-cpu so the cached cpu_id
-            // never goes stale. get_robust_list: nothing registered.
-            | Sysno::Rseq
-            | Sysno::GetRobustList
             | Sysno::InotifyRmWatch
             // getgroups: no supplementary groups (count 0).
-            | Sysno::Getgroups
-            | Sysno::Membarrier => 0,
+            | Sysno::Getgroups => 0,
             _ => {
                 // Known-but-refused syscalls answer their documented errno and
                 // stay out of the unknown ledger.
@@ -3579,6 +3676,14 @@ impl Kernel {
         info.alarm_deadline = None;
         info.alarm_interval_ns = 0;
         info.ptimers = Vec::new();
+        // The robust-futex head is per thread and reset for every new task
+        // (the new thread's libc registers its own); an rseq registration
+        // survives into a fork child (same address in its copied memory) but
+        // not into a new thread, which registers its own area.
+        info.robust_list = 0;
+        if flags & CLONE_VM != 0 {
+            info.rseq = None;
+        }
         // A child inherits the parent's *process group*, so resolve the `pgid == 0`
         // ("group leader = self") sentinel to the parent's effective pgid here.
         // Left as 0 it would default to the child's *own* pid (`pgid_of`), putting
@@ -3709,6 +3814,15 @@ impl Kernel {
         }
 
         if let Some(cm) = child_mem.take() {
+            // Seals are a property of the mappings, which the copy inherits.
+            let child_mm = sh.spaces.len();
+            let seals: Vec<_> = sh
+                .sealed
+                .iter()
+                .filter(|s| s.0 == cx.cur.mm)
+                .map(|&(_, a, b)| (child_mm, a, b))
+                .collect();
+            sh.sealed.extend(seals);
             // A forked address space inherits the parent's arena position (its
             // pages were copied); `CLONE_VM` threads instead share the parent's
             // `mmap_areas[mm]` entry and never reach here.
@@ -3918,8 +4032,15 @@ impl Kernel {
         for fd in cx.cur.fds.close_cloexec() {
             self.bump_pipe(&fd, false);
         }
-        // POSIX timers are destroyed by execve (an ITIMER_REAL survives it).
+        // POSIX timers are destroyed by execve (an ITIMER_REAL survives it), as
+        // are the per-image registrations: rseq, the robust list, mseal seals
+        // and membarrier registrations (they describe the old address space).
         cx.cur.ptimers.clear();
+        cx.cur.rseq = None;
+        cx.cur.robust_list = 0;
+        let mm = cx.cur.mm;
+        sh.sealed.retain(|s| s.0 != mm);
+        sh.membarrier.remove(&mm);
         // Writable shared file mappings die with the old image: flush them to
         // their files now (their bytes are the source of truth) and forget them,
         // or the exit-time flush would write whatever the *new* image later
@@ -7560,16 +7681,16 @@ impl Kernel {
     }
 
     /// `uname(buf)`.
-    fn sys_uname(&self, buf: u64, mem: &mut GuestMemory) -> i64 {
+    fn sys_uname(&self, sh: &Shared, buf: u64, mem: &mut GuestMemory) -> i64 {
         const FIELD: usize = 65;
         let mut data = [0u8; FIELD * 6];
         let fields: [&[u8]; 6] = [
             b"Linux",
-            b"nixvm",
+            sh.hostname.as_bytes(),
             b"6.1.0-nixvm",
             b"#1 nixvm",
             self.arch.as_str().as_bytes(),
-            b"(none)",
+            sh.domainname.as_bytes(),
         ];
         for (i, f) in fields.iter().enumerate() {
             let n = f.len().min(FIELD - 1);
@@ -7976,6 +8097,33 @@ fn xattr_target(sys: Sysno, arg0: u64) -> xattr::XattrTarget {
         }
         _ => xattr::XattrTarget::path(arg0, false),
     }
+}
+
+/// `migrate_pages`'s target check: `pid` (0 = self) must exist.
+fn attrs_check_pid(sh: &Shared, cx: &ServiceCtx, pid: u64) -> Result<(), i64> {
+    let pid = pid as i32;
+    if pid == 0 || pid == cx.cur.pid || sh.procs.iter().flatten().any(|p| p.info.pid == pid) {
+        Ok(())
+    } else {
+        Err(err(Errno::ESRCH))
+    }
+}
+
+/// A nodemask naming only node 0 (or nothing) — the one-node machine's
+/// valid masks (`EINVAL` otherwise, `EFAULT` if unreadable).
+fn attrs_nodes_ok(mem: &GuestMemory, ptr: u64, maxnode: u64) -> Result<(), i64> {
+    if ptr == 0 || maxnode <= 1 {
+        return Ok(());
+    }
+    let words = (maxnode - 1).div_ceil(64);
+    for w in 0..words.min(1 << 14) {
+        match mem.read_u64(ptr + w * 8) {
+            Ok(v) if (w == 0 && v & !1 == 0) || v == 0 => {}
+            Ok(_) => return Err(err(Errno::EINVAL)),
+            Err(_) => return Err(err(Errno::EFAULT)),
+        }
+    }
+    Ok(())
 }
 
 /// Read a NUL-terminated path string from guest memory.

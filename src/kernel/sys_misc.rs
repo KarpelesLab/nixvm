@@ -445,19 +445,6 @@ pub(super) fn sys_getcpu(cpu: u64, node: u64, mem: &mut GuestMemory) -> i64 {
     0
 }
 
-/// `capget(hdrp, datap)` — report an empty capability set.
-pub(super) fn sys_capget(datap: u64, mem: &mut GuestMemory) -> i64 {
-    if datap == 0 {
-        return 0;
-    }
-    // Two `__user_cap_data_struct` entries (version 3), all bits clear.
-    let zeros = [0u8; 24];
-    if mem.write(datap, &zeros).is_err() {
-        return err(Errno::EFAULT);
-    }
-    0
-}
-
 pub(super) const RLIMIT_NOFILE: u64 = 7;
 /// The largest `RLIMIT_NOFILE` hard limit we'll grant. This bounds the fd
 /// space a program believes it has — node/V8 binary-search-raise it and then
