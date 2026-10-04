@@ -305,9 +305,23 @@ impl Pty {
 #[derive(Debug, Default)]
 pub(super) struct Ptys {
     table: Vec<Pty>,
+    /// Terminal state of the console as reached through `/dev/tty` (see
+    /// [`super::Fd::Tty`]) when it is not the host's own terminal.
+    console: Option<([u8; TERMIOS_LEN], [u8; WINSIZE_LEN])>,
 }
 
 impl Ptys {
+    /// The console terminal's `(termios, winsize)`: cooked `N_TTY` defaults
+    /// and 80×24 until the guest changes them.
+    pub(super) fn console(&mut self) -> &mut ([u8; TERMIOS_LEN], [u8; WINSIZE_LEN]) {
+        self.console.get_or_insert_with(|| {
+            let mut w = [0u8; WINSIZE_LEN];
+            w[0..2].copy_from_slice(&24u16.to_le_bytes()); // ws_row
+            w[2..4].copy_from_slice(&80u16.to_le_bytes()); // ws_col
+            (default_termios(), w)
+        })
+    }
+
     /// Allocate a fresh pty (its master just opened, slave locked) and return its
     /// index — the number `TIOCGPTN` reports and the `N` in `/dev/pts/N`.
     pub(super) fn alloc(&mut self) -> usize {

@@ -5379,7 +5379,7 @@ impl Kernel {
         };
         // fd 1/2 fall back to the host sinks only when still the standard stream.
         match cx.cur.fds.get(fd as i32).cloned() {
-            Some(Fd::Stdout) => match sh.stdout.write_all(&data) {
+            Some(Fd::Stdout | Fd::Tty) => match sh.stdout.write_all(&data) {
                 Ok(()) => count as i64,
                 Err(_) => err(Errno::EIO),
             },
@@ -5708,7 +5708,7 @@ impl Kernel {
         mem: &mut GuestMemory,
     ) -> i64 {
         match cx.cur.fds.get(fd as i32).cloned() {
-            Some(Fd::Stdin) if self.interactive => {
+            Some(Fd::Stdin | Fd::Tty) if self.interactive => {
                 // Draw from the buffered terminal input; block (re-trap) when it
                 // is empty and not yet closed, so the embedder can pump more.
                 if sh.stdin_buf.is_empty() {
@@ -5728,7 +5728,7 @@ impl Kernel {
                 }
                 n as i64
             }
-            Some(Fd::Stdin) => {
+            Some(Fd::Stdin | Fd::Tty) => {
                 let mut tmp = vec![0u8; count.min(1 << 20) as usize];
                 match sh.stdin.read(&mut tmp) {
                     Ok(n) => {
@@ -6070,7 +6070,7 @@ impl Kernel {
                     Err(e) => io_errno(&e),
                 }
             }
-            Some(Fd::Stdout) => sh
+            Some(Fd::Stdout | Fd::Tty) => sh
                 .stdout
                 .write_all(&buf)
                 .map_or(err(Errno::EIO), |()| buf.len() as i64),
@@ -6635,6 +6635,14 @@ impl Kernel {
         if let Fd::PtyMaster(n) | Fd::PtySlave(n) = f {
             return self.pty_ioctl(n, matches!(f, Fd::PtyMaster(_)), req, arg, mem);
         }
+        // `/dev/tty` on the console: the host terminal's own answers on the CLI
+        // path, else the emulated console terminal.
+        if matches!(f, Fd::Tty)
+            && !self.host_tty
+            && let Some(r) = self.console_tty_ioctl(cx, req, arg, mem)
+        {
+            return r;
+        }
         // Terminal-attribute ioctls on the guest's stdio: forward to the real
         // host tty when the guest's stdio is the host's own (the CLI path), so
         // the guest gets a working virtual terminal (size, raw mode, echo). The
@@ -6642,7 +6650,7 @@ impl Kernel {
         // (output piped), so isatty() stays honest.
         if self.host_tty && is_tty_ioctl(req) {
             let host_fd = match f {
-                Fd::Stdin => Some(0),
+                Fd::Stdin | Fd::Tty => Some(0),
                 Fd::Stdout => Some(1),
                 Fd::Stderr => Some(2),
                 _ => None,
@@ -6760,6 +6768,63 @@ impl Kernel {
                 err(Errno::ENOTTY)
             }
         }
+    }
+
+    /// Terminal ioctls on the emulated console terminal (`/dev/tty` when the
+    /// console isn't the host's terminal): termios and window size are kept
+    /// (so `tcgetattr`/`tcsetattr` round-trip — a password prompt turning
+    /// echo off works), the foreground group is the caller's, and the
+    /// queue/flow requests succeed. `None` for anything else (the generic fd
+    /// requests apply).
+    fn console_tty_ioctl(
+        &self,
+        cx: &ServiceCtx,
+        req: u32,
+        arg: u64,
+        mem: &mut GuestMemory,
+    ) -> Option<i64> {
+        const TCGETS: u32 = 0x5401;
+        const TCSETS: u32 = 0x5402;
+        const TCSETSW: u32 = 0x5403;
+        const TCSETSF: u32 = 0x5404;
+        const TIOCGWINSZ: u32 = 0x5413;
+        const TIOCSWINSZ: u32 = 0x5414;
+        const TIOCGPGRP: u32 = 0x540F;
+        const TIOCSPGRP: u32 = 0x5410;
+        const TIOCSCTTY: u32 = 0x540E;
+        const TCSBRK: u32 = 0x5409;
+        const TCXONC: u32 = 0x540A;
+        const TCFLSH: u32 = 0x540B;
+        let mut ptys = self.ptys.lock().unwrap();
+        let (termios, winsize) = ptys.console();
+        let put = |mem: &mut GuestMemory, b: &[u8]| {
+            if mem.write(arg, b).is_ok() {
+                0
+            } else {
+                err(Errno::EFAULT)
+            }
+        };
+        Some(match req {
+            TCGETS => put(mem, &termios[..]),
+            TIOCGWINSZ => put(mem, &winsize[..]),
+            TCSETS | TCSETSW | TCSETSF => match mem.read_vec(arg, pty::TERMIOS_LEN) {
+                Ok(v) => {
+                    termios.copy_from_slice(&v);
+                    0
+                }
+                Err(_) => err(Errno::EFAULT),
+            },
+            TIOCSWINSZ => match mem.read_vec(arg, pty::WINSIZE_LEN) {
+                Ok(v) => {
+                    winsize.copy_from_slice(&v);
+                    0
+                }
+                Err(_) => err(Errno::EFAULT),
+            },
+            TIOCGPGRP => put(mem, &pgid_of(&cx.cur).to_le_bytes()),
+            TIOCSPGRP | TIOCSCTTY | TCSBRK | TCXONC | TCFLSH => 0,
+            _ => return None,
+        })
     }
 
     /// ioctls on a pty end: `TCGETS`/`TCSETS`(`W`/`F`) and `TIOCGWINSZ`/
@@ -7018,6 +7083,28 @@ impl Kernel {
             && let Some(pf) = vfs.procfs_mut()
         {
             pf.update_self(self.proc_self_live(cx));
+        }
+
+        // `/dev/tty` is the caller's controlling terminal: the pty its stdio
+        // is attached to, else the console when there is one (the CLI's host
+        // terminal, the interactive embedder's), else none — ENXIO, as for a
+        // Linux process without a controlling terminal.
+        if abs == "/dev/tty" {
+            const O_CLOEXEC: u64 = 0o2000000;
+            let pty = (0..3).find_map(|n| match cx.cur.fds.get(n) {
+                Some(Fd::PtySlave(p)) => Some(*p),
+                _ => None,
+            });
+            let fd = if let Some(p) = pty {
+                self.ptys.lock().unwrap().open_slave(p, pgid_of(&cx.cur));
+                cx.cur.fds.alloc(Fd::PtySlave(p))
+            } else if self.interactive || self.host_tty {
+                cx.cur.fds.alloc(Fd::Tty)
+            } else {
+                return err(Errno::ENXIO);
+            };
+            cx.cur.fds.set_cloexec(fd, flags & O_CLOEXEC != 0);
+            return i64::from(fd);
         }
 
         // Pseudo-terminals: `/dev/ptmx` allocates a fresh pty and returns its
@@ -7327,6 +7414,7 @@ impl Kernel {
                 Fd::Stdin
                 | Fd::Stdout
                 | Fd::Stderr
+                | Fd::Tty
                 | Fd::Eventfd(_)
                 | Fd::Signalfd(_)
                 | Fd::Timerfd(_)

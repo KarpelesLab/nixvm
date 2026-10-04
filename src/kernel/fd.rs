@@ -106,6 +106,10 @@ pub enum Fd {
     Stdin,
     Stdout,
     Stderr,
+    /// `/dev/tty` opened on the console: the controlling terminal, read from
+    /// the guest's terminal input and written to its terminal output (a
+    /// terminal device is one read/write file), with the terminal ioctls.
+    Tty,
     /// An open path in the [`crate::fs::MountTable`], with the current offset.
     File {
         path: String,
