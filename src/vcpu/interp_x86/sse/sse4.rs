@@ -4,10 +4,10 @@
 
 #![allow(clippy::too_many_lines)]
 
-use super::{Ff, Mp, arith_lane, lane, map2, mp, pack, sat_s, sx};
+use super::{Ff, Mp, arith_lane, lane, map2, mp, pack, sat_s, set_lane, sx};
 use crate::vcpu::GuestMemory;
-use crate::vcpu::interp_x86::{Flags, ModRm, Pfx, RAX, RCX, RDX, RmKind, Step, X86Interp, fetch};
-use crate::vcpu::softfloat::{self as sf, Op, Round};
+use crate::vcpu::interp_x86::{Flags, Pfx, RAX, RCX, RDX, RmKind, Step, X86Interp, fetch};
+use crate::vcpu::softfloat::{self as sf, Mx, Op, Round};
 
 /// SSSE3 and SSE4.1/SSE4.2 — not yet advertised, so `#UD` while false.
 pub(in crate::vcpu::interp_x86) const SSSE3: bool = true;
@@ -36,7 +36,7 @@ const CRC32C: [u32; 256] = {
 };
 
 /// SSSE3 binary ops over `n` bytes (8 for MMX, 16 for XMM).
-fn ssse3_op(op: u8, a: u128, b: u128, n: usize) -> Option<u128> {
+pub(super) fn ssse3_op(op: u8, a: u128, b: u128, n: usize) -> Option<u128> {
     let half = |w: usize| n / w / 2; // lanes per operand half for horizontal ops
     let hz = |w: usize, f: &dyn Fn(u64, u64) -> u64| -> u128 {
         let bits = 8 * w;
@@ -95,7 +95,7 @@ fn ssse3_op(op: u8, a: u128, b: u128, n: usize) -> Option<u128> {
 }
 
 /// `PALIGNR`: the `2n`-byte concatenation `a:b` shifted right by `imm` bytes.
-fn palignr(a: u128, b: u128, imm: u8, n: usize) -> u128 {
+pub(super) fn palignr(a: u128, b: u128, imm: u8, n: usize) -> u128 {
     let mut out = 0u128;
     for i in 0..n {
         let k = usize::from(imm) + i;
@@ -112,7 +112,7 @@ fn palignr(a: u128, b: u128, imm: u8, n: usize) -> u128 {
 }
 
 /// `PMOVSX*`/`PMOVZX*`: widen the low lanes of `v` from `from` to `to` bytes.
-fn pmov_ext(v: u128, from: usize, to: usize, signed: bool) -> u128 {
+pub(super) fn pmov_ext(v: u128, from: usize, to: usize, signed: bool) -> u128 {
     let mut out = 0u128;
     let m = if to == 8 {
         u128::from(u64::MAX)
@@ -125,6 +125,194 @@ fn pmov_ext(v: u128, from: usize, to: usize, signed: bool) -> u128 {
         out |= (u128::from(x) & m) << (8 * to * i);
     }
     out
+}
+
+/// The SSE4.1/SSE4.2 binary integer ops of the `0F 38` map that are pure
+/// functions of the two operands (`PMULDQ`, `PCMPEQQ`, `PACKUSDW`,
+/// `PCMPGTQ`, `PMIN*`/`PMAX*`, `PMULLD`); `None` for other opcodes.
+pub(super) fn sse41_op(op: u8, a: u128, b: u128) -> Option<u128> {
+    Some(match op {
+        0x28 => map2(a, b, 8, 16, |x, y| {
+            (sx(x & 0xffff_ffff, 4).wrapping_mul(sx(y & 0xffff_ffff, 4))) as u64
+        }),
+        0x29 => map2(a, b, 8, 16, |x, y| if x == y { u64::MAX } else { 0 }),
+        0x2B => pack(a, b, 4, 16, false),
+        0x37 if SSE42 => map2(a, b, 8, 16, |x, y| {
+            if (x as i64) > (y as i64) { u64::MAX } else { 0 }
+        }),
+        0x38 => map2(a, b, 1, 16, |x, y| if sx(x, 1) < sx(y, 1) { x } else { y }),
+        0x39 => map2(a, b, 4, 16, |x, y| if sx(x, 4) < sx(y, 4) { x } else { y }),
+        0x3A => map2(a, b, 2, 16, u64::min),
+        0x3B => map2(a, b, 4, 16, u64::min),
+        0x3C => map2(a, b, 1, 16, |x, y| if sx(x, 1) > sx(y, 1) { x } else { y }),
+        0x3D => map2(a, b, 4, 16, |x, y| if sx(x, 4) > sx(y, 4) { x } else { y }),
+        0x3E => map2(a, b, 2, 16, u64::max),
+        0x3F => map2(a, b, 4, 16, u64::max),
+        0x40 => map2(a, b, 4, 16, u64::wrapping_mul),
+        _ => return None,
+    })
+}
+
+/// `PHMINPOSUW`: the minimum unsigned word of `b` and its index.
+pub(super) fn phminposuw(b: u128) -> u128 {
+    let (mut min, mut idx) = (lane(b, 2, 0), 0u64);
+    for i in 1..8 {
+        let v = lane(b, 2, i);
+        if v < min {
+            min = v;
+            idx = i as u64;
+        }
+    }
+    u128::from(min | (idx << 16))
+}
+
+/// `BLENDPS`/`BLENDPD`/`PBLENDW` (`0F 3A 0C/0D/0E`): lane `i` from `b` when
+/// `imm` bit `i` is set.
+pub(super) fn blend_imm(op: u8, a: u128, b: u128, imm: u8) -> u128 {
+    let w = match op {
+        0x0C => 4,
+        0x0D => 8,
+        _ => 2,
+    };
+    let mut out = 0u128;
+    for i in 0..16 / w {
+        let s = if (imm >> i) & 1 != 0 { b } else { a };
+        out |= u128::from(lane(s, w, i)) << (8 * w * i);
+    }
+    out
+}
+
+/// `PBLENDVB`/`BLENDVPS`/`BLENDVPD` (`w` = 1/4/8): lane from `b` where the
+/// mask lane's sign bit is set.
+pub(super) fn blendv(a: u128, b: u128, mask: u128, w: usize) -> u128 {
+    let mut out = 0u128;
+    for i in 0..16 / w {
+        let s = if lane(mask, w, i) >> (8 * w - 1) != 0 {
+            b
+        } else {
+            a
+        };
+        out = set_lane(out, w, i, lane(s, w, i));
+    }
+    out
+}
+
+/// `MPSADBW`: eight sums of absolute differences of 4-byte groups — `a` at
+/// byte offsets `imm[2]·4 + i`, `b` at `imm[1:0]·4`.
+pub(super) fn mpsadbw(a: u128, b: u128, imm: u8) -> u128 {
+    let ao = usize::from((imm >> 2) & 1) * 4;
+    let bo = usize::from(imm & 3) * 4;
+    let mut out = 0u128;
+    for i in 0..8 {
+        let s: u64 = (0..4)
+            .map(|k| lane(a, 1, ao + i + k).abs_diff(lane(b, 1, bo + k)))
+            .sum();
+        out |= u128::from(s) << (16 * i);
+    }
+    out
+}
+
+/// `ADDSUBPS/PD` (`kind` 0), `HADDPS/PD` (1), `HSUBPS/PD` (2).
+pub(super) fn fp_horiz(ff: Ff, kind: u8, a: u128, b: u128, mx: Mx) -> (u128, u32) {
+    let w = ff.bytes();
+    let lanes = 16 / w;
+    let mut out = 0u128;
+    let mut flags = 0;
+    for i in 0..lanes {
+        let (x, y, o) = match kind {
+            0 => (
+                lane(a, w, i),
+                lane(b, w, i),
+                if i % 2 == 0 { Op::Sub } else { Op::Add },
+            ),
+            _ => {
+                let src = if i < lanes / 2 { a } else { b };
+                let k = (i % (lanes / 2)) * 2;
+                (
+                    lane(src, w, k),
+                    lane(src, w, k + 1),
+                    if kind == 1 { Op::Add } else { Op::Sub },
+                )
+            }
+        };
+        let (r, f) = arith_lane(o, ff, x, y, mx);
+        out |= u128::from(r) << (8 * w * i);
+        flags |= f;
+    }
+    (out, flags)
+}
+
+/// `ROUNDPS`/`ROUNDPD`/`ROUNDSS`/`ROUNDSD` (`op` = `0F 3A 08..0B`) of `b`;
+/// the scalar forms keep `a`'s upper lanes.
+pub(super) fn round_lanes(op: u8, a: u128, b: u128, imm: u8, mx: Mx) -> (u128, u32) {
+    let (ff, lanes) = match op {
+        0x08 => (Ff::S, 4),
+        0x09 => (Ff::D, 2),
+        0x0A => (Ff::S, 1),
+        _ => (Ff::D, 1),
+    };
+    let mode = if imm & 4 != 0 {
+        mx.mode
+    } else {
+        Round::from_x86(u32::from(imm & 3))
+    };
+    let w = ff.bytes();
+    let mut out = a;
+    let mut flags = 0;
+    for i in 0..lanes {
+        let (u, _) = mx.input(ff.unpack(lane(b, w, i)), ff.fmt());
+        let (r, f) = if u.is_nan() {
+            (
+                ff.pack(&u.quieted()),
+                if u.is_snan() { sf::INVALID } else { 0 },
+            )
+        } else {
+            let rr = sf::round_to_int(u, mode);
+            let fl = if imm & 8 != 0 { 0 } else { rr.flags };
+            // Re-pack through the format (an integral value is exact).
+            let v = sf::round_fp(rr.v, ff.fmt(), Round::Nearest).v;
+            (ff.pack(&v), fl)
+        };
+        out = set_lane(out, w, i, r);
+        flags |= f;
+    }
+    (out, flags)
+}
+
+/// `DPPS`/`DPPD`: the dot product of the lanes selected by `imm[7:4]`,
+/// broadcast to the lanes selected by `imm[3:0]` (others zeroed).
+pub(super) fn dpp(a: u128, b: u128, single: bool, imm: u8, mx: Mx) -> (u128, u32) {
+    let (ff, lanes) = if single { (Ff::S, 4) } else { (Ff::D, 2) };
+    let w = ff.bytes();
+    let mut flags = 0;
+    let zero = 0u64; // +0.0 in either format
+    let mut prods = [zero; 4];
+    for (i, pr) in prods.iter_mut().enumerate().take(lanes) {
+        if (imm >> (4 + i)) & 1 != 0 {
+            let (r, f) = arith_lane(Op::Mul, ff, lane(a, w, i), lane(b, w, i), mx);
+            *pr = r;
+            flags |= f;
+        }
+    }
+    let mut add = |x: u64, y: u64| -> u64 {
+        let (r, f) = arith_lane(Op::Add, ff, x, y, mx);
+        flags |= f;
+        r
+    };
+    let sum = if single {
+        let t2 = add(prods[0], prods[1]);
+        let t3 = add(prods[2], prods[3]);
+        add(t2, t3)
+    } else {
+        add(prods[0], prods[1])
+    };
+    let mut out = 0u128;
+    for i in 0..lanes {
+        if (imm >> i) & 1 != 0 {
+            out |= u128::from(sum) << (8 * w * i);
+        }
+    }
+    (out, flags)
 }
 
 /// The element count, format and per-element accessor of a `PCMPxSTRx`.
@@ -283,33 +471,7 @@ impl X86Interp {
     fn sse3_arith(&mut self, mem: &GuestMemory, pc: u64, p: Pfx, ff: Ff, kind: u8) -> Step {
         let (m, end) = fetch!(self.modrm(pc, p.rex));
         let b = fetch!(self.xsrc(mem, &m, end, 16, true));
-        let a = self.xmm[m.reg];
-        let mx = self.mx();
-        let w = ff.bytes();
-        let lanes = 16 / w;
-        let mut out = 0u128;
-        let mut flags = 0;
-        for i in 0..lanes {
-            let (x, y, o) = match kind {
-                0 => (
-                    lane(a, w, i),
-                    lane(b, w, i),
-                    if i % 2 == 0 { Op::Sub } else { Op::Add },
-                ),
-                _ => {
-                    let src = if i < lanes / 2 { a } else { b };
-                    let k = (i % (lanes / 2)) * 2;
-                    (
-                        lane(src, w, k),
-                        lane(src, w, k + 1),
-                        if kind == 1 { Op::Add } else { Op::Sub },
-                    )
-                }
-            };
-            let (r, f) = arith_lane(o, ff, x, y, mx);
-            out |= u128::from(r) << (8 * w * i);
-            flags |= f;
-        }
+        let (out, flags) = fp_horiz(ff, kind, self.xmm[m.reg], b, self.mx());
         fetch!(self.sse_flags(flags));
         self.xmm[m.reg] = out;
         self.next(end)
@@ -375,31 +537,15 @@ impl X86Interp {
             _ => 16,
         };
         let b = fetch!(self.xsrc(mem, &m, end, src_n, true));
+        if let Some(r) = sse41_op(op, a, b) {
+            self.xmm[m.reg] = r;
+            return self.next(end);
+        }
         let r = match op {
-            0x10 => {
-                // PBLENDVB (mask: XMM0 byte sign bits)
-                let mut out = 0u128;
-                for i in 0..16 {
-                    let s = if lane(x0, 1, i) & 0x80 != 0 { b } else { a };
-                    out |= u128::from(lane(s, 1, i)) << (8 * i);
-                }
-                out
-            }
-            0x14 | 0x15 => {
-                let w = if op == 0x14 { 4 } else { 8 };
-                let mut out = 0u128;
-                for i in 0..16 / w {
-                    let sign = lane(x0, w, i) >> (8 * w - 1) != 0;
-                    let s = if sign { b } else { a };
-                    let lm = if w == 8 {
-                        u128::from(u64::MAX)
-                    } else {
-                        0xffff_ffff
-                    };
-                    out |= (u128::from(lane(s, w, i)) & lm) << (8 * w * i);
-                }
-                out
-            }
+            // PBLENDVB / BLENDVPS / BLENDVPD (mask: XMM0 lane sign bits)
+            0x10 => blendv(a, b, x0, 1),
+            0x14 => blendv(a, b, x0, 4),
+            0x15 => blendv(a, b, x0, 8),
             0x17 => {
                 // PTEST
                 self.flags = Flags {
@@ -421,40 +567,12 @@ impl X86Interp {
             0x33 => pmov_ext(b, 2, 4, false),
             0x34 => pmov_ext(b, 2, 8, false),
             0x35 => pmov_ext(b, 4, 8, false),
-            0x28 => map2(a, b, 8, 16, |x, y| {
-                (sx(x & 0xffff_ffff, 4).wrapping_mul(sx(y & 0xffff_ffff, 4))) as u64
-            }),
-            0x29 => map2(a, b, 8, 16, |x, y| if x == y { u64::MAX } else { 0 }),
             0x2A => {
                 // MOVNTDQA xmm, m128 (aligned load; memory only)
                 let addr = fetch!(self.mem_only(m.kind, end));
                 fetch!(Self::mem_read(mem, addr, 16, 16))
             }
-            0x2B => pack(a, b, 4, 16, false),
-            0x37 if SSE42 => map2(a, b, 8, 16, |x, y| {
-                if (x as i64) > (y as i64) { u64::MAX } else { 0 }
-            }),
-            0x38 => map2(a, b, 1, 16, |x, y| if sx(x, 1) < sx(y, 1) { x } else { y }),
-            0x39 => map2(a, b, 4, 16, |x, y| if sx(x, 4) < sx(y, 4) { x } else { y }),
-            0x3A => map2(a, b, 2, 16, u64::min),
-            0x3B => map2(a, b, 4, 16, u64::min),
-            0x3C => map2(a, b, 1, 16, |x, y| if sx(x, 1) > sx(y, 1) { x } else { y }),
-            0x3D => map2(a, b, 4, 16, |x, y| if sx(x, 4) > sx(y, 4) { x } else { y }),
-            0x3E => map2(a, b, 2, 16, u64::max),
-            0x3F => map2(a, b, 4, 16, u64::max),
-            0x40 => map2(a, b, 4, 16, u64::wrapping_mul),
-            0x41 => {
-                // PHMINPOSUW
-                let (mut min, mut idx) = (lane(b, 2, 0), 0u64);
-                for i in 1..8 {
-                    let v = lane(b, 2, i);
-                    if v < min {
-                        min = v;
-                        idx = i as u64;
-                    }
-                }
-                u128::from(min | (idx << 16))
-            }
+            0x41 => phminposuw(b),
             _ => return Step::Illegal,
         };
         self.xmm[m.reg] = r;
@@ -490,22 +608,10 @@ impl X86Interp {
         }
         let (m, imm, end) = fetch!(self.modrm_imm(pc, p, true));
         match op {
-            0x08..=0x0B => self.round_ps(mem, &m, end, op, imm),
             0x0C..=0x0E => {
                 // BLENDPS / BLENDPD / PBLENDW
                 let b = fetch!(self.xsrc(mem, &m, end, 16, true));
-                let a = self.xmm[m.reg];
-                let w = match op {
-                    0x0C => 4,
-                    0x0D => 8,
-                    _ => 2,
-                };
-                let mut out = 0u128;
-                for i in 0..16 / w {
-                    let s = if (imm >> i) & 1 != 0 { b } else { a };
-                    out |= u128::from(lane(s, w, i)) << (8 * w * i);
-                }
-                self.xmm[m.reg] = out;
+                self.xmm[m.reg] = blend_imm(op, self.xmm[m.reg], b, imm);
                 self.next(end)
             }
             0x14..=0x17 => {
@@ -574,159 +680,86 @@ impl X86Interp {
                 self.xmm[m.reg] = x;
                 self.next(end)
             }
-            0x40 | 0x41 => self.dpp(mem, &m, end, op == 0x40, imm),
+            0x08..=0x0B | 0x40 | 0x41 => {
+                // ROUNDPS/PD/SS/SD, DPPS/DPPD
+                let n = match op {
+                    0x0A => 4,
+                    0x0B => 8,
+                    _ => 16,
+                };
+                let b = fetch!(self.xsrc(mem, &m, end, n, true));
+                let (a, mx) = (self.xmm[m.reg], self.mx());
+                let (r, flags) = if op >= 0x40 {
+                    dpp(a, b, op == 0x40, imm, mx)
+                } else {
+                    round_lanes(op, a, b, imm, mx)
+                };
+                fetch!(self.sse_flags(flags));
+                self.xmm[m.reg] = r;
+                self.next(end)
+            }
             0x42 => {
                 // MPSADBW
                 let b = fetch!(self.xsrc(mem, &m, end, 16, true));
-                let a = self.xmm[m.reg];
-                let ao = usize::from((imm >> 2) & 1) * 4;
-                let bo = usize::from(imm & 3) * 4;
-                let mut out = 0u128;
-                for i in 0..8 {
-                    let s: u64 = (0..4)
-                        .map(|k| lane(a, 1, ao + i + k).abs_diff(lane(b, 1, bo + k)))
-                        .sum();
-                    out |= u128::from(s) << (16 * i);
-                }
-                self.xmm[m.reg] = out;
+                self.xmm[m.reg] = mpsadbw(self.xmm[m.reg], b, imm);
                 self.next(end)
             }
             0x60..=0x63 if SSE42 => {
                 // PCMPESTRM / PCMPESTRI / PCMPISTRM / PCMPISTRI
                 let b = fetch!(self.xsrc(mem, &m, end, 16, false));
-                let a = self.xmm[m.reg];
-                let f = StrFmt::new(imm);
-                let explicit = op <= 0x61;
-                let (la, lb) = if explicit {
-                    let len = |r: usize| -> usize {
-                        let v = if p.rex.w {
-                            self.gpr[r] as i64
-                        } else {
-                            i64::from(self.gpr[r] as u32 as i32)
-                        };
-                        usize::try_from(v.unsigned_abs().min(f.n as u64)).unwrap_or(f.n)
-                    };
-                    (len(RAX), len(RDX))
-                } else {
-                    (f.implicit_len(a), f.implicit_len(b))
-                };
-                let (res, flags) = pcmpstr(a, b, la, lb, imm);
-                self.flags = flags;
-                if op & 1 == 1 {
-                    // index → ECX
-                    let idx = if res == 0 {
-                        f.n as u32
-                    } else if imm & 0x40 != 0 {
-                        res.ilog2()
-                    } else {
-                        res.trailing_zeros()
-                    };
-                    self.gpr[RCX] = u64::from(idx);
-                } else {
-                    // mask → XMM0
-                    self.xmm[0] = if imm & 0x40 == 0 {
-                        u128::from(res)
-                    } else {
-                        let w = if f.words { 2 } else { 1 };
-                        let ones = if w == 2 { 0xffffu128 } else { 0xff };
-                        (0..f.n).fold(0u128, |acc, i| {
-                            acc | if (res >> i) & 1 != 0 {
-                                ones << (8 * w * i)
-                            } else {
-                                0
-                            }
-                        })
-                    };
-                }
+                self.pcmpstr_run(op, imm, self.xmm[m.reg], b, p.rex.w);
                 self.next(end)
             }
             _ => Step::Illegal,
         }
     }
 
-    /// `ROUNDPS`/`ROUNDPD`/`ROUNDSS`/`ROUNDSD` (`0F 3A 08..0B`).
-    fn round_ps(&mut self, mem: &GuestMemory, m: &ModRm, end: u64, op: u8, imm: u8) -> Step {
-        let (ff, lanes, n) = match op {
-            0x08 => (Ff::S, 4, 16),
-            0x09 => (Ff::D, 2, 16),
-            0x0A => (Ff::S, 1, 4),
-            _ => (Ff::D, 1, 8),
-        };
-        let b = fetch!(self.xsrc(mem, m, end, n, true));
-        let mx = self.mx();
-        let mode = if imm & 4 != 0 {
-            mx.mode
-        } else {
-            Round::from_x86(u32::from(imm & 3))
-        };
-        let w = ff.bytes();
-        let mut out = self.xmm[m.reg];
-        let mut flags = 0;
-        for i in 0..lanes {
-            let (u, _) = mx.input(ff.unpack(lane(b, w, i)), ff.fmt());
-            let (r, f) = if u.is_nan() {
-                (
-                    ff.pack(&u.quieted()),
-                    if u.is_snan() { sf::INVALID } else { 0 },
-                )
-            } else {
-                let rr = sf::round_to_int(u, mode);
-                let fl = if imm & 8 != 0 { 0 } else { rr.flags };
-                // Re-pack through the format (an integral value is exact).
-                let v = sf::round_fp(rr.v, ff.fmt(), Round::Nearest).v;
-                (ff.pack(&v), fl)
+    /// Run `PCMPxSTRx` (`op` = `0F 3A 60..63`) on `a`/`b` — explicit lengths
+    /// from `EAX`/`EDX` (`RAX`/`RDX` when `wide`) or implicit (NUL-terminated):
+    /// the flags, then the index into `ECX` (`op` odd) or the mask into
+    /// `XMM0`.
+    pub(super) fn pcmpstr_run(&mut self, op: u8, imm: u8, a: u128, b: u128, wide: bool) {
+        let f = StrFmt::new(imm);
+        let (la, lb) = if op <= 0x61 {
+            let len = |r: usize| -> usize {
+                let v = if wide {
+                    self.gpr[r] as i64
+                } else {
+                    i64::from(self.gpr[r] as u32 as i32)
+                };
+                usize::try_from(v.unsigned_abs().min(f.n as u64)).unwrap_or(f.n)
             };
-            let lm: u128 = if w == 8 {
-                u128::from(u64::MAX)
-            } else {
-                0xffff_ffff
-            };
-            out = (out & !(lm << (8 * w * i))) | (u128::from(r) << (8 * w * i));
-            flags |= f;
-        }
-        fetch!(self.sse_flags(flags));
-        self.xmm[m.reg] = out;
-        self.next(end)
-    }
-
-    /// `DPPS`/`DPPD`: the dot product of the lanes selected by `imm[7:4]`,
-    /// broadcast to the lanes selected by `imm[3:0]` (others zeroed).
-    fn dpp(&mut self, mem: &GuestMemory, m: &ModRm, end: u64, single: bool, imm: u8) -> Step {
-        let b = fetch!(self.xsrc(mem, m, end, 16, true));
-        let a = self.xmm[m.reg];
-        let mx = self.mx();
-        let (ff, lanes) = if single { (Ff::S, 4) } else { (Ff::D, 2) };
-        let w = ff.bytes();
-        let mut flags = 0;
-        let zero = 0u64; // +0.0 in either format
-        let mut prods = [zero; 4];
-        for (i, pr) in prods.iter_mut().enumerate().take(lanes) {
-            if (imm >> (4 + i)) & 1 != 0 {
-                let (r, f) = arith_lane(Op::Mul, ff, lane(a, w, i), lane(b, w, i), mx);
-                *pr = r;
-                flags |= f;
-            }
-        }
-        let mut add = |x: u64, y: u64| -> u64 {
-            let (r, f) = arith_lane(Op::Add, ff, x, y, mx);
-            flags |= f;
-            r
-        };
-        let sum = if single {
-            let t2 = add(prods[0], prods[1]);
-            let t3 = add(prods[2], prods[3]);
-            add(t2, t3)
+            (len(RAX), len(RDX))
         } else {
-            add(prods[0], prods[1])
+            (f.implicit_len(a), f.implicit_len(b))
         };
-        let mut out = 0u128;
-        for i in 0..lanes {
-            if (imm >> i) & 1 != 0 {
-                out |= u128::from(sum) << (8 * w * i);
-            }
+        let (res, flags) = pcmpstr(a, b, la, lb, imm);
+        self.flags = flags;
+        if op & 1 == 1 {
+            // index → ECX
+            let idx = if res == 0 {
+                f.n as u32
+            } else if imm & 0x40 != 0 {
+                res.ilog2()
+            } else {
+                res.trailing_zeros()
+            };
+            self.gpr[RCX] = u64::from(idx);
+        } else {
+            // mask → XMM0
+            self.xmm[0] = if imm & 0x40 == 0 {
+                u128::from(res)
+            } else {
+                let w = if f.words { 2 } else { 1 };
+                let ones = if w == 2 { 0xffffu128 } else { 0xff };
+                (0..f.n).fold(0u128, |acc, i| {
+                    acc | if (res >> i) & 1 != 0 {
+                        ones << (8 * w * i)
+                    } else {
+                        0
+                    }
+                })
+            };
         }
-        fetch!(self.sse_flags(flags));
-        self.xmm[m.reg] = out;
-        self.next(end)
     }
 }

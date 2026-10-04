@@ -334,12 +334,21 @@ fn fast_arith(op: Op, ff: Ff, a: u64, b: u64) -> Option<(u64, u32)> {
                     let err = (x - (s - bb)) + (y - bb);
                     (s, err == 0.0)
                 }
+                // The FMA error terms are exact only while they stay above
+                // the denormal range: products/dividends near the bottom of
+                // the exponent range take the soft path.
                 Op::Mul => {
                     let p = x * y;
+                    if p.abs() < MIN_EXACT_RESIDUE {
+                        return None;
+                    }
                     (p, x.mul_add(y, -p) == 0.0)
                 }
                 Op::Div => {
                     let q = x / y;
+                    if x.abs() < MIN_EXACT_RESIDUE {
+                        return None;
+                    }
                     (q, (-q).mul_add(y, x) == 0.0)
                 }
             };
@@ -375,6 +384,12 @@ fn fast_arith(op: Op, ff: Ff, a: u64, b: u64) -> Option<(u64, u32)> {
     }
 }
 
+/// Below this magnitude an `f64` product's (or quotient's, or square root's)
+/// rounding error can fall under the denormal range, where the host FMA that
+/// measures it would itself round: 2^-960 leaves the 2^-106-relative error
+/// terms representable.
+const MIN_EXACT_RESIDUE: f64 = f64::from_bits(0x03F0_0000_0000_0000);
+
 /// One SSE arithmetic lane (`ADD`/`SUB`/`MUL`/`DIV`).
 fn arith_lane(op: Op, ff: Ff, a: u64, b: u64, mx: Mx) -> (u64, u32) {
     if mx.mode == Round::Nearest
@@ -391,6 +406,10 @@ fn arith_lane(op: Op, ff: Ff, a: u64, b: u64, mx: Mx) -> (u64, u32) {
 fn sqrt_lane(ff: Ff, a: u64, mx: Mx) -> (u64, u32) {
     if mx.mode == Round::Nearest && ff.normal(a) && (a >> (8 * ff.bytes() - 1)) & 1 == 0 {
         let (bits, exact) = match ff {
+            Ff::D if f64::from_bits(a) < MIN_EXACT_RESIDUE => {
+                let (v, f) = sf::sse_sqrt(ff.unpack(a), ff.fmt(), mx);
+                return (ff.pack(&v), f);
+            }
             Ff::D => {
                 let x = f64::from_bits(a);
                 let s = x.sqrt();
@@ -436,14 +455,16 @@ fn minmax_lane(ff: Ff, a: u64, b: u64, mx: Mx, max: bool) -> (u64, u32) {
     (ff.pack(&pick), d)
 }
 
-/// `CMPccPS/PD/SS/SD` lane: all-ones if predicate `pred` (0..7) holds.
+/// `CMPccPS/PD/SS/SD` lane: all-ones if predicate `pred` holds. Legacy
+/// SSE encodes predicates 0..7; the VEX forms all 32 (`pred[3]` adds the
+/// `EQ_UQ`…`TRUE` set, `pred[4]` flips quiet/signaling).
 fn cmp_lane(ff: Ff, a: u64, b: u64, mx: Mx, pred: u8) -> (u64, u32) {
-    use core::cmp::Ordering::{Equal, Less};
+    use core::cmp::Ordering::{Equal, Greater, Less};
     let (ua, da) = mx.input(ff.unpack(a), ff.fmt());
     let (ub, db) = mx.input(ff.unpack(b), ff.fmt());
     let mut f = da | db;
     let ord = if ua.is_nan() || ub.is_nan() {
-        let signaling = matches!(pred & 7, 1 | 2 | 5 | 6);
+        let signaling = matches!(pred & 15, 1 | 2 | 5 | 6 | 9 | 10 | 13 | 14) ^ (pred & 16 != 0);
         if signaling || ua.is_snan() || ub.is_snan() {
             f |= INVALID;
         }
@@ -451,7 +472,7 @@ fn cmp_lane(ff: Ff, a: u64, b: u64, mx: Mx, pred: u8) -> (u64, u32) {
     } else {
         Some(sf::compare(&ua, &ub))
     };
-    let hit = match pred & 7 {
+    let hit = match pred & 15 {
         0 => ord == Some(Equal),
         1 => ord == Some(Less),
         2 => matches!(ord, Some(Less | Equal)),
@@ -459,10 +480,80 @@ fn cmp_lane(ff: Ff, a: u64, b: u64, mx: Mx, pred: u8) -> (u64, u32) {
         4 => ord != Some(Equal),
         5 => ord != Some(Less),
         6 => !matches!(ord, Some(Less | Equal)),
-        _ => ord.is_some(),
+        7 => ord.is_some(),
+        8 => matches!(ord, None | Some(Equal)),
+        9 => matches!(ord, None | Some(Less)),
+        10 => ord != Some(Greater),
+        11 => false,
+        12 => matches!(ord, Some(Less | Greater)),
+        13 => matches!(ord, Some(Greater | Equal)),
+        14 => ord == Some(Greater),
+        _ => true,
     };
     let ones = if ff == Ff::S { 0xffff_ffff } else { u64::MAX };
     (if hit { ones } else { 0 }, f)
+}
+
+/// The lane format, lane count and memory-operand size of a float op by
+/// mandatory prefix: packed single/double, scalar single/double.
+const fn fp_shape(mp: Mp) -> (Ff, usize, usize) {
+    match mp {
+        Mp::None => (Ff::S, 4, 16),
+        Mp::P66 => (Ff::D, 2, 16),
+        Mp::F3 => (Ff::S, 1, 4),
+        Mp::F2 => (Ff::D, 1, 8),
+    }
+}
+
+/// `v` with lane `i` (of `w` bytes) replaced by `x`.
+#[inline]
+fn set_lane(v: u128, w: usize, i: usize, x: u64) -> u128 {
+    let sh = 8 * w * i;
+    let lm: u128 = if w == 8 {
+        u128::from(u64::MAX)
+    } else {
+        (1u128 << (8 * w)) - 1
+    };
+    (v & !(lm << sh)) | ((u128::from(x) & lm) << sh)
+}
+
+/// `SQRT`/`ADD`/`MUL`/`SUB`/`MIN`/`DIV`/`MAX` (`op` = `51/58/59/5C/5D/5E/5F`)
+/// of `a` and `b` in the shape `mp` selects; the scalar forms keep `a`'s
+/// upper lanes. Returns the result and the exception flags.
+fn fp_arith(op: u8, mp: Mp, a: u128, b: u128, mx: Mx) -> (u128, u32) {
+    let (ff, lanes, _) = fp_shape(mp);
+    let w = ff.bytes();
+    let mut out = a;
+    let mut flags = 0;
+    for i in 0..lanes {
+        let (x, y) = (lane(a, w, i), lane(b, w, i));
+        let (r, f) = match op {
+            0x51 => sqrt_lane(ff, y, mx),
+            0x58 => arith_lane(Op::Add, ff, x, y, mx),
+            0x59 => arith_lane(Op::Mul, ff, x, y, mx),
+            0x5C => arith_lane(Op::Sub, ff, x, y, mx),
+            0x5E => arith_lane(Op::Div, ff, x, y, mx),
+            0x5D => minmax_lane(ff, x, y, mx, false),
+            _ => minmax_lane(ff, x, y, mx, true),
+        };
+        out = set_lane(out, w, i, r);
+        flags |= f;
+    }
+    (out, flags)
+}
+
+/// `CMPccPS/PD/SS/SD` of `a` and `b` (scalar forms keep `a`'s upper lanes).
+fn fp_cmp(mp: Mp, a: u128, b: u128, mx: Mx, pred: u8) -> (u128, u32) {
+    let (ff, lanes, _) = fp_shape(mp);
+    let w = ff.bytes();
+    let mut out = a;
+    let mut flags = 0;
+    for i in 0..lanes {
+        let (r, f) = cmp_lane(ff, lane(a, w, i), lane(b, w, i), mx, pred);
+        out = set_lane(out, w, i, r);
+        flags |= f;
+    }
+    (out, flags)
 }
 
 /// Float → `i32`/`i64` conversion lane (`CVT*2SI`, `CVT*2DQ`, `CVT*2PI`):
@@ -1176,39 +1267,9 @@ impl X86Interp {
     /// `0F 51/58/59/5C/5D/5E/5F`: `SQRT`/`ADD`/`MUL`/`SUB`/`MIN`/`DIV`/`MAX`
     /// in all four forms (`PS`/`PD`/`SS`/`SD`).
     fn sse_arith(&mut self, mem: &GuestMemory, pc: u64, p: Pfx, mp: Mp, op: u8) -> Step {
-        let (ff, lanes, n) = match mp {
-            Mp::None => (Ff::S, 4, 16),
-            Mp::P66 => (Ff::D, 2, 16),
-            Mp::F3 => (Ff::S, 1, 4),
-            Mp::F2 => (Ff::D, 1, 8),
-        };
         let (m, end) = fetch!(self.modrm(pc, p.rex));
-        let b = fetch!(self.xsrc(mem, &m, end, n, true));
-        let a = self.xmm[m.reg];
-        let mx = self.mx();
-        let w = ff.bytes();
-        let mut out = a;
-        let mut flags = 0;
-        for i in 0..lanes {
-            let (x, y) = (lane(a, w, i), lane(b, w, i));
-            let (r, f) = match op {
-                0x51 => sqrt_lane(ff, y, mx),
-                0x58 => arith_lane(Op::Add, ff, x, y, mx),
-                0x59 => arith_lane(Op::Mul, ff, x, y, mx),
-                0x5C => arith_lane(Op::Sub, ff, x, y, mx),
-                0x5E => arith_lane(Op::Div, ff, x, y, mx),
-                0x5D => minmax_lane(ff, x, y, mx, false),
-                _ => minmax_lane(ff, x, y, mx, true),
-            };
-            let sh = 8 * w * i;
-            let lm: u128 = if w == 8 {
-                u128::from(u64::MAX)
-            } else {
-                0xffff_ffff
-            };
-            out = (out & !(lm << sh)) | (u128::from(r) << sh);
-            flags |= f;
-        }
+        let b = fetch!(self.xsrc(mem, &m, end, fp_shape(mp).2, true));
+        let (out, flags) = fp_arith(op, mp, self.xmm[m.reg], b, self.mx());
         fetch!(self.sse_flags(flags));
         self.xmm[m.reg] = out;
         self.next(end)
@@ -1216,30 +1277,9 @@ impl X86Interp {
 
     /// `CMPPS/PD/SS/SD xmm, xmm/m, imm8` (predicate in `imm8[2:0]`).
     fn sse_cmp(&mut self, mem: &GuestMemory, pc: u64, p: Pfx, mp: Mp) -> Step {
-        let (ff, lanes, n) = match mp {
-            Mp::None => (Ff::S, 4, 16),
-            Mp::P66 => (Ff::D, 2, 16),
-            Mp::F3 => (Ff::S, 1, 4),
-            Mp::F2 => (Ff::D, 1, 8),
-        };
         let (m, imm, end) = fetch!(self.modrm_imm(pc, p, true));
-        let b = fetch!(self.xsrc(mem, &m, end, n, true));
-        let a = self.xmm[m.reg];
-        let mx = self.mx();
-        let w = ff.bytes();
-        let mut out = a;
-        let mut flags = 0;
-        for i in 0..lanes {
-            let (r, f) = cmp_lane(ff, lane(a, w, i), lane(b, w, i), mx, imm);
-            let sh = 8 * w * i;
-            let lm: u128 = if w == 8 {
-                u128::from(u64::MAX)
-            } else {
-                0xffff_ffff
-            };
-            out = (out & !(lm << sh)) | (u128::from(r) << sh);
-            flags |= f;
-        }
+        let b = fetch!(self.xsrc(mem, &m, end, fp_shape(mp).2, true));
+        let (out, flags) = fp_cmp(mp, self.xmm[m.reg], b, self.mx(), imm & 7);
         fetch!(self.sse_flags(flags));
         self.xmm[m.reg] = out;
         self.next(end)
