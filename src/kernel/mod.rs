@@ -598,6 +598,7 @@ const SIGRTMIN: u64 = 32;
 const SIGILL: u64 = 4;
 const SIGTRAP: u64 = 5;
 const SIGBUS: u64 = 7;
+const SIGFPE: u64 = 8;
 const SIGSEGV: u64 = 11;
 /// Posted when an `ITIMER_REAL` (`alarm`/`setitimer`) deadline passes.
 const SIGALRM: u64 = 14;
@@ -2294,10 +2295,35 @@ impl Kernel {
                 self.die_of_signal(cx, SIGILL as u32, mem);
                 Serviced::Ended
             }
-            Exit::Breakpoint { pc, .. } => {
+            Exit::ArithmeticFault { pc, code, vector } => {
+                if self.deliver_fault_signal(cx, signal::Fault::fpe(pc, code, vector), vcpu, mem) {
+                    return Serviced::Resume;
+                }
+                eprintln!(
+                    "[fault] pid {} arithmetic exception (vector {vector}, si_code {code}) at {pc:#x}",
+                    cx.cur.pid
+                );
+                self.dump_fault_context(vcpu, mem);
+                self.die_of_signal(cx, SIGFPE as u32, mem);
+                Serviced::Ended
+            }
+            Exit::ProtectionFault { pc } => {
+                if self.deliver_fault_signal(cx, signal::Fault::gp(), vcpu, mem) {
+                    return Serviced::Resume;
+                }
+                eprintln!(
+                    "[fault] pid {} general protection fault at {pc:#x}",
+                    cx.cur.pid
+                );
+                self.dump_fault_context(vcpu, mem);
+                self.die_of_signal(cx, SIGSEGV as u32, mem);
+                Serviced::Ended
+            }
+            Exit::Breakpoint { pc, code } => {
                 // `BRK`/`int3`: SIGTRAP (a debugger-less process dies of it with
                 // a core, like Linux; a guest handler — Go, sanitizers — runs).
-                if self.deliver_fault_signal(cx, signal::Fault::brk(self.arch, pc), vcpu, mem) {
+                let fault = signal::Fault::brk(self.arch, pc, code);
+                if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume;
                 }
                 eprintln!("[fault] pid {} breakpoint trap at {pc:#x}", cx.cur.pid);
@@ -11188,8 +11214,17 @@ mod tests {
         let mut vcpu = backend.new_vcpu(0x1_1111, 0x1_3000).unwrap();
         vcpu.set_reg(3, 0xdead); // rbx (callee-saved) — must survive the handler
         vcpu.set_reg(0, 0x1234); // rax
+        // Full extended state: MXCSR rounding, the x87 control word, XMM and
+        // the YMM upper halves — all must survive the handler.
         let xmm: Vec<u8> = (0..=255u8).collect(); // XMM0..15, distinctive
-        vcpu.set_simd_state(&xmm);
+        let mut xs = vcpu.simd_state();
+        assert_eq!(xs.len(), crate::vcpu::X86_XSAVE_SIZE);
+        xs[0..2].copy_from_slice(&0x0c7fu16.to_le_bytes()); // fcw: round toward zero
+        xs[24..28].copy_from_slice(&0x7f80u32.to_le_bytes()); // mxcsr: RZ
+        xs[160..416].copy_from_slice(&xmm);
+        xs[576..832].copy_from_slice(&[0xa5; 256]); // ymm_hi
+        vcpu.set_simd_state(&xs);
+        let xs = vcpu.simd_state();
         let (orig_pc, orig_sp) = (vcpu.pc(), vcpu.sp());
 
         let (mut k, mut mem, _v, mut cx) = setup();
@@ -11235,19 +11270,108 @@ mod tests {
         let fpstate = mem.read_u64(frame + 8 + 40 + 23 * 8).unwrap();
         assert!(fpstate > frame && fpstate % 64 == 0, "fpstate {fpstate:#x}");
         assert_eq!(mem.read_vec(fpstate + 160, 256).unwrap(), xmm);
-        assert_eq!(mem.read_u32(fpstate + 24).unwrap(), 0x1f80, "mxcsr");
+        assert_eq!(mem.read_u32(fpstate + 24).unwrap(), 0x7f80, "mxcsr");
+        assert_eq!(mem.read_vec(fpstate + 576, 256).unwrap(), vec![0xa5; 256]);
+        // _fpx_sw_bytes, FP_XSTATE_MAGIC2 and UC_FP_XSTATE, as Linux.
+        assert_eq!(mem.read_u32(fpstate + 464).unwrap(), 0x4650_5853, "magic1");
+        assert_eq!(mem.read_u32(fpstate + 468).unwrap(), 0x344, "extended_size");
+        assert_eq!(mem.read_u64(fpstate + 472).unwrap(), 7, "xfeatures");
+        assert_eq!(mem.read_u32(fpstate + 480).unwrap(), 0x340, "xstate_size");
+        assert_eq!(
+            mem.read_u32(fpstate + 0x340).unwrap(),
+            0x4650_5845,
+            "magic2"
+        );
+        assert_eq!(mem.read_u64(frame + 8).unwrap() & 1, 1, "UC_FP_XSTATE");
 
-        // The handler clobbers rbx and the XMM file; rt_sigreturn restores them.
+        // The handler clobbers rbx and the whole FP state; rt_sigreturn
+        // restores them.
         vcpu.set_reg(3, 0);
-        vcpu.set_simd_state(&[0u8; 256]);
+        vcpu.set_simd_state(&[0u8; 512]);
         vcpu.set_sp(frame + 8); // as if the restorer's `ret` popped pretcode
         k.sys_rt_sigreturn(&mut cx, vcpu.as_mut(), &mem);
         assert_eq!(vcpu.pc(), orig_pc, "pc restored");
         assert_eq!(vcpu.sp(), orig_sp, "rsp restored");
         assert_eq!(vcpu.reg(3), 0xdead, "rbx restored");
         assert_eq!(vcpu.reg(0), 0x1234, "rax restored");
-        assert_eq!(vcpu.simd_state(), xmm, "XMM restored");
+        assert_eq!(vcpu.simd_state(), xs, "XSAVE state restored");
+
+        // A frame whose MAGIC2 was trampled restores only the legacy region
+        // (fxrstor): XMM comes back, the YMM upper halves are reset.
+        vcpu.set_simd_state(&xs);
+        assert!(k.deliver_fault_signal(
+            &mut cx,
+            signal::Fault::segv(k.arch, 0xcafe, false, false, false),
+            vcpu.as_mut(),
+            &mut mem
+        ));
+        let frame = vcpu.sp();
+        let fpstate = mem.read_u64(frame + 8 + 40 + 23 * 8).unwrap();
+        mem.write(fpstate + 0x340, &0u32.to_le_bytes()).unwrap();
+        vcpu.set_simd_state(&[0u8; 512]);
+        vcpu.set_sp(frame + 8);
+        k.sys_rt_sigreturn(&mut cx, vcpu.as_mut(), &mem);
+        let back = vcpu.simd_state();
+        assert_eq!(back[160..416], xmm[..], "XMM from the legacy region");
+        assert_eq!(back[576..832], [0u8; 256][..], "YMM upper halves reset");
         assert_eq!(cx.cur.blocked, 0, "signal mask restored");
+    }
+
+    /// x86 exceptions reach the handler as Linux reports them: `#XM` as
+    /// SIGFPE with the backend's si_code, si_addr = rip and trapno 19; `#GP`
+    /// as SIGSEGV/SI_KERNEL with no address and trapno 13.
+    #[test]
+    fn x86_cpu_exceptions_carry_linux_siginfo() {
+        use crate::vcpu::Backend;
+        let backend = crate::vcpu::interp_x86::X86Backend::new(Arch::X86_64).unwrap();
+        let (mut k, mut mem, _v, mut cx) = setup();
+        k.arch = Arch::X86_64;
+        mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
+        for sig in [8, 11] {
+            cx.cur.handlers[sig] = SigAction {
+                handler: 0x2_0000,
+                flags: SA_NODEFER,
+                restorer: 0x2_1000,
+                mask: 0,
+            };
+        }
+        let si_at = |vcpu: &dyn crate::vcpu::Vcpu| vcpu.reg(6);
+        let mctx = |vcpu: &dyn crate::vcpu::Vcpu| vcpu.reg(2) + 40;
+        let mut vcpu = backend.new_vcpu(0x1_1111, 0x1_3000).unwrap();
+        let exit = Exit::ArithmeticFault {
+            pc: 0x1_1111,
+            code: 3,
+            vector: 19,
+        };
+        assert!(matches!(
+            k.service(&mut cx, exit, vcpu.as_mut(), &mut mem),
+            Serviced::Resume
+        ));
+        let si = si_at(vcpu.as_ref());
+        assert_eq!(mem.read_u32(si).unwrap(), 8, "SIGFPE");
+        assert_eq!(mem.read_u32(si + 8).unwrap(), 3, "FPE_FLTDIV");
+        assert_eq!(mem.read_u64(si + 16).unwrap(), 0x1_1111, "si_addr = rip");
+        assert_eq!(
+            mem.read_u64(mctx(vcpu.as_ref()) + 20 * 8).unwrap(),
+            19,
+            "trapno"
+        );
+
+        let mut vcpu = backend.new_vcpu(0x1_1111, 0x1_3000).unwrap();
+        let exit = Exit::ProtectionFault { pc: 0x1_1111 };
+        assert!(matches!(
+            k.service(&mut cx, exit, vcpu.as_mut(), &mut mem),
+            Serviced::Resume
+        ));
+        let si = si_at(vcpu.as_ref());
+        assert_eq!(mem.read_u32(si).unwrap(), 11, "SIGSEGV");
+        assert_eq!(mem.read_u32(si + 8).unwrap(), 0x80, "SI_KERNEL");
+        assert_eq!(mem.read_u64(si + 16).unwrap(), 0, "no address");
+        assert_eq!(
+            mem.read_u64(mctx(vcpu.as_ref()) + 20 * 8).unwrap(),
+            13,
+            "trapno"
+        );
     }
 
     #[test]
@@ -11507,7 +11631,7 @@ mod tests {
         }
         // BRK: SIGTRAP / TRAP_BRKPT at the BRK, no esr_context.
         let mut vcpu = backend.new_vcpu(0x1_1110, 0x1_3000).unwrap();
-        let f = signal::Fault::brk(k.arch, 0x1_1110);
+        let f = signal::Fault::brk(k.arch, 0x1_1110, 0);
         assert!(k.deliver_fault_signal(&mut cx, f, vcpu.as_mut(), &mut mem));
         // No SA_RESTORER: lr is the mapped `rt_sigreturn` trampoline
         // (`mov x8, #139; svc #0`), Linux's vDSO sigtramp.

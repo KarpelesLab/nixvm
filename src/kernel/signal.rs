@@ -18,8 +18,8 @@
 //! A signal left at its default disposition still takes the default action.
 
 use super::{
-    Kernel, QueuedSig, RunState, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SIGBUS, SIGILL, SIGSEGV,
-    SIGTRAP, SS_DISABLE, ServiceCtx, Shared, err, pgid_of,
+    Kernel, QueuedSig, RunState, SA_NODEFER, SA_ONSTACK, SA_RESETHAND, SIGBUS, SIGFPE, SIGILL,
+    SIGSEGV, SIGTRAP, SS_DISABLE, ServiceCtx, Shared, err, pgid_of,
 };
 use crate::abi::Arch;
 use crate::abi::errno::Errno;
@@ -136,14 +136,23 @@ impl Fault {
 
     /// A software breakpoint: `SIGTRAP` — arm64 `BRK` is `TRAP_BRKPT` with
     /// `si_addr` = the `BRK` (no `esr_context`: `send_user_sigtrap` sets no
-    /// fault code); x86-64 `int3` is `SI_KERNEL` with trapno #BP and no
-    /// address.
-    pub(super) fn brk(arch: Arch, pc: u64) -> Self {
+    /// fault code). On x86-64 `code` is the vector: `int3` (#BP, 3) is a
+    /// plain `force_sig` — `SI_KERNEL`, no address — while `INT1`/`ICEBP`
+    /// (#DB, 1) goes through `send_sigtrap`: `TRAP_BRKPT` with `si_addr` =
+    /// the `rip` after it.
+    pub(super) fn brk(arch: Arch, pc: u64, code: u64) -> Self {
         match arch {
             Arch::Aarch64 => Self {
                 sig: SIGTRAP,
                 code: TRAP_BRKPT,
                 addr: pc,
+                ..Self::default()
+            },
+            Arch::X86_64 if code == 1 => Self {
+                sig: SIGTRAP,
+                code: TRAP_BRKPT,
+                addr: pc,
+                trapno: 1,
                 ..Self::default()
             },
             Arch::X86_64 => Self {
@@ -152,6 +161,30 @@ impl Fault {
                 trapno: 3,
                 ..Self::default()
             },
+        }
+    }
+
+    /// An arithmetic exception: `SIGFPE` with the backend's `si_code`,
+    /// `si_addr` = the faulting instruction, trapno = the vector (#DE 0,
+    /// #MF 16, #XM 19) — `do_error_trap`/`math_error`.
+    pub(super) fn fpe(pc: u64, code: u64, vector: u64) -> Self {
+        Self {
+            sig: SIGFPE,
+            code,
+            addr: pc,
+            trapno: vector,
+            ..Self::default()
+        }
+    }
+
+    /// x86-64 `#GP`: `SIGSEGV` with `SI_KERNEL`, no address, trapno 13
+    /// (`exc_general_protection` → `force_sig(SIGSEGV)`).
+    pub(super) fn gp() -> Self {
+        Self {
+            sig: SIGSEGV,
+            code: SI_KERNEL,
+            trapno: 13,
+            ..Self::default()
         }
     }
 
@@ -908,24 +941,29 @@ impl Kernel {
             cur_sp - 128 // red zone
         };
 
-        // FPU state: a 512-byte `fxsave` image (no XSAVE header — `sw_reserved`
-        // magic1 stays 0, so readers treat it as legacy FXSR state, and so does
-        // our `rt_sigreturn`). Only the XMM file is modelled by the backends
-        // that expose SIMD state; x87 and MXCSR are saved at their defaults.
+        // FPU state, as `copy_fpstate_to_sigframe` writes it: the XSAVE area
+        // (legacy fxsave region, header, AVX upper halves), its `sw_reserved`
+        // bytes (`struct _fpx_sw_bytes`: FP_XSTATE_MAGIC1, extended_size,
+        // xfeatures, xstate_size) and FP_XSTATE_MAGIC2 right after the area,
+        // 64-byte aligned below the red zone. A backend without XSAVE state
+        // (KVM here) passes none: fpstate stays NULL.
         let simd = vcpu.simd_state();
-        let (fpstate, below) = if simd.len() >= 256 {
-            let fp = (base - FXSAVE_SIZE) & !63;
-            let mut img = [0u8; FXSAVE_SIZE as usize];
-            img[0..2].copy_from_slice(&0x037fu16.to_le_bytes()); // fcw
-            img[24..28].copy_from_slice(&0x1f80u32.to_le_bytes()); // mxcsr
-            img[28..32].copy_from_slice(&0xffffu32.to_le_bytes()); // mxcsr_mask
-            img[160..416].copy_from_slice(&simd[..256]); // xmm0..15
+        let (fpstate, below, xstate) = if simd.len() >= crate::vcpu::X86_XSAVE_SIZE {
+            let size = crate::vcpu::X86_XSAVE_SIZE as u64;
+            let fp = (base - size - 4) & !63;
+            let mut img = simd[..size as usize].to_vec();
+            let xfeatures = u64::from_le_bytes(img[512..520].try_into().unwrap());
+            img[464..468].copy_from_slice(&FP_XSTATE_MAGIC1.to_le_bytes());
+            img[468..472].copy_from_slice(&((size + 4) as u32).to_le_bytes()); // extended_size
+            img[472..480].copy_from_slice(&xfeatures.to_le_bytes());
+            img[480..484].copy_from_slice(&(size as u32).to_le_bytes()); // xstate_size
+            img.extend_from_slice(&FP_XSTATE_MAGIC2.to_le_bytes());
             if mem.write(fp, &img).is_err() {
                 return false;
             }
-            (fp, fp)
+            (fp, fp, true)
         } else {
-            (0, base)
+            (0, base, false)
         };
 
         // Frame layout: reserve the whole frame, then 16-align so that at the
@@ -940,8 +978,8 @@ impl Kernel {
         };
         put(0, act.restorer); // pretcode
         // uc_flags: UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS, as Linux's 64-bit
-        // frames (no UC_FP_XSTATE: the FPU image is legacy fxsave).
-        put(UC_OFF, 0x6);
+        // frames, plus UC_FP_XSTATE when the FPU image is an XSAVE area.
+        put(UC_OFF, 0x6 | u64::from(xstate));
         put(UC_OFF + 8, 0); // uc_link
         put(UC_OFF + 16, alt_sp); // uc_stack.ss_sp
         put(UC_OFF + 24, alt_flags); // ss_flags (+ padded size)
@@ -1066,12 +1104,24 @@ impl Kernel {
         vcpu.set_sp(read(REG_RSP));
         vcpu.set_rflags(read(REG_EFL));
         vcpu.set_pc(read(REG_RIP));
-        // The FPU image (a NULL fpstate means "no FPU state", as on Linux).
+        // The FPU image (a NULL fpstate means "no FPU state", as on Linux):
+        // the whole XSAVE area when both magics check out (`check_xstate_in_
+        // sigframe`), else only the legacy fxsave region — `fxrstor`, the
+        // extended components reset.
         let fpstate = read(GREG_COUNT);
         if fpstate != 0
-            && let Ok(xmm) = mem.read_vec(fpstate + 160, 256)
+            && let Ok(legacy) = mem.read_vec(fpstate, FXSAVE_SIZE as usize)
         {
-            vcpu.set_simd_state(&xmm);
+            let word = |o: usize| u32::from_le_bytes(legacy[o..o + 4].try_into().unwrap());
+            let xsize = u64::from(word(480));
+            let full = word(464) == FP_XSTATE_MAGIC1
+                && xsize >= crate::vcpu::X86_XSAVE_SIZE as u64
+                && u64::from(word(468)) == xsize + 4
+                && mem.read_u32(fpstate + xsize).ok() == Some(FP_XSTATE_MAGIC2);
+            match mem.read_vec(fpstate, crate::vcpu::X86_XSAVE_SIZE) {
+                Ok(area) if full => vcpu.set_simd_state(&area),
+                _ => vcpu.set_simd_state(&legacy),
+            }
         }
         // Restore the signal mask the handler ran under (uc_sigmask).
         let uc = mctx.wrapping_sub(MCTX_OFF - UC_OFF);
@@ -1284,6 +1334,10 @@ impl Kernel {
 /// `sizeof(struct _fpstate)` without XSAVE extensions — the legacy `fxsave`
 /// image an x86-64 frame's `uc_mcontext.fpstate` points at.
 const FXSAVE_SIZE: u64 = 512;
+/// `struct _fpx_sw_bytes.magic1`: the fpstate is an XSAVE area.
+const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+/// The word Linux appends right after the XSAVE area.
+const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
 
 // aarch64 signal-frame geometry (arm64 UAPI `asm/sigcontext.h` + `asm/ucontext.h`).
 /// `sizeof(siginfo_t)` — the frame's leading member.

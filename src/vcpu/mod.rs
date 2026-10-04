@@ -86,6 +86,10 @@ pub(crate) fn yield_due() -> bool {
     at != 0 && crate::clock::now_monotonic().as_nanos() >= at
 }
 
+/// Size of the x86-64 `XSAVE` area [`Vcpu::simd_state`] uses (x87, SSE and
+/// AVX components, standard format: `CPUID.(EAX=0xD,ECX=0).EBX`).
+pub const X86_XSAVE_SIZE: usize = 0x340;
+
 /// Why [`Vcpu::run`] returned control to the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -107,6 +111,15 @@ pub enum Exit {
     /// single-copy-atomicity granule. Linux answers with `SIGBUS`
     /// (`BUS_ADRALN`, `si_addr` = `addr`), not `SIGSEGV`.
     Misaligned { addr: u64, write: bool },
+    /// An arithmetic exception at the instruction at `pc` — x86 `#DE`
+    /// (`vector` 0), x87 `#MF` (16), SIMD `#XM` (19) — that Linux delivers as
+    /// `SIGFPE` with `si_code` = `code` (`FPE_INTDIV`, `FPE_FLTDIV`, …, as the
+    /// backend derived it from the unmasked status/`MXCSR` bits).
+    ArithmeticFault { pc: u64, code: u64, vector: u64 },
+    /// x86 `#GP` (a privileged instruction at CPL 3, a misaligned `MOVAPS`,
+    /// reserved `MXCSR` bits, …) at `pc`: Linux's `SIGSEGV` with `SI_KERNEL`
+    /// and no address.
+    ProtectionFault { pc: u64 },
     /// The host asked the vcpu to stop (another thread wants to run, or a
     /// deadline/signal fired). The kernel decides what to do next.
     Interrupted,
@@ -248,9 +261,14 @@ pub trait Vcpu: Send {
     }
     fn set_rflags(&mut self, _value: u64) {}
 
-    /// Read/replace the SIMD/FP register file as raw bytes (x86 `XMM0..15` as a
-    /// 256-byte little-endian blob), so a signal frame can save and restore it.
-    /// Backends without SIMD return an empty vector and ignore a set.
+    /// Read/replace the SIMD/FP register file as raw bytes, so a signal frame
+    /// can save and restore it: on arm64 the `fpsimd_context` payload (FPSR,
+    /// FPCR, V0–V31; 520 bytes); on x86-64 the standard-format `XSAVE` area
+    /// of every enabled component (legacy x87/SSE region, header, AVX upper
+    /// halves; [`X86_XSAVE_SIZE`] bytes). An x86 set also accepts a bare
+    /// 512-byte `FXSAVE` image (the `fxrstor`-only restore: the extended
+    /// components are reset). Backends without SIMD state return an empty
+    /// vector and ignore a set.
     fn simd_state(&self) -> Vec<u8> {
         Vec::new()
     }
