@@ -96,6 +96,9 @@ const netAddr = ref("");
 // 0: unknown), and a clock ticking while online so the countdown updates.
 const netExpires = ref(0);
 const netNow = ref(Date.now());
+// Briefly true after the address was copied, to say so on the button.
+const netCopied = ref(false);
+let netCopiedTimer = 0;
 
 /// "01:52:59" — what is left until `until` (Unix ms), as a clock.
 function remaining(until, now) {
@@ -108,6 +111,7 @@ const netLabel = computed(() => {
   if (!netEnabled.value) return "net: off";
   switch (netState.value) {
     case "online":
+      if (netCopied.value) return "net: address copied";
       return netExpires.value
         ? `net: ${netAddr.value} · ${remaining(netExpires.value, netNow.value)}`
         : `net: ${netAddr.value}`;
@@ -129,8 +133,12 @@ const netTitle = computed(() => {
     online && netExpires.value
       ? ` Valid until ${new Date(netExpires.value).toLocaleTimeString()} (then a new tunnel, and a new address).`
       : "";
-  return `Guest networking via a WebSocket IP tunnel (grouterd).${addr}${until} Click to disconnect.`;
+  const click = online && netAddr.value.includes(":") ? " Click to copy the address." : "";
+  return `Guest networking via a WebSocket IP tunnel (grouterd).${addr}${until}${click}`;
 });
+const netCanCopy = computed(
+  () => netEnabled.value && netState.value === "online" && netAddr.value.includes(":"),
+);
 const bootingPhases = new Set(["downloading", "decompressing", "loading", "booting"]);
 const rebootDisabled = computed(() => bootingPhases.has(status.value));
 const bootLabel = computed(() => (hasBooted.value ? "Reboot" : "Start"));
@@ -665,6 +673,28 @@ function toggleNet() {
   }
 }
 
+// The address part of the net control: copies the guest's IPv6 while online;
+// otherwise it does what the power toggle would (connect, or retry).
+async function netLabelClick() {
+  if (!netCanCopy.value) {
+    if (!netEnabled.value || netState.value === "unavailable") toggleNet();
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(netAddr.value);
+  } catch {
+    // No clipboard access (insecure context, denied): select the text so
+    // it can be copied by hand.
+    const sel = window.getSelection();
+    if (sel && netLabelEl.value) sel.selectAllChildren(netLabelEl.value);
+    return;
+  }
+  netCopied.value = true;
+  clearTimeout(netCopiedTimer);
+  netCopiedTimer = setTimeout(() => (netCopied.value = false), 1500);
+}
+const netLabelEl = ref(null);
+
 function netRetryNow() {
   netUnavailable.value = false;
   netEnabled.value = true;
@@ -840,15 +870,27 @@ onBeforeUnmount(() => {
           {{ a.label }}
         </button>
       </div>
-      <button
-        class="net-btn"
-        :class="`is-${netEnabled ? netState : 'off'}`"
-        :title="netTitle"
-        :disabled="!hasBooted"
-        @click="toggleNet"
-      >
-        {{ netLabel }}
-      </button>
+      <div class="net-group" :class="`is-${netEnabled ? netState : 'off'}`">
+        <button
+          ref="netLabelEl"
+          class="net-btn"
+          :title="netTitle"
+          :disabled="!hasBooted"
+          @click="netLabelClick"
+        >
+          {{ netLabel }}
+        </button>
+        <button
+          class="net-power"
+          :title="netEnabled ? 'Turn guest networking off' : 'Turn guest networking on'"
+          :aria-label="netEnabled ? 'Turn guest networking off' : 'Turn guest networking on'"
+          :aria-pressed="netEnabled"
+          :disabled="!hasBooted"
+          @click="toggleNet"
+        >
+          ⏻
+        </button>
+      </div>
       <button class="reboot-btn" :disabled="rebootDisabled" @click="hasBooted ? reboot() : boot()">
         {{ bootLabel }}
       </button>
@@ -963,8 +1005,17 @@ onBeforeUnmount(() => {
   cursor: not-allowed;
 }
 
-.net-btn {
+.net-group {
   flex: none;
+  display: flex;
+  min-width: 0;
+}
+
+.net-btn {
+  flex: 0 1 auto;
+  min-width: 0;
+  border-top-right-radius: 0 !important;
+  border-bottom-right-radius: 0 !important;
   /* Fixed-width digits: the countdown ticks every second without the
      button's width jittering. */
   font-variant-numeric: tabular-nums;
@@ -982,16 +1033,41 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.net-btn.is-online {
+.net-power {
+  flex: none;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--panel-border);
+  border-left: none;
+  border-radius: 0 0.4rem 0.4rem 0;
+  padding: 0.3rem 0.55rem;
+  font-size: 0.8rem;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.net-power:hover:not(:disabled),
+.net-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.net-power:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.is-online .net-btn,
+.is-online .net-power {
   color: #8ce99a;
 }
 
-.net-btn.is-connecting {
+.is-connecting .net-btn,
+.is-connecting .net-power {
   color: #ffd43b;
 }
 
-.net-btn.is-error,
-.net-btn.is-unavailable {
+.is-error .net-btn,
+.is-unavailable .net-btn {
   color: var(--danger);
 }
 
