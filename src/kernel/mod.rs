@@ -48,6 +48,7 @@ mod ptimer;
 mod pty;
 mod seccomp;
 mod signal;
+mod sockopt;
 mod splice;
 mod stat;
 mod sys_misc;

@@ -395,6 +395,9 @@ struct SockOpts {
     /// machinery is here so `getsockopt(SO_ERROR)` behaves correctly if a
     /// future path (e.g. a failed background connect) ever sets it.
     error: i32,
+    /// Every other known option the guest set, by `(level, optname)`, stored
+    /// verbatim (bounded) so `getsockopt` echoes it back.
+    extra: BTreeMap<(u64, u64), Vec<u8>>,
 }
 
 impl Default for SockOpts {
@@ -418,6 +421,7 @@ impl Default for SockOpts {
             sndbuf: 106_496,
             tos: 0,
             error: 0,
+            extra: BTreeMap::new(),
         }
     }
 }
@@ -1507,7 +1511,29 @@ impl Kernel {
         let Some((sock, _)) = self.sock_of(cx, fd) else {
             return err(Errno::ENOTSOCK);
         };
+        // An option Linux doesn't know is ENOPROTOOPT; the read-only ones
+        // (SO_TYPE, SO_ERROR, SO_PEERCRED, SO_ACCEPTCONN, SO_PROTOCOL, …) too.
+        if !super::sockopt::known(level, optname)
+            || (level == SOL_SOCKET
+                && matches!(
+                    optname,
+                    3 | 4 | 17 | 28 | 30 | 31 | 38 | 39 | 57 | 59 | 71 | 77
+                ))
+        {
+            if !super::sockopt::known(level, optname) {
+                self.note_unsupported("setsockopt", (level << 32) | optname);
+            }
+            return err(Errno::ENOPROTOOPT);
+        }
+        if super::sockopt::is_int(level, optname) && optlen < 4 {
+            return err(Errno::EINVAL);
+        }
         let opts = &mut net.socks[sock].opts;
+        if optlen <= 256
+            && let Ok(raw) = mem.read_vec(optval, optlen as usize)
+        {
+            opts.extra.insert((level, optname), raw);
+        }
         if level == SOL_SOCKET {
             match optname {
                 SO_REUSEADDR if optlen >= 4 => {
@@ -1556,9 +1582,7 @@ impl Kernel {
                         opts.sndtimeo.copy_from_slice(&b);
                     }
                 }
-                // SO_TYPE/SO_ERROR/SO_ACCEPTCONN/SO_DOMAIN/SO_PROTOCOL are
-                // read-only in real Linux; anything else is unrecognized.
-                // Either way: accept-and-ignore.
+                // Every other known option: stored above, echoed by getsockopt.
                 _ => {}
             }
         } else if level == IPPROTO_TCP && optname == TCP_NODELAY && optlen >= 4 {
@@ -1576,7 +1600,6 @@ impl Kernel {
         {
             opts.tos = v;
         }
-        // Unknown level/optname combos: accept-and-ignore.
         0
     }
 
@@ -1663,7 +1686,27 @@ impl Kernel {
                     (_, d) if d == AF_UNIX || d == AF_NETLINK => 0, // NETLINK_ROUTE == 0
                     _ => 6,                                         // IPPROTO_TCP
                 },
-                _ => 0,
+                // SO_PEERCRED: `struct ucred { pid, uid, gid }` of the peer.
+                // Peer identity isn't tracked per connection; the caller's own
+                // credentials are the answer for the common cases (a
+                // socketpair, a connection within one process tree).
+                17 => {
+                    let mut b = [0u8; 12];
+                    b[0..4].copy_from_slice(&cx.cur.tgid.to_le_bytes());
+                    b[4..8].copy_from_slice(&cx.cur.creds.euid.to_le_bytes());
+                    b[8..12].copy_from_slice(&cx.cur.creds.egid.to_le_bytes());
+                    return write_optval(mem, optval, optlen_ptr, &b);
+                }
+                // SO_PEERSEC: no LSM labels.
+                31 => return err(Errno::ENOPROTOOPT),
+                // SO_COOKIE: a stable 64-bit id for the socket.
+                57 => {
+                    return write_optval(mem, optval, optlen_ptr, &(sock as u64 + 1).to_le_bytes());
+                }
+                _ => {
+                    return self
+                        .getsockopt_generic(net, sock, level, optname, optval, optlen_ptr, mem);
+                }
             }
         } else if level == IPPROTO_TCP && optname == TCP_NODELAY {
             u32::from(net.socks[sock].opts.nodelay)
@@ -1672,9 +1715,37 @@ impl Kernel {
         } else if level == IPPROTO_IP && optname == IP_TOS {
             net.socks[sock].opts.tos
         } else {
-            0
+            return self.getsockopt_generic(net, sock, level, optname, optval, optlen_ptr, mem);
         };
         write_optval(mem, optval, optlen_ptr, &value.to_le_bytes())
+    }
+
+    /// `getsockopt` of an option without dedicated handling: the value the
+    /// guest set, else Linux's default for a fresh socket, else zero; an
+    /// option Linux doesn't know is `ENOPROTOOPT` (and recorded).
+    #[allow(clippy::too_many_arguments)]
+    fn getsockopt_generic(
+        &self,
+        net: &Net,
+        sock: usize,
+        level: u64,
+        optname: u64,
+        optval: u64,
+        optlen_ptr: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        if !super::sockopt::known(level, optname) {
+            self.note_unsupported("getsockopt", (level << 32) | optname);
+            return err(Errno::ENOPROTOOPT);
+        }
+        let v = net.socks[sock]
+            .opts
+            .extra
+            .get(&(level, optname))
+            .cloned()
+            .or_else(|| super::sockopt::default_value(level, optname))
+            .unwrap_or_else(|| vec![0; 4]);
+        write_optval(mem, optval, optlen_ptr, &v)
     }
 
     /// `sendto(fd, buf, len, flags, dest_addr, addrlen)` — for a datagram
@@ -3151,11 +3222,22 @@ fn write_sockaddr(
 /// length to the `socklen_t` at `optlen_ptr`. A no-op for a null pointer.
 /// Always returns success (`0`).
 fn write_optval(mem: &mut GuestMemory, optval: u64, optlen_ptr: u64, value: &[u8]) -> i64 {
-    if optval != 0 {
-        let _ = mem.write(optval, value);
+    // Copy no more than the caller's buffer holds (`*optlen` in), and report
+    // how much was copied (`*optlen` out) — Linux truncates, never overruns.
+    let cap = if optlen_ptr == 0 {
+        value.len()
+    } else {
+        match mem.read_u32(optlen_ptr) {
+            Ok(n) if (n as i32) < 0 => return err(Errno::EINVAL),
+            Ok(n) => (n as usize).min(value.len()),
+            Err(_) => return err(Errno::EFAULT),
+        }
+    };
+    if optval != 0 && mem.write(optval, &value[..cap]).is_err() {
+        return err(Errno::EFAULT);
     }
     if optlen_ptr != 0 {
-        let _ = mem.write(optlen_ptr, &(value.len() as u32).to_le_bytes());
+        let _ = mem.write(optlen_ptr, &(cap as u32).to_le_bytes());
     }
     0
 }

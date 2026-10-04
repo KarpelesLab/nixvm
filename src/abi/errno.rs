@@ -72,6 +72,7 @@ errnos! {
     EBADFD = 77,
     ENOTSOCK = 88,
     EMSGSIZE = 90,
+    ENOPROTOOPT = 92,
     EOPNOTSUPP = 95,
     EAFNOSUPPORT = 97,
     EADDRNOTAVAIL = 99,
