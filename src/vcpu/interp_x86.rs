@@ -5460,6 +5460,7 @@ mod tests {
             return;
         };
         let text = std::fs::read_to_string(path).unwrap();
+        let invert = std::env::var_os("NIXVM_SCAN_X86_INVALID").is_some();
         let base = 0x1_0000u64;
         let page = crate::vcpu::mem::PAGE_SIZE;
         let mut m = GuestMemory::new(base, 64 * page);
@@ -5496,8 +5497,10 @@ mod tests {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 matches!(c.exec(&mut m), Step::Illegal)
             }));
+            // NIXVM_SCAN_X86_INVALID: the file lists invalid encodings;
+            // report those that do *not* raise #UD.
             let (bad, panicked) = match res {
-                Ok(illegal) => (illegal, false),
+                Ok(illegal) => (illegal != invert, false),
                 Err(_) => (true, true),
             };
             if bad {

@@ -1571,7 +1571,8 @@ impl X86Interp {
             | (3, 0xF0, Mp::F2) => (false, true),
             _ => return Step::Illegal,
         };
-        if vx.l || (bmi1 && !BMI1) || (bmi2 && !BMI2) {
+        // (RORX has no vvvv operand: it must be 1111.)
+        if vx.l || (bmi1 && !BMI1) || (bmi2 && !BMI2) || (vx.map == 3 && vx.v != 0) {
             return Step::Illegal;
         }
         let (m, imm, end) = fetch!(self.modrm_imm(pc, p, vx.map == 3));
