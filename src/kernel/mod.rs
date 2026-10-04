@@ -34,6 +34,7 @@ mod mem_syscalls;
 mod net;
 mod path;
 mod poll;
+mod procx;
 mod ptimer;
 mod pty;
 mod signal;
@@ -3189,6 +3190,19 @@ impl Kernel {
             Sysno::TimerGettime => self.sys_timer_gettime(sh, cx, args[0], args[1], mem),
             Sysno::TimerGetoverrun => self.sys_timer_getoverrun(sh, cx, args[0]),
             Sysno::TimerDelete => self.sys_timer_delete(sh, cx, args[0]),
+            // Cross-process: pidfds, kcmp, process_vm_* (see `procx.rs`).
+            Sysno::PidfdOpen => self.sys_pidfd_open(sh, cx, args[0], args[1]),
+            Sysno::PidfdSendSignal => {
+                self.sys_pidfd_send_signal(sh, cx, args[0], args[1], args[2], args[3], mem)
+            }
+            Sysno::PidfdGetfd => self.sys_pidfd_getfd(sh, cx, args[0], args[1], args[2]),
+            Sysno::Kcmp => self.sys_kcmp(sh, cx, args[0], args[1], args[2], args[3], args[4]),
+            Sysno::ProcessVmReadv => self.sys_process_vm(sh, cx, args, false, mem),
+            Sysno::ProcessVmWritev => self.sys_process_vm(sh, cx, args, true, mem),
+            Sysno::ProcessMadvise => {
+                self.sys_process_madvise(sh, cx, args[0], args[1], args[2], args[3], args[4], mem)
+            }
+            Sysno::ProcessMrelease => self.sys_process_mrelease(sh, cx, args[0], args[1]),
             Sysno::Setitimer => self.sys_setitimer(cx, args[0], args[1], args[2], mem),
             Sysno::Getitimer => self.sys_getitimer(cx, args[0], args[1], mem),
             Sysno::Nanosleep => self.sys_nanosleep(cx, 0, 0, args[0], args[1], mem),
@@ -3730,6 +3744,7 @@ impl Kernel {
                 pf.pidfds.push(PidfdInst {
                     target_pid: pid,
                     exited: false,
+                    nonblock: false,
                 });
                 idx
             };
@@ -4077,14 +4092,35 @@ impl Kernel {
         const P_ALL: u64 = 0;
         const P_PID: u64 = 1;
         const P_PGID: u64 = 2;
+        const P_PIDFD: u64 = 3;
         const WNOHANG: u64 = 1;
         const WSTOPPED: u64 = 2; // report a job-control-stopped child
+        const WEXITED: u64 = 4; // report an exited child
         const WCONTINUED: u64 = 8; // report a continued child
         const WNOWAIT: u64 = 0x0100_0000;
+        // __WNOTHREAD | __WALL | __WCLONE: accepted (threads are never waitable
+        // children here, so they change nothing).
+        const WLINUX: u64 = 0xe000_0000;
         const SIGCHLD: i32 = 17;
         const SIGCONT: i32 = 18;
         const CLD_STOPPED: i32 = 5;
         const CLD_CONTINUED: i32 = 6;
+        if options & !(WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | WLINUX) != 0
+            || options & (WEXITED | WSTOPPED | WCONTINUED) == 0
+        {
+            return err(Errno::EINVAL);
+        }
+        // P_PIDFD names the child by a pidfd (`pidfd_open`/`CLONE_PIDFD`): the
+        // same wait as P_PID on its target, except that an O_NONBLOCK pidfd
+        // makes a would-block wait EAGAIN instead of parking.
+        let (idtype, id, pidfd_nonblock) = match idtype {
+            P_PIDFD => match self.pidfd_target(cx, id as i32) {
+                Ok((pid, nonblock)) => (P_PID, i64::from(pid), nonblock),
+                Err(e) => return e,
+            },
+            P_ALL | P_PID | P_PGID => (idtype, id, false),
+            _ => return err(Errno::EINVAL),
+        };
         let cur = cx.cur.pid;
         let matches_id = |p: &ProcInfo| match idtype {
             P_ALL => true,
@@ -4100,7 +4136,7 @@ impl Kernel {
             if p.info.ppid == cur && !p.info.is_thread && matches_id(&p.info) {
                 has_child = true;
                 match p.info.run {
-                    RunState::Zombie(code) if zombie.is_none() => {
+                    RunState::Zombie(code) if zombie.is_none() && options & WEXITED != 0 => {
                         zombie = Some((p.info.pid, code, p.info.cpu_ns));
                     }
                     RunState::Stopped(sig) if !p.info.stop_reported && stopped.is_none() => {
@@ -4189,7 +4225,15 @@ impl Kernel {
             return err(Errno::ECHILD);
         }
         if options & WNOHANG != 0 {
+            // Nothing waitable: Linux zeroes the siginfo (callers tell "no
+            // child changed state" from a report by `si_pid == 0`).
+            if infop != 0 {
+                let _ = mem.write(infop, &[0u8; 128]);
+            }
             return 0;
+        }
+        if pidfd_nonblock {
+            return err(Errno::EAGAIN);
         }
         cx.block = true;
         0

@@ -60,6 +60,9 @@ pub(super) struct PollFds {
 pub(super) struct PidfdInst {
     pub(super) target_pid: i32,
     pub(super) exited: bool,
+    /// `PIDFD_NONBLOCK` (`O_NONBLOCK`): a `waitid(P_PIDFD)` that would block
+    /// fails `EAGAIN` instead.
+    pub(super) nonblock: bool,
 }
 
 /// One `signalfd4`: the accepted-signal mask. Readable when the owning process
