@@ -112,6 +112,10 @@ impl Kernel {
         off: u64,
         data: &[u8],
     ) -> std::io::Result<usize> {
+        // memfd seals (F_SEAL_WRITE/F_SEAL_GROW) refuse the write outright.
+        if self.seal_blocks_write(vfs, path, off, data.len() as u64) {
+            return Err(std::io::Error::from_raw_os_error(1)); // EPERM
+        }
         let n = vfs.write_at(path, off, data)?;
         self.pc_after_write(vfs, path, off, &data[..n]);
         Ok(n)
@@ -124,13 +128,16 @@ impl Kernel {
         path: &str,
         len: u64,
     ) -> std::io::Result<()> {
+        if self.seal_blocks_truncate(vfs, path, len) {
+            return Err(std::io::Error::from_raw_os_error(1)); // EPERM
+        }
         vfs.truncate(path, len)?;
         self.pc_after_truncate(vfs, path, len);
         Ok(())
     }
 
     /// The cache key of the file at `path`, if it exists.
-    fn pc_key(vfs: &mut MountTable, path: &str) -> Option<FileKey> {
+    pub(super) fn pc_key(vfs: &mut MountTable, path: &str) -> Option<FileKey> {
         let ino = vfs.stat(path)?.inode;
         Some((vfs.mount_point_of(path)?, ino))
     }

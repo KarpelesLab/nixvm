@@ -2,34 +2,54 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// The file position of an *open file description*. Shared — not copied —
-/// by every descriptor that refers to the same open file: a `dup`, a
-/// `fork` child's inherited descriptor, an `SCM_RIGHTS` copy. So when a
-/// shell runs `{ cmd1; cmd2; } > out`, each child's writes advance the one
-/// position its siblings and parent continue from, instead of every writer
-/// starting over at offset 0 and clobbering the previous output. A fresh
-/// `open` makes a new one. The pointer identity doubles as the description's
-/// identity (`kcmp(KCMP_FILE)`, `F_DUPFD_QUERY`, `flock` ownership).
+/// The shared state of an *open file description*: its file position and
+/// its `O_APPEND` status flag. Shared — not copied — by every descriptor that
+/// refers to the same open file: a `dup`, a `fork` child's inherited
+/// descriptor, an `SCM_RIGHTS` copy. So when a shell runs `{ cmd1; cmd2; } >
+/// out`, each child's writes advance the one position its siblings and
+/// parent continue from (instead of every writer starting over at offset 0
+/// and clobbering the previous output), and `>> log` followed by
+/// `dup2(fd, 1)` keeps appending through fd 1. A fresh `open` makes a new
+/// one. The pointer identity doubles as the description's identity
+/// (`kcmp(KCMP_FILE)`, `F_DUPFD_QUERY`, OFD/`flock` lock ownership), and the
+/// reference count says when its last descriptor closed.
 #[derive(Debug, Clone)]
-pub struct FileOffset(Arc<AtomicU64>);
+pub struct FileOffset(Arc<OfdState>);
+
+#[derive(Debug)]
+struct OfdState {
+    pos: AtomicU64,
+    append: AtomicBool,
+}
 
 impl FileOffset {
     /// A new open file description positioned at `pos`.
     #[must_use]
     pub fn new(pos: u64) -> Self {
-        Self(Arc::new(AtomicU64::new(pos)))
+        Self(Arc::new(OfdState {
+            pos: AtomicU64::new(pos),
+            append: AtomicBool::new(false),
+        }))
     }
     #[must_use]
     pub fn get(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+        self.0.pos.load(Ordering::Relaxed)
     }
     pub fn set(&self, pos: u64) {
-        self.0.store(pos, Ordering::Relaxed);
+        self.0.pos.store(pos, Ordering::Relaxed);
     }
     pub fn add(&self, n: u64) {
-        self.0.fetch_add(n, Ordering::Relaxed);
+        self.0.pos.fetch_add(n, Ordering::Relaxed);
+    }
+    /// The description's `O_APPEND` flag.
+    #[must_use]
+    pub fn append(&self) -> bool {
+        self.0.append.load(Ordering::Relaxed)
+    }
+    pub fn set_append(&self, on: bool) {
+        self.0.append.store(on, Ordering::Relaxed);
     }
     /// Whether two descriptors share this open file description.
     #[must_use]
@@ -40,6 +60,40 @@ impl FileOffset {
     #[must_use]
     pub fn id(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
+    }
+    /// How many descriptors (across every task) refer to the description —
+    /// 1 means the one about to be dropped is the last.
+    #[must_use]
+    pub fn refs(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+}
+
+/// Per-descriptor attributes `fcntl` records and reports back: the
+/// `F_SETOWN[_EX]` owner (`(F_OWNER_* type, id)`), the `F_SETSIG` signal, the
+/// `F_SETLEASE` lease, the `F_NOTIFY` mask, and the `F_SET_RW_HINT` hint.
+/// (Linux keeps several of these per open file description; per descriptor is
+/// the approximation, and nothing is delivered through them — no `SIGIO`,
+/// lease breaks or dnotify events.)
+#[derive(Debug, Clone, Copy)]
+pub struct FdMeta {
+    pub owner: (i32, i32),
+    pub sig: i32,
+    pub lease: i32,
+    pub notify: u64,
+    pub rw_hint: u64,
+}
+
+impl Default for FdMeta {
+    fn default() -> Self {
+        Self {
+            // F_OWNER_PID with no owner; no signal; F_UNLCK; no notify; NOT_SET.
+            owner: (1, 0),
+            sig: 0,
+            lease: 2,
+            notify: 0,
+            rw_hint: 0,
+        }
     }
 }
 
@@ -112,8 +166,9 @@ pub struct FdTable {
     /// `F_DUPFD_CLOEXEC`/`fcntl(F_SETFD)`): closed on `execve`, inherited on
     /// `fork` (the whole table is cloned).
     cloexec: BTreeSet<i32>,
-    /// Descriptors opened `O_APPEND`: every write seeks to end-of-file first.
-    append: BTreeSet<i32>,
+    /// `fcntl`-recorded per-descriptor attributes (see [`FdMeta`]); absent =
+    /// the defaults.
+    meta: BTreeMap<i32, FdMeta>,
 }
 
 impl FdTable {
@@ -127,7 +182,7 @@ impl FdTable {
         Self {
             map,
             cloexec: BTreeSet::new(),
-            append: BTreeSet::new(),
+            meta: BTreeMap::new(),
         }
     }
 
@@ -156,6 +211,7 @@ impl FdTable {
     /// without `FD_CLOEXEC` (dup2 clears it; dup3 sets it afterward if asked).
     pub fn insert(&mut self, n: i32, fd: Fd) -> Option<Fd> {
         self.cloexec.remove(&n);
+        self.meta.remove(&n);
         self.map.insert(n, fd)
     }
 
@@ -176,21 +232,29 @@ impl FdTable {
         self.cloexec.contains(&n)
     }
 
-    /// Mark `n` as `O_APPEND` (a no-op if not open).
+    /// Set `O_APPEND` on the open file description behind `n` (shared with
+    /// its dups; a no-op for anything but a regular file).
     pub fn set_append(&mut self, n: i32, on: bool) {
-        if !self.map.contains_key(&n) {
-            return;
-        }
-        if on {
-            self.append.insert(n);
-        } else {
-            self.append.remove(&n);
+        if let Some(Fd::File { offset, .. }) = self.map.get(&n) {
+            offset.set_append(on);
         }
     }
 
+    /// Whether the open file description behind `n` is `O_APPEND`.
     #[must_use]
     pub fn is_append(&self, n: i32) -> bool {
-        self.append.contains(&n)
+        matches!(self.map.get(&n), Some(Fd::File { offset, .. }) if offset.append())
+    }
+
+    /// The `fcntl` attributes recorded for `n`.
+    #[must_use]
+    pub fn meta(&self, n: i32) -> FdMeta {
+        self.meta.get(&n).copied().unwrap_or_default()
+    }
+
+    /// Mutable `fcntl` attributes of `n` (created with the defaults).
+    pub fn meta_mut(&mut self, n: i32) -> &mut FdMeta {
+        self.meta.entry(n).or_default()
     }
 
     /// Close every `FD_CLOEXEC` descriptor, returning the removed [`Fd`]s so the
@@ -198,7 +262,10 @@ impl FdTable {
     pub fn close_cloexec(&mut self) -> Vec<Fd> {
         let fds: Vec<i32> = std::mem::take(&mut self.cloexec).into_iter().collect();
         fds.into_iter()
-            .filter_map(|n| self.map.remove(&n))
+            .filter_map(|n| {
+                self.meta.remove(&n);
+                self.map.remove(&n)
+            })
             .collect()
     }
 
@@ -213,7 +280,7 @@ impl FdTable {
 
     pub fn close(&mut self, fd: i32) -> Option<Fd> {
         self.cloexec.remove(&fd);
-        self.append.remove(&fd);
+        self.meta.remove(&fd);
         self.map.remove(&fd)
     }
 
@@ -232,7 +299,7 @@ impl FdTable {
     /// Remove every descriptor, returning them (used on process exit).
     pub fn drain(&mut self) -> Vec<Fd> {
         self.cloexec.clear();
-        self.append.clear();
+        self.meta.clear();
         std::mem::take(&mut self.map).into_values().collect()
     }
 }

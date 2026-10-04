@@ -30,6 +30,7 @@ use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 
 mod attrs;
 pub mod egress;
+mod fcntl;
 mod fd;
 mod fs_ext;
 mod futex;
@@ -1219,6 +1220,8 @@ pub struct Kernel {
     /// lock; the counter mints the hidden names.
     orphans: Mutex<BTreeSet<String>>,
     orphan_seq: AtomicU64,
+    /// Record/OFD/`flock` locks and memfd seals (see [`fcntl`]). A leaf lock.
+    locks: Mutex<fcntl::FileLocks>,
 }
 
 /// All kernel state mutated while a syscall is serviced, behind [`Kernel`]'s
@@ -1536,6 +1539,7 @@ impl Kernel {
             page_cache: Mutex::new(pagecache::PageCache::default()),
             orphans: Mutex::new(BTreeSet::new()),
             orphan_seq: AtomicU64::new(0),
+            locks: Mutex::new(fcntl::FileLocks::default()),
             shared: Mutex::new(Shared {
                 stdin: Box::new(std::io::stdin()),
                 stdout: Box::new(std::io::stdout()),
@@ -2725,7 +2729,7 @@ impl Kernel {
             Sysno::MemfdCreate => {
                 let mut sh = self.shared.lock().unwrap();
                 let mut vfs = self.vfs.lock().unwrap();
-                self.sys_memfd_create(&mut sh, &mut vfs, cx, args[0], mem)
+                self.sys_memfd_create(&mut sh, &mut vfs, cx, args[0], args[1], mem)
             }
             Sysno::Sendfile => {
                 let mut sh = self.shared.lock().unwrap();
@@ -3328,16 +3332,18 @@ impl Kernel {
             // is refused too (no debugging surface).
             Sysno::Settimeofday | Sysno::ClockSettime | Sysno::Ptrace => err(Errno::EPERM),
             // Closing the last descriptor of an unlinked file deletes it.
+            // Closing a descriptor drops the locks it carried, and closing the
+            // last descriptor of an unlinked file deletes it.
             Sysno::Close => {
+                let closed = cx.cur.fds.get(args[0] as i32).cloned();
                 let r = self.sys_close(cx, args[0] as i32);
+                if let Some(f) = closed {
+                    self.release_fd_locks(sh, cx, &f);
+                }
                 self.reap_orphans_locked(sh, cx);
                 r
             }
-            Sysno::CloseRange => {
-                let r = self.sys_close_range(cx, args[0], args[1]);
-                self.reap_orphans_locked(sh, cx);
-                r
-            }
+            Sysno::CloseRange => self.sys_close_range(sh, cx, args[0], args[1], args[2]),
             // Credentials: the VM starts as root but a process may drop
             // privileges; the ids are tracked per task (see `Creds`).
             Sysno::Getuid => i64::from(cx.cur.creds.ruid),
@@ -3399,7 +3405,8 @@ impl Kernel {
             }
             Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], mem),
             Sysno::Ioctl => self.sys_ioctl(cx, args[0], args[1], args[2], mem),
-            Sysno::Fcntl => self.sys_fcntl(cx, args[0], args[1], args[2], mem),
+            Sysno::Fcntl => self.sys_fcntl(sh, cx, args[0], args[1], args[2], mem),
+            Sysno::Flock => self.sys_flock(sh, cx, args[0], args[1]),
             Sysno::Futex => self.sys_futex(sh, cx, args, mem),
             Sysno::FutexWaitv => self.sys_futex_waitv(sh, cx, args, mem),
             Sysno::FutexWake => self.sys_futex2_wake(sh, cx, args, mem),
@@ -3431,11 +3438,18 @@ impl Kernel {
             Sysno::Dup => self.sys_dup(cx, args[0]),
             // dup2 has no flags (pass 0); dup3's 3rd arg is O_CLOEXEC.
             Sysno::Dup2 | Sysno::Dup3 => {
+                let replaced = cx.cur.fds.get(args[1] as i32).cloned();
                 let r = if sys == Sysno::Dup3 {
                     self.sys_dup2(cx, args[0], args[1], args[2], true)
                 } else {
                     self.sys_dup2(cx, args[0], args[1], 0, false)
                 };
+                if r >= 0
+                    && args[0] != args[1]
+                    && let Some(f) = replaced
+                {
+                    self.release_fd_locks(sh, cx, &f);
+                }
                 self.reap_orphans_locked(sh, cx);
                 r
             }
@@ -3609,11 +3623,6 @@ impl Kernel {
             | Sysno::Mlockall
             | Sysno::Munlockall
             | Sysno::Setrlimit
-            // flock: advisory whole-file locks. One kernel instance runs one
-            // cooperating process tree and nothing else can touch the in-VM
-            // files, so granting every request immediately is safe — apk
-            // locks its database this way.
-            | Sysno::Flock
             // Sync family: nothing is durably backed (in-memory / host
             // passthrough), so there's nothing to flush. `sync()` takes no fd;
             // the fd-taking members (fsync/fdatasync/syncfs/sync_file_range) are
@@ -4133,6 +4142,7 @@ impl Kernel {
         // into the program it launches.
         for fd in cx.cur.fds.close_cloexec() {
             self.bump_pipe(&fd, false);
+            self.release_fd_locks_with(sh, cx, vfs, &fd);
         }
         self.reap_orphans(sh, cx, vfs);
         // POSIX timers are destroyed by execve (an ITIMER_REAL survives it), as
@@ -4531,11 +4541,50 @@ impl Kernel {
     /// `close_range(first, last, flags)` — close every open fd in `[first,
     /// last]`. `flags` (e.g. `CLOSE_RANGE_CLOEXEC`) is ignored beyond the
     /// close itself.
-    fn sys_close_range(&self, cx: &mut ServiceCtx, first: u64, last: u64) -> i64 {
-        let last = last.min(4095); // bound the sweep to a sane fd ceiling
-        for fd in first..=last {
-            let _ = self.sys_close(cx, fd as i32);
+    /// `close_range(first, last, flags)`: close every open descriptor in
+    /// `[first, last]` — or, with `CLOSE_RANGE_CLOEXEC`, just mark them
+    /// close-on-exec; `CLOSE_RANGE_UNSHARE` first gives the caller a private
+    /// copy of a shared descriptor table (so siblings keep theirs).
+    fn sys_close_range(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        first: u64,
+        last: u64,
+        flags: u64,
+    ) -> i64 {
+        const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
+        const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
+        let (first, last) = (first as u32, last as u32);
+        if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
+            return err(Errno::EINVAL);
         }
+        if flags & CLOSE_RANGE_UNSHARE != 0 {
+            const CLONE_FILES: u64 = 0x400;
+            let r = self.sys_unshare(sh, cx, CLONE_FILES);
+            if r < 0 {
+                return r;
+            }
+        }
+        let targets: Vec<i32> = cx
+            .cur
+            .fds
+            .iter()
+            .map(|(n, _)| n)
+            .filter(|&n| (first..=last).contains(&(n as u32)))
+            .collect();
+        for n in targets {
+            if flags & CLOSE_RANGE_CLOEXEC != 0 {
+                cx.cur.fds.set_cloexec(n, true);
+            } else {
+                let closed = cx.cur.fds.get(n).cloned();
+                let _ = self.sys_close(cx, n);
+                if let Some(f) = closed {
+                    self.release_fd_locks(sh, cx, &f);
+                }
+            }
+        }
+        self.reap_orphans_locked(sh, cx);
         0
     }
 
@@ -4649,9 +4698,12 @@ impl Kernel {
     }
 
     /// `memfd_create(name, flags)` — an anonymous, initially-empty read/write
-    /// file. Backed by a uniquely-named node in `/tmp` (a tmpfs), which gives
-    /// the read/write/`ftruncate`/`mmap` behavior programs expect from a memfd
-    /// (the "not linked into any directory" nuance is not modeled).
+    /// file: an *orphan* (see [`orphan`]) at the root, so it is in no
+    /// directory and vanishes with its last descriptor, while its pages stay
+    /// alive in the page cache for whoever still maps it. `MFD_CLOEXEC` and
+    /// `MFD_ALLOW_SEALING` (else the memfd starts sealed against sealing) are
+    /// honored; `MFD_EXEC`/`MFD_NOEXEC_SEAL` (`F_SEAL_EXEC`) are accepted;
+    /// hugetlb memfds are refused (`EINVAL`, no huge pages).
     #[allow(clippy::unused_self)]
     fn sys_memfd_create(
         &self,
@@ -4659,24 +4711,42 @@ impl Kernel {
         vfs: &mut MountTable,
         cx: &mut ServiceCtx,
         name_ptr: u64,
+        flags: u64,
         mem: &GuestMemory,
     ) -> i64 {
-        let name = read_path(mem, name_ptr).unwrap_or_default();
-        let short: String = name.chars().take(64).filter(|c| *c != '/').collect();
+        const MFD_CLOEXEC: u64 = 1;
+        const MFD_ALLOW_SEALING: u64 = 2;
+        const MFD_HUGETLB: u64 = 4;
+        const MFD_NOEXEC_SEAL: u64 = 8;
+        const MFD_EXEC: u64 = 0x10;
+        if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL | MFD_EXEC) != 0
+            || flags & MFD_HUGETLB != 0
+            || (flags & MFD_EXEC != 0 && flags & MFD_NOEXEC_SEAL != 0)
+        {
+            return err(Errno::EINVAL);
+        }
+        let Some(name) = read_path(mem, name_ptr) else {
+            return err(Errno::EFAULT);
+        };
+        if name.len() > 249 {
+            return err(Errno::EINVAL);
+        }
         sh.memfd_seq += 1;
-        // Back it at the (always-writable) root with a dot-prefixed name so it
-        // stays out of ordinary `ls` output — the root is a tmpfs/overlay in
-        // every configuration, so this doesn't depend on `/tmp` existing.
-        let path = format!("/.memfd.{short}.{}", sh.memfd_seq);
-        if vfs.create(&path, 0o600).is_err() {
+        let path = format!("/{}memfd.{}", orphan::ORPHAN_PREFIX, sh.memfd_seq);
+        if vfs.create(&path, 0o777).is_err() {
             return err(Errno::ENOSPC);
         }
-        i64::from(cx.cur.fds.alloc(Fd::File {
+        self.orphans.lock().unwrap().insert(path.clone());
+        // MFD_NOEXEC_SEAL implies a sealable memfd with F_SEAL_EXEC set.
+        self.memfd_register(&path, flags & (MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL) != 0);
+        let fd = cx.cur.fds.alloc(Fd::File {
             path,
             offset: FileOffset::new(0),
             readable: true,
             writable: true,
-        }))
+        });
+        cx.cur.fds.set_cloexec(fd, flags & MFD_CLOEXEC != 0);
+        i64::from(fd)
     }
 
     /// `inotify_init1(flags)` stub — an eventfd-backed descriptor that is always
@@ -4754,6 +4824,7 @@ impl Kernel {
         if !others_share {
             for fd in cx.cur.fds.drain() {
                 self.bump_pipe(&fd, false);
+                self.release_fd_locks(sh, cx, &fd);
             }
             self.reap_orphans_locked(sh, cx);
         }
@@ -4776,6 +4847,14 @@ impl Kernel {
             && sh.ipc.exit_group(tgid)
         {
             sh.unpark_all();
+        }
+        if !sh
+            .procs
+            .iter()
+            .flatten()
+            .any(|p| p.info.tgid == tgid && !matches!(p.info.run, RunState::Zombie(_)))
+        {
+            self.release_process_locks(sh, tgid);
         }
         cx.cur.run = RunState::Zombie(cause);
         // The signal a terminating child sends its parent. A plain fork uses
@@ -6555,105 +6634,6 @@ impl Kernel {
                 self.note_unsupported("ioctl(pty)", u64::from(req));
                 err(Errno::ENOTTY)
             }
-        }
-    }
-
-    /// `fcntl(fd, cmd, ...)` — the subset real programs need at startup.
-    fn sys_fcntl(
-        &self,
-        cx: &mut ServiceCtx,
-        fd: u64,
-        cmd: u64,
-        arg: u64,
-        mem: &mut GuestMemory,
-    ) -> i64 {
-        const F_DUPFD: u64 = 0;
-        const F_GETFD: u64 = 1;
-        const F_SETFD: u64 = 2;
-        const F_GETFL: u64 = 3;
-        const F_SETFL: u64 = 4;
-        const F_SETLK: u64 = 6;
-        const F_SETLKW: u64 = 7;
-        const F_GETLK: u64 = 5;
-        const F_OFD_GETLK: u64 = 36;
-        const F_OFD_SETLK: u64 = 37;
-        const F_OFD_SETLKW: u64 = 38;
-        const F_DUPFD_CLOEXEC: u64 = 1030;
-        const F_SETPIPE_SZ: u64 = 1031;
-        const F_GETPIPE_SZ: u64 = 1032;
-        const FD_CLOEXEC: u64 = 1;
-        const F_UNLCK: u16 = 2;
-        const O_NONBLOCK: u64 = 0o4000;
-        const O_RDWR: u64 = 2;
-        // Every fcntl command operates on an open fd. Returning success for a
-        // closed fd breaks the common "mark every fd from 3 up cloexec until
-        // EBADF" loop (node/libuv do this at startup) into an unbounded spin —
-        // it must see EBADF to stop.
-        let Some(f) = cx.cur.fds.get(fd as i32).cloned() else {
-            return err(Errno::EBADF);
-        };
-        match cmd {
-            // Duplicate to the lowest free fd `>= arg` (the minimum), optionally
-            // close-on-exec.
-            F_DUPFD | F_DUPFD_CLOEXEC => {
-                self.bump_pipe(&f, true);
-                let n = cx.cur.fds.alloc_from(f, arg as i32);
-                cx.cur.fds.set_cloexec(n, cmd == F_DUPFD_CLOEXEC);
-                i64::from(n)
-            }
-            // Pipe capacity: nixvm's pipes are unbounded, so report/accept the
-            // Linux default (64 KiB) rather than the misleading 0.
-            F_GETPIPE_SZ | F_SETPIPE_SZ => 65536,
-            // The close-on-exec flag (`FD_CLOEXEC`) — the only `F_*FD` bit.
-            F_GETFD => i64::from(cx.cur.fds.is_cloexec(fd as i32)),
-            F_SETFD => {
-                cx.cur.fds.set_cloexec(fd as i32, arg & FD_CLOEXEC != 0);
-                0
-            }
-            // `F_SETFL` only `O_NONBLOCK` matters here (the access mode and
-            // `O_APPEND`/`O_DIRECT` are fixed or irrelevant). Wiring it is
-            // essential: libuv/c-ares create a socket, then set it non-blocking
-            // via `fcntl` — without this the socket stays blocking and a
-            // `recvfrom` on it (e.g. the DNS reply) parks the whole event-loop
-            // thread instead of returning `EAGAIN`.
-            F_SETFL => {
-                const O_APPEND: u64 = 0o2000;
-                self.fd_set_nonblock(&f, arg & O_NONBLOCK != 0);
-                cx.cur.fds.set_append(fd as i32, arg & O_APPEND != 0);
-                0
-            }
-            F_GETFL => {
-                const O_APPEND: u64 = 0o2000;
-                O_RDWR as i64
-                    | if self.fd_is_nonblock(&f) {
-                        O_NONBLOCK as i64
-                    } else {
-                        0
-                    }
-                    | if cx.cur.fds.is_append(fd as i32) {
-                        O_APPEND as i64
-                    } else {
-                        0
-                    }
-            }
-            // POSIX (and OFD) record locks. One kernel instance runs a single
-            // cooperating process tree over in-VM files nothing else can touch,
-            // so every lock request is granted immediately (like `flock`).
-            #[allow(clippy::match_same_arms)] // named for the record, same as `_`
-            F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => 0,
-            // A lock *query*: the caller passes a `struct flock` and the kernel
-            // must report whether the region is locked. Since we grant every
-            // lock (nothing conflicts), the region is always available — set
-            // `l_type = F_UNLCK` so the guest doesn't read its own request back
-            // and conclude the file is already locked. `l_type` is the first
-            // field (a `short`); the rest of the struct is left as passed.
-            F_GETLK | F_OFD_GETLK => {
-                if mem.write(arg, &F_UNLCK.to_le_bytes()).is_err() {
-                    return err(Errno::EFAULT);
-                }
-                0
-            }
-            _ => 0,
         }
     }
 
