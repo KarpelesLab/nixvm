@@ -239,6 +239,10 @@ enum Imm {
     Enter,
     /// Only for `F6`/`F7`: `/0` and `/1` (TEST) take imm8/immZ.
     Grp3,
+    /// A forward branch displacement (8/32-bit) into filler instructions
+    /// appended after the branch, so taken and not-taken are distinguishable.
+    Rel8,
+    Rel32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -296,6 +300,18 @@ fn specs() -> Vec<OpSpec> {
         }
         v.push(op(Int, &ONE[(base + 4) as usize], false, B));
         v.push(op(Int, &ONE[(base + 5) as usize], false, Z));
+    }
+    // Conditional branches, LOOP/LOOPE/LOOPNE/JrCXZ, short/near JMP.
+    for o in 0x70..=0x7F {
+        v.push(op(Int, &ONE[o], false, Rel8));
+    }
+    for o in 0xE0..=0xE3 {
+        v.push(op(Int, &ONE[o], false, Rel8));
+    }
+    v.push(op(Int, &ONE[0xEB], false, Rel8));
+    v.push(op(Int, &ONE[0xE9], false, Rel32));
+    for o in 0x80..=0x8F {
+        v.push(op(Int, &TWO[o], false, Rel32));
     }
     for o in 0x50..=0x5F {
         v.push(op(Int, &ONE[o], false, None));
@@ -900,7 +916,8 @@ fn gen_case(rng: &mut Rng, spec: &OpSpec, insn_addr: u64) -> Case {
     let mut code = Vec::new();
     // Prefixes.
     let mut has66 = false;
-    let no66 = matches!(spec.op, [0xC8 | 0xC9] | [0x0F, 0xC3 | 0xAE]);
+    let no66 = matches!(spec.op, [0xC8 | 0xC9] | [0x0F, 0xC3 | 0xAE])
+        || matches!(spec.imm, Imm::Rel8 | Imm::Rel32);
     if spec.cat == Cat::Int {
         if !no66 && rng.chance(1, 5) {
             code.push(0x66);
@@ -1025,6 +1042,8 @@ fn gen_case(rng: &mut Rng, spec: &OpSpec, insn_addr: u64) -> Case {
         }
         Imm::V => osz / 8,
         Imm::Enter => 3,
+        Imm::Rel8 => 1,
+        Imm::Rel32 => 4,
         Imm::Grp3 => {
             if modrm_reg < 2 {
                 if spec.op[0] == 0xF6 {
@@ -1045,6 +1064,19 @@ fn gen_case(rng: &mut Rng, spec: &OpSpec, insn_addr: u64) -> Case {
     if spec.op == [0x0F, 0xC2] {
         let n = code.len();
         code[n - 1] &= 7;
+    }
+    if matches!(spec.imm, Imm::Rel8 | Imm::Rel32) {
+        // K fillers of `inc r15` (3 bytes); jump over j of them.
+        const FILL: [u8; 3] = [0x49, 0xFF, 0xC7];
+        let k = rng.below(4);
+        let j = rng.below(k + 1) as u32;
+        let n = code.len();
+        let w = if spec.imm == Imm::Rel8 { 1 } else { 4 };
+        code[n - w..].copy_from_slice(&(3 * j).to_le_bytes()[..w]);
+        for _ in 0..k {
+            code.extend_from_slice(&FILL);
+        }
+        st.gpr[1] = rng.below(3); // LOOP counts 0, 1, 2
     }
     if spec.imm == Imm::Enter {
         // Keep the nesting level small: level copies that many frame words.
@@ -1386,7 +1418,14 @@ fn compare(
         return diffs; // faulted identically; state is the pre-fault state
     }
     for r in 0..16 {
-        if sw.gpr[r] != hw.gpr[r] {
+        // CMPXCHG r/m32 that succeeds: the SDM writes no accumulator (RAX's
+        // upper half survives); Rosetta writes EAX (zero-extending).
+        let cmpxchg32_ok = r == 0
+            && case.spec.op == [0x0F, 0xB1]
+            && hw.rflags & ZF != 0
+            && sw.gpr[0] & 0xffff_ffff == hw.gpr[0]
+            && hw.gpr[0] >> 32 == 0;
+        if sw.gpr[r] != hw.gpr[r] && !cmpxchg32_ok {
             diffs.push(format!(
                 "{} {:#x} vs {:#x} (was {:#x})",
                 GPR_NAMES[r], sw.gpr[r], hw.gpr[r], case.st.gpr[r]
@@ -1551,7 +1590,16 @@ fn interpreter_matches_real_x86() {
         page[insn_off..insn_off + case.code.len()].copy_from_slice(&case.code);
         let mut mem = interp_mem(&page, &case.data);
         let mut sw = case.st.clone();
-        let out = testing::step(&mut mem, &mut sw);
+        // Run until execution reaches the end of the case's code (one
+        // instruction, or a branch plus the filler it may skip).
+        let end = oracle.insn_addr + case.code.len() as u64;
+        let mut out = testing::step(&mut mem, &mut sw);
+        for _ in 0..8 {
+            if out != Outcome::Done || sw.rip == end {
+                break;
+            }
+            out = testing::step(&mut mem, &mut sw);
+        }
         let sw_data = mem.read_vec(DATA, DATA_LEN).unwrap();
         let sw_sig = signal_of(out);
         let Some(ign) = known_differences(&case, sw_sig, hw.signo) else {
