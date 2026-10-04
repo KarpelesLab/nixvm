@@ -39,14 +39,32 @@ fn names(fd_path: &str, path: &str) -> bool {
 }
 
 impl Kernel {
-    /// A fresh hidden name at the root of `path`'s mount.
-    pub(super) fn orphan_name(&self, vfs: &mut MountTable, path: &str) -> String {
+    /// A fresh hidden name in directory `dir`.
+    fn orphan_in(&self, dir: &str) -> String {
         let n = self
             .orphan_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mp = vfs.mount_point_of(path).unwrap_or_else(|| "/".to_string());
-        let sep = if mp.ends_with('/') { "" } else { "/" };
-        format!("{mp}{sep}{ORPHAN_PREFIX}{n}")
+        let sep = if dir.ends_with('/') { "" } else { "/" };
+        format!("{dir}{sep}{ORPHAN_PREFIX}{n}")
+    }
+
+    /// Candidate homes for an orphan of `path` (a file, or for `O_TMPFILE` the
+    /// directory itself): the root of its mount first — so the directory it
+    /// came from can still be removed — then the directory itself, for
+    /// backends with a writable subtree only (`/dev/shm` inside `/dev`).
+    fn orphan_homes(&self, vfs: &mut MountTable, dir: &str) -> [String; 2] {
+        let mp = vfs.mount_point_of(dir).unwrap_or_else(|| "/".to_string());
+        [self.orphan_in(&mp), self.orphan_in(dir)]
+    }
+
+    /// Move file `path` to a fresh orphan name, returning it.
+    fn orphan_move(&self, vfs: &mut MountTable, path: &str) -> std::io::Result<String> {
+        let parent = super::parent_of(path).to_string();
+        let [root, local] = self.orphan_homes(vfs, &parent);
+        match vfs.rename(path, &root) {
+            Ok(()) => Ok(root),
+            Err(_) => vfs.rename(path, &local).map(|()| local),
+        }
     }
 
     /// Does any descriptor — the caller's or a checked-in table's — name
@@ -126,9 +144,8 @@ impl Kernel {
         let abs = self.resolve_path(cx, dirfd, &rel);
         let is_file = vfs.stat(&abs).is_some_and(|a| a.kind != NodeKind::Dir);
         if is_file && Self::path_is_open(sh, cx, &abs) {
-            let hidden = self.orphan_name(vfs, &abs);
-            return match vfs.rename(&abs, &hidden) {
-                Ok(()) => {
+            return match self.orphan_move(vfs, &abs) {
+                Ok(hidden) => {
                     Self::repoint(sh, cx, &abs, &hidden);
                     self.orphans.lock().unwrap().insert(hidden);
                     0
@@ -184,12 +201,10 @@ impl Kernel {
             && vfs.stat(&to).is_some_and(|a| a.kind != NodeKind::Dir)
             && vfs.stat(&from).is_some_and(|a| a.kind != NodeKind::Dir)
             && Self::path_is_open(sh, cx, &to)
+            && let Ok(hidden) = self.orphan_move(vfs, &to)
         {
-            let hidden = self.orphan_name(vfs, &to);
-            if vfs.rename(&to, &hidden).is_ok() {
-                Self::repoint(sh, cx, &to, &hidden);
-                self.orphans.lock().unwrap().insert(hidden);
-            }
+            Self::repoint(sh, cx, &to, &hidden);
+            self.orphans.lock().unwrap().insert(hidden);
         }
         let r = self.sys_renameat(vfs, cx, olddirfd, oldptr, newdirfd, newptr, flags, mem);
         if r == 0 {
@@ -256,10 +271,14 @@ impl Kernel {
             Some(_) => return err(Errno::ENOTDIR),
             None => return err(Errno::ENOENT),
         }
-        let hidden = self.orphan_name(vfs, dir);
-        if let Err(e) = vfs.create(&hidden, (mode & 0o7777) as u32) {
-            return io_errno(&e);
-        }
+        let [root, local] = self.orphan_homes(vfs, dir);
+        let hidden = match vfs.create(&root, (mode & 0o7777) as u32) {
+            Ok(()) => root,
+            Err(_) => match vfs.create(&local, (mode & 0o7777) as u32) {
+                Ok(()) => local,
+                Err(e) => return io_errno(&e),
+            },
+        };
         self.orphans.lock().unwrap().insert(hidden.clone());
         let fd = cx.cur.fds.alloc(Fd::File {
             path: hidden,
@@ -503,5 +522,50 @@ mod tests {
             ),
             e(Errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn orphans_inside_a_writable_subtree_stay_in_it() {
+        // /dev/shm is a writable tmpfs inside the read-only /dev mount: the
+        // orphan can't go to /dev's root, so it stays in /dev/shm.
+        let (k, mut mem, mut v, mut cx) = setup();
+        k.vfs
+            .lock()
+            .unwrap()
+            .mount("/dev", Box::new(crate::fs::DevFs::new()));
+        let path = BASE;
+        put_str(&mut mem, path, "/dev/shm/pym-1");
+        let fd = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Openat,
+            [AT_FDCWD, path, 0o102, 0o600, 0, 0],
+        ) as u64;
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Unlinkat,
+                [AT_FDCWD, path, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Ftruncate,
+                [fd, 4096, 0, 0, 0, 0]
+            ),
+            0
+        );
+        let o = k.orphans.lock().unwrap().iter().next().cloned().unwrap();
+        assert!(o.starts_with("/dev/shm/.nixvm-orphan-"), "{o}");
     }
 }
