@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/KarpelesLab/nixvm/compare/v0.0.3...v0.0.4) - 2026-10-04
+
+### Other
+
+- Make nginx run: directory symlinks, NEON/FP gaps, socket and epoll lifetimes
+- show the tunnel as tun0 in ip addr/ip route/ifconfig
+- getsockname on netlink sockets returns a full sockaddr_nl (fixes `ip addr`)
+- clicking the net address copies it; on/off moves to a separate ⏻ toggle
+
 ## [0.0.3](https://github.com/KarpelesLab/nixvm/compare/v0.0.2...v0.0.3) - 2026-10-03
 
 ### Other
