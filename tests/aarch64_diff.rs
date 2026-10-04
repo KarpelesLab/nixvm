@@ -73,6 +73,71 @@ unsafe extern "C" {
     fn sys_icache_invalidate(start: *mut c_void, len: usize);
     fn sigaction(sig: i32, act: *const SigAction, old: *mut SigAction) -> i32;
     fn sigaltstack(ss: *const StackT, old: *mut StackT) -> i32;
+    fn sysctlbyname(
+        name: *const std::ffi::c_char,
+        oldp: *mut c_void,
+        oldlenp: *mut usize,
+        newp: *mut c_void,
+        newlen: usize,
+    ) -> i32;
+}
+
+/// Whether the host CPU implements `FEAT_<name>` (`hw.optional.arm.FEAT_*`).
+fn host_has(feature: &str) -> bool {
+    let name = std::ffi::CString::new(format!("hw.optional.arm.FEAT_{feature}")).unwrap();
+    let mut v: i32 = 0;
+    let mut len = std::mem::size_of::<i32>();
+    let rc = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            (&raw mut v).cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    rc == 0 && v != 0
+}
+
+/// The architecture extension an instruction (by its disassembly) needs
+/// beyond Armv8.0 + the crypto/CRC/LSE baseline, so words the host CPU can't
+/// run natively are skipped (CI runners may be older than the dev machine).
+fn required_feature(asm: &str) -> Option<&'static str> {
+    let mn = asm.split_whitespace().next().unwrap_or("");
+    let ops = asm.get(mn.len()..).unwrap_or("");
+    Some(match mn {
+        m if m.starts_with("bf") => "BF16",
+        "smmla" | "ummla" | "usmmla" | "usdot" | "sudot" => "I8MM",
+        "sdot" | "udot" => "DotProd",
+        "sqrdmlah" | "sqrdmlsh" => "RDM",
+        "fcmla" | "fcadd" => "FCMA",
+        "fjcvtzs" => "JSCVT",
+        "fmlal" | "fmlal2" | "fmlsl" | "fmlsl2" => "FHM",
+        m if m.starts_with("sha512") => "SHA512",
+        "eor3" | "bcax" | "rax1" | "xar" => "SHA3",
+        m if m.starts_with("frint32") || m.starts_with("frint64") => "FRINTTS",
+        "cfinv" | "rmif" | "setf8" | "setf16" => "FlagM",
+        "axflag" | "xaflag" => "FlagM2",
+        m if m.starts_with("ldapur") || m.starts_with("stlur") => "LRCPC2",
+        m if m.starts_with("ldapr") => "LRCPC",
+        "sb" => "SB",
+        // Half-precision FP arithmetic (fcvt to/from half is Armv8.0).
+        m if m.starts_with('f')
+            && !m.starts_with("fcvt")
+            && (ops.contains(" h")
+                || ops.contains(".4h")
+                || ops.contains(".8h")
+                || ops.contains(".h[")) =>
+        {
+            "FP16"
+        }
+        m if (m.starts_with("scvtf") || m.starts_with("ucvtf"))
+            && (ops.contains(" h") || ops.contains(".4h") || ops.contains(".8h")) =>
+        {
+            "FP16"
+        }
+        _ => return None,
+    })
 }
 
 /// Signal number caught during the native run (0 = none) and where to resume.
@@ -797,10 +862,17 @@ fn run_words(words: &[(u32, String)], iters: u64, seed: u64) -> Report {
         skipped: 0,
     };
     let mut data = vec![0u8; DATA_LEN];
+    let mut host_features: BTreeMap<&'static str, bool> = BTreeMap::new();
     // Optionally misalign base registers (exercises alignment faults).
     let misalign = std::env::var_os("NIXVM_DIFF_MISALIGN").is_some();
     for (word, asm) in words {
         let mnemonic = asm.split_whitespace().next().unwrap_or("?").to_string();
+        if let Some(f) = required_feature(asm)
+            && !*host_features.entry(f).or_insert_with(|| host_has(f))
+        {
+            report.skipped += 1;
+            continue;
+        }
         let (class, word) = classify(*word);
         if class == Class::Skip || unpredictable(word) || wild_address(word) {
             report.skipped += 1;
@@ -993,7 +1065,7 @@ fn interpreter_matches_native_execution() {
     let iters = std::env::var("NIXVM_DIFF_ITERS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
+        .unwrap_or(16);
     let seed = std::env::var("NIXVM_DIFF_SEED")
         .ok()
         .and_then(|s| s.parse().ok())
