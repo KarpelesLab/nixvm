@@ -33,6 +33,31 @@ impl Arch {
         }
     }
 
+    /// The architecture an ELF image is built for, from its header's
+    /// `e_machine` (offset 18): `EM_AARCH64` (183) or `EM_X86_64` (62).
+    /// `None` for anything else, or a truncated header.
+    #[must_use]
+    pub fn from_elf(elf: &[u8]) -> Option<Self> {
+        const EM_X86_64: u16 = 62;
+        const EM_AARCH64: u16 = 183;
+        match u16::from_le_bytes([*elf.get(18)?, *elf.get(19)?]) {
+            EM_AARCH64 => Some(Self::Aarch64),
+            EM_X86_64 => Some(Self::X86_64),
+            _ => None,
+        }
+    }
+
+    /// Parse an architecture name as users spell it: `aarch64`/`arm64`,
+    /// `x86_64`/`x86-64`/`amd64` (case-insensitive).
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "aarch64" | "arm64" => Some(Self::Aarch64),
+            "x86_64" | "x86-64" | "amd64" | "x64" => Some(Self::X86_64),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

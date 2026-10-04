@@ -218,8 +218,10 @@ enum Step {
 enum Trap {
     /// `#DE`: `DIV`/`IDIV` by zero or with a quotient that doesn't fit.
     Divide,
-    /// `#BP`/`#DB`: `INT3` / `INT1`.
+    /// `#BP`: `INT3` (a trap: `rip` is past it).
     Breakpoint,
+    /// `#DB` from `INT1`/`ICEBP` (a trap: `rip` is past it).
+    Debug,
     /// `#GP`: a privileged instruction (`HLT`, `CLI`, `IN`/`OUT`, `INT n`, …)
     /// at CPL 3, or a `#GP`-raising operand (`LDMXCSR` reserved bits, a
     /// misaligned `MOVAPS`, an over-long instruction, …). Linux delivers
@@ -237,9 +239,29 @@ impl Trap {
     const fn signal(self) -> i32 {
         match self {
             Self::Divide | Self::X87 | Self::Simd => 8, // SIGFPE
-            Self::Breakpoint => 5,                      // SIGTRAP
+            Self::Breakpoint | Self::Debug => 5,        // SIGTRAP
             Self::Protection => 11,                     // SIGSEGV
         }
+    }
+}
+
+/// Linux's `SIGFPE` `si_code` for the unmasked exception bits `err`
+/// (x87 status or `MXCSR` flags, `IE` = bit 0 … `PE` = bit 5), in the
+/// priority `fpu__exception_code` applies: invalid, divide-by-zero,
+/// overflow, underflow/denormal, precision.
+fn fpe_code(err: u32) -> u64 {
+    if err & 0x01 != 0 {
+        7 // FPE_FLTINV
+    } else if err & 0x04 != 0 {
+        3 // FPE_FLTDIV
+    } else if err & 0x08 != 0 {
+        4 // FPE_FLTOVF
+    } else if err & 0x12 != 0 {
+        5 // FPE_FLTUND
+    } else if err & 0x20 != 0 {
+        6 // FPE_FLTRES
+    } else {
+        0
     }
 }
 
@@ -2468,7 +2490,11 @@ impl X86Interp {
             // Far returns/interrupt returns and software interrupts: no far
             // code segments or IDT gates are reachable from a user task.
             0xCA | 0xCB | 0xCD | 0xCF => Step::Trap(Trap::Protection),
-            0xCC => Step::Trap(Trap::Breakpoint),
+            // INT3/INT1 are traps: the saved `rip` is the next instruction.
+            0xCC => {
+                self.rip = pc;
+                Step::Trap(Trap::Breakpoint)
+            }
             0xD0 => self.group2(mem, pc, p, 8, Some(1)),
             0xD1 => self.group2(mem, pc, p, width, Some(1)),
             0xD2 => self.group2(mem, pc, p, 8, Some(self.gpr[RCX] as u8)),
@@ -2518,7 +2544,10 @@ impl X86Interp {
                 let (rel, end) = fetch!(self.fetch_i8(pc));
                 self.jump(end.wrapping_add(i64::from(rel) as u64))
             }
-            0xF1 => Step::Trap(Trap::Breakpoint), // INT1 / ICEBP
+            0xF1 => {
+                self.rip = pc; // INT1 / ICEBP
+                Step::Trap(Trap::Debug)
+            }
             // HLT, CLI, STI: privileged at CPL 3.
             0xF4 | 0xFA | 0xFB => Step::Trap(Trap::Protection),
             0xF5 => {
@@ -2945,6 +2974,36 @@ impl X86Interp {
         Ok(())
     }
 
+    /// The [`Exit`] (and so the Linux signal) for a non-memory exception:
+    /// `#DE` → `SIGFPE`/`FPE_INTDIV` (Linux reports every divide error so,
+    /// overflow included); `#MF`/`#XM` → `SIGFPE` with the `si_code` of the
+    /// first unmasked pending exception (`fpu__exception_code`); `INT3` →
+    /// `SIGTRAP` (`SI_KERNEL`), `INT1` → `SIGTRAP` (`TRAP_BRKPT`), both with
+    /// `rip` past the instruction; `#GP` → `SIGSEGV` (`SI_KERNEL`).
+    fn trap_exit(&self, t: Trap) -> Exit {
+        let pc = self.rip;
+        match t {
+            Trap::Divide => Exit::ArithmeticFault {
+                pc,
+                code: 1, // FPE_INTDIV
+                vector: 0,
+            },
+            Trap::X87 => Exit::ArithmeticFault {
+                pc,
+                code: fpe_code(u32::from(self.fpu_sw() & !self.fpu_cw & 0x3f)),
+                vector: 16,
+            },
+            Trap::Simd => Exit::ArithmeticFault {
+                pc,
+                code: fpe_code(self.mxcsr & !(self.mxcsr >> 7) & 0x3f),
+                vector: 19,
+            },
+            Trap::Breakpoint => Exit::Breakpoint { pc, code: 3 },
+            Trap::Debug => Exit::Breakpoint { pc, code: 1 },
+            Trap::Protection => Exit::ProtectionFault { pc },
+        }
+    }
+
     /// The 512-byte `FXSAVE` image of the x87/MMX/SSE state (Intel SDM Vol. 1
     /// §10.5.1): control/status words, abridged tag, last opcode/pointers
     /// (64-bit `FIP`/`FDP` for the `REX.W` form, else 32-bit offsets with a
@@ -3040,17 +3099,7 @@ impl Vcpu for X86Interp {
                 Step::Syscall => return Ok(Exit::Syscall),
                 Step::Illegal => return Ok(Exit::IllegalInstruction { pc: self.rip }),
                 Step::Fault { addr, write } => return Ok(Exit::MemFault { addr, write }),
-                // `#GP` is a `SIGSEGV` with `si_addr == 0` on Linux — exactly
-                // what an unresolvable fault at address 0 becomes. The
-                // `SIGFPE`/`SIGTRAP` exceptions have no `Exit` of their own
-                // yet, so they surface as an illegal instruction (`SIGILL`).
-                Step::Trap(Trap::Protection) => {
-                    return Ok(Exit::MemFault {
-                        addr: 0,
-                        write: false,
-                    });
-                }
-                Step::Trap(_) => return Ok(Exit::IllegalInstruction { pc: self.rip }),
+                Step::Trap(t) => return Ok(self.trap_exit(t)),
             }
             // Poll the wall clock only every QUANTUM_STRIDE instructions — a read
             // per instruction would swamp the interpreter's per-op cost.
@@ -3117,17 +3166,52 @@ impl Vcpu for X86Interp {
         self.set_rflags_user(v);
     }
 
+    /// The standard-format `XSAVE` area of every `XCR0` component (64-bit
+    /// `FXSAVE64` legacy region, header with `XSTATE_BV` = `XCR0`, AVX upper
+    /// halves at 576) — what Linux's `copy_fpstate_to_sigframe` stores.
     fn simd_state(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(256);
-        for x in &self.xmm {
-            out.extend_from_slice(&x.to_le_bytes());
+        let mut out = vec![0u8; super::X86_XSAVE_SIZE];
+        out[..512].copy_from_slice(&self.fxsave_image(true));
+        out[512..520].copy_from_slice(&XCR0.to_le_bytes());
+        if XCR0 & 4 != 0 {
+            for (i, v) in self.ymm_hi.iter().enumerate() {
+                out[576 + 16 * i..592 + 16 * i].copy_from_slice(&v.to_le_bytes());
+            }
         }
         out
     }
 
+    /// Restore from an `XSAVE` area (components whose `XSTATE_BV` bit is
+    /// clear return to their initial state, as `XRSTOR` does) or from a bare
+    /// 512-byte `FXSAVE` image (the extended state is reset). A `MXCSR` with
+    /// reserved bits set leaves the state untouched.
     fn set_simd_state(&mut self, bytes: &[u8]) {
-        for (i, chunk) in bytes.as_chunks::<16>().0.iter().take(16).enumerate() {
-            self.xmm[i] = u128::from_le_bytes(*chunk);
+        if bytes.len() < 512 {
+            return;
+        }
+        let bv = if bytes.len() >= super::X86_XSAVE_SIZE {
+            u64::from_le_bytes(bytes[512..520].try_into().unwrap()) & XCR0
+        } else {
+            3 // legacy image: x87 + SSE
+        };
+        let mut img: [u8; 512] = bytes[..512].try_into().unwrap();
+        if bv & 1 == 0 {
+            img[..24].fill(0);
+            img[..2].copy_from_slice(&0x037Fu16.to_le_bytes());
+            img[32..160].fill(0);
+        }
+        if bv & 2 == 0 {
+            img[160..416].fill(0);
+        }
+        if !self.fxrstor_image(&img, true) {
+            return;
+        }
+        for (i, v) in self.ymm_hi.iter_mut().enumerate() {
+            *v = if bv & 4 != 0 {
+                u128::from_le_bytes(bytes[576 + 16 * i..592 + 16 * i].try_into().unwrap())
+            } else {
+                0
+            };
         }
     }
 
@@ -3829,7 +3913,7 @@ mod tests {
     }
 
     #[test]
-    fn mul_8bit_and_div_by_zero_is_illegal() {
+    fn mul_8bit_and_div_by_zero_is_a_divide_error() {
         let mut m = mem();
         let mut cpu = X86Interp::new(CODE, STACK);
         cpu.gpr[RAX] = 20; // AL = 20
@@ -3848,9 +3932,76 @@ mod tests {
         m.write_init(CODE, &[0xF6, 0xF1]).unwrap();
         cpu.rip = CODE;
         match cpu.run(&mut m).unwrap() {
-            Exit::IllegalInstruction { .. } => {}
-            other => panic!("expected IllegalInstruction on divide-by-zero, got {other:?}"),
+            Exit::ArithmeticFault {
+                pc: CODE,
+                code: 1,
+                vector: 0,
+            } => {}
+            other => panic!("expected #DE (FPE_INTDIV) on divide-by-zero, got {other:?}"),
         }
+    }
+
+    /// The trap exits carry Linux's view: INT3/INT1 leave `rip` past the
+    /// instruction, `#GP` and an unmasked `#XM` report the faulting `rip`.
+    #[test]
+    fn trap_exits_match_linux_signals() {
+        let mut m = mem();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        m.write_init(CODE, &[0xCC]).unwrap();
+        assert_eq!(
+            cpu.run(&mut m).unwrap(),
+            Exit::Breakpoint {
+                pc: CODE + 1,
+                code: 3
+            }
+        );
+        cpu.rip = CODE;
+        m.write_init(CODE, &[0xF1]).unwrap();
+        assert_eq!(
+            cpu.run(&mut m).unwrap(),
+            Exit::Breakpoint {
+                pc: CODE + 1,
+                code: 1
+            }
+        );
+        cpu.rip = CODE;
+        m.write_init(CODE, &[0xF4]).unwrap(); // hlt
+        assert_eq!(cpu.run(&mut m).unwrap(), Exit::ProtectionFault { pc: CODE });
+        // divss xmm0, xmm1 with ZE unmasked and xmm1 = 0: #XM, FPE_FLTDIV.
+        cpu.rip = CODE;
+        cpu.mxcsr = 0x1f80 & !(1 << 9);
+        cpu.xmm[0] = u128::from(1.0f32.to_bits());
+        cpu.xmm[1] = 0;
+        m.write_init(CODE, &[0xF3, 0x0F, 0x5E, 0xC1]).unwrap();
+        assert_eq!(
+            cpu.run(&mut m).unwrap(),
+            Exit::ArithmeticFault {
+                pc: CODE,
+                code: 3,
+                vector: 19
+            }
+        );
+    }
+
+    /// `simd_state` is a standard-format XSAVE area that round-trips the
+    /// x87 control word, MXCSR, XMM and YMM upper halves; a bare FXSAVE image
+    /// resets the AVX upper halves.
+    #[test]
+    fn simd_state_is_an_xsave_area() {
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.mxcsr = 0x7f80; // round toward zero
+        cpu.set_fpu_cw(0x0c7f);
+        cpu.xmm[3] = 0x1234;
+        cpu.ymm_hi[3] = 0x5678;
+        let area = cpu.simd_state();
+        assert_eq!(area.len(), super::super::X86_XSAVE_SIZE);
+        assert_eq!(u64::from_le_bytes(area[512..520].try_into().unwrap()), XCR0);
+        let mut other = X86Interp::new(CODE, STACK);
+        other.set_simd_state(&area);
+        assert_eq!((other.mxcsr, other.fpu_cw), (0x7f80, 0x0c7f));
+        assert_eq!((other.xmm[3], other.ymm_hi[3]), (0x1234, 0x5678));
+        other.set_simd_state(&area[..512]);
+        assert_eq!((other.xmm[3], other.ymm_hi[3]), (0x1234, 0));
     }
 
     #[test]

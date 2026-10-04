@@ -156,9 +156,10 @@ impl Vm {
             install_resolv_conf(&mut mounts);
         }
 
-        let elf = read_mount_file(&mut mounts, &path)
+        let elf = mounts
+            .read_file(&path)
             .ok_or_else(|| format!("{path} not found in the root image"))?;
-        let arch = detect_arch(&elf).ok_or("unrecognized ELF machine type")?;
+        let arch = Arch::from_elf(&elf).ok_or("unrecognized ELF machine type")?;
 
         // A large virtual extent over a `mem_bytes` physical pool: runtimes
         // reserve far more address space than they touch (Go's page-summary
@@ -171,7 +172,8 @@ impl Vm {
             envp: default_env(),
         };
         let loaded = if let Some(interp) = interp_path(&elf) {
-            let interp_elf = read_mount_file(&mut mounts, &interp)
+            let interp_elf = mounts
+                .read_file(&interp)
                 .ok_or_else(|| format!("dynamic linker {interp} not found in the root image"))?;
             load_dynamic(&mut mem, &elf, &interp_elf, &spec)
         } else {
@@ -315,32 +317,6 @@ impl Vm {
             exit_code: self.finished,
             busy: false,
         })
-    }
-}
-
-fn read_mount_file(mounts: &mut MountTable, path: &str) -> Option<Vec<u8>> {
-    let size = mounts.stat(path)?.size as usize;
-    let mut buf = vec![0u8; size];
-    let mut off = 0;
-    while off < size {
-        match mounts.read_at(path, off as u64, &mut buf[off..]) {
-            Ok(0) => break,
-            Ok(n) => off += n,
-            Err(_) => return None,
-        }
-    }
-    buf.truncate(off);
-    Some(buf)
-}
-
-/// Peek the ELF header's `e_machine` (offset 18) to pick an arch.
-fn detect_arch(elf: &[u8]) -> Option<Arch> {
-    const EM_X86_64: u16 = 62;
-    const EM_AARCH64: u16 = 183;
-    match u16::from_le_bytes([*elf.get(18)?, *elf.get(19)?]) {
-        EM_AARCH64 => Some(Arch::Aarch64),
-        EM_X86_64 => Some(Arch::X86_64),
-        _ => None,
     }
 }
 
