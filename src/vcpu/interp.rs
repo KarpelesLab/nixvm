@@ -157,6 +157,68 @@ struct Aarch64Interp {
     /// `PSTATE.DIT` (data-independent timing; FEAT_DIT). Only stored — this
     /// interpreter's timing doesn't depend on data either way.
     dit: bool,
+    /// Decoded-fetch cache: copies of recently executed code pages.
+    fetch: FetchCache,
+}
+
+/// A tiny direct-mapped cache of guest code pages, so instruction fetch is an
+/// array index instead of a page-table walk per instruction. Coherent by
+/// construction: every store this vcpu performs goes through `note_store`,
+/// which drops a cached copy of the page it writes; `ISB`/`IC IVAU` drop
+/// everything; and each `run()` starts empty, since the kernel or another
+/// vcpu may have remapped or modified memory in between.
+#[derive(Clone)]
+struct FetchCache {
+    tags: [u64; FETCH_WAYS],
+    pages: Box<[[u8; 4096]]>,
+}
+
+const FETCH_WAYS: usize = 16;
+/// Tag of an empty cache way (no page is aligned like this).
+const NO_PAGE: u64 = 1;
+
+impl FetchCache {
+    fn new() -> Self {
+        FetchCache {
+            tags: [NO_PAGE; FETCH_WAYS],
+            pages: vec![[0; 4096]; FETCH_WAYS].into_boxed_slice(),
+        }
+    }
+    #[inline]
+    fn way(page: u64) -> usize {
+        ((page >> 12) as usize) % FETCH_WAYS
+    }
+    fn clear(&mut self) {
+        self.tags = [NO_PAGE; FETCH_WAYS];
+    }
+    /// Drop any cached copy of the pages `[addr, addr + nbytes)` touches.
+    #[inline]
+    fn invalidate(&mut self, addr: u64, nbytes: usize) {
+        let first = addr & !0xfff;
+        let last = addr.wrapping_add(nbytes as u64 - 1) & !0xfff;
+        for p in [first, last] {
+            let w = Self::way(p);
+            if self.tags[w] == p {
+                self.tags[w] = NO_PAGE;
+            }
+        }
+    }
+    /// The instruction at `pc` (4-byte aligned), filling its page on a miss.
+    #[inline]
+    fn fetch(&mut self, pc: u64, mem: &GuestMemory) -> Option<u32> {
+        let page = pc & !0xfff;
+        let w = Self::way(page);
+        if self.tags[w] != page {
+            if mem.read(page, &mut self.pages[w]).is_err() {
+                // An unreadable page: fault (or fetch just this word).
+                return mem.read_u32(pc).ok();
+            }
+            self.tags[w] = page;
+        }
+        let off = (pc & 0xfff) as usize;
+        let b = &self.pages[w][off..off + 4];
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
 }
 
 impl Aarch64Interp {
@@ -177,6 +239,7 @@ impl Aarch64Interp {
             excl_monitor: false,
             excl_addr: 0,
             dit: false,
+            fetch: FetchCache::new(),
         }
     }
 
@@ -219,6 +282,7 @@ impl Aarch64Interp {
     #[inline]
     fn note_store(&mut self, addr: u64, value: u128, nbytes: usize) {
         self.excl_monitor = false;
+        self.fetch.invalidate(addr, nbytes);
         if let Some(w) = self.watch
             && w >= addr
             && w < addr + nbytes as u64
@@ -230,12 +294,12 @@ impl Aarch64Interp {
         }
     }
 
-    /// Instruction-fetch invalidation hook (`ISB`, `IC IVAU`). The
-    /// interpreter fetches every instruction from guest memory, so there is
-    /// no cached copy to drop.
+    /// Instruction-fetch invalidation (`ISB`, `IC IVAU`): drop every cached
+    /// code page.
     #[inline]
-    #[allow(clippy::unused_self)]
-    fn invalidate_fetch(&mut self) {}
+    fn invalidate_fetch(&mut self) {
+        self.fetch.clear();
+    }
 
     #[inline]
     fn cond_holds(&self, cond: u32) -> bool {
@@ -278,13 +342,21 @@ impl Vcpu for Aarch64Interp {
         // Entering from the kernel is an exception return: the local
         // exclusive monitor is cleared.
         self.excl_monitor = false;
+        // Memory may have changed while the kernel (or another vcpu) ran.
+        self.fetch.clear();
         for i in 0..MAX_STEPS {
             // The embedder's yield deadline (`Kernel::pump_for`), polled every
             // 4096 instructions: a clock read per instruction would dominate.
             if i & 4095 == 4095 && super::yield_due() {
                 return Ok(Exit::Interrupted);
             }
-            let Ok(instr) = mem.read_u32(self.pc) else {
+            // A misaligned PC is a PC alignment fault (SIGBUS on Linux).
+            let fetched = if self.pc & 3 == 0 {
+                self.fetch.fetch(self.pc, mem)
+            } else {
+                None
+            };
+            let Some(instr) = fetched else {
                 return Ok(Exit::MemFault {
                     addr: self.pc,
                     write: false,
