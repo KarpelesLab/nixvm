@@ -160,7 +160,12 @@ impl Vm {
             .ok_or_else(|| format!("{path} not found in the root image"))?;
         let arch = detect_arch(&elf).ok_or("unrecognized ELF machine type")?;
 
-        let mut mem = GuestMemory::new(GUEST_BASE, round_up_page(mem_bytes));
+        // A large virtual extent over a `mem_bytes` physical pool: runtimes
+        // reserve far more address space than they touch (Go's page-summary
+        // and arena reservations need ~1 GiB, JS engines tens of GiB), and
+        // only touched pages take a frame.
+        let mem_bytes = round_up_page(mem_bytes);
+        let mut mem = GuestMemory::new_split(GUEST_BASE, GUEST_VSIZE.max(mem_bytes), mem_bytes);
         let spec = ProcessSpec {
             argv,
             envp: default_env(),
@@ -396,6 +401,10 @@ fn default_env() -> Vec<String> {
         "HOSTNAME=nixvm".to_string(),
     ]
 }
+
+/// Virtual extent of a [`Vm`]'s address space (see `sandbox::GUEST_VSIZE`):
+/// costs ~4 bytes of per-page metadata per 4 KiB page (32 MiB), not RAM.
+const GUEST_VSIZE: u64 = 32 << 30;
 
 fn round_up_page(v: u64) -> u64 {
     v.div_ceil(PAGE_SIZE) * PAGE_SIZE
