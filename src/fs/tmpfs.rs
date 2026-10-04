@@ -1,9 +1,16 @@
 //! In-memory read-write filesystem.
 //!
 //! Backs `/tmp` and serves as the writable upper layer of the copy-on-write
-//! overlay (Phase 4). Paths are stored flat in a `BTreeMap` keyed by the
+//! overlay (Phase 4). The namespace is stored flat in a `BTreeMap` keyed by the
 //! mount-relative path (`""` is the backend root, then `"a"`, `"a/b"`, …); this
 //! keeps `readdir` (children of a directory) and subtree `rename` simple.
+//!
+//! Regular files are *inodes*: a path entry names a file by inode number and
+//! the data, mode, owner, timestamps and xattrs live in [`TmpFs::files`], so
+//! several names can share one file — real hard links (`link(2)`), with
+//! `st_nlink` counting the names and the file freed when the last name goes.
+//! (`git clone` of a local repository verifies that its hard-linked objects
+//! report the source's inode; a copy-on-"link" fails that check.)
 
 use std::collections::BTreeMap;
 use std::io;
@@ -18,9 +25,9 @@ const S_IFIFO: u32 = 0o010_000;
 
 /// Per-node metadata common to every node kind: identity, owner, the
 /// access/modification timestamps `utimensat`/`chown` mutate, and the node's
-/// extended attributes. Living in the node, the attributes follow it through a
-/// `rename` and vanish with it on `unlink` — the inode semantics a path-keyed
-/// side table would get wrong.
+/// extended attributes. Living with the node (or, for a regular file, its
+/// inode), the attributes follow it through a `rename` and vanish with it —
+/// the inode semantics a path-keyed side table would get wrong.
 #[derive(Debug)]
 struct Meta {
     inode: u64,
@@ -31,15 +38,24 @@ struct Meta {
     xattrs: BTreeMap<String, Vec<u8>>,
 }
 
+/// A regular file's inode: shared by every name hard-linked to it.
+#[derive(Debug)]
+struct FileData {
+    meta: Meta,
+    data: Vec<u8>,
+    mode: u32,
+    /// How many path entries name this inode (`st_nlink`).
+    links: u32,
+}
+
 #[derive(Debug)]
 enum Node {
     Dir {
         meta: Meta,
     },
+    /// A regular file: its inode in [`TmpFs::files`].
     File {
-        meta: Meta,
-        data: Vec<u8>,
-        mode: u32,
+        ino: u64,
     },
     Fifo {
         meta: Meta,
@@ -51,33 +67,11 @@ enum Node {
     },
 }
 
-impl Node {
-    fn meta(&self) -> &Meta {
-        match self {
-            Node::Dir { meta }
-            | Node::File { meta, .. }
-            | Node::Fifo { meta, .. }
-            | Node::Symlink { meta, .. } => meta,
-        }
-    }
-
-    fn meta_mut(&mut self) -> &mut Meta {
-        match self {
-            Node::Dir { meta }
-            | Node::File { meta, .. }
-            | Node::Fifo { meta, .. }
-            | Node::Symlink { meta, .. } => meta,
-        }
-    }
-
-    fn inode(&self) -> u64 {
-        self.meta().inode
-    }
-}
-
 #[derive(Debug)]
 pub struct TmpFs {
     nodes: BTreeMap<String, Node>,
+    /// Regular-file inodes by inode number.
+    files: BTreeMap<u64, FileData>,
     next_inode: u64,
 }
 
@@ -106,6 +100,7 @@ impl TmpFs {
         );
         Self {
             nodes,
+            files: BTreeMap::new(),
             next_inode: 2,
         }
     }
@@ -126,6 +121,58 @@ impl TmpFs {
             atime: now,
             mtime: now,
             xattrs: BTreeMap::new(),
+        }
+    }
+
+    /// Create a fresh regular-file inode with one link and return its number.
+    fn new_file(&mut self, mode: u32) -> u64 {
+        let meta = self.new_meta();
+        let ino = meta.inode;
+        self.files.insert(
+            ino,
+            FileData {
+                meta,
+                data: Vec::new(),
+                mode,
+                links: 1,
+            },
+        );
+        ino
+    }
+
+    /// The metadata of the node at `rel` (a regular file's lives in its inode).
+    fn meta_of(&self, rel: &str) -> Option<&Meta> {
+        match self.nodes.get(rel)? {
+            Node::Dir { meta } | Node::Fifo { meta, .. } | Node::Symlink { meta, .. } => Some(meta),
+            Node::File { ino } => self.files.get(ino).map(|f| &f.meta),
+        }
+    }
+
+    fn meta_of_mut(&mut self, rel: &str) -> Option<&mut Meta> {
+        match self.nodes.get_mut(rel)? {
+            Node::Dir { meta } | Node::Fifo { meta, .. } | Node::Symlink { meta, .. } => Some(meta),
+            Node::File { ino } => self.files.get_mut(ino).map(|f| &mut f.meta),
+        }
+    }
+
+    /// The regular file named `rel`, if it is one.
+    fn file_mut(&mut self, rel: &str) -> Option<&mut FileData> {
+        match self.nodes.get(rel)? {
+            Node::File { ino } => self.files.get_mut(ino),
+            _ => None,
+        }
+    }
+
+    /// Drop the path entry `rel`, releasing a regular file's inode when it was
+    /// the last name.
+    fn remove_entry(&mut self, rel: &str) {
+        if let Some(Node::File { ino }) = self.nodes.remove(rel)
+            && let Some(f) = self.files.get_mut(&ino)
+        {
+            f.links -= 1;
+            if f.links == 0 {
+                self.files.remove(&ino);
+            }
         }
     }
 
@@ -182,6 +229,9 @@ impl TmpFs {
 fn enoent() -> io::Error {
     io::Error::from_raw_os_error(2)
 }
+fn eperm() -> io::Error {
+    io::Error::from_raw_os_error(1)
+}
 fn eexist() -> io::Error {
     io::Error::from_raw_os_error(17)
 }
@@ -214,44 +264,48 @@ impl MountFs for TmpFs {
 
     fn stat(&mut self, rel: &str) -> Option<Attrs> {
         let node = self.nodes.get(rel)?;
-        let (kind, mode, size) = match node {
-            Node::Dir { .. } => (NodeKind::Dir, S_IFDIR | 0o755, 0),
-            Node::File { data, mode, .. } => {
-                (NodeKind::File, S_IFREG | (mode & 0o777), data.len() as u64)
+        let (kind, mode, size, nlink) = match node {
+            Node::Dir { .. } => {
+                // Directory hard-link count: "." plus ".." plus one ".." per
+                // immediate subdirectory (the standard Unix accounting).
+                let subdirs = self
+                    .nodes
+                    .iter()
+                    .filter(|(k, n)| {
+                        Self::parent_of(k) == rel && !k.is_empty() && matches!(n, Node::Dir { .. })
+                    })
+                    .count();
+                (
+                    NodeKind::Dir,
+                    S_IFDIR | 0o755,
+                    0,
+                    2 + u32::try_from(subdirs).unwrap_or(u32::MAX),
+                )
             }
-            Node::Fifo { mode, .. } => (NodeKind::Fifo, S_IFIFO | (mode & 0o777), 0),
+            Node::File { ino } => {
+                let f = self.files.get(ino)?;
+                (
+                    NodeKind::File,
+                    S_IFREG | (f.mode & 0o7777),
+                    f.data.len() as u64,
+                    f.links,
+                )
+            }
+            Node::Fifo { mode, .. } => (NodeKind::Fifo, S_IFIFO | (mode & 0o777), 0, 1),
             Node::Symlink { target, .. } => {
-                (NodeKind::Symlink, S_IFLNK | 0o777, target.len() as u64)
+                (NodeKind::Symlink, S_IFLNK | 0o777, target.len() as u64, 1)
             }
         };
-        let meta = node.meta();
-        let (uid, gid, atime, mtime) = (meta.uid, meta.gid, meta.atime, meta.mtime);
-        let inode = node.inode();
-        // Directory hard-link count: "." plus ".." plus one ".." per
-        // immediate subdirectory (the standard Unix accounting); files and
-        // symlinks in this backend are never hard-linked, so always 1.
-        let nlink = if kind == NodeKind::Dir {
-            let subdirs = self
-                .nodes
-                .keys()
-                .filter(|k| {
-                    Self::parent_of(k) == rel
-                        && matches!(self.nodes.get(k.as_str()), Some(Node::Dir { .. }))
-                })
-                .count();
-            2 + u32::try_from(subdirs).unwrap_or(u32::MAX)
-        } else {
-            1
-        };
+        let meta = self.meta_of(rel)?;
         Some(Attrs {
             kind,
             size,
             mode,
-            uid,
-            gid,
-            atime,
-            mtime,
-            inode,
+            uid: meta.uid,
+            gid: meta.gid,
+            atime: meta.atime,
+            mtime: meta.mtime,
+            inode: meta.inode,
             nlink,
             rdev: 0,
         })
@@ -259,7 +313,8 @@ impl MountFs for TmpFs {
 
     fn read_at(&mut self, rel: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {
         match self.nodes.get(rel) {
-            Some(Node::File { data, .. }) => {
+            Some(Node::File { ino }) => {
+                let data = &self.files.get(ino).ok_or_else(enoent)?.data;
                 let off = off as usize;
                 if off >= data.len() {
                     return Ok(0);
@@ -284,30 +339,31 @@ impl MountFs for TmpFs {
             if path.is_empty() || Self::parent_of(path) != rel {
                 continue;
             }
-            let kind = match node {
-                Node::Dir { .. } => NodeKind::Dir,
-                Node::File { .. } => NodeKind::File,
-                Node::Fifo { .. } => NodeKind::Fifo,
-                Node::Symlink { .. } => NodeKind::Symlink,
+            let (kind, inode) = match node {
+                Node::Dir { meta } => (NodeKind::Dir, meta.inode),
+                Node::File { ino } => (NodeKind::File, *ino),
+                Node::Fifo { meta, .. } => (NodeKind::Fifo, meta.inode),
+                Node::Symlink { meta, .. } => (NodeKind::Symlink, meta.inode),
             };
             out.push(DirEntry {
                 name: Self::base_name(path).to_string(),
                 kind,
-                inode: node.inode(),
+                inode,
             });
         }
         Ok(out)
     }
 
     fn write_at(&mut self, rel: &str, off: u64, buf: &[u8]) -> io::Result<usize> {
-        match self.nodes.get_mut(rel) {
-            Some(Node::File { data, meta, .. }) => {
+        match self.nodes.get(rel) {
+            Some(Node::File { .. }) => {
+                let f = self.file_mut(rel).ok_or_else(enoent)?;
                 let end = off as usize + buf.len();
-                if data.len() < end {
-                    data.resize(end, 0);
+                if f.data.len() < end {
+                    f.data.resize(end, 0);
                 }
-                data[off as usize..end].copy_from_slice(buf);
-                meta.mtime = now_ts();
+                f.data[off as usize..end].copy_from_slice(buf);
+                f.meta.mtime = now_ts();
                 Ok(buf.len())
             }
             Some(_) => Err(eisdir()),
@@ -320,15 +376,8 @@ impl MountFs for TmpFs {
         if self.nodes.contains_key(rel) {
             return Err(eexist());
         }
-        let meta = self.new_meta();
-        self.nodes.insert(
-            rel.to_string(),
-            Node::File {
-                meta,
-                data: Vec::new(),
-                mode,
-            },
-        );
+        let ino = self.new_file(mode);
+        self.nodes.insert(rel.to_string(), Node::File { ino });
         Ok(())
     }
 
@@ -347,26 +396,24 @@ impl MountFs for TmpFs {
         // backend. A type of 0 means a regular file (mknod(2) semantics);
         // device/socket nodes report EPERM, matching an unprivileged mknod.
         let typ = mode & 0o170_000;
-        let node_kind = match typ {
-            0 | S_IFREG => false,                             // regular file
-            S_IFIFO => true,                                  // fifo
-            _ => return Err(io::Error::from_raw_os_error(1)), // EPERM
+        let is_fifo = match typ {
+            0 | S_IFREG => false,
+            S_IFIFO => true,
+            _ => return Err(eperm()),
         };
         self.require_parent(rel)?;
         if self.nodes.contains_key(rel) {
             return Err(eexist());
         }
-        let meta = self.new_meta();
-        let node = if node_kind {
+        let node = if is_fifo {
+            let meta = self.new_meta();
             Node::Fifo {
                 meta,
                 mode: mode & 0o7777,
             }
         } else {
             Node::File {
-                meta,
-                data: Vec::new(),
-                mode: mode & 0o7777,
+                ino: self.new_file(mode & 0o7777),
             }
         };
         self.nodes.insert(rel.to_string(), node);
@@ -378,7 +425,7 @@ impl MountFs for TmpFs {
         match self.nodes.get(rel) {
             Some(Node::Dir { .. }) => Err(eisdir()),
             Some(_) => {
-                self.nodes.remove(rel);
+                self.remove_entry(rel);
                 Ok(())
             }
             None => Err(enoent()),
@@ -404,10 +451,11 @@ impl MountFs for TmpFs {
     }
 
     fn truncate(&mut self, rel: &str, len: u64) -> io::Result<()> {
-        match self.nodes.get_mut(rel) {
-            Some(Node::File { data, meta, .. }) => {
-                data.resize(len as usize, 0);
-                meta.mtime = now_ts();
+        match self.nodes.get(rel) {
+            Some(Node::File { .. }) => {
+                let f = self.file_mut(rel).ok_or_else(enoent)?;
+                f.data.resize(len as usize, 0);
+                f.meta.mtime = now_ts();
                 Ok(())
             }
             Some(Node::Dir { .. }) => Err(eisdir()),
@@ -419,7 +467,14 @@ impl MountFs for TmpFs {
     fn set_mode(&mut self, rel: &str, mode: u32) -> io::Result<()> {
         match self.nodes.get_mut(rel) {
             // Files and fifos store their mode; dirs/symlinks don't model one.
-            Some(Node::File { mode: m, .. } | Node::Fifo { mode: m, .. }) => {
+            Some(Node::File { ino }) => {
+                let ino = *ino;
+                if let Some(f) = self.files.get_mut(&ino) {
+                    f.mode = (f.mode & !0o7777) | (mode & 0o7777);
+                }
+                Ok(())
+            }
+            Some(Node::Fifo { mode: m, .. }) => {
                 *m = (*m & !0o7777) | (mode & 0o7777);
                 Ok(())
             }
@@ -435,58 +490,42 @@ impl MountFs for TmpFs {
             SetTime::Now => *slot = now,
             SetTime::Set { sec, .. } => *slot = sec,
         };
-        match self.nodes.get_mut(rel) {
-            Some(node) => {
-                let meta = node.meta_mut();
-                apply(&mut meta.atime, atime);
-                apply(&mut meta.mtime, mtime);
-                Ok(())
-            }
-            None => Err(enoent()),
-        }
+        let meta = self.meta_of_mut(rel).ok_or_else(enoent)?;
+        apply(&mut meta.atime, atime);
+        apply(&mut meta.mtime, mtime);
+        Ok(())
     }
 
     fn set_owner(&mut self, rel: &str, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
-        match self.nodes.get_mut(rel) {
-            Some(node) => {
-                let meta = node.meta_mut();
-                if let Some(u) = uid {
-                    meta.uid = u;
-                }
-                if let Some(g) = gid {
-                    meta.gid = g;
-                }
-                Ok(())
-            }
-            None => Err(enoent()),
+        let meta = self.meta_of_mut(rel).ok_or_else(enoent)?;
+        if let Some(u) = uid {
+            meta.uid = u;
         }
+        if let Some(g) = gid {
+            meta.gid = g;
+        }
+        Ok(())
     }
 
     fn getxattr(&mut self, rel: &str, name: &str) -> io::Result<Vec<u8>> {
-        let node = self.nodes.get(rel).ok_or_else(enoent)?;
-        node.meta().xattrs.get(name).cloned().ok_or_else(enodata)
+        let meta = self.meta_of(rel).ok_or_else(enoent)?;
+        meta.xattrs.get(name).cloned().ok_or_else(enodata)
     }
 
     fn setxattr(&mut self, rel: &str, name: &str, value: &[u8]) -> io::Result<()> {
-        let node = self.nodes.get_mut(rel).ok_or_else(enoent)?;
-        node.meta_mut()
-            .xattrs
-            .insert(name.to_string(), value.to_vec());
+        let meta = self.meta_of_mut(rel).ok_or_else(enoent)?;
+        meta.xattrs.insert(name.to_string(), value.to_vec());
         Ok(())
     }
 
     fn listxattr(&mut self, rel: &str) -> io::Result<Vec<String>> {
-        let node = self.nodes.get(rel).ok_or_else(enoent)?;
-        Ok(node.meta().xattrs.keys().cloned().collect())
+        let meta = self.meta_of(rel).ok_or_else(enoent)?;
+        Ok(meta.xattrs.keys().cloned().collect())
     }
 
     fn removexattr(&mut self, rel: &str, name: &str) -> io::Result<()> {
-        let node = self.nodes.get_mut(rel).ok_or_else(enoent)?;
-        node.meta_mut()
-            .xattrs
-            .remove(name)
-            .map(drop)
-            .ok_or_else(enodata)
+        let meta = self.meta_of_mut(rel).ok_or_else(enoent)?;
+        meta.xattrs.remove(name).map(drop).ok_or_else(enodata)
     }
 
     fn symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {
@@ -513,6 +552,27 @@ impl MountFs for TmpFs {
         }
     }
 
+    /// A real hard link: `new_rel` names the same inode as `old_rel`. Only
+    /// regular files are inodes here; a directory is `EPERM` (as on Linux),
+    /// and a FIFO or symlink is `EOPNOTSUPP` (the kernel then recreates it).
+    fn link(&mut self, old_rel: &str, new_rel: &str) -> io::Result<()> {
+        let ino = match self.nodes.get(old_rel) {
+            Some(Node::File { ino }) => *ino,
+            Some(Node::Dir { .. }) => return Err(eperm()),
+            Some(_) => return Err(io::Error::from_raw_os_error(95)), // EOPNOTSUPP
+            None => return Err(enoent()),
+        };
+        self.require_parent(new_rel)?;
+        if self.nodes.contains_key(new_rel) {
+            return Err(eexist());
+        }
+        if let Some(f) = self.files.get_mut(&ino) {
+            f.links += 1;
+        }
+        self.nodes.insert(new_rel.to_string(), Node::File { ino });
+        Ok(())
+    }
+
     fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
         if from == to {
             return if self.nodes.contains_key(from) {
@@ -526,6 +586,14 @@ impl MountFs for TmpFs {
             Some(_) => false,
             None => return Err(enoent()),
         };
+        // Renaming one name of a file onto another name of the same file is
+        // a successful no-op (POSIX), leaving both names.
+        if let (Some(Node::File { ino: a }), Some(Node::File { ino: b })) =
+            (self.nodes.get(from), self.nodes.get(to))
+            && a == b
+        {
+            return Ok(());
+        }
         // Refuse to move a directory into itself or one of its own
         // descendants (mirrors Linux `rename(2)`'s EINVAL).
         if from_is_dir && (to == from || to.starts_with(&format!("{from}/"))) {
@@ -547,7 +615,7 @@ impl MountFs for TmpFs {
                 // File/symlink onto an existing file/symlink: replaces it.
                 (false, _) => {}
             }
-            self.nodes.remove(to);
+            self.remove_entry(to);
         }
         // Move the node itself and, for a directory, every descendant, by
         // rewriting the path prefix.
@@ -805,5 +873,36 @@ mod tests {
         fs.mkdir("d/sub2", 0o755).unwrap();
         fs.create("d/file", 0o644).unwrap();
         assert_eq!(fs.stat("d").unwrap().nlink, 4);
+    }
+
+    #[test]
+    fn hard_links_share_one_inode() {
+        let mut fs = TmpFs::new();
+        fs.create("a", 0o644).unwrap();
+        fs.write_at("a", 0, b"one").unwrap();
+        fs.link("a", "b").unwrap();
+        let (sa, sb) = (fs.stat("a").unwrap(), fs.stat("b").unwrap());
+        assert_eq!(sa.inode, sb.inode);
+        assert_eq!((sa.nlink, sb.nlink), (2, 2));
+        // A write through one name shows through the other.
+        fs.write_at("b", 0, b"TWO").unwrap();
+        let mut buf = [0u8; 3];
+        fs.read_at("a", 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"TWO");
+        // Unlinking one name keeps the file under the other.
+        fs.unlink("a").unwrap();
+        assert_eq!(fs.stat("b").unwrap().nlink, 1);
+        // Renaming a name onto another name of the same file is a no-op.
+        fs.link("b", "c").unwrap();
+        fs.rename("b", "c").unwrap();
+        assert!(fs.stat("b").is_some() && fs.stat("c").is_some());
+        // Linking a directory is EPERM; over an existing name, EEXIST.
+        fs.mkdir("d", 0o755).unwrap();
+        assert_eq!(fs.link("d", "e").unwrap_err().raw_os_error(), Some(1));
+        assert_eq!(fs.link("b", "c").unwrap_err().raw_os_error(), Some(17));
+        // The inode goes with its last name.
+        fs.unlink("b").unwrap();
+        fs.unlink("c").unwrap();
+        assert!(fs.files.is_empty());
     }
 }

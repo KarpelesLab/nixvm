@@ -392,6 +392,24 @@ impl MountFs for Overlay {
         self.upper.symlink(target, linkpath)
     }
 
+    /// A hard link: the source is copied up (if it lives only in the lower
+    /// layer) and linked within the upper layer, so both names share one
+    /// upper inode.
+    fn link(&mut self, old_rel: &str, new_rel: &str) -> io::Result<()> {
+        match self.stat(old_rel) {
+            None => return Err(enoent()),
+            Some(a) if a.kind == NodeKind::Dir => return Err(io::Error::from_raw_os_error(1)),
+            Some(_) => {}
+        }
+        if self.stat(new_rel).is_some() {
+            return Err(eexist());
+        }
+        self.copy_up(old_rel)?;
+        self.whiteouts.remove(new_rel);
+        self.ensure_dir_in_upper(parent_of(new_rel));
+        self.upper.link(old_rel, new_rel)
+    }
+
     fn readlink(&mut self, rel: &str) -> io::Result<String> {
         if self.is_whited(rel) {
             return Err(enoent());

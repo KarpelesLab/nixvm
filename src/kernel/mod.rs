@@ -6138,13 +6138,28 @@ impl Kernel {
         oldp: u64,
         newdirfd: i64,
         newp: u64,
-        _flags: u64,
+        flags: u64,
         mem: &GuestMemory,
     ) -> i64 {
+        const AT_SYMLINK_FOLLOW: u64 = 0x400;
+        const AT_EMPTY_PATH: u64 = 0x1000;
+        if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+            return err(Errno::EINVAL);
+        }
         let (Some(orel), Some(nrel)) = (read_path(mem, oldp), read_path(mem, newp)) else {
             return err(Errno::EFAULT);
         };
-        let old_abs = self.resolve_path(cx, olddirfd, &orel);
+        if orel.is_empty() && flags & AT_EMPTY_PATH == 0 {
+            return err(Errno::ENOENT);
+        }
+        let mut old_abs = self.resolve_path(cx, olddirfd, &orel);
+        // AT_SYMLINK_FOLLOW links the symlink's target instead of the link.
+        if flags & AT_SYMLINK_FOLLOW != 0 {
+            old_abs = match self.follow_or_eloop(vfs, &old_abs) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+        }
         let new_abs = self.resolve_path(cx, newdirfd, &nrel);
         // Naming an unnamed (O_TMPFILE) or unlinked file moves it into place.
         if let Some(r) = self.link_orphan(vfs, cx, &old_abs, &new_abs) {
@@ -6156,17 +6171,35 @@ impl Kernel {
         if attrs.kind == NodeKind::Dir {
             return err(Errno::EPERM); // can't hard-link a directory
         }
-        // Make a real hard link where the backend supports it (host-backed
-        // mounts): st_nlink, the shared inode, and write-through then behave.
-        // EOPNOTSUPP means the backend has no inodes to share (path-keyed
-        // tmpfs/overlay) or the paths cross mounts — fall back to a copy, the
-        // historical behavior; any other error (EEXIST/EACCES/…) is real.
+        if vfs.stat(&new_abs).is_some() {
+            return err(Errno::EEXIST);
+        }
+        // Make a real hard link (tmpfs, the overlay's upper layer, host-backed
+        // mounts): one inode, st_nlink, shared writes. EOPNOTSUPP means the
+        // backend can't (a read-only image, a FIFO/symlink in tmpfs);
+        // crossing mounts is EXDEV, as on Linux. Any other error is real.
         match vfs.link(&old_abs, &new_abs) {
             Ok(()) => return 0,
-            Err(e) if e.raw_os_error() == Some(95) => {} // EOPNOTSUPP: copy below
+            Err(e) if e.raw_os_error() == Some(95) => {} // EOPNOTSUPP: recreate below
             Err(e) => return io_errno(&e),
         }
-        // Read the whole source, create the target, copy.
+        // No inode to share: recreate the node under the new name — a
+        // symlink as a symlink, a FIFO as a FIFO, a file as a copy.
+        if attrs.kind == NodeKind::Symlink {
+            return match vfs
+                .readlink(&old_abs)
+                .and_then(|t| vfs.symlink(&t, &new_abs))
+            {
+                Ok(()) => 0,
+                Err(e) => io_errno(&e),
+            };
+        }
+        if attrs.kind == NodeKind::Fifo {
+            return match vfs.mknod(&new_abs, attrs.mode) {
+                Ok(()) => 0,
+                Err(e) => io_errno(&e),
+            };
+        }
         let mut data = vec![0u8; attrs.size as usize];
         if vfs.read_at(&old_abs, 0, &mut data).is_err() {
             return err(Errno::EIO);
@@ -6529,6 +6562,9 @@ impl Kernel {
         const FIONCLEX: u32 = 0x5450;
         const FIOASYNC: u32 = 0x5452;
         const FIGETBSZ: u32 = 2;
+        const FICLONE: u32 = 0x4004_9409;
+        const FICLONERANGE: u32 = 0x4020_940d;
+        const FIDEDUPERANGE: u32 = 0xc018_9436;
         const FIOQSIZE: u32 = 0x5460;
         const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
         const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
@@ -6587,6 +6623,10 @@ impl Kernel {
             // `FIOASYNC` (signal-driven I/O): accepted, but no `SIGIO` is ever
             // sent — callers (nginx's master/worker channel) also poll the fd.
             FIOASYNC => 0,
+            // Reflinks/dedupe (FICLONE, FICLONERANGE, FIDEDUPERANGE): no
+            // backend shares extents — EOPNOTSUPP, which `cp --reflink=auto`
+            // and friends fall back from to a plain copy.
+            FICLONE | FICLONERANGE | FIDEDUPERANGE => err(Errno::EOPNOTSUPP),
             // File-only queries: FIGETBSZ (block size), FIOQSIZE (size), and
             // the ext2-style attribute ioctls `lsattr`/`chattr`/`cp -a` use:
             // no attribute flags are set and none can be (EOPNOTSUPP, as

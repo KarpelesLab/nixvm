@@ -369,7 +369,7 @@ impl MountTable {
         let old_idx = self.best_mount(&old).ok_or_else(enoent)?;
         let new_idx = self.best_mount(&new).ok_or_else(enoent)?;
         if old_idx != new_idx {
-            return Err(io::Error::from_raw_os_error(95)); // EOPNOTSUPP → caller copies
+            return Err(io::Error::from_raw_os_error(18)); // EXDEV, as Linux
         }
         let point = self.mounts[old_idx].point.clone();
         let old_rel = relative_to(&old, &point);
