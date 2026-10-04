@@ -15,6 +15,12 @@
 //! allocates entries under them yet — except `/dev/net`, which holds
 //! `/dev/net/tun`.
 //!
+//! `/dev/shm` is the exception to "empty": it is a real writable tmpfs (as on
+//! every Linux system), delegated to an embedded [`TmpFs`] — POSIX shared
+//! memory (`shm_open`) and named semaphores (`sem_open`, which musl and glibc
+//! both implement as files in `/dev/shm`) need it, and with it Python's
+//! `multiprocessing` locks, queues and `shared_memory`.
+//!
 //! The set of nodes is fixed, so there is no path map: `stat`/`read_at`/
 //! `write_at` dispatch on the mount-relative name directly (the one nested
 //! path, `net/tun`, is matched as a literal string like everything else). The
@@ -23,7 +29,7 @@
 
 use std::io;
 
-use super::{Attrs, DirEntry, MountFs, NodeKind};
+use super::{Attrs, DirEntry, MountFs, NodeKind, SetTime, TmpFs};
 
 /// Unix mode type bit for a character device.
 const S_IFCHR: u32 = 0o020_000;
@@ -124,6 +130,8 @@ pub struct DevFs {
     /// xorshift64 state for `/dev/random` and `/dev/urandom`. `0` means
     /// "not yet seeded"; seeding happens lazily on first use.
     rng: u64,
+    /// The writable tmpfs behind `/dev/shm`.
+    shm: TmpFs,
 }
 
 impl Default for DevFs {
@@ -135,7 +143,20 @@ impl Default for DevFs {
 impl DevFs {
     #[must_use]
     pub fn new() -> Self {
-        Self { rng: 0 }
+        Self {
+            rng: 0,
+            shm: TmpFs::new(),
+        }
+    }
+
+    /// The path inside the `/dev/shm` tmpfs for a mount-relative `rel`
+    /// (`""` for the `shm` directory itself), or `None` outside it.
+    fn shm_rel(rel: &str) -> Option<&str> {
+        if rel == "shm" {
+            Some("")
+        } else {
+            rel.strip_prefix("shm/")
+        }
     }
 
     /// Look up a root-level char-device name, returning its `(inode, rdev)`.
@@ -262,6 +283,31 @@ impl DevFs {
     }
 }
 
+/// Tag on `/dev/shm` entries' inodes so they never collide with the fixed
+/// device inodes (both start numbering low).
+const SHM_INODE_TAG: u64 = 1 << 40;
+
+impl DevFs {
+    /// Run a namespace-changing operation inside `/dev/shm` (the only
+    /// writable directory). Anywhere else under `/dev` it is `EROFS` — or
+    /// `EEXIST` for a creation (`creates`) over a fixed node — and the `shm`
+    /// mount point itself can't be created or removed.
+    fn shm_op(
+        &mut self,
+        rel: &str,
+        creates: bool,
+        f: impl FnOnce(&mut TmpFs, &str) -> io::Result<()>,
+    ) -> io::Result<()> {
+        match Self::shm_rel(rel) {
+            Some("") if creates => Err(io::Error::from_raw_os_error(17)), // EEXIST
+            Some("") => Err(io::Error::from_raw_os_error(16)),            // EBUSY: the mount point
+            Some(r) => f(&mut self.shm, r),
+            None if creates && self.stat(rel).is_some() => Err(io::Error::from_raw_os_error(17)),
+            None => Err(io::Error::from_raw_os_error(30)), // EROFS
+        }
+    }
+}
+
 fn enoent() -> io::Error {
     io::Error::from_raw_os_error(2) // ENOENT
 }
@@ -287,6 +333,17 @@ impl MountFs for DevFs {
     }
 
     fn stat(&mut self, rel: &str) -> Option<Attrs> {
+        if let Some(r) = Self::shm_rel(rel) {
+            let mut a = self.shm.stat(r)?;
+            if r.is_empty() {
+                // tmpfs mounted at /dev/shm: world-writable with the sticky bit.
+                a.mode = S_IFDIR | 0o1777;
+                a.inode = 12;
+            } else {
+                a.inode |= SHM_INODE_TAG;
+            }
+            return Some(a);
+        }
         if rel.is_empty() {
             // The `/dev` directory itself.
             return Some(Attrs {
@@ -346,7 +403,10 @@ impl MountFs for DevFs {
         })
     }
 
-    fn read_at(&mut self, rel: &str, _off: u64, buf: &mut [u8]) -> io::Result<usize> {
+    fn read_at(&mut self, rel: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(r) = Self::shm_rel(rel) {
+            return self.shm.read_at(r, off, buf);
+        }
         match rel {
             // Always EOF: no data ever arrives on these control-only nodes.
             "null" | "tty" | "console" | "kmsg" | "ptmx" | "loop-control" | "rtc0" | "hpet"
@@ -372,6 +432,13 @@ impl MountFs for DevFs {
     }
 
     fn readdir(&mut self, rel: &str) -> io::Result<Vec<DirEntry>> {
+        if let Some(r) = Self::shm_rel(rel) {
+            let mut v = self.shm.readdir(r)?;
+            for e in &mut v {
+                e.inode |= SHM_INODE_TAG;
+            }
+            return Ok(v);
+        }
         match rel {
             "" => {
                 let mut out: Vec<DirEntry> = DEVICES
@@ -407,10 +474,9 @@ impl MountFs for DevFs {
                     inode: *inode,
                 })
                 .collect()),
-            // `pts`, `shm`, `mapper`, `disk`, `char`, `block`, `hugepages`
-            // exist and are listable, but nothing populates entries under
-            // them yet.
-            "pts" | "shm" | "mapper" | "disk" | "char" | "block" | "hugepages" => Ok(Vec::new()),
+            // `pts`, `mapper`, `disk`, `char`, `block`, `hugepages` exist and
+            // are listable, but nothing populates entries under them yet.
+            "pts" | "mapper" | "disk" | "char" | "block" | "hugepages" => Ok(Vec::new()),
             _ if Self::lookup(rel).is_some()
                 || Self::block_lookup(rel).is_some()
                 || Self::net_lookup(rel).is_some()
@@ -422,7 +488,10 @@ impl MountFs for DevFs {
         }
     }
 
-    fn write_at(&mut self, rel: &str, _off: u64, buf: &[u8]) -> io::Result<usize> {
+    fn write_at(&mut self, rel: &str, off: u64, buf: &[u8]) -> io::Result<usize> {
+        if let Some(r) = Self::shm_rel(rel) {
+            return self.shm.write_at(r, off, buf);
+        }
         match rel {
             // Discard writes, reporting the whole buffer consumed.
             "null" | "zero" | "random" | "urandom" | "tty" | "console" | "kmsg" | "ptmx"
@@ -438,7 +507,81 @@ impl MountFs for DevFs {
         }
     }
 
+    fn create(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        self.shm_op(rel, true, |fs, r| fs.create(r, mode))
+    }
+    fn mkdir(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        self.shm_op(rel, true, |fs, r| fs.mkdir(r, mode))
+    }
+    fn mknod(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        self.shm_op(rel, true, |fs, r| fs.mknod(r, mode))
+    }
+    fn unlink(&mut self, rel: &str) -> io::Result<()> {
+        self.shm_op(rel, false, MountFs::unlink)
+    }
+    fn rmdir(&mut self, rel: &str) -> io::Result<()> {
+        self.shm_op(rel, false, MountFs::rmdir)
+    }
+    fn truncate(&mut self, rel: &str, len: u64) -> io::Result<()> {
+        self.shm_op(rel, false, |fs, r| fs.truncate(r, len))
+    }
+    fn set_times(&mut self, rel: &str, atime: SetTime, mtime: SetTime) -> io::Result<()> {
+        match Self::shm_rel(rel) {
+            Some(r) => self.shm.set_times(r, atime, mtime),
+            None => Ok(()),
+        }
+    }
+    fn set_owner(&mut self, rel: &str, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+        match Self::shm_rel(rel) {
+            Some(r) => self.shm.set_owner(r, uid, gid),
+            None => Ok(()),
+        }
+    }
+    fn set_mode(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        match Self::shm_rel(rel) {
+            Some(r) => self.shm.set_mode(r, mode),
+            None => Ok(()),
+        }
+    }
+    fn symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {
+        self.shm_op(linkpath, true, |fs, r| fs.symlink(target, r))
+    }
+    fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
+        match (Self::shm_rel(from), Self::shm_rel(to)) {
+            (Some(f), Some(t)) if !f.is_empty() && !t.is_empty() => self.shm.rename(f, t),
+            (Some(_), _) | (_, Some(_)) => Err(io::Error::from_raw_os_error(18)), // EXDEV
+            _ => Err(io::Error::from_raw_os_error(30)),                           // EROFS
+        }
+    }
+    fn getxattr(&mut self, rel: &str, name: &str) -> io::Result<Vec<u8>> {
+        match Self::shm_rel(rel) {
+            Some(r) => self.shm.getxattr(r, name),
+            None => Err(io::Error::from_raw_os_error(95)),
+        }
+    }
+    fn setxattr(&mut self, rel: &str, name: &str, value: &[u8]) -> io::Result<()> {
+        match Self::shm_rel(rel) {
+            Some(r) => self.shm.setxattr(r, name, value),
+            None => Err(io::Error::from_raw_os_error(95)),
+        }
+    }
+    fn listxattr(&mut self, rel: &str) -> io::Result<Vec<String>> {
+        match Self::shm_rel(rel) {
+            Some(r) => self.shm.listxattr(r),
+            None => Ok(Vec::new()),
+        }
+    }
+    fn removexattr(&mut self, rel: &str, name: &str) -> io::Result<()> {
+        match Self::shm_rel(rel) {
+            Some(r) => self.shm.removexattr(r, name),
+            None => Err(io::Error::from_raw_os_error(95)),
+        }
+    }
+
     fn readlink(&mut self, rel: &str) -> io::Result<String> {
+        if let Some(r) = Self::shm_rel(rel) {
+            return self.shm.readlink(r);
+        }
         if let Some((_, target)) = Self::symlink_lookup(rel) {
             return Ok(target.to_string());
         }
@@ -772,5 +915,42 @@ mod tests {
         assert_eq!(fs.readlink("stdin").unwrap(), "/proc/self/fd/0");
         assert_eq!(fs.readlink("stdout").unwrap(), "/proc/self/fd/1");
         assert_eq!(fs.readlink("stderr").unwrap(), "/proc/self/fd/2");
+    }
+
+    #[test]
+    fn dev_shm_is_a_writable_tmpfs() {
+        let mut d = DevFs::new();
+        let st = d.stat("shm").unwrap();
+        assert_eq!(st.mode, S_IFDIR | 0o1777);
+        d.create("shm/sem.x", 0o600).unwrap();
+        assert_eq!(d.write_at("shm/sem.x", 0, b"abc").unwrap(), 3);
+        let mut b = [0u8; 3];
+        assert_eq!(d.read_at("shm/sem.x", 0, &mut b).unwrap(), 3);
+        assert_eq!(&b, b"abc");
+        let names: Vec<_> = d
+            .readdir("shm")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["sem.x".to_string()]);
+        d.rename("shm/sem.x", "shm/y").unwrap();
+        assert!(d.stat("shm/y").unwrap().inode > 1 << 40, "tagged inode");
+        assert_eq!(
+            d.rename("shm/y", "null").unwrap_err().raw_os_error(),
+            Some(18)
+        );
+        d.unlink("shm/y").unwrap();
+        assert!(d.stat("shm/y").is_none());
+        // Elsewhere /dev stays read-only.
+        assert_eq!(
+            d.create("newnode", 0o600).unwrap_err().raw_os_error(),
+            Some(30)
+        );
+        assert_eq!(
+            d.create("null", 0o600).unwrap_err().raw_os_error(),
+            Some(17)
+        );
+        assert_eq!(d.unlink("null").unwrap_err().raw_os_error(), Some(30));
     }
 }
