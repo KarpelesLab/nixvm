@@ -2,7 +2,11 @@
 
 use std::io;
 
-use super::{Attrs, DirEntry, MountFs};
+use super::{Attrs, DirEntry, MountFs, NodeKind};
+
+/// Most symlinks followed while resolving one path's directories (Linux's
+/// `MAXSYMLINKS`).
+const SYMLINK_MAX: usize = 40;
 
 struct Mount {
     /// Absolute mount point, e.g. "/", "/work", "/proc".
@@ -76,7 +80,7 @@ impl MountTable {
     /// and equivalent spellings of a path (`/a/./b`, `/a//b`, `/a/x/../b`)
     /// all resolve to the same `(backend, relative path)` pair.
     fn resolve(&mut self, abs_path: &str) -> Option<(&mut dyn MountFs, String)> {
-        let abs_path = normalize(abs_path);
+        let abs_path = self.canonical(abs_path);
         let i = self.best_mount(&abs_path)?;
         let rel = relative_to(&abs_path, &self.mounts[i].point);
         Some((self.mounts[i].fs.as_mut(), rel))
@@ -85,6 +89,97 @@ impl MountTable {
     pub fn stat(&mut self, abs_path: &str) -> Option<Attrs> {
         let (fs, rel) = self.resolve(abs_path)?;
         fs.stat(&rel)
+    }
+
+    /// `stat` of an already-canonical path, without resolving symlinks.
+    fn stat_raw(&mut self, abs_path: &str) -> Option<Attrs> {
+        let i = self.best_mount(abs_path)?;
+        let rel = relative_to(abs_path, &self.mounts[i].point);
+        self.mounts[i].fs.stat(&rel)
+    }
+
+    /// `abs_path`, normalized, with every symlink among its directories
+    /// followed (the final component is left alone: whether to follow it is
+    /// the caller's choice, e.g. `stat` vs `lstat`). Backends only know their
+    /// own paths, so a link to a directory — possibly on another mount, like
+    /// Alpine's `/var/lib/nginx/logs -> /var/log/nginx` — is resolved here.
+    /// A symlink loop leaves the path as is, for the backend to fail on.
+    fn canonical(&mut self, abs_path: &str) -> String {
+        let path = normalize(abs_path);
+        // Fast path: the parent is a real directory, so no symlink is involved.
+        let parent = match path.rfind('/') {
+            Some(0) | None => return path,
+            Some(i) => &path[..i],
+        };
+        if self
+            .stat_raw(parent)
+            .is_some_and(|a| a.kind == NodeKind::Dir)
+        {
+            return path;
+        }
+        let mut done = String::new();
+        let mut rest: Vec<String> = path
+            .split('/')
+            .rev()
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut hops = 0;
+        while let Some(c) = rest.pop() {
+            if c == "." {
+                continue;
+            }
+            if c == ".." {
+                done.truncate(done.rfind('/').unwrap_or(0));
+                continue;
+            }
+            let cand = format!("{done}/{c}");
+            if rest.is_empty() {
+                done = cand;
+                break;
+            }
+            match self.stat_raw(&cand) {
+                Some(a) if a.kind == NodeKind::Symlink => {
+                    hops += 1;
+                    let Some(target) = (hops <= SYMLINK_MAX)
+                        .then(|| {
+                            let i = self.best_mount(&cand)?;
+                            let rel = relative_to(&cand, &self.mounts[i].point);
+                            self.mounts[i].fs.readlink(&rel).ok()
+                        })
+                        .flatten()
+                    else {
+                        return path;
+                    };
+                    if target.starts_with('/') {
+                        done.clear();
+                    }
+                    rest.extend(
+                        target
+                            .split('/')
+                            .rev()
+                            .filter(|c| !c.is_empty())
+                            .map(str::to_string),
+                    );
+                }
+                // A missing or non-directory component: the rest can't
+                // resolve; let the backend report it.
+                None => {
+                    done = cand;
+                    for c in rest.drain(..).rev() {
+                        done.push('/');
+                        done.push_str(&c);
+                    }
+                    return normalize(&done);
+                }
+                Some(_) => done = cand,
+            }
+        }
+        if done.is_empty() {
+            "/".to_string()
+        } else {
+            done
+        }
     }
 
     /// The mounted procfs backend, if one is mounted, so the kernel can refresh
@@ -186,8 +281,8 @@ impl MountTable {
 
     /// Rename within a single backend. Cross-mount renames return `EXDEV`.
     pub fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
-        let from = normalize(from);
-        let to = normalize(to);
+        let from = self.canonical(from);
+        let to = self.canonical(to);
         let from_idx = self.best_mount(&from).ok_or_else(enoent)?;
         let to_idx = self.best_mount(&to).ok_or_else(enoent)?;
         if from_idx != to_idx {
@@ -205,8 +300,8 @@ impl MountTable {
     /// backend — which either makes a real hard link (host-backed) or itself
     /// reports `EOPNOTSUPP` (path-keyed in-memory backends → copy).
     pub fn link(&mut self, old: &str, new: &str) -> io::Result<()> {
-        let old = normalize(old);
-        let new = normalize(new);
+        let old = self.canonical(old);
+        let new = self.canonical(new);
         let old_idx = self.best_mount(&old).ok_or_else(enoent)?;
         let new_idx = self.best_mount(&new).ok_or_else(enoent)?;
         if old_idx != new_idx {
@@ -412,6 +507,45 @@ mod tests {
         assert_eq!(a, "work:x/y");
         assert_eq!(a, b);
         assert_eq!(b, c);
+    }
+
+    #[test]
+    fn directory_symlinks_resolve_across_mounts() {
+        let mut t = MountTable::new();
+        t.mount("/", Box::new(crate::fs::TmpFs::new()));
+        t.mount("/run", Box::new(crate::fs::TmpFs::new()));
+        for d in [
+            "/var",
+            "/var/log",
+            "/var/log/nginx",
+            "/var/lib",
+            "/var/lib/nginx",
+        ] {
+            t.mkdir(d, 0o755).unwrap();
+        }
+        t.mkdir("/run/nginx", 0o755).unwrap();
+        // Absolute, relative, and cross-mount links to directories.
+        t.symlink("/var/log/nginx", "/var/lib/nginx/logs").unwrap();
+        t.symlink("../log", "/var/lib/oldlog").unwrap();
+        t.symlink("/run/nginx", "/var/lib/nginx/run").unwrap();
+        t.create("/var/lib/nginx/logs/error.log", 0o644).unwrap();
+        assert!(t.stat("/var/log/nginx/error.log").is_some());
+        assert!(t.stat("/var/lib/oldlog/nginx/error.log").is_some());
+        t.create("/var/lib/nginx/run/nginx.pid", 0o644).unwrap();
+        assert!(
+            t.readdir("/run/nginx")
+                .unwrap()
+                .iter()
+                .any(|e| e.name == "nginx.pid")
+        );
+        // The final component itself is not followed.
+        assert_eq!(
+            t.stat("/var/lib/nginx/logs").unwrap().kind,
+            NodeKind::Symlink
+        );
+        // A loop fails instead of hanging.
+        t.symlink("/var/loop", "/var/loop").unwrap();
+        assert!(t.stat("/var/loop/x").is_none());
     }
 
     #[test]

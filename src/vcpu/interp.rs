@@ -136,8 +136,8 @@ struct Aarch64Interp {
     /// waiting for the counter to advance terminates, even though this
     /// interpreter has no wall-clock timer to drive a real one.
     cntvct: u64,
-    /// Modeled `FPCR`/`FPSR`. This interpreter doesn't consult the rounding
-    /// mode or raise FP exception bits, but `MRS`/`MSR` round-trip through
+    /// Modeled `FPCR`/`FPSR`. This interpreter consults the rounding mode
+    /// only for FRINTX/FRINTI and doesn't raise FP exception bits, but `MRS`/`MSR` round-trip through
     /// these so save/restore code (e.g. a signal handler prologue) and
     /// feature-probing code that reads them back see consistent state.
     fpcr: u64,
@@ -302,6 +302,11 @@ impl Aarch64Interp {
         self.v[d] = u128::from(x.to_bits());
     }
     /// Write `x` to `v[d]`, zeroing the upper bits (scalar double-precision).
+    /// The `FPCR.RMode` rounding mode (`ROUND_*`), for FRINTX/FRINTI.
+    fn fpcr_rmode(&self) -> u32 {
+        ((self.fpcr >> 22) & 3) as u32
+    }
+
     fn set_fp64(&mut self, d: usize, x: f64) {
         self.v[d] = u128::from(x.to_bits());
     }
@@ -2079,15 +2084,21 @@ impl Aarch64Interp {
                         _ => return Step::Illegal,
                     }
                 }
-                (3, 0b000 | 0b001) => {
-                    // FCVTZS / FCVTZU: floating-point -> integer, round toward zero.
-                    let signed = opcode == 0b000;
+                (_, 0b000 | 0b001) | (0, 0b100 | 0b101) => {
+                    // FCVT{N,P,M,Z}{S,U} (rmode 0..3) / FCVTA{S,U} (opcode
+                    // 10x): floating-point -> integer, rounded as named.
+                    let signed = opcode & 1 == 0;
                     let x = match ftype {
                         0 => f64::from(self.fp32(rn)),
                         1 => self.fp64(rn),
                         _ => return Step::Illegal,
                     };
-                    self.write_x(rd, fp_to_int(x, signed, sf == 1));
+                    let mode = if opcode & 0b100 != 0 {
+                        ROUND_AWAY
+                    } else {
+                        rmode
+                    };
+                    self.write_x(rd, fp_to_int(round_with(x, mode), signed, sf == 1));
                 }
                 (0, 0b111) => {
                     // GP -> FP: Vd = Rn (32 or 64 bits), upper bits cleared.
@@ -2114,6 +2125,41 @@ impl Aarch64Interp {
                 }
                 (1, 0b110) => self.write_x(rd, (self.v[rn] >> 64) as u64), // Vn.D[1] -> GP
                 _ => return Step::Illegal, // FCVT*/SCVTF/etc: not implemented
+            }
+            return Step::Next;
+        }
+
+        // ---- conversion between FP and fixed-point (GPR side) ----
+        // SCVTF/UCVTF/FCVTZS/FCVTZU with `#fbits` (scale = 64 - fbits).
+        if (instr >> 24) & 0x7f == 0b0011110 && (instr >> 21) & 1 == 0 {
+            let sf = (instr >> 31) & 1 == 1;
+            let ftype = (instr >> 22) & 3;
+            let rmode_op = (instr >> 16) & 0x1f;
+            let scale = (instr >> 10) & 0x3f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            if ftype > 1 || (!sf && scale < 32) {
+                return Step::Illegal;
+            }
+            let k = 2f64.powi(64 - scale as i32); // 2^fbits
+            match rmode_op {
+                0b00_010 | 0b00_011 => {
+                    let x = int_to_f64(self.read_x(rn), rmode_op == 0b00_010, sf) / k;
+                    if ftype == 0 {
+                        self.set_fp32(rd, x as f32);
+                    } else {
+                        self.set_fp64(rd, x);
+                    }
+                }
+                0b11_000 | 0b11_001 => {
+                    let x = if ftype == 0 {
+                        f64::from(self.fp32(rn))
+                    } else {
+                        self.fp64(rn)
+                    };
+                    self.write_x(rd, fp_to_int(x * k, rmode_op == 0b11_000, sf));
+                }
+                _ => return Step::Illegal,
             }
             return Step::Next;
         }
@@ -2153,6 +2199,8 @@ impl Aarch64Interp {
                         0b001010 => a.floor(),           // FRINTM
                         0b001011 => a.trunc(),           // FRINTZ
                         0b001100 => a.round(),           // FRINTA
+                        // FRINTX / FRINTI: the FPCR rounding mode.
+                        0b001110 | 0b001111 => round_with(f64::from(a), self.fpcr_rmode()) as f32,
                         _ => return Step::Illegal,
                     };
                     self.set_fp32(rd, r);
@@ -2169,6 +2217,7 @@ impl Aarch64Interp {
                         0b001010 => a.floor(),
                         0b001011 => a.trunc(),
                         0b001100 => a.round(),
+                        0b001110 | 0b001111 => round_with(a, self.fpcr_rmode()),
                         _ => return Step::Illegal,
                     };
                     self.set_fp64(rd, r);
@@ -2787,6 +2836,32 @@ impl Aarch64Interp {
             return Step::Next;
         }
 
+        // ---- CNT / RBIT (vector): per-byte population count / bit
+        // reverse — NOT/MVN's opcode (0b00101) with size 00 (CNT, U=0) or
+        // 01 (RBIT, U=1) ----
+        if (instr >> 24) & 0x1f == 0b0_1110
+            && (instr >> 17) & 0x1f == 0b1_0000
+            && (instr >> 12) & 0x1f == 0b0_0101
+            && (instr >> 10) & 3 == 0b10
+            && matches!(((instr >> 29) & 1, (instr >> 22) & 3), (0, 0) | (1, 1))
+        {
+            let rbit = (instr >> 29) & 1 == 1;
+            let q = (instr >> 30) & 1;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let mut b = self.v[rn].to_le_bytes();
+            for x in &mut b {
+                *x = if rbit {
+                    x.reverse_bits()
+                } else {
+                    x.count_ones() as u8
+                };
+            }
+            let mask = if q == 1 { u128::MAX } else { ones_u128(64) };
+            self.v[rd] = u128::from_le_bytes(b) & mask;
+            return Step::Next;
+        }
+
         // ---- NOT/MVN (vector): bitwise complement ----
         if (instr >> 24) & 0x1f == 0b0_1110
             && (instr >> 29) & 1 == 1
@@ -2919,6 +2994,90 @@ impl Aarch64Interp {
                     unsigned_sat(sum, esize)
                 };
                 result |= lane << sh;
+            }
+            self.v[rd] = result;
+            return Step::Next;
+        }
+
+        // ---- SIMD two-register misc (scalar + vector): integer CMGT/CMGE/
+        // CMEQ/CMLE/CMLT against #0, and FP <-> integer conversions
+        // (FCVT{N,P,M,Z,A}{S,U}, SCVTF/UCVTF) ----
+        // Checked before the FCMEQ/FRECPE arm below, which shares opcodes
+        // 0b11100/0b11101 with the size<1> == 1 encodings (URECPE/FRECPE)
+        // but not the size<1> == 0 ones (FCVTA*, *CVTF) handled here.
+        if ((instr >> 24) & 0x1f == 0b0_1110 || (instr >> 24) & 0x1f == 0b1_1110)
+            && (instr >> 17) & 0x1f == 0b1_0000
+            && (instr >> 10) & 3 == 0b10
+            && matches!(
+                ((instr >> 12) & 0x1f, (instr >> 23) & 1, (instr >> 29) & 1),
+                (0b0_1000 | 0b0_1001 | 0b1_1010 | 0b1_1011, _, _)
+                    | (0b0_1010, _, 0)
+                    | (0b1_1100 | 0b1_1101, 0, _)
+            )
+        {
+            let scalar = (instr >> 24) & 0x1f == 0b1_1110;
+            let q = (instr >> 30) & 1;
+            let uns = (instr >> 29) & 1 == 1;
+            let size = (instr >> 22) & 3;
+            let opcode = (instr >> 12) & 0x1f;
+            let rn = reg_field(instr, 5);
+            let rd = reg_field(instr, 0);
+            let int_cmp = opcode < 0b1_0000;
+            // Integer compares use any element size (scalar: only D); the
+            // conversions use size<0> to pick 32- or 64-bit lanes.
+            let esize = if int_cmp {
+                8u32 << size
+            } else {
+                32u32 << (size & 1)
+            };
+            if (scalar && int_cmp && size != 3) || (!scalar && esize == 64 && q == 0) {
+                return Step::Illegal;
+            }
+            let width = if scalar {
+                esize
+            } else if q == 1 {
+                128
+            } else {
+                64
+            };
+            let mask = ones_u128(esize);
+            let mut result = 0u128;
+            for i in 0..width / esize {
+                let sh = i * esize;
+                let raw = ((self.v[rn] >> sh) & mask) as u64;
+                let out: u64 = if int_cmp {
+                    let x = sign_extend(raw, esize);
+                    let hit = match (opcode, uns) {
+                        (0b0_1000, false) => x > 0,  // CMGT #0
+                        (0b0_1000, true) => x >= 0,  // CMGE #0
+                        (0b0_1001, false) => x == 0, // CMEQ #0
+                        (0b0_1001, true) => x <= 0,  // CMLE #0
+                        _ => x < 0,                  // CMLT #0
+                    };
+                    if hit { u64::MAX } else { 0 }
+                } else if opcode == 0b1_1101 {
+                    // SCVTF / UCVTF
+                    if esize == 64 {
+                        int_to_f64(raw, !uns, true).to_bits()
+                    } else {
+                        u64::from(int_to_f32(raw, !uns, false).to_bits())
+                    }
+                } else {
+                    let x = if esize == 64 {
+                        f64::from_bits(raw)
+                    } else {
+                        f64::from(f32::from_bits(raw as u32))
+                    };
+                    let mode = match (opcode, size >> 1) {
+                        (0b1_1010, 0) => ROUND_NEAREST, // FCVTN*
+                        (0b1_1010, _) => ROUND_PLUS,    // FCVTP*
+                        (0b1_1011, 0) => ROUND_MINUS,   // FCVTM*
+                        (0b1_1011, _) => ROUND_ZERO,    // FCVTZ*
+                        _ => ROUND_AWAY,                // FCVTA*
+                    };
+                    fp_to_int(round_with(x, mode), !uns, esize == 64)
+                };
+                result |= (u128::from(out) & mask) << sh;
             }
             self.v[rd] = result;
             return Step::Next;
@@ -4166,6 +4325,25 @@ fn decode_bit_masks(n: u32, imms: u32, immr: u32, width: u32) -> Option<(u64, u6
     let wmask = replicate(ror_val(ones(s + 1), r, esize), esize, width);
     let tmask = replicate(ones(diff + 1), esize, width);
     Some((wmask, tmask))
+}
+
+// Rounding modes, numbered as `FPCR.RMode` and the FCVT* `rmode` field
+// number them, plus FCVTA*'s ties-away (which has no FPCR encoding).
+const ROUND_NEAREST: u32 = 0;
+const ROUND_PLUS: u32 = 1;
+const ROUND_MINUS: u32 = 2;
+const ROUND_ZERO: u32 = 3;
+const ROUND_AWAY: u32 = 4;
+
+/// `x` rounded to an integral value in rounding mode `mode` (`ROUND_*`).
+fn round_with(x: f64, mode: u32) -> f64 {
+    match mode {
+        ROUND_NEAREST => x.round_ties_even(),
+        ROUND_PLUS => x.ceil(),
+        ROUND_MINUS => x.floor(),
+        ROUND_ZERO => x.trunc(),
+        _ => x.round(),
+    }
 }
 
 /// Convert an integer register value to `f32` (SCVTF/UCVTF single). `sf`
@@ -5664,6 +5842,83 @@ mod tests {
         assert_eq!(c.v[0], 0xFFFF_FFFF_0000_0000_F800_0000_0000_0010u128);
         c.exec(0x6EA2_4420, &mut m); // ushl v0.4s,v1.4s,v2.4s
         assert_eq!(c.v[0], 0x7FFF_FFFF_0000_0000_0800_0000_0000_0010u128);
+    }
+
+    #[test]
+    fn neon_cnt_rbit() {
+        let (mut c, mut m) = (cpu(), scratch());
+        c.v[0] = u128::from_le_bytes([
+            0x00, 0x01, 0x03, 0xff, 0x80, 0x0f, 0xf0, 0x55, 1, 1, 1, 1, 1, 1, 1, 1,
+        ]);
+        // cnt v1.8b, v0.8b ; addv b2, v1.8b  (popcount, as nginx uses it)
+        c.exec(0x0E20_5801, &mut m);
+        assert_eq!(
+            c.v[1],
+            u128::from(u64::from_le_bytes([0, 1, 2, 8, 1, 4, 4, 4]))
+        );
+        c.exec(0x0E31_B822, &mut m);
+        assert_eq!(c.v[2], 24);
+        c.exec(0x4E20_5803, &mut m); // cnt v3.16b, v0.16b
+        assert_eq!(c.v[3] >> 64, u128::from(u64::from_le_bytes([1; 8])));
+        c.exec(0x2E60_5804, &mut m); // rbit v4.8b, v0.8b
+        assert_eq!(
+            c.v[4],
+            u128::from(u64::from_le_bytes([
+                0x00, 0x80, 0xc0, 0xff, 0x01, 0xf0, 0x0f, 0xaa
+            ]))
+        );
+    }
+
+    #[test]
+    fn simd_compare_zero_and_fp_int_conversions() {
+        let (mut c, mut m) = (cpu(), scratch());
+        // cmeq d0, d0, #0 (scalar) on zero and nonzero
+        c.v[0] = 0;
+        c.exec(0x5EE0_9800, &mut m);
+        assert_eq!(c.v[0], u128::from(u64::MAX));
+        c.exec(0x5EE0_9800, &mut m);
+        assert_eq!(c.v[0], 0);
+        // cmlt v1.4s, v2.4s, #0
+        c.v[2] = u128::from_le_bytes([
+            1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0x80,
+        ]);
+        c.exec(0x4EA0_A841, &mut m);
+        assert_eq!(c.v[1], 0xffff_ffff_0000_0000_ffff_ffff_0000_0000);
+        // scvtf d0, d0 ; ucvtf d1, d1
+        c.v[0] = u128::from((-3i64) as u64);
+        c.exec(0x5E61_D800, &mut m);
+        assert_eq!(f64::from_bits(c.v[0] as u64), -3.0);
+        c.v[1] = u128::from(u64::MAX);
+        c.exec(0x7E61_D821, &mut m);
+        assert_eq!(f64::from_bits(c.v[1] as u64), 18_446_744_073_709_551_615.0);
+        // fcvtzs d2, d2 (toward zero) ; fcvtas x0, d0 (ties away)
+        c.v[2] = u128::from((-2.7f64).to_bits());
+        c.exec(0x5EE1_B842, &mut m);
+        assert_eq!(c.v[2] as u64 as i64, -2);
+        c.v[0] = u128::from(2.5f64.to_bits());
+        c.exec(0x9E64_0000, &mut m);
+        assert_eq!(c.x[0], 3);
+        // fcvtms x0, d0 (floor) ; fcvtns x0, d0 (ties to even)
+        c.v[0] = u128::from((-2.5f64).to_bits());
+        c.exec(0x9E70_0000, &mut m);
+        assert_eq!(c.x[0] as i64, -3);
+        c.exec(0x9E60_0000, &mut m);
+        assert_eq!(c.x[0] as i64, -2);
+        // scvtf d0, w0, #2 ; fcvtzs w0, d0, #2  (fixed point, 2 fraction bits)
+        c.x[0] = 10;
+        c.exec(0x1E42_F800, &mut m);
+        assert_eq!(f64::from_bits(c.v[0] as u64), 2.5);
+        c.v[0] = u128::from((-1.3f64).to_bits());
+        c.exec(0x1E58_F800, &mut m);
+        assert_eq!(c.x[0], u64::from((-5i32) as u32));
+        // frintx / frinti d0, d0 use FPCR.RMode (default: nearest even)
+        c.v[0] = u128::from(2.5f64.to_bits());
+        c.exec(0x1E67_4000, &mut m);
+        assert_eq!(f64::from_bits(c.v[0] as u64), 2.0);
+        c.v[0] = u128::from(2.5f64.to_bits());
+        c.fpcr = 1 << 22; // round toward +inf
+        c.exec(0x1E67_C000, &mut m);
+        assert_eq!(f64::from_bits(c.v[0] as u64), 3.0);
     }
 
     #[test]

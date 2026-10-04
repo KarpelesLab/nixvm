@@ -6006,6 +6006,7 @@ impl Kernel {
         const FIONBIO: u32 = 0x5421;
         const FIOCLEX: u32 = 0x5451;
         const FIONCLEX: u32 = 0x5450;
+        const FIOASYNC: u32 = 0x5452;
         const FIONREAD: u32 = 0x541B; // == SIOCINQ
         const SIOCOUTQ: u32 = 0x5411;
         let Some(f) = cx.cur.fds.get(fd as i32).cloned() else {
@@ -6052,7 +6053,10 @@ impl Kernel {
             }
             // Set/clear close-on-exec. nixvm does not track the flag separately
             // (as `fcntl(F_SETFD)` doesn't either), so this is an accepted no-op.
-            FIOCLEX | FIONCLEX => 0,
+            //
+            // `FIOASYNC` (signal-driven I/O): accepted, but no `SIGIO` is ever
+            // sent — callers (nginx's master/worker channel) also poll the fd.
+            FIOCLEX | FIONCLEX | FIOASYNC => 0,
             // Bytes available to read, written as an `int` at `arg`.
             FIONREAD => {
                 let bytes = match &f {
@@ -6512,6 +6516,7 @@ impl Kernel {
         match cx.cur.fds.close(fd) {
             Some(f) => {
                 self.bump_pipe(&f, false);
+                self.epoll_forget(cx, fd);
                 match f {
                     Fd::PtyMaster(n) => self.ptys.lock().unwrap().close_master(n),
                     Fd::PtySlave(n) => self.ptys.lock().unwrap().close_slave(n),
@@ -6592,6 +6597,7 @@ impl Kernel {
         }
         if let Some(old) = cx.cur.fds.close(newfd as i32) {
             self.bump_pipe(&old, false);
+            self.epoll_forget(cx, newfd as i32);
         }
         self.bump_pipe(&fd, true);
         cx.cur.fds.insert(newfd as i32, fd);

@@ -656,6 +656,22 @@ impl Kernel {
         i64::from(fd)
     }
 
+    /// Drop fd `fd` (just closed, or replaced by `dup2`) from the interest of
+    /// every epoll instance this process holds. Linux removes a registration
+    /// when its file is closed; keyed by fd number here, a stale one would
+    /// make the next `EPOLL_CTL_ADD` of a reused number fail with `EEXIST`
+    /// (nginx's second connection) and report events for the wrong file.
+    pub(super) fn epoll_forget(&self, cx: &ServiceCtx, fd: i32) {
+        let mut pf = self.pollfds.lock().unwrap();
+        for f in cx.cur.fds.values() {
+            if let Fd::Epoll(idx) = f
+                && let Some(ep) = pf.epolls.get_mut(*idx)
+            {
+                ep.interest.remove(&fd);
+            }
+        }
+    }
+
     /// `epoll_ctl(epfd, op, fd, event)`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_epoll_ctl(

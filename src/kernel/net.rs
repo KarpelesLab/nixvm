@@ -357,6 +357,10 @@ struct Sock {
     nonblock: bool,
     /// `setsockopt`-controlled knobs, `SO_ERROR`, and buffer-size hints.
     opts: SockOpts,
+    /// Open fds on this socket while it is not a connected [`Pair`] (which
+    /// counts per end): when the last one closes, the socket is released —
+    /// a listener frees its port, a host connection is shut down.
+    refs: usize,
 }
 
 /// The mutable `setsockopt`-controlled state of a socket, plus `SO_ERROR`.
@@ -677,14 +681,43 @@ impl Net {
     /// Adjust the open-fd refcount of the socket end `fd` refers to (a no-op for
     /// non-socket fds or unconnected sockets). Mirrors `Kernel::bump_pipe`.
     pub(super) fn bump(&mut self, fd: &Fd, inc: bool) {
-        if let Fd::Socket { sock, end } = *fd
-            && let Some(Kind::Pair(p)) = self.socks.get_mut(sock).map(|s| &mut s.kind)
-        {
-            if inc {
-                p.refs[end] += 1;
-            } else {
-                p.refs[end] = p.refs[end].saturating_sub(1);
+        let Fd::Socket { sock, end } = *fd else {
+            return;
+        };
+        let Some(s) = self.socks.get_mut(sock) else {
+            return;
+        };
+        let n = match &mut s.kind {
+            Kind::Pair(p) => &mut p.refs[end],
+            _ => &mut s.refs,
+        };
+        if inc {
+            *n += 1;
+        } else {
+            *n = n.saturating_sub(1);
+            if s.refs == 0 && !matches!(s.kind, Kind::Pair(_)) {
+                self.release(sock);
             }
+        }
+    }
+
+    /// The last fd on (non-pair) socket `sock` closed: free what it holds. A
+    /// listener leaves the port table (pending connections see the server
+    /// end closed), a host connection is shut down and dropped, a datagram
+    /// socket frees its port.
+    fn release(&mut self, sock: usize) {
+        let old = std::mem::replace(&mut self.socks[sock].kind, Kind::Idle { bound: None });
+        match old {
+            Kind::Listener { backlog, .. } => {
+                self.listeners.retain(|_, &mut i| i != sock);
+                for pending in backlog {
+                    if let Some(Kind::Pair(p)) = self.socks.get_mut(pending).map(|s| &mut s.kind) {
+                        p.refs[1] = 0;
+                    }
+                }
+            }
+            Kind::Host(mut h) if !h.wr_shut => h.conn.shutdown_write(),
+            _ => {}
         }
     }
 
@@ -815,6 +848,7 @@ impl Kernel {
                 kind,
                 nonblock,
                 opts: SockOpts::default(),
+                refs: 1,
             });
             let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
             cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
@@ -860,6 +894,7 @@ impl Kernel {
                 }),
                 nonblock,
                 opts: SockOpts::default(),
+                refs: 1,
             });
             let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
             cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
@@ -881,6 +916,7 @@ impl Kernel {
             kind,
             nonblock,
             opts: SockOpts::default(),
+            refs: 1,
         });
         let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
         cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
@@ -925,6 +961,7 @@ impl Kernel {
                     }),
                     nonblock,
                     opts: SockOpts::default(),
+                    refs: 1,
                 });
             }
             (a, b, 0, 0)
@@ -937,6 +974,7 @@ impl Kernel {
                 kind: Kind::Pair(pair),
                 nonblock,
                 opts: SockOpts::default(),
+                refs: 1,
             });
             (idx, idx, 0, 1)
         };
@@ -1193,6 +1231,8 @@ impl Kernel {
             pair.addrs[0] = Some(net.fresh_local(v6));
             pair.addrs[1] = Some(peer_addr);
         }
+        // The client end is held by every fd the idle socket had.
+        pair.refs[0] = net.socks[sock].refs;
         net.socks[sock].kind = Kind::Pair(pair);
         if let Kind::Listener { backlog, .. } = &mut net.socks[lidx].kind {
             backlog.push_back(sock);
@@ -3721,6 +3761,53 @@ mod tests {
             4
         );
         assert_eq!(mem.read_vec(out, 4).unwrap(), b"pong");
+    }
+
+    #[test]
+    fn closing_the_last_listener_fd_frees_the_address() {
+        // A unix listener, shared by a dup: the address stays live until the
+        // last fd closes, then a connect is refused and a fresh bind works.
+        let (k, mut mem, mut v, mut cx) = setup();
+        let addr = 0x1_1000;
+        mem.write_init(addr, &1u16.to_le_bytes()).unwrap();
+        mem.write_init(addr + 2, b"/srv\0").unwrap();
+        let mut sys = |cx: &mut ServiceCtx, mem: &mut GuestMemory, nr, a: [u64; 6]| {
+            call(&k, cx, mem, &mut v, nr, a)
+        };
+        let srv = sys(&mut cx, &mut mem, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
+        assert_eq!(
+            sys(&mut cx, &mut mem, Sysno::Bind, [srv, addr, 7, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            sys(&mut cx, &mut mem, Sysno::Listen, [srv, 8, 0, 0, 0, 0]),
+            0
+        );
+        let dup = sys(&mut cx, &mut mem, Sysno::Dup, [srv, 0, 0, 0, 0, 0]) as u64;
+        assert_eq!(
+            sys(&mut cx, &mut mem, Sysno::Close, [srv, 0, 0, 0, 0, 0]),
+            0
+        );
+        let cli = sys(&mut cx, &mut mem, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
+        assert_eq!(
+            sys(&mut cx, &mut mem, Sysno::Connect, [cli, addr, 7, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            sys(&mut cx, &mut mem, Sysno::Close, [dup, 0, 0, 0, 0, 0]),
+            0
+        );
+        // The pending connection sees the server side gone: EOF.
+        let out = 0x1_2000;
+        assert_eq!(
+            sys(&mut cx, &mut mem, Sysno::Read, [cli, out, 4, 0, 0, 0]),
+            0
+        );
+        let cli2 = sys(&mut cx, &mut mem, Sysno::Socket, [1, 1, 0, 0, 0, 0]) as u64;
+        assert_eq!(
+            sys(&mut cx, &mut mem, Sysno::Connect, [cli2, addr, 7, 0, 0, 0]),
+            -i64::from(Errno::ECONNREFUSED.0)
+        );
     }
 
     #[test]
