@@ -2,8 +2,8 @@
 //! through busybox `sh`, exactly as the browser terminal does.
 //!
 //! Skipped unless `NIXVM_ALPINE_TAR` points at an *uncompressed* Alpine
-//! minirootfs `.tar` (the browser decompresses the `.tar.gz` itself), so CI —
-//! which has no image — is unaffected. To run it:
+//! minirootfs `.tar` (the browser decompresses the `.tar.gz` itself). CI's
+//! `alpine` job supplies one; `cargo test` alone skips these. To run it:
 //!
 //! ```text
 //! curl -O https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/aarch64/alpine-minirootfs-3.20.10-aarch64.tar.gz
@@ -130,7 +130,7 @@ fn boots_alpine_from_in_memory_squashfs_overlay() {
 
 /// Live host-egress smoke test: boot Alpine with `NIXVM_NET=host` set and run
 /// `apk update` against the real mirror over plain HTTP. Gated on **both**
-/// `NIXVM_ALPINE_TAR` *and* `NIXVM_NET=host` (so CI, with neither, skips it)
+/// `NIXVM_ALPINE_TAR` *and* `NIXVM_NET=host` (CI doesn't set the latter, so skips it)
 /// and needs real outbound internet. Proves the full egress path: DNS over a
 /// host UDP socket, TCP connect passthrough, and poll/read/write bridging.
 #[cfg(feature = "fstool")]

@@ -61,6 +61,92 @@ jobs:
       - name: Test (tunnel networking)
         run: cargo test --features tunnel --lib tunnel
 
+  # Boots a real Alpine root image on each execution path. tests/alpine_boot.rs
+  # skips itself without an image, so nothing else in CI runs these tests. KVM
+  # and the interpreter behave differently enough to need separate runs: guests
+  # run orders of magnitude faster on KVM, which has already hidden a test bug.
+  alpine:
+    name: Alpine boot (${{ matrix.guest }} guest, ${{ matrix.backend }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, guest: x86_64, backend: kvm }
+          - { os: ubuntu-latest, guest: x86_64, backend: interp }
+          - { os: ubuntu-latest, guest: aarch64, backend: interp }
+          - { os: macos-latest, guest: aarch64, backend: interp }
+    env:
+      # Pinned to the branch the browser demo ships (see pages.yml), and verified
+      # by digest, so a new Alpine release can't change what these tests run on.
+      ALPINE_VERSION: 3.20.10
+      SHA256_x86_64: 0d44a414245f043ae56872a23762e6c9bee585da2cbe4aa81cbd0331eaf53223
+      SHA256_aarch64: 61ac877fdbcee6914731bc22a4ed5668ea3470f201f97a7078931c48b71bbeec
+      NIXVM_INTERP: ${{ matrix.backend == 'interp' && '1' || '0' }}
+      NIXVM_ALPINE_TAR: ${{ runner.temp }}/alpine/alpine.tar
+      NIXVM_ALPINE_TARGZ: ${{ runner.temp }}/alpine/alpine.tar.gz
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: alpine-${{ matrix.os }}
+
+      - name: Cache the Alpine image
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/alpine/alpine.tar.gz
+          key: alpine-minirootfs-${{ env.ALPINE_VERSION }}-${{ matrix.guest }}
+
+      - name: Fetch and verify the Alpine image
+        env:
+          SHA256: ${{ matrix.guest == 'x86_64' && env.SHA256_x86_64 || env.SHA256_aarch64 }}
+        run: |
+          mkdir -p "$(dirname "$NIXVM_ALPINE_TARGZ")"
+          if [ ! -f "$NIXVM_ALPINE_TARGZ" ]; then
+            branch="v${ALPINE_VERSION%.*}"
+            file="alpine-minirootfs-$ALPINE_VERSION-${{ matrix.guest }}.tar.gz"
+            curl -fsSL --retry 5 -o "$NIXVM_ALPINE_TARGZ" \
+              "https://dl-cdn.alpinelinux.org/alpine/$branch/releases/${{ matrix.guest }}/$file"
+          fi
+          echo "$SHA256  $NIXVM_ALPINE_TARGZ" | shasum -a 256 -c -
+          gzip -dc "$NIXVM_ALPINE_TARGZ" > "$NIXVM_ALPINE_TAR"
+
+      - name: Give the runner access to /dev/kvm
+        if: matrix.backend == 'kvm'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # The backend probe falls back to the interpreter when KVM is unusable, so
+      # without this check the job would pass without ever running on KVM.
+      - name: Require a working KVM
+        if: matrix.backend == 'kvm'
+        run: |
+          set -o pipefail
+          cargo test --lib vcpu::kvm -- --nocapture 2>&1 | tee kvm.log
+          if grep -q 'skipping KVM test' kvm.log; then
+            echo '::error::KVM is not usable on this runner'
+            exit 1
+          fi
+
+      - name: Run the live boot tests
+        run: |
+          set -o pipefail
+          cargo test --features fstool,targz,tunnel --test alpine_boot -- --nocapture 2>&1 | tee boot.log
+          # Not the tunnel test's "NIXVM_TUNNEL_BRIDGE/NIXVM_ALPINE_TAR not set":
+          # that one needs a live bridge, so it is expected to skip here.
+          if grep -Eq '(^|[^/])NIXVM_ALPINE_TAR(GZ)? not set' boot.log; then
+            echo '::error::a test skipped itself for lack of an Alpine image'
+            exit 1
+          fi
+
   wasm:
     name: wasm build guard
     runs-on: ubuntu-latest
