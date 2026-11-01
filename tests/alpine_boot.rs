@@ -541,33 +541,49 @@ fn pump_for_yields_during_guest_computation() {
     )
     .expect("boot");
     let _ = drain(&mut vm);
-    // A pure-CPU loop: no syscalls for long stretches.
-    vm.write_stdin(b"i=0; while [ $i -lt 3000 ]; do i=$((i+1)); done; echo loop-done\n");
     let budget = Duration::from_millis(30);
-    let (mut out, mut busy_calls, mut longest) = (Vec::new(), 0, Duration::ZERO);
+    let (mut busy_calls, mut longest) = (0, Duration::ZERO);
     let start = Instant::now();
+    // A pure-CPU loop: no syscalls for long stretches. How long it takes varies
+    // by orders of magnitude between backends (3000 iterations take ~18 s on the
+    // interpreter but ~5 ms on KVM, well inside the budget), so grow it until it
+    // outlasts the budget. 3 million iterations take seconds even on KVM, so
+    // finishing that many without a single yield is a real failure.
+    let mut iterations = 3000u64;
     loop {
-        let t = Instant::now();
-        let step = vm.pump_for(budget).expect("pump_for");
-        longest = longest.max(t.elapsed());
-        out.extend_from_slice(&step.stdout);
-        busy_calls += usize::from(step.busy);
-        if !step.busy && vm.awaiting_input() {
+        vm.write_stdin(
+            format!("i=0; while [ $i -lt {iterations} ]; do i=$((i+1)); done; echo loop-done-$i\n")
+                .as_bytes(),
+        );
+        let mut out = Vec::new();
+        loop {
+            let t = Instant::now();
+            let step = vm.pump_for(budget).expect("pump_for");
+            longest = longest.max(t.elapsed());
+            out.extend_from_slice(&step.stdout);
+            busy_calls += usize::from(step.busy);
+            if !step.busy && vm.awaiting_input() {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(120),
+                "loop never finished"
+            );
+        }
+        let out = String::from_utf8_lossy(&out);
+        assert!(
+            out.contains(&format!("loop-done-{iterations}")),
+            "the computation completes: {out:?}"
+        );
+        if busy_calls > 0 || iterations >= 3_000_000 {
             break;
         }
-        assert!(
-            start.elapsed() < Duration::from_secs(120),
-            "loop never finished"
-        );
+        iterations *= 10;
     }
-    let out = String::from_utf8_lossy(&out);
     eprintln!(
-        "pump_for: {busy_calls} busy returns, longest call {longest:?}, total {:?}",
+        "pump_for: {iterations} iterations, {busy_calls} busy returns, \
+         longest call {longest:?}, total {:?}",
         start.elapsed()
-    );
-    assert!(
-        out.contains("loop-done"),
-        "the computation completes: {out:?}"
     );
     assert!(busy_calls > 0, "a long computation yields at least once");
     assert!(
