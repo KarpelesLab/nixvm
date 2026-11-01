@@ -83,8 +83,6 @@ jobs:
       SHA256_x86_64: 0d44a414245f043ae56872a23762e6c9bee585da2cbe4aa81cbd0331eaf53223
       SHA256_aarch64: 61ac877fdbcee6914731bc22a4ed5668ea3470f201f97a7078931c48b71bbeec
       NIXVM_INTERP: ${{ matrix.backend == 'interp' && '1' || '0' }}
-      NIXVM_ALPINE_TAR: ${{ runner.temp }}/alpine/alpine.tar
-      NIXVM_ALPINE_TARGZ: ${{ runner.temp }}/alpine/alpine.tar.gz
     steps:
       - uses: actions/checkout@v7
 
@@ -95,6 +93,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: alpine-${{ matrix.os }}
+
+      - name: Locate the Alpine image
+        run: |
+          echo "NIXVM_ALPINE_TAR=$RUNNER_TEMP/alpine/alpine.tar" >> "$GITHUB_ENV"
+          echo "NIXVM_ALPINE_TARGZ=$RUNNER_TEMP/alpine/alpine.tar.gz" >> "$GITHUB_ENV"
 
       - name: Cache the Alpine image
         uses: actions/cache@v6
