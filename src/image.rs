@@ -290,7 +290,7 @@ fn stage_http(url: &str, tmp: &Path) -> Result<[u8; 32], ImageError> {
     let resp = ureq::get(url)
         .call()
         .map_err(|e| ImageError::Fetch(format!("GET {url}: {e}")))?;
-    let mut reader = resp.into_reader();
+    let mut reader = resp.into_body().into_reader();
     let mut output = std::fs::File::create(tmp).map_err(ImageError::Io)?;
     let mut hasher = Sha256::new();
     copy_with_hash(&mut reader, &mut output, &mut hasher).map_err(ImageError::Io)?;

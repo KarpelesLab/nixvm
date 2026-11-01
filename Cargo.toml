@@ -11,7 +11,7 @@
 name = "nixvm"
 version = "0.0.3"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/KarpelesLab/nixvm"
 authors = ["Mark Karpeles <magicaltux@gmail.com>"]
@@ -77,7 +77,7 @@ tunnel = ["dep:pktkit"]
 # Since 0.4.28 each filesystem is its own feature (a `default-features = false`
 # build gets none and doesn't compile); enable the ones nixvm reads/builds:
 # ext2/3/4 root images, squashfs (the repacked overlay lower), tar.
-fstool = { version = "0.4.28", optional = true, default-features = false, features = [
+fstool = { version = "0.5.2", optional = true, default-features = false, features = [
     "gzip",
     "ext",
     "squashfs",
@@ -85,10 +85,10 @@ fstool = { version = "0.4.28", optional = true, default-features = false, featur
 ] }
 # Blocking HTTP(S) client for downloading guest root images, gated behind the
 # `fetch` feature (see src/image.rs). Not linked into the default build.
-ureq = { version = "2", optional = true }
+ureq = { version = "3", optional = true }
 # Compression collection (gzip decoder), gated behind `targz`. `std` + `gzip`
 # only — a pure-Rust inflate that builds for wasm32. Same crate `fstool` uses.
-compcol = { version = "0.6", optional = true, default-features = false, features = [
+compcol = { version = "0.7.8", optional = true, default-features = false, features = [
     "std",
     "gzip",
 ] }

@@ -60,10 +60,6 @@ fn to_io(e: fstool::Error) -> io::Error {
         // former and a defensible default for the latter (callers that care
         // about the EISDIR/ENOTDIR/EINVAL distinction use `classify` first).
         fstool::Error::InvalidArgument(_) => enoent(),
-        // On-disk structure failed validation, or a read/write reached past
-        // the device's logical extent: both mean the image itself can't be
-        // trusted for this operation.
-        fstool::Error::InvalidImage(_) | fstool::Error::OutOfBounds { .. } => eio(),
         // The format lacks a feature this build of fstool implements.
         fstool::Error::Unsupported(_) => enosys(),
         // Attempted mutation of a write-once (SquashFS/ISO) or streaming
@@ -71,6 +67,11 @@ fn to_io(e: fstool::Error) -> io::Error {
         // `self.read_only` before reaching fstool, so this is a defensive
         // fallback rather than the common path.
         fstool::Error::Streaming { .. } | fstool::Error::Immutable { .. } => erofs(),
+        // `InvalidImage` (on-disk structure failed validation) and `OutOfBounds`
+        // (a read/write reached past the device's logical extent) both mean the
+        // image itself can't be trusted for this operation. The enum is
+        // `#[non_exhaustive]`, so any failure we don't recognize lands here too.
+        _ => eio(),
     }
 }
 
@@ -214,13 +215,13 @@ impl FsToolMount {
         let mut dev = MemoryBackend::new(size);
         let block_size = 4096u32;
         let blocks_count = (size / u64::from(block_size)).max(64) as u32;
-        let opts = ext::FormatOpts {
-            kind: ext::FsKind::Ext4,
-            block_size,
-            blocks_count,
-            inodes_count: (blocks_count / 4).max(16),
-            ..Default::default()
-        };
+        // `FormatOpts` is `#[non_exhaustive]`, so it can't be built with a
+        // struct expression, even with `..Default::default()`.
+        let mut opts = ext::FormatOpts::default();
+        opts.kind = ext::FsKind::Ext4;
+        opts.block_size = block_size;
+        opts.blocks_count = blocks_count;
+        opts.inodes_count = (blocks_count / 4).max(16);
         let fs = ext::Ext::format_with(&mut dev, &opts).map_err(to_io)?;
         Ok(Self {
             fs: Box::new(fs),

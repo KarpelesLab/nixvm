@@ -579,7 +579,7 @@ Run continuously alongside the phases:
   hypervisor and runs anywhere. The only GitHub Actions workflow today
   (`.github/workflows/pages.yml`) builds and deploys the wasm demo on push to
   `main`; a build+clippy+test matrix across macOS/arm64 and Linux/x86-64, and
-  an MSRV (1.89) job, have not been set up yet.
+  an MSRV (1.95) job, have not been set up yet.
 
 ### Browser demo (wasm)  ✅ shipped (in a smaller shape than first planned)
 
