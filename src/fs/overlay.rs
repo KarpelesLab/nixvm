@@ -200,6 +200,10 @@ impl MountFs for Overlay {
         self.upper.attach_quota(quota);
     }
 
+    fn attach_disk_quota(&mut self, quota: &std::sync::Arc<crate::limits::Quota>) {
+        self.upper.attach_disk_quota(quota);
+    }
+
     fn read_only(&self) -> bool {
         false
     }

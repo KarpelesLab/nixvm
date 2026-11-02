@@ -113,6 +113,10 @@ pub trait MountFs: std::fmt::Debug + Send {
     /// backend holding no host memory for the guest doesn't need this.
     fn attach_quota(&mut self, _quota: &std::sync::Arc<crate::limits::Quota>) {}
 
+    /// Charge growth on the host's disk to `quota` from now on. A backend that
+    /// doesn't write to the host doesn't need this.
+    fn attach_disk_quota(&mut self, _quota: &std::sync::Arc<crate::limits::Quota>) {}
+
     fn read_only(&self) -> bool {
         true
     }

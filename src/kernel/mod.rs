@@ -1338,6 +1338,16 @@ impl ServiceCtx {
 pub struct Kernel {
     /// Host memory held for the guest (see [`crate::limits::Limits`]).
     memory_quota: Arc<crate::limits::Quota>,
+    /// Growth on the host's disk (see [`crate::limits::Limits::disk_bytes`]).
+    disk_quota: Arc<crate::limits::Quota>,
+    /// The VM's `(cpu, wall)` time ceilings.
+    time_limits: Mutex<(Option<std::time::Duration>, Option<std::time::Duration>)>,
+    /// When the scheduler first ran, what the wall-clock ceiling counts from.
+    started_at: Mutex<Option<std::time::Duration>>,
+    /// CPU time used by every task so far, what the CPU ceiling measures.
+    total_cpu_ns: AtomicU64,
+    /// Whether a time ceiling has been reached and the guest killed.
+    limit_hit: std::sync::atomic::AtomicBool,
     /// Tasks that may exist at once (see [`crate::limits::Limits::tasks`]).
     max_tasks: AtomicUsize,
     /// Descriptors that may be open at once across the VM
@@ -1702,7 +1712,9 @@ impl Shared {
             return false;
         };
         if dl > now {
-            let ns = (dl - now).min(3_600_000_000_000) as u64; // cap at 1h
+            // Wake at least this often: a VM-wide time limit must also catch a
+            // guest that does nothing but sleep.
+            let ns = (dl - now).min(250_000_000) as u64;
             std::thread::sleep(std::time::Duration::from_nanos(ns));
         }
         true
@@ -1868,8 +1880,15 @@ impl Kernel {
         let limits = crate::limits::Limits::for_this_host();
         let memory_quota = crate::limits::Quota::new(limits.kernel_memory);
         mounts.attach_quota(&memory_quota);
+        let disk_quota = crate::limits::Quota::new(limits.disk_bytes);
+        mounts.attach_disk_quota(&disk_quota);
         Self {
             memory_quota,
+            disk_quota,
+            time_limits: Mutex::new((limits.cpu_time, limits.wall_time)),
+            started_at: Mutex::new(None),
+            total_cpu_ns: AtomicU64::new(0),
+            limit_hit: std::sync::atomic::AtomicBool::new(false),
             max_tasks: AtomicUsize::new(limits.tasks as usize),
             max_open_files: AtomicUsize::new(limits.open_files as usize),
             arch,
@@ -1949,6 +1968,8 @@ impl Kernel {
     /// Replace the VM-wide resource ceilings.
     pub fn set_limits(&mut self, limits: crate::limits::Limits) {
         self.memory_quota.set_limit(limits.kernel_memory);
+        self.disk_quota.set_limit(limits.disk_bytes);
+        *self.time_limits.lock().unwrap() = (limits.cpu_time, limits.wall_time);
         self.max_tasks
             .store(limits.tasks as usize, std::sync::atomic::Ordering::Relaxed);
         self.max_open_files.store(
@@ -2116,6 +2137,7 @@ impl Kernel {
             if crate::vcpu::yield_due() {
                 return Ok(progressed);
             }
+            self.enforce_time_limits(&mut self.shared.lock().unwrap());
             // Pick the least-vruntime runnable task and check it out (slot → `None`,
             // fd table into `cx`), releasing `sh` before running the slice so the
             // slice's syscalls can take their own per-handler locks.
@@ -2368,7 +2390,7 @@ impl Kernel {
                 .saturating_sub(step_start);
             cx.cur.cpu_ns = cx.cur.cpu_ns.saturating_add(delta);
             charge_vruntime(&mut cx.cur, delta);
-            Self::charge_cpu_time(cx, delta);
+            self.charge_cpu_time(cx, delta);
             match flow {
                 Serviced::SetRet => {
                     // The result was already written to the vcpu inside `service`
@@ -2796,6 +2818,7 @@ impl Kernel {
                 // for the dispatch decision, not while awaiting results).
                 let dispatch = {
                     let mut sh = self.shared.lock().unwrap();
+                    self.enforce_time_limits(&mut sh);
                     if let Some(code) = sh.pid1_code() {
                         break Ok(code);
                     }
@@ -2851,7 +2874,8 @@ impl Kernel {
                         StallAction::SleepUntil(dl) => {
                             let now = poll::now_ns();
                             if dl > now {
-                                let ns = (dl - now).min(3_600_000_000_000) as u64;
+                                // Short enough that a VM-wide time limit still fires.
+                                let ns = (dl - now).min(250_000_000) as u64;
                                 std::thread::sleep(std::time::Duration::from_nanos(ns));
                             }
                             stalled = false;
@@ -2997,7 +3021,7 @@ impl Kernel {
             .saturating_sub(step_start);
         cx.cur.cpu_ns = cx.cur.cpu_ns.saturating_add(delta);
         charge_vruntime(&mut cx.cur, delta);
-        Self::charge_cpu_time(&mut cx, delta);
+        self.charge_cpu_time(&mut cx, delta);
         {
             let mut sh = self.shared.lock().unwrap();
             // Fold in what other workers did to the stand-in meanwhile: signals
@@ -7237,10 +7261,49 @@ impl Kernel {
         limit != sys_misc::RLIM_INFINITY && mem.mapped_bytes().saturating_add(len) > limit
     }
 
-    /// Charge `ns` of CPU time to the current thread group, raising whatever
-    /// `RLIMIT_CPU` calls for.
-    fn charge_cpu_time(cx: &mut ServiceCtx, ns: u128) {
+    /// Whether a VM-wide time ceiling stopped the guest
+    /// (see [`crate::limits::Limits::cpu_time`]).
+    #[must_use]
+    pub fn time_limit_reached(&self) -> bool {
+        self.limit_hit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// If a VM-wide time ceiling has passed, kill every guest task. Called from
+    /// the scheduler, where no task is mid-slice on this thread. A compute-bound
+    /// guest comes back here each quantum, so it can't outrun this.
+    fn enforce_time_limits(&self, sh: &mut Shared) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (cpu, wall) = *self.time_limits.lock().unwrap();
+        if (cpu.is_none() && wall.is_none()) || self.limit_hit.load(Relaxed) {
+            return;
+        }
+        let now = crate::clock::now_monotonic();
+        let start = *self.started_at.lock().unwrap().get_or_insert(now);
+        let out_of_wall = wall.is_some_and(|w| now.saturating_sub(start) >= w);
+        let used = self.total_cpu_ns.load(Relaxed);
+        let out_of_cpu = cpu.is_some_and(|c| u128::from(used) >= c.as_nanos());
+        if !out_of_wall && !out_of_cpu {
+            return;
+        }
+        self.limit_hit.store(true, Relaxed);
+        let which = if out_of_wall { "run time" } else { "CPU time" };
+        eprintln!("nixvm: the VM's {which} limit was reached; killing the guest");
+        const SIGKILL_BIT: u64 = 1 << (9 - 1);
+        for p in sh.procs.iter_mut().flatten() {
+            if !matches!(p.info.run, RunState::Zombie(_)) {
+                p.info.pending |= SIGKILL_BIT;
+                p.info.run = RunState::Running;
+            }
+        }
+        sh.unpark_all();
+    }
+
+    /// Charge `ns` of CPU time to the VM and to the current thread group, raising
+    /// whatever `RLIMIT_CPU` calls for.
+    fn charge_cpu_time(&self, cx: &mut ServiceCtx, ns: u128) {
         let ns = u64::try_from(ns).unwrap_or(u64::MAX);
+        self.total_cpu_ns
+            .fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
         if let Some(sig) = cx.cur.rlimits.charge_cpu(ns) {
             cx.cur.pending |= 1u64 << (sig - 1);
         }
@@ -11193,6 +11256,39 @@ mod tests {
         assert_eq!(limits.charge_cpu(SEC / 2), None, "not again this second");
         assert_eq!(limits.charge_cpu(SEC / 2), Some(SIGXCPU));
         assert_eq!(limits.charge_cpu(SEC), Some(9));
+    }
+
+    #[test]
+    fn a_vm_time_limit_kills_every_task_once() {
+        let (mut k, mut mem, mut v, mut cx) = setup();
+        let child = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [0x11, 0, 0, 0, 0, 0],
+        );
+        let mut limits = crate::limits::Limits::for_this_host();
+        limits.wall_time = Some(std::time::Duration::from_secs(3600));
+        limits.cpu_time = Some(std::time::Duration::from_secs(1));
+        k.set_limits(limits);
+        let pending = |k: &Kernel| {
+            let sh = k.shared.lock().unwrap();
+            let mut p = sh
+                .procs
+                .iter()
+                .flatten()
+                .filter(|p| i64::from(p.info.pid) == child);
+            p.next().unwrap().info.pending
+        };
+        k.enforce_time_limits(&mut k.shared.lock().unwrap());
+        assert!(!k.time_limit_reached(), "still within both");
+        assert_eq!(pending(&k) & (1 << 8), 0);
+        k.charge_cpu_time(&mut cx, 2_000_000_000);
+        k.enforce_time_limits(&mut k.shared.lock().unwrap());
+        assert!(k.time_limit_reached());
+        assert_ne!(pending(&k) & (1 << 8), 0, "SIGKILL is pending");
     }
 
     #[test]

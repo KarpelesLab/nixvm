@@ -31,6 +31,8 @@ pub struct MountTable {
     mounts: Vec<Mount>,
     /// What every mounted filesystem charges its in-memory contents to.
     quota: Option<std::sync::Arc<crate::limits::Quota>>,
+    /// What every mounted filesystem charges growth on the host's disk to.
+    disk_quota: Option<std::sync::Arc<crate::limits::Quota>>,
 }
 
 impl MountTable {
@@ -48,6 +50,15 @@ impl MountTable {
         self.quota = Some(quota.clone());
     }
 
+    /// Charge every filesystem's growth on the host's disk to `quota`, now and for
+    /// anything mounted later.
+    pub fn attach_disk_quota(&mut self, quota: &std::sync::Arc<crate::limits::Quota>) {
+        for mount in &mut self.mounts {
+            mount.fs.attach_disk_quota(quota);
+        }
+        self.disk_quota = Some(quota.clone());
+    }
+
     /// Mount `fs` at absolute `point`. Deeper mount points win via
     /// longest-prefix resolution.
     ///
@@ -57,6 +68,9 @@ impl MountTable {
     pub fn mount(&mut self, point: impl Into<String>, mut fs: Box<dyn MountFs>) {
         if let Some(quota) = &self.quota {
             fs.attach_quota(quota);
+        }
+        if let Some(quota) = &self.disk_quota {
+            fs.attach_disk_quota(quota);
         }
         self.mounts.push(Mount {
             point: normalize(&point.into()),
@@ -70,6 +84,9 @@ impl MountTable {
     pub fn mount_guest(&mut self, point: &str, mut fs: Box<dyn MountFs>) {
         if let Some(quota) = &self.quota {
             fs.attach_quota(quota);
+        }
+        if let Some(quota) = &self.disk_quota {
+            fs.attach_disk_quota(quota);
         }
         self.mounts.push(Mount {
             point: normalize(point),

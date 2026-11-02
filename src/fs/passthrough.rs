@@ -64,9 +64,11 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::{Attrs, DirEntry, MountFs, NodeKind, SetTime};
+use crate::limits::Quota;
 
 /// `openat(2)`-family flag and errno values `std` doesn't expose. Declared
 /// by hand (rather than depending on the `libc` crate, which is not a
@@ -137,6 +139,7 @@ compile_error!("passthrough: openat(2) flag/errno constants are only defined for
 unsafe extern "C" {
     fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: u32) -> c_int;
     fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int;
+    fn statvfs(path: *const c_char, buf: *mut c_void) -> c_int;
     fn mkdirat(dirfd: c_int, path: *const c_char, mode: u32) -> c_int;
     fn symlinkat(target: *const c_char, dirfd: c_int, linkpath: *const c_char) -> c_int;
     fn renameat(
@@ -537,7 +540,17 @@ fn list_dir_fd(fd: OwnedFd) -> io::Result<Vec<DirEntry>> {
 pub struct Passthrough {
     root: PathBuf,
     read_only: bool,
+    /// What growth on the host's disk is charged to.
+    disk: Arc<Quota>,
+    /// Bytes charged since the host's free space was last checked; `None` before
+    /// the first check.
+    since_host_check: Option<u64>,
 }
+
+/// What a new directory entry is charged, since it takes host disk too.
+const ENTRY_COST: u64 = 4096;
+/// How much may be written between checks of the host's free space.
+const HOST_CHECK_INTERVAL: u64 = 64 << 20;
 
 impl Passthrough {
     /// Map host directory `root` at the mount point, read-write.
@@ -546,6 +559,8 @@ impl Passthrough {
         Self {
             root: root.into(),
             read_only: false,
+            disk: Quota::unlimited(),
+            since_host_check: None,
         }
     }
 
@@ -555,7 +570,108 @@ impl Passthrough {
         Self {
             root: root.into(),
             read_only: true,
+            disk: Quota::unlimited(),
+            since_host_check: None,
         }
+    }
+
+    /// Charge `bytes` of new disk use, or fail with `ENOSPC` if that's over the
+    /// VM's quota or the host is running out. The host always keeps some room,
+    /// whatever the quota says: a guest must not be able to fill its disk.
+    fn charge_disk(&mut self, bytes: u64) -> io::Result<()> {
+        if !self.disk.try_charge(bytes) {
+            return Err(enospc());
+        }
+        let since = self
+            .since_host_check
+            .map_or(HOST_CHECK_INTERVAL, |s| s + bytes);
+        if since < HOST_CHECK_INTERVAL {
+            self.since_host_check = Some(since);
+            return Ok(());
+        }
+        self.since_host_check = Some(0);
+        if host_is_low_on_space(&self.root) {
+            self.disk.release(bytes);
+            // Check again next time rather than after another interval.
+            self.since_host_check = None;
+            return Err(enospc());
+        }
+        Ok(())
+    }
+
+    /// Hold the charge for a new directory entry while `make` creates it.
+    fn with_entry_charge(
+        &mut self,
+        make: impl FnOnce(&mut Self) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.charge_disk(ENTRY_COST)?;
+        let made = make(self);
+        if made.is_err() {
+            self.disk.release(ENTRY_COST);
+        }
+        made
+    }
+
+    fn create_entry(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        let (parent, name) = self.resolve(rel, true, true)?;
+        let cname = cstr(&name)?;
+        let fd = raw_openat(
+            parent.as_raw_fd(),
+            &cname,
+            sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC | sys::O_NOFOLLOW,
+            mode & 0o777,
+        )
+        .map_err(normalize_errno)?;
+        // openat's mode is subject to umask; chmod explicitly afterward to
+        // match the exact requested bits, as the original `fs::File::create`
+        // + `set_permissions` pair did.
+        fs::File::from(fd).set_permissions(fs::Permissions::from_mode(mode & 0o777))
+    }
+
+    fn mkdir_entry(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        self.deny_if_ro()?;
+        let (parent, name) = self.resolve(rel, false, false)?;
+        let cname = cstr(&name)?;
+        raw_mkdirat(parent.as_raw_fd(), &cname, mode & 0o777)?;
+        let fd = raw_openat(
+            parent.as_raw_fd(),
+            &cname,
+            sys::O_DIRECTORY | sys::O_RDONLY | sys::O_NOFOLLOW,
+            0,
+        )
+        .map_err(normalize_errno)?;
+        fs::File::from(fd).set_permissions(fs::Permissions::from_mode(mode & 0o777))
+    }
+
+    fn mknod_entry(&mut self, rel: &str, mode: u32) -> io::Result<()> {
+        self.deny_if_ro()?;
+        let (parent, name) = self.resolve(rel, false, false)?;
+        let cname = cstr(&name)?;
+        raw_mknodat(parent.as_raw_fd(), &cname, mode)?;
+        // Match the exact requested permission bits (mknod's mode is subject to
+        // the umask), mirroring `create`/`mkdir`.
+        let _ = raw_fchmodat(parent.as_raw_fd(), &cname, mode & 0o7777);
+        Ok(())
+    }
+
+    fn symlink_entry(&mut self, target: &str, linkpath: &str) -> io::Result<()> {
+        self.deny_if_ro()?;
+        let (parent, name) = self.resolve(linkpath, false, false)?;
+        let cname = cstr(&name)?;
+        let ctarget = cstr(target)?;
+        raw_symlinkat(&ctarget, parent.as_raw_fd(), &cname)
+    }
+
+    fn link_entry(&mut self, old_rel: &str, new_rel: &str) -> io::Result<()> {
+        self.deny_if_ro()?;
+        // Resolve both without following the final component (link(2) links the
+        // symlink itself), then make a real host hard link so st_nlink, the
+        // shared inode, and write-through all behave.
+        let (old_parent, old_name) = self.resolve(old_rel, false, false)?;
+        let (new_parent, new_name) = self.resolve(new_rel, false, false)?;
+        let cold = cstr(&old_name)?;
+        let cnew = cstr(&new_name)?;
+        raw_linkat(old_parent.as_raw_fd(), &cold, new_parent.as_raw_fd(), &cnew)
     }
 
     fn deny_if_ro(&self) -> io::Result<()> {
@@ -767,6 +883,10 @@ fn attrs_of(m: &fs::Metadata) -> Attrs {
 }
 
 impl MountFs for Passthrough {
+    fn attach_disk_quota(&mut self, quota: &Arc<Quota>) {
+        self.disk = quota.clone();
+    }
+
     fn read_only(&self) -> bool {
         self.read_only
     }
@@ -847,51 +967,43 @@ impl MountFs for Passthrough {
         )
         .map_err(normalize_errno)?;
         let mut f = fs::File::from(fd);
-        f.seek(SeekFrom::Start(off))?;
-        f.write(buf)
+        let size = f.metadata()?.len();
+        let end = off.saturating_add(buf.len() as u64);
+        let growth = end.saturating_sub(size);
+        self.charge_disk(growth)?;
+        let written = f
+            .seek(SeekFrom::Start(off))
+            .and_then(|_| f.write(buf))
+            .inspect_err(|_| self.disk.release(growth))?;
+        // A short write grew the file by less than was charged.
+        self.disk
+            .release(end - (off + written as u64).max(size).min(end));
+        Ok(written)
     }
 
     fn create(&mut self, rel: &str, mode: u32) -> io::Result<()> {
         self.deny_if_ro()?;
-        let (parent, name) = self.resolve(rel, true, true)?;
-        let cname = cstr(&name)?;
-        let fd = raw_openat(
-            parent.as_raw_fd(),
-            &cname,
-            sys::O_WRONLY | sys::O_CREAT | sys::O_TRUNC | sys::O_NOFOLLOW,
-            mode & 0o777,
-        )
-        .map_err(normalize_errno)?;
-        // openat's mode is subject to umask; chmod explicitly afterward to
-        // match the exact requested bits, as the original `fs::File::create`
-        // + `set_permissions` pair did.
-        fs::File::from(fd).set_permissions(fs::Permissions::from_mode(mode & 0o777))
+        self.with_entry_charge(|fs| fs.create_entry(rel, mode))
     }
 
     fn mkdir(&mut self, rel: &str, mode: u32) -> io::Result<()> {
         self.deny_if_ro()?;
-        let (parent, name) = self.resolve(rel, false, false)?;
-        let cname = cstr(&name)?;
-        raw_mkdirat(parent.as_raw_fd(), &cname, mode & 0o777)?;
-        let fd = raw_openat(
-            parent.as_raw_fd(),
-            &cname,
-            sys::O_DIRECTORY | sys::O_RDONLY | sys::O_NOFOLLOW,
-            0,
-        )
-        .map_err(normalize_errno)?;
-        fs::File::from(fd).set_permissions(fs::Permissions::from_mode(mode & 0o777))
+        self.with_entry_charge(|fs| fs.mkdir_entry(rel, mode))
     }
 
     fn mknod(&mut self, rel: &str, mode: u32) -> io::Result<()> {
         self.deny_if_ro()?;
-        let (parent, name) = self.resolve(rel, false, false)?;
-        let cname = cstr(&name)?;
-        raw_mknodat(parent.as_raw_fd(), &cname, mode)?;
-        // Match the exact requested permission bits (mknod's mode is subject to
-        // the umask), mirroring `create`/`mkdir`.
-        let _ = raw_fchmodat(parent.as_raw_fd(), &cname, mode & 0o7777);
-        Ok(())
+        self.with_entry_charge(|fs| fs.mknod_entry(rel, mode))
+    }
+
+    fn symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {
+        self.deny_if_ro()?;
+        self.with_entry_charge(|fs| fs.symlink_entry(target, linkpath))
+    }
+
+    fn link(&mut self, old_rel: &str, new_rel: &str) -> io::Result<()> {
+        self.deny_if_ro()?;
+        self.with_entry_charge(|fs| fs.link_entry(old_rel, new_rel))
     }
 
     fn set_times(&mut self, rel: &str, atime: SetTime, mtime: SetTime) -> io::Result<()> {
@@ -939,14 +1051,30 @@ impl MountFs for Passthrough {
         {
             return Err(io::Error::from_raw_os_error(21)); // EISDIR
         }
-        raw_unlinkat(parent.as_raw_fd(), &cname, 0)
+        // Only the last name frees the file's data.
+        let freed = if let Ok(fd) = raw_openat(
+            parent.as_raw_fd(),
+            &cname,
+            sys::O_RDONLY | sys::O_NOFOLLOW | sys::O_NONBLOCK,
+            0,
+        ) {
+            let meta = fs::File::from(fd).metadata();
+            meta.map_or(0, |m| if m.nlink() == 1 { m.len() } else { 0 })
+        } else {
+            0
+        };
+        raw_unlinkat(parent.as_raw_fd(), &cname, 0)?;
+        self.disk.release(freed + ENTRY_COST);
+        Ok(())
     }
 
     fn rmdir(&mut self, rel: &str) -> io::Result<()> {
         self.deny_if_ro()?;
         let (parent, name) = self.resolve(rel, false, false)?;
         let cname = cstr(&name)?;
-        raw_unlinkat(parent.as_raw_fd(), &cname, sys::AT_REMOVEDIR)
+        raw_unlinkat(parent.as_raw_fd(), &cname, sys::AT_REMOVEDIR)?;
+        self.disk.release(ENTRY_COST);
+        Ok(())
     }
 
     fn truncate(&mut self, rel: &str, len: u64) -> io::Result<()> {
@@ -976,15 +1104,12 @@ impl MountFs for Passthrough {
         if !meta.file_type().is_file() {
             return Err(io::Error::from_raw_os_error(22)); // EINVAL: ftruncate is only meaningful on a regular file
         }
+        let size = meta.len();
+        self.charge_disk(len.saturating_sub(size))?;
         file.set_len(len)
-    }
-
-    fn symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {
-        self.deny_if_ro()?;
-        let (parent, name) = self.resolve(linkpath, false, false)?;
-        let cname = cstr(&name)?;
-        let ctarget = cstr(target)?;
-        raw_symlinkat(&ctarget, parent.as_raw_fd(), &cname)
+            .inspect_err(|_| self.disk.release(len.saturating_sub(size)))?;
+        self.disk.release(size.saturating_sub(len));
+        Ok(())
     }
 
     fn readlink(&mut self, rel: &str) -> io::Result<String> {
@@ -1012,18 +1137,46 @@ impl MountFs for Passthrough {
         let cto = cstr(&to_name)?;
         raw_renameat(from_parent.as_raw_fd(), &cfrom, to_parent.as_raw_fd(), &cto)
     }
+}
 
-    fn link(&mut self, old_rel: &str, new_rel: &str) -> io::Result<()> {
-        self.deny_if_ro()?;
-        // Resolve both without following the final component (link(2) links the
-        // symlink itself), then make a real host hard link so st_nlink, the
-        // shared inode, and write-through all behave.
-        let (old_parent, old_name) = self.resolve(old_rel, false, false)?;
-        let (new_parent, new_name) = self.resolve(new_rel, false, false)?;
-        let cold = cstr(&old_name)?;
-        let cnew = cstr(&new_name)?;
-        raw_linkat(old_parent.as_raw_fd(), &cold, new_parent.as_raw_fd(), &cnew)
+/// `ENOSPC`.
+fn enospc() -> io::Error {
+    io::Error::from_raw_os_error(28)
+}
+
+/// Whether the host filesystem holding `path` is down to its last 5% of space
+/// (at most 1 GiB of that) or inodes. If it can't be told, it's assumed fine: the
+/// host will still report a truly full disk itself.
+fn host_is_low_on_space(path: &Path) -> bool {
+    let Ok(cpath) = CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    // `struct statvfs`, whose start is all we read: f_bsize, f_frsize, then
+    // f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_favail. Those last six are
+    // 64-bit on Linux and 32-bit on macOS. Oversized for either's whole struct.
+    let mut buf = [0u64; 64];
+    // SAFETY: `cpath` is NUL-terminated, and `buf` is larger than `struct statvfs`
+    // on every target here; the callee only writes within that struct.
+    if unsafe { statvfs(cpath.as_ptr(), buf.as_mut_ptr().cast()) } != 0 {
+        return false;
     }
+    let frsize = buf[1];
+    #[cfg(target_os = "linux")]
+    let (blocks, bavail, files, favail) = (buf[2], buf[4], buf[5], buf[7]);
+    #[cfg(target_os = "macos")]
+    let (blocks, bavail, files, favail) = {
+        let field = |i: usize| {
+            let word = buf[2 + i / 2];
+            if i % 2 == 0 {
+                word & 0xffff_ffff
+            } else {
+                word >> 32
+            }
+        };
+        (field(0), field(2), field(3), field(5))
+    };
+    let reserve = (blocks.saturating_mul(frsize) / 20).min(1 << 30);
+    bavail.saturating_mul(frsize) < reserve || (files > 0 && favail < files / 20)
 }
 
 #[cfg(test)]
@@ -1044,6 +1197,82 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn with_quota(tag: &str, limit: u64) -> (TempDir, Passthrough, Arc<Quota>) {
+        let tmp = TempDir::new(tag);
+        let mut pt = Passthrough::new(tmp.0.clone());
+        let quota = Quota::new(limit);
+        pt.attach_disk_quota(&quota);
+        (tmp, pt, quota)
+    }
+
+    #[test]
+    fn writes_past_the_disk_quota_fail_and_nothing_reaches_the_host() {
+        let (_tmp, mut pt, quota) = with_quota("quota-write", 64 * 1024);
+        pt.create("f", 0o644).unwrap();
+        pt.write_at("f", 0, &vec![0; 1024]).unwrap();
+        let err = pt.write_at("f", 1024, &vec![0; 1 << 20]).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(28));
+        assert_eq!(pt.stat("f").unwrap().size, 1024);
+        assert_eq!(quota.used(), 1024 + ENTRY_COST);
+        // Overwriting in place uses no more disk.
+        pt.write_at("f", 0, &vec![1; 1024]).unwrap();
+        assert_eq!(quota.used(), 1024 + ENTRY_COST);
+    }
+
+    #[test]
+    fn truncate_is_charged_and_refunded() {
+        let (_tmp, mut pt, quota) = with_quota("quota-truncate", 64 * 1024);
+        pt.create("f", 0o644).unwrap();
+        pt.truncate("f", 8192).unwrap();
+        assert_eq!(quota.used(), 8192 + ENTRY_COST);
+        assert_eq!(
+            pt.truncate("f", 1 << 40).unwrap_err().raw_os_error(),
+            Some(28)
+        );
+        assert_eq!(pt.stat("f").unwrap().size, 8192);
+        pt.truncate("f", 0).unwrap();
+        assert_eq!(quota.used(), ENTRY_COST);
+    }
+
+    #[test]
+    fn deleting_refunds_only_when_the_last_name_goes() {
+        let (_tmp, mut pt, quota) = with_quota("quota-unlink", 1 << 20);
+        pt.create("f", 0o644).unwrap();
+        pt.write_at("f", 0, &vec![0; 4096]).unwrap();
+        pt.link("f", "g").unwrap();
+        let held = quota.used();
+        pt.unlink("f").unwrap();
+        assert_eq!(quota.used(), held - ENTRY_COST, "the data is still there");
+        pt.unlink("g").unwrap();
+        assert_eq!(quota.used(), 0);
+    }
+
+    #[test]
+    fn entries_cannot_be_created_without_bound() {
+        let (_tmp, mut pt, quota) = with_quota("quota-entries", 3 * ENTRY_COST);
+        pt.mkdir("d", 0o755).unwrap();
+        pt.create("f", 0o644).unwrap();
+        pt.symlink("t", "l").unwrap();
+        let full = |r: io::Result<()>| r.unwrap_err().raw_os_error() == Some(28);
+        assert!(full(pt.create("g", 0o644)));
+        assert!(full(pt.mkdir("e", 0o755)));
+        assert!(full(pt.link("f", "h")));
+        pt.rmdir("d").unwrap();
+        pt.mkdir("e", 0o755).unwrap();
+        // A failed create gives its charge back.
+        pt.rmdir("e").unwrap();
+        assert_eq!(pt.mkdir("f", 0o755).unwrap_err().raw_os_error(), Some(17));
+        assert_eq!(quota.used(), 2 * ENTRY_COST);
+    }
+
+    #[test]
+    fn the_host_free_space_check_runs_here() {
+        // This filesystem has room: the guard must not refuse.
+        let tmp = TempDir::new("low-space");
+        assert!(!host_is_low_on_space(&tmp.0));
+        assert!(!host_is_low_on_space(Path::new("/no/such/path")));
     }
 
     #[test]

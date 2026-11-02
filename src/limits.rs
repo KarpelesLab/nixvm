@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// VM-wide resource ceilings. See [`Limits::for_this_host`] for the defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,13 +22,26 @@ pub struct Limits {
     /// File descriptors open at once across the whole VM, on top of each
     /// process's own `RLIMIT_NOFILE`. Opening more fails with `ENFILE`.
     pub open_files: u32,
+    /// How much the guest may grow what it stores in host directories, in bytes.
+    /// Past this, writes there fail with `ENOSPC`. Whatever this says, a guest
+    /// can't take a host filesystem below its last 5% of space or inodes.
+    pub disk_bytes: u64,
+    /// CPU time the whole VM may use across all tasks, or `None` for no limit.
+    /// When it runs out every guest task is killed.
+    pub cpu_time: Option<Duration>,
+    /// How long the VM may run from its first use, or `None` for no limit. When
+    /// it runs out every guest task is killed.
+    pub wall_time: Option<Duration>,
 }
 
 impl Limits {
     /// Sensible defaults for the machine this runs on: a quarter of its RAM for
     /// kernel memory, at most 8 GiB and at least 256 MiB, 4096 tasks and 262144 open
     /// files. Each can be overridden with `NIXVM_LIMIT_KERNEL_MEMORY` (bytes),
-    /// `NIXVM_LIMIT_TASKS` or `NIXVM_LIMIT_OPEN_FILES`.
+    /// `NIXVM_LIMIT_TASKS` or `NIXVM_LIMIT_OPEN_FILES`. Disk, CPU time and run time
+    /// have no default limit, since a host can't guess what a job needs, and can be
+    /// set with `NIXVM_LIMIT_DISK_BYTES`, `NIXVM_LIMIT_CPU_SECONDS` and
+    /// `NIXVM_LIMIT_WALL_SECONDS`.
     #[must_use]
     pub fn for_this_host() -> Self {
         const MIB: u64 = 1024 * 1024;
@@ -37,6 +51,9 @@ impl Limits {
             tasks: env_u64("NIXVM_LIMIT_TASKS").map_or(4096, |n| n.min(1 << 22) as u32),
             open_files: env_u64("NIXVM_LIMIT_OPEN_FILES")
                 .map_or(1 << 18, |n| n.min(u64::from(u32::MAX)) as u32),
+            disk_bytes: env_u64("NIXVM_LIMIT_DISK_BYTES").unwrap_or(u64::MAX),
+            cpu_time: env_u64("NIXVM_LIMIT_CPU_SECONDS").map(Duration::from_secs),
+            wall_time: env_u64("NIXVM_LIMIT_WALL_SECONDS").map(Duration::from_secs),
         }
     }
 }
