@@ -210,6 +210,16 @@ const SO_LINGER: u64 = 13;
 const SO_REUSEPORT: u64 = 15;
 const SO_RCVTIMEO: u64 = 20;
 const SO_SNDTIMEO: u64 = 21;
+/// Which of a socket's two timeouts governs a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SockDirection {
+    Receive,
+    Send,
+}
+
+const SO_RCVTIMEO_NEW: u64 = 66;
+const SO_SNDTIMEO_NEW: u64 = 67;
+const SO_PRIORITY: u64 = 12;
 const SO_ACCEPTCONN: u64 = 30;
 const SO_PROTOCOL: u64 = 38;
 const SO_DOMAIN: u64 = 39;
@@ -316,9 +326,11 @@ const TUN_IFINDEX: i32 = 2;
 pub(super) struct Net {
     socks: Vec<Sock>,
     /// AF_UNIX path, or `"tcp4:port"`/`"tcp6:port"` -> listening slot.
-    listeners: BTreeMap<String, usize>,
+    listeners: BTreeMap<String, Vec<usize>>,
+    /// Picks the next member of a `SO_REUSEPORT` listener group, round robin.
+    next_listener: usize,
     /// `"udp4:port"`/`"udp6:port"` -> bound `Dgram` slot.
-    dgram_ports: BTreeMap<String, usize>,
+    pub(super) dgram_ports: BTreeMap<String, Vec<usize>>,
     /// AF_UNIX filesystem path -> bound datagram slot (e.g. syslog's /dev/log).
     dgram_paths: BTreeMap<String, usize>,
     /// Host-egress backend. `None` = loopback-only (the default, and the only
@@ -335,6 +347,7 @@ impl std::fmt::Debug for Net {
         f.debug_struct("Net")
             .field("socks", &self.socks)
             .field("listeners", &self.listeners)
+            .field("next_listener", &self.next_listener)
             .field("dgram_ports", &self.dgram_ports)
             .field("dgram_paths", &self.dgram_paths)
             .field("egress", &self.egress.is_some())
@@ -360,8 +373,8 @@ struct Sock {
 }
 
 /// The mutable `setsockopt`-controlled state of a socket, plus `SO_ERROR`.
-/// Only `reuseaddr` has an observable effect on this virtual loopback (it
-/// relaxes `bind`'s `EADDRINUSE` check); the rest are stored and echoed back
+/// [`Kernel::sys_setsockopt`] says which of these change behavior; the rest are
+/// stored and echoed back
 /// by `getsockopt` for compatibility with guest code that sets/reads them,
 /// since there is no real transport here to actually tune. The many
 /// independent `bool` flags genuinely are independent `setsockopt` knobs
@@ -709,7 +722,10 @@ impl Net {
         let old = std::mem::replace(&mut self.socks[sock].kind, Kind::Idle { bound: None });
         match old {
             Kind::Listener { backlog, .. } => {
-                self.listeners.retain(|_, &mut i| i != sock);
+                self.listeners.retain(|_, group| {
+                    group.retain(|&i| i != sock);
+                    !group.is_empty()
+                });
                 for pending in backlog {
                     if let Some(Kind::Pair(p)) = self.socks.get_mut(pending).map(|s| &mut s.kind) {
                         p.refs[1] = 0;
@@ -717,6 +733,10 @@ impl Net {
                 }
             }
             Kind::Host(mut h) if !h.wr_shut => h.conn.shutdown_write(),
+            Kind::Dgram(_) => self.dgram_ports.retain(|_, group| {
+                group.retain(|&i| i != sock);
+                !group.is_empty()
+            }),
             _ => {}
         }
     }
@@ -724,24 +744,69 @@ impl Net {
     /// True if some *other* socket already occupies `proto`/`a`'s port.
     fn addr_in_use(&self, proto: &str, a: InetAddr, exclude: usize) -> bool {
         let key = route_key(proto, a);
+        // `exclude` is out of range when probing for a free ephemeral port, on
+        // behalf of no socket: then nothing has opted in to sharing.
+        let (my_reuseaddr, my_reuseport) = self
+            .socks
+            .get(exclude)
+            .map_or((false, false), |s| (s.opts.reuseaddr, s.opts.reuseport));
         self.socks.iter().enumerate().any(|(i, s)| {
             if i == exclude {
                 return false;
             }
-            match &s.kind {
+            let (same_addr, listening) = match &s.kind {
                 Kind::Idle {
                     bound: Some(Addr::Inet(b)),
-                } if proto == "tcp" => route_key("tcp", *b) == key,
+                } if proto == "tcp" => (route_key("tcp", *b) == key, false),
                 Kind::Listener {
                     addr: Some(Addr::Inet(b)),
                     ..
-                } if proto == "tcp" => route_key("tcp", *b) == key,
+                } if proto == "tcp" => (route_key("tcp", *b) == key, true),
                 Kind::Dgram(d) if proto == "udp" => {
-                    d.local.is_some_and(|b| route_key("udp", b) == key)
+                    (d.local.is_some_and(|b| route_key("udp", b) == key), false)
                 }
-                _ => false,
-            }
+                _ => (false, false),
+            };
+            // Linux's rule: both sockets must have opted in. SO_REUSEPORT shares
+            // a port outright; SO_REUSEADDR never shares one with a listener.
+            same_addr
+                && !(my_reuseport && s.opts.reuseport)
+                && !(my_reuseaddr && s.opts.reuseaddr && !listening)
         })
+    }
+
+    /// Whether another socket already listens on `a`'s port in a way that
+    /// stops `sock` from listening there too.
+    fn listen_conflict(&self, a: InetAddr, sock: usize) -> bool {
+        let reuseport = self.socks[sock].opts.reuseport;
+        self.listeners
+            .get(&route_key("tcp", a))
+            .is_some_and(|group| {
+                group
+                    .iter()
+                    .any(|&i| i != sock && !(reuseport && self.socks[i].opts.reuseport))
+            })
+    }
+
+    /// The listener a new connection to `key` goes to: the next in turn if a
+    /// `SO_REUSEPORT` group is sharing the port.
+    fn pick_listener(&mut self, key: &str) -> Option<usize> {
+        let group = self.listeners.get(key)?;
+        let chosen = *group.get(self.next_listener % group.len())?;
+        self.next_listener = self.next_listener.wrapping_add(1);
+        Some(chosen)
+    }
+
+    /// The socket a datagram from `src_port` to `key` goes to. A `SO_REUSEPORT`
+    /// group spreads by source, so one flow stays on one socket; otherwise the
+    /// most recent bind wins, as it does with `SO_REUSEADDR` on Linux.
+    fn pick_dgram_target(&self, key: &str, src_port: u16) -> Option<usize> {
+        let group = self.dgram_ports.get(key)?;
+        if group.iter().all(|&i| self.socks[i].opts.reuseport) {
+            group.get(usize::from(src_port) % group.len()).copied()
+        } else {
+            group.last().copied()
+        }
     }
 
     /// The lowest free port >= 32768 for `proto`/`v6` (the standard Linux
@@ -814,7 +879,10 @@ impl Kernel {
         if let Kind::Dgram(d) = &mut net.socks[sock].kind {
             d.local = Some(local);
         }
-        net.dgram_ports.insert(route_key("udp", local), sock);
+        net.dgram_ports
+            .entry(route_key("udp", local))
+            .or_default()
+            .push(sock);
         local
     }
 
@@ -1046,7 +1114,7 @@ impl Kernel {
                     return err(Errno::EINVAL);
                 }
                 if !a.valid_bind() {
-                    return err(Errno::EINVAL); // real errno: EADDRNOTAVAIL
+                    return err(Errno::EADDRNOTAVAIL);
                 }
                 let proto = match &net.socks[sock].kind {
                     Kind::Idle { .. } => "tcp",
@@ -1055,8 +1123,8 @@ impl Kernel {
                 };
                 if a.port == 0 {
                     a.port = net.ephemeral_port(proto, a.v6);
-                } else if !net.socks[sock].opts.reuseaddr && net.addr_in_use(proto, a, sock) {
-                    return err(Errno::EINVAL); // real errno: EADDRINUSE
+                } else if net.addr_in_use(proto, a, sock) {
+                    return err(Errno::EADDRINUSE);
                 }
                 match &mut net.socks[sock].kind {
                     Kind::Idle { bound } => *bound = Some(Addr::Inet(a)),
@@ -1064,7 +1132,9 @@ impl Kernel {
                     _ => return err(Errno::EINVAL),
                 }
                 if proto == "udp" {
-                    net.dgram_ports.insert(route_key("udp", a), sock);
+                    let group = net.dgram_ports.entry(route_key("udp", a)).or_default();
+                    group.retain(|&i| i != sock);
+                    group.push(sock);
                 }
                 0
             }
@@ -1098,12 +1168,19 @@ impl Kernel {
             Some(Addr::Inet(a)) => Some(route_key("tcp", *a)),
             None => None,
         };
+        // Two sockets may share a port with SO_REUSEADDR while they are only
+        // bound, but listening on it is exclusive unless they use SO_REUSEPORT.
+        if let Some(Addr::Inet(a)) = &bound
+            && net.listen_conflict(*a, sock)
+        {
+            return err(Errno::EADDRINUSE);
+        }
         net.socks[sock].kind = Kind::Listener {
             addr: bound,
             backlog: VecDeque::new(),
         };
         if let Some(k) = key {
-            net.listeners.insert(k, sock);
+            net.listeners.entry(k).or_default().push(sock);
         }
         0
     }
@@ -1203,7 +1280,7 @@ impl Kernel {
             Addr::Unix(p) => p.clone(),
             Addr::Inet(a) => route_key("tcp", *a),
         };
-        let Some(&lidx) = net.listeners.get(&key) else {
+        let Some(lidx) = net.pick_listener(&key) else {
             return err(Errno::ECONNREFUSED);
         };
         let listener_addr = match &net.socks[lidx].kind {
@@ -1278,6 +1355,16 @@ impl Kernel {
                     Ok(up) => !up,
                     Err(e) => return connect_errno(&e),
                 };
+                // Only an explicit choice: a transport's own default stands
+                // for a guest that never asked.
+                let mut conn = conn;
+                if net.socks[sock]
+                    .opts
+                    .extra
+                    .contains_key(&(IPPROTO_TCP, TCP_NODELAY))
+                {
+                    conn.set_nodelay(net.socks[sock].opts.nodelay);
+                }
                 net.socks[sock].kind = Kind::Host(HostSock {
                     conn,
                     peer: dest,
@@ -1488,14 +1575,62 @@ impl Kernel {
         }
     }
 
-    /// `setsockopt(fd, level, optname, optval, optlen)`. `SOL_SOCKET`
-    /// `SO_REUSEADDR` has an observable effect (it relaxes the `bind`
-    /// `EADDRINUSE` check); the rest of the options listed below are stored
-    /// and echoed back by `getsockopt`, since this is a virtual loopback with
-    /// no real transport to actually tune. Any option this module doesn't
-    /// recognize is accepted and silently ignored (returns `0`) rather than
-    /// erroring, matching how a real stack treats a great many `setsockopt`
-    /// calls guest code makes speculatively.
+    /// Apply `SO_RCVTIMEO`/`SO_SNDTIMEO` to a socket call that just returned
+    /// `ret`: if it wants to block on a socket with a timeout, arm the deadline
+    /// on the first pass, and on the re-run after it passes fail with `EAGAIN`,
+    /// as Linux does. Such a call isn't restarted after a signal (signal(7)).
+    pub(super) fn apply_sock_timeout(
+        &self,
+        net: &Net,
+        cx: &mut ServiceCtx,
+        fd: u64,
+        direction: SockDirection,
+        ret: i64,
+    ) -> i64 {
+        let Some((sock, _)) = self.sock_of(cx, fd) else {
+            return ret;
+        };
+        let opts = &net.socks[sock].opts;
+        let raw = match direction {
+            SockDirection::Receive => opts.rcvtimeo,
+            SockDirection::Send => opts.sndtimeo,
+        };
+        let secs = i64::from_le_bytes(raw[0..8].try_into().unwrap());
+        let usecs = i64::from_le_bytes(raw[8..16].try_into().unwrap());
+        let timeout_ns = i128::from(secs) * 1_000_000_000 + i128::from(usecs) * 1_000;
+        if timeout_ns <= 0 {
+            return ret;
+        }
+        if !cx.block {
+            cx.cur.wake_deadline = None;
+            return ret;
+        }
+        cx.restartable = false;
+        let now = super::poll::now_ns();
+        match cx.cur.wake_deadline {
+            Some(deadline) if now >= deadline => {
+                cx.cur.wake_deadline = None;
+                cx.block = false;
+                err(Errno::EAGAIN)
+            }
+            Some(_) => ret,
+            None => {
+                cx.cur.wake_deadline = Some(now + timeout_ns as u128);
+                ret
+            }
+        }
+    }
+
+    /// `setsockopt(fd, level, optname, optval, optlen)`.
+    ///
+    /// These take effect: `SO_REUSEADDR`/`SO_REUSEPORT` (`bind`, `listen` and
+    /// connection routing), `SO_RCVTIMEO`/`SO_SNDTIMEO` (blocking socket calls),
+    /// `TCP_NODELAY` (the real connection), `SO_SNDBUF`/`SO_RCVBUF` (clamped as
+    /// Linux does, though the in-VM queues don't shrink to them).
+    ///
+    /// Other known options are stored and echoed back by `getsockopt` without
+    /// changing how the socket behaves. [`super::sockopt::refused`] lists the
+    /// ones that fail instead, and an option Linux doesn't know is `ENOPROTOOPT`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_setsockopt(
         &self,
@@ -1525,8 +1660,42 @@ impl Kernel {
             }
             return err(Errno::ENOPROTOOPT);
         }
+        if let Some(errno) = super::sockopt::refused(level, optname) {
+            return err(errno);
+        }
         if super::sockopt::is_int(level, optname) && optlen < 4 {
             return err(Errno::EINVAL);
+        }
+        // SO_PRIORITY above 6 needs CAP_NET_ADMIN.
+        if (level, optname) == (SOL_SOCKET, SO_PRIORITY)
+            && mem
+                .read_u32(optval)
+                .is_ok_and(|v| v as i32 > 6 || (v as i32) < 0)
+        {
+            return err(Errno::EPERM);
+        }
+        // A timeout's microseconds must be below one second (EDOM on Linux).
+        let is_timeo = level == SOL_SOCKET
+            && matches!(
+                optname,
+                SO_RCVTIMEO | SO_SNDTIMEO | SO_RCVTIMEO_NEW | SO_SNDTIMEO_NEW
+            );
+        if is_timeo {
+            if optlen < 16 {
+                return err(Errno::EINVAL);
+            }
+            let Ok(usec) = mem.read_u64(optval + 8) else {
+                return err(Errno::EFAULT);
+            };
+            if usec >= 1_000_000 {
+                return err(Errno::EDOM);
+            }
+        }
+        if (level, optname) == (IPPROTO_TCP, TCP_NODELAY)
+            && let Ok(v) = mem.read_u32(optval)
+            && let Kind::Host(h) = &mut net.socks[sock].kind
+        {
+            h.conn.set_nodelay(v != 0);
         }
         let opts = &mut net.socks[sock].opts;
         if optlen <= 256
@@ -1558,12 +1727,12 @@ impl Kernel {
                 }
                 SO_RCVBUF if optlen >= 4 => {
                     if let Ok(v) = mem.read_u32(optval) {
-                        opts.rcvbuf = v;
+                        opts.rcvbuf = super::sockopt::clamp_sock_buf(v);
                     }
                 }
                 SO_SNDBUF if optlen >= 4 => {
                     if let Ok(v) = mem.read_u32(optval) {
-                        opts.sndbuf = v;
+                        opts.sndbuf = super::sockopt::clamp_sock_buf(v);
                     }
                 }
                 SO_LINGER if optlen >= 8 => {
@@ -1572,12 +1741,12 @@ impl Kernel {
                         opts.linger_secs = i32::from_le_bytes([b[4], b[5], b[6], b[7]]);
                     }
                 }
-                SO_RCVTIMEO if optlen >= 16 => {
+                SO_RCVTIMEO | SO_RCVTIMEO_NEW if optlen >= 16 => {
                     if let Ok(b) = mem.read_vec(optval, 16) {
                         opts.rcvtimeo.copy_from_slice(&b);
                     }
                 }
-                SO_SNDTIMEO if optlen >= 16 => {
+                SO_SNDTIMEO | SO_SNDTIMEO_NEW if optlen >= 16 => {
                     if let Ok(b) = mem.read_vec(optval, 16) {
                         opts.sndtimeo.copy_from_slice(&b);
                     }
@@ -1631,9 +1800,14 @@ impl Kernel {
             b[4..8].copy_from_slice(&opts.linger_secs.to_le_bytes());
             return write_optval(mem, optval, optlen_ptr, &b);
         }
-        if level == SOL_SOCKET && (optname == SO_RCVTIMEO || optname == SO_SNDTIMEO) {
+        if level == SOL_SOCKET
+            && matches!(
+                optname,
+                SO_RCVTIMEO | SO_SNDTIMEO | SO_RCVTIMEO_NEW | SO_SNDTIMEO_NEW
+            )
+        {
             let opts = &net.socks[sock].opts;
-            let b = if optname == SO_RCVTIMEO {
+            let b = if matches!(optname, SO_RCVTIMEO | SO_RCVTIMEO_NEW) {
                 opts.rcvtimeo
             } else {
                 opts.sndtimeo
@@ -1853,7 +2027,7 @@ impl Kernel {
         }
         let src = self.ensure_dgram_bound(net, sock);
         let key = route_key("udp", dest);
-        if let Some(&tgt) = net.dgram_ports.get(&key)
+        if let Some(tgt) = net.pick_dgram_target(&key, src.port)
             && let Kind::Dgram(td) = &mut net.socks[tgt].kind
         {
             td.queue.push_back((src, data.to_vec()));
@@ -2879,7 +3053,7 @@ impl Kernel {
             }
             let src = self.ensure_dgram_bound(net, sock);
             let key = route_key("udp", peer);
-            if let Some(&tgt) = net.dgram_ports.get(&key)
+            if let Some(tgt) = net.pick_dgram_target(&key, src.port)
                 && let Kind::Dgram(td) = &mut net.socks[tgt].kind
             {
                 td.queue.push_back((src, data.to_vec()));
@@ -4917,12 +5091,25 @@ mod tests {
         // Without SO_REUSEADDR, binding the same port fails.
         assert_eq!(
             k.sys_bind(&mut k.net.lock().unwrap(), &mut cx, b, addr, 16, &mem),
-            -i64::from(Errno::EINVAL.0)
+            -i64::from(Errno::EADDRINUSE.0)
         );
 
-        // Setting SO_REUSEADDR=1 on b lets the rebind through.
+        // Both sockets have to opt in: SO_REUSEADDR=1 on a, then on b.
         let optval = 0x1_1600;
         mem.write_init(optval, &1u32.to_le_bytes()).unwrap();
+        assert_eq!(
+            k.sys_setsockopt(
+                &mut k.net.lock().unwrap(),
+                &mut cx,
+                a,
+                SOL_SOCKET,
+                SO_REUSEADDR,
+                optval,
+                4,
+                &mem
+            ),
+            0
+        );
         assert_eq!(
             k.sys_setsockopt(
                 &mut k.net.lock().unwrap(),

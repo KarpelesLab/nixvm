@@ -57,6 +57,11 @@ pub trait HostConn: Send + Debug {
     fn poll_connect(&mut self) -> io::Result<bool> {
         Ok(true)
     }
+    /// Apply the guest's `TCP_NODELAY` to the real connection. A transport with
+    /// no such control ignores it.
+    fn set_nodelay(&mut self, nodelay: bool) {
+        let _ = nodelay;
+    }
 }
 
 /// One received datagram: `(source ip, v6, source port, payload)`.
@@ -182,6 +187,9 @@ mod native {
         }
         fn shutdown_write(&mut self) {
             let _ = self.0.shutdown(std::net::Shutdown::Write);
+        }
+        fn set_nodelay(&mut self, nodelay: bool) {
+            let _ = self.0.set_nodelay(nodelay);
         }
         fn poll_readable(&mut self) -> bool {
             // A non-blocking peek: any bytes (or a clean EOF, reported as

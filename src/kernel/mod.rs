@@ -3045,7 +3045,22 @@ impl Kernel {
             | Sysno::Sendmmsg
             | Sysno::Recvmmsg => {
                 let mut net = self.net.lock().unwrap();
-                self.dispatch_net(&mut net, cx, sys, args, mem)
+                let ret = self.dispatch_net(&mut net, cx, sys, args, mem);
+                let direction = match sys {
+                    Sysno::Accept
+                    | Sysno::Accept4
+                    | Sysno::Recvfrom
+                    | Sysno::Recvmsg
+                    | Sysno::Recvmmsg => Some(net::SockDirection::Receive),
+                    Sysno::Sendto | Sysno::Sendmsg | Sysno::Sendmmsg => {
+                        Some(net::SockDirection::Send)
+                    }
+                    _ => None,
+                };
+                match direction {
+                    Some(d) => self.apply_sock_timeout(&net, cx, args[0], d, ret),
+                    None => ret,
+                }
             }
             // pipes-only: `pipe2` just allocates a fresh pipe, holding ONLY
             // `pipes` (the innermost/last lock) — no sh, no vfs, no net.
@@ -5294,7 +5309,8 @@ impl Kernel {
             }
             Some(Fd::Socket { .. }) => {
                 let mut net = self.net.lock().unwrap();
-                self.write_socket_fd(&mut net, cx, fd, buf, count, mem)
+                let ret = self.write_socket_fd(&mut net, cx, fd, buf, count, mem);
+                self.apply_sock_timeout(&net, cx, fd, net::SockDirection::Send, ret)
             }
             Some(Fd::PipeWrite(..)) => {
                 let mut pipes = self.pipes.lock().unwrap();
@@ -5530,7 +5546,8 @@ impl Kernel {
             }
             Some(Fd::Socket { .. }) => {
                 let mut net = self.net.lock().unwrap();
-                self.read_socket_fd(&mut net, cx, fd, buf, count, mem)
+                let ret = self.read_socket_fd(&mut net, cx, fd, buf, count, mem);
+                self.apply_sock_timeout(&net, cx, fd, net::SockDirection::Receive, ret)
             }
             Some(Fd::PipeRead(..)) => {
                 let mut pipes = self.pipes.lock().unwrap();

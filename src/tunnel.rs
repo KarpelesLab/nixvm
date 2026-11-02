@@ -435,6 +435,10 @@ impl TunnelConn {
 }
 
 impl HostConn for TunnelConn {
+    fn set_nodelay(&mut self, nodelay: bool) {
+        let _ = self.conn.set_nodelay(nodelay);
+    }
+
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if !self.pending.is_empty() {
             let n = buf.len().min(self.pending.len());

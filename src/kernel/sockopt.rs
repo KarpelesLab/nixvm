@@ -8,6 +8,13 @@
 //! reports Linux's default when never set. A pair Linux doesn't know is
 //! `ENOPROTOOPT` — and recorded as an unsupported subcommand — rather than a
 //! silent success, so the gap is visible.
+//!
+//! [`refused`] is the policy for the rest: options that would need host
+//! privileges, reach past the sandbox's network boundary, or promise a security
+//! property nixvm doesn't provide. These fail, because a guest told "done" would
+//! go on trusting a filter or a device binding that doesn't exist.
+
+use crate::abi::errno::Errno;
 
 /// `SOL_SOCKET`.
 pub(super) const SOL_SOCKET: u64 = 1;
@@ -45,6 +52,50 @@ pub(super) fn known(level: u64, optname: u64) -> bool {
         SOL_PACKET => (1..=23).contains(&optname),
         _ => false,
     }
+}
+
+/// Why `setsockopt` won't accept `(level, optname)`, or `None` if it will.
+///
+/// `EPERM` is for what an unprivileged container is denied (`CAP_NET_ADMIN`,
+/// `CAP_NET_RAW`), `ENOPROTOOPT` for features the kernel simply lacks here,
+/// which is the answer programs already fall back from.
+#[allow(clippy::match_same_arms)] // a table: grouped by what each option does
+pub(super) fn refused(level: u64, optname: u64) -> Option<Errno> {
+    match (level, optname) {
+        // SO_BINDTODEVICE, SO_SNDBUFFORCE, SO_RCVBUFFORCE, SO_MARK,
+        // SO_BINDTOIFINDEX: device binding, buffer limits, routing marks.
+        (SOL_SOCKET, 25 | 32 | 33 | 36 | 62) => Some(Errno::EPERM),
+        // IP_HDRINCL, IP_ROUTER_ALERT, IP_FREEBIND, IP_IPSEC_POLICY,
+        // IP_XFRM_POLICY, IP_TRANSPARENT: forged headers, spoofed or unowned
+        // addresses, kernel IPsec state.
+        (SOL_IP, 3 | 5 | 15 | 16 | 17 | 19) => Some(Errno::EPERM),
+        // IPV6_ROUTER_ALERT, IPV6_IPSEC_POLICY, IPV6_XFRM_POLICY,
+        // IPV6_TRANSPARENT, IPV6_FREEBIND: the same, for IPv6.
+        (SOL_IPV6, 22 | 34 | 35 | 75 | 78) => Some(Errno::EPERM),
+        // TCP_REPAIR, TCP_REPAIR_QUEUE, TCP_QUEUE_SEQ, TCP_REPAIR_OPTIONS,
+        // TCP_REPAIR_WINDOW, TCP_AO_REPAIR: raw control of connection state.
+        (SOL_TCP, 19..=22 | 29 | 42) => Some(Errno::EPERM),
+        // Socket filters (SO_ATTACH_FILTER, SO_DETACH_FILTER, SO_LOCK_FILTER,
+        // SO_ATTACH_BPF, SO_ATTACH_REUSEPORT_CBPF/EBPF,
+        // SO_DETACH_REUSEPORT_BPF): nothing would run the program, so accepting
+        // one would let unfiltered traffic through a filter the guest trusts.
+        (SOL_SOCKET, 26 | 27 | 44 | 50..=52 | 68) => Some(Errno::ENOPROTOOPT),
+        // TCP_MD5SIG, TCP_ULP, TCP_MD5SIG_EXT, TCP_AO_*: authentication and
+        // kTLS, which nothing here would apply to the wire.
+        (SOL_TCP, 14 | 31 | 32 | 38..=41) => Some(Errno::ENOPROTOOPT),
+        // There are no packet sockets.
+        (SOL_PACKET, _) => Some(Errno::ENOPROTOOPT),
+        _ => None,
+    }
+}
+
+/// The value `SO_SNDBUF`/`SO_RCVBUF` store for a guest's request: Linux caps it
+/// at `net.core.[rw]mem_max` and floors it at half the minimum buffer (the
+/// stored value is doubled on read).
+pub(super) fn clamp_sock_buf(requested: u32) -> u32 {
+    const MEM_MAX: u32 = 212_992;
+    const MIN: u32 = 2304;
+    requested.clamp(MIN, MEM_MAX)
 }
 
 /// Options whose value is an `int` (`optlen < 4` is `EINVAL` on set).
@@ -108,6 +159,7 @@ pub(super) fn default_value(level: u64, optname: u64) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::testutil::{BASE, call, e, setup};
     use super::*;
 
     #[test]
@@ -124,10 +176,245 @@ mod tests {
     }
 
     #[test]
-    fn options_are_stored_defaulted_truncated_or_refused() {
-        use super::super::testutil::{BASE, call, e, setup};
+    fn refused_covers_the_dangerous_options_and_leaves_the_everyday_ones() {
+        // Everyday options stay available.
+        for (level, opt) in [
+            (SOL_SOCKET, 2),  // SO_REUSEADDR
+            (SOL_SOCKET, 15), // SO_REUSEPORT
+            (SOL_SOCKET, 9),  // SO_KEEPALIVE
+            (SOL_SOCKET, 7),  // SO_SNDBUF
+            (SOL_SOCKET, 20), // SO_RCVTIMEO
+            (SOL_TCP, 1),     // TCP_NODELAY
+            (SOL_TCP, 4),     // TCP_KEEPIDLE
+            (SOL_IP, 1),      // IP_TOS
+            (SOL_IP, 2),      // IP_TTL
+            (SOL_IPV6, 26),   // IPV6_V6ONLY
+        ] {
+            assert_eq!(refused(level, opt), None, "({level}, {opt})");
+        }
+        for (level, opt, errno) in [
+            (SOL_SOCKET, 25, Errno::EPERM),       // SO_BINDTODEVICE
+            (SOL_SOCKET, 36, Errno::EPERM),       // SO_MARK
+            (SOL_SOCKET, 33, Errno::EPERM),       // SO_RCVBUFFORCE
+            (SOL_SOCKET, 26, Errno::ENOPROTOOPT), // SO_ATTACH_FILTER
+            (SOL_SOCKET, 50, Errno::ENOPROTOOPT), // SO_ATTACH_BPF
+            (SOL_IP, 3, Errno::EPERM),            // IP_HDRINCL
+            (SOL_IP, 19, Errno::EPERM),           // IP_TRANSPARENT
+            (SOL_IPV6, 75, Errno::EPERM),         // IPV6_TRANSPARENT
+            (SOL_TCP, 19, Errno::EPERM),          // TCP_REPAIR
+            (SOL_TCP, 14, Errno::ENOPROTOOPT),    // TCP_MD5SIG
+            (SOL_TCP, 31, Errno::ENOPROTOOPT),    // TCP_ULP
+            (SOL_PACKET, 1, Errno::ENOPROTOOPT),  // PACKET_ADD_MEMBERSHIP
+        ] {
+            assert_eq!(refused(level, opt), Some(errno), "({level}, {opt})");
+        }
+    }
+
+    /// `socket(AF_INET, ty)`, with `opts` set to 1 at `SOL_SOCKET`, bound to
+    /// loopback `port`.
+    fn bound_socket(h: &mut Harness, ty: u64, opts: &[u64], port: u16) -> (u64, i64) {
         use crate::abi::arch::Sysno;
-        use crate::abi::errno::Errno;
+        let s = h.call(Sysno::Socket, [2, ty, 0, 0, 0, 0]) as u64;
+        h.mem.write(BASE, &1u32.to_le_bytes()).unwrap();
+        for &opt in opts {
+            h.call(Sysno::Setsockopt, [s, SOL_SOCKET, opt, BASE, 4, 0]);
+        }
+        let addr = BASE + 0x100;
+        let mut sa = [0u8; 16];
+        sa[0] = 2; // AF_INET
+        sa[2..4].copy_from_slice(&port.to_be_bytes());
+        sa[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        h.mem.write(addr, &sa).unwrap();
+        (s, h.call(Sysno::Bind, [s, addr, 16, 0, 0, 0]))
+    }
+
+    struct Harness {
+        k: crate::kernel::Kernel,
+        mem: crate::vcpu::GuestMemory,
+        v: super::super::testutil::DummyVcpu,
+        cx: crate::kernel::ServiceCtx,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let (k, mem, v, cx) = setup();
+            Self { k, mem, v, cx }
+        }
+
+        fn call(&mut self, sys: crate::abi::arch::Sysno, args: [u64; 6]) -> i64 {
+            call(&self.k, &mut self.cx, &mut self.mem, &mut self.v, sys, args)
+        }
+    }
+
+    const SO_REUSEADDR: u64 = 2;
+    const SO_REUSEPORT: u64 = 15;
+    const SOCK_STREAM: u64 = 1;
+    const SOCK_DGRAM: u64 = 2;
+
+    #[test]
+    fn dangerous_options_fail_through_the_syscall_and_are_not_stored() {
+        use crate::abi::arch::Sysno;
+        let mut h = Harness::new();
+        let s = h.call(Sysno::Socket, [2, SOCK_STREAM, 0, 0, 0, 0]) as u64;
+        h.mem.write(BASE, &1u32.to_le_bytes()).unwrap();
+        let set =
+            |h: &mut Harness, level, opt| h.call(Sysno::Setsockopt, [s, level, opt, BASE, 4, 0]);
+        assert_eq!(set(&mut h, SOL_SOCKET, 36), e(Errno::EPERM), "SO_MARK");
+        assert_eq!(
+            set(&mut h, SOL_SOCKET, 50),
+            e(Errno::ENOPROTOOPT),
+            "SO_ATTACH_BPF"
+        );
+        assert_eq!(set(&mut h, SOL_TCP, 19), e(Errno::EPERM), "TCP_REPAIR");
+        // Reading back shows it never took.
+        let len = BASE + 0x10;
+        h.mem.write_u64(len, 4).unwrap();
+        h.call(Sysno::Getsockopt, [s, SOL_SOCKET, 36, BASE, len, 0]);
+        assert_eq!(h.mem.read_u32(BASE).unwrap(), 0);
+    }
+
+    #[test]
+    fn so_priority_above_six_needs_privilege() {
+        use crate::abi::arch::Sysno;
+        let mut h = Harness::new();
+        let s = h.call(Sysno::Socket, [2, SOCK_STREAM, 0, 0, 0, 0]) as u64;
+        h.mem.write(BASE, &6u32.to_le_bytes()).unwrap();
+        let args = [s, SOL_SOCKET, 12, BASE, 4, 0];
+        assert_eq!(h.call(Sysno::Setsockopt, args), 0);
+        h.mem.write(BASE, &7u32.to_le_bytes()).unwrap();
+        assert_eq!(h.call(Sysno::Setsockopt, args), e(Errno::EPERM));
+    }
+
+    #[test]
+    fn a_port_is_shared_only_when_both_sockets_opted_in() {
+        let mut h = Harness::new();
+        let port = 9700;
+        assert_eq!(bound_socket(&mut h, SOCK_STREAM, &[], port).1, 0);
+        for opts in [&[][..], &[SO_REUSEADDR], &[SO_REUSEPORT]] {
+            assert_eq!(
+                bound_socket(&mut h, SOCK_STREAM, opts, port).1,
+                e(Errno::EADDRINUSE),
+                "the first socket didn't opt in ({opts:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn reuseaddr_shares_a_port_only_until_someone_listens() {
+        use crate::abi::arch::Sysno;
+        let mut h = Harness::new();
+        let (port, opts) = (9701, &[SO_REUSEADDR][..]);
+        let (a, r) = bound_socket(&mut h, SOCK_STREAM, opts, port);
+        assert_eq!(r, 0);
+        let (b, r) = bound_socket(&mut h, SOCK_STREAM, opts, port);
+        assert_eq!(r, 0);
+        assert_eq!(h.call(Sysno::Listen, [a, 8, 0, 0, 0, 0]), 0);
+        assert_eq!(
+            h.call(Sysno::Listen, [b, 8, 0, 0, 0, 0]),
+            e(Errno::EADDRINUSE)
+        );
+        assert_eq!(
+            bound_socket(&mut h, SOCK_STREAM, opts, port).1,
+            e(Errno::EADDRINUSE),
+            "no binding over a listener"
+        );
+    }
+
+    #[test]
+    fn reuseport_listeners_take_turns_accepting() {
+        use crate::abi::arch::Sysno;
+        let mut h = Harness::new();
+        let (port, opts) = (9702, &[SO_REUSEPORT][..]);
+        let (a, r) = bound_socket(&mut h, SOCK_STREAM, opts, port);
+        assert_eq!(r, 0);
+        let (b, r) = bound_socket(&mut h, SOCK_STREAM, opts, port);
+        assert_eq!(r, 0);
+        assert_eq!(h.call(Sysno::Listen, [a, 8, 0, 0, 0, 0]), 0);
+        assert_eq!(h.call(Sysno::Listen, [b, 8, 0, 0, 0, 0]), 0);
+        let addr = BASE + 0x100;
+        for _ in 0..4 {
+            let c = h.call(Sysno::Socket, [2, SOCK_STREAM, 0, 0, 0, 0]) as u64;
+            assert_eq!(h.call(Sysno::Connect, [c, addr, 16, 0, 0, 0]), 0);
+        }
+        // Accept must find two connections waiting on each listener.
+        for s in [a, b] {
+            for _ in 0..2 {
+                assert!(h.call(Sysno::Accept4, [s, 0, 0, 0, 0, 0]) >= 0);
+                assert!(!h.cx.block);
+            }
+            h.call(Sysno::Accept4, [s, 0, 0, 0, 0, 0]);
+            assert!(h.cx.block, "and no more than two");
+            h.cx.block = false;
+        }
+    }
+
+    #[test]
+    fn closing_a_udp_socket_frees_its_port_in_the_routing_table() {
+        use crate::abi::arch::Sysno;
+        let mut h = Harness::new();
+        let port = 9703;
+        let (a, r) = bound_socket(&mut h, SOCK_DGRAM, &[], port);
+        assert_eq!(r, 0);
+        assert_eq!(h.call(Sysno::Close, [a, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(bound_socket(&mut h, SOCK_DGRAM, &[], port).1, 0);
+        assert_eq!(h.k.net.lock().unwrap().dgram_ports.len(), 1);
+    }
+
+    #[test]
+    fn recv_with_so_rcvtimeo_blocks_until_the_deadline_then_fails() {
+        use crate::abi::arch::Sysno;
+        let mut h = Harness::new();
+        let (s, r) = bound_socket(&mut h, SOCK_DGRAM, &[], 9704);
+        assert_eq!(r, 0);
+        let tv = BASE + 0x200;
+        h.mem.write_u64(tv, 5).unwrap(); // 5 s
+        h.mem.write_u64(tv + 8, 0).unwrap();
+        let set = [s, SOL_SOCKET, 20, tv, 16, 0];
+        assert_eq!(h.call(Sysno::Setsockopt, set), 0);
+
+        let recv = [s, BASE, 1, 0, 0, 0];
+        assert_eq!(h.call(Sysno::Recvfrom, recv), 0);
+        assert!(h.cx.block, "parks for now");
+        assert!(!h.cx.restartable, "a timed socket call isn't restarted");
+        let deadline = h.cx.cur.wake_deadline.expect("armed");
+
+        // Re-run before the deadline: same deadline, still parked.
+        h.cx.block = false;
+        assert_eq!(h.call(Sysno::Recvfrom, recv), 0);
+        assert!(h.cx.block);
+        assert_eq!(h.cx.cur.wake_deadline, Some(deadline));
+
+        // Re-run after it.
+        h.cx.block = false;
+        h.cx.cur.wake_deadline = Some(0);
+        assert_eq!(h.call(Sysno::Recvfrom, recv), e(Errno::EAGAIN));
+        assert!(!h.cx.block);
+        assert_eq!(h.cx.cur.wake_deadline, None);
+    }
+
+    #[test]
+    fn a_timeout_with_bad_microseconds_is_edom() {
+        use crate::abi::arch::Sysno;
+        let mut h = Harness::new();
+        let s = h.call(Sysno::Socket, [2, SOCK_DGRAM, 0, 0, 0, 0]) as u64;
+        h.mem.write_u64(BASE, 0).unwrap();
+        h.mem.write_u64(BASE + 8, 1_000_000).unwrap();
+        assert_eq!(
+            h.call(Sysno::Setsockopt, [s, SOL_SOCKET, 20, BASE, 16, 0]),
+            e(Errno::EDOM)
+        );
+    }
+
+    #[test]
+    fn socket_buffers_are_clamped_like_linux() {
+        assert_eq!(clamp_sock_buf(1), 2304);
+        assert_eq!(clamp_sock_buf(65_536), 65_536);
+        assert_eq!(clamp_sock_buf(u32::MAX), 212_992);
+    }
+
+    #[test]
+    fn options_are_stored_defaulted_truncated_or_refused() {
+        use crate::abi::arch::Sysno;
         let (k, mut mem, mut v, mut cx) = setup();
         // A TCP socket (AF_INET, SOCK_STREAM).
         let s = call(
