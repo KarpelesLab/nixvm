@@ -127,6 +127,88 @@ impl SigHand {
     }
 }
 
+/// A process's resource limits and the CPU time they're measured against. Like
+/// [`SigHand`], cloning the handle shares it: limits belong to the whole thread
+/// group, so a thread's `setrlimit` applies to its siblings, and a thread's CPU
+/// time counts for all of them. A new process gets [`RLimits::private_copy`].
+#[derive(Clone, Debug)]
+struct RLimits(Arc<RLimitState>);
+
+#[derive(Debug)]
+struct RLimitState {
+    /// `(soft, hard)` for each resource.
+    limits: Mutex<[(u64, u64); sys_misc::RLIM_NLIMITS]>,
+    /// CPU time used by the thread group, in nanoseconds.
+    cpu_ns: AtomicU64,
+    /// When `RLIMIT_CPU`'s next `SIGXCPU` is due, in nanoseconds of CPU time.
+    next_xcpu_ns: AtomicU64,
+}
+
+impl Default for RLimits {
+    fn default() -> Self {
+        Self::with_limits(sys_misc::default_rlimits())
+    }
+}
+
+impl RLimits {
+    fn with_limits(limits: [(u64, u64); sys_misc::RLIM_NLIMITS]) -> Self {
+        Self(Arc::new(RLimitState {
+            limits: Mutex::new(limits),
+            cpu_ns: AtomicU64::new(0),
+            next_xcpu_ns: AtomicU64::new(0),
+        }))
+    }
+
+    /// `(soft, hard)` for `resource`, which must be below `RLIM_NLIMITS`.
+    fn get(&self, resource: u64) -> (u64, u64) {
+        self.0.limits.lock().unwrap()[resource as usize]
+    }
+
+    /// The soft limit for `resource`.
+    fn soft(&self, resource: u64) -> u64 {
+        self.get(resource).0
+    }
+
+    fn set(&self, resource: u64, limit: (u64, u64)) {
+        self.0.limits.lock().unwrap()[resource as usize] = limit;
+    }
+
+    /// The same limits, for a new process: its CPU time starts from zero.
+    fn private_copy(&self) -> Self {
+        Self::with_limits(*self.0.limits.lock().unwrap())
+    }
+
+    /// Add `ns` of CPU time and say which signal `RLIMIT_CPU` now calls for:
+    /// `SIGKILL` past the hard limit, and past the soft limit `SIGXCPU` once per
+    /// second of CPU time used.
+    fn charge_cpu(&self, ns: u64) -> Option<u64> {
+        const NS_PER_SEC: u64 = 1_000_000_000;
+        let used = self
+            .0
+            .cpu_ns
+            .fetch_add(ns, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(ns);
+        let (soft, hard) = self.get(sys_misc::RLIMIT_CPU);
+        if hard != sys_misc::RLIM_INFINITY && used / NS_PER_SEC >= hard {
+            return Some(9); // SIGKILL
+        }
+        if soft == sys_misc::RLIM_INFINITY || used / NS_PER_SEC < soft {
+            return None;
+        }
+        let due = self
+            .0
+            .next_xcpu_ns
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if used < due {
+            return None;
+        }
+        self.0
+            .next_xcpu_ns
+            .store(used + NS_PER_SEC, std::sync::atomic::Ordering::Relaxed);
+        Some(SIGXCPU)
+    }
+}
+
 /// Per-process kernel-side state (swapped into `Kernel::cur` while running).
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -217,6 +299,8 @@ struct ProcInfo {
     /// flags, restorer, and mask from `rt_sigaction`). Indexed by signal number
     /// (1..=64); index 0 is unused.
     handlers: SigHand,
+    /// Resource limits (see [`RLimits`]).
+    rlimits: RLimits,
     /// Alternate signal stack (`sigaltstack`): `(base, size, flags)`. A handler
     /// registered `SA_ONSTACK` runs here instead of the interrupted stack —
     /// which is exactly how a runtime catches its own stack-overflow fault.
@@ -432,6 +516,7 @@ impl Default for ProcInfo {
             continued: false,
             stop_reported: false,
             handlers: SigHand::default(),
+            rlimits: RLimits::default(),
             altstack: (0, 0, SS_DISABLE),
             blocked: 0,
             pending: 0,
@@ -673,6 +758,10 @@ const SIGPIPE: u64 = 13;
 /// Sent to a process's parent when a child terminates (so a blocked `wait`
 /// wakes to reap it).
 const SIGCHLD: u64 = 17;
+/// `RLIMIT_CPU`'s soft limit was passed.
+const SIGXCPU: u64 = 24;
+/// A write went past `RLIMIT_FSIZE`.
+const SIGXFSZ: u64 = 25;
 
 // ---- clone(2)/clone3(2) flags (asm-generic; identical on x86-64 & aarch64) ---
 // The child's termination signal is the low byte of `clone`'s `flags` (or
@@ -1370,7 +1459,6 @@ pub(super) struct Shared {
     /// soft)` marking fds cloexec — so the hard cap must be *bounded* or that
     /// loop runs to `1<<20`. A `setrlimit` that always "succeeds" made node
     /// conclude it could raise the limit to a million fds and spin there.
-    rlimit_nofile: (u64, u64),
     /// Monotonic counter for `memfd_create` backing-file names.
     memfd_seq: u64,
     /// The process file-creation mask (`umask`); global for our single session.
@@ -1810,7 +1898,6 @@ impl Kernel {
                 stdout: Box::new(std::io::stdout()),
                 stderr: Box::new(std::io::stderr()),
                 rng_state: 0,
-                rlimit_nofile: (1024, 4096),
                 memfd_seq: 0,
                 umask: 0o022,
                 unsupported: BTreeMap::new(),
@@ -2281,6 +2368,7 @@ impl Kernel {
                 .saturating_sub(step_start);
             cx.cur.cpu_ns = cx.cur.cpu_ns.saturating_add(delta);
             charge_vruntime(&mut cx.cur, delta);
+            Self::charge_cpu_time(cx, delta);
             match flow {
                 Serviced::SetRet => {
                     // The result was already written to the vcpu inside `service`
@@ -2909,6 +2997,7 @@ impl Kernel {
             .saturating_sub(step_start);
         cx.cur.cpu_ns = cx.cur.cpu_ns.saturating_add(delta);
         charge_vruntime(&mut cx.cur, delta);
+        Self::charge_cpu_time(&mut cx, delta);
         {
             let mut sh = self.shared.lock().unwrap();
             // Fold in what other workers did to the stand-in meanwhile: signals
@@ -2990,6 +3079,9 @@ impl Kernel {
     fn grow_stack(&self, cx: &mut ServiceCtx, addr: u64, mem: &mut GuestMemory) -> bool {
         let stack_top = mem.base() + mem.size();
         if addr < cx.cur.stack_limit || addr >= stack_top {
+            return false;
+        }
+        if stack_top - addr > cx.cur.rlimits.soft(sys_misc::RLIMIT_STACK) {
             return false;
         }
         // Only grow genuinely-unmapped pages (a fault on a mapped stack page is
@@ -3100,8 +3192,7 @@ impl Kernel {
             Sysno::Dup2 | Sysno::Dup3 => 0,
             _ => return None,
         };
-        let sh = self.shared.lock().unwrap();
-        let soft = sh.rlimit_nofile.0;
+        let soft = cx.cur.rlimits.soft(sys_misc::RLIMIT_NOFILE);
         if matches!(sys, Sysno::Dup2 | Sysno::Dup3) {
             return (args[1] >= soft).then(|| err(Errno::EBADF));
         }
@@ -3113,6 +3204,7 @@ impl Kernel {
         }
         // Across the VM. The running tasks' own tables are checked out of this
         // list, which only ever makes the count a little low.
+        let sh = self.shared.lock().unwrap();
         let open: usize = sh.file_tables.iter().flatten().map(FdTable::len).sum();
         let limit = self
             .max_open_files
@@ -4090,11 +4182,11 @@ impl Kernel {
             // nixvm's file mappings are private copies, so the call can only be
             // refused as for any other mapping.
             Sysno::PkeyFree | Sysno::RemapFilePages => err(Errno::EINVAL),
-            Sysno::Prlimit64 => self.sys_prlimit64(sh, args[1], args[2], args[3], mem),
-            Sysno::Getrlimit => self.sys_getrlimit(sh, args[0], args[1], mem),
-            // setrlimit(resource, rlim) is prlimit64 on the caller without the
-            // old-value output (so RLIMIT_NOFILE is tracked either way).
-            Sysno::Setrlimit => self.sys_prlimit64(sh, args[0], args[1], 0, mem),
+            Sysno::Prlimit64 => {
+                self.sys_prlimit64(sh, cx, args[0] as i32, args[1], args[2], args[3], mem)
+            }
+            Sysno::Getrlimit => self.sys_prlimit64(sh, cx, 0, args[0], 0, args[1], mem),
+            Sysno::Setrlimit => self.sys_prlimit64(sh, cx, 0, args[0], args[1], 0, mem),
             Sysno::Prctl => self.sys_prctl(cx, args, mem),
             // getpriority returns the kernel ABI value 20 - nice (glibc converts
             // it back to the nice value); setpriority records the nice.
@@ -4240,6 +4332,15 @@ impl Kernel {
         // Resources first, before anything changes: a task that can't be created
         // fails with EAGAIN and leaves the caller exactly as it was.
         sh.reap_unwaited_zombies(cx);
+        // RLIMIT_NPROC counts every task of the user. Root is exempt, as on Linux.
+        if cx.cur.creds.ruid != 0 {
+            let uid = cx.cur.creds.ruid;
+            let tasks = sh.procs.iter().flatten();
+            let mine = tasks.filter(|p| p.info.creds.ruid == uid).count() as u64;
+            if mine + 1 >= cx.cur.rlimits.soft(sys_misc::RLIMIT_NPROC) {
+                return err(Errno::EAGAIN);
+            }
+        }
         let max_tasks = self.max_tasks.load(std::sync::atomic::Ordering::Relaxed);
         if sh.procs.iter().flatten().count() >= max_tasks {
             return err(Errno::EAGAIN);
@@ -4333,6 +4434,10 @@ impl Kernel {
             info.is_thread = false;
             // The termination signal is the low byte of `flags` (SIGCHLD for fork).
             info.exit_signal = (ca.exit_signal & 0xff) as u8;
+        }
+        // Limits belong to the thread group, so only a new process gets its own.
+        if !is_thread {
+            info.rlimits = info.rlimits.private_copy();
         }
         // `cx.cur.clone()` above shares the handler table, which is what
         // CLONE_SIGHAND asks for. Anything else gets its own copy.
@@ -5776,7 +5881,12 @@ impl Kernel {
         } else {
             offset
         };
-        match self.vfs_write(vfs, &path, write_off, &data) {
+        let allowed = match self.fsize_allows(cx, write_off, data.len() as u64) {
+            Ok(n) => n as usize,
+            Err(e) => return e,
+        };
+        let data = &data[..allowed];
+        match self.vfs_write(vfs, &path, write_off, data) {
             Ok(n) => {
                 ofs.set(write_off + n as u64);
                 n as i64
@@ -6323,6 +6433,10 @@ impl Kernel {
         offset: u64,
         mem: &GuestMemory,
     ) -> i64 {
+        let count = match self.fsize_allows(cx, offset, count) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
         let count = count.min(MAX_RW_COUNT);
         let Some(Fd::File { path, writable, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::ESPIPE);
@@ -6414,6 +6528,9 @@ impl Kernel {
     /// `ftruncate(fd, len)` — resize the file the fd refers to.
     #[allow(clippy::unused_self)]
     fn sys_ftruncate(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, fd: u64, len: u64) -> i64 {
+        if self.fsize_allows(cx, len, 1).is_err() {
+            return err(Errno::EFBIG);
+        }
         let Some(Fd::File { path, writable, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
@@ -6435,6 +6552,9 @@ impl Kernel {
         len: u64,
         mem: &GuestMemory,
     ) -> i64 {
+        if self.fsize_allows(cx, len, 1).is_err() {
+            return err(Errno::EFBIG);
+        }
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
@@ -7029,57 +7149,101 @@ impl Kernel {
         total
     }
 
-    /// The `(soft, hard)` limit pair for `resource`, consulting the tracked
-    /// `RLIMIT_NOFILE` and the fixed values for everything else.
-    #[allow(clippy::unused_self)]
-    fn rlimit_pair(&self, sh: &mut Shared, resource: u64) -> (u64, u64) {
-        if resource == sys_misc::RLIMIT_NOFILE {
-            sh.rlimit_nofile
-        } else {
-            sys_misc::rlimit_for(resource)
-        }
-    }
-
-    /// `prlimit64(pid, resource, new_limit, old_limit)` — report the current
-    /// limit into `old_limit`, then apply `new_limit` (for `RLIMIT_NOFILE`,
-    /// which is the only one we track; the hard limit is capped so a program
-    /// can't raise it into a pathological fd-scan range).
+    /// `prlimit64(pid, resource, new_limit, old_limit)`, and `getrlimit` and
+    /// `setrlimit` by way of it: report the limit into `old_limit`, then apply
+    /// `new_limit`. `pid` 0 is the caller.
+    #[allow(clippy::too_many_arguments, clippy::unused_self)]
     fn sys_prlimit64(
         &self,
         sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        pid: i32,
         resource: u64,
         new_limit: u64,
         old_limit: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        let (cur, max) = self.rlimit_pair(sh, resource);
-        if old_limit != 0 {
-            let r = sys_misc::write_rlimit(mem, old_limit, cur, max);
-            if r < 0 {
-                return r;
-            }
+        if resource >= sys_misc::RLIM_NLIMITS as u64 {
+            return err(Errno::EINVAL);
         }
-        if new_limit != 0 && resource == sys_misc::RLIMIT_NOFILE {
-            let Some((mut new_cur, mut new_max)) = sys_misc::read_rlimit(mem, new_limit) else {
+        let new = if new_limit == 0 {
+            None
+        } else {
+            let Some(new) = sys_misc::read_rlimit(mem, new_limit) else {
                 return err(Errno::EFAULT);
             };
-            new_max = new_max.min(sys_misc::NOFILE_HARD_CAP);
-            new_cur = new_cur.min(new_max);
-            sh.rlimit_nofile = (new_cur, new_max);
+            if new.0 > new.1 {
+                return err(Errno::EINVAL);
+            }
+            Some(new)
+        };
+        let root = cx.cur.creds.euid == 0;
+        let target = if pid == 0 || pid == cx.cur.tgid || pid == cx.cur.pid {
+            cx.cur.rlimits.clone()
+        } else {
+            let Some(p) = sh
+                .procs
+                .iter()
+                .flatten()
+                .find(|p| p.info.pid == pid || p.info.tgid == pid)
+            else {
+                return err(Errno::ESRCH);
+            };
+            if !root && p.info.creds.ruid != cx.cur.creds.ruid {
+                return err(Errno::EPERM);
+            }
+            p.info.rlimits.clone()
+        };
+        let (cur, max) = target.get(resource);
+        if let Some((new_cur, new_max)) = new {
+            // Only privilege raises a hard limit.
+            if new_max > max && !root {
+                return err(Errno::EPERM);
+            }
+            // The fd space stays bounded even for root: node/V8 raise this as far
+            // as it goes and then loop over every possible descriptor.
+            let (new_cur, new_max) = if resource == sys_misc::RLIMIT_NOFILE {
+                let new_max = new_max.min(sys_misc::NOFILE_HARD_CAP);
+                (new_cur.min(new_max), new_max)
+            } else {
+                (new_cur, new_max)
+            };
+            target.set(resource, (new_cur, new_max));
+        }
+        if old_limit != 0 {
+            return sys_misc::write_rlimit(mem, old_limit, cur, max);
         }
         0
     }
 
-    /// `getrlimit(resource, buf)` — report the current limit for `resource`.
-    fn sys_getrlimit(
-        &self,
-        sh: &mut Shared,
-        resource: u64,
-        buf: u64,
-        mem: &mut GuestMemory,
-    ) -> i64 {
-        let (cur, max) = self.rlimit_pair(sh, resource);
-        sys_misc::write_rlimit(mem, buf, cur, max)
+    /// `RLIMIT_FSIZE`: how much of a `count`-byte write at `pos` may proceed. A
+    /// write starting at or past the limit fails with `EFBIG` and raises `SIGXFSZ`.
+    #[allow(clippy::unused_self)]
+    fn fsize_allows(&self, cx: &mut ServiceCtx, pos: u64, count: u64) -> Result<u64, i64> {
+        let limit = cx.cur.rlimits.soft(sys_misc::RLIMIT_FSIZE);
+        if limit == sys_misc::RLIM_INFINITY || count == 0 {
+            return Ok(count);
+        }
+        if pos >= limit {
+            cx.cur.pending |= 1u64 << (SIGXFSZ - 1);
+            return Err(err(Errno::EFBIG));
+        }
+        Ok(count.min(limit - pos))
+    }
+
+    /// `RLIMIT_AS`: whether `len` more bytes of mappings would go over the limit.
+    fn address_space_exceeded(cx: &ServiceCtx, mem: &GuestMemory, len: u64) -> bool {
+        let limit = cx.cur.rlimits.soft(sys_misc::RLIMIT_AS);
+        limit != sys_misc::RLIM_INFINITY && mem.mapped_bytes().saturating_add(len) > limit
+    }
+
+    /// Charge `ns` of CPU time to the current thread group, raising whatever
+    /// `RLIMIT_CPU` calls for.
+    fn charge_cpu_time(cx: &mut ServiceCtx, ns: u128) {
+        let ns = u64::try_from(ns).unwrap_or(u64::MAX);
+        if let Some(sig) = cx.cur.rlimits.charge_cpu(ns) {
+            cx.cur.pending |= 1u64 << (sig - 1);
+        }
     }
 
     /// `ioctl(fd, request, arg)` — only the fd-flag requests that work on any fd
@@ -8233,7 +8397,10 @@ impl Kernel {
             // exclusive, so its page is not yet part of the heap.
             let from = cx.cur.brk.div_ceil(PAGE_SIZE) * PAGE_SIZE;
             let to = addr.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+            let data_limit = cx.cur.rlimits.soft(sys_misc::RLIMIT_DATA);
             if to > cx.cur.heap_limit
+                || to - cx.cur.heap_start > data_limit
+                || Self::address_space_exceeded(cx, mem, to.saturating_sub(from))
                 || (to > from && mem.map(from, to - from, Prot::rw()).is_err())
             {
                 return cx.cur.brk as i64;
@@ -8270,6 +8437,9 @@ impl Kernel {
         a: &[u64; 6],
         mem: &mut GuestMemory,
     ) -> i64 {
+        if Self::address_space_exceeded(cx, mem, a[1]) {
+            return err(Errno::ENOMEM);
+        }
         const MAP_SHARED: u64 = 0x01;
         const MAP_FIXED: u64 = 0x10;
         const MAP_ANONYMOUS: u64 = 0x20;
@@ -10977,6 +11147,52 @@ mod tests {
         k.shared.lock().unwrap().next_pid = child as i32;
         let next = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, args);
         assert_eq!(next, child + 1);
+    }
+
+    #[test]
+    fn rlimits_are_shared_by_threads_and_copied_by_fork() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        const THREAD: u64 = 0x100 | 0x800 | 0x1_0000;
+        let thread = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [THREAD, 0, 0, 0, 0, 0],
+        );
+        let forked = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [0x11, 0, 0, 0, 0, 0],
+        );
+        cx.cur.rlimits.set(sys_misc::RLIMIT_CPU, (5, 6));
+        let limit_of = |pid: i64| {
+            let sh = k.shared.lock().unwrap();
+            let mut p = sh
+                .procs
+                .iter()
+                .flatten()
+                .filter(|p| i64::from(p.info.pid) == pid);
+            p.next().unwrap().info.rlimits.get(sys_misc::RLIMIT_CPU)
+        };
+        assert_eq!(limit_of(thread), (5, 6));
+        assert_ne!(limit_of(forked), (5, 6));
+    }
+
+    #[test]
+    fn cpu_time_raises_sigxcpu_once_a_second_then_sigkill() {
+        const SEC: u64 = 1_000_000_000;
+        let limits = RLimits::default();
+        limits.set(sys_misc::RLIMIT_CPU, (2, 4));
+        assert_eq!(limits.charge_cpu(SEC), None);
+        assert_eq!(limits.charge_cpu(SEC), Some(SIGXCPU));
+        assert_eq!(limits.charge_cpu(SEC / 2), None, "not again this second");
+        assert_eq!(limits.charge_cpu(SEC / 2), Some(SIGXCPU));
+        assert_eq!(limits.charge_cpu(SEC), Some(9));
     }
 
     #[test]

@@ -110,6 +110,8 @@ pub struct GuestMemory {
     /// this page meant to be writable?" that [`GuestMemory::cow_fault`] needs.
     prot: PageVec<Prot>,
     mapped: PageVec<bool>,
+    /// How many entries of [`Self::mapped`] are set.
+    mapped_count: usize,
     /// Per-page: loaded from a file (an ELF segment). `MADV_DONTNEED` preserves
     /// these; cleared when a page is re-`map`ped anonymously.
     file_backed: PageVec<bool>,
@@ -239,6 +241,7 @@ impl GuestMemory {
             space,
             prot: PageVec::new(npages, Prot::NONE),
             mapped: PageVec::new(npages, false),
+            mapped_count: 0,
             file_backed: PageVec::new(npages, false),
             shared_anon: PageVec::new(npages, false),
             fork_policy: std::collections::BTreeMap::new(),
@@ -319,6 +322,12 @@ impl GuestMemory {
     /// stale entry never serves an unmapped or replaced frame.
     pub(crate) fn take_tlb_dirty(&mut self) -> bool {
         std::mem::take(&mut self.tlb_dirty)
+    }
+
+    /// Total size of this space's mappings, what `RLIMIT_AS` measures.
+    #[must_use]
+    pub fn mapped_bytes(&self) -> u64 {
+        self.mapped_count as u64 * PAGE_SIZE
     }
 
     /// Number of live (allocated) frames in the shared pool — for leak checks.
@@ -417,6 +426,7 @@ impl GuestMemory {
                     fa.free(frame);
                 }
             }
+            self.mapped_count += usize::from(!self.mapped[p]);
             self.mapped[p] = true;
             self.prot[p] = prot;
             self.file_backed[p] = false;
@@ -574,6 +584,7 @@ impl GuestMemory {
                     return Err(MemError::Host("frame pool exhausted".into()));
                 }
             }
+            self.mapped_count += usize::from(!self.mapped[p]);
             self.mapped[p] = true;
             self.prot[p] = prot;
             self.file_backed[p] = false;
@@ -720,6 +731,7 @@ impl GuestMemory {
                 fa.free(frame);
                 self.tlb_dirty = true; // a present leaf was cleared
             }
+            self.mapped_count -= usize::from(self.mapped[p]);
             self.mapped[p] = false;
             self.prot[p] = Prot::NONE;
             self.file_backed[p] = false;
@@ -1078,11 +1090,13 @@ impl GuestMemory {
         };
         self.kstack_pa = parent_kstack;
         let mut mapped = self.mapped.clone();
+        let mut mapped_count = self.mapped_count;
         let mut shared_anon = self.shared_anon.clone();
         let mut fork_policy = std::collections::BTreeMap::new();
         for (&p, &policy) in &self.fork_policy {
             shared_anon[p] = false;
             if policy == FORK_DONT {
+                mapped_count -= usize::from(mapped[p]);
                 mapped[p] = false;
             } else {
                 fork_policy.insert(p, policy);
@@ -1096,6 +1110,7 @@ impl GuestMemory {
             space: child_space,
             prot: self.prot.clone(),
             mapped,
+            mapped_count,
             file_backed: self.file_backed.clone(),
             shared_anon,
             fork_policy,
@@ -1125,6 +1140,7 @@ impl GuestMemory {
         self.kstack_pa = 0;
         self.prot.clear();
         self.mapped.clear();
+        self.mapped_count = 0;
         self.file_backed.clear();
         self.shared_anon.clear();
         self.fork_policy.clear();
@@ -1151,6 +1167,7 @@ impl GuestMemory {
         drop(fa);
         self.prot.clear();
         self.mapped.clear();
+        self.mapped_count = 0;
         self.file_backed.clear();
         self.shared_anon.clear();
         self.fork_policy.clear();

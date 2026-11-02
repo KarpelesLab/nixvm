@@ -532,17 +532,27 @@ pub(super) const RLIMIT_NOFILE: u64 = 7;
 /// startup into a million-iteration spin.
 pub(super) const NOFILE_HARD_CAP: u64 = 4096;
 
-/// The constant soft/hard limit pair we report for the resources with a fixed
-/// value (everything except `RLIMIT_NOFILE`, which the kernel tracks).
-pub(super) fn rlimit_for(resource: u64) -> (u64, u64) {
-    const RLIMIT_STACK: u64 = 3;
-    const RLIMIT_NPROC: u64 = 6;
-    const RLIM_INFINITY: u64 = u64::MAX;
-    match resource {
-        RLIMIT_STACK => (8 * 1024 * 1024, RLIM_INFINITY),
-        RLIMIT_NPROC => (4096, 4096),
-        _ => (RLIM_INFINITY, RLIM_INFINITY),
-    }
+pub(super) const RLIMIT_CPU: u64 = 0;
+pub(super) const RLIMIT_FSIZE: u64 = 1;
+pub(super) const RLIMIT_DATA: u64 = 2;
+pub(super) const RLIMIT_STACK: u64 = 3;
+pub(super) const RLIMIT_NPROC: u64 = 6;
+pub(super) const RLIMIT_AS: u64 = 9;
+pub(super) const RLIMIT_SIGPENDING: u64 = 11;
+pub(super) const RLIMIT_MSGQUEUE: u64 = 12;
+/// How many resources there are (`RLIM_NLIMITS`).
+pub(super) const RLIM_NLIMITS: usize = 16;
+pub(super) const RLIM_INFINITY: u64 = u64::MAX;
+
+/// The limits a new VM's first process starts with.
+pub(super) fn default_rlimits() -> [(u64, u64); RLIM_NLIMITS] {
+    let mut limits = [(RLIM_INFINITY, RLIM_INFINITY); RLIM_NLIMITS];
+    limits[RLIMIT_STACK as usize] = (8 * 1024 * 1024, RLIM_INFINITY);
+    limits[RLIMIT_NPROC as usize] = (4096, 4096);
+    limits[RLIMIT_NOFILE as usize] = (1024, NOFILE_HARD_CAP);
+    limits[RLIMIT_SIGPENDING as usize] = (4096, 4096);
+    limits[RLIMIT_MSGQUEUE as usize] = (819_200, 819_200);
+    limits
 }
 
 /// Read a `struct rlimit { rlim_cur, rlim_max }` (2 x u64) from `addr`.

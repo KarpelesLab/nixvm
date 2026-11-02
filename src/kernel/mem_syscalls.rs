@@ -87,6 +87,9 @@ impl Kernel {
         if old_size == 0 || new_size == 0 || !old_addr.is_multiple_of(PAGE_SIZE) {
             return err(Errno::EINVAL);
         }
+        if Self::address_space_exceeded(cx, mem, new_size.saturating_sub(old_size)) {
+            return err(Errno::ENOMEM);
+        }
         if flags & !(MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP) != 0
             || (flags & (MREMAP_FIXED | MREMAP_DONTUNMAP) != 0 && flags & MREMAP_MAYMOVE == 0)
         {
