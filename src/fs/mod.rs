@@ -35,11 +35,11 @@ pub mod tmpfs;
 pub use devfs::DevFs;
 #[cfg(feature = "fstool")]
 pub use fstoolfs::FsToolMount;
-pub use mount::{MountEntry, MountTable, PivotMap};
+pub use mount::{MountEntry, MountTable, PathMove, PivotMap};
 pub use overlay::Overlay;
 #[cfg(unix)]
 pub use passthrough::Passthrough;
-pub use procfs::{ProcFs, ProcSelf};
+pub use procfs::{ProcFs, ProcSelf, ProcTask};
 pub use sysfs::SysFs;
 pub use tmpfs::TmpFs;
 

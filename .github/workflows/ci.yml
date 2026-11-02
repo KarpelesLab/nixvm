@@ -139,6 +139,24 @@ jobs:
             exit 1
           fi
 
+      # On KVM here, unlike the `test` job, whose runner has no access to /dev/kvm.
+      - name: Run the guest conformance programs on KVM
+        if: matrix.backend == 'kvm'
+        run: cargo test --test guest_conformance
+
+      # Real tools using every namespace at once find what targeted tests don't.
+      - name: Run bubblewrap and util-linux in the VM
+        if: matrix.backend == 'kvm'
+        run: |
+          set -o pipefail
+          export NIXVM_BWRAP_TAR="$RUNNER_TEMP/bwrap.tar"
+          scripts/alpine-with-bwrap.sh "$NIXVM_ALPINE_TAR" "$NIXVM_BWRAP_TAR"
+          cargo test --features fstool --test namespace_tools -- --nocapture 2>&1 | tee tools.log
+          if grep -q 'NIXVM_BWRAP_TAR not set' tools.log; then
+            echo '::error::the namespace tools test skipped itself'
+            exit 1
+          fi
+
       - name: Run the live boot tests
         run: |
           set -o pipefail

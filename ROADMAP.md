@@ -448,24 +448,36 @@ under policy. DNS.
     decoder lacks (LD2/3/4 de-interleave, LDR-SIMD register offset) before it
     even reaches the network — egress itself is arch-agnostic.
 
-### Phase 9 — Resource limits & isolation policy  ⬜ not started
+### Phase 9 — Resource limits & isolation  🟡 limits and namespaces done; syscall-filter policy not started
 
-Turn it into a real *jail*: enforce the limits that make running dangerous tasks
-safe.
+Turn it into a real *jail*: a guest must not be able to take the host down, and
+must get the isolation it asks for.
 
-- **Limits:** guest RAM ceiling (already sized) with real accounting; CPU time /
-  wall-clock deadline; max pids/threads; max open fds; disk quota on the overlay
-  upper; `prlimit64` honored.
-- **Policy:** syscall-filter policy (allow/deny/log, gVisor-style), no-network
-  mode, read-only `/work`, env scrubbing, drop-privilege semantics
-  (`uid`/`gid`/`no-new-privs`).
-- **Exit criteria:** a fork bomb, a memory hog, and an infinite loop are each
-  contained and terminated with a clear diagnostic; policy denials are logged.
-- **Status:** `prlimit64`/`getrlimit` return plausible fixed values rather than
-  tracking or enforcing real limits; `Mlock*`/`Setrlimit`/scheduling setters
-  are no-ops. No CPU/wall-clock deadline, pid/fd ceiling, disk quota, or
-  syscall-filter policy exists yet — an infinite loop or fork bomb inside the
-  guest is not currently contained by nixvm itself.
+- **VM-wide limits (`limits::Limits`):** what's in place, with the environment variable
+  that overrides each default:
+  - Host memory the kernel holds for the guest (tmpfs, overlay upper, message queues):
+    a quarter of host RAM, 256 MiB to 8 GiB, `ENOSPC`/`ENOMEM` past it
+    (`NIXVM_LIMIT_KERNEL_MEMORY`).
+  - Guest RAM: capped at three quarters of host RAM (`NIXVM_LIMIT_GUEST_MEMORY`).
+  - Tasks: 4096, `EAGAIN` past it (`NIXVM_LIMIT_TASKS`).
+  - Open files across the VM: 262144, `ENFILE` past it (`NIXVM_LIMIT_OPEN_FILES`).
+  - Disk growth in host directories: no default ceiling (`NIXVM_LIMIT_DISK_BYTES`), but
+    a guest can never take a host filesystem below its last 5% of space or inodes.
+  - CPU and run time: no default, kills the guest when reached
+    (`NIXVM_LIMIT_CPU_SECONDS`, `NIXVM_LIMIT_WALL_SECONDS`).
+  - Pipes, socket queues, ptys and queued signals hold fixed amounts, as on Linux.
+- **Per-process `rlimit`s:** `NOFILE`, `AS`, `DATA`, `STACK`, `FSIZE`, `CPU` and `NPROC` are
+  enforced. The others are stored and reported only.
+- **Namespaces (`kernel/ns.rs`, `pidns.rs`, `userns.rs`):** UTS, IPC, network, mount, PID,
+  user and time, with `setns` and `/proc/<pid>/ns`, plus real `chroot`, `pivot_root` and
+  bind mounts. Bubblewrap and util-linux's `unshare` run inside the VM.
+  Known limits: mounts are all private (propagation is accepted and does nothing); a new
+  network namespace's `lo` starts up; cgroup namespaces only change the id; a file kept
+  open across `setns` into another mount namespace resolves there.
+- **Not started:** the syscall-filter policy, env scrubbing and logging of denials.
+- **Tests:** `tests/guest_conformance.rs` runs the C programs in `tests/guest`, written to
+  pass on real Linux too, and contains the attacks; `tests/namespace_tools.rs` runs the
+  real tools.
 
 ### Phase 10 — Portability backends (KVM + interpreter) & x86-64 guests  🟡 interpreters live; HVF + KVM/x86-64 run static programs; KVM/arm64 not started
 

@@ -188,6 +188,18 @@ Useful environment variables (both harnesses):
   with `O_NOFOLLOW`, so even a symlink swapped in mid-race fails safely
   instead of redirecting the I/O.
 
+## Limits and isolation
+
+A guest can't exhaust the host: file data in guest memory, tasks, open files, guest RAM
+and disk growth in host directories all have ceilings, and hitting one is an ordinary
+error in the guest. Defaults come from `Limits::for_this_host()`, and can be set with
+`SandboxBuilder::limits`, `Vm::set_limits` or the `NIXVM_LIMIT_*` environment variables
+listed under Phase 9 in [ROADMAP.md](ROADMAP.md). CPU and run time have no default limit,
+since nothing can guess what a job needs: set them for untrusted work.
+
+Inside the VM, namespaces work as on Linux, including unprivileged user namespaces, so
+tools like bubblewrap run in a guest.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

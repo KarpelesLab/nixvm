@@ -59,6 +59,8 @@ const PATHS: &[&str] = &[
     "sys/kernel/ostype",
     "sys/kernel/osrelease",
     "sys/kernel/hostname",
+    "sys/kernel/overflowuid",
+    "sys/kernel/overflowgid",
     "sys/kernel/pid_max",
     "self/cmdline",
     "self/status",
@@ -172,6 +174,62 @@ const ROOT_FILES: &[&str] = &[
     "consoles",
 ];
 
+/// What `/proc/<pid>` shows about another task, as the reader numbers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcTask {
+    pub pid: u32,
+    pub ppid: u32,
+    pub comm: String,
+    pub cmdline: Vec<u8>,
+    /// The letter `ps` shows: `R`, `S`, `T` or `Z`.
+    pub state: char,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl ProcTask {
+    /// The contents of `name` under its directory, for the files it has.
+    fn file(&self, name: &str) -> Option<Vec<u8>> {
+        Some(match name {
+            "comm" => format!("{}\n", self.comm).into_bytes(),
+            "cmdline" => self.cmdline.clone(),
+            "stat" => {
+                // Only the leading fields `ps` and friends read carry anything.
+                let rest = "0 ".repeat(45);
+                format!(
+                    "{} ({}) {} {} {} {} 0 {}\n",
+                    self.pid,
+                    self.comm,
+                    self.state,
+                    self.ppid,
+                    self.pid,
+                    self.pid,
+                    rest.trim_end()
+                )
+                .into_bytes()
+            }
+            "status" => {
+                let (uid, gid) = (self.uid, self.gid);
+                format!(
+                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
+                     Uid:\t{uid} {uid} {uid} {uid}\nGid:\t{gid} {gid} {gid} {gid}\n",
+                    self.comm, self.state, self.pid, self.pid, self.ppid
+                )
+                .into_bytes()
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// Files under `/proc/<pid>` for a task other than the reader.
+const TASK_FILES: &[&str] = &["cmdline", "comm", "stat", "status"];
+
+/// A fixed inode range for `/proc/<pid>` entries, which have no table entry.
+fn task_inode(pid: u32, slot: u64) -> u64 {
+    (1 << 40) + (u64::from(pid) << 8) + slot
+}
+
 /// Entries of `self/ns`, in the order Linux lists them.
 const NS_FILES: &[&str] = &[
     "cgroup",
@@ -226,6 +284,8 @@ const SYS_KERNEL_FILES: &[&str] = &[
     "ostype",
     "osrelease",
     "hostname",
+    "overflowuid",
+    "overflowgid",
     "pid_max",
     "version",
     "threads-max",
@@ -511,6 +571,8 @@ const UID_GID_MAP: &str = "0 0 4294967295\n";
 /// supplies placeholders so every file still renders something plausible.
 #[derive(Debug, Clone)]
 pub struct ProcData {
+    /// Every task the reader can see, for `/proc/<pid>`.
+    pub tasks: Vec<ProcTask>,
     /// What the kernel says for `self/uid_map`, `self/gid_map`, `self/setgroups`
     /// and `self/timens_offsets`, once it has.
     pub uid_map: String,
@@ -567,6 +629,7 @@ pub struct ProcData {
 impl Default for ProcData {
     fn default() -> Self {
         Self {
+            tasks: Vec::new(),
             uid_map: String::new(),
             gid_map: String::new(),
             setgroups: String::new(),
@@ -599,6 +662,8 @@ impl Default for ProcData {
 /// of [`ProcData`] — just the values that actually change per running task.
 #[derive(Debug, Clone)]
 pub struct ProcSelf {
+    /// Every task the reader can see, for `/proc/<pid>`.
+    pub tasks: Vec<ProcTask>,
     /// `self/uid_map`, `self/gid_map`, `self/setgroups` and `self/timens_offsets`.
     pub uid_map: String,
     pub gid_map: String,
@@ -660,6 +725,7 @@ impl ProcFs {
     /// program. `pid`/`ppid` drive the `<pid>` alias too.
     pub fn update_self(&mut self, live: ProcSelf) {
         let d = &mut self.data;
+        d.tasks = live.tasks;
         d.mounts = live.mounts;
         d.uid_map = live.uid_map;
         d.gid_map = live.gid_map;
@@ -688,6 +754,52 @@ impl ProcFs {
     /// the injected pid, leaving every other path untouched. This is the only
     /// place `<pid>` paths are special-cased; everything downstream only ever
     /// sees `self`-rooted or static paths.
+    /// The task `rel` is under, if it's `<pid>` or `<pid>/...` for a task other
+    /// than the reader, with what comes after.
+    fn other_task<'a>(&self, rel: &'a str) -> Option<(&ProcTask, &'a str)> {
+        let (first, tail) = rel.split_once('/').unwrap_or((rel, ""));
+        let pid: u32 = first.parse().ok()?;
+        let task = self.data.tasks.iter().find(|t| t.pid == pid)?;
+        Some((task, tail))
+    }
+
+    /// `stat` under another task's directory.
+    fn other_task_stat(task: &ProcTask, tail: &str) -> Option<Attrs> {
+        let (kind, mode, size, slot) = match tail {
+            "" | "ns" | "fd" | "task" => {
+                let slot = match tail {
+                    "" => 0,
+                    "ns" => 1,
+                    "fd" => 2,
+                    _ => 3,
+                };
+                (NodeKind::Dir, S_IFDIR | 0o555, 0, slot)
+            }
+            _ if tail
+                .strip_prefix("ns/")
+                .is_some_and(|n| NS_FILES.contains(&n)) =>
+            {
+                (NodeKind::Symlink, S_IFLNK | 0o777, 0, 4)
+            }
+            name => {
+                let body = task.file(name)?;
+                (NodeKind::File, S_IFREG | 0o444, body.len() as u64, 5)
+            }
+        };
+        Some(Attrs {
+            kind,
+            size,
+            mode,
+            uid: task.uid,
+            gid: task.gid,
+            atime: 0,
+            mtime: 0,
+            inode: task_inode(task.pid, slot),
+            nlink: 1,
+            rdev: 0,
+        })
+    }
+
     fn normalize(&self, rel: &str) -> String {
         if self.data.pid != 0 {
             let pid_s = self.data.pid.to_string();
@@ -816,6 +928,7 @@ fn static_content(rel: &str) -> Option<&'static [u8]> {
         "sys/kernel/ostype" => OSTYPE,
         "sys/kernel/osrelease" => OSRELEASE,
         "sys/kernel/hostname" => HOSTNAME,
+        "sys/kernel/overflowuid" | "sys/kernel/overflowgid" => "65534\n",
         "sys/kernel/pid_max" => PID_MAX,
         "sys/kernel/version" => KERNEL_VERSION,
         "sys/kernel/threads-max" => THREADS_MAX,
@@ -1311,6 +1424,10 @@ impl MountFs for ProcFs {
         let rel = self.normalize(rel);
         let rel = rel.as_str();
 
+        if let Some((task, tail)) = self.other_task(rel) {
+            return Self::other_task_stat(task, tail);
+        }
+
         if let Some(n) = rel
             .strip_prefix("self/fd/")
             .and_then(|s| s.parse::<u32>().ok())
@@ -1375,6 +1492,10 @@ impl MountFs for ProcFs {
     fn read_at(&mut self, rel: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {
         let rel = self.normalize(rel);
         let rel = rel.as_str();
+        if let Some((task, tail)) = self.other_task(rel) {
+            let body = task.file(tail).ok_or_else(enoent)?;
+            return Ok(read_slice(&body, off, buf));
+        }
         if is_dir(rel) {
             return Err(eisdir());
         }
@@ -1395,6 +1516,26 @@ impl MountFs for ProcFs {
     fn readdir(&mut self, rel: &str) -> io::Result<Vec<DirEntry>> {
         let rel = self.normalize(rel);
         let rel = rel.as_str();
+        if let Some((task, tail)) = self.other_task(rel) {
+            let of = |name: &str, kind| DirEntry {
+                name: name.to_string(),
+                kind,
+                inode: task_inode(task.pid, 6),
+            };
+            return match tail {
+                "" => {
+                    let mut out: Vec<DirEntry> =
+                        TASK_FILES.iter().map(|n| of(n, NodeKind::File)).collect();
+                    out.push(of("ns", NodeKind::Dir));
+                    out.push(of("fd", NodeKind::Dir));
+                    out.push(of("task", NodeKind::Dir));
+                    Ok(out)
+                }
+                "ns" => Ok(NS_FILES.iter().map(|n| of(n, NodeKind::Symlink)).collect()),
+                "fd" | "task" => Ok(Vec::new()),
+                _ => Err(enotdir()),
+            };
+        }
         match rel {
             "" => {
                 let mut out: Vec<DirEntry> = ROOT_FILES
@@ -1402,6 +1543,13 @@ impl MountFs for ProcFs {
                     .map(|n| entry(n, n, NodeKind::File))
                     .collect();
                 out.push(entry("self", "self", NodeKind::Dir));
+                for task in self.data.tasks.iter().filter(|t| t.pid != self.data.pid) {
+                    out.push(DirEntry {
+                        name: task.pid.to_string(),
+                        kind: NodeKind::Dir,
+                        inode: task_inode(task.pid, 0),
+                    });
+                }
                 if self.data.pid != 0 {
                     out.push(DirEntry {
                         name: self.data.pid.to_string(),
@@ -1515,6 +1663,7 @@ mod tests {
     /// to eventually inject.
     fn sample() -> ProcData {
         ProcData {
+            tasks: Vec::new(),
             uid_map: String::new(),
             gid_map: String::new(),
             setgroups: String::new(),
@@ -1543,6 +1692,59 @@ mod tests {
             auxv: Vec::new(),
             arch: None,
         }
+    }
+
+    fn with_tasks() -> ProcFs {
+        let mut fs = ProcFs::new(1);
+        fs.data.pid = 1;
+        fs.data.tasks = vec![ProcTask {
+            pid: 7,
+            ppid: 1,
+            comm: "worker".to_string(),
+            cmdline: b"worker\0-x\0".to_vec(),
+            state: 'S',
+            uid: 5,
+            gid: 6,
+        }];
+        fs
+    }
+
+    #[test]
+    fn another_task_has_a_directory_of_its_own() {
+        let mut fs = with_tasks();
+        assert_eq!(fs.stat("7").unwrap().kind, NodeKind::Dir);
+        assert_eq!(fs.stat("7").unwrap().uid, 5);
+        assert_eq!(fs.stat("7/ns").unwrap().kind, NodeKind::Dir);
+        assert_eq!(fs.stat("7/ns/pid").unwrap().kind, NodeKind::Symlink);
+        assert!(fs.stat("7/nope").is_none());
+        assert!(fs.stat("8").is_none(), "not visible, so not there");
+        assert_eq!(read_all(&mut fs, "7/comm"), b"worker\n");
+        assert_eq!(read_all(&mut fs, "7/cmdline"), b"worker\0-x\0");
+        let stat = String::from_utf8(read_all(&mut fs, "7/stat")).unwrap();
+        assert!(stat.starts_with("7 (worker) S 1 "), "{stat}");
+        assert_eq!(stat.split_whitespace().count(), 52);
+        let status = String::from_utf8(read_all(&mut fs, "7/status")).unwrap();
+        assert!(status.contains("Uid:\t5 5 5 5"), "{status}");
+    }
+
+    #[test]
+    fn listing_proc_shows_every_visible_task() {
+        let mut fs = with_tasks();
+        let names: Vec<_> = fs
+            .readdir("")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.contains(&"7".to_string()));
+        let inner: Vec<_> = fs
+            .readdir("7")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(inner.contains(&"ns".to_string()) && inner.contains(&"stat".to_string()));
+        assert_eq!(fs.readdir("7/ns").unwrap().len(), NS_FILES.len());
     }
 
     #[test]
@@ -1596,6 +1798,7 @@ mod tests {
         // Default placeholder before any refresh.
         assert_eq!(read_all(&mut fs, "self/comm"), b"nixvm\n");
         fs.update_self(ProcSelf {
+            tasks: Vec::new(),
             uid_map: String::new(),
             gid_map: String::new(),
             setgroups: String::new(),

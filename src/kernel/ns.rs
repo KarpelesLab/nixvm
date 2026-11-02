@@ -298,8 +298,11 @@ impl Shared {
 }
 
 /// What a guest path is, if it names a namespace link: `/proc/<pid>/ns/<kind>`.
+///
+/// A proc mount can be anywhere, as `/oldroot/proc` is partway through setting up a
+/// container, so what counts is the last `/proc/` in the path.
 pub(super) fn parse_ns_path(path: &str) -> Option<(NsTarget, NsKind)> {
-    let rest = path.strip_prefix("/proc/")?;
+    let rest = &path[path.rfind("/proc/")? + "/proc/".len()..];
     let (who, rest) = rest.split_once('/')?;
     let name = rest.strip_prefix("ns/")?;
     let kind = NsKind::from_file_name(name)?;
@@ -340,6 +343,17 @@ impl Kernel {
             .ok_or_else(|| err(Errno::ENOENT))
     }
 
+    /// Bring procfs up to date for this task, ahead of a lookup in it. The other
+    /// tasks have to be read before taking `vfs`, which sorts after `shared`.
+    fn refresh_procfs(&self, cx: &ServiceCtx) {
+        let tasks = self.visible_tasks(cx);
+        let mut live = self.proc_self_live(cx);
+        live.tasks = tasks;
+        let mut vfs = self.vfs_for(cx);
+        live.mounts = vfs.listing();
+        vfs.with_procfs(|procfs| procfs.update_self(live.clone()));
+    }
+
     /// Answer a syscall aimed at a `/proc/<pid>/ns/<kind>` link, if this is one.
     /// These don't resolve through the filesystem: a link's target only names the
     /// namespace, and opening it gives a descriptor for the namespace itself.
@@ -354,20 +368,26 @@ impl Kernel {
         const AT_FDCWD: i64 = -100;
         const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
         let (dirfd, ptr) = match sys {
-            Sysno::Open | Sysno::Stat | Sysno::Readlink => (AT_FDCWD, args[0]),
+            Sysno::Open | Sysno::Stat | Sysno::Lstat | Sysno::Readlink | Sysno::Access => {
+                (AT_FDCWD, args[0])
+            }
             Sysno::Openat
             | Sysno::Openat2
             | Sysno::Readlinkat
             | Sysno::Newfstatat
-            | Sysno::Statx => (args[0] as i64, args[1]),
+            | Sysno::Statx
+            | Sysno::Faccessat
+            | Sysno::Faccessat2 => (args[0] as i64, args[1]),
             _ => return None,
         };
         let raw = super::read_path(mem, ptr)?;
-        if !raw.contains("ns/") {
+        let abs = self.resolve_path(cx, dirfd, &raw);
+        if !abs.contains("/proc") {
             return None;
         }
-        let abs = self.resolve_path(cx, dirfd, &raw);
-        let (target, kind) = parse_ns_path(&abs)?;
+        self.refresh_procfs(cx);
+        let inside = Self::as_seen_from_root(cx, &abs);
+        let (target, kind) = parse_ns_path(&inside)?;
         let id = match self.ns_of_target(cx, target, kind) {
             Ok(id) => id,
             Err(e) => return Some(e),
@@ -393,7 +413,7 @@ impl Kernel {
                 }
                 n as i64
             }
-            // A no-follow stat sees the link itself, which is the filesystem's.
+            // These see the link itself, which is the filesystem's.
             Sysno::Newfstatat if args[3] & AT_SYMLINK_NOFOLLOW != 0 => return None,
             Sysno::Statx if args[2] & AT_SYMLINK_NOFOLLOW != 0 => return None,
             Sysno::Stat | Sysno::Newfstatat => {
@@ -594,6 +614,10 @@ mod tests {
         assert_eq!(
             parse_ns_path("/proc/42/ns/pid_for_children"),
             Some((NsTarget::Pid(42), NsKind::PidForChildren))
+        );
+        assert_eq!(
+            parse_ns_path("/oldroot/proc/self/ns/uts"),
+            Some((cur, NsKind::Uts))
         );
         for other in [
             "/proc/self/ns",

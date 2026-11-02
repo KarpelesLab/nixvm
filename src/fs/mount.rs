@@ -84,6 +84,8 @@ pub struct MountTable {
     root: String,
     /// How many times `pivot_root` has run, to label each one's old mounts.
     pivots: u32,
+    /// How many mounts have been detached, to give each a place of its own.
+    detached: u32,
     /// What every mounted filesystem charges its in-memory contents to.
     quota: Option<std::sync::Arc<crate::limits::Quota>>,
     /// What every mounted filesystem charges growth on the host's disk to.
@@ -223,18 +225,28 @@ impl MountTable {
             put_old: normalize(&format!("/{}", relative_to(&put_old, &new_root))),
         };
         self.pivots += 1;
-        let (mut kept, mut old): (Vec<Mount>, Vec<Mount>) = std::mem::take(&mut self.mounts)
-            .into_iter()
-            .partition(|m| path_has_prefix(&m.point, &new_root));
-        for m in &mut old {
-            m.pivot_side = self.pivots;
+        // The new root is the mount on top at that path, with what's been mounted
+        // on it since. Anything earlier at or below the path is hidden beneath it,
+        // and goes with the old root.
+        let top = self
+            .mounts
+            .iter()
+            .rposition(|m| m.point == new_root)
+            .ok_or_else(einval)?;
+        let (mut kept, mut old) = (Vec::new(), Vec::new());
+        for (i, mut m) in std::mem::take(&mut self.mounts).into_iter().enumerate() {
+            if i >= top && path_has_prefix(&m.point, &new_root) {
+                m.point = normalize(&format!("/{}", relative_to(&m.point, &new_root)));
+                kept.push(m);
+            } else {
+                m.point = normalize(&format!("{}/{}", map.put_old, m.point));
+                m.pivot_side = self.pivots;
+                old.push(m);
+            }
         }
         // The old root goes on top, which is what "pivot_root(".", ".")" relies on.
         kept.append(&mut old);
         self.mounts = kept;
-        for m in &mut self.mounts {
-            m.point = map.translate(&m.point);
-        }
         Ok(map)
     }
 
@@ -244,6 +256,7 @@ impl MountTable {
     pub fn listing(&self) -> Vec<MountEntry> {
         self.mounts
             .iter()
+            .filter(|m| detached_root(&m.point).is_none())
             .filter(|m| self.root.is_empty() || path_has_prefix(&m.point, &self.root))
             .map(|m| MountEntry {
                 point: if self.root.is_empty() {
@@ -364,7 +377,7 @@ impl MountTable {
     /// Remove the most recent mount at exactly `point`: `Ok` if a guest mount
     /// went, `EBUSY` for one of the embedder's (the VM's own /proc, /dev, …),
     /// `EINVAL` if nothing is mounted there.
-    pub fn unmount(&mut self, point: &str, detach: bool) -> io::Result<()> {
+    pub fn unmount(&mut self, point: &str, detach: bool) -> io::Result<Option<PathMove>> {
         let point = normalize(point);
         let Some(i) = self.mounts.iter().rposition(|m| m.point == point) else {
             return Err(einval());
@@ -385,16 +398,44 @@ impl MountTable {
         if has_children && !detach {
             return Err(io::Error::from_raw_os_error(16)); // EBUSY
         }
+        let side = self.mounts[i].pivot_side;
         let gone = self.mounts.remove(i);
-        // A detach takes whatever is mounted below it too.
-        if detach {
-            self.mounts.retain(|m| {
-                !path_has_prefix(&m.point, &point)
-                    || m.point == point
-                    || m.pivot_side != gone.pivot_side
-            });
+        if !detach {
+            return Ok(None);
         }
-        Ok(())
+        // Linux keeps a detached mount alive for anything still using it. Paths are
+        // what's held here, so it moves somewhere no guest path can name (a path from
+        // the guest has no NUL in it), for the caller to send those users after it.
+        let hidden = format!("/{DETACHED_MARK}{}", self.detached);
+        self.detached += 1;
+        for m in &mut self.mounts {
+            if m.point != point && m.pivot_side == side && path_has_prefix(&m.point, &point) {
+                m.point = normalize(&format!("{hidden}/{}", relative_to(&m.point, &point)));
+            }
+        }
+        self.mounts.push(Mount {
+            point: hidden.clone(),
+            ..gone
+        });
+        Ok(Some(PathMove {
+            from: point,
+            to: hidden,
+        }))
+    }
+
+    /// Drop detached mounts nothing refers to any more. `in_use` is every path held
+    /// on behalf of a task.
+    pub fn collect_detached(&mut self, in_use: &[&str]) {
+        let is_used = |root: &str| in_use.iter().any(|p| path_has_prefix(p, root));
+        let roots: Vec<String> = self
+            .mounts
+            .iter()
+            .filter_map(|m| detached_root(&m.point))
+            .map(str::to_string)
+            .collect();
+        let dead: Vec<String> = roots.into_iter().filter(|r| !is_used(r)).collect();
+        self.mounts
+            .retain(|m| detached_root(&m.point).is_none_or(|r| !dead.iter().any(|d| d == r)));
     }
 
     /// Index of the longest-prefix mount owning `abs_path`.
@@ -755,6 +796,38 @@ fn einval() -> io::Error {
     io::Error::from_raw_os_error(22)
 }
 
+/// What marks a detached mount's path. No path from the guest can contain it.
+const DETACHED_MARK: char = '\0';
+
+/// The top of the detached mount `path` is in, if it's in one.
+fn detached_root(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix('/')?;
+    if !rest.starts_with(DETACHED_MARK) {
+        return None;
+    }
+    let end = rest.find('/').map_or(path.len(), |i| i + 1);
+    Some(&path[..end])
+}
+
+/// Where paths at or below `from` have gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathMove {
+    from: String,
+    to: String,
+}
+
+impl PathMove {
+    /// Where `path` is now.
+    #[must_use]
+    pub fn translate(&self, path: &str) -> String {
+        if path_has_prefix(path, &self.from) {
+            normalize(&format!("{}/{}", self.to, relative_to(path, &self.from)))
+        } else {
+            path.to_string()
+        }
+    }
+}
+
 /// One mount, for `/proc/self/mountinfo`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountEntry {
@@ -913,6 +986,33 @@ mod tests {
     }
 
     #[test]
+    fn pivot_root_takes_the_top_mount_and_leaves_what_it_was_hiding() {
+        let mut t = table_with_tmpfs_root();
+        t.mount("/a", Box::new(crate::fs::TmpFs::new()));
+        t.create("/a/hidden", 0o644).unwrap();
+        t.copy_namespace(0, 1, false);
+        t.enter(1, "/");
+        // A tmpfs over the existing mount at /a becomes the new root.
+        t.mount_guest("/a", Box::new(crate::fs::TmpFs::new()));
+        t.mkdir("/a/old", 0o755).unwrap();
+        t.create("/a/visible", 0o644).unwrap();
+        t.pivot_root("/a", "/a/old").unwrap();
+        assert!(t.stat("/visible").is_some());
+        assert!(
+            t.stat("/hidden").is_none(),
+            "what it hid isn't in the new root"
+        );
+        assert!(
+            t.stat("/old/a/hidden").is_some(),
+            "it went with the old root"
+        );
+        // And dropping the old root leaves the new one in charge at /.
+        t.unmount("/old", true).unwrap();
+        assert!(t.stat("/visible").is_some());
+        assert!(t.stat("/old/a/hidden").is_none());
+    }
+
+    #[test]
     fn pivot_root_rewrites_the_view_and_detaching_takes_the_old_root() {
         let mut t = table_with_tmpfs_root();
         t.copy_namespace(0, 1, false);
@@ -947,6 +1047,34 @@ mod tests {
         );
         let climbed = t.follow("/a/in/esc").unwrap();
         assert_ne!(climbed, "/secret");
+    }
+
+    #[test]
+    fn a_detached_mount_lives_on_for_paths_that_follow_it_until_they_let_go() {
+        let mut t = table_with_tmpfs_root();
+        t.mount_guest("/a", Box::new(crate::fs::TmpFs::new()));
+        t.mount_guest("/a/sub", Box::new(crate::fs::TmpFs::new()));
+        t.create("/a/f", 0o644).unwrap();
+        t.create("/a/sub/g", 0o644).unwrap();
+        let moved = t.unmount("/a", true).unwrap().unwrap();
+        assert!(t.stat("/a/f").is_none(), "gone from the tree");
+        assert!(t.stat("/a/sub/g").is_none());
+        let held = moved.translate("/a/sub");
+        assert!(held.contains(DETACHED_MARK));
+        assert!(
+            t.stat(&format!("{held}/g")).is_some(),
+            "still there for its user"
+        );
+        assert!(t.listing().iter().all(|m| !m.point.contains(DETACHED_MARK)));
+        assert_eq!(moved.translate("/other"), "/other");
+        t.collect_detached(&[&held]);
+        assert!(t.stat(&format!("{held}/g")).is_some(), "still in use");
+        t.collect_detached(&[]);
+        assert!(
+            t.stat(&format!("{held}/g")).is_none(),
+            "nothing holds it now"
+        );
+        assert_eq!(t.mounts.len(), 1);
     }
 
     #[test]

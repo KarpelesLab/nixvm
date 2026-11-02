@@ -3442,7 +3442,6 @@ impl Kernel {
             | Sysno::Access
             | Sysno::Msync
             | Sysno::Mount
-            | Sysno::Umount2
             | Sysno::Getxattr
             | Sysno::Lgetxattr
             | Sysno::Fgetxattr
@@ -3828,7 +3827,6 @@ impl Kernel {
             Sysno::Access => self.sys_faccessat(vfs, cx, AT_FDCWD, args[0], args[1], mem),
             Sysno::Msync => self.sys_msync(vfs, cx, args[0], args[1], args[2], mem),
             Sysno::Mount => self.sys_mount(vfs, cx, args, mem),
-            Sysno::Umount2 => self.sys_umount2(vfs, cx, args[0], args[1], mem),
             // Extended attributes: the path / no-follow / fd / *at spellings all
             // lower onto one handler per operation (see `xattr.rs`).
             Sysno::Getxattr | Sysno::Lgetxattr | Sysno::Fgetxattr => {
@@ -4287,6 +4285,7 @@ impl Kernel {
             Sysno::SetRobustList => self.sys_robust_list(sh, cx, args, false, mem),
             Sysno::GetRobustList => self.sys_robust_list(sh, cx, args, true, mem),
             Sysno::Unshare => self.sys_unshare(sh, cx, args[0]),
+            Sysno::Umount2 => self.sys_umount2(sh, cx, args[0], args[1], mem),
             Sysno::Chroot => {
                 let mut vfs = self.vfs_for(cx);
                 self.sys_chroot(&mut vfs, cx, args[0], mem)
@@ -7989,11 +7988,6 @@ impl Kernel {
         // task's live identity — its program name, cmdline, and open fds — not the
         // boot-time placeholder. Refresh procfs's `self/` view before the fd is
         // created so the following read/readdir renders the running process.
-        if abs.contains("/proc") {
-            let mut live = self.proc_self_live(cx);
-            live.mounts = vfs.listing();
-            vfs.with_procfs(|procfs| procfs.update_self(live.clone()));
-        }
 
         // `/dev/tty` is the caller's controlling terminal: the pty its stdio
         // is attached to, else the console when there is one (the CLI's host

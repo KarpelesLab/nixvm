@@ -12,6 +12,7 @@ use crate::abi::errno::Errno;
 use crate::fs::{MountTable, NodeKind};
 use crate::vcpu::GuestMemory;
 
+use super::fd::FdTable;
 use super::{AT_FDCWD, Fd, Kernel, ServiceCtx, Shared, err, io_errno, read_path, stat};
 
 /// `unlinkat` flag: remove a directory, like `rmdir(2)`.
@@ -221,16 +222,18 @@ impl Kernel {
         0
     }
 
-    /// `umount2(target, flags)`: remove a mount made with `mount(2)`; the
-    /// VM's own mounts are busy (`EBUSY`), a non-mount-point `EINVAL`.
+    /// `umount2(target, flags)`: remove a mount. The VM's own in its first namespace
+    /// are busy (`EBUSY`), and a non-mount-point `EINVAL`. With `MNT_DETACH` what's
+    /// below it goes too, and files open there keep working.
     pub(super) fn sys_umount2(
         &self,
-        vfs: &mut MountTable,
+        sh: &mut Shared,
         cx: &mut ServiceCtx,
         target: u64,
         flags: u64,
         mem: &GuestMemory,
     ) -> i64 {
+        const MNT_DETACH: u64 = 2;
         // MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW.
         if flags & !0xf != 0 || (flags & 4 != 0 && flags & 3 != 0) {
             return err(Errno::EINVAL);
@@ -242,11 +245,43 @@ impl Kernel {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(cx, AT_FDCWD, &rel);
-        const MNT_DETACH: u64 = 2;
-        match vfs.unmount(&abs, flags & MNT_DETACH != 0) {
-            Ok(()) => 0,
-            Err(e) => io_errno(&e),
+        let mut vfs = self.vfs_for(cx);
+        let moved = match vfs.unmount(&abs, flags & MNT_DETACH != 0) {
+            Ok(Some(moved)) => moved,
+            Ok(None) => return 0,
+            Err(e) => return io_errno(&e),
+        };
+        let ns = cx.cur.ns.mnt;
+        cx.cur.cwd = moved.translate(&cx.cur.cwd);
+        cx.cur.fds.rewrite_paths(&|p| moved.translate(p));
+        let (mut files, mut cwds) = (Vec::new(), Vec::new());
+        for p in sh.procs.iter().flatten() {
+            if p.info.ns.mnt == ns {
+                files.push(p.info.files);
+                cwds.push(p.info.fs);
+            }
         }
+        for f in files {
+            if let Some(Some(table)) = sh.file_tables.get_mut(f) {
+                table.rewrite_paths(&|p| moved.translate(p));
+            }
+        }
+        for c in cwds {
+            if let Some(Some(cwd)) = sh.cwd_tables.get_mut(c) {
+                *cwd = moved.translate(cwd);
+            }
+        }
+        let tables = sh.file_tables.iter().flatten().chain([&cx.cur.fds]);
+        let open = tables
+            .flat_map(FdTable::iter)
+            .filter_map(|(_, fd)| match fd {
+                Fd::File { path, .. } | Fd::Dir { path, .. } => Some(path.as_str()),
+                _ => None,
+            });
+        let dirs = sh.cwd_tables.iter().flatten().map(String::as_str);
+        let in_use: Vec<&str> = open.chain(dirs).chain([cx.cur.cwd.as_str()]).collect();
+        vfs.collect_detached(&in_use);
+        0
     }
 
     /// `statfs(path, buf)` — write a plausible `struct statfs` for the
@@ -319,6 +354,36 @@ impl Kernel {
         ))
     }
 
+    /// Everything visible from this task, with the numbers it knows them by. Threads
+    /// don't get an entry of their own at the top level, on Linux or here.
+    pub(super) fn visible_tasks(&self, cx: &ServiceCtx) -> Vec<crate::fs::ProcTask> {
+        use super::RunState;
+        let sh = self.shared.lock().unwrap();
+        let describe = |info: &super::ProcInfo| {
+            let pid = self.visible_pid(cx, info.tgid);
+            (pid != 0).then(|| crate::fs::ProcTask {
+                pid: pid as u32,
+                ppid: self.visible_pid(cx, info.ppid) as u32,
+                comm: info.comm.clone(),
+                cmdline: info.cmdline.clone(),
+                state: match info.run {
+                    RunState::Running if info.parked => 'S',
+                    RunState::Running => 'R',
+                    RunState::Stopped(_) => 'T',
+                    RunState::Zombie(_) => 'Z',
+                },
+                uid: info.creds.ruid,
+                gid: info.creds.rgid,
+            })
+        };
+        let others = sh.procs.iter().flatten().map(|p| &p.info);
+        others
+            .chain([&cx.cur])
+            .filter(|info| !info.is_thread)
+            .filter_map(describe)
+            .collect()
+    }
+
     /// Build the live `/proc/self` view (comm, cmdline, exe, cwd, pid/ppid, open
     /// fds) for the running task, so procfs renders the real running program
     /// instead of the boot-time placeholder. Called just before a `/proc` read.
@@ -332,6 +397,7 @@ impl Kernel {
             .collect();
         let (uid_map, gid_map, setgroups) = self.proc_identity_files(cx);
         crate::fs::ProcSelf {
+            tasks: Vec::new(),
             uid_map,
             gid_map,
             setgroups,

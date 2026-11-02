@@ -114,13 +114,15 @@ impl UserNamespaces {
         if self.chain(parent).len() + 1 >= MAX_DEPTH {
             return Err(Errno::ENOSPC);
         }
+        // Once denied, always denied below: a child can't get setgroups back.
+        let setgroups_denied = self.table.get(&parent).is_some_and(|p| p.setgroups_denied);
         self.table.insert(
             ns,
             UserNs {
                 parent,
                 uids: IdMap::default(),
                 gids: IdMap::default(),
-                setgroups_denied: false,
+                setgroups_denied,
                 creator_uid,
                 creator_gid,
             },
@@ -543,7 +545,8 @@ impl Kernel {
             return None;
         };
         let inside = Self::as_seen_from_root(cx, path);
-        let rest = inside.strip_prefix("/proc/")?;
+        // The proc mount can be anywhere; a container mid-setup has it at /oldroot/proc.
+        let rest = &inside[inside.rfind("/proc/")? + "/proc/".len()..];
         let (who, file) = rest.split_once('/')?;
         if !matches!(file, "uid_map" | "gid_map" | "setgroups" | "timens_offsets") {
             return None;
@@ -762,6 +765,17 @@ mod tests {
         assert!(t.setgroups_refused(1));
         assert_eq!(t.write_map(1, IdKind::Gid, "0 1000 1\n", false), Ok(()));
         assert_eq!(t.write_setgroups(1, "allow"), Err(Errno::EPERM));
+    }
+
+    #[test]
+    fn a_child_inherits_setgroups_being_denied() {
+        let mut t = UserNamespaces::default();
+        t.create(1, 0, 1000, 1000).unwrap();
+        t.write_setgroups(1, "deny").unwrap();
+        t.create(2, 1, 0, 0).unwrap();
+        assert_eq!(t.setgroups_state(2), "deny\n");
+        t.write_map(1, IdKind::Gid, "0 1000 1\n", false).unwrap();
+        assert_eq!(t.write_map(2, IdKind::Gid, "0 0 1\n", false), Ok(()));
     }
 
     #[test]
