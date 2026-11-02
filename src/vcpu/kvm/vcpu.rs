@@ -1004,6 +1004,13 @@ impl Vcpu for KvmVcpu {
         // user segments. Called when the host is about to redirect the guest away
         // from that pending `sysretq` (signal delivery / `rt_sigreturn`), so the
         // handler and the resumed user code run at CPL3 rather than supervisor.
+        //
+        // A signal can also arrive while the guest is in user mode, between two
+        // of its own instructions. There's no `sysretq` pending then, and `rcx`
+        // and `r11` are just whatever the program had in them.
+        if self.sregs.cs.selector & 3 == 3 {
+            return;
+        }
         self.regs.rip = self.regs.rcx;
         self.regs.rflags = self.regs.r11;
         self.regs_dirty = true;
@@ -1016,10 +1023,21 @@ impl Vcpu for KvmVcpu {
         self.in_syscall = false;
     }
 
-    /// A KVM exit may land inside the syscall/exception trampolines (CPL0);
-    /// signals wait for the next syscall boundary.
+    /// Interrupted in user mode, the guest is between two of its own instructions,
+    /// and a signal can be delivered there. In the syscall or exception trampolines
+    /// (CPL0) it can't, so it waits for the next preemption or syscall.
     fn async_signal_boundary(&self) -> bool {
-        false
+        if self.in_syscall || self.sregs.cs.selector & 3 != 3 {
+            return false;
+        }
+        // Nor while KVM holds an exception it's partway through delivering: it
+        // would be injected on re-entry, against whatever the signal set up.
+        // `struct kvm_vcpu_events` begins { injected, nr, has_error_code, pending }.
+        let mut events = [0u8; 64];
+        // SAFETY: the fd is live, and the buffer is the 64-byte struct this ioctl
+        // fills.
+        let ret = unsafe { sys::ioctl(self.fd.0, sys::KVM_GET_VCPU_EVENTS, events.as_mut_ptr()) };
+        ret == 0 && events[0] == 0 && events[3] == 0
     }
 
     fn flush_tlb(&mut self) {

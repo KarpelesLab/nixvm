@@ -135,6 +135,8 @@ pub const KVM_CREATE_VCPU: c_ulong = 0xAE41;
 pub const KVM_SET_USER_MEMORY_REGION: c_ulong = 0x4020_AE46;
 pub const KVM_SET_TSS_ADDR: c_ulong = 0xAE47;
 pub const KVM_RUN: c_ulong = 0xAE80;
+/// `_IOR(KVMIO, 0x9f, struct kvm_vcpu_events)`.
+pub const KVM_GET_VCPU_EVENTS: c_ulong = 0x8040_AE9F;
 pub const KVM_GET_REGS: c_ulong = 0x8090_AE81;
 pub const KVM_SET_REGS: c_ulong = 0x4090_AE82;
 pub const KVM_GET_SREGS: c_ulong = 0x8138_AE83;

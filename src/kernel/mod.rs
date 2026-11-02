@@ -1685,6 +1685,14 @@ impl Shared {
         })
     }
 
+    /// Whether any task could be scheduled right now.
+    fn has_runnable(&self) -> bool {
+        self.procs
+            .iter()
+            .flatten()
+            .any(|p| p.info.run == RunState::Running && !p.info.parked)
+    }
+
     fn any_running(&self) -> bool {
         self.procs
             .iter()
@@ -2082,6 +2090,11 @@ impl Kernel {
             // to re-check, it's a genuine deadlock.
             if !self.shared.lock().unwrap().unpark_all() {
                 let sh = self.shared.lock().unwrap();
+                // A task can already be awake here: one that just stopped or exited
+                // in this sweep woke its parent directly.
+                if sh.has_runnable() {
+                    continue;
+                }
                 if sh.any_running() {
                     return Err(VcpuError::Backend(
                         "deadlock: every process is blocked".into(),
@@ -2342,6 +2355,10 @@ impl Kernel {
             // interactive driver that means "waiting for input" (the embedder
             // feeds stdin / host I/O completes and re-pumps), not a deadlock.
             if self.shared.lock().unwrap().unpark_all() && self.serial_sweep()? {
+                continue;
+            }
+            // Woken directly during that sweep (a child stopped or exited).
+            if self.shared.lock().unwrap().has_runnable() {
                 continue;
             }
             // Genuinely parked. A task holding a timed-wait deadline (setTimeout

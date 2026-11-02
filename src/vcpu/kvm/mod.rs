@@ -367,6 +367,23 @@ mod tests {
     /// `NIXVM_QUANTUM_MS` quantum, so a broken timer hangs the test rather than
     /// passing.
     #[test]
+    fn a_signal_in_user_mode_settles_nothing() {
+        let Some(backend) = backend_or_skip() else {
+            return;
+        };
+        let base = 0x1_0000u64;
+        let mut mem = GuestMemory::new(base, 64 * 1024);
+        mem.map(base, PAGE_SIZE, Prot::rwx()).unwrap();
+        mem.write_init(base, &[0xEB, 0xFE]).unwrap(); // jmp $ (spin forever)
+        let mut v = backend.new_vcpu(base, base + 0x8000).unwrap();
+        v.set_reg(1, 0xdead_0000); // rcx: whatever the program had there
+        assert_eq!(v.run(&mut mem).unwrap(), Exit::Interrupted);
+        assert!(v.async_signal_boundary(), "preempted in user mode");
+        v.settle_syscall_return();
+        assert_eq!(v.pc(), base, "no sysretq was pending, so rip is untouched");
+    }
+
+    #[test]
     fn forks_outnumbering_the_kvm_vcpu_limit_are_fine_if_they_do_not_overlap() {
         let Some(backend) = backend_or_skip() else {
             return;
