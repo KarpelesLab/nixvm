@@ -217,6 +217,8 @@ pub(super) enum SockDirection {
     Send,
 }
 
+/// The most iovecs one `sendmsg`/`recvmsg` takes (`UIO_MAXIOV`).
+const UIO_MAXIOV: u64 = 1024;
 const SO_RCVTIMEO_NEW: u64 = 66;
 const SO_SNDTIMEO_NEW: u64 = 67;
 const SO_PRIORITY: u64 = 12;
@@ -1943,6 +1945,7 @@ impl Kernel {
         mem: &GuestMemory,
     ) -> i64 {
         const MSG_NOSIGNAL: u64 = 0x4000;
+        let len = len.min(super::MAX_RW_COUNT);
         let Ok(data) = mem.read_vec(buf, len as usize) else {
             return err(Errno::EFAULT);
         };
@@ -2358,12 +2361,19 @@ impl Kernel {
         let Some(hdr) = MsgHdr::read(mem, msg) else {
             return err(Errno::EFAULT);
         };
+        if hdr.iovlen > UIO_MAXIOV {
+            return err(Errno::EMSGSIZE);
+        }
         let mut data = Vec::new();
+        let mut remaining = super::MAX_RW_COUNT;
         for i in 0..hdr.iovlen {
             let ent = hdr.iov + i * 16;
             let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
                 return err(Errno::EFAULT);
             };
+            // Entries may repeat one buffer, so bound the total, not each one.
+            let len = len.min(remaining);
+            remaining -= len;
             match mem.read_vec(base, len as usize) {
                 Ok(mut chunk) => data.append(&mut chunk),
                 Err(_) => return err(Errno::EFAULT),
@@ -2491,6 +2501,9 @@ impl Kernel {
             return err(Errno::EFAULT);
         };
         // Total scatter capacity, and the (base, len) list to scatter into.
+        if hdr.iovlen > UIO_MAXIOV {
+            return err(Errno::EMSGSIZE);
+        }
         let mut iovs = Vec::with_capacity(hdr.iovlen as usize);
         let mut total = 0u64;
         for i in 0..hdr.iovlen {

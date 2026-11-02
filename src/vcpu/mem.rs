@@ -822,7 +822,12 @@ impl GuestMemory {
         // SSIZE_MAX bytes from a bogus pointer) must fault, not make the host
         // try to allocate it.
         self.check(addr, len, Prot::READ)?;
-        let mut v = vec![0u8; len];
+        // Mapped isn't the same as backed: a huge untouched mapping passes the
+        // check, and its length mustn't abort the host.
+        let mut v = Vec::new();
+        v.try_reserve_exact(len)
+            .map_err(|e| MemError::Host(e.to_string()))?;
+        v.resize(len, 0);
         self.read(addr, &mut v)?;
         Ok(v)
     }

@@ -29,6 +29,8 @@ impl std::fmt::Debug for Mount {
 #[derive(Debug, Default)]
 pub struct MountTable {
     mounts: Vec<Mount>,
+    /// What every mounted filesystem charges its in-memory contents to.
+    quota: Option<std::sync::Arc<crate::limits::Quota>>,
 }
 
 impl MountTable {
@@ -37,13 +39,25 @@ impl MountTable {
         Self::default()
     }
 
+    /// Charge every filesystem's in-memory contents to `quota`, now and for
+    /// anything mounted later.
+    pub fn attach_quota(&mut self, quota: &std::sync::Arc<crate::limits::Quota>) {
+        for mount in &mut self.mounts {
+            mount.fs.attach_quota(quota);
+        }
+        self.quota = Some(quota.clone());
+    }
+
     /// Mount `fs` at absolute `point`. Deeper mount points win via
     /// longest-prefix resolution.
     ///
     /// `point` is normalized (see `normalize`) before being stored, so
     /// callers may pass e.g. `"/dev/"` or `"/dev/../dev"` and still get the
     /// expected `"/dev"` mount point.
-    pub fn mount(&mut self, point: impl Into<String>, fs: Box<dyn MountFs>) {
+    pub fn mount(&mut self, point: impl Into<String>, mut fs: Box<dyn MountFs>) {
+        if let Some(quota) = &self.quota {
+            fs.attach_quota(quota);
+        }
         self.mounts.push(Mount {
             point: normalize(&point.into()),
             fs,
@@ -53,7 +67,10 @@ impl MountTable {
 
     /// Mount `fs` at `point` on the guest's behalf (`mount(2)`); it stacks
     /// over whatever was there and can be removed with [`Self::unmount`].
-    pub fn mount_guest(&mut self, point: &str, fs: Box<dyn MountFs>) {
+    pub fn mount_guest(&mut self, point: &str, mut fs: Box<dyn MountFs>) {
+        if let Some(quota) = &self.quota {
+            fs.attach_quota(quota);
+        }
         self.mounts.push(Mount {
             point: normalize(point),
             fs,

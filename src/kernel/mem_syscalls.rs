@@ -321,16 +321,19 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         let start = page_down(addr);
-        let end = page_up(addr + len);
-        let pages = ((end - start) / PAGE_SIZE) as usize;
-        let mut resident = vec![0u8; pages];
-        for (i, r) in resident.iter_mut().enumerate() {
-            let p = start + i as u64 * PAGE_SIZE;
+        // Beyond any address space: ENOMEM, like a hole.
+        let Some(end) = addr.checked_add(len).filter(|&e| e < (1 << 57)) else {
+            return err(Errno::ENOMEM);
+        };
+        let end = page_up(end);
+        // Built as it goes, so the length only costs what is really mapped.
+        let mut resident = Vec::new();
+        for p in (start..end).step_by(PAGE_SIZE as usize) {
             // A hole anywhere in the range makes the whole call ENOMEM.
             if mem.page_prot(p).is_none() {
                 return err(Errno::ENOMEM);
             }
-            *r = u8::from(mem.is_resident(p));
+            resident.push(u8::from(mem.is_resident(p)));
         }
         if mem.write(vec, &resident).is_err() {
             return err(Errno::EFAULT);

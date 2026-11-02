@@ -1220,6 +1220,8 @@ impl ServiceCtx {
 /// locks.
 #[allow(clippy::struct_excessive_bools)] // independent one-shot flags, not a state enum
 pub struct Kernel {
+    /// Host memory held for the guest (see [`crate::limits::Limits`]).
+    memory_quota: Arc<crate::limits::Quota>,
     arch: Arch,
     /// Interactive mode (the browser terminal): guest reads of fd 0 draw from
     /// `Shared::stdin_buf` and *block* (re-trap) when it is empty rather than
@@ -1622,8 +1624,12 @@ impl Shared {
 
 impl Kernel {
     #[must_use]
-    pub fn new(arch: Arch, mounts: MountTable) -> Self {
+    pub fn new(arch: Arch, mut mounts: MountTable) -> Self {
+        let limits = crate::limits::Limits::for_this_host();
+        let memory_quota = crate::limits::Quota::new(limits.kernel_memory);
+        mounts.attach_quota(&memory_quota);
         Self {
+            memory_quota,
             arch,
             trace: std::env::var_os("NIXVM_TRACE").is_some(),
             schedtrace: std::env::var_os("NIXVM_SCHEDTRACE").is_some(),
@@ -1694,6 +1700,11 @@ impl Kernel {
     /// addresses (and UDP/DNS) are bridged onto real host sockets, so
     /// `apk`/`curl`/`npm` reach the internet. Without this the network is
     /// loopback-only. See [`crate::kernel::egress`].
+    /// Replace the VM-wide resource ceilings.
+    pub fn set_limits(&mut self, limits: crate::limits::Limits) {
+        self.memory_quota.set_limit(limits.kernel_memory);
+    }
+
     pub fn set_egress(&mut self, egress: Box<dyn egress::Egress>) {
         self.net.get_mut().unwrap().set_egress(egress);
     }
@@ -5423,6 +5434,7 @@ impl Kernel {
         count: u64,
         mem: &GuestMemory,
     ) -> i64 {
+        let count = count.min(MAX_RW_COUNT);
         let Some(Fd::Socket { sock, end }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
@@ -5443,6 +5455,7 @@ impl Kernel {
         count: u64,
         mem: &GuestMemory,
     ) -> i64 {
+        let count = count.min(MAX_RW_COUNT);
         let Some(Fd::PipeWrite(i)) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
@@ -5464,6 +5477,7 @@ impl Kernel {
         count: u64,
         mem: &GuestMemory,
     ) -> i64 {
+        let count = count.min(MAX_RW_COUNT);
         let Some(Fd::File {
             path,
             offset: ofs,
@@ -5978,6 +5992,7 @@ impl Kernel {
         offset: u64,
         mem: &GuestMemory,
     ) -> i64 {
+        let count = count.min(MAX_RW_COUNT);
         let Some(Fd::File { path, writable, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::ESPIPE);
         };
@@ -6390,7 +6405,11 @@ impl Kernel {
                 Err(e) => io_errno(&e),
             };
         }
-        let mut data = vec![0u8; attrs.size as usize];
+        let mut data = Vec::new();
+        if data.try_reserve_exact(attrs.size as usize).is_err() {
+            return err(Errno::ENOSPC);
+        }
+        data.resize(attrs.size as usize, 0);
         if vfs.read_at(&old_abs, 0, &mut data).is_err() {
             return err(Errno::EIO);
         }
@@ -7849,7 +7868,10 @@ impl Kernel {
     #[allow(clippy::unused_self)]
     fn read_file(&self, vfs: &mut MountTable, path: &str) -> Option<Vec<u8>> {
         let size = vfs.stat(path)?.size as usize;
-        let mut buf = vec![0u8; size];
+        // A sparse file can claim any size at all.
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(size).ok()?;
+        buf.resize(size, 0);
         let mut off = 0;
         while off < size {
             match vfs.read_at(path, off as u64, &mut buf[off..]) {

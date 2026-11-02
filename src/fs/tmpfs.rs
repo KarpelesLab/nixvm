@@ -14,8 +14,10 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::Arc;
 
 use super::{Attrs, DirEntry, MountFs, NodeKind, SetTime};
+use crate::limits::Quota;
 
 /// Unix mode type bits.
 const S_IFDIR: u32 = 0o040_000;
@@ -46,6 +48,35 @@ struct FileData {
     mode: u32,
     /// How many path entries name this inode (`st_nlink`).
     links: u32,
+    /// Charged for `data`'s capacity and `meta`'s attributes until dropped.
+    quota: Arc<Quota>,
+}
+
+impl FileData {
+    /// What this inode holds charged against its quota.
+    fn cost(&self) -> u64 {
+        self.data.capacity() as u64 + xattr_cost(&self.meta)
+    }
+}
+
+impl Drop for FileData {
+    fn drop(&mut self) {
+        self.quota.release(self.cost());
+    }
+}
+
+/// The largest file offset, Linux's `s_maxbytes` for tmpfs.
+const MAX_FILE_SIZE: u64 = i64::MAX as u64;
+
+/// Roughly what a path entry costs on top of its name and contents.
+const NODE_OVERHEAD: u64 = 256;
+
+/// Host memory held by `meta`'s extended attributes.
+fn xattr_cost(meta: &Meta) -> u64 {
+    meta.xattrs
+        .iter()
+        .map(|(name, value)| (name.len() + value.len()) as u64 + NODE_OVERHEAD)
+        .sum()
 }
 
 #[derive(Debug)]
@@ -73,6 +104,8 @@ pub struct TmpFs {
     /// Regular-file inodes by inode number.
     files: BTreeMap<u64, FileData>,
     next_inode: u64,
+    /// What file data, names and attributes are charged to.
+    quota: Arc<Quota>,
 }
 
 impl Default for TmpFs {
@@ -102,6 +135,7 @@ impl TmpFs {
             nodes,
             files: BTreeMap::new(),
             next_inode: 2,
+            quota: Quota::unlimited(),
         }
     }
 
@@ -135,6 +169,7 @@ impl TmpFs {
                 data: Vec::new(),
                 mode,
                 links: 1,
+                quota: self.quota.clone(),
             },
         );
         ino
@@ -163,10 +198,60 @@ impl TmpFs {
         }
     }
 
+    /// What the path entry `rel` holding `node` costs. A regular file's data and
+    /// attributes belong to its inode (see [`FileData::cost`]).
+    fn node_cost(rel: &str, node: &Node) -> u64 {
+        let contents = match node {
+            Node::File { .. } => 0,
+            Node::Dir { meta } | Node::Fifo { meta, .. } => xattr_cost(meta),
+            Node::Symlink { meta, target } => target.len() as u64 + xattr_cost(meta),
+        };
+        NODE_OVERHEAD + rel.len() as u64 + contents
+    }
+
+    /// Add the path entry `rel`, if the quota has room for it.
+    fn insert_node(&mut self, rel: &str, node: Node) -> io::Result<()> {
+        if !self.quota.try_charge(Self::node_cost(rel, &node)) {
+            return Err(enospc());
+        }
+        self.nodes.insert(rel.to_string(), node);
+        Ok(())
+    }
+
+    /// Make room for a regular file of `end` bytes. Capacity grows geometrically
+    /// so appends stay linear, falling back to an exact fit near the quota; a
+    /// failure leaves the file as it was.
+    fn grow_file(f: &mut FileData, end: usize) -> io::Result<()> {
+        let capacity = f.data.capacity();
+        if end <= capacity {
+            return Ok(());
+        }
+        let quota = f.quota.clone();
+        let target = if quota.try_charge((end.max(capacity * 2) - capacity) as u64) {
+            end.max(capacity * 2)
+        } else if quota.try_charge((end - capacity) as u64) {
+            end
+        } else {
+            return Err(enospc());
+        };
+        let extra = target - f.data.len();
+        if f.data.try_reserve_exact(extra).is_err() {
+            quota.release((target - capacity) as u64);
+            return Err(enospc());
+        }
+        // The allocator may round up: stay charged for what is really held.
+        quota.force_charge((f.data.capacity() - target) as u64);
+        Ok(())
+    }
+
     /// Drop the path entry `rel`, releasing a regular file's inode when it was
     /// the last name.
     fn remove_entry(&mut self, rel: &str) {
-        if let Some(Node::File { ino }) = self.nodes.remove(rel)
+        let Some(node) = self.nodes.remove(rel) else {
+            return;
+        };
+        self.quota.release(Self::node_cost(rel, &node));
+        if let Node::File { ino } = node
             && let Some(f) = self.files.get_mut(&ino)
         {
             f.links -= 1;
@@ -229,6 +314,12 @@ impl TmpFs {
 fn enoent() -> io::Error {
     io::Error::from_raw_os_error(2)
 }
+fn enospc() -> io::Error {
+    io::Error::from_raw_os_error(28)
+}
+fn efbig() -> io::Error {
+    io::Error::from_raw_os_error(27)
+}
 fn eperm() -> io::Error {
     io::Error::from_raw_os_error(1)
 }
@@ -258,6 +349,18 @@ fn now_ts() -> i64 {
 }
 
 impl MountFs for TmpFs {
+    fn attach_quota(&mut self, quota: &Arc<Quota>) {
+        let nodes: u64 = self.nodes.iter().map(|(k, n)| Self::node_cost(k, n)).sum();
+        self.quota.release(nodes);
+        quota.force_charge(nodes);
+        for f in self.files.values_mut() {
+            f.quota.release(f.cost());
+            quota.force_charge(f.cost());
+            f.quota = quota.clone();
+        }
+        self.quota = quota.clone();
+    }
+
     fn read_only(&self) -> bool {
         false
     }
@@ -358,11 +461,16 @@ impl MountFs for TmpFs {
         match self.nodes.get(rel) {
             Some(Node::File { .. }) => {
                 let f = self.file_mut(rel).ok_or_else(enoent)?;
-                let end = off as usize + buf.len();
+                let end = off
+                    .checked_add(buf.len() as u64)
+                    .filter(|&end| end <= MAX_FILE_SIZE)
+                    .and_then(|end| usize::try_from(end).ok())
+                    .ok_or_else(efbig)?;
                 if f.data.len() < end {
+                    Self::grow_file(f, end)?;
                     f.data.resize(end, 0);
                 }
-                f.data[off as usize..end].copy_from_slice(buf);
+                f.data[end - buf.len()..end].copy_from_slice(buf);
                 f.meta.mtime = now_ts();
                 Ok(buf.len())
             }
@@ -377,7 +485,10 @@ impl MountFs for TmpFs {
             return Err(eexist());
         }
         let ino = self.new_file(mode);
-        self.nodes.insert(rel.to_string(), Node::File { ino });
+        if let Err(e) = self.insert_node(rel, Node::File { ino }) {
+            self.files.remove(&ino);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -387,7 +498,7 @@ impl MountFs for TmpFs {
             return Err(eexist());
         }
         let meta = self.new_meta();
-        self.nodes.insert(rel.to_string(), Node::Dir { meta });
+        self.insert_node(rel, Node::Dir { meta })?;
         Ok(())
     }
 
@@ -416,8 +527,15 @@ impl MountFs for TmpFs {
                 ino: self.new_file(mode & 0o7777),
             }
         };
-        self.nodes.insert(rel.to_string(), node);
-        Ok(())
+        let ino = match node {
+            Node::File { ino } => Some(ino),
+            _ => None,
+        };
+        let inserted = self.insert_node(rel, node);
+        if let (Err(_), Some(ino)) = (&inserted, ino) {
+            self.files.remove(&ino);
+        }
+        inserted
     }
 
     fn unlink(&mut self, rel: &str) -> io::Result<()> {
@@ -446,7 +564,7 @@ impl MountFs for TmpFs {
         {
             return Err(io::Error::from_raw_os_error(39)); // ENOTEMPTY
         }
-        self.nodes.remove(rel);
+        self.remove_entry(rel);
         Ok(())
     }
 
@@ -454,7 +572,19 @@ impl MountFs for TmpFs {
         match self.nodes.get(rel) {
             Some(Node::File { .. }) => {
                 let f = self.file_mut(rel).ok_or_else(enoent)?;
-                f.data.resize(len as usize, 0);
+                let len = usize::try_from(len)
+                    .ok()
+                    .filter(|&len| len as u64 <= MAX_FILE_SIZE)
+                    .ok_or_else(efbig)?;
+                if len > f.data.capacity() {
+                    Self::grow_file(f, len)?;
+                }
+                f.data.resize(len, 0);
+                if len < f.data.capacity() / 2 {
+                    let before = f.data.capacity();
+                    f.data.shrink_to(len);
+                    f.quota.release((before - f.data.capacity()) as u64);
+                }
                 f.meta.mtime = now_ts();
                 Ok(())
             }
@@ -513,8 +643,15 @@ impl MountFs for TmpFs {
     }
 
     fn setxattr(&mut self, rel: &str, name: &str, value: &[u8]) -> io::Result<()> {
+        let quota = self.quota.clone();
         let meta = self.meta_of_mut(rel).ok_or_else(enoent)?;
-        meta.xattrs.insert(name.to_string(), value.to_vec());
+        let new_cost = (name.len() + value.len()) as u64 + NODE_OVERHEAD;
+        if !quota.try_charge(new_cost) {
+            return Err(enospc());
+        }
+        if let Some(old) = meta.xattrs.insert(name.to_string(), value.to_vec()) {
+            quota.release((name.len() + old.len()) as u64 + NODE_OVERHEAD);
+        }
         Ok(())
     }
 
@@ -524,8 +661,11 @@ impl MountFs for TmpFs {
     }
 
     fn removexattr(&mut self, rel: &str, name: &str) -> io::Result<()> {
+        let quota = self.quota.clone();
         let meta = self.meta_of_mut(rel).ok_or_else(enoent)?;
-        meta.xattrs.remove(name).map(drop).ok_or_else(enodata)
+        let old = meta.xattrs.remove(name).ok_or_else(enodata)?;
+        quota.release((name.len() + old.len()) as u64 + NODE_OVERHEAD);
+        Ok(())
     }
 
     fn symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {
@@ -534,14 +674,13 @@ impl MountFs for TmpFs {
             return Err(eexist());
         }
         let meta = self.new_meta();
-        self.nodes.insert(
-            linkpath.to_string(),
+        self.insert_node(
+            linkpath,
             Node::Symlink {
                 meta,
                 target: target.to_string(),
             },
-        );
-        Ok(())
+        )
     }
 
     fn readlink(&mut self, rel: &str) -> io::Result<String> {
@@ -566,10 +705,10 @@ impl MountFs for TmpFs {
         if self.nodes.contains_key(new_rel) {
             return Err(eexist());
         }
+        self.insert_node(new_rel, Node::File { ino })?;
         if let Some(f) = self.files.get_mut(&ino) {
             f.links += 1;
         }
-        self.nodes.insert(new_rel.to_string(), Node::File { ino });
         Ok(())
     }
 
@@ -633,6 +772,10 @@ impl MountFs for TmpFs {
             } else {
                 format!("{to}{}", &key[from.len()..])
             };
+            // A rename must not fail halfway through a subtree: a longer name
+            // is charged even if it goes over, and released when removed.
+            self.quota.force_charge(new_key.len() as u64);
+            self.quota.release(key.len() as u64);
             self.nodes.insert(new_key, node);
         }
         Ok(())
@@ -642,6 +785,99 @@ impl MountFs for TmpFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn limited(limit: u64) -> (TmpFs, Arc<Quota>) {
+        let mut fs = TmpFs::new();
+        let quota = Quota::new(limit);
+        fs.attach_quota(&quota);
+        (fs, quota)
+    }
+
+    fn errno(e: &io::Error) -> i32 {
+        e.raw_os_error().unwrap()
+    }
+
+    #[test]
+    fn a_write_past_the_quota_is_enospc_and_leaves_the_file_alone() {
+        let (mut fs, _quota) = limited(1024 * 1024);
+        fs.create("f", 0o644).unwrap();
+        fs.write_at("f", 0, b"keep").unwrap();
+        let big = vec![0u8; 2 * 1024 * 1024];
+        assert_eq!(errno(&fs.write_at("f", 0, &big).unwrap_err()), 28);
+        assert_eq!(fs.stat("f").unwrap().size, 4);
+    }
+
+    #[test]
+    fn extending_to_absurd_sizes_fails_cleanly() {
+        let (mut fs, _quota) = limited(1024 * 1024);
+        fs.create("f", 0o644).unwrap();
+        assert_eq!(errno(&fs.truncate("f", 1 << 62).unwrap_err()), 28);
+        assert_eq!(errno(&fs.truncate("f", u64::MAX).unwrap_err()), 27);
+        assert_eq!(errno(&fs.write_at("f", u64::MAX, b"x").unwrap_err()), 27);
+        assert_eq!(
+            errno(&fs.write_at("f", i64::MAX as u64, b"x").unwrap_err()),
+            27
+        );
+        assert_eq!(errno(&fs.write_at("f", 1 << 62, b"x").unwrap_err()), 28);
+        assert_eq!(fs.stat("f").unwrap().size, 0);
+    }
+
+    #[test]
+    fn freeing_a_file_returns_its_quota() {
+        let (mut fs, quota) = limited(u64::MAX);
+        let baseline = quota.used();
+        fs.create("f", 0o644).unwrap();
+        fs.write_at("f", 0, &vec![0; 100_000]).unwrap();
+        fs.setxattr("f", "user.a", b"value").unwrap();
+        fs.link("f", "g").unwrap();
+        assert!(quota.used() >= baseline + 100_000);
+        fs.unlink("f").unwrap();
+        assert!(quota.used() >= baseline + 100_000, "still linked as g");
+        fs.unlink("g").unwrap();
+        assert_eq!(quota.used(), baseline);
+    }
+
+    #[test]
+    fn truncating_down_returns_quota() {
+        let (mut fs, quota) = limited(u64::MAX);
+        fs.create("f", 0o644).unwrap();
+        fs.truncate("f", 1_000_000).unwrap();
+        let full = quota.used();
+        fs.truncate("f", 10).unwrap();
+        assert!(quota.used() + 900_000 < full);
+    }
+
+    #[test]
+    fn empty_files_and_directories_cannot_grow_without_bound() {
+        let (mut fs, quota) = limited(10_000);
+        let mut made = 0;
+        let failure = loop {
+            match fs.create(&format!("f{made}"), 0o644) {
+                Ok(()) => made += 1,
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(errno(&failure), 28);
+        assert!(made > 0 && quota.used() <= 10_000);
+        assert_eq!(errno(&fs.mkdir("d", 0o755).unwrap_err()), 28);
+        assert_eq!(errno(&fs.symlink("t", "l").unwrap_err()), 28);
+        // Deleting makes room again, and a failed create left no stray inode.
+        fs.unlink("f0").unwrap();
+        fs.create("again", 0o644).unwrap();
+        assert_eq!(fs.files.len(), made);
+    }
+
+    #[test]
+    fn xattrs_are_charged_and_replacing_one_does_not_leak() {
+        let (mut fs, quota) = limited(u64::MAX);
+        fs.create("f", 0o644).unwrap();
+        let start = quota.used();
+        fs.setxattr("f", "user.a", &[0; 1000]).unwrap();
+        fs.setxattr("f", "user.a", &[0; 1000]).unwrap();
+        assert!(quota.used() >= start + 1000 && quota.used() < start + 2000);
+        fs.removexattr("f", "user.a").unwrap();
+        assert_eq!(quota.used(), start);
+    }
 
     #[test]
     fn create_write_read_roundtrip() {

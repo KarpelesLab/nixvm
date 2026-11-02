@@ -196,6 +196,10 @@ fn enotempty() -> io::Error {
 }
 
 impl MountFs for Overlay {
+    fn attach_quota(&mut self, quota: &std::sync::Arc<crate::limits::Quota>) {
+        self.upper.attach_quota(quota);
+    }
+
     fn read_only(&self) -> bool {
         false
     }

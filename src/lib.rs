@@ -35,6 +35,7 @@ pub mod clock;
 pub mod fs;
 pub mod image;
 pub mod kernel;
+pub mod limits;
 pub mod loader;
 pub mod sandbox;
 #[cfg(feature = "tunnel")]

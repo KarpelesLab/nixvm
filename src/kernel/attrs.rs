@@ -407,6 +407,10 @@ impl Kernel {
         if modep != 0 && mem.write(modep, &mode.to_le_bytes()).is_err() {
             return err(Errno::EFAULT);
         }
+        // Linux caps this at one page's worth of bits.
+        if maxnode > 4096 * 8 {
+            return err(Errno::EINVAL);
+        }
         if nodemask != 0 {
             let words = (maxnode.saturating_sub(1)).div_ceil(64).max(1) as usize;
             let mut b = vec![0u8; words * 8];

@@ -436,6 +436,10 @@ impl Kernel {
         mem: &mut GuestMemory,
     ) -> i64 {
         const STRIDE: u64 = 8; // struct pollfd { int fd; short events; short revents; }
+        // More descriptors than a process can hold is EINVAL on Linux.
+        if nfds > super::sys_misc::NOFILE_HARD_CAP {
+            return err(Errno::EINVAL);
+        }
         let mut entries = Vec::with_capacity(nfds as usize);
         for i in 0..nfds {
             let addr = fds_ptr + i * STRIDE;
@@ -519,6 +523,12 @@ impl Kernel {
         immediate: bool,
         mem: &mut GuestMemory,
     ) -> i64 {
+        // A negative count is EINVAL; beyond the highest possible fd, Linux just
+        // ignores the rest.
+        if nfds as u32 > i32::MAX as u32 {
+            return err(Errno::EINVAL);
+        }
+        let nfds = nfds.min(super::sys_misc::NOFILE_HARD_CAP);
         let Some(rbits) = read_fdset(mem, r, nfds) else {
             return err(Errno::EFAULT);
         };

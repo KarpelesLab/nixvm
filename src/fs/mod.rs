@@ -109,6 +109,10 @@ pub trait MountFs: std::fmt::Debug + Send {
     fn readdir(&mut self, rel: &str) -> io::Result<Vec<DirEntry>>;
 
     // ---- optional (write side); default read-only ----
+    /// Charge this filesystem's in-memory contents to `quota` from now on. A
+    /// backend holding no host memory for the guest doesn't need this.
+    fn attach_quota(&mut self, _quota: &std::sync::Arc<crate::limits::Quota>) {}
+
     fn read_only(&self) -> bool {
         true
     }
