@@ -143,7 +143,7 @@ impl Kernel {
         if oflag & O_ACCMODE == 3 {
             return err(Errno::EINVAL);
         }
-        let q = match pf.mq_names.get(&name) {
+        let q = match pf.mq_names.get(&format!("{}/{name}", cx.cur.ns.ipc)) {
             Some(&q) => {
                 if oflag & O_CREAT != 0 && oflag & O_EXCL != 0 {
                     return err(Errno::EEXIST);
@@ -186,7 +186,7 @@ impl Kernel {
                     notify: None,
                 });
                 let q = pf.mqueues.len() - 1;
-                pf.mq_names.insert(name, q);
+                pf.mq_names.insert(format!("{}/{name}", cx.cur.ns.ipc), q);
                 q
             }
         };
@@ -200,12 +200,22 @@ impl Kernel {
 
     /// `mq_unlink(name)`: remove the name; open descriptors keep the queue.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_mq_unlink(&self, pf: &mut PollFds, name: u64, mem: &GuestMemory) -> i64 {
+    pub(super) fn sys_mq_unlink(
+        &self,
+        pf: &mut PollFds,
+        cx: &ServiceCtx,
+        name: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
         let name = match check_name(mem, name) {
             Ok(n) => n,
             Err(e) => return e,
         };
-        if pf.mq_names.remove(&name).is_some() {
+        if pf
+            .mq_names
+            .remove(&format!("{}/{name}", cx.cur.ns.ipc))
+            .is_some()
+        {
             0
         } else {
             err(Errno::ENOENT)

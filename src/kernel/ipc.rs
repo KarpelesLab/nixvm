@@ -54,6 +54,8 @@ const SHMMNI: i32 = 4096;
 /// The `struct ipc64_perm` an object carries.
 #[derive(Clone, Debug)]
 struct Perm {
+    /// The IPC namespace it belongs to. Nothing else can see it.
+    ns: u32,
     key: i32,
     uid: u32,
     gid: u32,
@@ -67,6 +69,7 @@ impl Perm {
     fn new(key: i32, cx: &ServiceCtx, mode: u64, seq: u16) -> Self {
         let (uid, gid) = (cx.cur.creds.euid, cx.cur.creds.egid);
         Self {
+            ns: cx.cur.ns.ipc,
             key,
             uid,
             gid,
@@ -191,6 +194,21 @@ pub(super) struct Ipc {
     semadj: BTreeMap<(i32, i32, u16), i32>,
 }
 
+impl Shared {
+    /// Whether `id` names an object in another IPC namespace. Such an object
+    /// doesn't exist as far as the caller is concerned, even if it guessed the id.
+    pub(super) fn ipc_is_foreign(&self, cx: &ServiceCtx, id: i32) -> bool {
+        let ipc = &self.ipc;
+        let ns = ipc
+            .msq
+            .get(&id)
+            .map(|o| o.perm.ns)
+            .or_else(|| ipc.sem.get(&id).map(|o| o.perm.ns))
+            .or_else(|| ipc.shm.get(&id).map(|o| o.perm.ns));
+        ns.is_some_and(|ns| ns != cx.cur.ns.ipc)
+    }
+}
+
 impl Ipc {
     fn alloc_id(&mut self) -> (i32, u16) {
         let n = self.next;
@@ -287,7 +305,7 @@ macro_rules! ipc_get {
             None
         } else {
             $map.iter()
-                .find(|(_, o)| o.perm.key == key)
+                .find(|(_, o)| o.perm.key == key && o.perm.ns == $cx.cur.ns.ipc)
                 .map(|(&id, _)| id)
         };
         match existing {
@@ -543,14 +561,25 @@ impl Kernel {
                 if mem.write(buf, &b).is_err() {
                     return err(Errno::EFAULT);
                 }
-                ipc.msq.keys().copied().max().map_or(0, i64::from)
+                ipc.msq
+                    .iter()
+                    .filter(|(_, o)| o.perm.ns == cx.cur.ns.ipc)
+                    .map(|(&id, _)| id)
+                    .max()
+                    .map_or(0, i64::from)
             }
             IPC_STAT | MSG_STAT | MSG_STAT_ANY => {
                 let id = if cmd == IPC_STAT {
                     id as i32
                 } else {
                     // *_STAT take a table index (here: the nth live queue).
-                    match ipc.msq.keys().nth(id as usize) {
+                    match ipc
+                        .msq
+                        .iter()
+                        .filter(|(_, o)| o.perm.ns == cx.cur.ns.ipc)
+                        .map(|(k, _)| k)
+                        .nth(id as usize)
+                    {
                         Some(&k) => k,
                         None => return err(Errno::EINVAL),
                     }
@@ -836,10 +865,23 @@ impl Kernel {
             if mem.write(arg, &b).is_err() {
                 return err(Errno::EFAULT);
             }
-            return ipc.sem.keys().copied().max().map_or(0, i64::from);
+            return ipc
+                .sem
+                .iter()
+                .filter(|(_, o)| o.perm.ns == cx.cur.ns.ipc)
+                .map(|(&id, _)| id)
+                .max()
+                .map_or(0, i64::from);
         }
         let real_id = if matches!(cmd, SEM_STAT | SEM_STAT_ANY) {
-            match sh.ipc.sem.keys().nth(id as usize) {
+            match sh
+                .ipc
+                .sem
+                .iter()
+                .filter(|(_, o)| o.perm.ns == cx.cur.ns.ipc)
+                .map(|(k, _)| k)
+                .nth(id as usize)
+            {
                 Some(&k) => k,
                 None => return err(Errno::EINVAL),
             }
@@ -1167,7 +1209,12 @@ impl Kernel {
                 if mem.write(buf, &b).is_err() {
                     return err(Errno::EFAULT);
                 }
-                ipc.shm.keys().copied().max().map_or(0, i64::from)
+                ipc.shm
+                    .iter()
+                    .filter(|(_, o)| o.perm.ns == cx.cur.ns.ipc)
+                    .map(|(&id, _)| id)
+                    .max()
+                    .map_or(0, i64::from)
             }
             SHM_INFO => {
                 // struct shm_info: used_ids (int, padded), shm_tot, shm_rss,
@@ -1180,13 +1227,24 @@ impl Kernel {
                 if mem.write(buf, &b).is_err() {
                     return err(Errno::EFAULT);
                 }
-                ipc.shm.keys().copied().max().map_or(0, i64::from)
+                ipc.shm
+                    .iter()
+                    .filter(|(_, o)| o.perm.ns == cx.cur.ns.ipc)
+                    .map(|(&id, _)| id)
+                    .max()
+                    .map_or(0, i64::from)
             }
             IPC_STAT | SHM_STAT | SHM_STAT_ANY => {
                 let id = if cmd == IPC_STAT {
                     id as i32
                 } else {
-                    match ipc.shm.keys().nth(id as usize) {
+                    match ipc
+                        .shm
+                        .iter()
+                        .filter(|(_, o)| o.perm.ns == cx.cur.ns.ipc)
+                        .map(|(k, _)| k)
+                        .nth(id as usize)
+                    {
                         Some(&k) => k,
                         None => return err(Errno::EINVAL),
                     }

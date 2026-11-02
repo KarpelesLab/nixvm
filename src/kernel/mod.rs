@@ -38,6 +38,7 @@ mod ipc;
 mod mem_syscalls;
 mod mqueue;
 mod net;
+mod ns;
 mod orphan;
 mod pagecache;
 mod path;
@@ -209,6 +210,12 @@ impl RLimits {
     }
 }
 
+/// Whether `clone` flags ask for a thread while the PID namespace rules forbid it.
+fn is_thread_flags_conflict(flags: u64, ns: &ns::NsProxy) -> bool {
+    flags & CLONE_THREAD != 0
+        && (flags & (ns::CLONE_NEWPID | ns::CLONE_NEWUSER) != 0 || ns.pid_for_children != ns.pid)
+}
+
 /// Per-process kernel-side state (swapped into `Kernel::cur` while running).
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -301,6 +308,8 @@ struct ProcInfo {
     handlers: SigHand,
     /// Resource limits (see [`RLimits`]).
     rlimits: RLimits,
+    /// The namespaces this task is in.
+    ns: ns::NsProxy,
     /// Alternate signal stack (`sigaltstack`): `(base, size, flags)`. A handler
     /// registered `SA_ONSTACK` runs here instead of the interrupted stack —
     /// which is exactly how a runtime catches its own stack-overflow fault.
@@ -517,6 +526,7 @@ impl Default for ProcInfo {
             stop_reported: false,
             handlers: SigHand::default(),
             rlimits: RLimits::default(),
+            ns: ns::NsProxy::default(),
             altstack: (0, 0, SS_DISABLE),
             blocked: 0,
             pending: 0,
@@ -846,12 +856,6 @@ const CLONE_ALL_FLAGS: u64 = CLONE_VM
     | CLONE_IO
     | CLONE_CLEAR_SIGHAND
     | CLONE_INTO_CGROUP;
-// nixvm models a single global namespace of each `CLONE_NEW*` kind, and runs as
-// root (for whom real Linux *succeeds* and creates a namespace), so those flags
-// are ACCEPTED as no-ops — the child runs against the one global view — rather
-// than returning `EPERM`/`EINVAL`. That is the closest faithful behavior a
-// namespace-less VM can offer; failing would wrongly break a root program that
-// legitimately asks for a fresh namespace.
 
 /// The fully-decoded arguments of a `clone`/`clone3`, normalized so the shared
 /// [`Kernel::do_clone`] core is arch- and syscall-independent. Legacy `clone`
@@ -1522,9 +1526,10 @@ pub(super) struct Shared {
     /// every syscall, and the last value seen there.
     watch_addr: Option<u64>,
     watch_last: u64,
-    /// `sethostname`/`setdomainname`: what `uname` reports.
-    hostname: String,
-    domainname: String,
+    /// What `sethostname`/`setdomainname` set and `uname` reports, by namespace.
+    uts_namespaces: BTreeMap<u32, ns::UtsNs>,
+    /// The id the last new namespace got.
+    next_ns_id: u32,
     /// `mseal`ed ranges: `(mm, start, end)`.
     sealed: Vec<(usize, u64, u64)>,
     /// `membarrier` registrations per address space (`MEMBARRIER_CMD_REGISTER_*`
@@ -1947,8 +1952,8 @@ impl Kernel {
                     .ok()
                     .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
                 watch_last: 0,
-                hostname: "nixvm".to_string(),
-                domainname: "(none)".to_string(),
+                uts_namespaces: BTreeMap::new(),
+                next_ns_id: 0,
                 sealed: Vec::new(),
                 membarrier: BTreeMap::new(),
                 ipc: ipc::Ipc::default(),
@@ -3186,6 +3191,9 @@ impl Kernel {
         if let Some(failure) = self.fd_limit_error(cx, sys, args) {
             return failure;
         }
+        if let Some(result) = self.ns_path_syscall(cx, sys, args, mem) {
+            return result;
+        }
         if !self.trace {
             return self.dispatch_impl(cx, sys, raw, args, vcpu, mem);
         }
@@ -3579,7 +3587,7 @@ impl Kernel {
             // POSIX message queues (see `mqueue.rs`); send/receive also signal
             // and wake, so they run under `sh` instead.
             Sysno::MqOpen => self.sys_mq_open(pf, cx, args, mem),
-            Sysno::MqUnlink => self.sys_mq_unlink(pf, args[0], mem),
+            Sysno::MqUnlink => self.sys_mq_unlink(pf, cx, args[0], mem),
             Sysno::MqNotify => self.sys_mq_notify(pf, cx, args[0], args[1], mem),
             Sysno::MqGetsetattr => self.sys_mq_getsetattr(pf, cx, args[0], args[1], args[2], mem),
             // Legacy x86-64 `signalfd(fd, mask, sizemask)`: signalfd4 with no flags.
@@ -3879,7 +3887,7 @@ impl Kernel {
             }
             Sysno::Madvise => self.sys_madvise(args[0], args[1], args[2], mem),
             Sysno::Mincore => self.sys_mincore(args[0], args[1], args[2], mem),
-            Sysno::Uname => self.sys_uname(sh, args[0], mem),
+            Sysno::Uname => self.sys_uname(sh, cx, args[0], mem),
             // ClockGettime/Gettimeofday/ClockGetres/Time are handled in the fast
             // `dispatch_impl` table (they never reach here). nanosleep's interval
             // is relative (no clock/flags); clock_nanosleep carries a clock id and
@@ -3898,6 +3906,12 @@ impl Kernel {
             Sysno::MqTimedreceive => self.sys_mq_timedreceive(sh, cx, args, mem),
             // System V IPC (see `ipc.rs`).
             Sysno::Msgget => self.sys_msgget(sh, cx, args[0], args[1]),
+            Sysno::Msgsnd | Sysno::Msgrcv | Sysno::Msgctl | Sysno::Semop | Sysno::Semtimedop
+            | Sysno::Semctl | Sysno::Shmat | Sysno::Shmctl
+                if sh.ipc_is_foreign(cx, args[0] as i32) =>
+            {
+                err(Errno::EINVAL)
+            }
             Sysno::Msgsnd => self.sys_msgsnd(sh, cx, args, mem),
             Sysno::Msgrcv => self.sys_msgrcv(sh, cx, args, mem),
             Sysno::Msgctl => self.sys_msgctl(sh, cx, args[0], args[1], args[2], mem),
@@ -4203,7 +4217,7 @@ impl Kernel {
             Sysno::GetRobustList => self.sys_robust_list(sh, cx, args, true, mem),
             Sysno::Unshare => self.sys_unshare(sh, cx, args[0]),
             Sysno::Seccomp => self.sys_seccomp(sh, cx, args[0], args[1], args[2], mem),
-            Sysno::Setns => self.sys_setns(cx, args[0], args[1]),
+            Sysno::Setns => self.sys_setns(sh, cx, args[0], args[1]),
             Sysno::Ustat => self.sys_ustat(args[1], mem),
             Sysno::Sysfs => self.sys_sysfs(args[0], args[1], args[2], mem),
             // vhangup: hang up the controlling terminal — needs
@@ -4386,6 +4400,24 @@ impl Kernel {
         if sh.procs.iter().flatten().count() >= max_tasks {
             return err(Errno::EAGAIN);
         }
+        // A thread stays in its process's PID namespace, so it can't start one, and
+        // can't be created once `unshare` set a different one aside for children.
+        if is_thread_flags_conflict(flags, &cx.cur.ns) {
+            return err(Errno::EINVAL);
+        }
+        const NEEDS_PRIVILEGE: u64 = ns::CLONE_NEWNS
+            | ns::CLONE_NEWCGROUP
+            | ns::CLONE_NEWUTS
+            | ns::CLONE_NEWIPC
+            | ns::CLONE_NEWPID
+            | ns::CLONE_NEWNET;
+        if flags & NEEDS_PRIVILEGE != 0 && cx.cur.creds.euid != 0 {
+            return err(Errno::EPERM);
+        }
+        let child_ns = match sh.namespaces_for_clone(cx, flags & !ns::CLONE_NEWTIME) {
+            Ok(ns) => ns,
+            Err(e) => return e,
+        };
         let Ok(mut child_vcpu) = vcpu.fork() else {
             return err(Errno::EAGAIN);
         };
@@ -4407,13 +4439,9 @@ impl Kernel {
         // CLONE_FS shares the filesystem context (cwd); CLONE_THREAD implies it,
         // and every pthread sets it, so a `chdir` in one thread is seen by all.
         let share_fs = flags & CLONE_FS != 0;
-        // The namespace flags (CLONE_NEW*), CLONE_SYSVSEM, CLONE_IO, CLONE_PTRACE,
-        // CLONE_UNTRACED, CLONE_DETACHED and CLONE_INTO_CGROUP need no code here:
-        // nixvm models one global namespace of each kind (and runs as root, for
-        // whom real Linux *creates* a new namespace successfully), a single SysV
-        // sem/IO/cgroup context, and no ptrace — so each is ACCEPTED as a no-op,
-        // the child simply running against the one global view. See the flag
-        // definitions for why acceptance (not EPERM) is the faithful choice.
+        // CLONE_SYSVSEM, CLONE_IO, CLONE_PTRACE, CLONE_UNTRACED, CLONE_DETACHED and
+        // CLONE_INTO_CGROUP need no code here: there's a single SysV semaphore-undo
+        // context, IO context and cgroup, and no ptrace.
 
         let pid = sh.alloc_pid();
         let mut info = cx.cur.clone();
@@ -4476,6 +4504,7 @@ impl Kernel {
             // The termination signal is the low byte of `flags` (SIGCHLD for fork).
             info.exit_signal = (ca.exit_signal & 0xff) as u8;
         }
+        info.ns = child_ns;
         // Limits belong to the thread group, so only a new process gets its own.
         if !is_thread {
             info.rlimits = info.rlimits.private_copy();
@@ -5999,7 +6028,7 @@ impl Kernel {
             }
             Some(Fd::PtyMaster(..) | Fd::PtySlave(..)) => self.read_pty_fd(cx, fd, buf, count, mem),
             // A pidfd carries no data — `read` is EINVAL (it is only pollable).
-            Some(Fd::Pidfd(..)) => err(Errno::EINVAL),
+            Some(Fd::Pidfd(..) | Fd::Namespace { .. }) => err(Errno::EINVAL),
             _ => {
                 let mut sh = self.shared.lock().unwrap();
                 self.read_shared_fd(&mut sh, cx, fd, buf, count, mem)
@@ -8155,6 +8184,10 @@ impl Kernel {
                 | Fd::Epoll(_)
                 | Fd::PtyMaster(_),
             ) => stat::char_device_attrs(),
+            Some(Fd::Namespace { kind, id }) => Attrs {
+                inode: kind.inode(*id),
+                ..stat::char_device_attrs()
+            },
             Some(Fd::PipeRead(_) | Fd::PipeWrite(_)) => stat::fifo_attrs(),
             Some(Fd::Socket { .. }) => stat::socket_attrs(),
             // A message queue is a regular file on the mqueue filesystem.
@@ -8860,16 +8893,17 @@ impl Kernel {
     }
 
     /// `uname(buf)`.
-    fn sys_uname(&self, sh: &Shared, buf: u64, mem: &mut GuestMemory) -> i64 {
+    fn sys_uname(&self, sh: &mut Shared, cx: &ServiceCtx, buf: u64, mem: &mut GuestMemory) -> i64 {
         const FIELD: usize = 65;
         let mut data = [0u8; FIELD * 6];
+        let names = sh.uts(cx.cur.ns.uts).clone();
         let fields: [&[u8]; 6] = [
             b"Linux",
-            sh.hostname.as_bytes(),
+            names.hostname.as_bytes(),
             b"6.1.0-nixvm",
             b"#1 nixvm",
             self.arch.as_str().as_bytes(),
-            sh.domainname.as_bytes(),
+            names.domainname.as_bytes(),
         ];
         for (i, f) in fields.iter().enumerate() {
             let n = f.len().min(FIELD - 1);
@@ -11306,6 +11340,80 @@ mod tests {
         k.enforce_time_limits(&mut k.shared.lock().unwrap());
         assert!(k.time_limit_reached());
         assert_ne!(pending(&k) & (1 << 8), 0, "SIGKILL is pending");
+    }
+
+    #[test]
+    fn a_new_uts_namespace_copies_the_name_and_then_keeps_its_own() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let name = 0x1_0000;
+        mem.write(name, b"first").unwrap();
+        let set = [name, 5, 0, 0, 0, 0];
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Sethostname, set),
+            0
+        );
+        let outer = cx.cur.ns.uts;
+        let unshare = [ns::CLONE_NEWUTS, 0, 0, 0, 0, 0];
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Unshare, unshare),
+            0
+        );
+        assert_ne!(cx.cur.ns.uts, outer);
+        let hostname = |k: &Kernel, id: u32| k.shared.lock().unwrap().uts(id).hostname.clone();
+        assert_eq!(hostname(&k, cx.cur.ns.uts), "first");
+        mem.write(name, b"inner").unwrap();
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Sethostname, set),
+            0
+        );
+        assert_eq!(hostname(&k, cx.cur.ns.uts), "inner");
+        assert_eq!(hostname(&k, outer), "first");
+    }
+
+    #[test]
+    fn new_namespaces_need_privilege_and_pid_ones_are_for_children() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let (pid_before, unshare) = (cx.cur.ns.pid, [ns::CLONE_NEWPID, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Unshare, unshare),
+            0
+        );
+        assert_eq!(cx.cur.ns.pid, pid_before, "the caller doesn't move");
+        assert_ne!(cx.cur.ns.pid_for_children, pid_before);
+        let child = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [0x11, 0, 0, 0, 0, 0],
+        );
+        {
+            let sh = k.shared.lock().unwrap();
+            let mut task = sh
+                .procs
+                .iter()
+                .flatten()
+                .filter(|p| i64::from(p.info.pid) == child);
+            assert_eq!(task.next().unwrap().info.ns.pid, cx.cur.ns.pid_for_children);
+        }
+        // Threads can't straddle PID namespaces.
+        let thread = [0x100 | 0x800 | 0x1_0000, 0, 0, 0, 0, 0];
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, thread),
+            err(Errno::EINVAL)
+        );
+        cx.cur.creds.euid = 1000;
+        let uts = [ns::CLONE_NEWUTS, 0, 0, 0, 0, 0];
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Unshare, uts),
+            err(Errno::EPERM)
+        );
+        let clone = [ns::CLONE_NEWUTS | 0x11, 0, 0, 0, 0, 0];
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, clone),
+            err(Errno::EPERM)
+        );
     }
 
     #[test]

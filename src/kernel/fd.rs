@@ -1,5 +1,6 @@
 //! The per-process file-descriptor table.
 
+use super::ns::NsKind;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -148,6 +149,11 @@ pub enum Fd {
     /// Becomes `POLLIN`-readable when the referenced process exits; `read` on it
     /// is `EINVAL` (matching Linux — a pidfd carries no data).
     Pidfd(usize),
+    /// A namespace, from opening `/proc/<pid>/ns/<kind>`: what `setns` takes.
+    Namespace {
+        kind: NsKind,
+        id: u32,
+    },
     /// An `epoll_create1` instance: index into the kernel's epoll table.
     Epoll(usize),
     /// The master end of pseudo-terminal `index` (`/dev/ptmx`).

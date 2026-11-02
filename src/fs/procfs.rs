@@ -114,6 +114,17 @@ const PATHS: &[&str] = &[
     "self/setgroups",
     "self/gid_map",
     "self/uid_map",
+    "self/ns",
+    "self/ns/cgroup",
+    "self/ns/ipc",
+    "self/ns/mnt",
+    "self/ns/net",
+    "self/ns/pid",
+    "self/ns/pid_for_children",
+    "self/ns/time",
+    "self/ns/time_for_children",
+    "self/ns/user",
+    "self/ns/uts",
     "sys/kernel/random",
     "sys/kernel/random/boot_id",
     "sys/kernel/random/uuid",
@@ -160,9 +171,24 @@ const ROOT_FILES: &[&str] = &[
     "consoles",
 ];
 
+/// Entries of `self/ns`, in the order Linux lists them.
+const NS_FILES: &[&str] = &[
+    "cgroup",
+    "ipc",
+    "mnt",
+    "net",
+    "pid",
+    "pid_for_children",
+    "time",
+    "time_for_children",
+    "user",
+    "uts",
+];
+
 /// Per-process entry names under `self/`, in `readdir("self")` order. `exe`
 /// and `cwd` are symlinks, `fd` is a directory, the rest are files.
 const SELF_FILES: &[&str] = &[
+    "ns",
     "cmdline",
     "status",
     "stat",
@@ -1141,6 +1167,7 @@ fn is_dir(rel: &str) -> bool {
         rel,
         "" | "self"
             | "self/fd"
+            | "self/ns"
             | "sys"
             | "sys/kernel"
             | "sys/kernel/random"
@@ -1244,6 +1271,13 @@ impl MountFs for ProcFs {
             )
         } else if rel == "self/root" {
             (NodeKind::Symlink, S_IFLNK | 0o777, ROOT_TARGET.len() as u64)
+        } else if rel
+            .strip_prefix("self/ns/")
+            .is_some_and(|n| NS_FILES.contains(&n))
+        {
+            // The kernel answers opens and readlinks of these itself, since the
+            // link names a namespace rather than anything in this filesystem.
+            (NodeKind::Symlink, S_IFLNK | 0o777, 0)
         } else {
             let data = self.content(rel)?;
             (NodeKind::File, S_IFREG | 0o444, data.len() as u64)
@@ -1272,6 +1306,7 @@ impl MountFs for ProcFs {
             || rel == "self/cwd"
             || rel == "self/root"
             || rel.starts_with("self/fd/")
+            || rel.starts_with("self/ns/")
         {
             return Err(einval()); // read on a symlink; use readlink
         }
@@ -1308,11 +1343,15 @@ impl MountFs for ProcFs {
                     let path = format!("self/{n}");
                     let kind = match *n {
                         "exe" | "cwd" | "root" => NodeKind::Symlink,
-                        "fd" => NodeKind::Dir,
+                        "fd" | "ns" => NodeKind::Dir,
                         _ => NodeKind::File,
                     };
                     entry(n, &path, kind)
                 })
+                .collect()),
+            "self/ns" => Ok(NS_FILES
+                .iter()
+                .map(|n| entry(n, &format!("self/ns/{n}"), NodeKind::Symlink))
                 .collect()),
             "self/fd" => Ok(self
                 .data

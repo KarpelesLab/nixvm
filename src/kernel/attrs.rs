@@ -12,7 +12,7 @@
 //! it back — a program that sets a value and reads it back, or probes for a
 //! feature, sees a coherent machine.
 
-use super::{Fd, Kernel, ProcInfo, RunState, ServiceCtx, Shared, err};
+use super::{Kernel, ProcInfo, RunState, ServiceCtx, Shared, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 use crate::vcpu::mem::PAGE_SIZE;
@@ -892,9 +892,9 @@ impl Kernel {
         };
         let s = String::from_utf8_lossy(&b).into_owned();
         if domain {
-            sh.domainname = s;
+            sh.uts(cx.cur.ns.uts).domainname = s;
         } else {
-            sh.hostname = s;
+            sh.uts(cx.cur.ns.uts).hostname = s;
         }
         0
     }
@@ -929,11 +929,10 @@ impl Kernel {
         0
     }
 
-    /// `unshare(flags)`. `CLONE_FILES`/`CLONE_FS` really split a shared fd
-    /// table / filesystem context off into a private copy; the namespace flags
-    /// are accepted as no-ops for root exactly as `clone` accepts them (one
-    /// global namespace of each kind) and refused for a non-root caller
-    /// (`EPERM`; a user namespace needs no privilege). `CLONE_THREAD`/
+    /// `unshare(flags)`. `CLONE_FILES`/`CLONE_FS` split a shared fd table or
+    /// filesystem context off into a private copy, and the namespace flags move
+    /// the caller into new namespaces. Those need privilege (`EPERM`), except a user
+    /// namespace. `CLONE_THREAD`/
     /// `CLONE_SIGHAND`/`CLONE_VM` are only valid for a single-threaded caller.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_unshare(&self, sh: &mut Shared, cx: &mut ServiceCtx, flags: u64) -> i64 {
@@ -992,6 +991,13 @@ impl Kernel {
         if flags & NS != 0 && cx.cur.creds.euid != 0 {
             return err(Errno::EPERM);
         }
+        // A new PID or user namespace is for a single-threaded process only.
+        if flags & (CLONE_NEWUSER | CLONE_NEWPID) != 0 && threaded {
+            return err(Errno::EINVAL);
+        }
+        if let Err(e) = sh.unshare_namespaces(cx, flags & (NS | CLONE_NEWUSER)) {
+            return e;
+        }
         // A private fd table: the shared slot (checked out into `cur.fds` for
         // this slice) gets a copy for the siblings; this task moves to a fresh
         // slot its table is checked into at the end of the slice.
@@ -1011,30 +1017,6 @@ impl Kernel {
             sh.cwd_tables.push(None);
         }
         0
-    }
-
-    /// `setns(fd, nstype)`: join the namespaces `fd` names. Only a pidfd can
-    /// name namespaces here (there are no `/proc/<pid>/ns/*` files), and every
-    /// process shares the one set of namespaces, so joining is a successful
-    /// no-op; any other descriptor is not a namespace (`EINVAL`).
-    #[allow(clippy::unused_self)]
-    pub(super) fn sys_setns(&self, cx: &ServiceCtx, fd: u64, nstype: u64) -> i64 {
-        const NS_ALL: u64 = 0x80
-            | 0x2_0000
-            | 0x200_0000
-            | 0x400_0000
-            | 0x800_0000
-            | 0x1000_0000
-            | 0x2000_0000
-            | 0x4000_0000;
-        if nstype & !NS_ALL != 0 {
-            return err(Errno::EINVAL);
-        }
-        match cx.cur.fds.get(fd as i32) {
-            Some(Fd::Pidfd(_)) => 0,
-            Some(_) => err(Errno::EINVAL),
-            None => err(Errno::EBADF),
-        }
     }
 
     /// x86-64 `ustat(dev, struct ustat *)`: free blocks/inodes of the

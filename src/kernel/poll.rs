@@ -377,7 +377,7 @@ impl Kernel {
             // A message queue: readable with a message, writable with room.
             Fd::Mqueue { q, .. } => pf.mq_ready(q),
             // Nested epoll readiness is not modeled.
-            Fd::Epoll(_) => 0,
+            Fd::Namespace { .. } | Fd::Epoll(_) => 0,
             // Pseudo-terminal ends — `ptys` is the innermost lock (after
             // pollfds), so acquiring it here keeps the order consistent.
             Fd::PtyMaster(i) => self.ptys.lock().unwrap().master_ready(i),
