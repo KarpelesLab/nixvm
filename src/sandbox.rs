@@ -59,7 +59,8 @@ pub enum RootSource {
     Image(ImageRef),
 }
 
-/// Default guest RAM ceiling: 512 MiB.
+/// Default guest RAM ceiling: 8 GiB, reduced on a host without that much to spare
+/// (see [`crate::limits::guest_memory_ceiling`]).
 const DEFAULT_MEM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 /// Guest base address for the flat process address space (Phase 2 refines this).
 const GUEST_BASE: u64 = 0x1_0000;

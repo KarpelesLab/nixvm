@@ -406,6 +406,9 @@ impl Kernel {
                 Self::ipc_block(cx)
             };
         }
+        if !self.memory_quota.try_charge(text.len() as u64) {
+            return err(Errno::ENOMEM);
+        }
         q.msgs.push_back((mtype as i64, text));
         q.stime = now_s();
         q.lspid = cx.cur.tgid;
@@ -478,7 +481,9 @@ impl Kernel {
             return err(Errno::EFAULT);
         }
         if flags & MSG_COPY == 0 {
-            q.msgs.remove(i);
+            if let Some((_, taken)) = q.msgs.remove(i) {
+                self.memory_quota.release(taken.len() as u64);
+            }
             q.rtime = now_s();
             q.lrpid = cx.cur.tgid;
             sh.unpark_all();
@@ -589,7 +594,9 @@ impl Kernel {
                     return err(Errno::EPERM);
                 }
                 q.perm.set_from(&raw);
-                q.qbytes = qbytes;
+                // Root may raise this past MSGMNB, but not without bound. The bytes
+                // are charged as they arrive; this limits one queue's share.
+                q.qbytes = qbytes.min(64 << 20);
                 q.ctime = now_s();
                 sh.unpark_all();
                 0
@@ -600,7 +607,10 @@ impl Kernel {
                     None => err(Errno::EINVAL),
                     Some(q) if !q.perm.owner(cx) => err(Errno::EPERM),
                     Some(_) => {
-                        ipc.msq.remove(&id);
+                        if let Some(q) = ipc.msq.remove(&id) {
+                            let held: u64 = q.msgs.iter().map(|m| m.1.len() as u64).sum();
+                            self.memory_quota.release(held);
+                        }
                         ipc.removed.insert(id);
                         sh.unpark_all();
                         0
@@ -629,6 +639,12 @@ impl Kernel {
         let nsems = nsems as i32;
         if nsems < 0 || nsems as u64 > SEMMSL {
             return err(Errno::EINVAL);
+        }
+        // Linux's SEMMNS: the most semaphores across all sets. (Generous, but each
+        // one is host memory, and SEMMNI * SEMMSL would be a billion of them.)
+        let existing: usize = sh.ipc.sem.values().map(|s| s.vals.len()).sum();
+        if existing + nsems as usize > 1 << 20 {
+            return err(Errno::ENOSPC);
         }
         let ipc = &mut sh.ipc;
         ipc_get!(

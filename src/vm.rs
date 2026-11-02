@@ -32,7 +32,17 @@ struct CaptureSink(Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for CaptureSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        /// Past this much waiting, hand control back so the embedder can drain it.
+        const YIELD_ABOVE: usize = 16 << 20;
+        /// An embedder that never drains loses output rather than the host's memory.
+        const DROP_ABOVE: usize = 256 << 20;
+        let mut held = self.0.lock().unwrap();
+        if held.len() < DROP_ABOVE {
+            held.extend_from_slice(buf);
+        }
+        if held.len() > YIELD_ABOVE {
+            crate::vcpu::set_yield_deadline(Some(std::time::Duration::ZERO));
+        }
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -305,17 +315,19 @@ impl Vm {
     /// Propagates a backend/scheduler failure (a guest fault ends the run via
     /// `exit_code`, not an error).
     pub fn pump(&mut self) -> Result<Step, String> {
+        let mut busy = false;
         if self.finished.is_none() {
             match self.kernel.pump().map_err(|e| e.to_string())? {
                 Pumped::Exited(code) => self.finished = Some(code),
-                Pumped::Blocked | Pumped::Busy => {}
+                Pumped::Blocked => {}
+                Pumped::Busy => busy = true,
             }
         }
         Ok(Step {
             stdout: std::mem::take(&mut *self.stdout.lock().unwrap()),
             stderr: std::mem::take(&mut *self.stderr.lock().unwrap()),
             exit_code: self.finished,
-            busy: false,
+            busy,
         })
     }
 }

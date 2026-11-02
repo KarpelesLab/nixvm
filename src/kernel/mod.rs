@@ -510,7 +510,13 @@ impl ProcInfo {
     /// standard signals coalesce, keeping the newest info.
     fn post_siginfo(&mut self, sig: u64, qs: QueuedSig) {
         if sig >= SIGRTMIN {
-            self.rt_queue.entry(sig as u32).or_default().push_back(qs);
+            // Not without bound. (Linux refuses in `sigqueue` at RLIMIT_SIGPENDING;
+            // past that, like there, the signal itself stays pending but its extra
+            // deliveries don't queue.)
+            const MAX_QUEUED: usize = 4096;
+            if self.rt_queue.values().map(VecDeque::len).sum::<usize>() < MAX_QUEUED {
+                self.rt_queue.entry(sig as u32).or_default().push_back(qs);
+            }
         } else if (sig as usize) < NSIG_SLOTS {
             self.queued_siginfo[sig as usize] = Some(qs);
         }
@@ -1917,7 +1923,8 @@ impl Kernel {
     /// separate host threads while syscalls are serviced serially on the main
     /// thread (a big-kernel-lock model that maps cleanly onto KVM/HVF later).
     pub fn set_ncpus(&mut self, n: usize) {
-        self.ncpus = n.max(1);
+        // Each is a host thread; far more than any machine has helps nobody.
+        self.ncpus = n.clamp(1, 256);
     }
 
     /// Run the machine: `vcpu`/`mem` become the initial process (pid 1), then
@@ -2185,7 +2192,10 @@ impl Kernel {
     /// with no progress is reported as [`Pumped::Blocked`] (needs input), not a
     /// deadlock error.
     pub fn pump(&self) -> Result<Pumped, VcpuError> {
-        self.pump_inner()
+        let result = self.pump_inner();
+        // A sink may have asked for control back; that's now done.
+        crate::vcpu::set_yield_deadline(None);
+        result
     }
 
     /// [`Kernel::pump`] with a time budget: return [`Pumped::Busy`] once
@@ -5603,6 +5613,22 @@ impl Kernel {
         mem: &GuestMemory,
     ) -> i64 {
         let f = cx.cur.fds.get(fd as i32).cloned();
+        // The slave's output waits for the master to read it. A full terminal
+        // takes what fits (a short write is normal here) or makes the writer wait.
+        let count = if let Some(Fd::PtySlave(n)) = f {
+            let ptys = self.ptys.lock().unwrap();
+            let room = ptys.slave_room(n) as u64;
+            if room == 0 {
+                if ptys.is_nonblock(n, false) {
+                    return err(Errno::EAGAIN);
+                }
+                cx.block = true;
+                return 0;
+            }
+            count.min(room)
+        } else {
+            count.min(pty::MAX_QUEUED as u64)
+        };
         let Ok(data) = mem.read_vec(buf, count as usize) else {
             return err(Errno::EFAULT);
         };

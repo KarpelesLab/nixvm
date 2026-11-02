@@ -47,6 +47,14 @@ impl Default for Limits {
     }
 }
 
+/// The most guest RAM a VM may be given: three quarters of this machine's RAM,
+/// since a guest can touch every page it's promised, or
+/// `NIXVM_LIMIT_GUEST_MEMORY` (bytes).
+#[must_use]
+pub fn guest_memory_ceiling() -> u64 {
+    env_u64("NIXVM_LIMIT_GUEST_MEMORY").unwrap_or_else(|| host_memory_bytes() / 4 * 3)
+}
+
 /// A positive integer from environment variable `name`.
 fn env_u64(name: &str) -> Option<u64> {
     std::env::var(name).ok()?.trim().parse().ok()

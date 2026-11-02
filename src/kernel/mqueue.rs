@@ -254,6 +254,11 @@ impl Kernel {
         let Ok(data) = mem.read_vec(ptr, len as usize) else {
             return err(Errno::EFAULT);
         };
+        // A queue may promise far more than the host should hold, so what it
+        // really holds counts against the VM's kernel memory.
+        if !self.memory_quota.try_charge(data.len() as u64) {
+            return err(Errno::ENOMEM);
+        }
         cx.cur.wake_deadline = None;
         let was_empty = m.msgs.is_empty();
         let at = m
@@ -325,7 +330,8 @@ impl Kernel {
             return err(Errno::EFAULT);
         }
         let n = data.len() as i64;
-        m.msgs.remove(0);
+        let (_, taken) = m.msgs.remove(0);
+        self.memory_quota.release(taken.len() as u64);
         drop(pf);
         sh.unpark_all();
         n

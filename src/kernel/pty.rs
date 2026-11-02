@@ -81,6 +81,10 @@ fn default_termios() -> [u8; TERMIOS_LEN] {
 }
 
 /// One pseudo-terminal.
+/// The most a terminal queues in either direction (Linux's `N_TTY_BUF_SIZE` is
+/// 4 KiB, with larger flip buffers ahead of it).
+pub(super) const MAX_QUEUED: usize = 64 * 1024;
+
 #[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
 pub(super) struct Pty {
@@ -197,6 +201,11 @@ impl Pty {
     /// feed the slave. Returns the signals the `ISIG` chars generated, for the
     /// caller to deliver to [`Pty::fg_pgrp`].
     fn master_write(&mut self, data: &[u8]) -> Vec<u32> {
+        // A terminal nobody reads drops further input, as Linux's N_TTY does.
+        // Echo goes to the output queue, so it's bounded here too.
+        let queued = self.input.len() + self.canon.len();
+        let room = MAX_QUEUED.saturating_sub(queued.max(self.output.len()));
+        let data = &data[..data.len().min(room / 2)];
         let (canon, echo) = (self.lflag() & ICANON != 0, self.lflag() & ECHO != 0);
         let isig = self.lflag() & ISIG != 0;
         let (icrnl, inlcr, igncr) = (
@@ -389,6 +398,14 @@ impl Ptys {
             None => (Vec::new(), 0),
         }
     }
+    /// How many bytes the slave can write before the master must read some.
+    /// Output processing can double a byte (NL → CR-NL), so room is halved.
+    pub(super) fn slave_room(&self, n: usize) -> usize {
+        self.table.get(n).map_or(MAX_QUEUED, |p| {
+            MAX_QUEUED.saturating_sub(p.output.len()) / 2
+        })
+    }
+
     pub(super) fn slave_write(&mut self, n: usize, data: &[u8]) {
         if let Some(p) = self.table.get_mut(n) {
             p.slave_write(data);
@@ -551,6 +568,21 @@ impl Ptys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_terminal_nobody_reads_stops_taking_output_and_input() {
+        let mut t = Ptys::default();
+        let n = t.alloc();
+        assert_eq!(t.slave_room(n), MAX_QUEUED / 2);
+        t.slave_write(n, &vec![b'x'; MAX_QUEUED]);
+        assert_eq!(t.slave_room(n), 0);
+        // Echo and queued input can't grow without bound either.
+        t.master_write(n, &vec![b'y'; 4 * MAX_QUEUED]);
+        t.master_write(n, &vec![b'y'; 4 * MAX_QUEUED]);
+        let p = t.table.get(n).unwrap();
+        assert!(p.input.len() + p.canon.len() <= MAX_QUEUED);
+        assert!(p.output.len() <= 2 * MAX_QUEUED);
+    }
 
     #[test]
     fn canonical_line_discipline_echoes_and_buffers() {

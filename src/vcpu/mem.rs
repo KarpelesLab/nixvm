@@ -210,6 +210,7 @@ impl GuestMemory {
         assert_eq!(base % PAGE_SIZE, 0, "base must be page-aligned");
         let size = vsize.max(PAGE_SIZE).next_multiple_of(HOST_PAGE as u64);
         let npages = (size / PAGE_SIZE) as usize;
+        let phys_bytes = phys_bytes.min(crate::limits::guest_memory_ceiling());
 
         // Pool budget: the physical RAM (`phys_bytes`) holds the committed working
         // set — one frame per *touched* page — plus interior page tables (a PT per
