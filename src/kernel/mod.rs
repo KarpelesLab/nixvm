@@ -71,6 +71,62 @@ const AT_FDCWD: i64 = -100;
 /// Max symlink hops before `ELOOP` (matches Linux's `MAXSYMLINKS`).
 const SYMLINK_MAX: u32 = 40;
 
+/// A task's table of signal dispositions, indexed by signal number (1..=64;
+/// index 0 is unused). Cloning this handle *shares* the table, so a change made
+/// by one `CLONE_SIGHAND` task (every thread) is seen by the others at once;
+/// use [`SigHand::private_copy`] for a task that must not share it.
+///
+/// The mutex is a leaf lock: it is only held to copy one entry in or out, and
+/// nothing else is locked under it.
+#[derive(Clone, Debug)]
+struct SigHand(Arc<Mutex<[SigAction; 65]>>);
+
+impl Default for SigHand {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new([SigAction::default(); 65])))
+    }
+}
+
+impl SigHand {
+    /// The disposition of signal `sig`.
+    fn get(&self, sig: impl TryInto<usize>) -> SigAction {
+        let sig = sig.try_into().unwrap_or(0);
+        self.0.lock().unwrap()[sig]
+    }
+
+    /// Set the disposition of signal `sig`, for every task sharing the table.
+    fn set(&self, sig: impl TryInto<usize>, act: SigAction) {
+        let sig = sig.try_into().unwrap_or(0);
+        self.0.lock().unwrap()[sig] = act;
+    }
+
+    /// A new table with the same contents, shared with nobody.
+    fn private_copy(&self) -> Self {
+        let table = *self.0.lock().unwrap();
+        Self(Arc::new(Mutex::new(table)))
+    }
+
+    /// Whether two handles name the same table.
+    fn same_table(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Reset every caught signal to `SIG_DFL` and clear all flags, masks and
+    /// restorers, leaving `SIG_IGN` in place (Linux's
+    /// `flush_signal_handlers(tsk, 0)`: what `execve` and `CLONE_CLEAR_SIGHAND`
+    /// do, since handler addresses don't mean anything in the new context).
+    fn reset_caught(&self) {
+        const SIG_IGN: u64 = 1;
+        for act in self.0.lock().unwrap().iter_mut() {
+            let handler = if act.handler == SIG_IGN { SIG_IGN } else { 0 };
+            *act = SigAction {
+                handler,
+                ..SigAction::default()
+            };
+        }
+    }
+}
+
 /// Per-process kernel-side state (swapped into `Kernel::cur` while running).
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -160,7 +216,7 @@ struct ProcInfo {
     /// Per-signal disposition (handler address / `SIG_DFL` / `SIG_IGN`, plus the
     /// flags, restorer, and mask from `rt_sigaction`). Indexed by signal number
     /// (1..=64); index 0 is unused.
-    handlers: [SigAction; 65],
+    handlers: SigHand,
     /// Alternate signal stack (`sigaltstack`): `(base, size, flags)`. A handler
     /// registered `SA_ONSTACK` runs here instead of the interrupted stack —
     /// which is exactly how a runtime catches its own stack-overflow fault.
@@ -372,7 +428,7 @@ impl Default for ProcInfo {
             run: RunState::Running,
             continued: false,
             stop_reported: false,
-            handlers: [SigAction::default(); 65],
+            handlers: SigHand::default(),
             altstack: (0, 0, SS_DISABLE),
             blocked: 0,
             pending: 0,
@@ -2127,7 +2183,7 @@ impl Kernel {
                     && let Some(sig) = self.first_handled_signal(cx)
                 {
                     cx.block = false;
-                    if cx.cur.handlers[sig].flags & SA_RESTART != 0 && cx.restartable {
+                    if cx.cur.handlers.get(sig).flags & SA_RESTART != 0 && cx.restartable {
                         // Re-run the `syscall` once the handler returns; the
                         // re-run re-establishes any wait bookkeeping (e.g. a
                         // futex's), so leave it in place.
@@ -3918,6 +3974,7 @@ impl Kernel {
         if (flags & CLONE_FS != 0 && flags & (CLONE_NEWNS | CLONE_NEWUSER) != 0)
             || (flags & CLONE_THREAD != 0 && flags & CLONE_SIGHAND == 0)
             || (flags & CLONE_SIGHAND != 0 && flags & CLONE_VM == 0)
+            || (flags & CLONE_SIGHAND != 0 && flags & CLONE_CLEAR_SIGHAND != 0)
         {
             return err(Errno::EINVAL);
         }
@@ -3946,12 +4003,6 @@ impl Kernel {
         // sem/IO/cgroup context, and no ptrace — so each is ACCEPTED as a no-op,
         // the child simply running against the one global view. See the flag
         // definitions for why acceptance (not EPERM) is the faithful choice.
-        // CLONE_SIGHAND asks to *share* the handler table; nixvm copies handlers
-        // per task (`info = cx.cur.clone()` below), so a CLONE_SIGHAND/THREAD
-        // child gets a snapshot of the caller's handlers rather than a live-shared
-        // table. This matches the common case (handlers are installed before
-        // threads spawn and rarely change afterward); true live sharing would need
-        // a handler table like `file_tables` and is deferred.
 
         let pid = sh.next_pid;
         sh.next_pid += 1;
@@ -4015,9 +4066,15 @@ impl Kernel {
             // The termination signal is the low byte of `flags` (SIGCHLD for fork).
             info.exit_signal = (ca.exit_signal & 0xff) as u8;
         }
-        // CLONE_CLEAR_SIGHAND (clone3): the child starts with default dispositions.
+        // `cx.cur.clone()` above shares the handler table, which is what
+        // CLONE_SIGHAND asks for. Anything else gets its own copy.
+        if flags & CLONE_SIGHAND == 0 {
+            info.handlers = info.handlers.private_copy();
+        }
+        // CLONE_CLEAR_SIGHAND (clone3): caught signals start at their default
+        // disposition in the child; ignored ones stay ignored.
         if flags & CLONE_CLEAR_SIGHAND != 0 {
-            info.handlers = [SigAction::default(); 65];
+            info.handlers.reset_caught();
         }
 
         // Address space: share the caller's slot (CLONE_VM), or fork a
@@ -4327,12 +4384,10 @@ impl Kernel {
         // jump the new program to garbage on the next signal. Ignored (SIG_IGN)
         // dispositions are preserved, as Linux does; the blocked mask and pending
         // signals survive too. The alternate signal stack does not survive exec.
-        for h in &mut cx.cur.handlers {
-            if h.handler != 1 {
-                // != SIG_IGN
-                *h = SigAction::default(); // SIG_DFL, no flags/mask/restorer
-            }
-        }
+        // A table shared with another task (CLONE_SIGHAND) is split off first:
+        // the new image's dispositions are this task's alone.
+        cx.cur.handlers = cx.cur.handlers.private_copy();
+        cx.cur.handlers.reset_caught();
         cx.cur.altstack = (0, 0, SS_DISABLE);
         // Close every `FD_CLOEXEC` descriptor (dropping its pipe/socket backing)
         // — this is what execve is *for*, so a process doesn't leak private fds
@@ -9836,12 +9891,15 @@ mod tests {
         let (k, mut mem, mut v, mut cx) = setup();
         const SIG_IGN: u64 = 1;
         // SIGTSTP ignored → dropped, task stays Running.
-        cx.cur.handlers[20] = SigAction {
-            handler: SIG_IGN,
-            flags: 0,
-            restorer: 0,
-            mask: 0,
-        };
+        cx.cur.handlers.set(
+            20,
+            SigAction {
+                handler: SIG_IGN,
+                flags: 0,
+                restorer: 0,
+                mask: 0,
+            },
+        );
         cx.cur.pending = 1 << (20 - 1);
         k.deliver_pending_signals(&mut cx, &mut v, &mut mem);
         assert!(
@@ -9850,7 +9908,7 @@ mod tests {
         );
         assert_eq!(cx.cur.pending & (1 << (20 - 1)), 0, "and is dropped");
         // SIGTSTP at SIG_DFL → stop.
-        cx.cur.handlers[20] = SigAction::default();
+        cx.cur.handlers.set(20, SigAction::default());
         cx.cur.pending = 1 << (20 - 1);
         k.deliver_pending_signals(&mut cx, &mut v, &mut mem);
         assert!(
@@ -10420,6 +10478,157 @@ mod tests {
         assert_ne!(fs(forked), 0, "a fork gets its own cwd slot");
     }
 
+    /// The disposition of `sig` as task `pid` sees it.
+    fn handler_of(k: &Kernel, pid: i64, sig: usize) -> u64 {
+        let sh = k.shared.lock().unwrap();
+        let p = sh.procs.iter().flatten();
+        let mut p = p.filter(|p| i64::from(p.info.pid) == pid);
+        p.next().unwrap().info.handlers.get(sig).handler
+    }
+
+    fn caught(handler: u64) -> SigAction {
+        SigAction {
+            handler,
+            flags: SA_RESTART,
+            ..SigAction::default()
+        }
+    }
+
+    #[test]
+    fn threads_share_signal_handlers_live_a_fork_gets_a_copy() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        const THREAD: u64 = 0x100 | 0x800 | 0x1_0000; // CLONE_VM|SIGHAND|THREAD
+        cx.cur.handlers.set(10, caught(0x1000));
+        let thread = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [THREAD, 0, 0, 0, 0, 0],
+        );
+        let forked = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [0x11, 0, 0, 0, 0, 0],
+        );
+        assert!(thread > 0 && forked > 0);
+        assert_eq!(handler_of(&k, thread, 10), 0x1000, "inherited at clone");
+        assert_eq!(handler_of(&k, forked, 10), 0x1000, "inherited at fork");
+
+        // Installed by the parent after both exist: reaches the thread only.
+        cx.cur.handlers.set(10, caught(0x2000));
+        assert_eq!(handler_of(&k, thread, 10), 0x2000);
+        assert_eq!(handler_of(&k, forked, 10), 0x1000);
+
+        // And in the other direction: a thread's change reaches its siblings.
+        {
+            let sh = k.shared.lock().unwrap();
+            let t = sh.procs.iter().flatten();
+            let mut t = t.filter(|p| i64::from(p.info.pid) == thread);
+            t.next().unwrap().info.handlers.set(12, caught(0x3000));
+        }
+        assert_eq!(cx.cur.handlers.get(12).handler, 0x3000);
+    }
+
+    #[test]
+    fn rt_sigaction_in_one_thread_is_what_a_sibling_reads_back() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        const THREAD: u64 = 0x100 | 0x800 | 0x1_0000;
+        let thread = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [THREAD, 0, 0, 0, 0, 0],
+        );
+        let (act, old) = (0x1_0000, 0x1_0100);
+        mem.write(act, &0x4000u64.to_le_bytes()).unwrap();
+        let args = [10, act, 0, 8, 0, 0];
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::RtSigaction, args),
+            0
+        );
+        assert_eq!(handler_of(&k, thread, 10), 0x4000);
+
+        // Read it back through the syscall, as the sibling would.
+        let sibling = {
+            let sh = k.shared.lock().unwrap();
+            let t = sh.procs.iter().flatten();
+            let mut t = t.filter(|p| i64::from(p.info.pid) == thread);
+            t.next().unwrap().info.clone()
+        };
+        let parent = std::mem::replace(&mut cx.cur, sibling);
+        let args = [10, 0, old, 8, 0, 0];
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::RtSigaction, args),
+            0
+        );
+        assert_eq!(mem.read_u64(old).unwrap(), 0x4000);
+        cx.cur = parent;
+    }
+
+    #[test]
+    fn reset_caught_keeps_ignored_signals_ignored() {
+        let table = SigHand::default();
+        table.set(2, caught(0x1000));
+        table.set(
+            3,
+            SigAction {
+                handler: 1, // SIG_IGN
+                flags: SA_RESTART,
+                ..SigAction::default()
+            },
+        );
+        table.reset_caught();
+        assert_eq!(table.get(2), SigAction::default());
+        assert_eq!(table.get(3).handler, 1, "SIG_IGN survives");
+        assert_eq!(table.get(3).flags, 0, "its flags don't");
+    }
+
+    #[test]
+    fn a_private_copy_of_the_handler_table_is_independent() {
+        let table = SigHand::default();
+        table.set(2, caught(0x1000));
+        let (shared, copy) = (table.clone(), table.private_copy());
+        table.set(2, caught(0x2000));
+        assert!(shared.same_table(&table));
+        assert!(!copy.same_table(&table));
+        assert_eq!(shared.get(2).handler, 0x2000);
+        assert_eq!(copy.get(2).handler, 0x1000);
+    }
+
+    #[test]
+    fn unshare_sighand_needs_a_table_nobody_else_is_using() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        const CLONE_SIGHAND: u64 = 0x800;
+        let unshare = [CLONE_SIGHAND, 0, 0, 0, 0, 0];
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Unshare, unshare),
+            0,
+            "nothing shares it yet"
+        );
+        // A non-thread sharing the table: CLONE_VM | CLONE_SIGHAND.
+        let flags = 0x100 | CLONE_SIGHAND;
+        let child = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [flags, 0, 0, 0, 0, 0],
+        );
+        assert!(child > 0);
+        assert_eq!(
+            call(&k, &mut cx, &mut mem, &mut v, Sysno::Unshare, unshare),
+            err(Errno::EINVAL)
+        );
+    }
+
     #[test]
     fn clone_pidfd_yields_an_fd_that_polls_ready_after_the_child_exits() {
         let (k, mut mem, mut v, mut cx) = setup();
@@ -10742,7 +10951,7 @@ mod tests {
 
         // A real handler for a pending signal interrupts.
         cx.cur.pending = bit(2); // SIGINT
-        cx.cur.handlers[2] = handler;
+        cx.cur.handlers.set(2, handler);
         assert_eq!(k.first_handled_signal(&cx), Some(2));
 
         // …but not while that signal is blocked.
@@ -10751,15 +10960,18 @@ mod tests {
         cx.cur.blocked = 0;
 
         // SIG_IGN does not interrupt.
-        cx.cur.handlers[2] = SigAction {
-            handler: 1,
-            ..handler
-        };
+        cx.cur.handlers.set(
+            2,
+            SigAction {
+                handler: 1,
+                ..handler
+            },
+        );
         assert_eq!(k.first_handled_signal(&cx), None);
 
         // A default-terminate signal (SIG_DFL) returns None: the caller lets the
         // Zombie path end the task rather than interrupting the syscall.
-        cx.cur.handlers[2] = SigAction::default();
+        cx.cur.handlers.set(2, SigAction::default());
         cx.cur.pending = bit(15); // SIGTERM, no handler
         assert_eq!(k.first_handled_signal(&cx), None);
 
@@ -10769,7 +10981,7 @@ mod tests {
 
         // Alongside a default-ignored signal, the lowest *handled* one wins.
         cx.cur.pending = bit(17) | bit(10);
-        cx.cur.handlers[10] = handler;
+        cx.cur.handlers.set(10, handler);
         assert_eq!(k.first_handled_signal(&cx), Some(10));
     }
 
@@ -11231,12 +11443,15 @@ mod tests {
         k.arch = Arch::X86_64; // this test drives an x86-64 vcpu + frame layout
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
         cx.cur.mm = 0;
-        cx.cur.handlers[11] = SigAction {
-            handler: 0x2_0000,
-            flags: 0,
-            restorer: 0x2_1000,
-            mask: 0,
-        };
+        cx.cur.handlers.set(
+            11,
+            SigAction {
+                handler: 0x2_0000,
+                flags: 0,
+                restorer: 0x2_1000,
+                mask: 0,
+            },
+        );
 
         // Deliver SIGSEGV (fault addr 0xcafe) → the vcpu enters the handler.
         assert!(k.deliver_fault_signal(
@@ -11328,12 +11543,15 @@ mod tests {
         k.arch = Arch::X86_64;
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
         for sig in [8, 11] {
-            cx.cur.handlers[sig] = SigAction {
-                handler: 0x2_0000,
-                flags: SA_NODEFER,
-                restorer: 0x2_1000,
-                mask: 0,
-            };
+            cx.cur.handlers.set(
+                sig,
+                SigAction {
+                    handler: 0x2_0000,
+                    flags: SA_NODEFER,
+                    restorer: 0x2_1000,
+                    mask: 0,
+                },
+            );
         }
         let si_at = |vcpu: &dyn crate::vcpu::Vcpu| vcpu.reg(6);
         let mctx = |vcpu: &dyn crate::vcpu::Vcpu| vcpu.reg(2) + 40;
@@ -11383,12 +11601,15 @@ mod tests {
         k.arch = Arch::X86_64; // this test drives an x86-64 vcpu + frame layout
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
         cx.cur.mm = 0;
-        cx.cur.handlers[10] = SigAction {
-            handler: 0x2_0000,
-            flags: 0,
-            restorer: 0x2_1000,
-            mask: 0,
-        };
+        cx.cur.handlers.set(
+            10,
+            SigAction {
+                handler: 0x2_0000,
+                flags: 0,
+                restorer: 0x2_1000,
+                mask: 0,
+            },
+        );
 
         // A guest siginfo with si_code = SI_QUEUE (-1) and si_value = 0xABCD.
         let uinfo = 0x1_2000;
@@ -11551,12 +11772,15 @@ mod tests {
         let (k, mut mem, _v, mut cx) = setup(); // setup() is already Arch::Aarch64
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
         cx.cur.mm = 0;
-        cx.cur.handlers[11] = SigAction {
-            handler: 0x2_0000,
-            flags: 0x0400_0000, // SA_RESTORER
-            restorer: 0x2_1000,
-            mask: 0,
-        };
+        cx.cur.handlers.set(
+            11,
+            SigAction {
+                handler: 0x2_0000,
+                flags: 0x0400_0000, // SA_RESTORER
+                restorer: 0x2_1000,
+                mask: 0,
+            },
+        );
 
         // Deliver SIGSEGV (fault addr 0xcafe) → the vcpu enters the aarch64 handler.
         assert!(k.deliver_fault_signal(
@@ -11622,12 +11846,15 @@ mod tests {
         let (k, mut mem, _v, mut cx) = setup();
         mem.map(0x1_0000, 4 * PAGE, Prot::rw()).unwrap();
         for sig in [5, 7] {
-            cx.cur.handlers[sig] = SigAction {
-                handler: 0x2_0000,
-                flags: SA_NODEFER,
-                restorer: 0x2_1000,
-                mask: 0,
-            };
+            cx.cur.handlers.set(
+                sig,
+                SigAction {
+                    handler: 0x2_0000,
+                    flags: SA_NODEFER,
+                    restorer: 0x2_1000,
+                    mask: 0,
+                },
+            );
         }
         // BRK: SIGTRAP / TRAP_BRKPT at the BRK, no esr_context.
         let mut vcpu = backend.new_vcpu(0x1_1110, 0x1_3000).unwrap();
@@ -11671,12 +11898,15 @@ mod tests {
         let backend = crate::vcpu::interp::InterpBackend::new(Arch::Aarch64).unwrap();
         let mut vcpu = backend.new_vcpu(0x1_1230, 0x1_3000).unwrap();
         let (k, mut mem, _v, mut cx) = setup();
-        cx.cur.handlers[14] = SigAction {
-            handler: 0x2_0000,
-            flags: 0x0400_0000, // SA_RESTORER
-            restorer: 0x2_1000,
-            mask: 0,
-        };
+        cx.cur.handlers.set(
+            14,
+            SigAction {
+                handler: 0x2_0000,
+                flags: 0x0400_0000, // SA_RESTORER
+                restorer: 0x2_1000,
+                mask: 0,
+            },
+        );
         // Blocked: stays pending, the guest just resumes.
         cx.cur.pending = 1 << 13;
         cx.cur.blocked = 1 << 13;
@@ -11798,7 +12028,7 @@ mod tests {
             ),
             0
         );
-        assert_eq!(cx.cur.handlers[2].handler, 0xdead);
+        assert_eq!(cx.cur.handlers.get(2).handler, 0xdead);
 
         // Install 0xbeef and read back the previous (0xdead) via oldact.
         mem.write_init(act, &0xbeefu64.to_le_bytes()).unwrap();
@@ -11814,7 +12044,7 @@ mod tests {
             0
         );
         assert_eq!(mem.read_u64(oldact).unwrap(), 0xdead);
-        assert_eq!(cx.cur.handlers[2].handler, 0xbeef);
+        assert_eq!(cx.cur.handlers.get(2).handler, 0xbeef);
     }
 
     #[test]

@@ -966,12 +966,23 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         let tgid = cx.cur.tgid;
-        let threaded = sh
-            .procs
-            .iter()
-            .flatten()
-            .any(|p| p.info.tgid == tgid && !matches!(p.info.run, RunState::Zombie(_)));
+        // The SMP scheduler keeps a copy of the caller in `procs` while its
+        // syscall is serviced, so the caller itself has to be excluded here.
+        let others = || {
+            sh.procs
+                .iter()
+                .flatten()
+                .filter(|p| p.info.pid != cx.cur.pid && !matches!(p.info.run, RunState::Zombie(_)))
+        };
+        let threaded = others().any(|p| p.info.tgid == tgid);
         if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0 && threaded {
+            return err(Errno::EINVAL);
+        }
+        // A handler table shared with a non-thread (CLONE_VM | CLONE_SIGHAND)
+        // can't be unshared either: Linux refuses while its count is above one.
+        if flags & CLONE_SIGHAND != 0
+            && others().any(|p| p.info.handlers.same_table(&cx.cur.handlers))
+        {
             return err(Errno::EINVAL);
         }
         if flags & NS != 0 && cx.cur.creds.euid != 0 {

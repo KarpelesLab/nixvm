@@ -266,7 +266,7 @@ impl Kernel {
         let idx = sig as usize;
         if oldact != 0 {
             // struct sigaction: handler u64, flags u64, restorer u64, mask u64.
-            let old = cx.cur.handlers[idx];
+            let old = cx.cur.handlers.get(idx);
             let mut buf = [0u8; 32];
             buf[0..8].copy_from_slice(&old.handler.to_le_bytes());
             buf[8..16].copy_from_slice(&old.flags.to_le_bytes());
@@ -282,12 +282,15 @@ impl Kernel {
                 return err(Errno::EFAULT);
             }
             let word = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
-            cx.cur.handlers[idx] = super::SigAction {
-                handler: word(0),
-                flags: word(8),
-                restorer: word(16),
-                mask: word(24),
-            };
+            cx.cur.handlers.set(
+                idx,
+                super::SigAction {
+                    handler: word(0),
+                    flags: word(8),
+                    restorer: word(16),
+                    mask: word(24),
+                },
+            );
         }
         0
     }
@@ -649,7 +652,7 @@ impl Kernel {
             if deliverable & (1u64 << (sig - 1)) == 0 {
                 continue;
             }
-            match cx.cur.handlers[sig as usize].handler {
+            match cx.cur.handlers.get(sig as usize).handler {
                 SIG_IGN => {}                                   // dropped — no interrupt
                 h if h != SIG_DFL => return Some(sig as usize), // real handler runs
                 _ if is_default_ignored(sig) => {}              // dropped — no interrupt
@@ -690,7 +693,7 @@ impl Kernel {
             // falls through and is dropped. Stopping parks the task and notifies
             // the parent so its `wait4(WUNTRACED)`/`waitid(WSTOPPED)` wakes.
             if sig == SIGSTOP
-                || (is_stop_signal(sig) && cx.cur.handlers[sig as usize].handler == SIG_DFL)
+                || (is_stop_signal(sig) && cx.cur.handlers.get(sig as usize).handler == SIG_DFL)
             {
                 cx.cur.run = RunState::Stopped(sig as i32);
                 cx.cur.stop_reported = false;
@@ -699,7 +702,7 @@ impl Kernel {
                 self.notify_parent_of_child_event(cx.cur.ppid);
                 return false;
             }
-            match cx.cur.handlers[sig as usize].handler {
+            match cx.cur.handlers.get(sig as usize).handler {
                 // Ignored explicitly: drop it (and any queued RT instances).
                 SIG_IGN => cx.cur.drain_rt(sig),
                 // A real handler: push the frame + redirect the vcpu, then STOP —
@@ -816,7 +819,7 @@ impl Kernel {
         if std::env::var_os("NIXVM_NOSIG").is_some() {
             return false;
         }
-        let act = cx.cur.handlers[sig as usize];
+        let act = cx.cur.handlers.get(sig as usize);
         // Only a real, non-default, non-ignore handler is deliverable.
         if act.handler == SIG_DFL || act.handler == SIG_IGN {
             return false;
@@ -857,7 +860,7 @@ impl Kernel {
         vcpu: &mut dyn crate::vcpu::Vcpu,
         mem: &mut GuestMemory,
     ) -> bool {
-        let act = cx.cur.handlers[sig as usize];
+        let act = cx.cur.handlers.get(sig as usize);
         if act.handler == SIG_DFL || act.handler == SIG_IGN {
             return false;
         }
@@ -929,7 +932,7 @@ impl Kernel {
         }
         let si_code = si.code;
         let si_addr = si.addr;
-        let act = cx.cur.handlers[sig as usize];
+        let act = cx.cur.handlers.get(sig as usize);
         // Choose the stack: the alternate stack if the handler asked for it and
         // one is configured, else just below the current rsp (with the ABI red
         // zone skipped).
@@ -1061,13 +1064,15 @@ impl Kernel {
     /// deadlocks. `SA_RESETHAND` (one-shot) resets the disposition to SIG_DFL
     /// on entry, so a second delivery takes the default action (`signal()`).
     fn enter_handler_mask(cx: &mut ServiceCtx, sig: u64) {
-        let act = cx.cur.handlers[sig as usize];
+        let act = cx.cur.handlers.get(sig as usize);
         cx.cur.blocked |= act.mask;
         if act.flags & SA_NODEFER == 0 {
             cx.cur.blocked |= 1u64 << (sig - 1);
         }
         if act.flags & SA_RESETHAND != 0 {
-            cx.cur.handlers[sig as usize] = super::SigAction::default();
+            cx.cur
+                .handlers
+                .set(sig as usize, super::SigAction::default());
         }
     }
 
@@ -1158,7 +1163,7 @@ impl Kernel {
         vcpu: &mut dyn crate::vcpu::Vcpu,
         mem: &mut GuestMemory,
     ) -> bool {
-        let act = cx.cur.handlers[sig as usize];
+        let act = cx.cur.handlers.get(sig as usize);
         let cur_sp = vcpu.sp();
         let (alt_sp, alt_size, alt_flags) = cx.cur.altstack;
         // aarch64 has no ABI red zone: build directly below the current sp (or on
