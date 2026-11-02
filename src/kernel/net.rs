@@ -361,6 +361,9 @@ impl std::fmt::Debug for Net {
 /// One entry in the socket table.
 #[derive(Debug)]
 struct Sock {
+    /// The network namespace this socket was created in, for good: `setns` moves
+    /// the task, not its sockets. Ports and abstract names are per namespace.
+    netns: u32,
     domain: u16,
     kind: Kind,
     /// `SOCK_NONBLOCK` at creation time (there is no `fcntl(F_SETFL)` wiring
@@ -711,11 +714,31 @@ fn loopback_ip(v6: bool) -> [u8; 16] {
 /// `"tcp4:8080"`. Deliberately ignores the specific address: only
 /// loopback/wildcard binds are valid here, so a port number alone identifies
 /// the endpoint.
-fn route_key(proto: &str, a: InetAddr) -> String {
-    format!("{proto}{}:{}", if a.v6 { 6 } else { 4 }, a.port)
+fn route_key(netns: u32, proto: &str, a: InetAddr) -> String {
+    format!("{netns}/{proto}{}:{}", if a.v6 { 6 } else { 4 }, a.port)
+}
+
+/// The routing key for an `AF_UNIX` name. Abstract names (leading NUL) belong to
+/// the network namespace. A path name is a file, so it's found through the
+/// filesystem whatever the namespace.
+fn unix_key(netns: u32, name: &str) -> String {
+    if name.starts_with('\0') {
+        format!("{netns}/{name}")
+    } else {
+        name.to_string()
+    }
 }
 
 impl Net {
+    /// What connects socket `sock` to the outside world. Only sockets in the VM's
+    /// first network namespace have this: a new namespace is loopback only.
+    fn egress_for(&self, sock: usize) -> Option<&dyn Egress> {
+        if self.socks[sock].netns != 0 {
+            return None;
+        }
+        self.egress.as_deref()
+    }
+
     /// Adjust the open-fd refcount of the socket end `fd` refers to (a no-op for
     /// non-socket fds or unconnected sockets). Mirrors `Kernel::bump_pipe`.
     pub(super) fn bump(&mut self, fd: &Fd, inc: bool) {
@@ -767,8 +790,8 @@ impl Net {
     }
 
     /// True if some *other* socket already occupies `proto`/`a`'s port.
-    fn addr_in_use(&self, proto: &str, a: InetAddr, exclude: usize) -> bool {
-        let key = route_key(proto, a);
+    fn addr_in_use(&self, netns: u32, proto: &str, a: InetAddr, exclude: usize) -> bool {
+        let key = route_key(netns, proto, a);
         // `exclude` is out of range when probing for a free ephemeral port, on
         // behalf of no socket: then nothing has opted in to sharing.
         let (my_reuseaddr, my_reuseport) = self
@@ -782,14 +805,15 @@ impl Net {
             let (same_addr, listening) = match &s.kind {
                 Kind::Idle {
                     bound: Some(Addr::Inet(b)),
-                } if proto == "tcp" => (route_key("tcp", *b) == key, false),
+                } if proto == "tcp" => (route_key(s.netns, "tcp", *b) == key, false),
                 Kind::Listener {
                     addr: Some(Addr::Inet(b)),
                     ..
-                } if proto == "tcp" => (route_key("tcp", *b) == key, true),
-                Kind::Dgram(d) if proto == "udp" => {
-                    (d.local.is_some_and(|b| route_key("udp", b) == key), false)
-                }
+                } if proto == "tcp" => (route_key(s.netns, "tcp", *b) == key, true),
+                Kind::Dgram(d) if proto == "udp" => (
+                    d.local.is_some_and(|b| route_key(s.netns, "udp", b) == key),
+                    false,
+                ),
                 _ => (false, false),
             };
             // Linux's rule: both sockets must have opted in. SO_REUSEPORT shares
@@ -805,7 +829,7 @@ impl Net {
     fn listen_conflict(&self, a: InetAddr, sock: usize) -> bool {
         let reuseport = self.socks[sock].opts.reuseport;
         self.listeners
-            .get(&route_key("tcp", a))
+            .get(&route_key(self.socks[sock].netns, "tcp", a))
             .is_some_and(|group| {
                 group
                     .iter()
@@ -836,14 +860,14 @@ impl Net {
 
     /// The lowest free port >= 32768 for `proto`/`v6` (the standard Linux
     /// ephemeral range, trimmed for a small in-VM table).
-    fn ephemeral_port(&self, proto: &str, v6: bool) -> u16 {
+    fn ephemeral_port(&self, netns: u32, proto: &str, v6: bool) -> u16 {
         for port in 32_768u32..=60_999 {
             let a = InetAddr {
                 v6,
                 port: port as u16,
                 ip: [0; 16],
             };
-            if !self.addr_in_use(proto, a, usize::MAX) {
+            if !self.addr_in_use(netns, proto, a, usize::MAX) {
                 return port as u16;
             }
         }
@@ -852,10 +876,10 @@ impl Net {
 
     /// A fresh client-side local address: loopback of `v6`'s family, with a
     /// freshly allocated ephemeral TCP port.
-    fn fresh_local(&self, v6: bool) -> InetAddr {
+    fn fresh_local(&self, netns: u32, v6: bool) -> InetAddr {
         InetAddr {
             v6,
-            port: self.ephemeral_port("tcp", v6),
+            port: self.ephemeral_port(netns, "tcp", v6),
             ip: loopback_ip(v6),
         }
     }
@@ -895,7 +919,7 @@ impl Kernel {
             return local;
         }
         let v6 = net.socks[sock].domain == AF_INET6;
-        let port = net.ephemeral_port("udp", v6);
+        let port = net.ephemeral_port(net.socks[sock].netns, "udp", v6);
         let local = InetAddr {
             v6,
             port,
@@ -905,7 +929,7 @@ impl Kernel {
             d.local = Some(local);
         }
         net.dgram_ports
-            .entry(route_key("udp", local))
+            .entry(route_key(net.socks[sock].netns, "udp", local))
             .or_default()
             .push(sock);
         local
@@ -937,6 +961,7 @@ impl Kernel {
             });
             let idx = net.socks.len();
             net.socks.push(Sock {
+                netns: cx.cur.ns.net,
                 domain,
                 kind,
                 nonblock,
@@ -973,12 +998,15 @@ impl Kernel {
             // Open the backend endpoint now, so a raw socket sees replies (and
             // other ICMP) whether or not it has sent; without one, only
             // loopback echoes are answered.
+            // Only the VM's first network namespace is connected to anything.
             let host = net
                 .egress
                 .as_ref()
+                .filter(|_| cx.cur.ns.net == 0)
                 .and_then(|e| e.open_icmp(domain == AF_INET6).ok());
             let idx = net.socks.len();
             net.socks.push(Sock {
+                netns: cx.cur.ns.net,
                 domain,
                 kind: Kind::Dgram(Dgram {
                     icmp: Some(icmp),
@@ -1005,6 +1033,7 @@ impl Kernel {
         };
         let idx = net.socks.len();
         net.socks.push(Sock {
+            netns: cx.cur.ns.net,
             domain,
             kind,
             nonblock,
@@ -1047,6 +1076,7 @@ impl Kernel {
             let b = a + 1;
             for peer in [b, a] {
                 net.socks.push(Sock {
+                    netns: cx.cur.ns.net,
                     domain: AF_UNIX,
                     kind: Kind::Dgram(Dgram {
                         pair_peer: Some(peer),
@@ -1063,6 +1093,7 @@ impl Kernel {
             pair.nonblock = [nonblock, nonblock];
             let idx = net.socks.len();
             net.socks.push(Sock {
+                netns: cx.cur.ns.net,
                 domain: AF_UNIX,
                 kind: Kind::Pair(pair),
                 nonblock,
@@ -1127,7 +1158,8 @@ impl Kernel {
                     // A datagram socket bound to a path receives datagrams sent to
                     // it (syslog's /dev/log, and unix-dgram IPC generally).
                     Kind::Dgram(_) => {
-                        net.dgram_paths.insert(path, sock);
+                        net.dgram_paths
+                            .insert(unix_key(net.socks[sock].netns, &path), sock);
                         0
                     }
                     _ => err(Errno::EINVAL),
@@ -1147,8 +1179,8 @@ impl Kernel {
                     _ => return err(Errno::EINVAL),
                 };
                 if a.port == 0 {
-                    a.port = net.ephemeral_port(proto, a.v6);
-                } else if net.addr_in_use(proto, a, sock) {
+                    a.port = net.ephemeral_port(net.socks[sock].netns, proto, a.v6);
+                } else if net.addr_in_use(net.socks[sock].netns, proto, a, sock) {
                     return err(Errno::EADDRINUSE);
                 }
                 match &mut net.socks[sock].kind {
@@ -1157,7 +1189,11 @@ impl Kernel {
                     _ => return err(Errno::EINVAL),
                 }
                 if proto == "udp" {
-                    let group = net.dgram_ports.entry(route_key("udp", a)).or_default();
+                    let netns = net.socks[sock].netns;
+                    let group = net
+                        .dgram_ports
+                        .entry(route_key(netns, "udp", a))
+                        .or_default();
                     group.retain(|&i| i != sock);
                     group.push(sock);
                 }
@@ -1181,7 +1217,7 @@ impl Kernel {
         };
         if bound.is_none() && domain != AF_UNIX {
             let v6 = domain == AF_INET6;
-            let port = net.ephemeral_port("tcp", v6);
+            let port = net.ephemeral_port(net.socks[sock].netns, "tcp", v6);
             bound = Some(Addr::Inet(InetAddr {
                 v6,
                 port,
@@ -1189,8 +1225,8 @@ impl Kernel {
             }));
         }
         let key = match &bound {
-            Some(Addr::Unix(p)) => Some(p.clone()),
-            Some(Addr::Inet(a)) => Some(route_key("tcp", *a)),
+            Some(Addr::Unix(p)) => Some(unix_key(net.socks[sock].netns, p)),
+            Some(Addr::Inet(a)) => Some(route_key(net.socks[sock].netns, "tcp", *a)),
             None => None,
         };
         // Two sockets may share a port with SO_REUSEADDR while they are only
@@ -1273,7 +1309,7 @@ impl Kernel {
             if matches!(net.socks[sock].kind, Kind::Dgram(_)) {
                 // UDP: remember the routable peer; the host socket is opened
                 // lazily on first send (see `send_bytes`/`write_socket`).
-                if net.egress.is_none() {
+                if net.egress_for(sock).is_none() {
                     return err(Errno::ENETUNREACH);
                 }
                 self.ensure_dgram_bound(net, sock);
@@ -1302,8 +1338,8 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         let key = match &target {
-            Addr::Unix(p) => p.clone(),
-            Addr::Inet(a) => route_key("tcp", *a),
+            Addr::Unix(p) => unix_key(net.socks[sock].netns, p),
+            Addr::Inet(a) => route_key(net.socks[sock].netns, "tcp", *a),
         };
         let Some(lidx) = net.pick_listener(&key) else {
             return err(Errno::ECONNREFUSED);
@@ -1336,7 +1372,7 @@ impl Kernel {
                 // Report the concrete loopback even if the server bound ANY.
                 peer_addr.ip = loopback_ip(v6);
             }
-            pair.addrs[0] = Some(net.fresh_local(v6));
+            pair.addrs[0] = Some(net.fresh_local(net.socks[sock].netns, v6));
             pair.addrs[1] = Some(peer_addr);
         }
         // The client end is held by every fd the idle socket had.
@@ -1376,7 +1412,7 @@ impl Kernel {
         if !matches!(&net.socks[sock].kind, Kind::Idle { .. } if end == 0) {
             return err(Errno::EINVAL);
         }
-        let Some(egress) = &net.egress else {
+        let Some(egress) = net.egress_for(sock) else {
             return err(Errno::ENETUNREACH);
         };
         match egress.connect_tcp(dest.ip, dest.v6, dest.port) {
@@ -2025,7 +2061,8 @@ impl Kernel {
                 if !matches!(net.socks[sock].kind, Kind::Dgram(_)) {
                     return err(Errno::EINVAL);
                 }
-                if let Some(&tgt) = net.dgram_paths.get(&path)
+                let key = unix_key(net.socks[sock].netns, &path);
+                if let Some(&tgt) = net.dgram_paths.get(&key)
                     && let Kind::Dgram(td) = &mut net.socks[tgt].kind
                 {
                     // Unix datagrams carry no INET src; a zeroed placeholder (the
@@ -2053,13 +2090,13 @@ impl Kernel {
         // A routable destination (DNS, chiefly) goes out through a real host
         // UDP socket when egress is enabled; without egress it's unreachable.
         if !dest.valid_bind() {
-            if net.egress.is_none() {
+            if net.egress_for(sock).is_none() {
                 return err(Errno::ENETUNREACH);
             }
             return self.host_udp_send(net, sock, data, dest);
         }
         let src = self.ensure_dgram_bound(net, sock);
-        let key = route_key("udp", dest);
+        let key = route_key(net.socks[sock].netns, "udp", dest);
         if let Some(tgt) = net.pick_dgram_target(&key, src.port)
             && let Kind::Dgram(td) = &mut net.socks[tgt].kind
         {
@@ -2244,7 +2281,7 @@ impl Kernel {
         if let Kind::Dgram(d) = &net.socks[sock].kind
             && d.host.is_none()
         {
-            match net.egress.as_ref().map(|e| e.open_udp()) {
+            match net.egress_for(sock).map(Egress::open_udp) {
                 Some(Ok(h)) => {
                     if let Kind::Dgram(d) = &mut net.socks[sock].kind {
                         d.host = Some(h);
@@ -3108,7 +3145,7 @@ impl Kernel {
                 return self.host_udp_send(net, sock, data, peer);
             }
             let src = self.ensure_dgram_bound(net, sock);
-            let key = route_key("udp", peer);
+            let key = route_key(net.socks[sock].netns, "udp", peer);
             if let Some(tgt) = net.pick_dgram_target(&key, src.port)
                 && let Kind::Dgram(td) = &mut net.socks[tgt].kind
             {
@@ -3209,7 +3246,8 @@ impl Kernel {
                 0
             };
             let wants = |f: u16| family == 0 || family == f;
-            let link = net.link();
+            // A new namespace has only its loopback interface.
+            let link = net.link().filter(|_| net.socks[sock].netns == 0);
             let done = || encode_nlmsg(NLMSG_DONE, 0, nlmsg_seq, pid, &0i32.to_le_bytes());
 
             let replies: Vec<Vec<u8>> = if nlmsg_type == RTM_GETLINK && dump {
