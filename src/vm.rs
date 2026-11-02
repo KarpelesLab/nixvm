@@ -266,6 +266,12 @@ impl Vm {
         self.tunnel.as_ref()
     }
 
+    /// Replace the VM-wide resource ceilings, which default to
+    /// [`Limits::for_this_host`](crate::limits::Limits::for_this_host).
+    pub fn set_limits(&mut self, limits: crate::limits::Limits) {
+        self.kernel.set_limits(limits);
+    }
+
     /// Whether the guest is parked reading the terminal, i.e. the last command
     /// finished and it wants input (see [`Kernel::awaiting_input`]).
     #[must_use]

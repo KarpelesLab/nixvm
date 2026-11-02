@@ -1167,7 +1167,7 @@ fn host_is_low_on_space(path: &Path) -> bool {
     let (blocks, bavail, files, favail) = {
         let field = |i: usize| {
             let word = buf[2 + i / 2];
-            if i % 2 == 0 {
+            if i.is_multiple_of(2) {
                 word & 0xffff_ffff
             } else {
                 word >> 32

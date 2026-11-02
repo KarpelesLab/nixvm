@@ -92,6 +92,8 @@ pub struct Config {
     pub ncpus: usize,
     /// Guest memory ceiling in bytes.
     pub mem_bytes: u64,
+    /// VM-wide resource ceilings.
+    pub limits: crate::limits::Limits,
     /// Guest architecture (defaults to the host's native arch). Unless set
     /// explicitly ([`Config::arch_explicit`]), the PID-1 binary's ELF header
     /// decides: an x86-64 root runs as x86-64 on any host.
@@ -150,6 +152,7 @@ impl Default for SandboxBuilder {
                     .and_then(|s| s.trim().parse::<usize>().ok())
                     .map_or(1, |n| n.max(1)),
                 mem_bytes: DEFAULT_MEM_BYTES,
+                limits: crate::limits::Limits::for_this_host(),
                 arch,
                 arch_explicit: false,
                 prefer_interp: false,
@@ -183,6 +186,14 @@ impl SandboxBuilder {
     #[must_use]
     pub fn mem_bytes(mut self, bytes: u64) -> Self {
         self.config.mem_bytes = bytes;
+        self
+    }
+
+    /// Set the VM-wide resource ceilings. The default is
+    /// [`Limits::for_this_host`](crate::limits::Limits::for_this_host).
+    #[must_use]
+    pub fn limits(mut self, limits: crate::limits::Limits) -> Self {
+        self.config.limits = limits;
         self
     }
 
@@ -356,6 +367,7 @@ impl Sandbox {
         let vcpu = backend.new_vcpu(img.entry, img.stack_pointer)?;
 
         let mut kernel = Kernel::new(arch, mounts);
+        kernel.set_limits(self.config.limits);
         kernel.set_ncpus(self.config.ncpus);
         kernel.set_host_tty(true);
         kernel.set_cwd(if self.config.mode == RunMode::Booted {
