@@ -220,7 +220,7 @@ impl Kernel {
                 if st.mode == SECCOMP_MODE_STRICT {
                     return err(Errno::EINVAL);
                 }
-                if !cx.cur.no_new_privs && cx.cur.creds.euid != 0 {
+                if !cx.cur.no_new_privs && !cx.cur.privileged() {
                     return err(Errno::EACCES);
                 }
                 let prog = match Self::read_fprog(mem, args) {

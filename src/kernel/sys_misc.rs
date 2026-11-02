@@ -23,8 +23,9 @@ impl Kernel {
     /// effective (and fs) uid to its real or saved uid, else `EPERM`.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_setuid(&self, cx: &mut ServiceCtx, uid: u32) -> i64 {
+        let privileged = cx.cur.privileged();
         let c = &mut cx.cur.creds;
-        if c.euid == 0 {
+        if privileged {
             c.ruid = uid;
             c.euid = uid;
             c.suid = uid;
@@ -43,7 +44,7 @@ impl Kernel {
     /// still determined by the *user* euid).
     #[allow(clippy::unused_self)]
     pub(super) fn sys_setgid(&self, cx: &mut ServiceCtx, gid: u32) -> i64 {
-        let privileged = cx.cur.creds.euid == 0;
+        let privileged = cx.cur.privileged();
         let c = &mut cx.cur.creds;
         if privileged {
             c.rgid = gid;
@@ -281,7 +282,7 @@ impl Kernel {
         list: u64,
         mem: &GuestMemory,
     ) -> i64 {
-        if cx.cur.creds.euid != 0 {
+        if !cx.cur.privileged() {
             return err(Errno::EPERM);
         }
         if size > 65536 {
@@ -348,7 +349,7 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         let action = action as u64;
-        if cx.cur.creds.euid != 0 && !matches!(action, READ_ALL | SIZE_BUFFER) {
+        if !cx.cur.privileged() && !matches!(action, READ_ALL | SIZE_BUFFER) {
             return err(Errno::EPERM);
         }
         match action {

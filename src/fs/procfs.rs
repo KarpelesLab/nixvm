@@ -114,6 +114,7 @@ const PATHS: &[&str] = &[
     "self/setgroups",
     "self/gid_map",
     "self/uid_map",
+    "self/timens_offsets",
     "self/ns",
     "self/ns/cgroup",
     "self/ns/ipc",
@@ -189,6 +190,7 @@ const NS_FILES: &[&str] = &[
 /// and `cwd` are symlinks, `fd` is a directory, the rest are files.
 const SELF_FILES: &[&str] = &[
     "ns",
+    "timens_offsets",
     "cmdline",
     "status",
     "stat",
@@ -509,6 +511,12 @@ const UID_GID_MAP: &str = "0 0 4294967295\n";
 /// supplies placeholders so every file still renders something plausible.
 #[derive(Debug, Clone)]
 pub struct ProcData {
+    /// What the kernel says for `self/uid_map`, `self/gid_map`, `self/setgroups`
+    /// and `self/timens_offsets`, once it has.
+    pub uid_map: String,
+    pub gid_map: String,
+    pub setgroups: String,
+    pub timens_offsets: String,
     /// The reader's mounts, for `mounts` and `self/mountinfo`. Empty until the
     /// kernel has refreshed this, when the fixed text is shown instead.
     pub mounts: Vec<super::MountEntry>,
@@ -559,6 +567,10 @@ pub struct ProcData {
 impl Default for ProcData {
     fn default() -> Self {
         Self {
+            uid_map: String::new(),
+            gid_map: String::new(),
+            setgroups: String::new(),
+            timens_offsets: String::new(),
             mounts: Vec::new(),
             cmdline: Vec::new(),
             exe: "/bin/busybox".to_string(),
@@ -587,6 +599,11 @@ impl Default for ProcData {
 /// of [`ProcData`] — just the values that actually change per running task.
 #[derive(Debug, Clone)]
 pub struct ProcSelf {
+    /// `self/uid_map`, `self/gid_map`, `self/setgroups` and `self/timens_offsets`.
+    pub uid_map: String,
+    pub gid_map: String,
+    pub setgroups: String,
+    pub timens_offsets: String,
     /// The caller's mounts, for `mounts` and `self/mountinfo`.
     pub mounts: Vec<super::MountEntry>,
     pub comm: String,
@@ -644,6 +661,10 @@ impl ProcFs {
     pub fn update_self(&mut self, live: ProcSelf) {
         let d = &mut self.data;
         d.mounts = live.mounts;
+        d.uid_map = live.uid_map;
+        d.gid_map = live.gid_map;
+        d.setgroups = live.setgroups;
+        d.timens_offsets = live.timens_offsets;
         d.comm = live.comm;
         d.cmdline = live.cmdline;
         d.exe = live.exe;
@@ -692,6 +713,19 @@ impl ProcFs {
             }
             "self/mountinfo" if !self.data.mounts.is_empty() => {
                 return Some(mountinfo_body(&self.data.mounts).into_bytes());
+            }
+            // A map can legitimately be empty; `setgroups` says the kernel has spoken.
+            "self/uid_map" if !self.data.setgroups.is_empty() => {
+                return Some(self.data.uid_map.clone().into_bytes());
+            }
+            "self/gid_map" if !self.data.setgroups.is_empty() => {
+                return Some(self.data.gid_map.clone().into_bytes());
+            }
+            "self/setgroups" if !self.data.setgroups.is_empty() => {
+                return Some(self.data.setgroups.clone().into_bytes());
+            }
+            "self/timens_offsets" => {
+                return Some(self.data.timens_offsets.clone().into_bytes());
             }
             "cpuinfo" => {
                 return Some(cpuinfo_body(self.data.nproc, self.data.arch).into_bytes());
@@ -1481,6 +1515,10 @@ mod tests {
     /// to eventually inject.
     fn sample() -> ProcData {
         ProcData {
+            uid_map: String::new(),
+            gid_map: String::new(),
+            setgroups: String::new(),
+            timens_offsets: String::new(),
             mounts: Vec::new(),
             cmdline: b"prog\0--flag\0".to_vec(),
             exe: "/usr/bin/prog".to_string(),
@@ -1558,6 +1596,10 @@ mod tests {
         // Default placeholder before any refresh.
         assert_eq!(read_all(&mut fs, "self/comm"), b"nixvm\n");
         fs.update_self(ProcSelf {
+            uid_map: String::new(),
+            gid_map: String::new(),
+            setgroups: String::new(),
+            timens_offsets: String::new(),
             mounts: Vec::new(),
             comm: "myprog".to_string(),
             cmdline: b"/bin/myprog\0-x\0".to_vec(),

@@ -619,7 +619,7 @@ impl Kernel {
                     return err(Errno::EPERM);
                 }
                 let qbytes = u64::from_le_bytes(raw[88..96].try_into().unwrap());
-                if qbytes > MSGMNB && cx.cur.creds.euid != 0 {
+                if qbytes > MSGMNB && !cx.cur.privileged() {
                     return err(Errno::EPERM);
                 }
                 q.perm.set_from(&raw);

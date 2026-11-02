@@ -319,7 +319,7 @@ impl Kernel {
             if class > 3 || (class != 0 && class != 3 && level > 7) || prio > 0xffff {
                 return err(Errno::EINVAL);
             }
-            if class == IOPRIO_CLASS_RT && cx.cur.creds.euid != 0 {
+            if class == IOPRIO_CLASS_RT && !cx.cur.privileged() {
                 return err(Errno::EPERM);
             }
         }
@@ -884,7 +884,7 @@ impl Kernel {
         if len > 64 {
             return err(Errno::EINVAL);
         }
-        if cx.cur.creds.euid != 0 {
+        if !self.may_administer(cx, cx.cur.ns.uts) {
             return err(Errno::EPERM);
         }
         let Ok(b) = mem.read_vec(name, len as usize) else {
@@ -988,7 +988,12 @@ impl Kernel {
         {
             return err(Errno::EINVAL);
         }
-        if flags & NS != 0 && cx.cur.creds.euid != 0 {
+        // A new user namespace needs no privilege, and gives what the rest need.
+        if flags & NS != 0 && !cx.cur.privileged() && flags & CLONE_NEWUSER == 0 {
+            return err(Errno::EPERM);
+        }
+        // A chroot jail isn't a way to confuse a privileged program in a new one.
+        if flags & CLONE_NEWUSER != 0 && cx.cur.root != "/" {
             return err(Errno::EPERM);
         }
         // A new PID or user namespace is for a single-threaded process only.
@@ -997,8 +1002,16 @@ impl Kernel {
         }
         let pid_parent = cx.cur.ns.pid_for_children;
         let old_mnt = cx.cur.ns.mnt;
+        let old_user = cx.cur.ns.user;
         if let Err(e) = sh.unshare_namespaces(cx, flags & (NS | CLONE_NEWUSER)) {
             return e;
+        }
+        if cx.cur.ns.user != old_user {
+            let new_user = cx.cur.ns.user;
+            if let Err(e) = self.enter_user_namespace(&mut cx.cur, new_user, old_user) {
+                cx.cur.ns.user = old_user;
+                return e;
+            }
         }
         if flags & CLONE_NEWPID != 0
             && let Err(e) = self.new_pid_namespace(sh, cx, cx.cur.ns.pid_for_children, pid_parent)
@@ -1017,7 +1030,10 @@ impl Kernel {
                 cx.cur.ns.mnt = old_mnt;
                 return err(Errno::ENOSPC);
             }
-            vfs.copy_namespace(old_mnt, cx.cur.ns.mnt);
+            // Handed to a less privileged user namespace, what was inherited is
+            // locked as it stands.
+            let inherited_from_above = cx.cur.ns.user != self.users.lock().unwrap().owner(old_mnt);
+            vfs.copy_namespace(old_mnt, cx.cur.ns.mnt, inherited_from_above);
         }
         // A private fd table: the shared slot (checked out into `cur.fds` for
         // this slice) gets a copy for the siblings; this task moves to a fresh
@@ -1110,7 +1126,7 @@ impl Kernel {
 /// `[effective, permitted, inheritable]` for a task: what `capset` stored, or
 /// root's full set / nothing for a non-root task.
 fn task_caps(p: &ProcInfo) -> [u64; 3] {
-    p.caps.unwrap_or(if p.creds.euid == 0 {
+    p.caps.unwrap_or(if p.privileged() {
         [CAP_ALL, CAP_ALL, 0]
     } else {
         [0, 0, 0]

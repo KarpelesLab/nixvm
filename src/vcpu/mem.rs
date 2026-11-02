@@ -324,6 +324,12 @@ impl GuestMemory {
         std::mem::take(&mut self.tlb_dirty)
     }
 
+    /// Send guests' clock reads through the kernel from now on, by leaving the vDSO
+    /// with no calibration to use.
+    pub fn disable_vdso_clocks(&self) {
+        super::ctrl::write_vvar(&self.phys, 0, 0, 0, 0, 0);
+    }
+
     /// Total size of this space's mappings, what `RLIMIT_AS` measures.
     #[must_use]
     pub fn mapped_bytes(&self) -> u64 {

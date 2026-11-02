@@ -199,6 +199,11 @@ impl Shared {
         flags: u64,
         moves_self: bool,
     ) -> Result<(), i64> {
+        // First, since it owns whatever else this call creates.
+        if flags & CLONE_NEWUSER != 0 {
+            ns.user = self.fresh_ns_id();
+        }
+        let before = *ns;
         if flags & CLONE_NEWUTS != 0 {
             let in_use: Vec<u32> = self
                 .procs
@@ -228,9 +233,6 @@ impl Shared {
         if flags & CLONE_NEWCGROUP != 0 {
             ns.cgroup = self.fresh_ns_id();
         }
-        if flags & CLONE_NEWUSER != 0 {
-            ns.user = self.fresh_ns_id();
-        }
         if flags & CLONE_NEWPID != 0 {
             ns.pid_for_children = self.fresh_ns_id();
             if moves_self {
@@ -241,6 +243,28 @@ impl Shared {
             ns.time_for_children = self.fresh_ns_id();
             if moves_self {
                 ns.time = ns.time_for_children;
+            }
+        }
+        let mut users = self.users.lock().unwrap();
+        if users.owned_count() >= super::userns::COLLECT_ABOVE {
+            let tasks = self.procs.iter().flatten().map(|p| p.info.ns);
+            let in_use: Vec<u32> = tasks
+                .chain([cx.cur.ns, *ns])
+                .flat_map(|n| NsKind::ALL.into_iter().map(move |kind| n.get(kind)))
+                .collect();
+            users.collect_garbage(&in_use);
+        }
+        for kind in [
+            NsKind::Cgroup,
+            NsKind::Ipc,
+            NsKind::Mnt,
+            NsKind::Net,
+            NsKind::PidForChildren,
+            NsKind::TimeForChildren,
+            NsKind::Uts,
+        ] {
+            if ns.get(kind) != before.get(kind) {
+                users.set_owner(ns.get(kind), ns.user).map_err(err)?;
             }
         }
         Ok(())
@@ -407,7 +431,15 @@ impl Kernel {
         if nstype & !ALL != 0 {
             return err(Errno::EINVAL);
         }
-        if cx.cur.creds.euid != 0 {
+        let joins_user = matches!(
+            cx.cur.fds.get(fd as i32),
+            Some(Fd::Namespace {
+                kind: NsKind::User,
+                ..
+            })
+        );
+        // Joining a user namespace has its own rule, in `join_user_namespace`.
+        if !cx.cur.privileged() && !joins_user {
             return err(Errno::EPERM);
         }
         let others_share_tgid = sh.procs.iter().flatten().any(|p| {
@@ -424,6 +456,12 @@ impl Kernel {
                 }
                 if threaded_refused(kind.flag()) {
                     return err(Errno::EINVAL);
+                }
+                if kind == NsKind::User {
+                    return self.join_user_namespace(cx, id);
+                }
+                if !self.may_administer(cx, id) {
+                    return err(Errno::EPERM);
                 }
                 if matches!(kind, NsKind::Pid | NsKind::PidForChildren)
                     && !self.may_join_pid_namespace(cx, id)
@@ -478,6 +516,44 @@ impl Kernel {
             Some(_) => err(Errno::EINVAL),
             None => err(Errno::EBADF),
         }
+    }
+
+    /// `setns` into a user namespace. This grants its capabilities, so it needs a
+    /// namespace nested in the caller's, where the caller is privileged already or
+    /// created it: a namespace's creator has every capability in it from outside.
+    /// The caller's ids stay the same ids, and are seen through the new maps.
+    fn join_user_namespace(&self, cx: &mut ServiceCtx, id: u32) -> i64 {
+        use super::userns::IdKind;
+        let current = cx.cur.ns.user;
+        let users = self.users.lock().unwrap();
+        if id == current {
+            return err(Errno::EINVAL);
+        }
+        let allowed = users.is_within(id, current)
+            && (cx.cur.privileged() || users.created_by(id, current, cx.cur.creds.euid));
+        if !allowed {
+            return err(Errno::EPERM);
+        }
+        let c = cx.cur.creds;
+        let view = |kind, value| {
+            let global = users.to_global(current, kind, value).unwrap_or(value);
+            users.seen_from_global(id, kind, global)
+        };
+        cx.cur.creds = super::Creds {
+            ruid: view(IdKind::Uid, c.ruid),
+            euid: view(IdKind::Uid, c.euid),
+            suid: view(IdKind::Uid, c.suid),
+            fsuid: view(IdKind::Uid, c.fsuid),
+            rgid: view(IdKind::Gid, c.rgid),
+            egid: view(IdKind::Gid, c.egid),
+            sgid: view(IdKind::Gid, c.sgid),
+            fsgid: view(IdKind::Gid, c.fsgid),
+        };
+        drop(users);
+        cx.cur.ns.user = id;
+        cx.cur.caps = None;
+        cx.cur.ns_caps = true;
+        0
     }
 
     /// A task entering a mount namespace starts at its root, as paths from where

@@ -393,7 +393,7 @@ impl Kernel {
                 if cmd == F_GETPIPE_SZ {
                     return pipes[i].capacity as i64;
                 }
-                if arg > super::PIPE_MAX_CAPACITY as u64 && cx.cur.creds.euid != 0 {
+                if arg > super::PIPE_MAX_CAPACITY as u64 && !cx.cur.privileged() {
                     return err(Errno::EPERM);
                 }
                 // Root may ask for more on Linux, but it's memory the host pays

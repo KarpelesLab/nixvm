@@ -39,7 +39,7 @@ impl Kernel {
         const MS_MOVE: u64 = 8192;
         const MS_PROPAGATION: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
         let (target, fstype, flags) = (a[1], a[2], a[3]);
-        if cx.cur.creds.euid != 0 {
+        if !self.may_administer(cx, cx.cur.ns.mnt) {
             return err(Errno::EPERM);
         }
         let Some(rel) = read_path(mem, target) else {
@@ -121,7 +121,7 @@ impl Kernel {
         path: u64,
         mem: &GuestMemory,
     ) -> i64 {
-        if cx.cur.creds.euid != 0 {
+        if !cx.cur.privileged() {
             return err(Errno::EPERM);
         }
         let Some(rel) = read_path(mem, path) else {
@@ -152,7 +152,7 @@ impl Kernel {
         put_old: u64,
         mem: &GuestMemory,
     ) -> i64 {
-        if cx.cur.creds.euid != 0 {
+        if !self.may_administer(cx, cx.cur.ns.mnt) {
             return err(Errno::EPERM);
         }
         // From inside a chroot this isn't allowed, as on Linux.
@@ -235,7 +235,7 @@ impl Kernel {
         if flags & !0xf != 0 || (flags & 4 != 0 && flags & 3 != 0) {
             return err(Errno::EINVAL);
         }
-        if cx.cur.creds.euid != 0 {
+        if !self.may_administer(cx, cx.cur.ns.mnt) {
             return err(Errno::EPERM);
         }
         let Some(rel) = read_path(mem, target) else {
@@ -298,7 +298,8 @@ impl Kernel {
     fn proc_fd_link(&self, cx: &ServiceCtx, abs: &str) -> Option<String> {
         let rest = abs.strip_prefix("/proc/")?;
         let (who, tail) = rest.split_once('/')?;
-        if who != "self" && who != cx.cur.pid.to_string() {
+        let me = self.visible_pid(cx, cx.cur.tgid).to_string();
+        if who != "self" && who != "thread-self" && who != me {
             return None;
         }
         // `/proc/self/{exe,cwd,root}` resolve to *live* per-task state, not
@@ -329,7 +330,12 @@ impl Kernel {
             .iter()
             .map(|(n, fd)| (n as u32, Self::as_seen_from_root(cx, &fd_link_target(fd))))
             .collect();
+        let (uid_map, gid_map, setgroups) = self.proc_identity_files(cx);
         crate::fs::ProcSelf {
+            uid_map,
+            gid_map,
+            setgroups,
+            timens_offsets: super::userns::render_time_offsets(self.time_offsets_for(cx)),
             mounts: Vec::new(),
             comm: cx.cur.comm.clone(),
             cmdline: cx.cur.cmdline.clone(),

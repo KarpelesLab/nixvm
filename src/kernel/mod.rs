@@ -58,6 +58,7 @@ mod sys_misc;
 mod testutil;
 mod time;
 mod unavailable;
+mod userns;
 mod xattr;
 
 pub use fd::{Fd, FdTable, FileOffset};
@@ -211,6 +212,12 @@ impl RLimits {
     }
 }
 
+/// A clock reading moved by a time namespace's offset.
+fn offset_clock(now: std::time::Duration, offset_ns: i64) -> std::time::Duration {
+    let moved = i128::try_from(now.as_nanos()).unwrap_or(0) + i128::from(offset_ns);
+    std::time::Duration::from_nanos(u64::try_from(moved).unwrap_or(0))
+}
+
 /// Whether `clone` flags ask for a thread while the PID namespace rules forbid it.
 fn is_thread_flags_conflict(flags: u64, ns: &ns::NsProxy) -> bool {
     flags & CLONE_THREAD != 0
@@ -313,6 +320,9 @@ struct ProcInfo {
     ns: ns::NsProxy,
     /// This task's root directory (`chroot`), in its mount namespace's terms.
     root: String,
+    /// It created or joined its user namespace, which gives it every capability
+    /// there whatever its uid, until it `exec`s a program as anyone but root.
+    ns_caps: bool,
     /// Alternate signal stack (`sigaltstack`): `(base, size, flags)`. A handler
     /// registered `SA_ONSTACK` runs here instead of the interrupted stack —
     /// which is exactly how a runtime catches its own stack-overflow fault.
@@ -531,6 +541,7 @@ impl Default for ProcInfo {
             rlimits: RLimits::default(),
             ns: ns::NsProxy::default(),
             root: "/".to_string(),
+            ns_caps: false,
             altstack: (0, 0, SS_DISABLE),
             blocked: 0,
             pending: 0,
@@ -593,6 +604,13 @@ struct Creds {
 }
 
 impl ProcInfo {
+    /// Whether this task is privileged where it is: root, or holding the
+    /// capabilities of a user namespace. Whether that covers a given resource is
+    /// [`Kernel::may_administer`]'s question.
+    fn privileged(&self) -> bool {
+        self.creds.euid == 0 || self.ns_caps
+    }
+
     /// The earliest real-time timer deadline this task holds — its
     /// `ITIMER_REAL` (`alarm`/`setitimer`) or any armed POSIX timer — which the
     /// schedulers sleep until / wake the task at, like [`Self::wake_deadline`].
@@ -1352,6 +1370,10 @@ pub struct Kernel {
     memory_quota: Arc<crate::limits::Quota>,
     /// What each task is numbered in nested PID namespaces (see [`pidns`]).
     pids: Arc<Mutex<pidns::PidNamespaces>>,
+    /// The maps and owners of user namespaces (see [`userns`]).
+    users: Arc<Mutex<userns::UserNamespaces>>,
+    /// The offsets of each time namespace that has any.
+    time_offsets: Mutex<BTreeMap<u32, userns::TimeNs>>,
     /// Growth on the host's disk (see [`crate::limits::Limits::disk_bytes`]).
     disk_quota: Arc<crate::limits::Quota>,
     /// The VM's `(cpu, wall)` time ceilings.
@@ -1496,6 +1518,8 @@ pub(super) struct Shared {
     free_proc_slots: Vec<usize>,
     /// The same table as [`Kernel::pids`], for tasks leaving it.
     pids: Arc<Mutex<pidns::PidNamespaces>>,
+    /// The same table as [`Kernel::users`], for namespaces being created.
+    users: Arc<Mutex<userns::UserNamespaces>>,
     /// Slots of [`Self::spaces`] and [`Self::mmap_areas`] no task refers to.
     free_mm_slots: Vec<usize>,
     /// Slots of [`Self::file_tables`] no task refers to.
@@ -1912,8 +1936,11 @@ impl Kernel {
         let disk_quota = crate::limits::Quota::new(limits.disk_bytes);
         mounts.attach_disk_quota(&disk_quota);
         let pids = Arc::new(Mutex::new(pidns::PidNamespaces::default()));
+        let users = Arc::new(Mutex::new(userns::UserNamespaces::default()));
         Self {
             pids: pids.clone(),
+            users: users.clone(),
+            time_offsets: Mutex::new(BTreeMap::new()),
             memory_quota,
             disk_quota,
             time_limits: Mutex::new((limits.cpu_time, limits.wall_time)),
@@ -1954,6 +1981,7 @@ impl Kernel {
                 procs: Vec::new(),
                 free_proc_slots: Vec::new(),
                 pids,
+                users,
                 free_mm_slots: Vec::new(),
                 free_file_slots: Vec::new(),
                 free_cwd_slots: Vec::new(),
@@ -3213,6 +3241,9 @@ impl Kernel {
         if let Some(result) = self.ns_path_syscall(cx, sys, args, mem) {
             return result;
         }
+        if cx.cur.ns.user != 0 {
+            return self.dispatch_in_user_ns(cx, sys, raw, args, vcpu, mem);
+        }
         if cx.cur.ns.pid != 0 {
             return self.dispatch_in_pid_ns(cx, sys, raw, args, vcpu, mem);
         }
@@ -3281,6 +3312,22 @@ impl Kernel {
             .max_open_files
             .load(std::sync::atomic::Ordering::Relaxed);
         (open + cx.cur.fds.len() + wanted as usize > limit).then(|| err(Errno::ENFILE))
+    }
+
+    /// A syscall whose user ids are settled, on its way through the PID layer.
+    fn dispatch_ids_translated(
+        &self,
+        cx: &mut ServiceCtx,
+        sys: Sysno,
+        raw: u64,
+        args: &[u64; 6],
+        vcpu: &mut dyn Vcpu,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        if cx.cur.ns.pid != 0 {
+            return self.dispatch_in_pid_ns(cx, sys, raw, args, vcpu, mem);
+        }
+        self.dispatch_impl(cx, sys, raw, args, vcpu, mem)
     }
 
     /// Route a syscall to the lock discipline it needs (steps B2/B3/B4/B5). No
@@ -4253,7 +4300,7 @@ impl Kernel {
             // CAP_SYS_TTY_CONFIG; for root a no-op (the session's tty is the
             // host's or an in-VM pty that the caller is about to reopen).
             Sysno::Vhangup => {
-                if cx.cur.creds.euid == 0 {
+                if cx.cur.privileged() {
                     0
                 } else {
                     err(Errno::EPERM)
@@ -4437,7 +4484,11 @@ impl Kernel {
             | ns::CLONE_NEWIPC
             | ns::CLONE_NEWPID
             | ns::CLONE_NEWNET;
-        if flags & NEEDS_PRIVILEGE != 0 && cx.cur.creds.euid != 0 {
+        // A new user namespace needs no privilege, and gives what the rest need.
+        if flags & NEEDS_PRIVILEGE != 0 && !cx.cur.privileged() && flags & ns::CLONE_NEWUSER == 0 {
+            return err(Errno::EPERM);
+        }
+        if flags & ns::CLONE_NEWUSER != 0 && cx.cur.root != "/" {
             return err(Errno::EPERM);
         }
         let child_ns = match sh.namespaces_for_clone(cx, flags & !ns::CLONE_NEWTIME) {
@@ -4555,6 +4606,15 @@ impl Kernel {
             info.exit_signal = (ca.exit_signal & 0xff) as u8;
         }
         info.ns = child_ns;
+        if child_ns.time != cx.cur.ns.time {
+            let mut times = self.time_offsets.lock().unwrap();
+            times.entry(child_ns.time).or_default().entered = true;
+        }
+        if child_ns.user != cx.cur.ns.user
+            && let Err(e) = self.enter_user_namespace(&mut info, child_ns.user, cx.cur.ns.user)
+        {
+            return e;
+        }
         if child_ns.mnt != cx.cur.ns.mnt {
             let mut vfs = self.vfs.lock().unwrap();
             if vfs.namespace_count() >= ns::MAX_MOUNT_NAMESPACES {
@@ -4565,7 +4625,10 @@ impl Kernel {
             if vfs.namespace_count() >= ns::MAX_MOUNT_NAMESPACES {
                 return err(Errno::ENOSPC);
             }
-            vfs.copy_namespace(cx.cur.ns.mnt, child_ns.mnt);
+            // Handed to a less privileged user namespace, what was inherited is
+            // locked as it stands.
+            let from_above = child_ns.user != self.users.lock().unwrap().owner(cx.cur.ns.mnt);
+            vfs.copy_namespace(cx.cur.ns.mnt, child_ns.mnt, from_above);
         }
         // Limits belong to the thread group, so only a new process gets its own.
         if !is_thread {
@@ -4911,6 +4974,11 @@ impl Kernel {
         let spec = ProcessSpec { argv, envp };
         // Point of no return. Record the new program image for `/proc/self/exe`.
         cx.cur.exe = abs.to_string();
+        // Capabilities from a user namespace last through exec only for its root.
+        if cx.cur.creds.euid != 0 {
+            cx.cur.ns_caps = false;
+            cx.cur.caps = None;
+        }
         // execve resets every *caught* signal handler to SIG_DFL — the handler
         // addresses point into the image being replaced, so keeping them would
         // jump the new program to garbage on the next signal. Ignored (SIG_IGN)
@@ -5826,6 +5894,9 @@ impl Kernel {
         count: u64,
         mem: &GuestMemory,
     ) -> i64 {
+        if let Some(result) = self.proc_control_write(cx, fd, buf, count, mem) {
+            return result;
+        }
         match cx.cur.fds.get(fd as i32) {
             Some(Fd::File { .. }) => {
                 let mut vfs = self.vfs_for(cx);
@@ -7325,7 +7396,7 @@ impl Kernel {
             }
             Some(new)
         };
-        let root = cx.cur.creds.euid == 0;
+        let root = cx.cur.privileged();
         let target = if pid == 0 || pid == cx.cur.tgid || pid == cx.cur.pid {
             cx.cur.rlimits.clone()
         } else {
@@ -9186,7 +9257,14 @@ impl Kernel {
         const MONOTONIC_COARSE: u64 = 6;
         const BOOTTIME: u64 = 7;
         let cpu = |ns: u128| std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX));
+        let offsets = self.time_offsets_for(cx);
         let now = match clk_id {
+            BOOTTIME if offsets.boottime != 0 => {
+                offset_clock(crate::clock::now_monotonic(), offsets.boottime)
+            }
+            MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE if offsets.monotonic != 0 => {
+                offset_clock(crate::clock::now_monotonic(), offsets.monotonic)
+            }
             MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE | BOOTTIME => {
                 crate::clock::now_monotonic()
             }

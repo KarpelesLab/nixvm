@@ -118,7 +118,7 @@ impl Kernel {
         const PR_SET_VMA: u64 = 0x5356_4d41;
         const PR_SET_PTRACER: u64 = 0x5961_6d61;
         let (a2, a3) = (args[1], args[2]);
-        let root = cx.cur.creds.euid == 0;
+        let root = cx.cur.privileged();
         let put_i32 = |mem: &mut GuestMemory, at: u64, v: i32| -> i64 {
             if mem.write(at, &v.to_le_bytes()).is_ok() {
                 0

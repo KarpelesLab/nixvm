@@ -181,7 +181,7 @@ impl Kernel {
     /// Whether the caller holds `CAP_SYS_ADMIN` (the `trusted.*` gate). The VM
     /// grants root every capability, so this is "is effectively root".
     fn xattr_admin(cx: &ServiceCtx) -> bool {
-        cx.cur.creds.euid == 0
+        cx.cur.privileged()
     }
 
     /// `getxattr`/`lgetxattr`/`fgetxattr`/`getxattrat`: copy attribute `name`'s

@@ -25,6 +25,8 @@ struct Mount {
     guest: bool,
     /// Writes through this mount fail with `EROFS`.
     read_only: bool,
+    /// Came from a more privileged user namespace: can't be undone individually.
+    locked: bool,
     /// Which pivot this mount was the old root's side of, 0 if none. After
     /// `pivot_root(".", ".")` an old root is stacked on the new one, and detaching
     /// it must take only its own mounts.
@@ -50,6 +52,7 @@ impl Mount {
             subdir: String::new(),
             guest,
             read_only: false,
+            locked: false,
             pivot_side: 0,
         }
     }
@@ -110,12 +113,22 @@ impl MountTable {
 
     /// Start mount namespace `new` as a copy of `from`. The two share filesystems,
     /// but mounting or unmounting in one no longer shows in the other.
-    pub fn copy_namespace(&mut self, from: u32, new: u32) {
-        let copy = if from == self.current {
+    ///
+    /// With `lock_inherited`, the copy is going to a less privileged user namespace,
+    /// which gets these mounts as they are: it can stack on them, but can't uncover
+    /// what's beneath one or make a read-only one writable.
+    pub fn copy_namespace(&mut self, from: u32, new: u32, lock_inherited: bool) {
+        let mut copy = if from == self.current {
             self.mounts.clone()
         } else {
             self.parked.get(&from).cloned().unwrap_or_default()
         };
+        if lock_inherited {
+            // The root itself isn't locked, so that it can be pivoted away from.
+            for m in copy.iter_mut().filter(|m| m.point != "/") {
+                m.locked = true;
+            }
+        }
         self.parked.insert(new, copy);
     }
 
@@ -140,6 +153,7 @@ impl MountTable {
             point: target.clone(),
             subdir: self.mounts[i].fs_path(&relative_to(&source, &self.mounts[i].point)),
             guest: true,
+            locked: false,
             ..self.mounts[i].clone()
         }];
         if recursive {
@@ -148,6 +162,7 @@ impl MountTable {
                     new.push(Mount {
                         point: normalize(&format!("{target}/{}", relative_to(&m.point, &source))),
                         guest: true,
+                        locked: false,
                         ..m.clone()
                     });
                 }
@@ -161,7 +176,7 @@ impl MountTable {
     pub fn move_mount(&mut self, from: &str, to: &str) -> io::Result<()> {
         let from = normalize(from);
         let to = normalize(to);
-        if !self.mounts.iter().any(|m| m.point == from) {
+        if !self.mounts.iter().any(|m| m.point == from && !m.locked) {
             return Err(einval());
         }
         for m in &mut self.mounts {
@@ -176,7 +191,11 @@ impl MountTable {
     pub fn set_read_only(&mut self, point: &str, read_only: bool) -> io::Result<()> {
         let point = normalize(point);
         let m = self.mounts.iter_mut().rfind(|m| m.point == point);
-        m.ok_or_else(einval)?.read_only = read_only;
+        let m = m.ok_or_else(einval)?;
+        if m.locked && m.read_only && !read_only {
+            return Err(io::Error::from_raw_os_error(1)); // EPERM
+        }
+        m.read_only = read_only;
         Ok(())
     }
 
@@ -350,6 +369,9 @@ impl MountTable {
         let Some(i) = self.mounts.iter().rposition(|m| m.point == point) else {
             return Err(einval());
         };
+        if self.mounts[i].locked {
+            return Err(einval());
+        }
         // Outside the initial namespace nothing is the VM's own: a container that
         // pivoted away from its old root drops those mounts like any other.
         if !self.mounts[i].guest && self.current == 0 {
@@ -842,7 +864,7 @@ mod tests {
     #[test]
     fn a_copied_namespace_shares_files_but_not_mounts() {
         let mut t = table_with_tmpfs_root();
-        t.copy_namespace(0, 1);
+        t.copy_namespace(0, 1, false);
         t.enter(1, "/");
         t.mount_guest("/a", Box::new(crate::fs::TmpFs::new()));
         t.create("/a/inner", 0o644).unwrap();
@@ -893,7 +915,7 @@ mod tests {
     #[test]
     fn pivot_root_rewrites_the_view_and_detaching_takes_the_old_root() {
         let mut t = table_with_tmpfs_root();
-        t.copy_namespace(0, 1);
+        t.copy_namespace(0, 1, false);
         t.enter(1, "/");
         t.mount_guest("/a", Box::new(crate::fs::TmpFs::new()));
         t.mkdir("/a/old", 0o755).unwrap();
@@ -931,7 +953,7 @@ mod tests {
     fn only_the_initial_namespace_keeps_the_vms_own_mounts() {
         let mut t = table_with_tmpfs_root();
         assert_eq!(t.unmount("/", false).unwrap_err().raw_os_error(), Some(16));
-        t.copy_namespace(0, 1);
+        t.copy_namespace(0, 1, false);
         t.enter(1, "/");
         t.unmount("/", false).unwrap();
         t.enter(0, "/");
