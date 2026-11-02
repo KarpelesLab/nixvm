@@ -530,6 +530,9 @@ impl Kernel {
         // Single process (or a tkill/tgkill tid): the common path.
         if pid > 0 {
             if pid == cur_pid {
+                if !self.signal_reaches_init(cx, &cx.cur, sig) {
+                    return 0;
+                }
                 cx.cur.pending |= bit;
                 if deliver {
                     cx.cur.post_siginfo(sig, sender);
@@ -546,6 +549,9 @@ impl Kernel {
             let mut found = false;
             for slot in sh.procs.iter_mut().flatten() {
                 if i64::from(slot.info.pid) == pid {
+                    if !self.signal_reaches_init(cx, &slot.info, sig) {
+                        return 0;
+                    }
                     slot.info.pending |= bit;
                     slot.info.parked = false;
                     if deliver {
@@ -575,7 +581,9 @@ impl Kernel {
         };
         let mut hit = false;
         let mut resumed_ppids: Vec<i32> = Vec::new();
-        if target_pgrp.is_none_or(|pg| pgid_of(&cx.cur) == pg) {
+        if target_pgrp.is_none_or(|pg| pgid_of(&cx.cur) == pg)
+            && self.signal_reaches_init(cx, &cx.cur, sig)
+        {
             cx.cur.pending |= bit;
             if deliver {
                 cx.cur.post_siginfo(sig, sender);
@@ -590,7 +598,7 @@ impl Kernel {
                 None => slot.info.pid != 1, // broadcast spares init (pid 1)
                 Some(pg) => pgid_of(&slot.info) == pg,
             };
-            if is_target {
+            if is_target && self.signal_reaches_init(cx, &slot.info, sig) {
                 slot.info.pending |= bit;
                 slot.info.parked = false;
                 if deliver {

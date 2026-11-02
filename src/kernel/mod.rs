@@ -42,6 +42,7 @@ mod ns;
 mod orphan;
 mod pagecache;
 mod path;
+mod pidns;
 mod poll;
 mod prctl;
 mod procx;
@@ -1342,6 +1343,8 @@ impl ServiceCtx {
 pub struct Kernel {
     /// Host memory held for the guest (see [`crate::limits::Limits`]).
     memory_quota: Arc<crate::limits::Quota>,
+    /// What each task is numbered in nested PID namespaces (see [`pidns`]).
+    pids: Arc<Mutex<pidns::PidNamespaces>>,
     /// Growth on the host's disk (see [`crate::limits::Limits::disk_bytes`]).
     disk_quota: Arc<crate::limits::Quota>,
     /// The VM's `(cpu, wall)` time ceilings.
@@ -1484,6 +1487,8 @@ pub(super) struct Shared {
     /// Slots of [`Self::procs`] whose task is gone for good. (A `None` slot alone
     /// doesn't say that: a task's slot is also empty while it runs.)
     free_proc_slots: Vec<usize>,
+    /// The same table as [`Kernel::pids`], for tasks leaving it.
+    pids: Arc<Mutex<pidns::PidNamespaces>>,
     /// Slots of [`Self::spaces`] and [`Self::mmap_areas`] no task refers to.
     free_mm_slots: Vec<usize>,
     /// Slots of [`Self::file_tables`] no task refers to.
@@ -1592,6 +1597,10 @@ impl Shared {
             return;
         };
         self.free_proc_slots.push(i);
+        self.pids
+            .lock()
+            .unwrap()
+            .remove_task(gone.info.pid, gone.info.ns.pid);
         // The caller is running, so it isn't in `procs` on the serial path.
         let in_use = |sh: &Self, id: fn(&ProcInfo) -> usize, slot: usize| {
             id(&cx.cur) == slot || sh.procs.iter().flatten().any(|p| id(&p.info) == slot)
@@ -1895,7 +1904,9 @@ impl Kernel {
         mounts.attach_quota(&memory_quota);
         let disk_quota = crate::limits::Quota::new(limits.disk_bytes);
         mounts.attach_disk_quota(&disk_quota);
+        let pids = Arc::new(Mutex::new(pidns::PidNamespaces::default()));
         Self {
+            pids: pids.clone(),
             memory_quota,
             disk_quota,
             time_limits: Mutex::new((limits.cpu_time, limits.wall_time)),
@@ -1935,6 +1946,7 @@ impl Kernel {
                 unsupported: BTreeMap::new(),
                 procs: Vec::new(),
                 free_proc_slots: Vec::new(),
+                pids,
                 free_mm_slots: Vec::new(),
                 free_file_slots: Vec::new(),
                 free_cwd_slots: Vec::new(),
@@ -3194,6 +3206,9 @@ impl Kernel {
         if let Some(result) = self.ns_path_syscall(cx, sys, args, mem) {
             return result;
         }
+        if cx.cur.ns.pid != 0 {
+            return self.dispatch_in_pid_ns(cx, sys, raw, args, vcpu, mem);
+        }
         if !self.trace {
             return self.dispatch_impl(cx, sys, raw, args, vcpu, mem);
         }
@@ -4418,6 +4433,14 @@ impl Kernel {
             Ok(ns) => ns,
             Err(e) => return e,
         };
+        if child_ns.pid != cx.cur.ns.pid_for_children
+            && let Err(e) = self.new_pid_namespace(sh, cx, child_ns.pid, cx.cur.ns.pid_for_children)
+        {
+            return e;
+        }
+        if !self.pids.lock().unwrap().accepts_tasks(child_ns.pid) {
+            return err(Errno::ENOMEM);
+        }
         let Ok(mut child_vcpu) = vcpu.fork() else {
             return err(Errno::EAGAIN);
         };
@@ -4444,6 +4467,16 @@ impl Kernel {
         // context, IO context and cgroup, and no ptrace.
 
         let pid = sh.alloc_pid();
+        // The ids the guest sees: the parent's view and the child's differ when the
+        // child is in a PID namespace the parent isn't.
+        let (view_from_parent, view_from_child) = {
+            let mut pids = self.pids.lock().unwrap();
+            pids.add_task(pid, child_ns.pid);
+            (
+                pids.to_local(pid, cx.cur.ns.pid),
+                pids.to_local(pid, child_ns.pid),
+            )
+        };
         let mut info = cx.cur.clone();
         info.pid = pid;
         info.run = RunState::Running;
@@ -4484,6 +4517,12 @@ impl Kernel {
         // every forked child in its own group — then a parent's `wait4(0)`
         // (same-process-group) or `kill(0, …)` would miss all its children.
         info.pgid = pgid_of(&cx.cur);
+        // Likewise the session, which a child stays in until it calls `setsid`.
+        info.sid = if cx.cur.sid == 0 {
+            cx.cur.pid
+        } else {
+            cx.cur.sid
+        };
         if is_thread {
             // A thread joins the caller's group: shared tgid, the leader's parent,
             // and no exit signal (only the group's termination notifies the parent).
@@ -4557,15 +4596,15 @@ impl Kernel {
         // fires for a given pointer and no guard is needed here. (`clone3` gives
         // pidfd its own field, so the two never collide there either.)
         if flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
-            let _ = mem.write(parent_tid, &(pid as u32).to_le_bytes());
+            let _ = mem.write(parent_tid, &(view_from_parent as u32).to_le_bytes());
         }
         if flags & CLONE_CHILD_SETTID != 0 && child_tid != 0 {
             match child_mem.as_mut() {
                 Some(cm) => {
-                    let _ = cm.write(child_tid, &(pid as u32).to_le_bytes());
+                    let _ = cm.write(child_tid, &(view_from_child as u32).to_le_bytes());
                 }
                 None => {
-                    let _ = mem.write(child_tid, &(pid as u32).to_le_bytes());
+                    let _ = mem.write(child_tid, &(view_from_child as u32).to_le_bytes());
                 }
             }
         }
@@ -4706,7 +4745,7 @@ impl Kernel {
             Some(slot) => sh.procs[slot] = Some(child),
             None => sh.procs.push(Some(child)),
         }
-        i64::from(pid)
+        i64::from(view_from_parent)
     }
 
     /// `execve(path, argv, envp)` — replace the process image with a new ELF
@@ -4984,8 +5023,10 @@ impl Kernel {
                 let _ = mem.write(rusage, &rusage_bytes(child_cpu));
             }
             cx.cur.child_cpu_ns = cx.cur.child_cpu_ns.saturating_add(child_cpu);
+            // Before it's gone: a removed task no longer has a number.
+            let visible = self.visible_pid(cx, child);
             sh.remove_task(child, cx);
-            return i64::from(child);
+            return i64::from(visible);
         }
         // WUNTRACED: report a stopped child (WIFSTOPPED | WSTOPSIG<<8), latching
         // it so the same stop isn't re-reported; the child is NOT reaped.
@@ -5002,7 +5043,7 @@ impl Kernel {
                     break;
                 }
             }
-            return i64::from(child);
+            return i64::from(self.visible_pid(cx, child));
         }
         // WCONTINUED: report a continued child (WIFCONTINUED = 0xffff), clearing
         // the latch; the child is NOT reaped.
@@ -5018,7 +5059,7 @@ impl Kernel {
                     break;
                 }
             }
-            return i64::from(child);
+            return i64::from(self.visible_pid(cx, child));
         }
         if !has_child {
             return err(Errno::ECHILD);
@@ -5112,7 +5153,8 @@ impl Kernel {
                 let mut si = [0u8; 128];
                 si[0..4].copy_from_slice(&SIGCHLD.to_le_bytes());
                 si[8..12].copy_from_slice(&code.to_le_bytes());
-                si[16..20].copy_from_slice(&child.to_le_bytes());
+                let visible = self.visible_pid(cx, child);
+                si[16..20].copy_from_slice(&visible.to_le_bytes());
                 si[24..28].copy_from_slice(&status.to_le_bytes());
                 let _ = mem.write(infop, &si);
             }
@@ -5125,7 +5167,8 @@ impl Kernel {
                 let mut si = [0u8; 128];
                 si[0..4].copy_from_slice(&17i32.to_le_bytes());
                 si[8..12].copy_from_slice(&code.si_code().to_le_bytes());
-                si[16..20].copy_from_slice(&child.to_le_bytes());
+                let visible = self.visible_pid(cx, child);
+                si[16..20].copy_from_slice(&visible.to_le_bytes());
                 si[24..28].copy_from_slice(&code.si_status().to_le_bytes());
                 let _ = mem.write(infop, &si);
             }
@@ -5600,10 +5643,19 @@ impl Kernel {
         let ppid = cx.cur.ppid;
         let me = cx.cur.pid;
         // Orphans go to the nearest living ancestor that declared itself a
-        // child subreaper (PR_SET_CHILD_SUBREAPER), else to init.
+        // child subreaper (PR_SET_CHILD_SUBREAPER), else to their namespace's init.
+        // If this task *is* that init, its namespace's tasks are dying with it, and
+        // what's left goes to the one outside.
+        self.close_pid_namespace_if_init(sh, cx);
         let new_parent = {
             let mut up = cx.cur.ppid;
-            let mut found = 1;
+            let mut found = self
+                .pids
+                .lock()
+                .unwrap()
+                .init_of(cx.cur.ns.pid)
+                .filter(|&init| init != cx.cur.tgid)
+                .unwrap_or(1);
             for _ in 0..64 {
                 let Some(p) = sh.procs.iter().flatten().find(|p| p.info.pid == up) else {
                     break;

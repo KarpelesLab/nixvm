@@ -295,9 +295,14 @@ impl Kernel {
     /// process. A process that has exited has no namespaces left to open.
     fn ns_of_target(&self, cx: &ServiceCtx, target: NsTarget, kind: NsKind) -> Result<u32, i64> {
         let pid = match target {
-            NsTarget::Pid(pid) if pid != cx.cur.pid && pid != cx.cur.tgid => pid,
-            _ => return Ok(cx.cur.ns.get(kind)),
+            NsTarget::Current => return Ok(cx.cur.ns.get(kind)),
+            NsTarget::Pid(local) => self
+                .global_pid(cx, local)
+                .ok_or_else(|| err(Errno::ENOENT))?,
         };
+        if pid == cx.cur.pid || pid == cx.cur.tgid {
+            return Ok(cx.cur.ns.get(kind));
+        }
         let sh = self.shared.lock().unwrap();
         let task = sh
             .procs
@@ -417,6 +422,11 @@ impl Kernel {
                 if threaded_refused(kind.flag()) {
                     return err(Errno::EINVAL);
                 }
+                if matches!(kind, NsKind::Pid | NsKind::PidForChildren)
+                    && !self.may_join_pid_namespace(cx, id)
+                {
+                    return err(Errno::EINVAL);
+                }
                 Self::join_namespace(&mut cx.cur.ns, kind, id);
                 0
             }
@@ -444,6 +454,12 @@ impl Kernel {
                     NsKind::User,
                     NsKind::Uts,
                 ] {
+                    if kind == NsKind::Pid
+                        && nstype & kind.flag() != 0
+                        && !self.may_join_pid_namespace(cx, target.pid)
+                    {
+                        return err(Errno::EINVAL);
+                    }
                     if nstype & kind.flag() != 0 {
                         Self::join_namespace(&mut cx.cur.ns, kind, target.get(kind));
                     }

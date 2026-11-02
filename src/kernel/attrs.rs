@@ -995,7 +995,14 @@ impl Kernel {
         if flags & (CLONE_NEWUSER | CLONE_NEWPID) != 0 && threaded {
             return err(Errno::EINVAL);
         }
+        let pid_parent = cx.cur.ns.pid_for_children;
         if let Err(e) = sh.unshare_namespaces(cx, flags & (NS | CLONE_NEWUSER)) {
+            return e;
+        }
+        if flags & CLONE_NEWPID != 0
+            && let Err(e) = self.new_pid_namespace(sh, cx, cx.cur.ns.pid_for_children, pid_parent)
+        {
+            cx.cur.ns.pid_for_children = pid_parent;
             return e;
         }
         // A private fd table: the shared slot (checked out into `cur.fds` for

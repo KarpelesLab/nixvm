@@ -443,7 +443,8 @@ impl Kernel {
         uaddr: u64,
         timeout: Option<Timeout>,
     ) -> i64 {
-        let tid = cx.cur.pid as u32;
+        // The word holds tids as the guest knows them, not global ones.
+        let tid = self.visible_pid(cx, cx.cur.pid) as u32;
         if cx.cur.futex_woken {
             // The unlocker already wrote our tid into the word.
             Self::futex_done(cx);
@@ -465,7 +466,10 @@ impl Kernel {
         } else if owner == tid {
             Self::futex_done(cx);
             return err(Errno::EDEADLK);
-        } else if !Self::tid_alive(sh, cx, owner as i32) {
+        } else if !self
+            .global_pid(cx, owner as i32)
+            .is_some_and(|g| Self::tid_alive(sh, cx, g))
+        {
             Some(take(FUTEX_OWNER_DIED))
         } else {
             None
@@ -517,7 +521,7 @@ impl Kernel {
         let Ok(word) = mem.read_u32(uaddr) else {
             return err(Errno::EFAULT);
         };
-        if word & FUTEX_TID_MASK != cx.cur.pid as u32 {
+        if word & FUTEX_TID_MASK != self.visible_pid(cx, cx.cur.pid) as u32 {
             return err(Errno::EPERM);
         }
         let waiting: Vec<usize> = sh
@@ -535,7 +539,8 @@ impl Kernel {
                 let p = &mut sh.procs[i].as_mut().expect("present").info;
                 p.futex_woken = true;
                 p.parked = false;
-                p.pid as u32 | if waiting.len() > 1 { FUTEX_WAITERS } else { 0 }
+                self.visible_pid(cx, p.pid) as u32
+                    | if waiting.len() > 1 { FUTEX_WAITERS } else { 0 }
             }
             None => 0,
         };

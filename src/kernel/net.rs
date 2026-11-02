@@ -1933,7 +1933,8 @@ impl Kernel {
                 // socketpair, a connection within one process tree).
                 17 => {
                     let mut b = [0u8; 12];
-                    b[0..4].copy_from_slice(&cx.cur.tgid.to_le_bytes());
+                    let pid = self.visible_pid(cx, cx.cur.tgid);
+                    b[0..4].copy_from_slice(&pid.to_le_bytes());
                     b[4..8].copy_from_slice(&cx.cur.creds.euid.to_le_bytes());
                     b[8..12].copy_from_slice(&cx.cur.creds.egid.to_le_bytes());
                     return write_optval(mem, optval, optlen_ptr, &b);
