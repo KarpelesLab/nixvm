@@ -195,6 +195,27 @@ impl FdTable {
     /// the standard streams and reopens gets it back at that number — busybox
     /// ash relies on exactly this for background jobs: it does `close(0);
     /// open("/dev/null")` and *dies* unless the reopen lands on fd 0.
+    /// How many descriptors are open.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether no descriptors are open.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Whether `wanted` more descriptors can be opened below `limit`, the
+    /// process's `RLIMIT_NOFILE`.
+    #[must_use]
+    pub fn has_room_for(&self, wanted: u64, limit: u64) -> bool {
+        let limit = i32::try_from(limit).unwrap_or(i32::MAX);
+        let used = self.map.range(..limit).count() as u64;
+        used + wanted <= u64::from(limit.unsigned_abs())
+    }
+
     pub fn alloc(&mut self, fd: Fd) -> i32 {
         self.alloc_from(fd, 0)
     }

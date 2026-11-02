@@ -579,6 +579,8 @@ struct Dgram {
     /// `None` for a standalone (named/INET) datagram socket.
     pair_peer: Option<usize>,
     queue: VecDeque<(InetAddr, Vec<u8>)>,
+    /// What [`Self::queue`] holds, by [`datagram_cost`].
+    queued_bytes: usize,
     /// A host UDP socket, opened lazily the first time this datagram socket
     /// sends to a *routable* address with egress enabled. Once present, all
     /// sends go out through it and inbound host datagrams are drained into
@@ -588,6 +590,26 @@ struct Dgram {
     /// are ICMP messages, carried by the egress backend's ICMP endpoint (in
     /// `host`) or answered locally for a loopback echo.
     icmp: Option<Icmp>,
+}
+
+/// What a queued datagram costs against a socket's receive buffer. The overhead
+/// keeps empty datagrams from filling memory unnoticed.
+fn datagram_cost(payload: &[u8]) -> usize {
+    payload.len() + 256
+}
+
+impl Dgram {
+    /// Queue an arriving datagram, or drop it if the receive buffer is full:
+    /// what UDP does on Linux, where a sender never finds out either.
+    fn enqueue(&mut self, from: InetAddr, payload: Vec<u8>) {
+        /// Linux's default `net.core.rmem_max`, doubled as it does.
+        const CAPACITY: usize = 2 * 212_992;
+        let cost = datagram_cost(&payload);
+        if self.queued_bytes + cost <= CAPACITY {
+            self.queued_bytes += cost;
+            self.queue.push_back((from, payload));
+        }
+    }
 }
 
 /// What kind of ICMP socket a [`Dgram`] is.
@@ -608,6 +630,7 @@ impl std::fmt::Debug for Dgram {
             .field("peer", &self.peer)
             .field("pair_peer", &self.pair_peer)
             .field("queue", &self.queue)
+            .field("queued_bytes", &self.queued_bytes)
             .field("host", &self.host.is_some())
             .field("icmp", &self.icmp)
             .finish()
@@ -1285,6 +1308,12 @@ impl Kernel {
         let Some(lidx) = net.pick_listener(&key) else {
             return err(Errno::ECONNREFUSED);
         };
+        // A full accept queue: nobody is taking connections (Linux's SOMAXCONN).
+        if let Kind::Listener { backlog, .. } = &net.socks[lidx].kind
+            && backlog.len() >= 4096
+        {
+            return err(Errno::EAGAIN);
+        }
         let listener_addr = match &net.socks[lidx].kind {
             Kind::Listener { addr, .. } => addr.clone(),
             _ => return err(Errno::ECONNREFUSED),
@@ -1949,6 +1978,7 @@ impl Kernel {
         let Ok(data) = mem.read_vec(buf, len as usize) else {
             return err(Errno::EFAULT);
         };
+        cx.dontwait = flags & MSG_DONTWAIT != 0;
         self.send_bytes(
             net,
             cx,
@@ -2005,7 +2035,7 @@ impl Kernel {
                         port: 0,
                         ip: [0; 16],
                     };
-                    td.queue.push_back((src, data.to_vec()));
+                    td.enqueue(src, data.to_vec());
                 }
                 return data.len() as i64;
             }
@@ -2033,7 +2063,7 @@ impl Kernel {
         if let Some(tgt) = net.pick_dgram_target(&key, src.port)
             && let Kind::Dgram(td) = &mut net.socks[tgt].kind
         {
-            td.queue.push_back((src, data.to_vec()));
+            td.enqueue(src, data.to_vec());
         }
         data.len() as i64
     }
@@ -2086,8 +2116,9 @@ impl Kernel {
                 if !p.to[e].is_empty() || eof {
                     m |= POLLIN;
                 }
-                if !p.shut_wr[e] {
-                    m |= POLLOUT; // unbounded send buffer → always writable
+                let capacity = net.socks[sock].opts.sndbuf.saturating_mul(2) as usize;
+                if !p.shut_wr[e] && p.to[1 - e].len() < capacity {
+                    m |= POLLOUT;
                 }
                 if peer_closed {
                     m |= POLLHUP;
@@ -2191,7 +2222,7 @@ impl Kernel {
                             dest.ip
                         },
                     };
-                    d.queue.push_back((src, p));
+                    d.enqueue(src, p);
                 }
             }
             return data.len() as i64;
@@ -2267,7 +2298,9 @@ impl Kernel {
             }
         }
         if let Kind::Dgram(d) = &mut net.socks[sock].kind {
-            d.queue.extend(arrived);
+            for (src, payload) in arrived {
+                d.enqueue(src, payload);
+            }
         }
     }
 
@@ -2393,6 +2426,7 @@ impl Kernel {
             }
         }
         const MSG_NOSIGNAL: u64 = 0x4000;
+        cx.dontwait = flags & MSG_DONTWAIT != 0;
         let r = self.send_bytes(
             net,
             cx,
@@ -2407,7 +2441,10 @@ impl Kernel {
         // passed fds as ancillary data riding the just-written bytes: bump each
         // backing ref (the in-flight duplicate) and record the stream offset the
         // fds attach to, so the matching `recvmsg` materializes them.
+        // A send still parked waiting for room queues its descriptors on the
+        // re-run that completes it.
         if r >= 0
+            && !cx.block
             && !passed.is_empty()
             && let Some((sock, end)) = self.sock_of(cx, fd)
             && matches!(net.socks[sock].kind, Kind::Pair(_))
@@ -2729,7 +2766,13 @@ impl Kernel {
         let peek = flags & MSG_PEEK != 0;
         match &mut net.socks[sock].kind {
             Kind::Dgram(d) if peek => d.queue.front().cloned(),
-            Kind::Dgram(d) => d.queue.pop_front(),
+            Kind::Dgram(d) => {
+                let next = d.queue.pop_front();
+                if let Some((_, payload)) = &next {
+                    d.queued_bytes -= datagram_cost(payload);
+                }
+                next
+            }
             _ => unreachable!("checked by caller"),
         }
     }
@@ -3042,7 +3085,7 @@ impl Kernel {
                     ip: [0; 16],
                 };
                 if let Kind::Dgram(td) = &mut net.socks[tgt].kind {
-                    td.queue.push_back((src, data.to_vec()));
+                    td.enqueue(src, data.to_vec());
                 }
                 return data.len() as i64;
             }
@@ -3069,7 +3112,7 @@ impl Kernel {
             if let Some(tgt) = net.pick_dgram_target(&key, src.port)
                 && let Kind::Dgram(td) = &mut net.socks[tgt].kind
             {
-                td.queue.push_back((src, data.to_vec()));
+                td.enqueue(src, data.to_vec());
             }
             return data.len() as i64;
         }
@@ -3094,16 +3137,39 @@ impl Kernel {
                 Err(_) => err(Errno::ECONNRESET),
             };
         }
+        // Linux doubles SO_SNDBUF for its bookkeeping, and so reports it.
+        let capacity = net.socks[sock].opts.sndbuf.saturating_mul(2) as usize;
         match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
                 if p.shut_wr[end] || p.refs[1 - end] == 0 {
+                    cx.cur.io_progress = 0;
                     if !nosignal {
                         self.raise_sigpipe(cx);
                     }
                     return err(Errno::EPIPE);
                 }
-                p.to[1 - end].extend(data.iter().copied());
-                data.len() as i64
+                // As with pipes: what fits goes in, and a blocking send parks to
+                // finish the rest, so the guest sees one complete send.
+                let done = (cx.cur.io_progress as usize).min(data.len());
+                let room = capacity.saturating_sub(p.to[1 - end].len());
+                let n = room.min(data.len() - done);
+                p.to[1 - end].extend(data[done..done + n].iter().copied());
+                let done = done + n;
+                if done == data.len() {
+                    cx.cur.io_progress = 0;
+                    return done as i64;
+                }
+                if p.nonblock[end] || cx.dontwait {
+                    cx.cur.io_progress = 0;
+                    return if done > 0 {
+                        done as i64
+                    } else {
+                        err(Errno::EAGAIN)
+                    };
+                }
+                cx.cur.io_progress = done as u64;
+                cx.block = true;
+                0
             }
             _ => err(Errno::EINVAL),
         }
@@ -3211,6 +3277,10 @@ impl Kernel {
                 )]
             };
             if let Kind::Netlink(nl) = &mut net.socks[sock].kind {
+                // Replies wait for a read; a guest that only ever asks gets told.
+                if nl.queue.len() + replies.len() > 4096 {
+                    return err(Errno::ENOBUFS);
+                }
                 nl.queue.extend(replies);
             }
             offset += nlmsg_align(nlmsg_len);

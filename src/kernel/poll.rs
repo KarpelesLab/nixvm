@@ -330,13 +330,15 @@ impl Kernel {
                 }
             }
             Fd::PipeWrite(i) => {
-                // Always writable (nixvm's pipes are unbounded, so never full);
-                // a vanished read end adds POLLERR on top (POLLOUT | POLLERR, not
-                // POLLERR alone) — the readiness a real host reports here.
+                // Writable while there's room; a vanished read end adds POLLERR
+                // on top (POLLOUT | POLLERR, not POLLERR alone), the readiness a
+                // real host reports here.
                 if pipes[i].readers == 0 {
                     POLLOUT | POLLERR
-                } else {
+                } else if pipes[i].buf.len() < pipes[i].capacity {
                     POLLOUT
+                } else {
+                    0
                 }
             }
             Fd::Eventfd(i) => {

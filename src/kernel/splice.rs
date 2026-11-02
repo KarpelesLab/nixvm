@@ -130,7 +130,11 @@ impl Kernel {
                     self.raise_sigpipe(cx);
                     return err(Errno::EPIPE);
                 }
-                let n = (len as usize).min(pipes[i].buf.len()).min(PIPE_BUF_CAP);
+                let room = pipes[j].capacity.saturating_sub(pipes[j].buf.len());
+                if room == 0 {
+                    return Self::pipe_full(cx, pipes[j].write_nonblock || nonblock);
+                }
+                let n = (len as usize).min(pipes[i].buf.len()).min(room);
                 let data: Vec<u8> = pipes[i].buf.drain(..n).collect();
                 pipes[j].buf.extend(data);
                 n as i64
@@ -208,7 +212,14 @@ impl Kernel {
             },
             // file / socket -> pipe.
             (None, Some(j)) => {
-                let cap = (len as usize).min(PIPE_BUF_CAP);
+                let room = {
+                    let pipes = self.pipes.lock().unwrap();
+                    if pipes[j].readers > 0 && pipes[j].buf.len() >= pipes[j].capacity {
+                        return Self::pipe_full(cx, pipes[j].write_nonblock || nonblock);
+                    }
+                    pipes[j].capacity.saturating_sub(pipes[j].buf.len())
+                };
+                let cap = (len as usize).min(PIPE_BUF_CAP).min(room.max(1));
                 match fin {
                     Fd::File {
                         path,
@@ -321,10 +332,25 @@ impl Kernel {
             self.raise_sigpipe(cx);
             return err(Errno::EPIPE);
         }
-        let n = (len as usize).min(pipes[i].buf.len()).min(PIPE_BUF_CAP);
+        let room = pipes[j].capacity.saturating_sub(pipes[j].buf.len());
+        if room == 0 {
+            let nonblock = flags & SPLICE_F_NONBLOCK != 0;
+            return Self::pipe_full(cx, pipes[j].write_nonblock || nonblock);
+        }
+        let n = (len as usize).min(pipes[i].buf.len()).min(room);
         let data: Vec<u8> = pipes[i].buf.iter().take(n).copied().collect();
         pipes[j].buf.extend(data);
         n as i64
+    }
+
+    /// The answer when a pipe has no room for a splice: try again later if the
+    /// caller can wait, otherwise `EAGAIN`.
+    fn pipe_full(cx: &mut ServiceCtx, nonblock: bool) -> i64 {
+        if nonblock {
+            return err(Errno::EAGAIN);
+        }
+        cx.block = true;
+        0
     }
 
     /// `vmsplice(fd, iov, nr_segs, flags)` — user memory into a pipe (write

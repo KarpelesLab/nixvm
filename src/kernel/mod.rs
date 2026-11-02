@@ -269,6 +269,9 @@ struct ProcInfo {
     /// of re-parking. This is what makes `setTimeout` fire — libuv sleeps in
     /// `epoll_pwait(timeout)` until the next timer is due.
     wake_deadline: Option<u128>,
+    /// Bytes a blocked pipe or socket write has already queued, so the re-run of
+    /// the syscall continues rather than starting over. 0 outside such a write.
+    io_progress: u64,
     /// CPU time consumed by this task, in nanoseconds: the wall time it has spent
     /// actually executing (each dispatched step's run + service), accumulated by
     /// the schedulers. A parked/blocked task doesn't advance it — which is what
@@ -438,6 +441,7 @@ impl Default for ProcInfo {
             parked: false,
             shared_maps: Vec::new(),
             wake_deadline: None,
+            io_progress: 0,
             cpu_ns: 0,
             vruntime: 0,
             child_cpu_ns: 0,
@@ -1153,7 +1157,16 @@ struct Pipe {
     /// pipe, a self-pipe) deadlocks the whole VM on the first empty read.
     read_nonblock: bool,
     write_nonblock: bool,
+    /// How many bytes this pipe holds before a writer blocks (`F_SETPIPE_SZ`).
+    capacity: usize,
 }
+
+/// A new pipe's capacity, as on Linux.
+pub(crate) const PIPE_DEFAULT_CAPACITY: usize = 65536;
+/// The largest capacity `F_SETPIPE_SZ` grants (Linux's `pipe-max-size` default).
+const PIPE_MAX_CAPACITY: usize = 1 << 20;
+/// Writes up to this size are atomic: all of it goes in, or none (`PIPE_BUF`).
+const PIPE_ATOMIC_WRITE: u64 = 4096;
 
 /// The running task's mutable servicing state, owned by the servicer for the
 /// duration of a slice instead of living in [`Kernel`]. Making it a passed-in
@@ -1191,6 +1204,8 @@ pub(super) struct ServiceCtx {
     /// restarted (an `SA_RESTART` handler interrupted it): [`Kernel::deliver_async_signal`]
     /// rewinds the guest PC to re-execute the `syscall` after the handler returns.
     restart_syscall: bool,
+    /// `MSG_DONTWAIT` on the send being serviced: don't park if it doesn't fit.
+    dontwait: bool,
     /// Syscalls serviced in the current slice (preemption quantum counter). (Was
     /// `Kernel::slice_syscalls`.)
     slice_syscalls: u32,
@@ -1208,6 +1223,7 @@ impl ServiceCtx {
             exec_ok: false,
             restartable: true,
             restart_syscall: false,
+            dontwait: false,
             slice_syscalls: 0,
         }
     }
@@ -1229,6 +1245,9 @@ pub struct Kernel {
     memory_quota: Arc<crate::limits::Quota>,
     /// Tasks that may exist at once (see [`crate::limits::Limits::tasks`]).
     max_tasks: AtomicUsize,
+    /// Descriptors that may be open at once across the VM
+    /// (see [`crate::limits::Limits::open_files`]).
+    max_open_files: AtomicUsize,
     arch: Arch,
     /// Interactive mode (the browser terminal): guest reads of fd 0 draw from
     /// `Shared::stdin_buf` and *block* (re-trap) when it is empty rather than
@@ -1758,6 +1777,7 @@ impl Kernel {
         Self {
             memory_quota,
             max_tasks: AtomicUsize::new(limits.tasks as usize),
+            max_open_files: AtomicUsize::new(limits.open_files as usize),
             arch,
             trace: std::env::var_os("NIXVM_TRACE").is_some(),
             schedtrace: std::env::var_os("NIXVM_SCHEDTRACE").is_some(),
@@ -1838,6 +1858,10 @@ impl Kernel {
         self.memory_quota.set_limit(limits.kernel_memory);
         self.max_tasks
             .store(limits.tasks as usize, std::sync::atomic::Ordering::Relaxed);
+        self.max_open_files.store(
+            limits.open_files as usize,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub fn set_egress(&mut self, egress: Box<dyn egress::Egress>) {
@@ -2335,7 +2359,13 @@ impl Kernel {
                         // futex's), so leave it in place.
                         cx.restart_syscall = true;
                     } else {
-                        ret = err(Errno::EINTR);
+                        // A write interrupted partway reports what it wrote.
+                        let done = std::mem::take(&mut cx.cur.io_progress);
+                        ret = if done > 0 {
+                            done as i64
+                        } else {
+                            err(Errno::EINTR)
+                        };
                         // Abandoning the syscall (not restarting): drop the
                         // futex-wait bookkeeping so a later FUTEX_WAKE on the
                         // old address can't spuriously flag this now-running
@@ -3010,6 +3040,9 @@ impl Kernel {
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
     ) -> i64 {
+        if let Some(failure) = self.fd_limit_error(cx, sys, args) {
+            return failure;
+        }
         if !self.trace {
             return self.dispatch_impl(cx, sys, raw, args, vcpu, mem);
         }
@@ -3022,6 +3055,59 @@ impl Kernel {
             eprintln!("[trace]   = {ret:#x}");
         }
         ret
+    }
+
+    /// Whether syscall `sys` would open more descriptors than allowed: the
+    /// failure to return if so. All of them pass through here, so the many places
+    /// that allocate a descriptor don't each need to check.
+    fn fd_limit_error(&self, cx: &ServiceCtx, sys: Sysno, args: &[u64; 6]) -> Option<i64> {
+        const F_DUPFD: u64 = 0;
+        const F_DUPFD_CLOEXEC: u64 = 1030;
+        let wanted = match sys {
+            Sysno::Pipe | Sysno::Pipe2 | Sysno::Socketpair => 2,
+            Sysno::Open
+            | Sysno::Openat
+            | Sysno::Openat2
+            | Sysno::Creat
+            | Sysno::Socket
+            | Sysno::Accept
+            | Sysno::Accept4
+            | Sysno::Dup
+            | Sysno::EpollCreate
+            | Sysno::EpollCreate1
+            | Sysno::Eventfd
+            | Sysno::Eventfd2
+            | Sysno::Signalfd
+            | Sysno::Signalfd4
+            | Sysno::TimerfdCreate
+            | Sysno::InotifyInit
+            | Sysno::InotifyInit1
+            | Sysno::MemfdCreate
+            | Sysno::PidfdOpen
+            | Sysno::PidfdGetfd
+            | Sysno::MqOpen => 1,
+            Sysno::Fcntl if matches!(args[1], F_DUPFD | F_DUPFD_CLOEXEC) => 1,
+            Sysno::Dup2 | Sysno::Dup3 => 0,
+            _ => return None,
+        };
+        let sh = self.shared.lock().unwrap();
+        let soft = sh.rlimit_nofile.0;
+        if matches!(sys, Sysno::Dup2 | Sysno::Dup3) {
+            return (args[1] >= soft).then(|| err(Errno::EBADF));
+        }
+        if sys == Sysno::Fcntl && args[2] >= soft {
+            return Some(err(Errno::EINVAL));
+        }
+        if !cx.cur.fds.has_room_for(wanted, soft) {
+            return Some(err(Errno::EMFILE));
+        }
+        // Across the VM. The running tasks' own tables are checked out of this
+        // list, which only ever makes the count a little low.
+        let open: usize = sh.file_tables.iter().flatten().map(FdTable::len).sum();
+        let limit = self
+            .max_open_files
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (open + cx.cur.fds.len() + wanted as usize > limit).then(|| err(Errno::ENFILE))
     }
 
     /// Route a syscall to the lock discipline it needs (steps B2/B3/B4/B5). No
@@ -3191,7 +3277,9 @@ impl Kernel {
             | Sysno::Sendmmsg
             | Sysno::Recvmmsg => {
                 let mut net = self.net.lock().unwrap();
+                cx.dontwait = false;
                 let ret = self.dispatch_net(&mut net, cx, sys, args, mem);
+                cx.dontwait = false;
                 let direction = match sys {
                     Sysno::Accept
                     | Sysno::Accept4
@@ -5621,10 +5709,9 @@ impl Kernel {
         let Some(Fd::PipeWrite(i)) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
-        let Ok(data) = mem.read_vec(buf, count as usize) else {
-            return err(Errno::EFAULT);
-        };
-        self.write_pipe(pipes, cx, i, &data, false)
+        self.pipe_write_from(pipes, cx, i, count, false, |off, n| {
+            mem.read_vec(buf + off, n).ok()
+        })
     }
 
     /// The `Fd::File` arm of [`Self::sys_write`]: write `count` bytes at the
@@ -6101,14 +6188,70 @@ impl Kernel {
         data: &[u8],
         nosignal: bool,
     ) -> i64 {
+        self.pipe_write_from(pipes, cx, i, data.len() as u64, nosignal, |off, n| {
+            Some(data[off as usize..off as usize + n].to_vec())
+        })
+    }
+
+    /// Write `total` bytes to pipe `i`, as much as fits. `read(off, n)` supplies
+    /// the bytes at offset `off` of the write, and is only asked for what fits, so
+    /// a huge write never copies more than the pipe can hold.
+    ///
+    /// A blocking write that doesn't fit parks the task, remembering how far it
+    /// got in [`ProcInfo::io_progress`]; the re-run after a reader makes room
+    /// carries on from there, so the guest sees one complete write, as on Linux.
+    fn pipe_write_from(
+        &self,
+        pipes: &mut [Pipe],
+        cx: &mut ServiceCtx,
+        i: usize,
+        total: u64,
+        nosignal: bool,
+        read: impl FnOnce(u64, usize) -> Option<Vec<u8>>,
+    ) -> i64 {
+        let done = cx.cur.io_progress;
         if pipes[i].readers == 0 {
+            cx.cur.io_progress = 0;
+            if done > 0 {
+                return done as i64;
+            }
             if !nosignal {
                 self.raise_sigpipe(cx);
             }
             return err(Errno::EPIPE);
         }
-        pipes[i].buf.extend(data.iter().copied());
-        data.len() as i64
+        let remaining = total.saturating_sub(done);
+        let room = pipes[i].capacity.saturating_sub(pipes[i].buf.len()) as u64;
+        let n = if remaining <= PIPE_ATOMIC_WRITE && room < remaining {
+            0
+        } else {
+            remaining.min(room)
+        };
+        let Some(data) = read(done, n as usize) else {
+            cx.cur.io_progress = 0;
+            return if done > 0 {
+                done as i64
+            } else {
+                err(Errno::EFAULT)
+            };
+        };
+        pipes[i].buf.extend(data);
+        let done = done + n;
+        if done >= total {
+            cx.cur.io_progress = 0;
+            return total as i64;
+        }
+        if pipes[i].write_nonblock {
+            cx.cur.io_progress = 0;
+            return if done > 0 {
+                done as i64
+            } else {
+                err(Errno::EAGAIN)
+            };
+        }
+        cx.cur.io_progress = done;
+        cx.block = true;
+        0
     }
 
     /// Post `SIGPIPE` to the current task — a write to a reader-less pipe/socket.
@@ -6786,27 +6929,27 @@ impl Kernel {
             }
             return total;
         }
-        if let Some(Fd::PipeWrite(..)) = cx.cur.fds.get(fd as i32) {
-            let mut pipes = self.pipes.lock().unwrap();
-            let mut total = 0i64;
+        if let Some(Fd::PipeWrite(i)) = cx.cur.fds.get(fd as i32).cloned() {
+            // One atomic, resumable write of the whole vector, as on Linux.
+            if iovcnt > 1024 {
+                return err(Errno::EINVAL);
+            }
+            let mut data = Vec::new();
+            let mut remaining = MAX_RW_COUNT;
             for i in 0..iovcnt {
                 let ent = iov + i * 16;
                 let (Ok(base), Ok(len)) = (mem.read_u64(ent), mem.read_u64(ent + 8)) else {
-                    return if total > 0 { total } else { err(Errno::EFAULT) };
+                    return err(Errno::EFAULT);
                 };
-                if len == 0 {
-                    continue;
-                }
-                let r = self.write_pipe_fd(&mut pipes, cx, fd, base, len, mem);
-                if r < 0 {
-                    return if total > 0 { total } else { r };
-                }
-                total += r;
-                if (r as u64) < len {
-                    break;
-                }
+                let len = len.min(remaining);
+                remaining -= len;
+                let Ok(mut chunk) = mem.read_vec(base, len as usize) else {
+                    return err(Errno::EFAULT);
+                };
+                data.append(&mut chunk);
             }
-            return total;
+            let mut pipes = self.pipes.lock().unwrap();
+            return self.write_pipe(&mut pipes, cx, i, &data, false);
         }
         if let Some(Fd::Eventfd(..)) = cx.cur.fds.get(fd as i32) {
             let mut pf = self.pollfds.lock().unwrap();
@@ -7537,6 +7680,7 @@ impl Kernel {
         let idx = pipes.len();
         pipes.push(Pipe {
             buf: VecDeque::new(),
+            capacity: PIPE_DEFAULT_CAPACITY,
             readers: 1,
             writers: 1,
             read_nonblock: nonblock,

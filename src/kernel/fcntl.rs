@@ -384,19 +384,29 @@ impl Kernel {
                 cx.cur.fds.set_cloexec(m, cmd == F_DUPFD_CLOEXEC);
                 i64::from(m)
             }
-            // Pipe capacity: nixvm's pipes are unbounded; report/accept the
-            // Linux default (64 KiB). Only pipes have one.
-            F_GETPIPE_SZ | F_SETPIPE_SZ => match f {
-                Fd::PipeRead(_) | Fd::PipeWrite(_) if cmd == F_GETPIPE_SZ => 65536,
-                Fd::PipeRead(_) | Fd::PipeWrite(_) => {
-                    if arg > 1 << 20 && cx.cur.creds.euid != 0 {
-                        err(Errno::EPERM)
-                    } else {
-                        (arg.max(4096).next_power_of_two()) as i64
-                    }
+            // Pipe capacity. Only pipes have one.
+            F_GETPIPE_SZ | F_SETPIPE_SZ => {
+                let (Fd::PipeRead(i) | Fd::PipeWrite(i)) = f else {
+                    return err(Errno::EBADF);
+                };
+                let mut pipes = self.pipes.lock().unwrap();
+                if cmd == F_GETPIPE_SZ {
+                    return pipes[i].capacity as i64;
                 }
-                _ => err(Errno::EBADF),
-            },
+                if arg > super::PIPE_MAX_CAPACITY as u64 && cx.cur.creds.euid != 0 {
+                    return err(Errno::EPERM);
+                }
+                // Root may ask for more on Linux, but it's memory the host pays
+                // for: everyone gets the same ceiling here.
+                let capacity = (arg as usize)
+                    .clamp(4096, super::PIPE_MAX_CAPACITY)
+                    .next_power_of_two();
+                if capacity < pipes[i].buf.len() {
+                    return err(Errno::EBUSY);
+                }
+                pipes[i].capacity = capacity;
+                capacity as i64
+            }
             // The close-on-exec flag (`FD_CLOEXEC`) — the only `F_*FD` bit.
             F_GETFD => i64::from(cx.cur.fds.is_cloexec(n)),
             F_SETFD => {

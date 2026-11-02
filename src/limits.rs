@@ -18,12 +18,16 @@ pub struct Limits {
     /// Tasks (threads and processes, counting zombies) that may exist at once.
     /// `fork` and `clone` beyond this fail with `EAGAIN`.
     pub tasks: u32,
+    /// File descriptors open at once across the whole VM, on top of each
+    /// process's own `RLIMIT_NOFILE`. Opening more fails with `ENFILE`.
+    pub open_files: u32,
 }
 
 impl Limits {
     /// Sensible defaults for the machine this runs on: a quarter of its RAM for
-    /// kernel memory, at most 8 GiB and at least 256 MiB, and 4096 tasks. Each can
-    /// be overridden with `NIXVM_LIMIT_KERNEL_MEMORY` (bytes) or `NIXVM_LIMIT_TASKS`.
+    /// kernel memory, at most 8 GiB and at least 256 MiB, 4096 tasks and 262144 open
+    /// files. Each can be overridden with `NIXVM_LIMIT_KERNEL_MEMORY` (bytes),
+    /// `NIXVM_LIMIT_TASKS` or `NIXVM_LIMIT_OPEN_FILES`.
     #[must_use]
     pub fn for_this_host() -> Self {
         const MIB: u64 = 1024 * 1024;
@@ -31,6 +35,8 @@ impl Limits {
         Self {
             kernel_memory: env_u64("NIXVM_LIMIT_KERNEL_MEMORY").unwrap_or(kernel_memory),
             tasks: env_u64("NIXVM_LIMIT_TASKS").map_or(4096, |n| n.min(1 << 22) as u32),
+            open_files: env_u64("NIXVM_LIMIT_OPEN_FILES")
+                .map_or(1 << 18, |n| n.min(u64::from(u32::MAX)) as u32),
         }
     }
 }
