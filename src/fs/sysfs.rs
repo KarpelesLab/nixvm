@@ -273,6 +273,10 @@ fn enotdir() -> io::Error {
 }
 
 impl MountFs for SysFs {
+    fn fs_type(&self) -> &'static str {
+        "sysfs"
+    }
+
     fn stat(&mut self, rel: &str) -> Option<Attrs> {
         let node = Self::tree().get(rel)?;
         let (kind, mode, size) = match node {

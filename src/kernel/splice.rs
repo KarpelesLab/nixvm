@@ -158,7 +158,7 @@ impl Kernel {
                         Ok(p) => p,
                         Err(e) => return e,
                     };
-                    let mut vfs = self.vfs.lock().unwrap();
+                    let mut vfs = self.vfs_for(cx);
                     let mut pipes = self.pipes.lock().unwrap();
                     if let PipeState::Done(r) = Self::pipe_src_state(&pipes, cx, i, nonblock) {
                         return r;
@@ -234,7 +234,7 @@ impl Kernel {
                             Ok(p) => p,
                             Err(e) => return e,
                         };
-                        let mut vfs = self.vfs.lock().unwrap();
+                        let mut vfs = self.vfs_for(cx);
                         let mut pipes = self.pipes.lock().unwrap();
                         if pipes[j].readers == 0 {
                             self.raise_sigpipe(cx);
@@ -417,7 +417,7 @@ impl Kernel {
             let Fd::File { path, .. } = &f else {
                 return self.sys_writev(cx, fd, iov, iovcnt, mem);
             };
-            let mut vfs = self.vfs.lock().unwrap();
+            let mut vfs = self.vfs_for(cx);
             let eof = vfs.stat(path).map_or(0, |at| at.size);
             let n = self.sys_pwritev(&mut vfs, cx, fd, iov, iovcnt, eof, mem);
             if n >= 0
@@ -442,7 +442,7 @@ impl Kernel {
                 self.sys_readv(cx, fd, iov, iovcnt, mem)
             };
         }
-        let mut vfs = self.vfs.lock().unwrap();
+        let mut vfs = self.vfs_for(cx);
         if write {
             self.sys_pwritev(&mut vfs, cx, fd, iov, iovcnt, off as u64, mem)
         } else {
@@ -647,7 +647,12 @@ impl RestrictedWalk {
             if self.in_root {
                 anchor.clone()
             } else {
-                Vec::new()
+                // The task's own root, which `chroot` may have moved.
+                let root = vfs.join_root("/");
+                root.split('/')
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+                    .collect()
             }
         } else {
             anchor.clone()
@@ -690,7 +695,11 @@ impl RestrictedWalk {
                         cur = if self.in_root {
                             anchor.clone()
                         } else {
-                            Vec::new()
+                            let root = vfs.join_root("/");
+                            root.split('/')
+                                .filter(|c| !c.is_empty())
+                                .map(str::to_string)
+                                .collect()
                         };
                     }
                     todo.extend(comps(&target).into_iter().rev());

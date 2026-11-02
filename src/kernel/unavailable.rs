@@ -113,8 +113,7 @@ impl Kernel {
             Sysno::KexecLoad
             | Sysno::KexecFileLoad
             | Sysno::Swapon
-            | Sysno::Swapoff
-            | Sysno::PivotRoot => err(Errno::EPERM),
+            | Sysno::Swapoff => err(Errno::EPERM),
             // File handles: no backend can re-open a node from an opaque handle
             // (paths are the only identity), so — like a filesystem without
             // export support — `name_to_handle_at` is EOPNOTSUPP (systemd and

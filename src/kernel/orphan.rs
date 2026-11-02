@@ -117,7 +117,7 @@ impl Kernel {
         if self.orphans.lock().unwrap().is_empty() {
             return;
         }
-        let mut vfs = self.vfs.lock().unwrap();
+        let mut vfs = self.vfs_for(cx);
         self.reap_orphans(sh, cx, &mut vfs);
     }
 

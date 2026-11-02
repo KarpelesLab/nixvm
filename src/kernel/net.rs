@@ -364,6 +364,8 @@ struct Sock {
     /// The network namespace this socket was created in, for good: `setns` moves
     /// the task, not its sockets. Ports and abstract names are per namespace.
     netns: u32,
+    /// The routing key of the `AF_UNIX` name this socket is bound to.
+    unix_bound_key: Option<String>,
     domain: u16,
     kind: Kind,
     /// `SOCK_NONBLOCK` at creation time (there is no `fcntl(F_SETFL)` wiring
@@ -721,11 +723,11 @@ fn route_key(netns: u32, proto: &str, a: InetAddr) -> String {
 /// The routing key for an `AF_UNIX` name. Abstract names (leading NUL) belong to
 /// the network namespace. A path name is a file, so it's found through the
 /// filesystem whatever the namespace.
-fn unix_key(netns: u32, name: &str) -> String {
+fn unix_key(netns: u32, name: &str, identity: Option<&String>) -> String {
     if name.starts_with('\0') {
         format!("{netns}/{name}")
     } else {
-        name.to_string()
+        identity.map_or_else(|| name.to_string(), Clone::clone)
     }
 }
 
@@ -962,6 +964,7 @@ impl Kernel {
             let idx = net.socks.len();
             net.socks.push(Sock {
                 netns: cx.cur.ns.net,
+                unix_bound_key: None,
                 domain,
                 kind,
                 nonblock,
@@ -1007,6 +1010,7 @@ impl Kernel {
             let idx = net.socks.len();
             net.socks.push(Sock {
                 netns: cx.cur.ns.net,
+                unix_bound_key: None,
                 domain,
                 kind: Kind::Dgram(Dgram {
                     icmp: Some(icmp),
@@ -1034,6 +1038,7 @@ impl Kernel {
         let idx = net.socks.len();
         net.socks.push(Sock {
             netns: cx.cur.ns.net,
+            unix_bound_key: None,
             domain,
             kind,
             nonblock,
@@ -1077,6 +1082,7 @@ impl Kernel {
             for peer in [b, a] {
                 net.socks.push(Sock {
                     netns: cx.cur.ns.net,
+                    unix_bound_key: None,
                     domain: AF_UNIX,
                     kind: Kind::Dgram(Dgram {
                         pair_peer: Some(peer),
@@ -1094,6 +1100,7 @@ impl Kernel {
             let idx = net.socks.len();
             net.socks.push(Sock {
                 netns: cx.cur.ns.net,
+                unix_bound_key: None,
                 domain: AF_UNIX,
                 kind: Kind::Pair(pair),
                 nonblock,
@@ -1150,6 +1157,11 @@ impl Kernel {
                     return err(Errno::EINVAL);
                 }
                 let path = path.clone();
+                net.socks[sock].unix_bound_key = Some(unix_key(
+                    net.socks[sock].netns,
+                    &path,
+                    cx.unix_identity.as_ref(),
+                ));
                 match &mut net.socks[sock].kind {
                     Kind::Idle { bound } => {
                         *bound = Some(parsed);
@@ -1158,8 +1170,10 @@ impl Kernel {
                     // A datagram socket bound to a path receives datagrams sent to
                     // it (syslog's /dev/log, and unix-dgram IPC generally).
                     Kind::Dgram(_) => {
-                        net.dgram_paths
-                            .insert(unix_key(net.socks[sock].netns, &path), sock);
+                        net.dgram_paths.insert(
+                            unix_key(net.socks[sock].netns, &path, cx.unix_identity.as_ref()),
+                            sock,
+                        );
                         0
                     }
                     _ => err(Errno::EINVAL),
@@ -1225,7 +1239,12 @@ impl Kernel {
             }));
         }
         let key = match &bound {
-            Some(Addr::Unix(p)) => Some(unix_key(net.socks[sock].netns, p)),
+            Some(Addr::Unix(p)) => Some(
+                net.socks[sock]
+                    .unix_bound_key
+                    .clone()
+                    .unwrap_or_else(|| unix_key(net.socks[sock].netns, p, None)),
+            ),
             Some(Addr::Inet(a)) => Some(route_key(net.socks[sock].netns, "tcp", *a)),
             None => None,
         };
@@ -1338,7 +1357,7 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         let key = match &target {
-            Addr::Unix(p) => unix_key(net.socks[sock].netns, p),
+            Addr::Unix(p) => unix_key(net.socks[sock].netns, p, cx.unix_identity.as_ref()),
             Addr::Inet(a) => route_key(net.socks[sock].netns, "tcp", *a),
         };
         let Some(lidx) = net.pick_listener(&key) else {
@@ -2062,7 +2081,7 @@ impl Kernel {
                 if !matches!(net.socks[sock].kind, Kind::Dgram(_)) {
                     return err(Errno::EINVAL);
                 }
-                let key = unix_key(net.socks[sock].netns, &path);
+                let key = unix_key(net.socks[sock].netns, &path, cx.unix_identity.as_ref());
                 if let Some(&tgt) = net.dgram_paths.get(&key)
                     && let Kind::Dgram(td) = &mut net.socks[tgt].kind
                 {

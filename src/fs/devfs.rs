@@ -328,6 +328,10 @@ fn eagain() -> io::Error {
 }
 
 impl MountFs for DevFs {
+    fn fs_type(&self) -> &'static str {
+        "devtmpfs"
+    }
+
     fn read_only(&self) -> bool {
         false
     }

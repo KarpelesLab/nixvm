@@ -996,6 +996,7 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         let pid_parent = cx.cur.ns.pid_for_children;
+        let old_mnt = cx.cur.ns.mnt;
         if let Err(e) = sh.unshare_namespaces(cx, flags & (NS | CLONE_NEWUSER)) {
             return e;
         }
@@ -1004,6 +1005,19 @@ impl Kernel {
         {
             cx.cur.ns.pid_for_children = pid_parent;
             return e;
+        }
+        if cx.cur.ns.mnt != old_mnt {
+            let mut vfs = self.vfs.lock().unwrap();
+            if vfs.namespace_count() >= super::ns::MAX_MOUNT_NAMESPACES {
+                let tasks = sh.procs.iter().flatten().map(|p| p.info.ns.mnt);
+                let in_use: Vec<u32> = tasks.chain([old_mnt]).collect();
+                vfs.collect_namespaces(&in_use);
+            }
+            if vfs.namespace_count() >= super::ns::MAX_MOUNT_NAMESPACES {
+                cx.cur.ns.mnt = old_mnt;
+                return err(Errno::ENOSPC);
+            }
+            vfs.copy_namespace(old_mnt, cx.cur.ns.mnt);
         }
         // A private fd table: the shared slot (checked out into `cur.fds` for
         // this slice) gets a copy for the siblings; this task moves to a fresh

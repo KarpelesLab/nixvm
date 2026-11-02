@@ -883,6 +883,10 @@ fn attrs_of(m: &fs::Metadata) -> Attrs {
 }
 
 impl MountFs for Passthrough {
+    fn fs_type(&self) -> &'static str {
+        "bind"
+    }
+
     fn attach_disk_quota(&mut self, quota: &Arc<Quota>) {
         self.disk = quota.clone();
     }

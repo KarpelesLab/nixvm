@@ -35,7 +35,7 @@ pub mod tmpfs;
 pub use devfs::DevFs;
 #[cfg(feature = "fstool")]
 pub use fstoolfs::FsToolMount;
-pub use mount::MountTable;
+pub use mount::{MountEntry, MountTable, PivotMap};
 pub use overlay::Overlay;
 #[cfg(unix)]
 pub use passthrough::Passthrough;
@@ -116,6 +116,11 @@ pub trait MountFs: std::fmt::Debug + Send {
     /// Charge growth on the host's disk to `quota` from now on. A backend that
     /// doesn't write to the host doesn't need this.
     fn attach_disk_quota(&mut self, _quota: &std::sync::Arc<crate::limits::Quota>) {}
+
+    /// The filesystem's type name, as `/proc/self/mountinfo` shows it.
+    fn fs_type(&self) -> &'static str {
+        "tmpfs"
+    }
 
     fn read_only(&self) -> bool {
         true

@@ -55,7 +55,39 @@ impl Kernel {
             Some(_) => return err(Errno::ENOTDIR),
             None => return err(Errno::ENOENT),
         }
-        if flags & (MS_REMOUNT | MS_BIND | MS_MOVE | MS_PROPAGATION) != 0 {
+        const MS_RDONLY: u64 = 1;
+        const MS_REC: u64 = 0x4000;
+        if flags & MS_REMOUNT != 0 {
+            // A remount changes how the existing mount behaves: here, read-only.
+            return match vfs.set_read_only(&abs, flags & MS_RDONLY != 0) {
+                Ok(()) => 0,
+                Err(e) => io_errno(&e),
+            };
+        }
+        if flags & (MS_BIND | MS_MOVE) != 0 {
+            let Some(source) = read_path(mem, a[0]) else {
+                return err(Errno::EFAULT);
+            };
+            let source = match self.follow_or_eloop(vfs, &self.resolve_path(cx, AT_FDCWD, &source))
+            {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            if vfs.stat(&source).is_none() {
+                return err(Errno::ENOENT);
+            }
+            let moved = if flags & MS_BIND != 0 {
+                vfs.bind(&source, &abs, flags & MS_REC != 0)
+            } else {
+                vfs.move_mount(&source, &abs)
+            };
+            return match moved {
+                Ok(()) => 0,
+                Err(e) => io_errno(&e),
+            };
+        }
+        // Propagation: every mount here is private, so there's nothing to change.
+        if flags & MS_PROPAGATION != 0 {
             return 0;
         }
         let fstype = if fstype == 0 {
@@ -80,6 +112,115 @@ impl Kernel {
         0
     }
 
+    /// `chroot(path)`: make `path` this task's root. Later paths resolve below it,
+    /// including absolute symlinks, and `..` stops there. Root only.
+    pub(super) fn sys_chroot(
+        &self,
+        vfs: &mut MountTable,
+        cx: &mut ServiceCtx,
+        path: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        if cx.cur.creds.euid != 0 {
+            return err(Errno::EPERM);
+        }
+        let Some(rel) = read_path(mem, path) else {
+            return err(Errno::EFAULT);
+        };
+        let abs = match self.follow_or_eloop(vfs, &self.resolve_path(cx, AT_FDCWD, &rel)) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        match vfs.stat(&abs) {
+            Some(st) if st.kind == NodeKind::Dir => {
+                cx.cur.root = abs;
+                0
+            }
+            Some(_) => err(Errno::ENOTDIR),
+            None => err(Errno::ENOENT),
+        }
+    }
+
+    /// `pivot_root(new_root, put_old)`: swap the namespace's root. Paths the kernel
+    /// holds on the namespace's tasks' behalf (working directories, open files) are
+    /// names, not references, so they're rewritten to match.
+    pub(super) fn sys_pivot_root(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        new_root: u64,
+        put_old: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        if cx.cur.creds.euid != 0 {
+            return err(Errno::EPERM);
+        }
+        // From inside a chroot this isn't allowed, as on Linux.
+        if cx.cur.root != "/" || cx.cur.ns.mnt == 0 {
+            return err(Errno::EINVAL);
+        }
+        let (Some(new_root), Some(put_old)) = (read_path(mem, new_root), read_path(mem, put_old))
+        else {
+            return err(Errno::EFAULT);
+        };
+        let mut vfs = self.vfs_for(cx);
+        let follow = |this: &Self, vfs: &mut MountTable, p: &str| {
+            this.follow_or_eloop(vfs, &this.resolve_path(cx, AT_FDCWD, p))
+        };
+        let new_root = match follow(self, &mut vfs, &new_root) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let put_old = match follow(self, &mut vfs, &put_old) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        for dir in [&new_root, &put_old] {
+            match vfs.stat(dir) {
+                Some(st) if st.kind == NodeKind::Dir => {}
+                Some(_) => return err(Errno::ENOTDIR),
+                None => return err(Errno::ENOENT),
+            }
+        }
+        let map = match vfs.pivot_root(&new_root, &put_old) {
+            Ok(map) => map,
+            Err(e) => return io_errno(&e),
+        };
+        drop(vfs);
+        let ns = cx.cur.ns.mnt;
+        // A working directory at the old root moves to the new one rather than with
+        // the old root, which is what makes `pivot_root(".", ".")` usable.
+        let moved = |path: &str| {
+            if path == "/" {
+                "/".to_string()
+            } else {
+                map.translate(path)
+            }
+        };
+        cx.cur.cwd = moved(&cx.cur.cwd);
+        cx.cur.exe = map.translate(&cx.cur.exe);
+        cx.cur.fds.rewrite_paths(&|p| map.translate(p));
+        let (mut files, mut cwds) = (Vec::new(), Vec::new());
+        for p in sh.procs.iter_mut().flatten() {
+            if p.info.ns.mnt == ns {
+                p.info.exe = map.translate(&p.info.exe);
+                files.push(p.info.files);
+                cwds.push(p.info.fs);
+            }
+        }
+        for f in files {
+            if let Some(Some(table)) = sh.file_tables.get_mut(f) {
+                table.rewrite_paths(&|p| map.translate(p));
+            }
+        }
+        for c in cwds {
+            if let Some(Some(cwd)) = sh.cwd_tables.get_mut(c) {
+                *cwd = moved(cwd);
+            }
+        }
+        0
+    }
+
     /// `umount2(target, flags)`: remove a mount made with `mount(2)`; the
     /// VM's own mounts are busy (`EBUSY`), a non-mount-point `EINVAL`.
     pub(super) fn sys_umount2(
@@ -101,7 +242,8 @@ impl Kernel {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(cx, AT_FDCWD, &rel);
-        match vfs.unmount(&abs) {
+        const MNT_DETACH: u64 = 2;
+        match vfs.unmount(&abs, flags & MNT_DETACH != 0) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
         }
@@ -162,13 +304,18 @@ impl Kernel {
         // `/proc/self/{exe,cwd,root}` resolve to *live* per-task state, not
         // procfs's static snapshot — programs read these to locate themselves.
         match tail {
-            "exe" => return (!cx.cur.exe.is_empty()).then(|| cx.cur.exe.clone()),
-            "cwd" => return Some(cx.cur.cwd.clone()),
+            "exe" => {
+                return (!cx.cur.exe.is_empty()).then(|| Self::as_seen_from_root(cx, &cx.cur.exe));
+            }
+            "cwd" => return Some(Self::as_seen_from_root(cx, &cx.cur.cwd)),
             "root" => return Some("/".to_string()),
             _ => {}
         }
         let n: i32 = tail.strip_prefix("fd/")?.parse().ok()?;
-        Some(fd_link_target(cx.cur.fds.get(n)?))
+        Some(Self::as_seen_from_root(
+            cx,
+            &fd_link_target(cx.cur.fds.get(n)?),
+        ))
     }
 
     /// Build the live `/proc/self` view (comm, cmdline, exe, cwd, pid/ppid, open
@@ -180,13 +327,14 @@ impl Kernel {
             .cur
             .fds
             .iter()
-            .map(|(n, fd)| (n as u32, fd_link_target(fd)))
+            .map(|(n, fd)| (n as u32, Self::as_seen_from_root(cx, &fd_link_target(fd))))
             .collect();
         crate::fs::ProcSelf {
+            mounts: Vec::new(),
             comm: cx.cur.comm.clone(),
             cmdline: cx.cur.cmdline.clone(),
-            exe: cx.cur.exe.clone(),
-            cwd: cx.cur.cwd.clone(),
+            exe: Self::as_seen_from_root(cx, &cx.cur.exe),
+            cwd: Self::as_seen_from_root(cx, &cx.cur.cwd),
             pid: self.visible_pid(cx, cx.cur.tgid) as u32,
             ppid: self.visible_pid(cx, cx.cur.ppid) as u32,
             fds,

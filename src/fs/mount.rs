@@ -1,6 +1,8 @@
 //! The mount table: composes [`MountFs`] backends by longest-prefix match.
 
+use std::collections::BTreeMap;
 use std::io;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::{Attrs, DirEntry, MountFs, NodeKind};
 
@@ -8,27 +10,77 @@ use super::{Attrs, DirEntry, MountFs, NodeKind};
 /// `MAXSYMLINKS`).
 const SYMLINK_MAX: usize = 40;
 
+#[derive(Clone)]
 struct Mount {
     /// Absolute mount point, e.g. "/", "/work", "/proc".
     point: String,
-    fs: Box<dyn MountFs>,
-    /// Mounted at runtime by the guest (`mount(2)`), so `umount(2)` may
+    /// The filesystem, which a bind mount or another namespace's copy of this
+    /// mount shares.
+    fs: Arc<Mutex<Box<dyn MountFs>>>,
+    /// Where in that filesystem this mount starts: empty for its root, and the
+    /// source directory (or file) of a bind mount.
+    subdir: String,
+    /// Mounted at runtime by the guest (`mount(2)`), so `umount(2)` can
     /// remove it; the embedder's mounts are permanent.
     guest: bool,
+    /// Writes through this mount fail with `EROFS`.
+    read_only: bool,
+    /// Which pivot this mount was the old root's side of, 0 if none. After
+    /// `pivot_root(".", ".")` an old root is stacked on the new one, and detaching
+    /// it must take only its own mounts.
+    pivot_side: u32,
 }
 
 impl std::fmt::Debug for Mount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Mount")
             .field("point", &self.point)
+            .field("subdir", &self.subdir)
+            .field("guest", &self.guest)
+            .field("read_only", &self.read_only)
             .finish_non_exhaustive()
+    }
+}
+
+impl Mount {
+    fn new(point: String, fs: Box<dyn MountFs>, guest: bool) -> Self {
+        Self {
+            point,
+            fs: Arc::new(Mutex::new(fs)),
+            subdir: String::new(),
+            guest,
+            read_only: false,
+            pivot_side: 0,
+        }
+    }
+
+    /// The path in this mount's filesystem of `rel`, a path below its mount point.
+    fn fs_path(&self, rel: &str) -> String {
+        match (self.subdir.is_empty(), rel.is_empty()) {
+            (true, _) => rel.to_string(),
+            (false, true) => self.subdir.clone(),
+            (false, false) => format!("{}/{rel}", self.subdir),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Box<dyn MountFs>> {
+        self.fs.lock().unwrap()
     }
 }
 
 /// Resolves guest paths across a set of mounted backends.
 #[derive(Debug, Default)]
 pub struct MountTable {
+    /// The mounts of the namespace in [`Self::current`]. Another namespace's are
+    /// parked in [`Self::parked`], and swapped in by [`Self::enter`].
     mounts: Vec<Mount>,
+    current: u32,
+    parked: BTreeMap<u32, Vec<Mount>>,
+    /// The caller's root directory (`chroot`), which absolute symlinks resolve
+    /// against and `..` can't climb above. Empty means `/`.
+    root: String,
+    /// How many times `pivot_root` has run, to label each one's old mounts.
+    pivots: u32,
     /// What every mounted filesystem charges its in-memory contents to.
     quota: Option<std::sync::Arc<crate::limits::Quota>>,
     /// What every mounted filesystem charges growth on the host's disk to.
@@ -41,11 +93,213 @@ impl MountTable {
         Self::default()
     }
 
+    /// Answer calls from here on for a task in mount namespace `ns` whose root
+    /// directory is `root`. Cheap when nothing changes, as it almost never does.
+    pub fn enter(&mut self, ns: u32, root: &str) {
+        if self.current != ns {
+            let incoming = self.parked.remove(&ns).unwrap_or_default();
+            let outgoing = std::mem::replace(&mut self.mounts, incoming);
+            self.parked.insert(self.current, outgoing);
+            self.current = ns;
+        }
+        let root = if root == "/" { "" } else { root };
+        if self.root != root {
+            root.clone_into(&mut self.root);
+        }
+    }
+
+    /// Start mount namespace `new` as a copy of `from`. The two share filesystems,
+    /// but mounting or unmounting in one no longer shows in the other.
+    pub fn copy_namespace(&mut self, from: u32, new: u32) {
+        let copy = if from == self.current {
+            self.mounts.clone()
+        } else {
+            self.parked.get(&from).cloned().unwrap_or_default()
+        };
+        self.parked.insert(new, copy);
+    }
+
+    /// Forget the mounts of namespaces not in `in_use`.
+    pub fn collect_namespaces(&mut self, in_use: &[u32]) {
+        self.parked.retain(|ns, _| *ns == 0 || in_use.contains(ns));
+    }
+
+    /// How many mount namespaces exist.
+    #[must_use]
+    pub fn namespace_count(&self) -> usize {
+        self.parked.len() + 1
+    }
+
+    /// Bind `source` (a directory or file, as seen now) onto `target`. With
+    /// `recursive`, mounts below `source` come along, as `MS_REC` asks.
+    pub fn bind(&mut self, source: &str, target: &str, recursive: bool) -> io::Result<()> {
+        let source = self.canonical(source);
+        let target = normalize(target);
+        let i = self.best_mount(&source).ok_or_else(enoent)?;
+        let mut new = vec![Mount {
+            point: target.clone(),
+            subdir: self.mounts[i].fs_path(&relative_to(&source, &self.mounts[i].point)),
+            guest: true,
+            ..self.mounts[i].clone()
+        }];
+        if recursive {
+            for m in &self.mounts {
+                if m.point != source && path_has_prefix(&m.point, &source) {
+                    new.push(Mount {
+                        point: normalize(&format!("{target}/{}", relative_to(&m.point, &source))),
+                        guest: true,
+                        ..m.clone()
+                    });
+                }
+            }
+        }
+        self.mounts.extend(new);
+        Ok(())
+    }
+
+    /// Move the mount at `from`, and any below it, to `to` (`MS_MOVE`).
+    pub fn move_mount(&mut self, from: &str, to: &str) -> io::Result<()> {
+        let from = normalize(from);
+        let to = normalize(to);
+        if !self.mounts.iter().any(|m| m.point == from) {
+            return Err(einval());
+        }
+        for m in &mut self.mounts {
+            if path_has_prefix(&m.point, &from) {
+                m.point = normalize(&format!("{to}/{}", relative_to(&m.point, &from)));
+            }
+        }
+        Ok(())
+    }
+
+    /// Set whether writes through the mount at `point` are refused.
+    pub fn set_read_only(&mut self, point: &str, read_only: bool) -> io::Result<()> {
+        let point = normalize(point);
+        let m = self.mounts.iter_mut().rfind(|m| m.point == point);
+        m.ok_or_else(einval)?.read_only = read_only;
+        Ok(())
+    }
+
+    /// Whether a mount sits at exactly `point`.
+    #[must_use]
+    pub fn is_mount_point(&self, point: &str) -> bool {
+        let point = normalize(point);
+        self.mounts.iter().any(|m| m.point == point)
+    }
+
+    /// `pivot_root`: make `new_root` the root, moving the old root to `put_old`
+    /// (which must be at or below `new_root`). Every path in this namespace's view
+    /// changes; returns how to translate one, for the kernel's own stored paths.
+    pub fn pivot_root(&mut self, new_root: &str, put_old: &str) -> io::Result<PivotMap> {
+        let new_root = normalize(new_root);
+        let put_old = normalize(put_old);
+        if !self.is_mount_point(&new_root)
+            || !path_has_prefix(&put_old, &new_root)
+            || new_root == "/"
+        {
+            return Err(einval());
+        }
+        let map = PivotMap {
+            new_root: new_root.clone(),
+            put_old: normalize(&format!("/{}", relative_to(&put_old, &new_root))),
+        };
+        self.pivots += 1;
+        let (mut kept, mut old): (Vec<Mount>, Vec<Mount>) = std::mem::take(&mut self.mounts)
+            .into_iter()
+            .partition(|m| path_has_prefix(&m.point, &new_root));
+        for m in &mut old {
+            m.pivot_side = self.pivots;
+        }
+        // The old root goes on top, which is what "pivot_root(".", ".")" relies on.
+        kept.append(&mut old);
+        self.mounts = kept;
+        for m in &mut self.mounts {
+            m.point = map.translate(&m.point);
+        }
+        Ok(map)
+    }
+
+    /// The mounts as `/proc/self/mountinfo` shows them to a task with the current
+    /// root.
+    #[must_use]
+    pub fn listing(&self) -> Vec<MountEntry> {
+        self.mounts
+            .iter()
+            .filter(|m| self.root.is_empty() || path_has_prefix(&m.point, &self.root))
+            .map(|m| MountEntry {
+                point: if self.root.is_empty() {
+                    m.point.clone()
+                } else {
+                    normalize(&format!("/{}", relative_to(&m.point, &self.root)))
+                },
+                subdir: m.subdir.clone(),
+                read_only: m.read_only,
+                fs_type: m.lock().fs_type().to_string(),
+            })
+            .collect()
+    }
+
+    /// A name for what `abs_path` refers to whichever namespace is looking: the
+    /// filesystem and the path inside it. Two paths with the same identity are the
+    /// same file, however they're mounted.
+    pub fn identity(&mut self, abs_path: &str) -> String {
+        let abs_path = self.canonical(abs_path);
+        match self.best_mount(&abs_path) {
+            Some(i) => {
+                let m = &self.mounts[i];
+                let fs = Arc::as_ptr(&m.fs).cast::<()>() as usize;
+                format!("{fs:x}:{}", m.fs_path(&relative_to(&abs_path, &m.point)))
+            }
+            None => abs_path,
+        }
+    }
+
+    /// Run `f` on each mounted procfs, so the kernel can refresh its live
+    /// per-process data before serving a `/proc` read.
+    pub fn with_procfs(&mut self, mut f: impl FnMut(&mut super::ProcFs)) {
+        for m in &self.mounts {
+            if let Some(procfs) = m.lock().as_procfs_mut() {
+                f(procfs);
+            }
+        }
+    }
+
+    /// Relative symlink `target`, found in directory `dir`. Worked out from inside
+    /// the caller's root, so however many `..` it has, it can't climb out.
+    #[must_use]
+    pub fn join_relative(&self, dir: &str, target: &str) -> String {
+        match dir.strip_prefix(self.root.as_str()) {
+            Some(inside) if !self.root.is_empty() => self.join_root(&format!("{inside}/{target}")),
+            _ => normalize(&format!("{dir}/{target}")),
+        }
+    }
+
+    /// `abs_path`, read from the caller's root (`chroot`), in the namespace's terms.
+    #[must_use]
+    pub fn join_root(&self, abs_path: &str) -> String {
+        normalize(&format!("{}/{}", self.root, normalize(abs_path)))
+    }
+
+    /// The mount owning `abs_path` and its path in that mount's filesystem, for a
+    /// call that changes something: fails `EROFS` on a read-only mount.
+    fn resolve_for_write(
+        &mut self,
+        abs_path: &str,
+    ) -> io::Result<(MutexGuard<'_, Box<dyn MountFs>>, String)> {
+        let abs_path = self.canonical(abs_path);
+        let i = self.best_mount(&abs_path).ok_or_else(enoent)?;
+        if self.mounts[i].read_only {
+            return Err(io::Error::from_raw_os_error(30)); // EROFS
+        }
+        let rel = self.mounts[i].fs_path(&relative_to(&abs_path, &self.mounts[i].point));
+        Ok((self.mounts[i].lock(), rel))
+    }
+
     /// Charge every filesystem's in-memory contents to `quota`, now and for
     /// anything mounted later.
     pub fn attach_quota(&mut self, quota: &std::sync::Arc<crate::limits::Quota>) {
-        for mount in &mut self.mounts {
-            mount.fs.attach_quota(quota);
+        for mount in &self.mounts {
+            mount.lock().attach_quota(quota);
         }
         self.quota = Some(quota.clone());
     }
@@ -53,8 +307,8 @@ impl MountTable {
     /// Charge every filesystem's growth on the host's disk to `quota`, now and for
     /// anything mounted later.
     pub fn attach_disk_quota(&mut self, quota: &std::sync::Arc<crate::limits::Quota>) {
-        for mount in &mut self.mounts {
-            mount.fs.attach_disk_quota(quota);
+        for mount in &self.mounts {
+            mount.lock().attach_disk_quota(quota);
         }
         self.disk_quota = Some(quota.clone());
     }
@@ -72,11 +326,8 @@ impl MountTable {
         if let Some(quota) = &self.disk_quota {
             fs.attach_disk_quota(quota);
         }
-        self.mounts.push(Mount {
-            point: normalize(&point.into()),
-            fs,
-            guest: false,
-        });
+        self.mounts
+            .push(Mount::new(normalize(&point.into()), fs, false));
     }
 
     /// Mount `fs` at `point` on the guest's behalf (`mount(2)`); it stacks
@@ -88,26 +339,40 @@ impl MountTable {
         if let Some(quota) = &self.disk_quota {
             fs.attach_disk_quota(quota);
         }
-        self.mounts.push(Mount {
-            point: normalize(point),
-            fs,
-            guest: true,
-        });
+        self.mounts.push(Mount::new(normalize(point), fs, true));
     }
 
     /// Remove the most recent mount at exactly `point`: `Ok` if a guest mount
     /// went, `EBUSY` for one of the embedder's (the VM's own /proc, /dev, …),
     /// `EINVAL` if nothing is mounted there.
-    pub fn unmount(&mut self, point: &str) -> io::Result<()> {
+    pub fn unmount(&mut self, point: &str, detach: bool) -> io::Result<()> {
         let point = normalize(point);
-        match self.mounts.iter().rposition(|m| m.point == point) {
-            Some(i) if self.mounts[i].guest => {
-                self.mounts.remove(i);
-                Ok(())
-            }
-            Some(_) => Err(io::Error::from_raw_os_error(16)), // EBUSY
-            None => Err(io::Error::from_raw_os_error(22)),    // EINVAL
+        let Some(i) = self.mounts.iter().rposition(|m| m.point == point) else {
+            return Err(einval());
+        };
+        // Outside the initial namespace nothing is the VM's own: a container that
+        // pivoted away from its old root drops those mounts like any other.
+        if !self.mounts[i].guest && self.current == 0 {
+            return Err(io::Error::from_raw_os_error(16)); // EBUSY
         }
+        let side = self.mounts[i].pivot_side;
+        let has_children = self
+            .mounts
+            .iter()
+            .any(|m| m.point != point && m.pivot_side == side && path_has_prefix(&m.point, &point));
+        if has_children && !detach {
+            return Err(io::Error::from_raw_os_error(16)); // EBUSY
+        }
+        let gone = self.mounts.remove(i);
+        // A detach takes whatever is mounted below it too.
+        if detach {
+            self.mounts.retain(|m| {
+                !path_has_prefix(&m.point, &point)
+                    || m.point == point
+                    || m.pivot_side != gone.pivot_side
+            });
+        }
+        Ok(())
     }
 
     /// Index of the longest-prefix mount owning `abs_path`.
@@ -142,11 +407,11 @@ impl MountTable {
     /// `stat("/dev")`) resolves to the backend's root (empty relative path),
     /// and equivalent spellings of a path (`/a/./b`, `/a//b`, `/a/x/../b`)
     /// all resolve to the same `(backend, relative path)` pair.
-    fn resolve(&mut self, abs_path: &str) -> Option<(&mut dyn MountFs, String)> {
+    fn resolve(&mut self, abs_path: &str) -> Option<(MutexGuard<'_, Box<dyn MountFs>>, String)> {
         let abs_path = self.canonical(abs_path);
         let i = self.best_mount(&abs_path)?;
-        let rel = relative_to(&abs_path, &self.mounts[i].point);
-        Some((self.mounts[i].fs.as_mut(), rel))
+        let rel = self.mounts[i].fs_path(&relative_to(&abs_path, &self.mounts[i].point));
+        Some((self.mounts[i].lock(), rel))
     }
 
     /// `abs_path` with its final component's symlink chain followed — inside
@@ -160,10 +425,10 @@ impl MountTable {
                 Some(a) if a.kind == NodeKind::Symlink => {
                     let target = self.readlink(&p).ok()?;
                     p = if target.starts_with('/') {
-                        normalize(&target)
+                        self.join_root(&target)
                     } else {
                         let dir = p.rfind('/').map_or("", |i| &p[..i]);
-                        normalize(&format!("{dir}/{target}"))
+                        self.join_relative(dir, &target)
                     };
                 }
                 _ => return Some(p),
@@ -177,7 +442,10 @@ impl MountTable {
     pub fn read_file(&mut self, abs_path: &str) -> Option<Vec<u8>> {
         let path = self.follow(abs_path)?;
         let size = self.stat(&path)?.size as usize;
-        let mut buf = vec![0u8; size];
+        // A sparse file can claim any size at all.
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(size).ok()?;
+        buf.resize(size, 0);
         let mut off = 0;
         while off < size {
             match self.read_at(&path, off as u64, &mut buf[off..]) {
@@ -191,15 +459,15 @@ impl MountTable {
     }
 
     pub fn stat(&mut self, abs_path: &str) -> Option<Attrs> {
-        let (fs, rel) = self.resolve(abs_path)?;
+        let (mut fs, rel) = self.resolve(abs_path)?;
         fs.stat(&rel)
     }
 
     /// `stat` of an already-canonical path, without resolving symlinks.
     fn stat_raw(&mut self, abs_path: &str) -> Option<Attrs> {
         let i = self.best_mount(abs_path)?;
-        let rel = relative_to(abs_path, &self.mounts[i].point);
-        self.mounts[i].fs.stat(&rel)
+        let rel = self.mounts[i].fs_path(&relative_to(abs_path, &self.mounts[i].point));
+        self.mounts[i].lock().stat(&rel)
     }
 
     /// `abs_path`, normalized, with every symlink among its directories
@@ -234,7 +502,10 @@ impl MountTable {
                 continue;
             }
             if c == ".." {
-                done.truncate(done.rfind('/').unwrap_or(0));
+                // `..` stops at the root, wherever that's been moved to.
+                if done.len() > self.root.len() {
+                    done.truncate(done.rfind('/').unwrap_or(0));
+                }
                 continue;
             }
             let cand = format!("{done}/{c}");
@@ -248,15 +519,17 @@ impl MountTable {
                     let Some(target) = (hops <= SYMLINK_MAX)
                         .then(|| {
                             let i = self.best_mount(&cand)?;
-                            let rel = relative_to(&cand, &self.mounts[i].point);
-                            self.mounts[i].fs.readlink(&rel).ok()
+                            let m = &self.mounts[i];
+                            let rel = m.fs_path(&relative_to(&cand, &m.point));
+                            m.lock().readlink(&rel).ok()
                         })
                         .flatten()
                     else {
                         return path;
                     };
                     if target.starts_with('/') {
-                        done.clear();
+                        // Absolute: from the caller's root, not the namespace's.
+                        done.clone_from(&self.root);
                     }
                     rest.extend(
                         target
@@ -286,15 +559,8 @@ impl MountTable {
         }
     }
 
-    /// The mounted procfs backend, if one is mounted, so the kernel can refresh
-    /// its live per-process data before serving a `/proc` read. `None` when no
-    /// procfs is mounted (e.g. minimal test harnesses).
-    pub fn procfs_mut(&mut self) -> Option<&mut super::ProcFs> {
-        self.mounts.iter_mut().find_map(|m| m.fs.as_procfs_mut())
-    }
-
     pub fn read_at(&mut self, abs_path: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
         fs.read_at(&rel, off, buf)
     }
 
@@ -308,42 +574,42 @@ impl MountTable {
     /// is a separate mount — cross-mount directory-listing merge isn't
     /// modeled at this layer.
     pub fn readdir(&mut self, abs_path: &str) -> io::Result<Vec<DirEntry>> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
         fs.readdir(&rel)
     }
 
     pub fn write_at(&mut self, abs_path: &str, off: u64, buf: &[u8]) -> io::Result<usize> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
         fs.write_at(&rel, off, buf)
     }
 
     pub fn create(&mut self, abs_path: &str, mode: u32) -> io::Result<()> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
         fs.create(&rel, mode)
     }
 
     pub fn mkdir(&mut self, abs_path: &str, mode: u32) -> io::Result<()> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
         fs.mkdir(&rel, mode)
     }
 
     pub fn mknod(&mut self, abs_path: &str, mode: u32) -> io::Result<()> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
         fs.mknod(&rel, mode)
     }
 
     pub fn unlink(&mut self, abs_path: &str) -> io::Result<()> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
         fs.unlink(&rel)
     }
 
     pub fn rmdir(&mut self, abs_path: &str) -> io::Result<()> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
         fs.rmdir(&rel)
     }
 
     pub fn truncate(&mut self, abs_path: &str, len: u64) -> io::Result<()> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
         fs.truncate(&rel, len)
     }
 
@@ -353,7 +619,7 @@ impl MountTable {
         atime: super::SetTime,
         mtime: super::SetTime,
     ) -> io::Result<()> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
         fs.set_times(&rel, atime, mtime)
     }
 
@@ -363,23 +629,23 @@ impl MountTable {
         uid: Option<u32>,
         gid: Option<u32>,
     ) -> io::Result<()> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
         fs.set_owner(&rel, uid, gid)
     }
 
     pub fn set_mode(&mut self, abs_path: &str, mode: u32) -> io::Result<()> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
         fs.set_mode(&rel, mode)
     }
 
     pub fn readlink(&mut self, abs_path: &str) -> io::Result<String> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
         fs.readlink(&rel)
     }
 
     /// Create a symlink at `abs_link` pointing at `target` (stored verbatim).
     pub fn symlink(&mut self, target: &str, abs_link: &str) -> io::Result<()> {
-        let (fs, rel) = self.resolve(abs_link).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve_for_write(abs_link)?;
         fs.symlink(target, &rel)
     }
 
@@ -396,25 +662,25 @@ impl MountTable {
     /// [`MountFs::getxattr`]). Like the other per-node operations the final
     /// component is not followed — the kernel decides follow vs. no-follow.
     pub fn getxattr(&mut self, abs_path: &str, name: &str) -> io::Result<Vec<u8>> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
         fs.getxattr(&rel, name)
     }
 
     /// Set extended attribute `name` on the node at `abs_path`.
     pub fn setxattr(&mut self, abs_path: &str, name: &str, value: &[u8]) -> io::Result<()> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
         fs.setxattr(&rel, name, value)
     }
 
     /// Every extended-attribute name on the node at `abs_path`.
     pub fn listxattr(&mut self, abs_path: &str) -> io::Result<Vec<String>> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
         fs.listxattr(&rel)
     }
 
     /// Remove extended attribute `name` from the node at `abs_path`.
     pub fn removexattr(&mut self, abs_path: &str, name: &str) -> io::Result<()> {
-        let (fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
         fs.removexattr(&rel, name)
     }
 
@@ -427,10 +693,13 @@ impl MountTable {
         if from_idx != to_idx {
             return Err(io::Error::from_raw_os_error(18)); // EXDEV
         }
-        let point = self.mounts[from_idx].point.clone();
-        let from_rel = relative_to(&from, &point);
-        let to_rel = relative_to(&to, &point);
-        self.mounts[from_idx].fs.rename(&from_rel, &to_rel)
+        let m = &self.mounts[from_idx];
+        if m.read_only {
+            return Err(io::Error::from_raw_os_error(30)); // EROFS
+        }
+        let from_rel = m.fs_path(&relative_to(&from, &m.point));
+        let to_rel = m.fs_path(&relative_to(&to, &m.point));
+        m.lock().rename(&from_rel, &to_rel)
     }
 
     /// Hard-link `new` to the existing `old` within a single backend. Returns
@@ -446,15 +715,50 @@ impl MountTable {
         if old_idx != new_idx {
             return Err(io::Error::from_raw_os_error(18)); // EXDEV, as Linux
         }
-        let point = self.mounts[old_idx].point.clone();
-        let old_rel = relative_to(&old, &point);
-        let new_rel = relative_to(&new, &point);
-        self.mounts[old_idx].fs.link(&old_rel, &new_rel)
+        let m = &self.mounts[old_idx];
+        if m.read_only {
+            return Err(io::Error::from_raw_os_error(30)); // EROFS
+        }
+        let old_rel = m.fs_path(&relative_to(&old, &m.point));
+        let new_rel = m.fs_path(&relative_to(&new, &m.point));
+        m.lock().link(&old_rel, &new_rel)
     }
 }
 
 fn enoent() -> io::Error {
     io::Error::from_raw_os_error(2)
+}
+
+fn einval() -> io::Error {
+    io::Error::from_raw_os_error(22)
+}
+
+/// One mount, for `/proc/self/mountinfo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountEntry {
+    pub point: String,
+    pub subdir: String,
+    pub read_only: bool,
+    pub fs_type: String,
+}
+
+/// How paths change across a [`MountTable::pivot_root`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PivotMap {
+    new_root: String,
+    put_old: String,
+}
+
+impl PivotMap {
+    /// Where `path`, from before the pivot, is now.
+    #[must_use]
+    pub fn translate(&self, path: &str) -> String {
+        if path_has_prefix(path, &self.new_root) {
+            normalize(&format!("/{}", relative_to(path, &self.new_root)))
+        } else {
+            normalize(&format!("{}/{}", self.put_old, path))
+        }
+    }
 }
 
 /// Normalize an absolute guest path into a clean `/a/b/c` form.
@@ -526,6 +830,113 @@ fn relative_to(path: &str, mp: &str) -> String {
 mod tests {
     use super::*;
     use crate::fs::NodeKind;
+
+    fn table_with_tmpfs_root() -> MountTable {
+        let mut t = MountTable::new();
+        t.mount("/", Box::new(crate::fs::TmpFs::new()));
+        t.mkdir("/a", 0o755).unwrap();
+        t.mkdir("/b", 0o755).unwrap();
+        t
+    }
+
+    #[test]
+    fn a_copied_namespace_shares_files_but_not_mounts() {
+        let mut t = table_with_tmpfs_root();
+        t.copy_namespace(0, 1);
+        t.enter(1, "/");
+        t.mount_guest("/a", Box::new(crate::fs::TmpFs::new()));
+        t.create("/a/inner", 0o644).unwrap();
+        t.create("/shared", 0o644).unwrap();
+        t.enter(0, "/");
+        assert!(
+            t.stat("/a/inner").is_none(),
+            "the mount stayed in namespace 1"
+        );
+        assert!(
+            t.stat("/shared").is_some(),
+            "the root filesystem is the same one"
+        );
+        t.enter(1, "/");
+        assert!(t.stat("/a/inner").is_some());
+    }
+
+    #[test]
+    fn a_bind_mount_is_the_same_files_and_can_be_read_only() {
+        let mut t = table_with_tmpfs_root();
+        t.create("/a/f", 0o644).unwrap();
+        t.bind("/a", "/b", false).unwrap();
+        assert!(t.stat("/b/f").is_some());
+        t.create("/b/g", 0o644).unwrap();
+        assert!(t.stat("/a/g").is_some());
+        t.set_read_only("/b", true).unwrap();
+        let erofs = |r: io::Result<()>| r.unwrap_err().raw_os_error() == Some(30);
+        assert!(erofs(t.create("/b/h", 0o644)));
+        assert!(erofs(t.unlink("/b/f")));
+        assert!(erofs(t.mkdir("/b/d", 0o755)));
+        assert!(erofs(t.rename("/b/f", "/b/f2")));
+        t.create("/a/h", 0o644).unwrap();
+        assert!(
+            t.stat("/b/h").is_some(),
+            "read-only is the mount's, not the file's"
+        );
+    }
+
+    #[test]
+    fn identity_sees_through_bind_mounts_and_tells_mounts_apart() {
+        let mut t = table_with_tmpfs_root();
+        t.bind("/a", "/b", false).unwrap();
+        assert_eq!(t.identity("/a/sock"), t.identity("/b/sock"));
+        t.mount_guest("/a", Box::new(crate::fs::TmpFs::new()));
+        assert_ne!(t.identity("/a/sock"), t.identity("/b/sock"));
+    }
+
+    #[test]
+    fn pivot_root_rewrites_the_view_and_detaching_takes_the_old_root() {
+        let mut t = table_with_tmpfs_root();
+        t.copy_namespace(0, 1);
+        t.enter(1, "/");
+        t.mount_guest("/a", Box::new(crate::fs::TmpFs::new()));
+        t.mkdir("/a/old", 0o755).unwrap();
+        t.create("/a/mark", 0o644).unwrap();
+        assert!(t.pivot_root("/b", "/b").is_err(), "not a mount point");
+        let map = t.pivot_root("/a", "/a/old").unwrap();
+        assert_eq!(map.translate("/a/mark"), "/mark");
+        assert_eq!(map.translate("/b"), "/old/b");
+        assert!(t.stat("/mark").is_some());
+        assert!(t.stat("/old/b").is_some());
+        t.unmount("/old", true).unwrap();
+        assert!(t.stat("/old/b").is_none());
+    }
+
+    #[test]
+    fn a_chroot_holds_for_symlinks_and_dot_dot() {
+        let mut t = table_with_tmpfs_root();
+        t.mkdir("/a/in", 0o755).unwrap();
+        t.create("/a/in/f", 0o644).unwrap();
+        t.create("/secret", 0o644).unwrap();
+        t.symlink("/in", "/a/abs").unwrap();
+        t.symlink("../../secret", "/a/in/esc").unwrap();
+        t.enter(0, "/a");
+        assert_eq!(t.join_root("/in"), "/a/in");
+        assert_eq!(t.follow("/a/abs").unwrap(), "/a/in");
+        assert!(
+            t.stat("/a/abs/f").is_some(),
+            "an absolute link stays inside"
+        );
+        let climbed = t.follow("/a/in/esc").unwrap();
+        assert_ne!(climbed, "/secret");
+    }
+
+    #[test]
+    fn only_the_initial_namespace_keeps_the_vms_own_mounts() {
+        let mut t = table_with_tmpfs_root();
+        assert_eq!(t.unmount("/", false).unwrap_err().raw_os_error(), Some(16));
+        t.copy_namespace(0, 1);
+        t.enter(1, "/");
+        t.unmount("/", false).unwrap();
+        t.enter(0, "/");
+        assert!(t.stat("/a").is_some());
+    }
 
     #[test]
     fn longest_prefix_and_relative() {

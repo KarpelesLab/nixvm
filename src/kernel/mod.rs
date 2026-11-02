@@ -311,6 +311,8 @@ struct ProcInfo {
     rlimits: RLimits,
     /// The namespaces this task is in.
     ns: ns::NsProxy,
+    /// This task's root directory (`chroot`), in its mount namespace's terms.
+    root: String,
     /// Alternate signal stack (`sigaltstack`): `(base, size, flags)`. A handler
     /// registered `SA_ONSTACK` runs here instead of the interrupted stack —
     /// which is exactly how a runtime catches its own stack-overflow fault.
@@ -528,6 +530,7 @@ impl Default for ProcInfo {
             handlers: SigHand::default(),
             rlimits: RLimits::default(),
             ns: ns::NsProxy::default(),
+            root: "/".to_string(),
             altstack: (0, 0, SS_DISABLE),
             blocked: 0,
             pending: 0,
@@ -1306,6 +1309,9 @@ pub(super) struct ServiceCtx {
     restart_syscall: bool,
     /// `MSG_DONTWAIT` on the send being serviced: don't park if it doesn't fit.
     dontwait: bool,
+    /// What the `AF_UNIX` path in the socket call being serviced refers to (see
+    /// [`MountTable::identity`]). Worked out first, since `vfs` sorts before `net`.
+    unix_identity: Option<String>,
     /// Syscalls serviced in the current slice (preemption quantum counter). (Was
     /// `Kernel::slice_syscalls`.)
     slice_syscalls: u32,
@@ -1324,6 +1330,7 @@ impl ServiceCtx {
             restartable: true,
             restart_syscall: false,
             dontwait: false,
+            unix_identity: None,
             slice_syscalls: 0,
         }
     }
@@ -3323,17 +3330,17 @@ impl Kernel {
             // both: sh THEN vfs, held together for atomicity.
             Sysno::Mmap => {
                 let mut sh = self.shared.lock().unwrap();
-                let mut vfs = self.vfs.lock().unwrap();
+                let mut vfs = self.vfs_for(cx);
                 self.sys_mmap(&mut sh, &mut vfs, cx, args, mem)
             }
             Sysno::MemfdCreate => {
                 let mut sh = self.shared.lock().unwrap();
-                let mut vfs = self.vfs.lock().unwrap();
+                let mut vfs = self.vfs_for(cx);
                 self.sys_memfd_create(&mut sh, &mut vfs, cx, args[0], args[1], mem)
             }
             Sysno::Sendfile => {
                 let mut sh = self.shared.lock().unwrap();
-                let mut vfs = self.vfs.lock().unwrap();
+                let mut vfs = self.vfs_for(cx);
                 self.sys_sendfile(
                     &mut sh, &mut vfs, cx, args[0], args[1], args[2], args[3], mem,
                 )
@@ -3407,7 +3414,7 @@ impl Kernel {
             | Sysno::Removexattrat
             | Sysno::Openat2
             | Sysno::Cachestat => {
-                let mut vfs = self.vfs.lock().unwrap();
+                let mut vfs = self.vfs_for(cx);
                 self.dispatch_vfs(&mut vfs, cx, sys, args, mem)
             }
             // Namespace changes: sh THEN vfs, so an unlink/rename can see every
@@ -3419,7 +3426,7 @@ impl Kernel {
             | Sysno::Renameat2
             | Sysno::Rename => {
                 let mut sh = self.shared.lock().unwrap();
-                let mut vfs = self.vfs.lock().unwrap();
+                let mut vfs = self.vfs_for(cx);
                 self.dispatch_namespace(&mut sh, &mut vfs, cx, sys, args, mem)
             }
             // net-only: the pure socket syscalls, holding ONLY `net` (the last
@@ -3442,10 +3449,12 @@ impl Kernel {
             | Sysno::Recvmsg
             | Sysno::Sendmmsg
             | Sysno::Recvmmsg => {
+                cx.unix_identity = self.unix_path_identity(cx, sys, args, mem);
                 let mut net = self.net.lock().unwrap();
                 cx.dontwait = false;
                 let ret = self.dispatch_net(&mut net, cx, sys, args, mem);
                 cx.dontwait = false;
+                cx.unix_identity = None;
                 let direction = match sys {
                     Sysno::Accept
                     | Sysno::Accept4
@@ -4231,6 +4240,11 @@ impl Kernel {
             Sysno::SetRobustList => self.sys_robust_list(sh, cx, args, false, mem),
             Sysno::GetRobustList => self.sys_robust_list(sh, cx, args, true, mem),
             Sysno::Unshare => self.sys_unshare(sh, cx, args[0]),
+            Sysno::Chroot => {
+                let mut vfs = self.vfs_for(cx);
+                self.sys_chroot(&mut vfs, cx, args[0], mem)
+            }
+            Sysno::PivotRoot => self.sys_pivot_root(sh, cx, args[0], args[1], mem),
             Sysno::Seccomp => self.sys_seccomp(sh, cx, args[0], args[1], args[2], mem),
             Sysno::Setns => self.sys_setns(sh, cx, args[0], args[1]),
             Sysno::Ustat => self.sys_ustat(args[1], mem),
@@ -4278,9 +4292,6 @@ impl Kernel {
             // the fd-taking members (fsync/fdatasync/syncfs/sync_file_range) are
             // handled separately below so a bad fd reports EBADF.
             | Sysno::Sync
-            // chroot is accepted without confining path resolution (a per-
-            // process root isn't modeled — documented limitation).
-            | Sysno::Chroot
             | Sysno::InotifyRmWatch => 0,
             Sysno::Setgroups => self.sys_setgroups(cx, args[0], args[1], mem),
             Sysno::Getgroups => self.sys_getgroups(cx, args[0], args[1], mem),
@@ -4544,6 +4555,18 @@ impl Kernel {
             info.exit_signal = (ca.exit_signal & 0xff) as u8;
         }
         info.ns = child_ns;
+        if child_ns.mnt != cx.cur.ns.mnt {
+            let mut vfs = self.vfs.lock().unwrap();
+            if vfs.namespace_count() >= ns::MAX_MOUNT_NAMESPACES {
+                let tasks = sh.procs.iter().flatten().map(|p| p.info.ns.mnt);
+                let in_use: Vec<u32> = tasks.chain([cx.cur.ns.mnt]).collect();
+                vfs.collect_namespaces(&in_use);
+            }
+            if vfs.namespace_count() >= ns::MAX_MOUNT_NAMESPACES {
+                return err(Errno::ENOSPC);
+            }
+            vfs.copy_namespace(cx.cur.ns.mnt, child_ns.mnt);
+        }
         // Limits belong to the thread group, so only a new process gets its own.
         if !is_thread {
             info.rlimits = info.rlimits.private_copy();
@@ -4768,7 +4791,7 @@ impl Kernel {
         };
         // `sh` is already held (this handler runs under `dispatch_shared`);
         // acquiring `vfs` here keeps the mandated sh→vfs order.
-        let mut vfs = self.vfs.lock().unwrap();
+        let mut vfs = self.vfs_for(cx);
         let Some(abs) = self.resolve_exec(&mut vfs, cx, &rel) else {
             return err(Errno::ENOENT);
         };
@@ -4808,7 +4831,7 @@ impl Kernel {
         let argv = read_string_array(mem, argv_ptr);
         let envp = read_string_array(mem, envp_ptr);
         // sh held (dispatch_shared) → acquire vfs in the mandated order.
-        let mut vfs = self.vfs.lock().unwrap();
+        let mut vfs = self.vfs_for(cx);
         self.exec_image(sh, &mut vfs, cx, &abs, argv, envp, vcpu, mem)
     }
 
@@ -4931,6 +4954,9 @@ impl Kernel {
         mem.exec_reset();
         self.pc_gc(mem);
         let loaded = if let Some(interp) = interp_path(&elf) {
+            // The dynamic linker is named by the program, so it's found from the
+            // task's root like any other path the program names.
+            let interp = Self::under_root(&cx.cur.root, &interp);
             let Some(interp_elf) = self.read_file(vfs, &interp) else {
                 return err(Errno::ENOENT); // interpreter missing
             };
@@ -5557,7 +5583,7 @@ impl Kernel {
         // held; scope `vfs` to just the flush (sh→vfs order), dropping it before
         // the rest of teardown.
         if !cx.cur.shared_maps.is_empty() {
-            let mut vfs = self.vfs.lock().unwrap();
+            let mut vfs = self.vfs_for(cx);
             self.flush_shared_maps(&mut vfs, cx, 0, 0, mem);
         }
         let ctid = cx.cur.clear_child_tid;
@@ -5745,7 +5771,7 @@ impl Kernel {
         // Flush any un-munmap'd writable shared file mappings first (sh→vfs,
         // scoped so the tail `sys_exit` can re-acquire vfs without a re-lock).
         if !cx.cur.shared_maps.is_empty() {
-            let mut vfs = self.vfs.lock().unwrap();
+            let mut vfs = self.vfs_for(cx);
             self.flush_shared_maps(&mut vfs, cx, 0, 0, mem);
         }
         let tgid = cx.cur.tgid;
@@ -5802,7 +5828,7 @@ impl Kernel {
     ) -> i64 {
         match cx.cur.fds.get(fd as i32) {
             Some(Fd::File { .. }) => {
-                let mut vfs = self.vfs.lock().unwrap();
+                let mut vfs = self.vfs_for(cx);
                 self.write_file_fd(&mut vfs, cx, fd, buf, count, mem)
             }
             Some(Fd::Socket { .. }) => {
@@ -6062,7 +6088,7 @@ impl Kernel {
     ) -> i64 {
         match cx.cur.fds.get(fd as i32) {
             Some(Fd::File { .. }) => {
-                let mut vfs = self.vfs.lock().unwrap();
+                let mut vfs = self.vfs_for(cx);
                 self.read_file_fd(&mut vfs, cx, fd, buf, count, mem)
             }
             Some(Fd::Socket { .. }) => {
@@ -7012,7 +7038,7 @@ impl Kernel {
         // holds only `vfs`, a socket readv only `net`, a pipe readv only
         // `pipes`, every other source `sh`.
         if let Some(Fd::File { .. }) = cx.cur.fds.get(fd as i32) {
-            let mut vfs = self.vfs.lock().unwrap();
+            let mut vfs = self.vfs_for(cx);
             let mut total = 0i64;
             for i in 0..iovcnt {
                 let ent = iov + i * 16;
@@ -7154,7 +7180,7 @@ impl Kernel {
         mem: &GuestMemory,
     ) -> i64 {
         if let Some(Fd::File { .. }) = cx.cur.fds.get(fd as i32) {
-            let mut vfs = self.vfs.lock().unwrap();
+            let mut vfs = self.vfs_for(cx);
             let mut total = 0i64;
             for i in 0..iovcnt {
                 let ent = iov + i * 16;
@@ -7514,7 +7540,7 @@ impl Kernel {
                 let out: Vec<u8> = match req {
                     FIGETBSZ => 4096u32.to_le_bytes().to_vec(),
                     FIOQSIZE => {
-                        let size = self.vfs.lock().unwrap().stat(&path).map_or(0, |a| a.size);
+                        let size = self.vfs_for(cx).stat(&path).map_or(0, |a| a.size);
                         size.to_le_bytes().to_vec()
                     }
                     FS_IOC_SETFLAGS => {
@@ -7892,10 +7918,10 @@ impl Kernel {
         // task's live identity — its program name, cmdline, and open fds — not the
         // boot-time placeholder. Refresh procfs's `self/` view before the fd is
         // created so the following read/readdir renders the running process.
-        if (abs == "/proc" || abs.starts_with("/proc/"))
-            && let Some(pf) = vfs.procfs_mut()
-        {
-            pf.update_self(self.proc_self_live(cx));
+        if abs.contains("/proc") {
+            let mut live = self.proc_self_live(cx);
+            live.mounts = vfs.listing();
+            vfs.with_procfs(|procfs| procfs.update_self(live.clone()));
         }
 
         // `/dev/tty` is the caller's controlling terminal: the pty its stdio
@@ -8384,7 +8410,13 @@ impl Kernel {
     /// `getcwd(buf, size)`.
     #[allow(clippy::unused_self)]
     fn sys_getcwd(&self, cx: &mut ServiceCtx, buf: u64, size: u64, mem: &mut GuestMemory) -> i64 {
-        let mut bytes = cx.cur.cwd.clone().into_bytes();
+        // A cwd outside the root is reported as Linux does, so it's plainly not a
+        // usable path.
+        let cwd = match Self::strip_root(&cx.cur.root, &cx.cur.cwd) {
+            Some(inside) => inside,
+            None => format!("(unreachable){}", cx.cur.cwd),
+        };
+        let mut bytes = cwd.into_bytes();
         bytes.push(0);
         if bytes.len() as u64 > size {
             return err(Errno::ERANGE);
@@ -8438,8 +8470,9 @@ impl Kernel {
     /// Resolve a possibly-relative guest path to an absolute, normalized path.
     #[allow(clippy::unused_self)]
     fn resolve_path(&self, cx: &ServiceCtx, dirfd: i64, p: &str) -> String {
+        let root = cx.cur.root.as_str();
         if p.starts_with('/') {
-            return path::normalize(p);
+            return Self::under_root(root, &path::normalize(p));
         }
         let base = if dirfd == AT_FDCWD {
             cx.cur.cwd.clone()
@@ -8449,7 +8482,84 @@ impl Kernel {
                 _ => cx.cur.cwd.clone(),
             }
         };
-        path::normalize(&format!("{base}/{p}"))
+        if root == "/" {
+            return path::normalize(&format!("{base}/{p}"));
+        }
+        // `..` is worked out below the root, so it can't climb out of it. A base
+        // outside the root (a cwd from before `chroot`) keeps resolving where it is.
+        match Self::strip_root(root, &base) {
+            Some(inside) => Self::under_root(root, &path::normalize(&format!("{inside}/{p}"))),
+            None => path::normalize(&format!("{base}/{p}")),
+        }
+    }
+
+    /// `path`, which is relative to `root`, in its mount namespace's terms.
+    fn under_root(root: &str, path: &str) -> String {
+        if root == "/" {
+            path.to_string()
+        } else {
+            path::normalize(&format!("{root}/{path}"))
+        }
+    }
+
+    /// `path` as seen from inside `root`, or `None` if it's outside.
+    fn strip_root(root: &str, path: &str) -> Option<String> {
+        if root == "/" {
+            return Some(path.to_string());
+        }
+        if path == root {
+            return Some("/".to_string());
+        }
+        let rest = path.strip_prefix(root)?;
+        rest.starts_with('/').then(|| rest.to_string())
+    }
+
+    /// `path` as the current task should see it.
+    pub(super) fn as_seen_from_root(cx: &ServiceCtx, path: &str) -> String {
+        Self::strip_root(&cx.cur.root, path).unwrap_or_else(|| path.to_string())
+    }
+
+    /// For a socket call naming an `AF_UNIX` path: which file that path is, in this
+    /// task's view. A path is found through the filesystem, so the same file
+    /// reached through a bind mount or from another mount namespace is the same
+    /// socket, and the same path in different mounts is not.
+    fn unix_path_identity(
+        &self,
+        cx: &ServiceCtx,
+        sys: Sysno,
+        args: &[u64; 6],
+        mem: &GuestMemory,
+    ) -> Option<String> {
+        const AF_UNIX: u16 = 1;
+        const SUN_PATH_OFFSET: u64 = 2;
+        const MSG_NAME: u64 = 0;
+        let ptr = match sys {
+            Sysno::Bind | Sysno::Connect => args[1],
+            Sysno::Sendto => args[4],
+            Sysno::Sendmsg => mem.read_u64(args[1] + MSG_NAME).ok()?,
+            _ => return None,
+        };
+        if ptr == 0 {
+            return None;
+        }
+        let family = mem.read_vec(ptr, 2).ok()?;
+        if u16::from_le_bytes([family[0], family[1]]) != AF_UNIX {
+            return None;
+        }
+        let first = mem.read_vec(ptr + SUN_PATH_OFFSET, 1).ok()?;
+        if first[0] == 0 {
+            return None; // abstract, which isn't a file
+        }
+        let path = read_path(mem, ptr + SUN_PATH_OFFSET)?;
+        let abs = self.resolve_path(cx, AT_FDCWD, &path);
+        Some(self.vfs_for(cx).identity(&abs))
+    }
+
+    /// The mount table, answering for this task's namespace and root.
+    fn vfs_for(&self, cx: &ServiceCtx) -> std::sync::MutexGuard<'_, MountTable> {
+        let mut vfs = self.vfs.lock().unwrap();
+        vfs.enter(cx.cur.ns.mnt, &cx.cur.root);
+        vfs
     }
 
     /// True if any *non-final* component of `abs` exists but is not a directory
@@ -8501,10 +8611,10 @@ impl Kernel {
                 Some(a) if a.kind == NodeKind::Symlink => {
                     let target = vfs.readlink(&p).ok()?;
                     p = if target.starts_with('/') {
-                        path::normalize(&target)
+                        vfs.join_root(&target)
                     } else {
                         let dir = parent_of(&p);
-                        path::normalize(&format!("{dir}/{target}"))
+                        vfs.join_relative(dir, &target)
                     };
                 }
                 _ => return Some(p),
@@ -8832,7 +8942,7 @@ impl Kernel {
         // Flush any writable shared file mapping before the pages go away.
         // `sh` is held (dispatch_shared) → acquire `vfs` in the mandated order.
         if !cx.cur.shared_maps.is_empty() {
-            let mut vfs = self.vfs.lock().unwrap();
+            let mut vfs = self.vfs_for(cx);
             self.flush_shared_maps(&mut vfs, cx, base, len, mem);
         }
         let _ = mem.unmap(base, len);

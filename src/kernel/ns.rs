@@ -171,6 +171,9 @@ impl Default for UtsNs {
     }
 }
 
+/// How many mount namespaces may exist (`user.max_mnt_namespaces`, about).
+pub(super) const MAX_MOUNT_NAMESPACES: usize = 1 << 16;
+
 /// How many UTS namespaces may exist. Linux has a limit of about this size too
 /// (`user.max_uts_namespaces`); each one here is a little host memory.
 const MAX_UTS_NAMESPACES: usize = 1 << 16;
@@ -428,6 +431,9 @@ impl Kernel {
                     return err(Errno::EINVAL);
                 }
                 Self::join_namespace(&mut cx.cur.ns, kind, id);
+                if kind == NsKind::Mnt {
+                    Self::reset_to_new_root(cx);
+                }
                 0
             }
             Some(Fd::Pidfd(i)) => {
@@ -464,11 +470,21 @@ impl Kernel {
                         Self::join_namespace(&mut cx.cur.ns, kind, target.get(kind));
                     }
                 }
+                if nstype & CLONE_NEWNS != 0 {
+                    Self::reset_to_new_root(cx);
+                }
                 0
             }
             Some(_) => err(Errno::EINVAL),
             None => err(Errno::EBADF),
         }
+    }
+
+    /// A task entering a mount namespace starts at its root, as paths from where
+    /// it was don't mean anything there.
+    fn reset_to_new_root(cx: &mut ServiceCtx) {
+        "/".clone_into(&mut cx.cur.root);
+        "/".clone_into(&mut cx.cur.cwd);
     }
 
     /// Join one namespace. Joining a PID or time namespace affects only the

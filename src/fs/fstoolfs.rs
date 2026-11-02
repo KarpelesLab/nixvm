@@ -275,6 +275,10 @@ fn einval() -> io::Error {
 }
 
 impl MountFs for FsToolMount {
+    fn fs_type(&self) -> &'static str {
+        "squashfs"
+    }
+
     fn read_only(&self) -> bool {
         self.read_only
     }

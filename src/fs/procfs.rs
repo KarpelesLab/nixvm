@@ -294,6 +294,31 @@ const MOUNTINFO: &str = "1 0 0:1 / / rw,relatime shared:1 - tmpfs tmpfs rw\n\
 3 1 0:3 / /sys rw,nosuid,nodev,noexec,relatime shared:3 - sysfs sysfs rw\n\
 4 1 0:4 / /dev rw,nosuid,relatime shared:4 - devtmpfs devtmpfs rw\n";
 
+/// `/proc/mounts`, one line per mount.
+fn mounts_body(mounts: &[super::MountEntry]) -> String {
+    let mut out = String::new();
+    for m in mounts {
+        let rw = if m.read_only { "ro" } else { "rw" };
+        let _ = writeln!(out, "{0} {1} {0} {rw} 0 0", m.fs_type, m.point);
+    }
+    out
+}
+
+/// `/proc/self/mountinfo`, in the format documented in `proc(5)`.
+fn mountinfo_body(mounts: &[super::MountEntry]) -> String {
+    let mut out = String::new();
+    for (i, m) in mounts.iter().enumerate() {
+        let (id, parent) = (i + 1, i);
+        let rw = if m.read_only { "ro" } else { "rw" };
+        let _ = writeln!(
+            out,
+            "{id} {parent} 0:{id} /{0} {1} {rw},relatime - {2} {2} {rw}",
+            m.subdir, m.point, m.fs_type,
+        );
+    }
+    out
+}
+
 const CMDLINE: &str = "\n";
 
 const OSTYPE: &str = "Linux\n";
@@ -484,6 +509,9 @@ const UID_GID_MAP: &str = "0 0 4294967295\n";
 /// supplies placeholders so every file still renders something plausible.
 #[derive(Debug, Clone)]
 pub struct ProcData {
+    /// The reader's mounts, for `mounts` and `self/mountinfo`. Empty until the
+    /// kernel has refreshed this, when the fixed text is shown instead.
+    pub mounts: Vec<super::MountEntry>,
     /// Raw `argv` for `self/cmdline`, NUL-separated as the kernel presents it.
     pub cmdline: Vec<u8>,
     /// Absolute path the `self/exe` symlink resolves to.
@@ -531,6 +559,7 @@ pub struct ProcData {
 impl Default for ProcData {
     fn default() -> Self {
         Self {
+            mounts: Vec::new(),
             cmdline: Vec::new(),
             exe: "/bin/busybox".to_string(),
             cwd: "/".to_string(),
@@ -558,6 +587,8 @@ impl Default for ProcData {
 /// of [`ProcData`] — just the values that actually change per running task.
 #[derive(Debug, Clone)]
 pub struct ProcSelf {
+    /// The caller's mounts, for `mounts` and `self/mountinfo`.
+    pub mounts: Vec<super::MountEntry>,
     pub comm: String,
     pub cmdline: Vec<u8>,
     pub exe: String,
@@ -612,6 +643,7 @@ impl ProcFs {
     /// program. `pid`/`ppid` drive the `<pid>` alias too.
     pub fn update_self(&mut self, live: ProcSelf) {
         let d = &mut self.data;
+        d.mounts = live.mounts;
         d.comm = live.comm;
         d.cmdline = live.cmdline;
         d.exe = live.exe;
@@ -655,6 +687,12 @@ impl ProcFs {
     /// regular file (a directory, a symlink, or unknown).
     fn content(&self, rel: &str) -> Option<Vec<u8>> {
         match rel {
+            "mounts" | "self/mounts" if !self.data.mounts.is_empty() => {
+                return Some(mounts_body(&self.data.mounts).into_bytes());
+            }
+            "self/mountinfo" if !self.data.mounts.is_empty() => {
+                return Some(mountinfo_body(&self.data.mounts).into_bytes());
+            }
             "cpuinfo" => {
                 return Some(cpuinfo_body(self.data.nproc, self.data.arch).into_bytes());
             }
@@ -1227,6 +1265,10 @@ fn einval() -> io::Error {
 }
 
 impl MountFs for ProcFs {
+    fn fs_type(&self) -> &'static str {
+        "proc"
+    }
+
     fn as_procfs_mut(&mut self) -> Option<&mut ProcFs> {
         Some(self)
     }
@@ -1439,6 +1481,7 @@ mod tests {
     /// to eventually inject.
     fn sample() -> ProcData {
         ProcData {
+            mounts: Vec::new(),
             cmdline: b"prog\0--flag\0".to_vec(),
             exe: "/usr/bin/prog".to_string(),
             cwd: "/home/user".to_string(),
@@ -1515,6 +1558,7 @@ mod tests {
         // Default placeholder before any refresh.
         assert_eq!(read_all(&mut fs, "self/comm"), b"nixvm\n");
         fs.update_self(ProcSelf {
+            mounts: Vec::new(),
             comm: "myprog".to_string(),
             cmdline: b"/bin/myprog\0-x\0".to_vec(),
             exe: "/bin/myprog".to_string(),

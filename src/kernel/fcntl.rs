@@ -227,7 +227,7 @@ impl Kernel {
         if !matches!(f, Fd::File { .. }) || self.locks.lock().unwrap().is_empty() {
             return;
         }
-        let mut vfs = self.vfs.lock().unwrap();
+        let mut vfs = self.vfs_for(cx);
         self.release_fd_locks_with(sh, cx, &mut vfs, f);
     }
 
@@ -639,7 +639,7 @@ impl Kernel {
             return 0;
         };
         let (key, size) = {
-            let mut vfs = self.vfs.lock().unwrap();
+            let mut vfs = self.vfs_for(cx);
             let size = vfs.stat(path).map_or(0, |a| a.size);
             (Self::lock_key(&mut vfs, path), size)
         };
@@ -730,7 +730,7 @@ impl Kernel {
             return 0; // nothing contends over a non-file descriptor
         };
         let key = {
-            let mut vfs = self.vfs.lock().unwrap();
+            let mut vfs = self.vfs_for(cx);
             Self::lock_key(&mut vfs, path)
         };
         let Some(key) = key else {

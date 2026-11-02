@@ -196,6 +196,10 @@ fn enotempty() -> io::Error {
 }
 
 impl MountFs for Overlay {
+    fn fs_type(&self) -> &'static str {
+        "overlay"
+    }
+
     fn attach_quota(&mut self, quota: &std::sync::Arc<crate::limits::Quota>) {
         self.upper.attach_quota(quota);
     }

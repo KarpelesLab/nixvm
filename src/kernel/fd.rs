@@ -201,6 +201,15 @@ impl FdTable {
     /// the standard streams and reopens gets it back at that number — busybox
     /// ash relies on exactly this for background jobs: it does `close(0);
     /// open("/dev/null")` and *dies* unless the reopen lands on fd 0.
+    /// Rewrite the path of every open file and directory.
+    pub fn rewrite_paths(&mut self, rewrite: &dyn Fn(&str) -> String) {
+        for fd in self.map.values_mut() {
+            if let Fd::File { path, .. } | Fd::Dir { path, .. } = fd {
+                *path = rewrite(path);
+            }
+        }
+    }
+
     /// How many descriptors are open.
     #[must_use]
     pub fn len(&self) -> usize {
