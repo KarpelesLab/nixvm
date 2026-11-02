@@ -15,18 +15,22 @@ pub struct Limits {
     /// data in tmpfs, pipe and socket queues, and the like. Guest RAM is
     /// separate; it is bounded by the size of the guest's physical pool.
     pub kernel_memory: u64,
+    /// Tasks (threads and processes, counting zombies) that may exist at once.
+    /// `fork` and `clone` beyond this fail with `EAGAIN`.
+    pub tasks: u32,
 }
 
 impl Limits {
     /// Sensible defaults for the machine this runs on: a quarter of its RAM for
-    /// kernel memory, at most 8 GiB and at least 256 MiB. Each can be overridden
-    /// with an environment variable, such as `NIXVM_LIMIT_KERNEL_MEMORY` (bytes).
+    /// kernel memory, at most 8 GiB and at least 256 MiB, and 4096 tasks. Each can
+    /// be overridden with `NIXVM_LIMIT_KERNEL_MEMORY` (bytes) or `NIXVM_LIMIT_TASKS`.
     #[must_use]
     pub fn for_this_host() -> Self {
         const MIB: u64 = 1024 * 1024;
         let kernel_memory = (host_memory_bytes() / 4).clamp(256 * MIB, 8192 * MIB);
         Self {
             kernel_memory: env_u64("NIXVM_LIMIT_KERNEL_MEMORY").unwrap_or(kernel_memory),
+            tasks: env_u64("NIXVM_LIMIT_TASKS").map_or(4096, |n| n.min(1 << 22) as u32),
         }
     }
 }

@@ -22,6 +22,7 @@
 
 use super::ctrl;
 use super::pagetable::AddrSpace;
+use super::pagevec::PageVec;
 use super::phys::{FrameAllocator, PhysMem};
 use super::region::HOST_PAGE;
 use std::sync::{Arc, Mutex};
@@ -107,17 +108,17 @@ pub struct GuestMemory {
     /// this — a copy-on-write-shared writable page reads `Prot::rw()` here but is
     /// installed read-only until privatized — so this is the authority on "was
     /// this page meant to be writable?" that [`GuestMemory::cow_fault`] needs.
-    prot: Vec<Prot>,
-    mapped: Vec<bool>,
+    prot: PageVec<Prot>,
+    mapped: PageVec<bool>,
     /// Per-page: loaded from a file (an ELF segment). `MADV_DONTNEED` preserves
     /// these; cleared when a page is re-`map`ped anonymously.
-    file_backed: Vec<bool>,
+    file_backed: PageVec<bool>,
     /// Per-page `MAP_SHARED | MAP_ANONYMOUS` marker. These pages back a shared
     /// anonymous region: they are eagerly frame-backed at `mmap`, and across
     /// `fork` the child *aliases* the same frame writable (not copy-on-write),
     /// so parent and child see each other's stores — the standard shared-memory
     /// IPC primitive. `make_writable`/`leaf_prot` therefore never privatize them.
-    shared_anon: Vec<bool>,
+    shared_anon: PageVec<bool>,
     /// Pages with a `madvise` fork policy (sparse: almost always empty):
     /// [`FORK_DONT`] (`MADV_DONTFORK` — absent from a fork child) or
     /// [`FORK_WIPE`] (`MADV_WIPEONFORK` — zero-filled in a fork child).
@@ -221,6 +222,9 @@ impl GuestMemory {
         let phys = Arc::new(PhysMem::new((pool_frames * PAGE_SIZE) as usize));
 
         let mut fa = FrameAllocator::new(phys.nframes());
+        // Well inside the slack the pool was given above, so a guest still gets
+        // all of the RAM it was promised.
+        fa.set_reserve(64);
         ctrl::reserve_and_build(&mut fa, &phys);
         let mut space = AddrSpace::new(&mut fa, &phys).expect("pool too small for a PML4");
         ctrl::map_into(&mut space, &mut fa, &phys);
@@ -232,10 +236,10 @@ impl GuestMemory {
             phys,
             fa: Arc::new(Mutex::new(fa)),
             space,
-            prot: vec![Prot::NONE; npages],
-            mapped: vec![false; npages],
-            file_backed: vec![false; npages],
-            shared_anon: vec![false; npages],
+            prot: PageVec::new(npages, Prot::NONE),
+            mapped: PageVec::new(npages, false),
+            file_backed: PageVec::new(npages, false),
+            shared_anon: PageVec::new(npages, false),
             fork_policy: std::collections::BTreeMap::new(),
             tlb_dirty: false,
             kstack_pa,
@@ -837,7 +841,8 @@ impl GuestMemory {
     /// frame if needed. A no-op on an already-private page beyond restoring its
     /// leaf write bit. An associated fn over the disjoint `space`/`phys` fields so
     /// callers can hold the `fa` guard (which borrows the `fa` field) at once.
-    /// Returns whether it changed a present leaf (so the caller flags the TLB).
+    /// Fails if a copy-on-write page can't be privatized for lack of a frame.
+    /// Otherwise returns whether it changed a present leaf (so the caller flags the TLB).
     fn make_writable(
         space: &mut AddrSpace,
         phys: &PhysMem,
@@ -845,30 +850,32 @@ impl GuestMemory {
         fa: &mut FrameAllocator,
         va: u64,
         shared_anon: bool,
-    ) -> bool {
+    ) -> Result<bool, MemError> {
         let Some(t) = space.translate(va, phys) else {
-            return false;
+            return Ok(false);
         };
         let frame = t.paddr & !(PAGE_SIZE - 1);
         if !shared_anon && fa.refcount(frame) > 1 {
             // Copy-on-write shared: privatize into a fresh frame. (A shared-anon
             // page is intentionally aliased — writes go to the shared frame, so
             // it takes the `else` branch and just gets its leaf write bit set.)
-            if let Some(new) = fa.alloc(phys) {
-                phys.copy_frame(new, frame);
-                if let Ok(old) = space.map(va, new, prot, false, fa, phys) {
-                    if let Some(of) = old {
-                        fa.decref(of);
-                    }
-                } else {
-                    fa.free(new);
-                }
+            // No frame must be an error: carrying on would write into the frame
+            // another process still shares.
+            let exhausted = || MemError::Host("frame pool exhausted".into());
+            let new = fa.alloc(phys).ok_or_else(exhausted)?;
+            phys.copy_frame(new, frame);
+            let Ok(old) = space.map(va, new, prot, false, fa, phys) else {
+                fa.free(new);
+                return Err(exhausted());
+            };
+            if let Some(of) = old {
+                fa.decref(of);
             }
-            true
+            Ok(true)
         } else {
             // Private already: make sure the leaf carries the intended write bit
             // (a prior fork may have cleared it).
-            space.protect(va, prot, false, phys)
+            Ok(space.protect(va, prot, false, phys))
         }
     }
 
@@ -894,7 +901,7 @@ impl GuestMemory {
                     &mut fa,
                     va,
                     self.shared_anon[p],
-                );
+                )?;
             }
             self.tlb_dirty |= changed;
         }
@@ -943,6 +950,8 @@ impl GuestMemory {
         }
         let va = self.base + (p as u64) * PAGE_SIZE;
         let mut fa = self.fa.lock().unwrap();
+        // Out of frames is a real fault: reporting success here would retry the
+        // store forever.
         Self::make_writable(
             &mut self.space,
             &self.phys,
@@ -950,8 +959,8 @@ impl GuestMemory {
             &mut fa,
             va,
             self.shared_anon[p],
-        );
-        true
+        )
+        .is_ok()
     }
 
     /// Write `buf` to guest `addr`, bypassing protection but requiring the pages
@@ -983,7 +992,7 @@ impl GuestMemory {
                     &mut fa,
                     va,
                     self.shared_anon[p],
-                );
+                )?;
             }
             self.tlb_dirty |= changed;
         }
@@ -1008,14 +1017,26 @@ impl GuestMemory {
     /// Fork this address space for a new process: the child shares every mapped
     /// frame copy-on-write (both sides go read-only; the first store privatizes).
     /// Only touched pages ever cost a private frame. The child shares the pool.
+    ///
+    /// # Panics
+    /// If the frame pool is exhausted. Guest-driven forks use
+    /// [`GuestMemory::try_fork`]; this is for setting up known-small spaces.
     #[must_use]
     pub fn fork(&mut self) -> Self {
+        self.try_fork().expect("fork: frame pool exhausted")
+    }
+
+    /// [`GuestMemory::fork`], or `None` with this space untouched if the frame
+    /// pool can't hold the child's page tables.
+    #[must_use]
+    pub fn try_fork(&mut self) -> Option<Self> {
         let (child_space, parent_kstack, child_kstack) = {
             let mut fa = self.fa.lock().unwrap();
-            let mut child = self
-                .space
-                .fork_cow(&mut fa, &self.phys)
-                .expect("fork_cow: frame pool exhausted");
+            let mut child = self.space.fork_cow(&mut fa, &self.phys)?;
+            // Past this point the fork can't fail, and it needs a couple more
+            // frames: `fork_cow` just left us above the reserve, so these dip into
+            // it by a bounded amount, and the next fork fails first.
+            fa.set_use_reserve(true);
             // `fork_cow` cleared the write bit on *every* leaf, including the
             // shared supervisor control block. Restore it, RW-supervisor, on both
             // sides.
@@ -1027,14 +1048,15 @@ impl GuestMemory {
             // are transient supervisor scratch, so nothing is lost by not copying.
             let parent_kstack = install_kstack(&mut self.space, &mut fa, &self.phys);
             let child_kstack = install_kstack(&mut child, &mut fa, &self.phys);
+            fa.set_use_reserve(false);
             // `MAP_SHARED | MAP_ANONYMOUS` pages must stay a *single writable*
             // frame shared between parent and child, not copy-on-write. fork_cow
             // already increffed the frame and installed a (read-only) child leaf;
             // republish both sides' leaves writable so stores land in the shared
             // frame and each side sees the other's writes. These pages are eagerly
             // backed at mmap, so a frame always exists here.
-            for p in 0..self.mapped.len() {
-                if self.shared_anon[p] && self.mapped[p] {
+            for (p, _) in self.shared_anon.non_default() {
+                if self.mapped[p] {
                     let va = self.base + (p as u64) * PAGE_SIZE;
                     self.space.protect(va, self.prot[p], false, &self.phys);
                     child.protect(va, self.prot[p], false, &self.phys);
@@ -1065,7 +1087,7 @@ impl GuestMemory {
                 fork_policy.insert(p, policy);
             }
         }
-        Self {
+        Some(Self {
             base: self.base,
             size: self.size,
             phys: Arc::clone(&self.phys),
@@ -1079,7 +1101,7 @@ impl GuestMemory {
             tlb_dirty: false,
             kstack_pa: child_kstack,
             shared: self.shared,
-        }
+        })
     }
 
     /// Tear down the current page tables (returning their frames to the pool) and
@@ -1090,15 +1112,31 @@ impl GuestMemory {
         self.reset_space();
     }
 
-    /// Release this address space's frames back to the pool on process exit,
-    /// leaving a minimal empty space behind (the task is a zombie and never runs
-    /// again). Keeps the pool from filling with dead processes' frames.
-    pub(crate) fn release(&mut self) {
-        self.reset_space();
+    /// Give up everything this address space holds when its last task exits,
+    /// including its page tables and kernel stack. The
+    /// task never runs again, but the slot outlives it, so anything kept here
+    /// would add up over a long-lived process tree until the pool ran dry.
+    pub(crate) fn retire(&mut self) {
+        let mut fa = self.fa.lock().unwrap();
+        let old = std::mem::replace(&mut self.space, AddrSpace::retired());
+        old.destroy(&mut fa, &self.phys);
+        drop(fa);
+        self.kstack_pa = 0;
+        self.prot.clear();
+        self.mapped.clear();
+        self.file_backed.clear();
+        self.shared_anon.clear();
+        self.fork_policy.clear();
+        self.tlb_dirty = true;
     }
 
     fn reset_space(&mut self) {
         let mut fa = self.fa.lock().unwrap();
+        // Exit and exec must always work, and this is what frees the frames a
+        // full pool needs: the reserve guarantees the few it takes first. The
+        // allocator lock is held throughout, so the old space's frames are back
+        // before anyone else can dip in.
+        fa.set_use_reserve(true);
         let mut ns = AddrSpace::new(&mut fa, &self.phys).expect("reset: pool exhausted");
         ctrl::map_into(&mut ns, &mut fa, &self.phys);
         let kstack_pa = install_kstack(&mut ns, &mut fa, &self.phys);
@@ -1107,12 +1145,13 @@ impl GuestMemory {
         // so `destroy` frees it along with the rest; the shared control frames it
         // also references are pinned and survive.
         old.destroy(&mut fa, &self.phys);
+        fa.set_use_reserve(false);
         self.kstack_pa = kstack_pa;
         drop(fa);
-        self.prot.fill(Prot::NONE);
-        self.mapped.fill(false);
-        self.file_backed.fill(false);
-        self.shared_anon.fill(false);
+        self.prot.clear();
+        self.mapped.clear();
+        self.file_backed.clear();
+        self.shared_anon.clear();
         self.fork_policy.clear();
     }
 
@@ -1358,11 +1397,78 @@ mod tests {
         assert_eq!(m.read_u64(0x1_0000 + PAGE_SIZE).unwrap(), 0x2222);
         // An ordinary page is inherited.
         assert_eq!(child.read_u64(0x1_0000 + 2 * PAGE_SIZE).unwrap(), 0x3333);
-        child.release();
+        child.retire();
     }
 
     #[test]
-    fn release_and_exec_reset_return_frames_to_the_pool() {
+    fn fork_and_retire_in_a_loop_leaks_no_frames() {
+        let mut parent = mem();
+        parent.map(0x1_0000, 4 * PAGE_SIZE, Prot::rw()).unwrap();
+        parent.write_u64(0x1_0000, 1).unwrap();
+        // The first pass settles the parent into copy-on-write shape.
+        let mut first = parent.fork();
+        first.retire();
+        let settled = parent.frames_in_use();
+        for _ in 0..50 {
+            let mut child = parent.fork();
+            child.write_u64(0x1_0000, 2).unwrap();
+            child.retire();
+            assert_eq!(parent.frames_in_use(), settled);
+        }
+        assert_eq!(parent.read_u64(0x1_0000).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_retired_space_finds_nothing_and_refuses_new_pages() {
+        let mut m = mem();
+        m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
+        m.write_u64(0x1_0000, 1).unwrap();
+        m.retire();
+        assert!(m.read_u64(0x1_0000).is_err());
+        assert!(m.write_u64(0x1_0000, 1).is_err());
+    }
+
+    #[test]
+    fn a_fork_that_does_not_fit_in_the_pool_fails_and_changes_nothing() {
+        let mut parent = GuestMemory::new(0x1_0000, 4 * 1024 * PAGE_SIZE);
+        parent.map(0x1_0000, 16 * PAGE_SIZE, Prot::rw()).unwrap();
+        parent.write_u64(0x1_0000, 7).unwrap();
+        // Hold every frame the allocator will hand out.
+        let held: Vec<u64> = {
+            let mut fa = parent.fa.lock().unwrap();
+            std::iter::from_fn(|| fa.alloc(&parent.phys)).collect()
+        };
+        let before = parent.frames_in_use();
+        assert!(parent.try_fork().is_none());
+        assert_eq!(parent.frames_in_use(), before);
+        assert_eq!(parent.read_u64(0x1_0000).unwrap(), 7);
+        // A write that would need a new frame fails too, rather than panicking,
+        // and tearing the space down still works with the pool this full.
+        assert!(parent.write_u64(0x1_0000 + PAGE_SIZE, 1).is_err());
+        parent.release_frames(&held);
+        assert!(parent.try_fork().is_some());
+    }
+
+    #[test]
+    fn copy_on_write_with_no_frame_left_fails_without_touching_the_shared_page() {
+        let mut parent = GuestMemory::new(0x1_0000, 4 * 1024 * PAGE_SIZE);
+        parent.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
+        parent.write_u64(0x1_0000, 7).unwrap();
+        let mut child = parent.fork();
+        let held: Vec<u64> = {
+            let mut fa = parent.fa.lock().unwrap();
+            std::iter::from_fn(|| fa.alloc(&parent.phys)).collect()
+        };
+        assert!(child.write_u64(0x1_0000, 99).is_err());
+        assert!(!child.cow_fault(0x1_0000, true), "reported, not retried");
+        assert_eq!(parent.read_u64(0x1_0000).unwrap(), 7);
+        parent.release_frames(&held);
+        child.write_u64(0x1_0000, 99).unwrap();
+        assert_eq!(parent.read_u64(0x1_0000).unwrap(), 7);
+    }
+
+    #[test]
+    fn exec_reset_returns_frames_to_the_pool() {
         let mut m = mem();
         let baseline = m.frames_in_use(); // empty space: PML4 + control-block tables
         // Touch several pages so real data frames are allocated (demand-paged).
@@ -1374,11 +1480,7 @@ mod tests {
             m.frames_in_use() > baseline,
             "touched pages consumed frames"
         );
-        // exit / execve must return every data + table frame the process held.
-        m.release();
-        assert_eq!(m.frames_in_use(), baseline, "release returned all frames");
-        m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
-        m.write_u64(0x1_0000, 1).unwrap();
+        // execve must return every data + table frame the process held.
         m.exec_reset();
         assert_eq!(
             m.frames_in_use(),

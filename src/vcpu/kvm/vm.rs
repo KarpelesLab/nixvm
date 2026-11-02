@@ -72,6 +72,21 @@ pub struct Vm {
     /// none). All address spaces share this pool, so it is registered exactly once.
     pool: Mutex<Option<std::sync::Arc<PhysMem>>>,
     next_vcpu_id: AtomicU32,
+    /// Vcpus whose task has gone, ready for the next one. KVM can't destroy a
+    /// vcpu or reuse its id while the VM lives, so without this a VM could only
+    /// ever create a few thousand tasks, however few were alive at a time. The
+    /// pointer is the `kvm_run` mapping, stored as an address so this stays `Send`.
+    idle_vcpus: Mutex<Vec<(Fd, usize)>>,
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        for (_fd, addr) in self.idle_vcpus.get_mut().unwrap().drain(..) {
+            // SAFETY: each idle entry owns its live mapping, and nothing else
+            // can reach it once the VM is being dropped.
+            unsafe { sys::munmap(addr as *mut _, self.vcpu_mmap_size) };
+        }
+    }
 }
 
 // SAFETY: `Vm` is shared (`Arc`) across the vcpus of one kernel. The pool handle
@@ -135,6 +150,7 @@ impl Vm {
             cpuid,
             pool: Mutex::new(None),
             next_vcpu_id: AtomicU32::new(0),
+            idle_vcpus: Mutex::new(Vec::new()),
         })
     }
 
@@ -178,6 +194,37 @@ impl Vm {
     }
 
     /// Create a vcpu: its fd and the shared `kvm_run` page.
+    /// A vcpu that has already been configured, if one is idle. Any exit the
+    /// previous task left unfinished is completed here: with `immediate_exit`
+    /// set, `KVM_RUN` wraps up pending work and returns without entering the
+    /// guest, so it can't write stale data over the new task's registers.
+    pub fn reuse_vcpu(&self) -> Option<(Fd, *mut sys::kvm_run)> {
+        const EINTR: i32 = 4;
+        loop {
+            let (fd, addr) = self.idle_vcpus.lock().unwrap().pop()?;
+            let run = addr as *mut sys::kvm_run;
+            // SAFETY: `run` is the live mapping of `fd`, which only this thread
+            // holds now that it's out of the idle list.
+            let settled = unsafe {
+                (*run).immediate_exit = 1;
+                let ret = sys::ioctl(fd.0, sys::KVM_RUN, 0u64);
+                (*run).immediate_exit = 0;
+                ret < 0 && std::io::Error::last_os_error().raw_os_error() == Some(EINTR)
+            };
+            if settled {
+                return Some((fd, run));
+            }
+            // Something is wrong with this one: let it go and try the next.
+            // SAFETY: the mapping is unused from here on, and unmapped only here.
+            unsafe { sys::munmap(run.cast(), self.vcpu_mmap_size) };
+        }
+    }
+
+    /// Keep a finished task's vcpu for the next one.
+    pub fn recycle_vcpu(&self, fd: Fd, run: *mut sys::kvm_run) {
+        self.idle_vcpus.lock().unwrap().push((fd, run as usize));
+    }
+
     pub fn create_vcpu(&self) -> Result<(Fd, *mut sys::kvm_run), VcpuError> {
         let id = self.next_vcpu_id.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `KVM_CREATE_VCPU` takes the vcpu id; the fd is owned below.
@@ -202,10 +249,6 @@ impl Vm {
             )));
         }
         Ok((fd, run.cast()))
-    }
-
-    pub fn vcpu_mmap_size(&self) -> usize {
-        self.vcpu_mmap_size
     }
 
     pub fn cpuid(&self) -> &sys::kvm_cpuid2 {

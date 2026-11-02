@@ -20,6 +20,7 @@ use crate::abi::Arch;
 pub(crate) mod ctrl;
 pub mod mem;
 pub(crate) mod pagetable;
+mod pagevec;
 pub(crate) mod phys;
 pub(crate) mod region;
 pub(crate) mod vdso;
@@ -280,7 +281,11 @@ pub trait Vcpu: Send {
     /// Duplicate this vcpu's full register state (for `fork`/`clone`). The copy
     /// resumes at the same point; the kernel then sets the child's syscall
     /// return value and advances its PC.
-    fn fork(&self) -> Box<dyn Vcpu>;
+    ///
+    /// # Errors
+    /// The backend can't provide another vcpu right now, as with KVM's limit on
+    /// live vcpus; the guest's `fork` fails rather than the host process.
+    fn fork(&self) -> Result<Box<dyn Vcpu>, VcpuError>;
 
     /// Reset every register for `execve`: clear general/SIMD registers, flags,
     /// and TLS, then set the entry PC and initial SP for the new image.

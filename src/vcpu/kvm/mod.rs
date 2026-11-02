@@ -367,6 +367,19 @@ mod tests {
     /// `NIXVM_QUANTUM_MS` quantum, so a broken timer hangs the test rather than
     /// passing.
     #[test]
+    fn forks_outnumbering_the_kvm_vcpu_limit_are_fine_if_they_do_not_overlap() {
+        let Some(backend) = backend_or_skip() else {
+            return;
+        };
+        let vcpu = backend.new_vcpu(0x1_0000, 0x2_0000).unwrap();
+        // KVM's id limit is a few thousand and ids can't be reused, so this only
+        // works because a finished task's vcpu goes to the next one.
+        for _ in 0..10_000 {
+            vcpu.fork().expect("a finished fork's vcpu is reused");
+        }
+    }
+
+    #[test]
     fn time_quantum_preempts_a_compute_bound_guest() {
         let Some(backend) = backend_or_skip() else {
             return;

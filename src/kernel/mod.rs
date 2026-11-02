@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Write};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use crate::abi::Arch;
@@ -824,6 +824,11 @@ struct Arena {
 }
 
 impl Arena {
+    /// Drop the list of freed ranges, once nothing will allocate from this again.
+    fn forget(&mut self) {
+        self.free = Vec::new();
+    }
+
     fn new(top: u64, floor: u64) -> Self {
         Self {
             cursor: top,
@@ -1222,6 +1227,8 @@ impl ServiceCtx {
 pub struct Kernel {
     /// Host memory held for the guest (see [`crate::limits::Limits`]).
     memory_quota: Arc<crate::limits::Quota>,
+    /// Tasks that may exist at once (see [`crate::limits::Limits::tasks`]).
+    max_tasks: AtomicUsize,
     arch: Arch,
     /// Interactive mode (the browser terminal): guest reads of fd 0 draw from
     /// `Shared::stdin_buf` and *block* (re-trap) when it is empty rather than
@@ -1347,6 +1354,15 @@ pub(super) struct Shared {
     /// All tasks; the running one is `take`n out during its slice, so its
     /// slot is temporarily `None` (making `fork`/`wait4` on the table clean).
     procs: Vec<Option<Process>>,
+    /// Slots of [`Self::procs`] whose task is gone for good. (A `None` slot alone
+    /// doesn't say that: a task's slot is also empty while it runs.)
+    free_proc_slots: Vec<usize>,
+    /// Slots of [`Self::spaces`] and [`Self::mmap_areas`] no task refers to.
+    free_mm_slots: Vec<usize>,
+    /// Slots of [`Self::file_tables`] no task refers to.
+    free_file_slots: Vec<usize>,
+    /// Slots of [`Self::cwd_tables`] no task refers to.
+    free_cwd_slots: Vec<usize>,
     /// Address-space table indexed by `ProcInfo::mm`, each behind its own lock
     /// so a task's guest memory can be handed to an SMP worker thread while the
     /// main thread keeps servicing other tasks' syscalls. Threads that share
@@ -1370,6 +1386,8 @@ pub(super) struct Shared {
     /// threads can never be handed overlapping ranges.
     mmap_areas: Vec<Arena>,
     next_pid: i32,
+    /// Whether task ids have wrapped around, so a new one may be in use.
+    pids_wrapped: bool,
     /// Fair-scheduling floor: the monotonic minimum weighted virtual runtime of
     /// the run queue (CFS's `min_vruntime`). Advanced to the vruntime of each task
     /// as it is picked; a task about to run is clamped *up* to this floor first,
@@ -1427,6 +1445,115 @@ impl std::fmt::Debug for Kernel {
 }
 
 impl Shared {
+    /// Forget task `pid`, freeing its slot.
+    fn remove_task(&mut self, pid: i32, cx: &ServiceCtx) {
+        let found = self
+            .procs
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|p| p.info.pid == pid));
+        if let Some(i) = found {
+            self.free_task_slot(i, cx);
+        }
+    }
+
+    /// Empty the task slot `i`, and free whichever per-task tables it was the
+    /// last to use. These slots would otherwise add up forever over a long-lived
+    /// process tree, however few tasks exist at a time.
+    fn free_task_slot(&mut self, i: usize, cx: &ServiceCtx) {
+        let Some(gone) = self.procs[i].take() else {
+            return;
+        };
+        self.free_proc_slots.push(i);
+        // The caller is running, so it isn't in `procs` on the serial path.
+        let in_use = |sh: &Self, id: fn(&ProcInfo) -> usize, slot: usize| {
+            id(&cx.cur) == slot || sh.procs.iter().flatten().any(|p| id(&p.info) == slot)
+        };
+        let mm = gone.info.mm;
+        if !in_use(self, |p| p.mm, mm) && mm < self.spaces.len() {
+            self.sealed.retain(|s| s.0 != mm);
+            self.free_mm_slots.push(mm);
+        }
+        let files = gone.info.files;
+        if !in_use(self, |p| p.files, files) && files < self.file_tables.len() {
+            self.file_tables[files] = None;
+            self.free_file_slots.push(files);
+        }
+        let fs = gone.info.fs;
+        if !in_use(self, |p| p.fs, fs) && fs < self.cwd_tables.len() {
+            self.cwd_tables[fs] = None;
+            self.free_cwd_slots.push(fs);
+        }
+    }
+
+    /// The address-space slot the next new space will take.
+    fn next_mm_slot(&self) -> usize {
+        self.free_mm_slots
+            .last()
+            .copied()
+            .unwrap_or(self.spaces.len())
+    }
+
+    /// Remove the zombies nobody will ever `wait` for, as Linux does when they
+    /// exit: threads, and children of a parent that ignores `SIGCHLD` or set
+    /// `SA_NOCLDWAIT`. Without this they would pile up and count as live tasks.
+    fn reap_unwaited_zombies(&mut self, cx: &ServiceCtx) {
+        const SIGCHLD: usize = 17;
+        const SIG_IGN: u64 = 1;
+        const SA_NOCLDWAIT: u64 = 2;
+        let discards_children =
+            |act: SigAction| act.handler == SIG_IGN || act.flags & SA_NOCLDWAIT != 0;
+        let handlers_of = |pid: i32, procs: &[Option<Process>]| {
+            if pid == cx.cur.pid {
+                return Some(cx.cur.handlers.get(SIGCHLD));
+            }
+            let parent = procs.iter().flatten().find(|p| p.info.pid == pid)?;
+            Some(parent.info.handlers.get(SIGCHLD))
+        };
+        let gone: Vec<usize> = self
+            .procs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                let p = slot.as_ref()?;
+                if !matches!(p.info.run, RunState::Zombie(_)) {
+                    return None;
+                }
+                let unwaited = p.info.is_thread
+                    || (usize::from(p.info.exit_signal) == SIGCHLD
+                        && handlers_of(p.info.ppid, &self.procs).is_some_and(discards_children));
+                unwaited.then_some(i)
+            })
+            .collect();
+        for i in gone {
+            self.free_task_slot(i, cx);
+        }
+    }
+
+    /// The next free task id. Ids count up to Linux's largest `pid_max`, then
+    /// start over, skipping any still in use.
+    fn alloc_pid(&mut self) -> i32 {
+        const PID_MAX: i32 = 1 << 22;
+        loop {
+            let pid = self.next_pid;
+            self.next_pid = if pid + 1 >= PID_MAX {
+                self.pids_wrapped = true;
+                2
+            } else {
+                pid + 1
+            };
+            if !self.pids_wrapped
+                || !self.procs.iter().flatten().any(|p| {
+                    p.info.pid == pid
+                        || p.info.tgid == pid
+                        || p.info.pgid == pid
+                        || p.info.sid == pid
+                })
+            {
+                return pid;
+            }
+        }
+    }
+
     /// pid 1's exit code, if it has become a zombie.
     fn pid1_code(&self) -> Option<i32> {
         self.procs.iter().flatten().find_map(|p| match p.info.run {
@@ -1630,6 +1757,7 @@ impl Kernel {
         mounts.attach_quota(&memory_quota);
         Self {
             memory_quota,
+            max_tasks: AtomicUsize::new(limits.tasks as usize),
             arch,
             trace: std::env::var_os("NIXVM_TRACE").is_some(),
             schedtrace: std::env::var_os("NIXVM_SCHEDTRACE").is_some(),
@@ -1661,6 +1789,10 @@ impl Kernel {
                 umask: 0o022,
                 unsupported: BTreeMap::new(),
                 procs: Vec::new(),
+                free_proc_slots: Vec::new(),
+                free_mm_slots: Vec::new(),
+                free_file_slots: Vec::new(),
+                free_cwd_slots: Vec::new(),
                 min_vruntime: 0,
                 spaces: Vec::new(),
                 file_tables: Vec::new(),
@@ -1670,6 +1802,7 @@ impl Kernel {
                 stdin_closed: false,
                 stdin_waiting: false,
                 next_pid: 2,
+                pids_wrapped: false,
                 watch_addr: std::env::var("NIXVM_WATCHCODE")
                     .ok()
                     .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
@@ -1703,6 +1836,8 @@ impl Kernel {
     /// Replace the VM-wide resource ceilings.
     pub fn set_limits(&mut self, limits: crate::limits::Limits) {
         self.memory_quota.set_limit(limits.kernel_memory);
+        self.max_tasks
+            .store(limits.tasks as usize, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_egress(&mut self, egress: Box<dyn egress::Egress>) {
@@ -4004,6 +4139,16 @@ impl Kernel {
         {
             return err(Errno::EINVAL);
         }
+        // Resources first, before anything changes: a task that can't be created
+        // fails with EAGAIN and leaves the caller exactly as it was.
+        sh.reap_unwaited_zombies(cx);
+        let max_tasks = self.max_tasks.load(std::sync::atomic::Ordering::Relaxed);
+        if sh.procs.iter().flatten().count() >= max_tasks {
+            return err(Errno::EAGAIN);
+        }
+        let Ok(mut child_vcpu) = vcpu.fork() else {
+            return err(Errno::EAGAIN);
+        };
         // `vfork` (CLONE_VM | CLONE_VFORK, no CLONE_THREAD) asks to *borrow* the
         // parent's address space, relying on real page tables: the child runs in
         // it only until it `execve`s (which installs a fresh mm) or `_exit`s,
@@ -4030,8 +4175,7 @@ impl Kernel {
         // the child simply running against the one global view. See the flag
         // definitions for why acceptance (not EPERM) is the faithful choice.
 
-        let pid = sh.next_pid;
-        sh.next_pid += 1;
+        let pid = sh.alloc_pid();
         let mut info = cx.cur.clone();
         info.pid = pid;
         info.run = RunState::Running;
@@ -4106,7 +4250,14 @@ impl Kernel {
         // Address space: share the caller's slot (CLONE_VM), or fork a
         // copy-on-write child (both parent and child pages become shared and
         // read-on-write until the first store privatizes a page).
-        let mut child_mem = if share_vm { None } else { Some(mem.fork()) };
+        let mut child_mem = if share_vm {
+            None
+        } else {
+            let Some(child) = mem.try_fork() else {
+                return err(Errno::ENOMEM);
+            };
+            Some(child)
+        };
         info.mm = if share_vm {
             // A thread shares this address space: mark it so the SMP scheduler
             // runs its tasks serialized (one page-table tree + one kstack frame
@@ -4116,7 +4267,7 @@ impl Kernel {
             mem.mark_shared();
             cx.cur.mm
         } else {
-            sh.spaces.len()
+            sh.next_mm_slot()
         };
 
         info.clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 {
@@ -4186,8 +4337,13 @@ impl Kernel {
                     pipes[i].writers += 1;
                 }
             }
-            info.files = sh.file_tables.len();
-            sh.file_tables.push(Some(copy));
+            info.files = if let Some(slot) = sh.free_file_slots.pop() {
+                sh.file_tables[slot] = Some(copy);
+                slot
+            } else {
+                sh.file_tables.push(Some(copy));
+                sh.file_tables.len() - 1
+            };
         }
 
         // Filesystem context (cwd). CLONE_FS shares the caller's `cwd_tables`
@@ -4197,13 +4353,19 @@ impl Kernel {
         if share_fs {
             info.fs = cx.cur.fs;
         } else {
-            info.fs = sh.cwd_tables.len();
-            sh.cwd_tables.push(Some(cx.cur.cwd.clone()));
+            let cwd = cx.cur.cwd.clone();
+            info.fs = if let Some(slot) = sh.free_cwd_slots.pop() {
+                sh.cwd_tables[slot] = Some(cwd);
+                slot
+            } else {
+                sh.cwd_tables.push(Some(cwd));
+                sh.cwd_tables.len() - 1
+            };
         }
 
         if let Some(cm) = child_mem.take() {
             // Seals are a property of the mappings, which the copy inherits.
-            let child_mm = sh.spaces.len();
+            let child_mm = sh.next_mm_slot();
             let seals: Vec<_> = sh
                 .sealed
                 .iter()
@@ -4217,11 +4379,16 @@ impl Kernel {
             // pages were copied); `CLONE_VM` threads instead share the parent's
             // `mmap_areas[mm]` entry and never reach here.
             let inherited = sh.mmap_areas[cx.cur.mm].clone();
-            sh.mmap_areas.push(inherited);
-            sh.spaces.push(Arc::new(Mutex::new(cm)));
+            let space = Arc::new(Mutex::new(cm));
+            if sh.free_mm_slots.pop().is_some() {
+                sh.mmap_areas[child_mm] = inherited;
+                sh.spaces[child_mm] = space;
+            } else {
+                sh.mmap_areas.push(inherited);
+                sh.spaces.push(space);
+            }
         }
 
-        let mut child_vcpu = vcpu.fork();
         if stack != 0 {
             child_vcpu.set_sp(stack);
         }
@@ -4258,10 +4425,14 @@ impl Kernel {
                 let _ = mem.write(ca.pidfd_ptr, &(pidfd as u32).to_le_bytes());
             }
         }
-        sh.procs.push(Some(Process {
+        let child = Process {
             vcpu: Some(child_vcpu),
             info,
-        }));
+        };
+        match sh.free_proc_slots.pop() {
+            Some(slot) => sh.procs[slot] = Some(child),
+            None => sh.procs.push(Some(child)),
+        }
         i64::from(pid)
     }
 
@@ -4540,12 +4711,7 @@ impl Kernel {
                 let _ = mem.write(rusage, &rusage_bytes(child_cpu));
             }
             cx.cur.child_cpu_ns = cx.cur.child_cpu_ns.saturating_add(child_cpu);
-            for slot in &mut sh.procs {
-                if slot.as_ref().is_some_and(|p| p.info.pid == child) {
-                    *slot = None;
-                    break;
-                }
-            }
+            sh.remove_task(child, cx);
             return i64::from(child);
         }
         // WUNTRACED: report a stopped child (WIFSTOPPED | WSTOPSIG<<8), latching
@@ -4697,12 +4863,7 @@ impl Kernel {
             // child's CPU into the parent (that happens when it's actually reaped).
             if options & WNOWAIT == 0 {
                 cx.cur.child_cpu_ns = cx.cur.child_cpu_ns.saturating_add(child_cpu);
-                for slot in &mut sh.procs {
-                    if slot.as_ref().is_some_and(|p| p.info.pid == child) {
-                        *slot = None;
-                        break;
-                    }
-                }
+                sh.remove_task(child, cx);
             }
             return 0;
         }
@@ -5113,8 +5274,9 @@ impl Kernel {
         // not accumulate dead processes' frames. Threads sharing the mm keep it.
         if !self.has_cowaiter(sh, mm) {
             sh.ipc.detach_mm(mm, mem);
-            mem.release();
+            mem.retire();
             self.pc_gc(mem);
+            sh.mmap_areas[mm].forget();
         }
         // The thread group's last task applies its SEM_UNDO adjustments (and
         // wakes anyone those unblock).
@@ -8883,8 +9045,8 @@ mod tests {
         }
         fn set_sp(&mut self, _v: u64) {}
         fn set_tls(&mut self, _v: u64) {}
-        fn fork(&self) -> Box<dyn Vcpu> {
-            Box::new(self.clone())
+        fn fork(&self) -> Result<Box<dyn Vcpu>, VcpuError> {
+            Ok(Box::new(self.clone()))
         }
         fn reset(&mut self, _e: u64, _s: u64) {}
     }
@@ -8936,8 +9098,8 @@ mod tests {
         }
         fn set_sp(&mut self, _v: u64) {}
         fn set_tls(&mut self, _v: u64) {}
-        fn fork(&self) -> Box<dyn Vcpu> {
-            Box::new(self.clone())
+        fn fork(&self) -> Result<Box<dyn Vcpu>, VcpuError> {
+            Ok(Box::new(self.clone()))
         }
         fn reset(&mut self, _e: u64, _s: u64) {}
     }
@@ -8993,8 +9155,8 @@ mod tests {
         }
         fn set_sp(&mut self, _v: u64) {}
         fn set_tls(&mut self, _v: u64) {}
-        fn fork(&self) -> Box<dyn Vcpu> {
-            Box::new(self.clone())
+        fn fork(&self) -> Result<Box<dyn Vcpu>, VcpuError> {
+            Ok(Box::new(self.clone()))
         }
         fn reset(&mut self, _e: u64, _s: u64) {}
     }
@@ -10531,6 +10693,120 @@ mod tests {
             flags: SA_RESTART,
             ..SigAction::default()
         }
+    }
+
+    /// Mark `pid` a zombie, as its exit would.
+    fn zombify(k: &Kernel, pid: i64) {
+        let mut sh = k.shared.lock().unwrap();
+        let p = sh.procs.iter_mut().flatten();
+        let mut p = p.filter(|p| i64::from(p.info.pid) == pid);
+        p.next().unwrap().info.run = RunState::Zombie(ExitCause::Exited(0));
+    }
+
+    fn task_exists(k: &Kernel, pid: i64) -> bool {
+        let sh = k.shared.lock().unwrap();
+        let mut tasks = sh.procs.iter().flatten();
+        tasks.any(|p| i64::from(p.info.pid) == pid)
+    }
+
+    #[test]
+    fn a_task_limit_counts_only_tasks_that_can_still_be_waited_for() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let mut limits = crate::limits::Limits::for_this_host();
+        limits.tasks = 3;
+        let mut k = k;
+        k.set_limits(limits);
+        const THREAD: u64 = 0x100 | 0x800 | 0x1_0000;
+        let mut clone = |k: &Kernel, flags: u64| {
+            call(
+                k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Clone,
+                [flags, 0, 0, 0, 0, 0],
+            )
+        };
+        let (a, b) = (clone(&k, 0x11), clone(&k, 0x11));
+        let thread = clone(&k, THREAD);
+        assert!(a > 0 && b > 0 && thread > 0);
+        assert_eq!(clone(&k, 0x11), err(Errno::EAGAIN), "at the limit");
+        assert_eq!(clone(&k, THREAD), err(Errno::EAGAIN));
+        // A zombie child still counts: its parent may yet wait for it.
+        zombify(&k, a);
+        assert_eq!(clone(&k, 0x11), err(Errno::EAGAIN));
+        assert!(task_exists(&k, a));
+        // A finished thread doesn't: nothing can wait for it.
+        zombify(&k, thread);
+        assert!(clone(&k, 0x11) > 0);
+        assert!(!task_exists(&k, thread));
+    }
+
+    #[test]
+    fn ignoring_sigchld_means_children_do_not_linger_as_zombies() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let mut limits = crate::limits::Limits::for_this_host();
+        limits.tasks = 2;
+        let mut k = k;
+        k.set_limits(limits);
+        let mut clone = |k: &Kernel, cx: &mut ServiceCtx| {
+            let args = [0x11, 0, 0, 0, 0, 0];
+            call(k, cx, &mut mem, &mut v, Sysno::Clone, args)
+        };
+        let child = clone(&k, &mut cx);
+        cx.cur.handlers.set(
+            17,
+            SigAction {
+                handler: 1, // SIG_IGN
+                ..SigAction::default()
+            },
+        );
+        assert!(clone(&k, &mut cx) > 0);
+        zombify(&k, child);
+        assert!(clone(&k, &mut cx) > 0, "the zombie made way");
+        assert!(!task_exists(&k, child));
+    }
+
+    #[test]
+    fn a_finished_tasks_table_slots_are_reused() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let args = [0x11, 0, 0, 0, 0, 0];
+        // This test's caller isn't in the tables, so the first child lands on the
+        // slots it claims to use. Settle past that before measuring.
+        for _ in 0..2 {
+            let settle = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, args);
+            k.shared.lock().unwrap().remove_task(settle as i32, &cx);
+        }
+        let sizes = |k: &Kernel| {
+            let sh = k.shared.lock().unwrap();
+            (
+                sh.procs.len(),
+                sh.spaces.len(),
+                sh.mmap_areas.len(),
+                sh.file_tables.len(),
+                sh.cwd_tables.len(),
+            )
+        };
+        let slots = sizes(&k);
+        for _ in 0..20 {
+            let child = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, args);
+            k.shared.lock().unwrap().remove_task(child as i32, &cx);
+        }
+        assert_eq!(sizes(&k), slots);
+    }
+
+    #[test]
+    fn task_ids_wrap_around_and_skip_ones_in_use() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let args = [0x11, 0, 0, 0, 0, 0];
+        let child = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, args);
+        k.shared.lock().unwrap().next_pid = (1 << 22) - 1;
+        let last = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, args);
+        assert_eq!(last, (1 << 22) - 1);
+        // Wraps to the bottom, and steps over the child still alive there.
+        k.shared.lock().unwrap().next_pid = child as i32;
+        let next = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, args);
+        assert_eq!(next, child + 1);
     }
 
     #[test]

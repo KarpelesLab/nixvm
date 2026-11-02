@@ -279,12 +279,21 @@ impl KvmVcpu {
     /// Create and fully configure a vcpu (CPUID, MSRs, long-mode sregs) with
     /// zeroed general registers; the caller sets rip/rsp.
     fn create(vm: Arc<Vm>) -> Result<Self, VcpuError> {
-        let (fd, run) = vm.create_vcpu()?;
+        let reused = vm.reuse_vcpu();
+        let is_new = reused.is_none();
+        let (fd, run) = match reused {
+            Some(vcpu) => vcpu,
+            None => vm.create_vcpu()?,
+        };
 
-        // SAFETY: `fd` is a live vcpu fd; the cpuid2 struct is valid for the
-        // call and the kernel only reads it.
-        let ret = unsafe { sys::ioctl(fd.0, sys::KVM_SET_CPUID2, std::ptr::from_ref(vm.cpuid())) };
-        check(ret, "KVM_SET_CPUID2")?;
+        // Fixed once a vcpu has run, and already right on a reused one.
+        if is_new {
+            // SAFETY: `fd` is a live vcpu fd; the cpuid2 struct is valid for the
+            // call and the kernel only reads it.
+            let ret =
+                unsafe { sys::ioctl(fd.0, sys::KVM_SET_CPUID2, std::ptr::from_ref(vm.cpuid())) };
+            check(ret, "KVM_SET_CPUID2")?;
+        }
 
         // The syscall trampoline wiring (see `super::vm`).
         let entries = [
@@ -399,7 +408,10 @@ impl KvmVcpu {
             ebp,
             quantum: crate::vcpu::preempt_quantum(),
             cur_cr3: None,
-            tlb_flush_pending: false,
+            // A reused vcpu's TLB still holds the previous task's translations,
+            // and a page table freed by that task can come back at the same
+            // physical address: KVM wouldn't flush on a cr3 it thinks unchanged.
+            tlb_flush_pending: !is_new,
             phys: None,
             kstack_pa: 0,
         })
@@ -902,13 +914,13 @@ impl Vcpu for KvmVcpu {
         self.sregs_dirty = true;
     }
 
-    fn fork(&self) -> Box<dyn Vcpu> {
+    fn fork(&self) -> Result<Box<dyn Vcpu>, VcpuError> {
         // A sibling vcpu in the same VM, cloned from the cached (just
         // refreshed) register state — including the mid-trap CPL0 segment
         // state, so the child's resume path is identical to the parent's. The
         // child re-issues the guest slot for its own (forked) memory on its
         // first `run` via the backing-generation seam.
-        let mut child = Self::create(self.vm.clone()).expect("create KVM vcpu (fork)");
+        let mut child = Self::create(self.vm.clone())?;
         child.regs = self.regs;
         child.regs_dirty = true;
         child.sregs = self.sregs;
@@ -921,11 +933,11 @@ impl Vcpu for KvmVcpu {
         let mut fpu = sys::kvm_fpu::default();
         // SAFETY: valid out-pointer; both fds are live vcpus of this VM.
         let ret = unsafe { sys::ioctl(self.fd.0, sys::KVM_GET_FPU, std::ptr::from_mut(&mut fpu)) };
-        check(ret, "KVM_GET_FPU").expect("read FPU state (fork)");
+        check(ret, "KVM_GET_FPU")?;
         // SAFETY: as above; the kernel only reads the struct.
         let ret = unsafe { sys::ioctl(child.fd.0, sys::KVM_SET_FPU, std::ptr::from_ref(&fpu)) };
-        check(ret, "KVM_SET_FPU").expect("write FPU state (fork)");
-        Box::new(child)
+        check(ret, "KVM_SET_FPU")?;
+        Ok(Box::new(child))
     }
 
     fn reset(&mut self, entry: u64, sp: u64) {
@@ -1020,8 +1032,9 @@ impl Vcpu for KvmVcpu {
 
 impl Drop for KvmVcpu {
     fn drop(&mut self) {
-        // SAFETY: `run` is the live mapping created in `Vm::create_vcpu`,
-        // unmapped exactly once here; the fd closes via its own Drop.
-        unsafe { sys::munmap(self.run.cast(), self.vm.vcpu_mmap_size()) };
+        // The fd and the `kvm_run` mapping go together to the VM's idle list. A
+        // placeholder fd is left behind, whose close is a harmless EBADF.
+        let fd = std::mem::replace(&mut self.fd, super::vm::Fd(-1));
+        self.vm.recycle_vcpu(fd, self.run);
     }
 }

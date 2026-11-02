@@ -259,7 +259,7 @@ impl Vcpu for HvfVcpu {
         self.set_sys(HV_SYS_REG_TPIDR_EL0, value);
     }
 
-    fn fork(&self) -> Box<dyn Vcpu> {
+    fn fork(&self) -> Result<Box<dyn Vcpu>, VcpuError> {
         // Create a sibling vcpu and copy the full guest register context. The
         // child re-maps its own (forked) memory on its first `run`.
         let vm = vm().expect("process VM exists (parent already created one)");
@@ -289,7 +289,7 @@ impl Vcpu for HvfVcpu {
         child.set_sys(HV_SYS_REG_VBAR_EL1, stub_ipa);
         child.set_sys(HV_SYS_REG_SCTLR_EL1, SCTLR_EL1_MMU_OFF);
         child.set_sys(HV_SYS_REG_CPACR_EL1, CPACR_EL1_FP_ON);
-        Box::new(child)
+        Ok(Box::new(child))
     }
 
     fn reset(&mut self, entry: u64, sp: u64) {

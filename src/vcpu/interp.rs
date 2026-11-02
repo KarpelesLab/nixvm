@@ -479,8 +479,8 @@ impl Vcpu for Aarch64Interp {
         self.tpidr = value;
     }
 
-    fn fork(&self) -> Box<dyn Vcpu> {
-        Box::new(self.clone())
+    fn fork(&self) -> Result<Box<dyn Vcpu>, VcpuError> {
+        Ok(Box::new(self.clone()))
     }
 
     fn reset(&mut self, entry: u64, sp: u64) {

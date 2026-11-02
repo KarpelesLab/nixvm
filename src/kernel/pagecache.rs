@@ -379,7 +379,7 @@ mod tests {
         let mut child = mem.fork();
         child.write(b, b"kid").unwrap();
         assert_eq!(mem.read_vec(a, 3).unwrap(), b"kid");
-        child.release(); // the child exits: its mappings go away
+        child.retire(); // the child exits: its mappings go away
         // Unmapping both releases the cache entry.
         assert_eq!(
             call(

@@ -1675,7 +1675,7 @@ mod tests {
         let mut child = mem.fork();
         child.write(a1, b"from child").unwrap();
         assert_eq!(mem.read_vec(a1, 10).unwrap(), b"from child");
-        child.release();
+        child.retire();
         let ds = BASE;
         assert_eq!(
             call(

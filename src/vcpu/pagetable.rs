@@ -126,6 +126,8 @@ pub struct Translation {
 /// Why a [`AddrSpace::map`] could not install a mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapErr {
+    /// The address space belongs to a process that has exited.
+    Retired,
     /// `vaddr` or `frame_pa` was not 4 KiB-aligned; the offending address.
     Misaligned(u64),
     /// The frame allocator was exhausted while allocating an interior table. Any
@@ -164,6 +166,13 @@ impl AddrSpace {
     #[must_use]
     pub fn cr3(&self) -> u64 {
         self.pml4
+    }
+
+    /// A space holding no frames at all, for a process that has exited. Frame 0
+    /// is the permanently pinned, zeroed null frame, so every lookup finds nothing
+    /// and [`AddrSpace::map`] refuses.
+    pub(crate) fn retired() -> Self {
+        Self { pml4: 0 }
     }
 
     /// Read the entry at slot `idx` of the table at `table_pa`.
@@ -213,6 +222,9 @@ impl AddrSpace {
         fa: &mut FrameAllocator,
         phys: &PhysMem,
     ) -> Result<Option<u64>, MapErr> {
+        if self.pml4 == 0 {
+            return Err(MapErr::Retired);
+        }
         if !vaddr.is_multiple_of(PAGE_SIZE) {
             return Err(MapErr::Misaligned(vaddr));
         }
@@ -355,6 +367,9 @@ impl AddrSpace {
     /// page-table frame (leaves up through the PML4) back to `fa`. Consumes the
     /// `AddrSpace` — see the module docs on why this can't be `Drop`.
     pub fn destroy(self, fa: &mut FrameAllocator, phys: &PhysMem) {
+        if self.pml4 == 0 {
+            return;
+        }
         free_subtree(PML4_LEVEL, self.pml4, fa, phys);
         fa.free(self.pml4);
     }

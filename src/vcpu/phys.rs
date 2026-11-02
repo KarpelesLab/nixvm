@@ -237,6 +237,12 @@ pub struct FrameAllocator {
     /// Count of live (non-pinned, refcount ≥ 1) frames, tracked so `alloc_count`
     /// is O(1) rather than a scan of `refcount`.
     allocated: usize,
+    /// Frames ordinary allocations leave free, so that tearing down an address
+    /// space, which needs a few frames to free many, can't be starved by a guest
+    /// that filled the pool.
+    reserve: usize,
+    /// Whether allocations may currently dip into [`Self::reserve`].
+    use_reserve: bool,
 }
 
 impl FrameAllocator {
@@ -258,6 +264,8 @@ impl FrameAllocator {
             refcount,
             free_list,
             allocated: 0,
+            reserve: 0,
+            use_reserve: false,
         }
     }
 
@@ -282,6 +290,9 @@ impl FrameAllocator {
     /// is taken by shared reference — the allocator is the sole authority on which
     /// frame is free, so zeroing it races with no other owner.
     pub fn alloc(&mut self, phys: &PhysMem) -> Option<u64> {
+        if !self.use_reserve && self.free_list.len() <= self.reserve {
+            return None;
+        }
         let f = self.free_list.pop()?;
         debug_assert_eq!(self.refcount[f as usize], 0, "free-list frame was not free");
         self.refcount[f as usize] = 1;
@@ -289,6 +300,16 @@ impl FrameAllocator {
         let pa = u64::from(f) * FRAME;
         phys.zero_frame(pa);
         Some(pa)
+    }
+
+    /// Keep `frames` free for allocations made under [`Self::set_use_reserve`].
+    pub fn set_reserve(&mut self, frames: usize) {
+        self.reserve = frames;
+    }
+
+    /// Let allocations dip into the reserve, or stop them doing so.
+    pub fn set_use_reserve(&mut self, on: bool) {
+        self.use_reserve = on;
     }
 
     /// Add a reference to the frame at `pa` — a second address space now shares
@@ -404,6 +425,22 @@ mod tests {
         let phys = PhysMem::new(nframes as usize * FRAME_SZ);
         let alloc = FrameAllocator::new(phys.nframes());
         (phys, alloc)
+    }
+
+    #[test]
+    fn ordinary_allocations_leave_the_reserve_alone() {
+        let (phys, mut fa) = pool(16);
+        let total = fa.free_count();
+        fa.set_reserve(4);
+        for _ in 0..total - 4 {
+            assert!(fa.alloc(&phys).is_some());
+        }
+        assert_eq!(fa.alloc(&phys), None, "stops at the reserve");
+        fa.set_use_reserve(true);
+        for _ in 0..4 {
+            assert!(fa.alloc(&phys).is_some());
+        }
+        assert_eq!(fa.alloc(&phys), None, "and then it really is empty");
     }
 
     #[test]

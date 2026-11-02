@@ -3219,8 +3219,8 @@ impl Vcpu for X86Interp {
         self.fs_base = value;
     }
 
-    fn fork(&self) -> Box<dyn Vcpu> {
-        Box::new(self.clone())
+    fn fork(&self) -> Result<Box<dyn Vcpu>, VcpuError> {
+        Ok(Box::new(self.clone()))
     }
 
     fn reset(&mut self, entry: u64, sp: u64) {
@@ -3712,7 +3712,7 @@ mod tests {
     fn fork_and_reset() {
         let mut cpu = X86Interp::new(CODE, STACK);
         cpu.gpr[RAX] = 42;
-        let forked = cpu.fork();
+        let forked = cpu.fork().unwrap();
         assert_eq!(forked.reg(RAX), 42);
 
         cpu.reset(0x2_0000, 0x3_0000);
