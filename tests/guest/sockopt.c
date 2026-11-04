@@ -5,7 +5,10 @@
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -55,5 +58,15 @@ int main(void) {
   getsockopt(a, IPPROTO_TCP, TCP_NODELAY, &v, &l); CHECK(v == 1, "TCP_NODELAY reads back");
   CHECK(!setsockopt(a, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one), "SO_KEEPALIVE accepted");
   v = 1 << 30; setsockopt(a, SOL_SOCKET, SO_RCVBUF, &v, sizeof v); getsockopt(a, SOL_SOCKET, SO_RCVBUF, &v, &l); CHECK(v > 0 && v < (1 << 30), "SO_RCVBUF clamped (%d)", v);
+  /* SO_PEERCRED is the other end's, not the caller's: a root server sees an
+     ordinary client as itself. */
+  { int ls = socket(AF_UNIX, SOCK_STREAM, 0); struct sockaddr_un ad = {AF_UNIX}; strcpy(ad.sun_path + 1, "peercred"); socklen_t al = offsetof(struct sockaddr_un, sun_path) + 9;
+    CHECK(!bind(ls, (void *)&ad, al) && !listen(ls, 1), "listen on an abstract socket");
+    fflush(stdout); pid_t c = fork();
+    if (!c) { if (setresgid(4322, 4322, 4322) || setresuid(4321, 4321, 4321)) _exit(2); int s = socket(AF_UNIX, SOCK_STREAM, 0); if (connect(s, (void *)&ad, al)) _exit(3);
+      struct ucred u; socklen_t ul = sizeof u; getsockopt(s, SOL_SOCKET, SO_PEERCRED, &u, &ul); char x; read(s, &x, 1); _exit(u.uid == 0 && u.pid == getppid() ? 0 : 4); }
+    int as = accept(ls, 0, 0); struct ucred u; socklen_t ul = sizeof u; CHECK(!getsockopt(as, SOL_SOCKET, SO_PEERCRED, &u, &ul) && u.pid == c && u.uid == 4321 && u.gid == 4322, "the server sees the client: pid %d uid %u gid %u", u.pid, u.uid, u.gid);
+    close(as); int st; waitpid(c, &st, 0); CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "the client sees the listener (%#x)", st);
+    int sv[2]; socketpair(AF_UNIX, SOCK_STREAM, 0, sv); ul = sizeof u; getsockopt(sv[0], SOL_SOCKET, SO_PEERCRED, &u, &ul); CHECK(u.pid == getpid(), "a socketpair's peer is its creator"); close(ls); }
   puts(fails ? "SOME FAILED" : "PASS"); return fails != 0;
 }

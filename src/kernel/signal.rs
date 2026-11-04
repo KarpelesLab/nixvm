@@ -501,8 +501,8 @@ impl Kernel {
         // A bare kill carries SI_USER (code 0) with the sender's pid.
         let sender = super::QueuedSig {
             code: 0,
-            pid: cx.cur.pid,
-            uid: 0,
+            pid: cx.cur.tgid,
+            uid: cx.cur.creds.ruid,
             value: 0,
         };
         self.post_signal(sh, cx, pid, sig, sender)
@@ -548,7 +548,8 @@ impl Kernel {
                 cx.cur.pending |= bit;
                 if deliver {
                     if queue_info {
-                        cx.cur.post_siginfo(sig, sender);
+                        cx.cur
+                            .post_siginfo(sig, self.seen_by(cx.cur.ns.pid, sender));
                     }
                     // The current task is Running (it's executing this syscall),
                     // so this never resumes it, but it still applies the
@@ -570,7 +571,8 @@ impl Kernel {
                     slot.info.parked = false;
                     if deliver {
                         if queue_info {
-                            slot.info.post_siginfo(sig, sender);
+                            slot.info
+                                .post_siginfo(sig, self.seen_by(slot.info.ns.pid, sender));
                         }
                         resumed_ppid = apply_stop_cont(&mut slot.info, sig);
                     }
@@ -602,7 +604,8 @@ impl Kernel {
         {
             cx.cur.pending |= bit;
             if deliver {
-                cx.cur.post_siginfo(sig, sender);
+                cx.cur
+                    .post_siginfo(sig, self.seen_by(cx.cur.ns.pid, sender));
                 if let Some(ppid) = apply_stop_cont(&mut cx.cur, sig) {
                     resumed_ppids.push(ppid);
                 }
@@ -618,7 +621,8 @@ impl Kernel {
                 slot.info.pending |= bit;
                 slot.info.parked = false;
                 if deliver {
-                    slot.info.post_siginfo(sig, sender);
+                    slot.info
+                        .post_siginfo(sig, self.seen_by(slot.info.ns.pid, sender));
                     if let Some(ppid) = apply_stop_cont(&mut slot.info, sig) {
                         resumed_ppids.push(ppid);
                     }
@@ -630,6 +634,25 @@ impl Kernel {
             notify_parent(sh, cx, ppid);
         }
         if hit { 0 } else { err(Errno::ESRCH) }
+    }
+
+    /// A pid as the current task sees it, where 0 (no process) stays 0.
+    pub(super) fn sender_pid_seen(&self, cx: &ServiceCtx, pid: i32) -> i32 {
+        if pid <= 0 {
+            pid
+        } else {
+            self.visible_pid(cx, pid)
+        }
+    }
+
+    /// Signal info as a receiver in PID namespace `ns` gets it: like Linux, the
+    /// sender's pid is turned into its number there (0 if it isn't in it) when
+    /// the signal is queued, while the sender still has one.
+    pub(super) fn seen_by(&self, ns: u32, mut qs: super::QueuedSig) -> super::QueuedSig {
+        if qs.pid > 0 && ns != 0 {
+            qs.pid = self.pids.lock().unwrap().to_local(qs.pid, ns);
+        }
+        qs
     }
 
     /// `rt_sigqueueinfo(pid, sig, uinfo)` / `rt_tgsigqueueinfo(tgid, tid, sig,
@@ -652,8 +675,8 @@ impl Kernel {
         let value = mem.read_u64(uinfo + 24).unwrap_or(0);
         let info = QueuedSig {
             code,
-            pid: cx.cur.pid,
-            uid: 0,
+            pid: cx.cur.tgid,
+            uid: cx.cur.creds.ruid,
             value,
         };
         // Post with the caller's siginfo directly (a real-time signal thereby

@@ -7,7 +7,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <sys/mman.h>
+#include <sys/msg.h>
+#include <sys/shm.h>
+#include <sys/signalfd.h>
+#include <sys/un.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -51,6 +56,30 @@ static int init_main(int outer_pid) {
   char link[32] = {0}; readlink("/proc/self", link, 31); CHECK(atoi(link) == 1 || link[0] == 0 || 1, "/proc/self: %s", link);
   /* Socket peer pid */
   int sv[2]; socketpair(AF_UNIX, SOCK_STREAM, 0, sv); struct ucred cr; socklen_t l = sizeof cr; getsockopt(sv[0], SOL_SOCKET, SO_PEERCRED, &cr, &l); CHECK(cr.pid == 1, "SO_PEERCRED pid is local (%d)", cr.pid);
+  /* Everything else that reports a pid reports it as seen here. */
+  { sigset_t m; sigemptyset(&m); sigaddset(&m, SIGUSR2); sigaddset(&m, SIGRTMIN); sigaddset(&m, SIGCHLD); sigprocmask(SIG_BLOCK, &m, 0);
+    c = fork(); if (!c) { union sigval v = {.sival_int = 42}; sigqueue(getppid(), SIGUSR2, v); sigqueue(getppid(), SIGRTMIN, v); _exit(0); }
+    siginfo_t qi; struct timespec z = {2, 0}; sigset_t one; sigemptyset(&one); sigaddset(&one, SIGCHLD);
+    CHECK(sigtimedwait(&one, &qi, &z) == SIGCHLD && qi.si_pid == c, "SIGCHLD's si_pid is local (%d, want %d)", qi.si_pid, c); status_of(c);
+    sigemptyset(&one); sigaddset(&one, SIGUSR2);
+    int r2 = sigtimedwait(&one, &qi, &z); CHECK(r2 == SIGUSR2 && qi.si_pid == c && qi.si_value.sival_int == 42, "sigqueue's si_pid is local (%d, want %d; signal %d, value %d)", qi.si_pid, c, r2, qi.si_value.sival_int);
+    sigset_t rt; sigemptyset(&rt); sigaddset(&rt, SIGRTMIN); int sfd = signalfd(-1, &rt, 0); struct signalfd_siginfo fi; memset(&fi, 0, sizeof fi);
+    CHECK(read(sfd, &fi, sizeof fi) == sizeof fi && fi.ssi_pid == (unsigned)c && fi.ssi_code == SI_QUEUE && fi.ssi_int == 42, "signalfd carries the sender, code and value (pid %u code %d int %d)", fi.ssi_pid, fi.ssi_code, fi.ssi_int);
+    close(sfd); sigprocmask(SIG_UNBLOCK, &m, 0); }
+  { int ls = socket(AF_UNIX, SOCK_STREAM, 0); struct sockaddr_un ad = {AF_UNIX}; strcpy(ad.sun_path + 1, "nspeer"); socklen_t al = offsetof(struct sockaddr_un, sun_path) + 7; bind(ls, (void *)&ad, al); listen(ls, 1);
+    int rp[2]; pipe(rp);
+    c = fork(); if (!c) { int s = socket(AF_UNIX, SOCK_STREAM, 0); connect(s, (void *)&ad, al); struct ucred u; socklen_t ul = sizeof u; getsockopt(s, SOL_SOCKET, SO_PEERCRED, &u, &ul); char x = u.pid == 1; write(rp[1], &x, 1); read(s, &x, 1); _exit(0); }
+    int as = accept(ls, 0, 0); struct ucred u; socklen_t ul = sizeof u; getsockopt(as, SOL_SOCKET, SO_PEERCRED, &u, &ul); char x = 0; read(rp[0], &x, 1);
+    CHECK(u.pid == c && x == 1, "SO_PEERCRED names the other end (%d, want %d), and the client sees the listener (%d)", u.pid, c, x); close(as); status_of(c); close(ls); }
+  { int q = msgget(IPC_PRIVATE, 0600), rp[2]; pipe(rp); c = fork(); if (!c) { struct { long t; char b[4]; } mm = {1, "hi"}; msgsnd(q, &mm, 4, 0); char x = 1; write(rp[1], &x, 1); pause(); _exit(0); }
+    char x; read(rp[0], &x, 1); struct msqid_ds ds; msgctl(q, IPC_STAT, &ds); CHECK(ds.msg_lspid == c, "msg_lspid is local (%d, want %d)", ds.msg_lspid, c); kill(c, SIGKILL); status_of(c); msgctl(q, IPC_RMID, 0);
+    int sh = shmget(IPC_PRIVATE, 4096, 0600); struct shmid_ds sd; shmctl(sh, IPC_STAT, &sd); CHECK(sd.shm_cpid == 1, "shm_cpid is local (%d)", sd.shm_cpid); shmctl(sh, IPC_RMID, 0); }
+  { int f = open("/tmp/nslock", O_CREAT | O_RDWR, 0600); int rp[2]; pipe(rp);
+    c = fork(); if (!c) { struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET}; fcntl(f, F_SETLK, &fl); char x = 1; write(rp[1], &x, 1); pause(); _exit(0); }
+    char x; read(rp[0], &x, 1); struct flock q = {.l_type = F_WRLCK, .l_whence = SEEK_SET}; fcntl(f, F_GETLK, &q); CHECK(q.l_type == F_WRLCK && q.l_pid == c, "F_GETLK's l_pid is local (%d, want %d)", q.l_pid, c);
+    CHECK(!fcntl(f, F_SETOWN, c) && fcntl(f, F_GETOWN) == c, "F_SETOWN/F_GETOWN take local ids (%d)", fcntl(f, F_GETOWN));
+    struct f_owner_ex ox = {F_OWNER_PID, c}, oy = {0}; fcntl(f, F_SETOWN_EX, &ox); fcntl(f, F_GETOWN_EX, &oy); CHECK(oy.type == F_OWNER_PID && oy.pid == c && ox.pid == c, "and F_SETOWN_EX/F_GETOWN_EX (%d)", oy.pid);
+    kill(c, SIGKILL); status_of(c); close(f); unlink("/tmp/nslock"); }
   /* A nested namespace. */
   c = fork(); if (!c) { if (unshare(CLONE_NEWPID)) _exit(50); pid_t g = fork(); if (!g) _exit(getpid() == 1 && getppid() == 0 ? 0 : 1); pid_t mine = getpid(); int s2; waitpid(g, &s2, 0); _exit(mine != 1 && WIFEXITED(s2) && WEXITSTATUS(s2) == 0 && g > 1 ? 0 : 51); } st = status_of(c); CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "nested namespace: its first child is 1 there, and has a number here too (%#x)", st);
   /* Leave a child that init's death must kill; the outer test watches it. */

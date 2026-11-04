@@ -957,8 +957,25 @@ impl Kernel {
             }
             let sig = ready.trailing_zeros() + 1;
             cx.cur.pending &= !(1u64 << (sig - 1));
+            // One queued instance per entry, as a handler would get it; a
+            // real-time signal with more queued stays pending for the next.
+            let (info, more) = cx.cur.take_siginfo(u64::from(sig));
+            if more {
+                cx.cur.pending |= 1u64 << (sig - 1);
+            }
             let mut si = [0u8; 128];
             si[0..4].copy_from_slice(&sig.to_le_bytes()); // ssi_signo
+            if let Some(q) = info {
+                si[8..12].copy_from_slice(&q.code.to_le_bytes()); // ssi_code
+                si[12..16].copy_from_slice(&q.pid.to_le_bytes()); // ssi_pid
+                si[16..20].copy_from_slice(&q.uid.to_le_bytes()); // ssi_uid
+                si[44..48].copy_from_slice(&(q.value as u32).to_le_bytes()); // ssi_int
+                si[48..56].copy_from_slice(&q.value.to_le_bytes()); // ssi_ptr
+                if sig == 17 {
+                    // SIGCHLD keeps the child's status where si_status is.
+                    si[40..44].copy_from_slice(&(q.value as u32).to_le_bytes()); // ssi_status
+                }
+            }
             if mem.write(buf + off, &si).is_err() {
                 return err(Errno::EFAULT);
             }

@@ -206,8 +206,8 @@ impl Kernel {
     }
 
     /// Whether a signal may reach `target`: a namespace's init is shielded from
-    /// signals it hasn't installed a handler for. Only `SIGKILL` and `SIGSTOP`
-    /// from an outer namespace get through regardless.
+    /// signals it hasn't installed a handler for or blocked. Only `SIGKILL` and
+    /// `SIGSTOP` from an outer namespace get through regardless.
     pub(super) fn signal_reaches_init(
         &self,
         cx: &ServiceCtx,
@@ -230,7 +230,11 @@ impl Kernel {
         {
             return true;
         }
-        !matches!(sig, SIGKILL | SIGSTOP) && target.handlers.get(sig as usize).handler != SIG_DFL
+        // A signal init has blocked still gets queued, for sigwaitinfo or a
+        // signalfd to collect.
+        let blocked = sig <= 64 && target.blocked & (1u64 << (sig - 1)) != 0;
+        !matches!(sig, SIGKILL | SIGSTOP)
+            && (blocked || target.handlers.get(sig as usize).handler != SIG_DFL)
     }
 
     /// Run a syscall for a task in a nested PID namespace: the ids in its arguments
@@ -338,15 +342,121 @@ impl Kernel {
                 map_arg!(positive, 1);
             }
             Sysno::Getpriority | Sysno::Setpriority | Sysno::IoprioGet | Sysno::IoprioSet => {
-                // The `who` argument is a pid only for PRIO_PROCESS / IOPRIO_WHO_PROCESS.
+                // `who` is a pid for PRIO_PROCESS / IOPRIO_WHO_PROCESS, and a
+                // process group for PRIO_PGRP / IOPRIO_WHO_PGRP.
                 let by_process = u64::from(!matches!(sys, Sysno::Getpriority | Sysno::Setpriority));
-                if args[0] == by_process {
+                if args[0] == by_process || args[0] == by_process + 1 {
                     map_arg!(positive, 1);
                 }
+            }
+            // The pids these report back are numbers in the caller's namespace.
+            Sysno::Msgctl | Sysno::Shmctl | Sysno::Semctl | Sysno::Fcntl => {
+                return self.ipc_and_fcntl_in_pid_ns(cx, sys, raw, &a, vcpu, mem);
             }
             _ => {}
         }
         self.dispatch_impl(cx, sys, raw, &a, vcpu, mem)
+    }
+
+    /// The SysV IPC and `fcntl` commands that carry pids, for a task in a nested
+    /// PID namespace: `IPC_STAT`'s last-sender/creator pids, `semctl(GETPID)`,
+    /// `F_GETLK`'s lock holder, and the `F_SETOWN`/`F_GETOWN` owner. A pid that
+    /// isn't in the namespace reads as 0, as on Linux.
+    fn ipc_and_fcntl_in_pid_ns(
+        &self,
+        cx: &mut ServiceCtx,
+        sys: Sysno,
+        raw: u64,
+        args: &[u64; 6],
+        vcpu: &mut dyn Vcpu,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        const IPC_STAT: u64 = 2;
+        const MSG_STAT: u64 = 11;
+        const MSG_STAT_ANY: u64 = 13;
+        const SHM_STAT: u64 = 13;
+        const SHM_STAT_ANY: u64 = 15;
+        const SEM_GETPID: u64 = 11;
+        const F_GETLK: u64 = 5;
+        const F_SETOWN: u64 = 8;
+        const F_GETOWN: u64 = 9;
+        const F_SETOWN_EX: u64 = 15;
+        const F_GETOWN_EX: u64 = 16;
+        const F_UNLCK: i16 = 2;
+        let seen = |this: &Self, cx: &ServiceCtx, global: i32| -> i32 {
+            match global.cmp(&0) {
+                std::cmp::Ordering::Greater => this.visible_pid(cx, global),
+                std::cmp::Ordering::Less => -this.visible_pid(cx, -global),
+                std::cmp::Ordering::Equal => 0,
+            }
+        };
+        // Rewrite the pids (`i32`s) at `offsets` from `base` in guest memory.
+        let rewrite =
+            |this: &Self, cx: &ServiceCtx, mem: &mut GuestMemory, base: u64, offsets: &[u64]| {
+                for &o in offsets {
+                    if let Ok(v) = mem.read_u32(base + o) {
+                        let _ = mem.write(base + o, &seen(this, cx, v as i32).to_le_bytes());
+                    }
+                }
+            };
+        // A local pid (or negated process group) to the global one; one that
+        // isn't in the namespace names nothing.
+        let global = |this: &Self, cx: &ServiceCtx, local: i32| -> i32 {
+            let g = |l: i32| this.global_pid(cx, l).unwrap_or(0);
+            match local {
+                0 => 0,
+                l if l > 0 => g(l),
+                l => -g(-l),
+            }
+        };
+        // IPC commands may carry IPC_64 (0x100); fcntl's are whole numbers.
+        let cmd = match sys {
+            Sysno::Semctl => args[2] & !0x100,
+            Sysno::Fcntl => args[1],
+            _ => args[1] & !0x100,
+        };
+        let mut a = *args;
+        match (sys, cmd) {
+            (Sysno::Fcntl, F_SETOWN) => a[2] = i64::from(global(self, cx, args[2] as i32)) as u64,
+            (Sysno::Fcntl, F_SETOWN_EX) => {
+                // struct f_owner_ex { int type; pid_t pid; }: translated in place
+                // for the call, then put back as the caller wrote it.
+                let Ok(local) = mem.read_u32(args[2] + 4) else {
+                    return err(Errno::EFAULT);
+                };
+                let g = global(self, cx, (local as i32).abs());
+                let _ = mem.write(args[2] + 4, &g.to_le_bytes());
+                let ret = self.dispatch_impl(cx, sys, raw, &a, vcpu, mem);
+                let _ = mem.write(args[2] + 4, &local.to_le_bytes());
+                return ret;
+            }
+            _ => {}
+        }
+        let ret = self.dispatch_impl(cx, sys, raw, &a, vcpu, mem);
+        if ret < 0 {
+            return ret;
+        }
+        match (sys, cmd) {
+            (Sysno::Msgctl, IPC_STAT | MSG_STAT | MSG_STAT_ANY) => {
+                rewrite(self, cx, mem, args[2], &[96, 100]); // msg_lspid, msg_lrpid
+            }
+            (Sysno::Shmctl, IPC_STAT | SHM_STAT | SHM_STAT_ANY) => {
+                rewrite(self, cx, mem, args[2], &[80, 84]); // shm_cpid, shm_lpid
+            }
+            // Both return a pid.
+            (Sysno::Semctl, SEM_GETPID) | (Sysno::Fcntl, F_GETOWN) => {
+                return i64::from(seen(self, cx, ret as i32));
+            }
+            (Sysno::Fcntl, F_GETLK) => {
+                // l_pid, when a conflicting lock was found.
+                if mem.read_u32(args[2]).is_ok_and(|t| t as i16 != F_UNLCK) {
+                    rewrite(self, cx, mem, args[2], &[24]);
+                }
+            }
+            (Sysno::Fcntl, F_GETOWN_EX) => rewrite(self, cx, mem, args[2], &[4]),
+            _ => {}
+        }
+        ret
     }
 
     /// `kill(-1, sig)` inside a PID namespace: everything visible in it, except the

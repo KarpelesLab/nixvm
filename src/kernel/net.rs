@@ -496,6 +496,8 @@ enum Kind {
     Listener {
         addr: Option<Addr>,
         backlog: VecDeque<usize>,
+        /// Who called `listen()`: what a client connecting here sees as its peer.
+        cred: Ucred,
     },
     /// A connected pair of byte streams (AF_UNIX, or AF_INET/AF_INET6 TCP).
     Pair(Pair),
@@ -561,6 +563,29 @@ struct Pair {
     /// duplicated backing reference, transferred to a fresh guest fd on receipt
     /// or dropped if the bytes are consumed by a plain `read`/`recv`.
     scm: [VecDeque<(usize, Vec<Fd>)>; 2],
+    /// The process on each end, for `SO_PEERCRED`: the creator of a
+    /// `socketpair`, or the connecting process (end 0) and the listener's
+    /// `listen()` caller (end 1), as Linux records them.
+    cred: [Ucred; 2],
+}
+
+/// `struct ucred`: a process's global pid, uid and gid when it set up a
+/// connection.
+#[derive(Debug, Clone, Copy, Default)]
+struct Ucred {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+impl Ucred {
+    fn of(cx: &ServiceCtx) -> Self {
+        Self {
+            pid: cx.cur.tgid,
+            uid: cx.cur.creds.euid,
+            gid: cx.cur.creds.egid,
+        }
+    }
 }
 
 impl Pair {
@@ -574,6 +599,7 @@ impl Pair {
             nonblock: [false, false],
             addrs: [None, None],
             scm: [VecDeque::new(), VecDeque::new()],
+            cred: [Ucred::default(); 2],
         }
     }
 
@@ -1142,6 +1168,7 @@ impl Kernel {
         } else {
             let mut pair = Pair::new();
             pair.nonblock = [nonblock, nonblock];
+            pair.cred = [Ucred::of(cx); 2];
             let idx = net.socks.len();
             net.socks.push(Sock {
                 netns: cx.cur.ns.net,
@@ -1303,6 +1330,7 @@ impl Kernel {
         net.socks[sock].kind = Kind::Listener {
             addr: bound,
             backlog: VecDeque::new(),
+            cred: Ucred::of(cx),
         };
         if let Some(k) = key {
             net.listeners.entry(k).or_default().push(sock);
@@ -1414,13 +1442,14 @@ impl Kernel {
         {
             return err(Errno::EAGAIN);
         }
-        let listener_addr = match &net.socks[lidx].kind {
-            Kind::Listener { addr, .. } => addr.clone(),
+        let (listener_addr, listener_cred) = match &net.socks[lidx].kind {
+            Kind::Listener { addr, cred, .. } => (addr.clone(), *cred),
             _ => return err(Errno::ECONNREFUSED),
         };
         // Repurpose the client's idle slot as the connected pair, then queue its
         // index (the server-side end 1) on the listener's backlog.
         let mut pair = Pair::new();
+        pair.cred = [Ucred::of(cx), listener_cred];
         pair.nonblock[0] = net.socks[sock].nonblock;
         if domain != AF_UNIX {
             let v6 = domain == AF_INET6;
@@ -1930,7 +1959,7 @@ impl Kernel {
         optlen_ptr: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        let Some((sock, _)) = self.sock_of(cx, fd) else {
+        let Some((sock, end)) = self.sock_of(cx, fd) else {
             return err(Errno::ENOTSOCK);
         };
         // SO_LINGER and the timeval-shaped options are wider than the u32
@@ -2002,16 +2031,23 @@ impl Kernel {
                     (_, d) if d == AF_UNIX || d == AF_NETLINK => 0, // NETLINK_ROUTE == 0
                     _ => 6,                                         // IPPROTO_TCP
                 },
-                // SO_PEERCRED: `struct ucred { pid, uid, gid }` of the peer.
-                // Peer identity isn't tracked per connection; the caller's own
-                // credentials are the answer for the common cases (a
-                // socketpair, a connection within one process tree).
+                // SO_PEERCRED: `struct ucred { pid, uid, gid }` of the process
+                // on the other end when the connection was made. A socket that
+                // isn't connected has no peer: pid 0 and the overflow ids.
                 17 => {
+                    let peer = match &net.socks[sock].kind {
+                        Kind::Pair(p) => p.cred[1 - end],
+                        _ => Ucred {
+                            pid: 0,
+                            uid: 65534,
+                            gid: 65534,
+                        },
+                    };
                     let mut b = [0u8; 12];
-                    let pid = self.visible_pid(cx, cx.cur.tgid);
+                    let pid = self.sender_pid_seen(cx, peer.pid);
                     b[0..4].copy_from_slice(&pid.to_le_bytes());
-                    b[4..8].copy_from_slice(&cx.cur.creds.euid.to_le_bytes());
-                    b[8..12].copy_from_slice(&cx.cur.creds.egid.to_le_bytes());
+                    b[4..8].copy_from_slice(&peer.uid.to_le_bytes());
+                    b[8..12].copy_from_slice(&peer.gid.to_le_bytes());
                     return write_optval(mem, optval, optlen_ptr, &b);
                 }
                 // SO_PEERSEC: no LSM labels.

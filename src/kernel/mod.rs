@@ -5804,10 +5804,25 @@ impl Kernel {
             }
             found
         };
+        // What the parent's handler, sigwaitinfo or signalfd reads with it:
+        // si_code CLD_EXITED or CLD_KILLED, the child's pid, and si_status (the
+        // `value` slot sits where si_status is).
+        let (cld_code, cld_status) = match cause {
+            ExitCause::Exited(code) => (1, code & 0xff),
+            ExitCause::Signaled(sig) => (2, sig),
+        };
+        let chld_info = QueuedSig {
+            code: cld_code,
+            pid: cx.cur.tgid,
+            uid: cx.cur.creds.ruid,
+            value: u64::from(cld_status as u32),
+        };
         for slot in sh.procs.iter_mut().flatten() {
             if slot.info.pid == ppid {
                 if (1..=64).contains(&exit_sig) {
                     slot.info.pending |= 1u64 << (exit_sig - 1);
+                    let info = self.seen_by(slot.info.ns.pid, chld_info);
+                    slot.info.post_siginfo(exit_sig, info);
                 }
                 slot.info.parked = false;
             }
