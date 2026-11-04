@@ -2,7 +2,9 @@
 //! hostile ones are contained.
 //!
 //! Needs `gcc` with static libraries on an x86-64 Linux host; it skips itself
-//! otherwise, printing why. See `tests/guest/README.md`.
+//! otherwise, printing why. The same programs run on an aarch64 guest too when
+//! a cross compiler is installed (`aarch64-linux-gnu-gcc`, or whatever
+//! `NIXVM_AARCH64_CC` names). See `tests/guest/README.md`.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use std::path::{Path, PathBuf};
@@ -26,44 +28,91 @@ const PROGRAMS: &[&str] = &[
 /// `exec` itself there. `None` if there's no compiler to build them with.
 fn built() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| build_with("gcc", "guest_root"))
+        .as_deref()
+}
+
+/// The same, built for an aarch64 guest by a cross compiler.
+fn built_aarch64() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("guest_root");
-        for sub in ["tmp", "etc", "proc", "dev", "sys", "mnt"] {
-            std::fs::create_dir_all(dir.join(sub)).expect("create guest root");
-        }
-        for name in PROGRAMS.iter().chain(&["attacks"]) {
-            let built = Command::new("gcc")
-                .args(["-static", "-O1", "-w", "-pthread", "-o"])
-                .arg(dir.join(name))
-                .arg(Path::new("tests/guest").join(format!("{name}.c")))
-                .arg("-lrt")
-                .output();
-            match built {
-                Ok(out) if out.status.success() => {}
-                Ok(out) => {
-                    let why = String::from_utf8_lossy(&out.stderr);
-                    eprintln!("can't build {name}, skipping: {why}");
-                    return None;
-                }
-                Err(e) => {
-                    eprintln!("no gcc, skipping: {e}");
-                    return None;
-                }
-            }
-        }
-        // ns_user execs itself by this name.
-        std::fs::copy(dir.join("ns_user"), dir.join("ns5")).expect("copy");
-        Some(dir)
+        let named = std::env::var("NIXVM_AARCH64_CC").ok();
+        let candidates = named.into_iter().chain([
+            "aarch64-linux-gnu-gcc".into(),
+            "aarch64-unknown-linux-gnu-gcc".into(),
+        ]);
+        let found = candidates.into_iter().find(|cc| {
+            Command::new(cc)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        });
+        let Some(cc) = found else {
+            eprintln!("no aarch64 cross compiler, skipping the aarch64 guest");
+            return None;
+        };
+        build_with(&cc, "guest_root_aarch64")
     })
     .as_deref()
+}
+
+fn build_with(cc: &str, dir_name: &str) -> Option<PathBuf> {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(dir_name);
+    for sub in ["tmp", "etc", "proc", "dev", "sys", "mnt"] {
+        std::fs::create_dir_all(dir.join(sub)).expect("create guest root");
+    }
+    for name in PROGRAMS.iter().chain(&["attacks"]) {
+        let built = Command::new(cc)
+            .args(["-static", "-O1", "-w", "-pthread", "-o"])
+            .arg(dir.join(name))
+            .arg(Path::new("tests/guest").join(format!("{name}.c")))
+            .arg("-lrt")
+            .output();
+        match built {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let why = String::from_utf8_lossy(&out.stderr);
+                eprintln!("can't build {name} with {cc}, skipping: {why}");
+                return None;
+            }
+            Err(e) => {
+                eprintln!("no {cc}, skipping: {e}");
+                return None;
+            }
+        }
+    }
+    // ns_user execs itself by this name.
+    std::fs::copy(dir.join("ns_user"), dir.join("ns5")).expect("copy");
+    Some(dir)
 }
 
 /// Run `program` in the VM with `env` set, killing it after a while so that a hang
 /// is a failure rather than a stuck test.
 fn run(root: &Path, program: &str, args: &[&str], env: &[(&str, &str)], seconds: &str) -> Output {
+    run_on(
+        env!("CARGO_BIN_EXE_run-elf-x86"),
+        root,
+        program,
+        args,
+        env,
+        seconds,
+    )
+}
+
+/// [`run`] with a given runner: `run-elf-x86`, or `run-elf` for an aarch64 guest.
+fn run_on(
+    runner: &str,
+    root: &Path,
+    program: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    seconds: &str,
+) -> Output {
     let mut cmd = Command::new("timeout");
     cmd.args(["--foreground", seconds])
-        .arg(env!("CARGO_BIN_EXE_run-elf-x86"))
+        .arg(runner)
         .arg(root.join(program))
         .arg(program)
         .args(args)
@@ -88,9 +137,13 @@ fn text(out: &Output) -> String {
 /// Every program, on one configuration.
 fn conformance(env: &[(&str, &str)], seconds: &str) {
     let Some(root) = built() else { return };
+    conformance_of(env!("CARGO_BIN_EXE_run-elf-x86"), root, env, seconds);
+}
+
+fn conformance_of(runner: &str, root: &Path, env: &[(&str, &str)], seconds: &str) {
     let mut failed = Vec::new();
     for name in PROGRAMS {
-        let out = run(root, name, &[], env, seconds);
+        let out = run_on(runner, root, name, &[], env, seconds);
         let text = text(&out);
         let passed = text.lines().any(|l| l == "PASS");
         let failures: Vec<&str> = text.lines().filter(|l| l.starts_with("FAIL")).collect();
@@ -115,6 +168,13 @@ fn programs_pass_on_the_interpreter() {
 #[test]
 fn programs_pass_with_several_cpus() {
     conformance(&[("NIXVM_CPUS", "3")], "120");
+}
+
+/// On an aarch64 guest, which runs on the interpreter on this host.
+#[test]
+fn programs_pass_on_an_aarch64_guest() {
+    let Some(root) = built_aarch64() else { return };
+    conformance_of(env!("CARGO_BIN_EXE_run-elf"), root, &[], "300");
 }
 
 /// Each attempt must come back as an ordinary error in the guest, or a clean kill of

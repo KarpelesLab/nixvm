@@ -17,7 +17,10 @@ int main(void) {
   while (ticks < 5 && time(0) - s < 4) { for (int i = 0; i < 1000000; i++) { a += b; c ^= a; d += c; b += 1; } }
   ualarm(0, 0); CHECK(ticks >= 5, "SIGALRM handler reaches a compute loop (%d)", ticks);
   /* Checksum computed with interruptions equals one without. */
-  unsigned long x = 1, y = 0; ticks = 0; ualarm(2000, 2000); for (unsigned long i = 0; i < 40000000UL; i++) { x = x * 6364136223846793005UL + 1442695040888963407UL; y ^= x; } ualarm(0, 0); unsigned long x2 = 1, y2 = 0; for (unsigned long i = 0; i < 40000000UL; i++) { x2 = x2 * 6364136223846793005UL + 1442695040888963407UL; y2 ^= x2; } CHECK(y == y2 && ticks > 0, "state survives %d async deliveries", ticks);
+  /* As long as it takes to be interrupted 20 times, so a slow interpreter isn't stuck on a fixed count. */
+  unsigned long x = 1, y = 0, n = 0; ticks = 0; ualarm(2000, 2000); s = time(0);
+  while (ticks < 20 && time(0) - s < 30) { for (int i = 0; i < 100000; i++) { x = x * 6364136223846793005UL + 1442695040888963407UL; y ^= x; } n += 100000; }
+  ualarm(0, 0); unsigned long x2 = 1, y2 = 0; for (unsigned long i = 0; i < n; i++) { x2 = x2 * 6364136223846793005UL + 1442695040888963407UL; y2 ^= x2; } CHECK(y == y2 && ticks >= 20, "state survives %d async deliveries over %lu steps", ticks, n);
   /* Stop and continue a spinner. */
   p = fork(); if (!p) { for (;;); } usleep(50000); kill(p, SIGSTOP); waitpid(p, &st, WUNTRACED); CHECK(WIFSTOPPED(st), "SIGSTOP stops a spinner (%#x)", st); kill(p, SIGCONT); usleep(50000); kill(p, SIGKILL); waitpid(p, &st, 0); CHECK(WIFSIGNALED(st), "and it can be continued, then killed");
   puts(fails ? "SOME FAILED" : "PASS"); return fails != 0;

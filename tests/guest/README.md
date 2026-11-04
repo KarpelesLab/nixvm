@@ -2,7 +2,9 @@
 
 Small C programs that exercise kernel behaviour from inside a guest, each printing
 `PASS` at the end. `tests/guest_conformance.rs` builds them with `gcc -static` and
-runs them on the VM.
+runs them on the VM: on x86-64 on each backend, and on an aarch64 guest when an
+aarch64 cross compiler is installed (`aarch64-linux-gnu-gcc`, or set
+`NIXVM_AARCH64_CC`).
 
 They're written to pass on real Linux too, which is how to check an expectation:
 

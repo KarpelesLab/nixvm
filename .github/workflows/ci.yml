@@ -139,10 +139,21 @@ jobs:
             exit 1
           fi
 
-      # On KVM here, unlike the `test` job, whose runner has no access to /dev/kvm.
-      - name: Run the guest conformance programs on KVM
+      # On KVM here, unlike the `test` job, whose runner has no access to /dev/kvm,
+      # and on an aarch64 guest (the interpreter), built with a cross compiler.
+      - name: Install an aarch64 cross compiler
         if: matrix.backend == 'kvm'
-        run: cargo test --test guest_conformance
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Run the guest conformance programs on KVM and on aarch64
+        if: matrix.backend == 'kvm'
+        run: |
+          set -o pipefail
+          cargo test --test guest_conformance -- --nocapture 2>&1 | tee conformance.log
+          if grep -q 'skipping' conformance.log; then
+            echo '::error::the conformance programs skipped themselves'
+            exit 1
+          fi
 
       # Real tools using every namespace at once find what targeted tests don't.
       - name: Run bubblewrap and util-linux in the VM

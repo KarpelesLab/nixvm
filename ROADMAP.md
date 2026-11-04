@@ -483,7 +483,8 @@ must get the isolation it asks for.
   as 0 inside a nested PID namespace.
 - **Not started:** the syscall-filter policy, env scrubbing and logging of denials.
 - **Tests:** `tests/guest_conformance.rs` runs the C programs in `tests/guest`, written to
-  pass on real Linux too, and contains the attacks; `tests/namespace_tools.rs` runs the
+  pass on real Linux too, on x86-64 (KVM, interpreter, SMP) and aarch64 guests, and
+  contains the attacks; `tests/namespace_tools.rs` runs the
   real tools.
 
 ### Phase 10 — Portability backends (KVM + interpreter) & x86-64 guests  🟡 interpreters live; HVF + KVM/x86-64 run static programs; KVM/arm64 not started
