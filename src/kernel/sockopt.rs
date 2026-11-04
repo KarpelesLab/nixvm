@@ -4,8 +4,8 @@
 //!
 //! `setsockopt`/`getsockopt` (in `net.rs`) model the options with behavior
 //! directly; everything else *known* is stored and echoed back verbatim (so a
-//! program that sets `TCP_KEEPIDLE` and reads it back sees its value), or
-//! reports Linux's default when never set. A pair Linux doesn't know is
+//! program that sets `IP_TTL` and reads it back sees its value), or reports
+//! Linux's default when never set. A pair Linux doesn't know is
 //! `ENOPROTOOPT` — and recorded as an unsupported subcommand — rather than a
 //! silent success, so the gap is visible.
 //!

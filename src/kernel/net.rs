@@ -229,6 +229,44 @@ const SO_DOMAIN: u64 = 39;
 // Protocol-level option names.
 const IP_TOS: u64 = 1;
 const TCP_NODELAY: u64 = 1;
+const TCP_KEEPIDLE: u64 = 4;
+const TCP_KEEPINTVL: u64 = 5;
+const TCP_KEEPCNT: u64 = 6;
+
+/// The options that also act on a host connection, applied when it's made if
+/// the guest set them first.
+const CONN_OPTIONS: &[(u64, u64)] = &[
+    (IPPROTO_TCP, TCP_NODELAY),
+    (SOL_SOCKET, SO_KEEPALIVE),
+    (IPPROTO_TCP, TCP_KEEPIDLE),
+    (IPPROTO_TCP, TCP_KEEPINTVL),
+    (IPPROTO_TCP, TCP_KEEPCNT),
+    (SOL_SOCKET, SO_LINGER),
+];
+
+/// What the guest's setting of `(level, optname)` means for a host
+/// connection, if it set it and it means anything there. Only an explicit
+/// choice counts: a transport's own default stands for a guest that never
+/// asked.
+fn conn_option(opts: &SockOpts, level: u64, optname: u64) -> Option<super::egress::ConnOption> {
+    use super::egress::ConnOption;
+    let raw = opts.extra.get(&(level, optname))?;
+    let int = || {
+        raw.get(..4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    Some(match (level, optname) {
+        (IPPROTO_TCP, TCP_NODELAY) => ConnOption::NoDelay(opts.nodelay),
+        (SOL_SOCKET, SO_KEEPALIVE) => ConnOption::KeepAlive(opts.keepalive),
+        (IPPROTO_TCP, TCP_KEEPIDLE) => ConnOption::KeepIdle(int()?),
+        (IPPROTO_TCP, TCP_KEEPINTVL) => ConnOption::KeepInterval(int()?),
+        (IPPROTO_TCP, TCP_KEEPCNT) => ConnOption::KeepCount(int()?),
+        (SOL_SOCKET, SO_LINGER) => {
+            ConnOption::ResetOnClose(opts.linger_on && opts.linger_secs == 0)
+        }
+        _ => return None,
+    })
+}
 const IPV6_V6ONLY: u64 = 26;
 
 // `sendto`/`recvfrom` `flags` bits this module honors (linux/socket.h).
@@ -782,7 +820,14 @@ impl Net {
                     }
                 }
             }
-            Kind::Host(mut h) if !h.wr_shut => h.conn.shutdown_write(),
+            // A zero SO_LINGER asked for a reset instead: dropping the connection
+            // without a clean shutdown first is what sends it.
+            Kind::Host(mut h) if !h.wr_shut => {
+                let opts = &self.socks[sock].opts;
+                if !(opts.linger_on && opts.linger_secs == 0) {
+                    h.conn.shutdown_write();
+                }
+            }
             Kind::Dgram(_) => self.dgram_ports.retain(|_, group| {
                 group.retain(|&i| i != sock);
                 !group.is_empty()
@@ -1444,12 +1489,10 @@ impl Kernel {
                 // Only an explicit choice: a transport's own default stands
                 // for a guest that never asked.
                 let mut conn = conn;
-                if net.socks[sock]
-                    .opts
-                    .extra
-                    .contains_key(&(IPPROTO_TCP, TCP_NODELAY))
-                {
-                    conn.set_nodelay(net.socks[sock].opts.nodelay);
+                for &(level, optname) in CONN_OPTIONS {
+                    if let Some(opt) = conn_option(&net.socks[sock].opts, level, optname) {
+                        conn.set_option(opt);
+                    }
                 }
                 net.socks[sock].kind = Kind::Host(HostSock {
                     conn,
@@ -1711,8 +1754,10 @@ impl Kernel {
     ///
     /// These take effect: `SO_REUSEADDR`/`SO_REUSEPORT` (`bind`, `listen` and
     /// connection routing), `SO_RCVTIMEO`/`SO_SNDTIMEO` (blocking socket calls),
-    /// `TCP_NODELAY` (the real connection), `SO_SNDBUF`/`SO_RCVBUF` (clamped as
-    /// Linux does, though the in-VM queues don't shrink to them).
+    /// `TCP_NODELAY`, `SO_KEEPALIVE`, `TCP_KEEPIDLE`/`KEEPINTVL`/`KEEPCNT` and an
+    /// abortive `SO_LINGER` (on the real connection, for a socket bridged to the
+    /// host), `SO_SNDBUF`/`SO_RCVBUF` (clamped as Linux does, though the in-VM
+    /// queues don't shrink to them).
     ///
     /// Other known options are stored and echoed back by `getsockopt` without
     /// changing how the socket behaves. [`super::sockopt::refused`] lists the
@@ -1777,11 +1822,16 @@ impl Kernel {
                 return err(Errno::EDOM);
             }
         }
-        if (level, optname) == (IPPROTO_TCP, TCP_NODELAY)
-            && let Ok(v) = mem.read_u32(optval)
-            && let Kind::Host(h) = &mut net.socks[sock].kind
+        // Linux's ranges for the keepalive timers.
+        if level == IPPROTO_TCP
+            && let Some(max) = match optname {
+                TCP_KEEPIDLE | TCP_KEEPINTVL => Some(32767),
+                TCP_KEEPCNT => Some(127),
+                _ => None,
+            }
+            && mem.read_u32(optval).is_ok_and(|v| v == 0 || v > max)
         {
-            h.conn.set_nodelay(v != 0);
+            return err(Errno::EINVAL);
         }
         let opts = &mut net.socks[sock].opts;
         if optlen <= 256
@@ -1854,6 +1904,12 @@ impl Kernel {
             && let Ok(v) = mem.read_u32(optval)
         {
             opts.tos = v;
+        }
+        // Options with a meaning on the real connection go to it too.
+        if let Some(opt) = conn_option(&net.socks[sock].opts, level, optname)
+            && let Kind::Host(h) = &mut net.socks[sock].kind
+        {
+            h.conn.set_option(opt);
         }
         0
     }
@@ -5870,6 +5926,121 @@ mod tests {
                 v6: Some((v6, 64)),
             })
         }
+    }
+
+    /// An egress whose connections record the options applied to them.
+    #[derive(Debug, Default)]
+    struct Recording(std::sync::Arc<std::sync::Mutex<Vec<super::super::egress::ConnOption>>>);
+    #[derive(Debug)]
+    struct RecordingConn(std::sync::Arc<std::sync::Mutex<Vec<super::super::egress::ConnOption>>>);
+    impl HostConn for RecordingConn {
+        fn recv(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::WouldBlock.into())
+        }
+        fn send(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            Ok(b.len())
+        }
+        fn shutdown_write(&mut self) {}
+        fn poll_readable(&mut self) -> bool {
+            false
+        }
+        fn set_option(&mut self, opt: super::super::egress::ConnOption) {
+            self.0.lock().unwrap().push(opt);
+        }
+    }
+    impl Egress for Recording {
+        fn connect_tcp(&self, _: [u8; 16], _: bool, _: u16) -> std::io::Result<Box<dyn HostConn>> {
+            Ok(Box::new(RecordingConn(self.0.clone())))
+        }
+        fn open_udp(&self) -> std::io::Result<Box<dyn HostDgram>> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    #[test]
+    fn keepalive_and_linger_reach_the_host_connection() {
+        use super::super::egress::ConnOption;
+        let (mut k, mut mem, mut v, mut cx) = setup();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        k.set_egress(Box::new(Recording(seen.clone())));
+        let fd = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Socket,
+            [u64::from(AF_INET), SOCK_STREAM, 0, 0, 0, 0],
+        ) as u64;
+        let val = 0x1_1000;
+        let mut set = |level: u64, name: u64, bytes: &[u8]| {
+            mem.write(val, bytes).unwrap();
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Setsockopt,
+                [fd, level, name, val, bytes.len() as u64, 0],
+            )
+        };
+        // Set before connecting: applied when the connection is made.
+        assert_eq!(set(SOL_SOCKET, SO_KEEPALIVE, &1u32.to_le_bytes()), 0);
+        assert_eq!(set(IPPROTO_TCP, TCP_KEEPIDLE, &30u32.to_le_bytes()), 0);
+        // Out of Linux's range.
+        assert_eq!(
+            set(IPPROTO_TCP, TCP_KEEPCNT, &0u32.to_le_bytes()),
+            err(Errno::EINVAL)
+        );
+        assert_eq!(
+            set(IPPROTO_TCP, TCP_KEEPINTVL, &40000u32.to_le_bytes()),
+            err(Errno::EINVAL)
+        );
+        let sa = 0x1_2000;
+        let mut b = [0u8; 16];
+        b[0..2].copy_from_slice(&AF_INET.to_le_bytes());
+        b[2..4].copy_from_slice(&80u16.to_be_bytes());
+        b[4..8].copy_from_slice(&[93, 184, 216, 34]);
+        mem.write(sa, &b).unwrap();
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Connect,
+                [fd, sa, 16, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [ConnOption::KeepAlive(true), ConnOption::KeepIdle(30)]
+        );
+        // Set on the live connection: applied at once. Only a zero linger resets.
+        seen.lock().unwrap().clear();
+        let mut set = |level: u64, name: u64, bytes: &[u8]| {
+            mem.write(val, bytes).unwrap();
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::Setsockopt,
+                [fd, level, name, val, bytes.len() as u64, 0],
+            )
+        };
+        assert_eq!(set(IPPROTO_TCP, TCP_KEEPCNT, &4u32.to_le_bytes()), 0);
+        assert_eq!(set(SOL_SOCKET, SO_LINGER, &[1, 0, 0, 0, 5, 0, 0, 0]), 0);
+        assert_eq!(set(SOL_SOCKET, SO_LINGER, &[1, 0, 0, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(set(SOL_SOCKET, SO_REUSEADDR, &1u32.to_le_bytes()), 0);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                ConnOption::KeepCount(4),
+                ConnOption::ResetOnClose(false),
+                ConnOption::ResetOnClose(true)
+            ]
+        );
     }
 
     #[test]

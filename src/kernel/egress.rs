@@ -57,11 +57,29 @@ pub trait HostConn: Send + Debug {
     fn poll_connect(&mut self) -> io::Result<bool> {
         Ok(true)
     }
-    /// Apply the guest's `TCP_NODELAY` to the real connection. A transport with
-    /// no such control ignores it.
-    fn set_nodelay(&mut self, nodelay: bool) {
-        let _ = nodelay;
+    /// Apply a socket option the guest set to the real connection. A transport
+    /// with no such control ignores it.
+    fn set_option(&mut self, opt: ConnOption) {
+        let _ = opt;
     }
+}
+
+/// A socket option a guest sets that also has to reach the real connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnOption {
+    /// `TCP_NODELAY`.
+    NoDelay(bool),
+    /// `SO_KEEPALIVE`: probe an idle connection, so a dead peer is noticed.
+    KeepAlive(bool),
+    /// `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_KEEPCNT`: seconds idle before the
+    /// first probe, seconds between probes, and how many go unanswered first.
+    KeepIdle(u32),
+    KeepInterval(u32),
+    KeepCount(u32),
+    /// `SO_LINGER` with a zero timeout: closing resets the connection rather
+    /// than ending it cleanly. A nonzero timeout makes `close` wait on Linux,
+    /// which the host can't do for a guest, so that one never reaches it.
+    ResetOnClose(bool),
 }
 
 /// One received datagram: `(source ip, v6, source port, payload)`.
@@ -125,7 +143,7 @@ pub use native::HostEgress;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use super::{Egress, HostConn, HostDgram};
+    use super::{ConnOption, Egress, HostConn, HostDgram};
     use std::io::{self, Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
     use std::time::Duration;
@@ -188,8 +206,16 @@ mod native {
         fn shutdown_write(&mut self) {
             let _ = self.0.shutdown(std::net::Shutdown::Write);
         }
-        fn set_nodelay(&mut self, nodelay: bool) {
-            let _ = self.0.set_nodelay(nodelay);
+        fn set_option(&mut self, opt: ConnOption) {
+            match opt {
+                ConnOption::NoDelay(on) => {
+                    let _ = self.0.set_nodelay(on);
+                }
+                #[cfg(unix)]
+                other => super::sockopt::apply(&self.0, other),
+                #[cfg(not(unix))]
+                _ => {}
+            }
         }
         fn poll_readable(&mut self) -> bool {
             // A non-blocking peek: any bytes (or a clean EOF, reported as
@@ -229,6 +255,130 @@ mod native {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
                 Err(e) => Err(e),
             }
+        }
+    }
+}
+
+/// Setting the options `std` has no call for on a host socket.
+///
+/// `unsafe`: `setsockopt(2)` is declared here by hand, since `std` doesn't expose
+/// it and the crate takes no FFI dependency. Every call passes a live descriptor
+/// borrowed from a `TcpStream` and a pointer to a local `c_int` with its size.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+mod sockopt {
+    use super::ConnOption;
+    use std::os::fd::AsRawFd;
+    use std::os::raw::{c_int, c_void};
+
+    unsafe extern "C" {
+        fn setsockopt(fd: c_int, level: c_int, name: c_int, val: *const c_void, len: u32) -> c_int;
+    }
+
+    #[cfg(target_os = "linux")]
+    mod consts {
+        use std::os::raw::c_int;
+        pub(super) const SOL_SOCKET: c_int = 1;
+        pub(super) const SO_KEEPALIVE: c_int = 9;
+        pub(super) const SO_LINGER: c_int = 13;
+        pub(super) const TCP_KEEPIDLE: c_int = 4;
+        pub(super) const TCP_KEEPINTVL: c_int = 5;
+        pub(super) const TCP_KEEPCNT: c_int = 6;
+    }
+    #[cfg(not(target_os = "linux"))]
+    mod consts {
+        // The BSDs and macOS.
+        use std::os::raw::c_int;
+        pub(super) const SOL_SOCKET: c_int = 0xffff;
+        pub(super) const SO_KEEPALIVE: c_int = 0x8;
+        pub(super) const SO_LINGER: c_int = 0x80;
+        #[cfg(target_vendor = "apple")]
+        pub(super) const TCP_KEEPIDLE: c_int = 0x10; // TCP_KEEPALIVE
+        #[cfg(not(target_vendor = "apple"))]
+        pub(super) const TCP_KEEPIDLE: c_int = 0x100;
+        #[cfg(target_vendor = "apple")]
+        pub(super) const TCP_KEEPINTVL: c_int = 0x101;
+        #[cfg(not(target_vendor = "apple"))]
+        pub(super) const TCP_KEEPINTVL: c_int = 0x200;
+        #[cfg(target_vendor = "apple")]
+        pub(super) const TCP_KEEPCNT: c_int = 0x102;
+        #[cfg(not(target_vendor = "apple"))]
+        pub(super) const TCP_KEEPCNT: c_int = 0x400;
+    }
+    use consts::{SO_KEEPALIVE, SO_LINGER, SOL_SOCKET, TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL};
+    const IPPROTO_TCP: c_int = 6;
+
+    /// Set `opt` on `sock`. Failure is ignored: the guest's own view of the
+    /// option is already recorded, and the connection works either way.
+    pub(super) fn apply(sock: &impl AsRawFd, opt: ConnOption) {
+        let int = |v: u32| c_int::try_from(v).unwrap_or(c_int::MAX);
+        match opt {
+            ConnOption::NoDelay(_) => {}
+            ConnOption::KeepAlive(on) => set(sock, SOL_SOCKET, SO_KEEPALIVE, &[c_int::from(on)]),
+            ConnOption::KeepIdle(s) => set(sock, IPPROTO_TCP, TCP_KEEPIDLE, &[int(s)]),
+            ConnOption::KeepInterval(s) => set(sock, IPPROTO_TCP, TCP_KEEPINTVL, &[int(s)]),
+            ConnOption::KeepCount(n) => set(sock, IPPROTO_TCP, TCP_KEEPCNT, &[int(n)]),
+            // struct linger { int l_onoff; int l_linger; }
+            ConnOption::ResetOnClose(on) => set(sock, SOL_SOCKET, SO_LINGER, &[c_int::from(on), 0]),
+        }
+    }
+
+    fn set(sock: &impl AsRawFd, level: c_int, name: c_int, val: &[c_int]) {
+        let len = std::mem::size_of_val(val) as u32;
+        // SAFETY: the descriptor is open for the borrow's lifetime, and `val`
+        // points at `len` readable bytes.
+        unsafe {
+            setsockopt(sock.as_raw_fd(), level, name, val.as_ptr().cast(), len);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{ConnOption, apply};
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::AsRawFd;
+        use std::os::raw::{c_int, c_void};
+
+        unsafe extern "C" {
+            fn getsockopt(
+                fd: c_int,
+                level: c_int,
+                name: c_int,
+                val: *mut c_void,
+                len: *mut u32,
+            ) -> c_int;
+        }
+
+        fn get(s: &TcpStream, level: c_int, name: c_int) -> [c_int; 2] {
+            let mut v = [0 as c_int; 2];
+            let mut len = std::mem::size_of_val(&v) as u32;
+            // SAFETY: a live descriptor and a buffer of `len` writable bytes.
+            let r = unsafe {
+                getsockopt(
+                    s.as_raw_fd(),
+                    level,
+                    name,
+                    v.as_mut_ptr().cast(),
+                    &raw mut len,
+                )
+            };
+            assert_eq!(r, 0);
+            v
+        }
+
+        #[test]
+        fn options_reach_the_host_socket() {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let s = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            apply(&s, ConnOption::KeepAlive(true));
+            assert_ne!(get(&s, super::SOL_SOCKET, super::SO_KEEPALIVE)[0], 0);
+            apply(&s, ConnOption::KeepIdle(42));
+            assert_eq!(get(&s, super::IPPROTO_TCP, super::TCP_KEEPIDLE)[0], 42);
+            apply(&s, ConnOption::KeepInterval(7));
+            assert_eq!(get(&s, super::IPPROTO_TCP, super::TCP_KEEPINTVL)[0], 7);
+            apply(&s, ConnOption::KeepCount(3));
+            assert_eq!(get(&s, super::IPPROTO_TCP, super::TCP_KEEPCNT)[0], 3);
+            apply(&s, ConnOption::ResetOnClose(true));
+            assert_ne!(get(&s, super::SOL_SOCKET, super::SO_LINGER)[0], 0);
         }
     }
 }

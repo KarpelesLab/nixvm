@@ -167,7 +167,7 @@ Useful environment variables (both harnesses):
   features (`hvf`, `kvm`, `interp`, `fstool`, `wasm`, `cli`) rather than
   separate crates. The core builds fully offline with zero third-party
   dependencies.
-- **`unsafe` policy.** `unsafe` is confined to four documented sites; the
+- **`unsafe` policy.** `unsafe` is confined to five documented sites; the
   interpreter and kernel paths have none. (1) `vcpu::hvf` — the
   Hypervisor.framework FFI (`hv_vm_*`/`hv_vcpu_*`) — and `vcpu::kvm`, its
   Linux equivalent (hand-rolled `/dev/kvm` ioctls, structs verified against
@@ -187,6 +187,8 @@ Useful environment variables (both harnesses):
   actual I/O syscall is always issued directly against `(parent_dirfd, name)`
   with `O_NOFOLLOW`, so even a symlink swapped in mid-race fails safely
   instead of redirecting the I/O.
+  (4) `kernel::egress` — `setsockopt(2)` on a host socket, for the keepalive
+  and linger options a guest sets that `std` has no call for.
 
 ## Limits and isolation
 

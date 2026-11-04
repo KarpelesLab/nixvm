@@ -435,8 +435,10 @@ impl TunnelConn {
 }
 
 impl HostConn for TunnelConn {
-    fn set_nodelay(&mut self, nodelay: bool) {
-        let _ = self.conn.set_nodelay(nodelay);
+    fn set_option(&mut self, opt: crate::kernel::egress::ConnOption) {
+        if let crate::kernel::egress::ConnOption::NoDelay(on) = opt {
+            let _ = self.conn.set_nodelay(on);
+        }
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
