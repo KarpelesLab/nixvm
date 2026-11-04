@@ -448,7 +448,7 @@ under policy. DNS.
     decoder lacks (LD2/3/4 de-interleave, LDR-SIMD register offset) before it
     even reaches the network — egress itself is arch-agnostic.
 
-### Phase 9 — Resource limits & isolation  🟡 limits and namespaces done; syscall-filter policy not started
+### Phase 9 — Resource limits & isolation  ✅ limits, namespaces and the syscall policy done
 
 Turn it into a real *jail*: a guest must not be able to take the host down, and
 must get the isolation it asks for.
@@ -482,7 +482,16 @@ must get the isolation it asks for.
   across namespaces and bind mounts, and `shared:`/`master:` in `mountinfo`.
   Known limits: cgroup namespaces only change the id; a pid recorded for an exited process (`msg_lspid`, say) reads
   as 0 inside a nested PID namespace.
-- **Not started:** the syscall-filter policy, env scrubbing and logging of denials.
+- **Syscall policy (`policy::SyscallPolicy`):** the embedder's list of syscalls no guest
+  task may make, by name or group (`@mount`, `@namespaces`, `@network`, `@debug`, `@clock`,
+  `@keyring`), each failing with an errno or killing the process. It's checked before the
+  guest's own seccomp filters and applies to every task, thread, child and exec. Denials
+  are counted, the latest 1024 kept (`Kernel::denials`), and printed with
+  `NIXVM_LOG_DENIALS=1`. Set with `SandboxBuilder::syscall_policy`, `Vm::set_syscall_policy`
+  or `NIXVM_DENY_SYSCALLS` (`mount,@network:EACCES,ptrace:kill`); a rule that doesn't parse
+  makes every syscall fail rather than none.
+- **Environment:** a guest starts with a fixed environment plus what the embedder passes;
+  nothing from the host's leaks in.
 - **Tests:** `tests/guest_conformance.rs` runs the C programs in `tests/guest`, written to
   pass on real Linux too, on x86-64 (KVM, interpreter, SMP) and aarch64 guests, and
   contains the attacks; `tests/namespace_tools.rs` runs the

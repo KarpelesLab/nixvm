@@ -111,6 +111,9 @@ pub struct Config {
     /// Extra `KEY=VALUE` entries appended to the guest environment, overriding
     /// the preconfigured defaults on a key collision.
     pub env: Vec<String>,
+    /// Syscalls refused to every guest task; `None` leaves the kernel's own
+    /// default (`NIXVM_DENY_SYSCALLS`).
+    pub syscall_policy: Option<crate::policy::SyscallPolicy>,
 }
 
 /// A host directory shared into the sandbox at a guest mount point.
@@ -158,6 +161,7 @@ impl Default for SandboxBuilder {
                 prefer_interp: false,
                 binds: Vec::new(),
                 env: Vec::new(),
+                syscall_policy: None,
             },
         }
     }
@@ -194,6 +198,14 @@ impl SandboxBuilder {
     #[must_use]
     pub fn limits(mut self, limits: crate::limits::Limits) -> Self {
         self.config.limits = limits;
+        self
+    }
+
+    /// Refuse syscalls to every guest task (see [`crate::policy`]). The default
+    /// is what `NIXVM_DENY_SYSCALLS` says, or nothing.
+    #[must_use]
+    pub fn syscall_policy(mut self, policy: crate::policy::SyscallPolicy) -> Self {
+        self.config.syscall_policy = Some(policy);
         self
     }
 
@@ -368,6 +380,9 @@ impl Sandbox {
 
         let mut kernel = Kernel::new(arch, mounts);
         kernel.set_limits(self.config.limits);
+        if let Some(policy) = &self.config.syscall_policy {
+            kernel.set_syscall_policy(policy);
+        }
         kernel.set_ncpus(self.config.ncpus);
         kernel.set_host_tty(true);
         kernel.set_cwd(if self.config.mode == RunMode::Booted {

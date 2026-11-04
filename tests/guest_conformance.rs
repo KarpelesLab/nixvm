@@ -63,7 +63,7 @@ fn build_with(cc: &str, dir_name: &str) -> Option<PathBuf> {
     for sub in ["tmp", "etc", "proc", "dev", "sys", "mnt"] {
         std::fs::create_dir_all(dir.join(sub)).expect("create guest root");
     }
-    for name in PROGRAMS.iter().chain(&["attacks"]) {
+    for name in PROGRAMS.iter().chain(&["attacks", "policy"]) {
         let built = Command::new(cc)
             .args(["-static", "-O1", "-w", "-pthread", "-o"])
             .arg(dir.join(name))
@@ -271,4 +271,42 @@ fn a_spinning_guest_is_stopped_by_the_time_limits() {
             assert!(out.contains("Ok(137)"), "killed with SIGKILL:\n{out}");
         }
     }
+}
+
+/// The embedder's syscall policy holds for every task, whatever the guest does,
+/// and says what it refused.
+#[test]
+fn the_syscall_policy_binds_every_task() {
+    let Some(root) = built() else { return };
+    let env = [
+        ("NIXVM_DENY_SYSCALLS", "@mount,unshare:EACCES,ptrace:kill"),
+        ("NIXVM_LOG_DENIALS", "1"),
+    ];
+    let out = text(&run(root, "policy", &[], &env, "60"));
+    for want in [
+        "getpid=1 errno=0",
+        "mount=-1 errno=1",
+        "unshare=-1 errno=13",
+        "thread-mount=-1 errno=1",
+        "child-mount=-1 errno=1",
+        "seccomp=0 errno=0",
+        "after-seccomp-mount=-1 errno=1",
+        "exec-mount=-1 errno=1",
+        "ptrace-child-killed=1 errno=0",
+        "done",
+        "nixvm: denied Mount",
+        "nixvm: denied Ptrace",
+    ] {
+        assert!(out.contains(want), "missing {want:?} in:\n{out}");
+    }
+    // A policy that can't be read refuses everything rather than nothing.
+    let out = text(&run(
+        root,
+        "policy",
+        &[],
+        &[("NIXVM_DENY_SYSCALLS", "mout")],
+        "60",
+    ));
+    assert!(out.contains("unknown syscall"), "{out}");
+    assert!(!out.contains("getpid="), "ran with a broken policy:\n{out}");
 }

@@ -1398,6 +1398,11 @@ pub struct Kernel {
     total_cpu_ns: AtomicU64,
     /// Whether a time ceiling has been reached and the guest killed.
     limit_hit: std::sync::atomic::AtomicBool,
+    /// The embedder's syscall policy for this guest's architecture.
+    policy: crate::policy::CompiledPolicy,
+    /// The most recent syscalls it refused, and how many in all.
+    denials: Mutex<VecDeque<crate::policy::Denial>>,
+    denied: AtomicU64,
     /// Tasks that may exist at once (see [`crate::limits::Limits::tasks`]).
     max_tasks: AtomicUsize,
     /// Descriptors that may be open at once across the VM
@@ -1961,6 +1966,15 @@ impl Kernel {
             started_at: Mutex::new(None),
             total_cpu_ns: AtomicU64::new(0),
             limit_hit: std::sync::atomic::AtomicBool::new(false),
+            policy: match crate::policy::SyscallPolicy::from_env() {
+                Ok(p) => p.compile(arch),
+                Err(e) => {
+                    eprintln!("nixvm: {e}; refusing every syscall");
+                    crate::policy::SyscallPolicy::deny_everything()
+                }
+            },
+            denials: Mutex::new(VecDeque::new()),
+            denied: AtomicU64::new(0),
             max_tasks: AtomicUsize::new(limits.tasks as usize),
             max_open_files: AtomicUsize::new(limits.open_files as usize),
             arch,
@@ -2035,10 +2049,6 @@ impl Kernel {
         self.shared.get_mut().unwrap().stdin = r;
     }
 
-    /// Install a host-network egress backend: guest `connect`s to routable
-    /// addresses (and UDP/DNS) are bridged onto real host sockets, so
-    /// `apk`/`curl`/`npm` reach the internet. Without this the network is
-    /// loopback-only. See [`crate::kernel::egress`].
     /// Replace the VM-wide resource ceilings.
     pub fn set_limits(&mut self, limits: crate::limits::Limits) {
         self.memory_quota.set_limit(limits.kernel_memory);
@@ -2052,6 +2062,62 @@ impl Kernel {
         );
     }
 
+    /// Replace the syscall policy (see [`crate::policy`]); by default it's what
+    /// `NIXVM_DENY_SYSCALLS` says, or nothing.
+    pub fn set_syscall_policy(&mut self, policy: &crate::policy::SyscallPolicy) {
+        self.policy = policy.compile(self.arch);
+    }
+
+    /// The most recent syscalls the policy refused (up to 1024), oldest first.
+    #[must_use]
+    pub fn denials(&self) -> Vec<crate::policy::Denial> {
+        self.denials.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// How many syscalls the policy has refused in all.
+    #[must_use]
+    pub fn denied_count(&self) -> u64 {
+        self.denied.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Apply the syscall policy to raw syscall `raw`: what it returns instead of
+    /// running, or `None` to let it run.
+    fn policy_check(&self, cx: &mut ServiceCtx, raw: u64, mem: &mut GuestMemory) -> Option<i64> {
+        const SIGKILL: i32 = 9;
+        let (action, name) = self.policy.verdict(raw)?;
+        self.denied
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.policy.logs() {
+            eprintln!(
+                "nixvm: denied {name} (syscall {raw}) to pid {}: {action:?}",
+                cx.cur.tgid
+            );
+        }
+        {
+            let mut log = self.denials.lock().unwrap();
+            if log.len() >= 1024 {
+                log.pop_front();
+            }
+            log.push_back(crate::policy::Denial {
+                pid: cx.cur.tgid,
+                syscall: name.to_string(),
+                action,
+            });
+        }
+        Some(match action {
+            crate::policy::Action::Errno(e) => err(e),
+            crate::policy::Action::Kill => {
+                let mut sh = self.shared.lock().unwrap();
+                self.exit_group_with(&mut sh, cx, ExitCause::Signaled(SIGKILL), mem);
+                0
+            }
+        })
+    }
+
+    /// Install a host-network egress backend: guest `connect`s to routable
+    /// addresses (and UDP/DNS) are bridged onto real host sockets, so
+    /// `apk`/`curl`/`npm` reach the internet. Without this the network is
+    /// loopback-only. See [`crate::kernel::egress`].
     pub fn set_egress(&mut self, egress: Box<dyn egress::Egress>) {
         self.net.get_mut().unwrap().set_egress(egress);
     }
@@ -2537,7 +2603,13 @@ impl Kernel {
                 // each handler needs (sh before vfs). This is what lets other
                 // workers service their own syscalls concurrently (step B2).
                 // seccomp filters see every syscall before it runs.
-                let verdict = if cx.cur.seccomp.active() {
+                // The embedder's policy comes first: nothing in the guest can
+                // change it.
+                let verdict = if self.policy.is_active()
+                    && let Some(r) = self.policy_check(cx, raw, mem)
+                {
+                    Some(r)
+                } else if cx.cur.seccomp.active() {
                     self.seccomp_check(cx, sys, raw, &args, vcpu.pc(), mem)
                 } else {
                     None

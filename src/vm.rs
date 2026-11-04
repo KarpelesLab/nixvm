@@ -272,6 +272,18 @@ impl Vm {
         self.kernel.set_limits(limits);
     }
 
+    /// Refuse syscalls to every guest task, whatever it does (see
+    /// [`crate::policy`]).
+    pub fn set_syscall_policy(&mut self, policy: &crate::policy::SyscallPolicy) {
+        self.kernel.set_syscall_policy(policy);
+    }
+
+    /// The syscalls the policy has refused lately, oldest first.
+    #[must_use]
+    pub fn denials(&self) -> Vec<crate::policy::Denial> {
+        self.kernel.denials()
+    }
+
     /// Whether the guest is parked reading the terminal, i.e. the last command
     /// finished and it wants input (see [`Kernel::awaiting_input`]).
     #[must_use]

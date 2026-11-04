@@ -37,6 +37,7 @@ pub mod image;
 pub mod kernel;
 pub mod limits;
 pub mod loader;
+pub mod policy;
 pub mod sandbox;
 #[cfg(feature = "tunnel")]
 pub mod tunnel;

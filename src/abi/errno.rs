@@ -20,6 +20,15 @@ macro_rules! errnos {
     ($($name:ident = $val:expr),+ $(,)?) => {
         impl Errno {
             $(pub const $name: Errno = Errno($val);)+
+
+            /// The errno a name like `EACCES` stands for.
+            #[must_use]
+            pub fn from_name(name: &str) -> Option<Errno> {
+                match name {
+                    $(stringify!($name) => Some(Errno($val)),)+
+                    _ => None,
+                }
+            }
         }
     };
 }

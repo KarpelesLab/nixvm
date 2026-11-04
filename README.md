@@ -202,6 +202,10 @@ since nothing can guess what a job needs: set them for untrusted work.
 Inside the VM, namespaces work as on Linux, including unprivileged user namespaces, so
 tools like bubblewrap run in a guest.
 
+On top of that, the embedder can refuse syscalls to the whole guest, whatever it does
+inside: `SandboxBuilder::syscall_policy`, or `NIXVM_DENY_SYSCALLS=@mount,ptrace:kill`
+(see `src/policy.rs`). Refusals are logged with `NIXVM_LOG_DENIALS=1`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
