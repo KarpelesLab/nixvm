@@ -374,9 +374,20 @@ fn mountinfo_body(mounts: &[super::MountEntry]) -> String {
     for (i, m) in mounts.iter().enumerate() {
         let (id, parent) = (i + 1, i);
         let rw = if m.read_only { "ro" } else { "rw" };
+        // The optional fields: peer group, master, unbindable.
+        let mut opt = String::new();
+        if m.peer != 0 {
+            let _ = write!(opt, " shared:{}", m.peer);
+        }
+        if m.master != 0 {
+            let _ = write!(opt, " master:{}", m.master);
+        }
+        if m.unbindable {
+            opt.push_str(" unbindable");
+        }
         let _ = writeln!(
             out,
-            "{id} {parent} 0:{id} /{0} {1} {rw},relatime - {2} {2} {rw}",
+            "{id} {parent} 0:{id} /{0} {1} {rw},relatime{opt} - {2} {2} {rw}",
             m.subdir, m.point, m.fs_type,
         );
     }

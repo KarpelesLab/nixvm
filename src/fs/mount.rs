@@ -11,6 +11,8 @@ use super::{Attrs, DirEntry, MountFs, NodeKind};
 const SYMLINK_MAX: usize = 40;
 
 #[derive(Clone)]
+// The flags are independent properties of a mount, as Linux's are.
+#[allow(clippy::struct_excessive_bools)]
 struct Mount {
     /// Absolute mount point, e.g. "/", "/work", "/proc".
     point: String,
@@ -31,6 +33,14 @@ struct Mount {
     /// `pivot_root(".", ".")` an old root is stacked on the new one, and detaching
     /// it must take only its own mounts.
     pivot_side: u32,
+    /// Its peer group if shared (mounts and unmounts below it happen on every
+    /// peer, in any namespace), 0 if not.
+    peer: u32,
+    /// The peer group it's a slave of, 0 if none: what happens below that
+    /// group's mounts happens below this one, but not the other way round.
+    master: u32,
+    /// Can't be bind mounted (`MS_UNBINDABLE`).
+    unbindable: bool,
 }
 
 impl std::fmt::Debug for Mount {
@@ -54,6 +64,9 @@ impl Mount {
             read_only: false,
             locked: false,
             pivot_side: 0,
+            peer: 0,
+            master: 0,
+            unbindable: false,
         }
     }
 
@@ -86,6 +99,8 @@ pub struct MountTable {
     pivots: u32,
     /// How many mounts have been detached, to give each a place of its own.
     detached: u32,
+    /// The last peer group number handed out.
+    groups: u32,
     /// What every mounted filesystem charges its in-memory contents to.
     quota: Option<std::sync::Arc<crate::limits::Quota>>,
     /// What every mounted filesystem charges growth on the host's disk to.
@@ -130,6 +145,13 @@ impl MountTable {
             for m in copy.iter_mut().filter(|m| m.point != "/") {
                 m.locked = true;
             }
+            // And what was shared reaches it only one way: it's a slave there.
+            for m in &mut copy {
+                if m.peer != 0 {
+                    m.master = m.peer;
+                    m.peer = 0;
+                }
+            }
         }
         self.parked.insert(new, copy);
     }
@@ -151,6 +173,11 @@ impl MountTable {
         let source = self.canonical(source);
         let target = normalize(target);
         let i = self.best_mount(&source).ok_or_else(enoent)?;
+        if self.mounts[i].unbindable {
+            return Err(einval());
+        }
+        // A bind mount of a shared mount is its peer, and of a slave a slave of
+        // the same master (Linux's clone_mnt), so it keeps getting what they get.
         let mut new = vec![Mount {
             point: target.clone(),
             subdir: self.mounts[i].fs_path(&relative_to(&source, &self.mounts[i].point)),
@@ -160,7 +187,7 @@ impl MountTable {
         }];
         if recursive {
             for m in &self.mounts {
-                if m.point != source && path_has_prefix(&m.point, &source) {
+                if m.point != source && path_has_prefix(&m.point, &source) && !m.unbindable {
                     new.push(Mount {
                         point: normalize(&format!("{target}/{}", relative_to(&m.point, &source))),
                         guest: true,
@@ -170,7 +197,7 @@ impl MountTable {
                 }
             }
         }
-        self.mounts.extend(new);
+        self.attach(new);
         Ok(())
     }
 
@@ -267,6 +294,9 @@ impl MountTable {
                 subdir: m.subdir.clone(),
                 read_only: m.read_only,
                 fs_type: m.lock().fs_type().to_string(),
+                peer: m.peer,
+                master: m.master,
+                unbindable: m.unbindable,
             })
             .collect()
     }
@@ -371,7 +401,244 @@ impl MountTable {
         if let Some(quota) = &self.disk_quota {
             fs.attach_disk_quota(quota);
         }
-        self.mounts.push(Mount::new(normalize(point), fs, true));
+        self.attach(vec![Mount::new(normalize(point), fs, true)]);
+    }
+
+    /// Add `tree` (a mount, then any below it) where its first mount says, and
+    /// propagate it: under a shared mount the tree becomes shared, and a copy
+    /// of it goes under each of that mount's peers and their slaves, in every
+    /// namespace (Linux's `propagate_mnt`).
+    fn attach(&mut self, mut tree: Vec<Mount>) {
+        let Some(top_point) = tree.first().map(|m| m.point.clone()) else {
+            return;
+        };
+        let parent = self.best_mount(&top_point).map(|i| self.mounts[i].clone());
+        let Some(parent) = parent.filter(|p| p.peer != 0) else {
+            self.mounts.extend(tree);
+            return;
+        };
+        for m in &mut tree {
+            if m.peer == 0 {
+                m.peer = self.fresh_group();
+            }
+        }
+        // Where the tree sits in the parent's filesystem.
+        let at = parent.fs_path(&relative_to(&top_point, &parent.point));
+        // Each step: a peer group to copy into, and the peer group and master
+        // each tree mount's copies there get.
+        let groups: Vec<u32> = tree.iter().map(|m| m.peer).collect();
+        let mut queue = vec![(parent.peer, groups, vec![0u32; tree.len()])];
+        let mut seen = std::collections::BTreeSet::new();
+        let mut copies: Vec<(u32, Mount)> = Vec::new();
+        while let Some((group, peers, masters)) = queue.pop() {
+            if !seen.insert(group) {
+                continue;
+            }
+            for (ns, target) in self.all_mounts() {
+                let is_source = ns == self.current && target.point == parent.point;
+                let place = |copies: &mut Vec<(u32, Mount)>, peers: &[u32], masters: &[u32]| {
+                    let Some(at_target) = path_strip(&at, &target.subdir) else {
+                        return;
+                    };
+                    let point = normalize(&format!("{}/{at_target}", target.point));
+                    for (k, m) in tree.iter().enumerate() {
+                        copies.push((
+                            ns,
+                            Mount {
+                                point: normalize(&format!(
+                                    "{point}/{}",
+                                    relative_to(&m.point, &top_point)
+                                )),
+                                guest: true,
+                                locked: false,
+                                pivot_side: target.pivot_side,
+                                peer: peers[k],
+                                master: masters[k],
+                                ..m.clone()
+                            },
+                        ));
+                    }
+                };
+                if target.peer == group && !is_source && Arc::ptr_eq(&target.fs, &parent.fs) {
+                    place(&mut copies, &peers, &masters);
+                } else if target.master == group && Arc::ptr_eq(&target.fs, &parent.fs) {
+                    if target.peer == 0 {
+                        place(&mut copies, &vec![0; tree.len()], &peers);
+                    } else {
+                        // A slave that's shared too: its peers get copies that
+                        // are peers of each other and slaves of these.
+                        let fresh: Vec<u32> = (0..tree.len()).map(|_| 0).collect();
+                        queue.push((target.peer, fresh, peers.clone()));
+                    }
+                }
+            }
+            // Peer groups for a level whose copies are shared among themselves.
+            for (_, peers, _) in &mut queue {
+                for g in peers.iter_mut() {
+                    if *g == 0 {
+                        self.groups += 1;
+                        *g = self.groups;
+                    }
+                }
+            }
+        }
+        self.mounts.extend(tree);
+        for (ns, m) in copies {
+            self.list_mut(ns).push(m);
+        }
+    }
+
+    /// Every mount, in any namespace, that gets what happens below the mounts
+    /// of peer group `group`: its peers, their slaves, and so on down.
+    fn receivers(&self, group: u32) -> Vec<(u32, Mount)> {
+        let all = self.all_mounts();
+        let mut groups = vec![group];
+        let mut out = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(g) = groups.pop() {
+            if !seen.insert(g) {
+                continue;
+            }
+            for (ns, m) in &all {
+                if m.peer == g || m.master == g {
+                    out.push((*ns, m.clone()));
+                    if m.master == g && m.peer != 0 {
+                        groups.push(m.peer);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The mount at `self.mounts[i]` is about to go: under a shared parent,
+    /// its copies under the parent's peers and slaves go too, where nothing is
+    /// mounted below them (Linux's `propagate_umount`).
+    fn propagate_unmount(&mut self, i: usize) {
+        let gone = self.mounts[i].clone();
+        let parent = self
+            .mounts
+            .iter()
+            .enumerate()
+            .filter(|&(j, m)| {
+                j != i && path_has_prefix(&gone.point, &m.point) && m.point != gone.point
+            })
+            .max_by_key(|&(j, m)| (m.point.len(), j))
+            .map(|(_, m)| m.clone());
+        let Some(parent) = parent.filter(|p| p.peer != 0) else {
+            return;
+        };
+        let at = parent.fs_path(&relative_to(&gone.point, &parent.point));
+        let current = self.current;
+        for (ns, target) in self.receivers(parent.peer) {
+            if (ns == current && target.point == parent.point)
+                || !Arc::ptr_eq(&target.fs, &parent.fs)
+            {
+                continue;
+            }
+            let Some(below) = path_strip(&at, &target.subdir) else {
+                continue;
+            };
+            let point = normalize(&format!("{}/{below}", target.point));
+            let list = self.list_mut(ns);
+            let busy = list
+                .iter()
+                .any(|m| m.point != point && path_has_prefix(&m.point, &point));
+            if busy {
+                continue;
+            }
+            if let Some(k) = list
+                .iter()
+                .rposition(|m| m.point == point && Arc::ptr_eq(&m.fs, &gone.fs))
+            {
+                list.remove(k);
+            }
+        }
+    }
+
+    fn fresh_group(&mut self) -> u32 {
+        self.groups += 1;
+        self.groups
+    }
+
+    /// Every mount of every namespace, with its namespace.
+    fn all_mounts(&self) -> Vec<(u32, Mount)> {
+        let current = self.mounts.iter().map(|m| (self.current, m.clone()));
+        let parked = self
+            .parked
+            .iter()
+            .flat_map(|(&ns, list)| list.iter().map(move |m| (ns, m.clone())));
+        current.chain(parked).collect()
+    }
+
+    /// Namespace `ns`'s mount list.
+    fn list_mut(&mut self, ns: u32) -> &mut Vec<Mount> {
+        if ns == self.current {
+            &mut self.mounts
+        } else {
+            self.parked.entry(ns).or_default()
+        }
+    }
+
+    /// Change how the mount at `point` (and with `recursive`, every mount below
+    /// it) propagates: `mount --make-shared`, `--make-slave`, `--make-private`,
+    /// `--make-unbindable`. `EINVAL` if `point` isn't a mount point.
+    pub fn set_propagation(
+        &mut self,
+        point: &str,
+        kind: Propagation,
+        recursive: bool,
+    ) -> io::Result<()> {
+        let point = normalize(point);
+        let Some(top) = self.mounts.iter().rposition(|m| m.point == point) else {
+            return Err(einval());
+        };
+        let targets: Vec<usize> = (0..self.mounts.len())
+            .filter(|&i| {
+                i == top
+                    || (recursive
+                        && path_has_prefix(&self.mounts[i].point, &point)
+                        && self.mounts[i].point != point)
+            })
+            .collect();
+        for i in targets {
+            match kind {
+                Propagation::Shared => {
+                    if self.mounts[i].peer == 0 {
+                        self.mounts[i].peer = self.fresh_group();
+                    }
+                    self.mounts[i].unbindable = false;
+                }
+                Propagation::Private => {
+                    let m = &mut self.mounts[i];
+                    (m.peer, m.master, m.unbindable) = (0, 0, false);
+                }
+                Propagation::Unbindable => {
+                    let m = &mut self.mounts[i];
+                    (m.peer, m.master, m.unbindable) = (0, 0, true);
+                }
+                Propagation::Slave => {
+                    // A shared mount becomes a slave of the group it leaves, if
+                    // anything is left in it; one that's neither stays private.
+                    let group = self.mounts[i].peer;
+                    if group != 0 {
+                        let others = self
+                            .all_mounts()
+                            .iter()
+                            .filter(|(_, m)| m.peer == group)
+                            .count()
+                            > 1;
+                        let m = &mut self.mounts[i];
+                        if others {
+                            m.master = group;
+                        }
+                        m.peer = 0;
+                    }
+                    self.mounts[i].unbindable = false;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Remove the most recent mount at exactly `point`: `Ok` if a guest mount
@@ -390,6 +657,12 @@ impl MountTable {
         if !self.mounts[i].guest && self.current == 0 {
             return Err(io::Error::from_raw_os_error(16)); // EBUSY
         }
+        self.propagate_unmount(i);
+        let i = self
+            .mounts
+            .iter()
+            .rposition(|m| m.point == point)
+            .ok_or_else(einval)?;
         let side = self.mounts[i].pivot_side;
         let has_children = self
             .mounts
@@ -884,6 +1157,20 @@ pub struct MountEntry {
     pub subdir: String,
     pub read_only: bool,
     pub fs_type: String,
+    /// `shared:N`, `master:N` and `unbindable` in `mountinfo`; 0 for none.
+    pub peer: u32,
+    pub master: u32,
+    pub unbindable: bool,
+}
+
+/// A mount's propagation type, as `mount(2)`'s `MS_SHARED`, `MS_SLAVE`,
+/// `MS_PRIVATE` and `MS_UNBINDABLE` set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Propagation {
+    Shared,
+    Slave,
+    Private,
+    Unbindable,
 }
 
 /// How paths change across a [`MountTable::pivot_root`].
@@ -961,6 +1248,21 @@ fn path_has_prefix(path: &str, mp: &str) -> bool {
 /// exactly the mount point `mp`, the result is the empty string — the
 /// backend's own root — so `stat`/`readdir` of a bare mount point reaches
 /// the backend instead of failing.
+/// `fs_path` (a path inside a filesystem, as [`Mount::fs_path`] gives it) below
+/// `subdir`, relative to it; `None` if it isn't below it.
+fn path_strip(fs_path: &str, subdir: &str) -> Option<String> {
+    if subdir.is_empty() {
+        return Some(fs_path.to_string());
+    }
+    if fs_path == subdir {
+        return Some(String::new());
+    }
+    fs_path
+        .strip_prefix(subdir)
+        .and_then(|r| r.strip_prefix('/'))
+        .map(str::to_string)
+}
+
 fn relative_to(path: &str, mp: &str) -> String {
     let rest = if mp == "/" {
         path

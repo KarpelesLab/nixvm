@@ -103,13 +103,53 @@ static int t_unix(void) {
   mount("tmpfs", B "/src", "tmpfs", 0, 0); int c3 = socket(AF_UNIX, SOCK_STREAM, 0); CHECK(connect(c3, (void *)&a, sizeof a) < 0, "a tmpfs over it hides it (%d)", errno);
   return fails;
 }
+/* Whether the mountinfo line for `point` has `field` among its optional fields. */
+static int mi_field(const char *point, const char *field) {
+  static char b[16384]; memset(b, 0, sizeof b); int f = open("/proc/self/mountinfo", O_RDONLY); if (f < 0) return -1; read(f, b, sizeof b - 1); close(f);
+  char needle[128]; sprintf(needle, " %s ", point); int found = 0;
+  for (char *l = strtok(b, "\n"); l; l = strtok(0, "\n")) { char *at = strstr(l, needle); char *dash = strstr(l, " - "); if (at && dash && at < dash) { found = 0; char *o = strstr(at, field); if (o && o < dash) found = 1; } }
+  return found;
+}
+static int t_propagation(void) {
+  unshare(CLONE_NEWNS); mount(0, "/", 0, MS_REC | MS_PRIVATE, 0);
+  mkdir(B "/p", 0755); CHECK(!mount("tmpfs", B "/p", "tmpfs", 0, 0), "a tmpfs to share"); for (const char *d = "abcdeu"; *d; d++) { char n[64]; sprintf(n, B "/p/%c", *d); mkdir(n, 0755); }
+  CHECK(!mi_field(B "/p", "shared:"), "private to start with");
+  CHECK(!mount(0, B "/p", 0, MS_SHARED, 0) && mi_field(B "/p", "shared:") == 1, "--make-shared, and mountinfo says so");
+  CHECK(mount(0, B "/p/a", 0, MS_SHARED, 0) < 0 && errno == EINVAL, "not a mount point: EINVAL (%d)", errno);
+  CHECK(mount(0, B "/p", 0, MS_SHARED | MS_PRIVATE, 0) < 0 && errno == EINVAL, "two types at once: EINVAL");
+  int go[2], back[2]; pipe(go); pipe(back); char x = 1; int st;
+  /* A peer in another namespace: mounts go both ways, and so do unmounts. */
+  fflush(stdout); pid_t c = fork();
+  if (!c) { unshare(CLONE_NEWNS); write(back[1], &x, 1); read(go[0], &x, 1); int seen = exists(B "/p/a/from-parent");
+    mount("tmpfs", B "/p/b", "tmpfs", 0, 0); put(B "/p/b/from-child", "x"); write(back[1], &x, 1); read(go[0], &x, 1); int gone = !exists(B "/p/a/from-parent"); _exit(seen && gone ? 0 : 1 + 2 * seen + 4 * gone); }
+  read(back[0], &x, 1); mount("tmpfs", B "/p/a", "tmpfs", 0, 0); put(B "/p/a/from-parent", "x"); write(go[1], &x, 1); read(back[0], &x, 1);
+  CHECK(exists(B "/p/b/from-child"), "a mount in a peer namespace shows here");
+  umount(B "/p/a"); write(go[1], &x, 1); waitpid(c, &st, 0); CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "ours shows there, and so does its unmount (%#x)", st);
+  /* A slave gets the master's mounts but keeps its own. */
+  fflush(stdout); c = fork();
+  if (!c) { unshare(CLONE_NEWNS); mount(0, B "/p", 0, MS_SLAVE, 0); int sl = mi_field(B "/p", "master:") == 1 && !mi_field(B "/p", "shared:"); write(back[1], &x, 1); read(go[0], &x, 1);
+    int seen = exists(B "/p/c/from-master"); mount("tmpfs", B "/p/d", "tmpfs", 0, 0); put(B "/p/d/from-slave", "x"); write(back[1], &x, 1); read(go[0], &x, 1); _exit(sl && seen ? 0 : 1 + 2 * sl + 4 * seen); }
+  read(back[0], &x, 1); mount("tmpfs", B "/p/c", "tmpfs", 0, 0); put(B "/p/c/from-master", "x"); write(go[1], &x, 1); read(back[0], &x, 1);
+  CHECK(!exists(B "/p/d/from-slave"), "a slave's own mounts don't come back"); write(go[1], &x, 1); waitpid(c, &st, 0); CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "a slave gets the master's mounts, and says master: (%#x)", st);
+  /* A bind mount of a shared mount is its peer. */
+  mkdir(B "/pbind", 0755); CHECK(!mount(B "/p", B "/pbind", 0, MS_BIND, 0) && mi_field(B "/pbind", "shared:") == 1, "a bind of a shared mount is shared");
+  mount("tmpfs", B "/p/e", "tmpfs", 0, 0); put(B "/p/e/x", "x"); CHECK(exists(B "/pbind/e/x"), "and gets what's mounted under the original");
+  CHECK(!mount(0, B "/pbind", 0, MS_PRIVATE, 0) && !mi_field(B "/pbind", "shared:"), "--make-private"); mount("tmpfs", B "/p/u", "tmpfs", 0, 0); put(B "/p/u/x", "x"); CHECK(!exists(B "/pbind/u/x"), "then nothing more arrives");
+  /* Unbindable */
+  mkdir(B "/ub", 0755); mkdir(B "/ubind", 0755); mount("tmpfs", B "/ub", "tmpfs", 0, 0); CHECK(!mount(0, B "/ub", 0, MS_UNBINDABLE, 0) && mi_field(B "/ub", "unbindable") == 1, "--make-unbindable");
+  CHECK(mount(B "/ub", B "/ubind", 0, MS_BIND, 0) < 0 && errno == EINVAL, "and it can't be bind mounted: EINVAL (%d)", errno);
+  /* Into a less privileged namespace, shared becomes slave. */
+  fflush(stdout); c = fork(); if (!c) { if (unshare(CLONE_NEWUSER | CLONE_NEWNS)) _exit(9); _exit(mi_field(B "/p", "master:") == 1 && !mi_field(B "/p", "shared:") ? 0 : 1); }
+  waitpid(c, &st, 0); CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "a new user namespace's copy of a shared mount is a slave (%#x)", st);
+  return fails;
+}
 int main(void) {
   mkdir(B, 0755); mount("tmpfs", B, "tmpfs", 0, 0); mkdir(B "/m", 0755); mkdir(B "/m2", 0755); mkdir(B "/src", 0755); mkdir(B "/src/sub", 0755); mkdir(B "/src/x", 0755); mkdir(B "/dst", 0755); mkdir(B "/new", 0755); put(B "/marker", "m");
   int st = in_child(t_private); CHECK(!exists(B "/m/inner"), "a mount in a child's namespace isn't visible outside"); CHECK(has_mount(B "/m") == 0, "nor in this mountinfo");
   in_child(t_bind); CHECK(!exists(B "/dst/f"), "binds stayed in their namespace"); CHECK(exists(B "/src/f"), "the file itself persists, it's the same filesystem");
   in_child(t_chroot); CHECK(exists(B "/secret"), "the jail didn't affect this process");
   in_child(t_chroot_fd); in_child(t_pivot); in_child(t_pivot_dotdot); CHECK(exists(B "/marker"), "pivots stayed in their namespaces");
-  in_child(t_setns_helper); in_child(t_unix);
+  in_child(t_setns_helper); in_child(t_unix); in_child(t_propagation);
   /* Clone */
   fflush(stdout); pid_t c = syscall(SYS_clone, CLONE_NEWNS | SIGCHLD, 0, 0, 0, 0); if (!c) { mount(0, "/", 0, MS_REC | MS_PRIVATE, 0); mount("tmpfs", B "/m", "tmpfs", 0, 0); put(B "/m/via-clone", "x"); _exit(exists(B "/m/via-clone") ? 0 : 1); } waitpid(c, &st, 0); CHECK(WIFEXITED(st) && !WEXITSTATUS(st) && !exists(B "/m/via-clone"), "clone(CLONE_NEWNS) works the same (%#x)", st);
   puts(fails ? "SOME FAILED" : "PASS"); return fails != 0;

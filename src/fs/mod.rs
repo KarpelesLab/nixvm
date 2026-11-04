@@ -35,7 +35,7 @@ pub mod tmpfs;
 pub use devfs::DevFs;
 #[cfg(feature = "fstool")]
 pub use fstoolfs::FsToolMount;
-pub use mount::{MountEntry, MountTable, PathMove, PivotMap};
+pub use mount::{MountEntry, MountTable, PathMove, PivotMap, Propagation};
 pub use overlay::Overlay;
 #[cfg(unix)]
 pub use passthrough::Passthrough;

@@ -22,8 +22,8 @@ impl Kernel {
     /// `mount(source, target, fstype, flags, data)`. The in-memory pseudo
     /// filesystems really mount (`tmpfs`/`ramfs`, `proc`, `sysfs`,
     /// `devtmpfs`), stacking over the target directory until `umount`; the
-    /// remount/bind/move/propagation variants and the kernel's other virtual
-    /// filesystems (`devpts`, `mqueue`, `cgroup2`, `debugfs`, `binfmt_misc`,
+    /// remount, bind and move variants work, as does propagation (shared, slave,
+    /// private and unbindable mounts); the kernel's other virtual filesystems (`devpts`, `mqueue`, `cgroup2`, `debugfs`, `binfmt_misc`,
     /// …, which nixvm already provides or doesn't model) are accepted as
     /// no-ops; a filesystem that needs a block device (`ext4`, `vfat`, …) is
     /// `ENODEV` — there are none. Root only (`EPERM`); the target must be an
@@ -87,9 +87,21 @@ impl Kernel {
                 Err(e) => io_errno(&e),
             };
         }
-        // Propagation: every mount here is private, so there's nothing to change.
+        // Propagation: exactly one type, on a mount point, and with MS_REC on
+        // everything below it too.
         if flags & MS_PROPAGATION != 0 {
-            return 0;
+            use crate::fs::Propagation;
+            let kind = match flags & MS_PROPAGATION {
+                f if f == 1 << 20 => Propagation::Shared,
+                f if f == 1 << 19 => Propagation::Slave,
+                f if f == 1 << 18 => Propagation::Private,
+                f if f == 1 << 17 => Propagation::Unbindable,
+                _ => return err(Errno::EINVAL),
+            };
+            return match vfs.set_propagation(&abs, kind, flags & MS_REC != 0) {
+                Ok(()) => 0,
+                Err(e) => io_errno(&e),
+            };
         }
         let fstype = if fstype == 0 {
             String::new()

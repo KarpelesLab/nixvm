@@ -478,8 +478,9 @@ must get the isolation it asks for.
   bind mounts. Bubblewrap and util-linux's `unshare` run inside the VM.
   A new network namespace's `lo` starts down, and files kept open across `setns`
   into another mount namespace stay the files they were opened on, as on Linux.
-  Known limits: mounts are all private (propagation is accepted and does nothing); cgroup
-  namespaces only change the id; a pid recorded for an exited process (`msg_lspid`, say) reads
+  Mount propagation works: shared, slave, private and unbindable mounts, peer groups
+  across namespaces and bind mounts, and `shared:`/`master:` in `mountinfo`.
+  Known limits: cgroup namespaces only change the id; a pid recorded for an exited process (`msg_lspid`, say) reads
   as 0 inside a nested PID namespace.
 - **Not started:** the syscall-filter policy, env scrubbing and logging of denials.
 - **Tests:** `tests/guest_conformance.rs` runs the C programs in `tests/guest`, written to
