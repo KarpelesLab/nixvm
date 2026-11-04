@@ -87,8 +87,13 @@ fn for_each_prio_target(
     if matches(&cx.cur) {
         f(&mut cx.cur);
     }
+    // The caller is `cx.cur`, whatever slot the scheduler still holds for it.
+    let me = cx.cur.pid;
     for slot in sh.procs.iter_mut().flatten() {
-        if !matches!(slot.info.run, RunState::Zombie(_)) && matches(&slot.info) {
+        if slot.info.pid != me
+            && !matches!(slot.info.run, RunState::Zombie(_))
+            && matches(&slot.info)
+        {
             f(&mut slot.info);
         }
     }

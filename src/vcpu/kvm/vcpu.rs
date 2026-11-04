@@ -196,6 +196,10 @@ pub struct KvmVcpu {
     /// Kernel-shared run page, mapped for the fd's lifetime.
     run: *mut sys::kvm_run,
     regs: sys::kvm_regs,
+    /// The registers as the vcpu last entered the guest. An AMD host resets a
+    /// vcpu that triple-faults, so after `KVM_EXIT_SHUTDOWN` its own registers
+    /// say nothing of where the task was; these do.
+    entry_regs: sys::kvm_regs,
     regs_dirty: bool,
     sregs: sys::kvm_sregs,
     sregs_dirty: bool,
@@ -400,6 +404,7 @@ impl KvmVcpu {
             fd,
             run,
             regs: sys::kvm_regs::default(),
+            entry_regs: sys::kvm_regs::default(),
             regs_dirty: true,
             sregs,
             sregs_dirty: true,
@@ -487,6 +492,7 @@ impl KvmVcpu {
         if let Some(q) = self.quantum {
             preempt::arm(q);
         }
+        self.entry_regs = self.regs;
         // SAFETY: `KVM_RUN` takes no argument; the fd is live and not run
         // concurrently (see the `Send` note).
         let ret = unsafe { sys::ioctl(self.fd.0, sys::KVM_RUN, 0) };
@@ -649,7 +655,13 @@ impl KvmVcpu {
             // faulting `rip`. (cr2 is deliberately *not* consulted: it is sticky
             // from the last real #PF, so with demand paging it is almost always
             // non-zero and would misattribute a #UD as a bogus memory fault.)
-            sys::KVM_EXIT_SHUTDOWN => Ok(Exit::IllegalInstruction { pc: self.regs.rip }),
+            sys::KVM_EXIT_SHUTDOWN => {
+                // An AMD host has reset the vcpu by now: report where it entered.
+                if self.regs.rip == 0xfff0 {
+                    self.regs = self.entry_regs;
+                }
+                Ok(Exit::IllegalInstruction { pc: self.regs.rip })
+            }
             sys::KVM_EXIT_INTR => Ok(Exit::Interrupted),
             sys::KVM_EXIT_FAIL_ENTRY => {
                 // SAFETY: as `mmio` — the arm matching the exit reason.

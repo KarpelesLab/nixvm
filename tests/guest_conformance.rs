@@ -28,7 +28,7 @@ const PROGRAMS: &[&str] = &[
 /// `exec` itself there. `None` if there's no compiler to build them with.
 fn built() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    DIR.get_or_init(|| build_with("gcc", "guest_root"))
+    DIR.get_or_init(|| build_with("gcc", "guest_root", &["attacks", "policy"]))
         .as_deref()
 }
 
@@ -53,17 +53,18 @@ fn built_aarch64() -> Option<&'static Path> {
             eprintln!("no aarch64 cross compiler, skipping the aarch64 guest");
             return None;
         };
-        build_with(&cc, "guest_root_aarch64")
+        // The attack and policy checks run on x86-64 only.
+        build_with(&cc, "guest_root_aarch64", &[])
     })
     .as_deref()
 }
 
-fn build_with(cc: &str, dir_name: &str) -> Option<PathBuf> {
+fn build_with(cc: &str, dir_name: &str, extra: &[&str]) -> Option<PathBuf> {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(dir_name);
     for sub in ["tmp", "etc", "proc", "dev", "sys", "mnt"] {
         std::fs::create_dir_all(dir.join(sub)).expect("create guest root");
     }
-    for name in PROGRAMS.iter().chain(&["attacks", "policy"]) {
+    for name in PROGRAMS.iter().chain(extra) {
         let built = Command::new(cc)
             .args(["-static", "-O1", "-w", "-pthread", "-o"])
             .arg(dir.join(name))

@@ -2521,6 +2521,7 @@ impl Kernel {
             // to the task's CPU total — a blocked task ends its slice here and
             // stops accruing, so this tracks CPU rather than wall time.
             let step_start = crate::clock::now_monotonic().as_nanos();
+            let io_before = cx.cur.io_progress;
             let exit = vcpu.run(mem)?;
             // A time-quantum interrupt (mid-compute preemption) ends the slice,
             // as on the SMP path: otherwise a syscall-free hot loop keeps the
@@ -2558,7 +2559,10 @@ impl Kernel {
                 }
                 Serviced::Resume if is_interrupt => return Ok(true),
                 Serviced::Resume => progressed = true,
-                Serviced::Blocked => return Ok(progressed),
+                // A write that moved data before blocking made progress, even
+                // though the call hasn't returned: counting it as none let a
+                // sweep that ran the reader first, then this, call it a deadlock.
+                Serviced::Blocked => return Ok(progressed || cx.cur.io_progress != io_before),
                 Serviced::Ended => return Ok(true),
             }
             // Preemption: after a full quantum of syscalls, end the slice so a
@@ -2965,6 +2969,10 @@ impl Kernel {
             // a genuinely deadlocked machine is detected after exactly one
             // fruitless retry instead of spinning or erroring prematurely.
             let mut blocked_at: BTreeMap<usize, u64> = BTreeMap::new();
+            // The task (by pid) each in-flight run of a slot is for, in dispatch
+            // order. A slot's runs go to one worker and come back in order, so
+            // the front is the task the next result for that slot belongs to.
+            let mut dispatched: BTreeMap<usize, VecDeque<i32>> = BTreeMap::new();
             let mut epoch: u64 = 0;
             let mut inflight = 0usize;
             let mut stalled = false;
@@ -2984,7 +2992,9 @@ impl Kernel {
                         };
                         let mm = sh.procs[i].as_ref().unwrap().info.mm;
                         let space = Arc::clone(&sh.spaces[mm]);
-                        let vcpu = sh.procs[i].as_mut().unwrap().vcpu.take().unwrap();
+                        let p = sh.procs[i].as_mut().unwrap();
+                        dispatched.entry(i).or_default().push_back(p.info.pid);
+                        let vcpu = p.vcpu.take().unwrap();
                         batch.push((i, vcpu, space));
                     }
                     batch
@@ -3054,6 +3064,23 @@ impl Kernel {
                 let (i, vcpu, out) = done_rx.recv().expect("workers outlive the scheduler");
                 inflight -= 1;
                 let mut sh = self.shared.lock().unwrap();
+                let ran = dispatched.get_mut(&i).and_then(VecDeque::pop_front);
+                // The task this ran for exited and was reaped while the result was
+                // on its way, and the slot may already hold a new task (a fork
+                // takes the lowest free slot). That one has a vcpu of its own: this
+                // one goes, and nothing here is about the new task.
+                if sh.procs[i]
+                    .as_ref()
+                    .is_none_or(|p| Some(p.info.pid) != ran || p.vcpu.is_some())
+                {
+                    drop(vcpu);
+                    if let SliceOutcome::Err(e) = out {
+                        break Err(e);
+                    }
+                    epoch += 1;
+                    stalled = false;
+                    continue;
+                }
                 // Re-attach the vcpu to its task slot — unless the task was
                 // *reaped while in flight*. A task's own worker services its
                 // `exit` in place, marking it a `Zombie` under the kernel lock
@@ -3104,10 +3131,14 @@ impl Kernel {
             // have been reaped (see the re-attach note above), so tolerate a
             // `None` slot.
             while inflight > 0 {
-                if let Ok((i, vcpu, _)) = done_rx.recv()
-                    && let Some(p) = self.shared.lock().unwrap().procs[i].as_mut()
-                {
-                    p.vcpu = Some(vcpu);
+                if let Ok((i, vcpu, _)) = done_rx.recv() {
+                    let ran = dispatched.get_mut(&i).and_then(VecDeque::pop_front);
+                    if let Some(p) = self.shared.lock().unwrap().procs[i].as_mut()
+                        && Some(p.info.pid) == ran
+                        && p.vcpu.is_none()
+                    {
+                        p.vcpu = Some(vcpu);
+                    }
                 }
                 inflight -= 1;
             }

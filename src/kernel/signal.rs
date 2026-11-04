@@ -1472,7 +1472,15 @@ fn notify_parent(sh: &mut Shared, cx: &mut ServiceCtx, ppid: i32) {
 /// process queued itself (`sigqueue`, negative `si_code`) are refused for it;
 /// `kill` and the kernel's own signals always get through.
 fn sigqueue_full(sh: &Shared, cx: &ServiceCtx, pid: i32) -> bool {
-    let tasks = || std::iter::once(&cx.cur).chain(sh.procs.iter().flatten().map(|s| &s.info));
+    // The caller may still have a slot of its own (the SMP scheduler keeps it):
+    // count it once, as itself.
+    let others = sh
+        .procs
+        .iter()
+        .flatten()
+        .map(|s| &s.info)
+        .filter(|p| p.pid != cx.cur.pid);
+    let tasks = || std::iter::once(&cx.cur).chain(others.clone());
     let Some(target) = tasks().find(|p| p.pid == pid) else {
         return false;
     };
