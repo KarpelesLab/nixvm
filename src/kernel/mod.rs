@@ -7364,6 +7364,11 @@ impl Kernel {
                     return err(Errno::EFAULT);
                 };
                 let len = len.min(remaining);
+                // An empty segment's pointer isn't looked at (musl flushes with
+                // one), as on Linux.
+                if len == 0 {
+                    continue;
+                }
                 remaining -= len;
                 let Ok(mut chunk) = mem.read_vec(base, len as usize) else {
                     return err(Errno::EFAULT);
@@ -7695,8 +7700,10 @@ impl Kernel {
         // Interface queries (`SIOCGIF*`) operate on any socket fd.
         if net::is_iface_ioctl(req) {
             return if matches!(f, Fd::Socket { .. }) {
-                let link = self.net.lock().unwrap().link();
-                net::iface_ioctl(req, arg, mem, link.as_ref())
+                let mut net = self.net.lock().unwrap();
+                let privileged = cx.cur.privileged();
+                let ns = net.netns_of(&f).unwrap_or(cx.cur.ns.net);
+                net::iface_ioctl(req, arg, mem, &mut net, ns, privileged)
             } else {
                 err(Errno::ENOTTY)
             };

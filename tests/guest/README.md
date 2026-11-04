@@ -12,5 +12,6 @@ unshare -Urm /tmp/ns_pid                  # the ns_* programs want root in a use
 ```
 
 `ns_user` starts as an ordinary user, so run that one with no `unshare` at all, and
-`ns_mount` with `unshare -Urmp --fork --mount-proc`. `attacks.c` isn't a pass/fail
+`ns_mount` with `unshare -Urmp --fork --mount-proc`, and `ns_net` with
+`unshare -Urn sh -c 'ip link set lo up && ./ns_net'` (a new namespace's `lo` starts down). `attacks.c` isn't a pass/fail
 program: the Rust test checks that each thing it tries is contained.

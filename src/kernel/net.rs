@@ -294,6 +294,7 @@ const CMSG_HDR_LEN: usize = 16;
 // enumerate the interfaces (`lo`, plus `tun0` while the egress backend
 // provides a link): `RTM_GETLINK`/`RTM_GETADDR`/`RTM_GETROUTE` dumps.
 const RTM_NEWLINK: u16 = 16;
+const RTM_SETLINK: u16 = 19;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
@@ -332,6 +333,7 @@ const IFLA_TXQLEN: u16 = 13;
 const IFLA_OPERSTATE: u16 = 16;
 /// `IFLA_OPERSTATE` values (linux/if.h): `lo` reports "unknown".
 const IF_OPER_UNKNOWN: u8 = 0;
+const IF_OPER_DOWN: u8 = 2;
 const IF_OPER_UP: u8 = 6;
 
 // `RTA_*` rtattr types and `rtmsg` field values (linux/rtnetlink.h) for the
@@ -380,6 +382,9 @@ pub(super) struct Net {
     egress: Option<Box<dyn Egress>>,
     /// Last echo identifier handed to a ping socket.
     ping_ident: u16,
+    /// Network namespaces whose `lo` has been set up or down. Unlisted, `lo` is
+    /// up in the VM's first namespace and down in a new one, as on Linux.
+    lo_state: BTreeMap<u32, bool>,
 }
 
 impl std::fmt::Debug for Net {
@@ -392,6 +397,7 @@ impl std::fmt::Debug for Net {
             .field("dgram_paths", &self.dgram_paths)
             .field("egress", &self.egress.is_some())
             .field("ping_ident", &self.ping_ident)
+            .field("lo_state", &self.lo_state)
             .finish()
     }
 }
@@ -796,6 +802,45 @@ fn unix_key(netns: u32, name: &str, identity: Option<&String>) -> String {
 }
 
 impl Net {
+    /// The network namespace socket `fd` belongs to.
+    pub(super) fn netns_of(&self, fd: &Fd) -> Option<u32> {
+        match *fd {
+            Fd::Socket { sock, .. } => self.socks.get(sock).map(|s| s.netns),
+            _ => None,
+        }
+    }
+
+    /// Whether network namespace `ns`'s `lo` is up.
+    pub(super) fn lo_up(&self, ns: u32) -> bool {
+        self.lo_state.get(&ns).copied().unwrap_or(ns == 0)
+    }
+
+    /// What `sock`'s namespace says to a loopback destination while its `lo`
+    /// is down: Linux has no route for IPv4 and no source address for IPv6.
+    fn loopback_unreachable(&self, sock: usize, dest: &InetAddr) -> Option<i64> {
+        if dest.valid_bind() && !self.lo_up(self.socks[sock].netns) {
+            Some(err(if dest.v6 {
+                Errno::EADDRNOTAVAIL
+            } else {
+                Errno::ENETUNREACH
+            }))
+        } else {
+            None
+        }
+    }
+
+    /// The interfaces namespace `ns` sees: its `lo`, and `tun0` only in the
+    /// first namespace, while the egress backend provides a link.
+    pub(super) fn ifaces_of(&self, ns: u32) -> Vec<Iface> {
+        let link = self.link().filter(|_| ns == 0);
+        ifaces(link.as_ref(), self.lo_up(ns))
+    }
+
+    /// Set namespace `ns`'s `lo` up or down.
+    pub(super) fn set_lo(&mut self, ns: u32, up: bool) {
+        self.lo_state.insert(ns, up);
+    }
+
     /// What connects socket `sock` to the outside world. Only sockets in the VM's
     /// first network namespace have this: a new namespace is loopback only.
     fn egress_for(&self, sock: usize) -> Option<&dyn Egress> {
@@ -1389,6 +1434,11 @@ impl Kernel {
         };
         if mismatched {
             return err(Errno::EINVAL);
+        }
+        if let Addr::Inet(a) = &target
+            && let Some(e) = net.loopback_unreachable(sock, a)
+        {
+            return e;
         }
         // A routable (non-loopback) destination: with a host-egress backend
         // installed, bridge it to the real internet; without one, it's
@@ -2192,6 +2242,9 @@ impl Kernel {
         };
         if !matches!(net.socks[sock].kind, Kind::Dgram(_)) {
             return err(Errno::EINVAL); // real errno: EOPNOTSUPP/EISCONN
+        }
+        if let Some(e) = net.loopback_unreachable(sock, &dest) {
+            return e;
         }
         if matches!(
             net.socks[sock].kind,
@@ -3217,7 +3270,8 @@ impl Kernel {
         nosignal: bool,
     ) -> i64 {
         if matches!(net.socks[sock].kind, Kind::Netlink(_)) {
-            return self.handle_netlink_request(net, sock, data);
+            let privileged = cx.cur.privileged();
+            return self.handle_netlink_request(net, sock, data, privileged);
         }
         if matches!(net.socks[sock].kind, Kind::Dgram(_)) {
             // A connected `socketpair(AF_UNIX, SOCK_DGRAM)` end: deliver the
@@ -3331,7 +3385,13 @@ impl Kernel {
     /// queue for a later `recv` to drain. Returns `data.len()` (the whole
     /// request was consumed), matching a real `write`/`send`.
     #[allow(clippy::unused_self)]
-    fn handle_netlink_request(&self, net: &mut Net, sock: usize, data: &[u8]) -> i64 {
+    fn handle_netlink_request(
+        &self,
+        net: &mut Net,
+        sock: usize,
+        data: &[u8],
+        privileged: bool,
+    ) -> i64 {
         let pid = match &net.socks[sock].kind {
             Kind::Netlink(nl) => nl.pid,
             _ => 0,
@@ -3359,11 +3419,23 @@ impl Kernel {
             };
             let wants = |f: u16| family == 0 || family == f;
             // A new namespace has only its loopback interface.
-            let link = net.link().filter(|_| net.socks[sock].netns == 0);
+            let ns = net.socks[sock].netns;
+            let link = net.link().filter(|_| ns == 0);
             let done = || encode_nlmsg(NLMSG_DONE, 0, nlmsg_seq, pid, &0i32.to_le_bytes());
+            let body = &data[offset..(offset + nlmsg_len).min(data.len())];
 
-            let replies: Vec<Vec<u8>> = if nlmsg_type == RTM_GETLINK && dump {
-                let mut r: Vec<Vec<u8>> = ifaces(link.as_ref())
+            let replies: Vec<Vec<u8>> = if matches!(nlmsg_type, RTM_NEWLINK | RTM_SETLINK) && !dump
+            {
+                // `ip link set lo up/down`: struct ifinfomsg's flags and change.
+                let errno = set_link(net, ns, privileged, body);
+                if errno != 0 || want_ack {
+                    vec![encode_nlmsgerr(-errno, &orig_hdr, nlmsg_seq, pid)]
+                } else {
+                    Vec::new()
+                }
+            } else if nlmsg_type == RTM_GETLINK && dump {
+                let mut r: Vec<Vec<u8>> = net
+                    .ifaces_of(ns)
                     .iter()
                     .map(|i| build_rtm_newlink(nlmsg_seq, pid, i))
                     .collect();
@@ -3371,7 +3443,7 @@ impl Kernel {
                 r
             } else if nlmsg_type == RTM_GETADDR && dump {
                 let mut r = Vec::new();
-                for i in ifaces(link.as_ref()) {
+                for i in net.ifaces_of(ns) {
                     if let Some((ip, len)) = i.v4.filter(|_| wants(AF_INET)) {
                         r.push(build_rtm_newaddr(nlmsg_seq, pid, &i, AF_INET, &ip, len));
                     }
@@ -3697,7 +3769,7 @@ fn encode_nlmsgerr(error: i32, orig_hdr: &[u8; 16], seq: u32, pid: u32) -> Vec<u
 
 /// One guest-visible network interface, as netlink dumps and `SIOCGIF*`
 /// ioctls describe it.
-struct Iface {
+pub(super) struct Iface {
     name: &'static str,
     index: i32,
     /// `ifi_type` / the hardware address family (`ARPHRD_*`).
@@ -3710,19 +3782,23 @@ struct Iface {
     v6: Option<([u8; 16], u8)>,
 }
 
-/// The guest's interfaces: the always-up `lo`, then `tun0` while the egress
-/// backend provides a link (`link`).
-fn ifaces(link: Option<&Link>) -> Vec<Iface> {
+/// The guest's interfaces: `lo`, which has its addresses only while up, then
+/// `tun0` while the egress backend provides a link (`link`).
+fn ifaces(link: Option<&Link>, lo_up: bool) -> Vec<Iface> {
     let mut v = vec![Iface {
         name: "lo",
         index: LOOPBACK_IFINDEX,
         hwtype: ARPHRD_LOOPBACK,
-        flags: IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_LOWER_UP,
+        flags: if lo_up {
+            IFF_UP | IFF_LOOPBACK | IFF_RUNNING | IFF_LOWER_UP
+        } else {
+            IFF_LOOPBACK
+        },
         mtu: 65_536,
         txqlen: 1000,
-        operstate: IF_OPER_UNKNOWN,
-        v4: Some(([127, 0, 0, 1], 8)),
-        v6: Some((loopback_ip(true), 128)),
+        operstate: if lo_up { IF_OPER_UNKNOWN } else { IF_OPER_DOWN },
+        v4: lo_up.then_some(([127, 0, 0, 1], 8)),
+        v6: lo_up.then(|| (loopback_ip(true), 128)),
     }];
     if let Some(l) = link {
         v.push(Iface {
@@ -3757,6 +3833,57 @@ fn mask_prefix<const N: usize>(ip: &[u8; N], len: u8) -> [u8; N] {
         };
     }
     out
+}
+
+/// An `RTM_NEWLINK`/`RTM_SETLINK` request (`body` is the whole message) in
+/// namespace `ns`: bring `lo` up or down, the one change modelled. Returns 0
+/// or a positive errno. `tun0` stays up, and the other interfaces don't exist.
+fn set_link(net: &mut Net, ns: u32, privileged: bool, body: &[u8]) -> i32 {
+    // struct ifinfomsg { u8 family, pad; u16 type; i32 index; u32 flags, change; }
+    let Some(msg) = body.get(16..32) else {
+        return Errno::EINVAL.0;
+    };
+    let index = i32::from_le_bytes(msg[4..8].try_into().unwrap());
+    let flags = u32::from_le_bytes(msg[8..12].try_into().unwrap());
+    let mut change = u32::from_le_bytes(msg[12..16].try_into().unwrap());
+    if change == 0 {
+        change = u32::MAX; // the old convention: every flag given is meant
+    }
+    // An interface named by IFLA_IFNAME instead of its index.
+    let named_lo = || {
+        let mut at = 32;
+        while at + 4 <= body.len() {
+            let len = usize::from(u16::from_le_bytes([body[at], body[at + 1]]));
+            let ty = u16::from_le_bytes([body[at + 2], body[at + 3]]);
+            if len < 4 {
+                break;
+            }
+            if ty == IFLA_IFNAME {
+                return body
+                    .get(at + 4..at + len)
+                    .is_some_and(|n| n.split(|&b| b == 0).next() == Some(b"lo"));
+            }
+            at += (len + 3) & !3;
+        }
+        false
+    };
+    let is_lo = index == LOOPBACK_IFINDEX || (index == 0 && named_lo());
+    let is_tun = index == TUN_IFINDEX && ns == 0 && net.link().is_some();
+    if !is_lo && !is_tun {
+        return Errno::ENODEV.0;
+    }
+    if !privileged {
+        return Errno::EPERM.0;
+    }
+    if change & IFF_UP == 0 {
+        return 0;
+    }
+    let up = flags & IFF_UP != 0;
+    if is_tun {
+        return if up { 0 } else { Errno::EPERM.0 };
+    }
+    net.set_lo(ns, up);
+    0
 }
 
 /// `RTM_NEWLINK` describing interface `i`.
@@ -3846,10 +3973,18 @@ fn build_rtm_newroute(
 /// `SIOCGIFCONF` which uses `struct ifconf`. A query for an unknown interface
 /// is `ENODEV`. Returns 0 on success or a negative errno; the caller has
 /// already checked `arg`'s fd is a socket.
-pub(super) fn iface_ioctl(req: u32, arg: u64, mem: &mut GuestMemory, link: Option<&Link>) -> i64 {
+pub(super) fn iface_ioctl(
+    req: u32,
+    arg: u64,
+    mem: &mut GuestMemory,
+    net: &mut Net,
+    ns: u32,
+    privileged: bool,
+) -> i64 {
     const SIOCGIFNAME: u32 = 0x8910;
     const SIOCGIFCONF: u32 = 0x8912;
     const SIOCGIFFLAGS: u32 = 0x8913;
+    const SIOCSIFFLAGS: u32 = 0x8914;
     const SIOCGIFADDR: u32 = 0x8915;
     const SIOCGIFDSTADDR: u32 = 0x8917;
     const SIOCGIFBRDADDR: u32 = 0x8919;
@@ -3868,7 +4003,7 @@ pub(super) fn iface_ioctl(req: u32, arg: u64, mem: &mut GuestMemory, link: Optio
         sa[4..8].copy_from_slice(&ip);
         mem.write(arg + IFR_UNION, &sa).is_ok()
     };
-    let all = ifaces(link);
+    let all = net.ifaces_of(ns);
 
     if req == SIOCGIFCONF {
         // struct ifconf { int ifc_len; /*4 pad*/ char* ifc_buf; } — one ifreq
@@ -3925,6 +4060,22 @@ pub(super) fn iface_ioctl(req: u32, arg: u64, mem: &mut GuestMemory, link: Optio
     let v4 = |mem: &mut GuestMemory, f: fn([u8; 4], u8) -> [u8; 4]| -> Option<bool> {
         i.v4.map(|(ip, len)| put_sin(mem, f(ip, len)))
     };
+    if req == SIOCSIFFLAGS {
+        // `lo` can be brought up or down; `tun0` stays up.
+        let Ok(raw) = mem.read_u32(arg + IFR_UNION) else {
+            return err(Errno::EFAULT);
+        };
+        if !privileged {
+            return err(Errno::EPERM);
+        }
+        let up = raw & IFF_UP != 0;
+        if i.index == LOOPBACK_IFINDEX {
+            net.set_lo(ns, up);
+        } else if !up {
+            return err(Errno::EPERM);
+        }
+        return 0;
+    }
     let ok = match req {
         SIOCGIFINDEX => mem.write(arg + IFR_UNION, &i.index.to_le_bytes()).is_ok(),
         SIOCGIFFLAGS => {
@@ -3963,6 +4114,7 @@ pub(super) fn is_iface_ioctl(req: u32) -> bool {
         0x8910
             | 0x8912
             | 0x8913
+            | 0x8914
             | 0x8915
             | 0x8917
             | 0x8919

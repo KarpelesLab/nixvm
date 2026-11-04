@@ -20,6 +20,10 @@ struct job { int fd; size_t n; unsigned *out; size_t *got; };
 static void *reader(void *a) { struct job *j = a; unsigned char *b = malloc(j->n); size_t got = 0; while (got < j->n) { ssize_t r = read(j->fd, b + got, j->n - got); if (r <= 0) break; got += r; usleep(200); } *j->got = got; *j->out = sum(b, got); free(b); return 0; }
 static void h(int s) { (void)s; }
 int main(void) {
+  /* An empty iovec's pointer is never looked at (musl's exit flush passes one). */
+  { int zp[2]; pipe(zp); struct iovec v[2] = {{"abc", 3}, {(void *)8, 0}}; CHECK(writev(zp[1], v, 2) == 3, "writev to a pipe with an empty bad segment");
+    int sv[2]; socketpair(AF_UNIX, SOCK_STREAM, 0, sv); struct msghdr mh = {0}; mh.msg_iov = v; mh.msg_iovlen = 2; CHECK(sendmsg(sv[0], &mh, 0) == 3, "and sendmsg");
+    CHECK(write(zp[1], (void *)8, 0) == 0 && read(zp[0], (void *)8, 0) == 0, "zero-length read/write with a bad pointer"); }
   int p[2]; pipe(p); long sz = fcntl(p[1], F_GETPIPE_SZ); CHECK(sz == 65536, "default capacity %ld", sz);
   struct pollfd w = {p[1], POLLOUT, 0}; CHECK(poll(&w, 1, 0) == 1, "empty pipe polls writable");
   fcntl(p[1], F_SETFL, O_NONBLOCK); char *big = malloc(1 << 20); for (int i = 0; i < 1 << 20; i++) big[i] = i * 7;

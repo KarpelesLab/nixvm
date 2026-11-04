@@ -476,9 +476,11 @@ must get the isolation it asks for.
 - **Namespaces (`kernel/ns.rs`, `pidns.rs`, `userns.rs`):** UTS, IPC, network, mount, PID,
   user and time, with `setns` and `/proc/<pid>/ns`, plus real `chroot`, `pivot_root` and
   bind mounts. Bubblewrap and util-linux's `unshare` run inside the VM.
-  Known limits: mounts are all private (propagation is accepted and does nothing); a new
-  network namespace's `lo` starts up; cgroup namespaces only change the id; a file kept
-  open across `setns` into another mount namespace resolves there.
+  A new network namespace's `lo` starts down, as on Linux.
+  Known limits: mounts are all private (propagation is accepted and does nothing); cgroup
+  namespaces only change the id; a file kept open across `setns` into another mount
+  namespace resolves there; a pid recorded for an exited process (`msg_lspid`, say) reads
+  as 0 inside a nested PID namespace.
 - **Not started:** the syscall-filter policy, env scrubbing and logging of denials.
 - **Tests:** `tests/guest_conformance.rs` runs the C programs in `tests/guest`, written to
   pass on real Linux too, and contains the attacks; `tests/namespace_tools.rs` runs the

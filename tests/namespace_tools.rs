@@ -52,6 +52,16 @@ fn real_namespace_tools_work() {
         ),
         ("ls /mnt | wc -l", "0\n"),
         ("unshare -Urn sh -c 'ip link 2>&1 | grep -c tun0; true'", ""),
+        // A new network namespace's lo starts down; `ip link set` brings it up.
+        (
+            "unshare -Urn sh -c 'ip link show lo | grep -c ,UP; ip link set lo up; ip link show lo | grep -c ,UP; ip addr show lo | grep -c 127.0.0.1'",
+            "0\n1\n1\n",
+        ),
+        // bwrap brings it up itself.
+        (
+            "bwrap --ro-bind / / --dev /dev --proc /proc --unshare-net ip addr show lo | grep -c 127.0.0.1",
+            "1\n",
+        ),
         (
             "bwrap --ro-bind / / --dev /dev --proc /proc echo bwrap-basic",
             "bwrap-basic\n",

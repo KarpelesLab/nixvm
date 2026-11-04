@@ -917,7 +917,12 @@ impl GuestMemory {
     }
 
     /// Read `buf.len()` bytes from guest `addr` (requires `READ`).
+    /// Copying nothing never faults, whatever `addr` is, as with Linux's
+    /// `copy_from_user`: a guest passes an empty buffer with any pointer.
     pub fn read(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemError> {
+        if buf.is_empty() {
+            return Ok(());
+        }
         self.check(addr, buf.len(), Prot::READ)?;
         self.copy_out(addr, buf);
         Ok(())
@@ -925,6 +930,9 @@ impl GuestMemory {
 
     /// Read `len` bytes into a fresh `Vec` (requires `READ`).
     pub fn read_vec(&self, addr: u64, len: usize) -> Result<Vec<u8>, MemError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
         // Validate before allocating: a guest-supplied length (a write of
         // SSIZE_MAX bytes from a bogus pointer) must fault, not make the host
         // try to allocate it.
@@ -1025,7 +1033,11 @@ impl GuestMemory {
     }
 
     /// Write `buf` to guest `addr` (requires `WRITE`). Kernel copy-out.
+    /// Like [`Self::read`], writing nothing never faults.
     pub fn write(&mut self, addr: u64, buf: &[u8]) -> Result<(), MemError> {
+        if buf.is_empty() {
+            return Ok(());
+        }
         self.check(addr, buf.len(), Prot::WRITE)?;
         self.copy_in(addr, buf)
     }
