@@ -85,7 +85,14 @@ static int t_pivot_dotdot(void) {
 }
 static int t_setns_helper(void) {
   int keep = open("/proc/self/ns/mnt", O_RDONLY); CHECK(keep >= 0, "handle on the first namespace"); unshare(CLONE_NEWNS); mount(0, "/", 0, MS_REC | MS_PRIVATE, 0); mount("tmpfs", B "/m", "tmpfs", 0, 0); put(B "/m/only-here", "x"); chdir(B "/m");
+  int of = open(B "/m/only-here", O_RDWR), od = open(B "/m", O_RDONLY | O_DIRECTORY); CHECK(of >= 0 && od >= 0, "open a file and a directory there");
   CHECK(!setns(keep, CLONE_NEWNS), "setns back"); CHECK(!exists(B "/m/only-here"), "that mount isn't in this namespace"); char b[200]; CHECK(getcwd(b, sizeof b) && !strcmp(b, "/"), "and the cwd is reset to the root (%s)", b);
+  /* What was open stays the file it was opened on, as on Linux. */
+  char r[8] = {0}; CHECK(pread(of, r, sizeof r - 1, 0) == 1 && r[0] == 'x', "the open file still reads its contents (%s)", r);
+  CHECK(pwrite(of, "yz", 2, 1) == 2 && pread(of, r, 3, 0) == 3 && !memcmp(r, "xyz", 3), "and writes to it");
+  struct stat st; CHECK(!fstat(of, &st) && st.st_size == 3, "fstat sees it (%ld)", (long)st.st_size);
+  int rel = openat(od, "only-here", O_RDONLY); CHECK(rel >= 0, "openat through the old directory finds it");
+  int made = openat(od, "made-later", O_CREAT | O_WRONLY, 0600); CHECK(made >= 0 && !exists(B "/m/made-later"), "a file made through it lands there, not here");
   return fails;
 }
 static int t_unix(void) {

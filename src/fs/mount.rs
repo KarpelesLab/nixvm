@@ -423,6 +423,55 @@ impl MountTable {
         }))
     }
 
+    /// Keep `paths`, as mount namespace `from` resolves them, reachable from the
+    /// current namespace: what a task's open files need when it joins another
+    /// one, since Linux's still name the file they were opened on. Each path's
+    /// mount is shared under a hidden name, like a detached mount, and the path
+    /// to use from now on is returned in its place (`None`: nothing there to
+    /// carry). [`Self::collect_detached`] drops them once unused.
+    pub fn carry_from(&mut self, from: u32, paths: &[String]) -> Vec<Option<String>> {
+        if from == self.current {
+            return paths.iter().cloned().map(Some).collect();
+        }
+        let Some(source) = self.parked.get(&from) else {
+            return vec![None; paths.len()];
+        };
+        // The longest-prefix mount for each path, among `from`'s.
+        let owner = |path: &str| {
+            source
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| path_has_prefix(path, &m.point))
+                .max_by_key(|(i, m)| (m.point.len(), *i))
+                .map(|(i, _)| i)
+        };
+        let mut carried: BTreeMap<usize, String> = BTreeMap::new();
+        let mut added = Vec::new();
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            let path = normalize(path);
+            let Some(i) = owner(&path) else {
+                out.push(None);
+                continue;
+            };
+            let hidden = carried.entry(i).or_insert_with(|| {
+                let hidden = format!("/{DETACHED_MARK}{}", self.detached);
+                self.detached += 1;
+                added.push(Mount {
+                    point: hidden.clone(),
+                    ..source[i].clone()
+                });
+                hidden
+            });
+            out.push(Some(normalize(&format!(
+                "{hidden}/{}",
+                relative_to(&path, &source[i].point)
+            ))));
+        }
+        self.mounts.extend(added);
+        out
+    }
+
     /// Drop detached mounts nothing refers to any more. `in_use` is every path held
     /// on behalf of a task.
     pub fn collect_detached(&mut self, in_use: &[&str]) {

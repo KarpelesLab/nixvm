@@ -494,9 +494,11 @@ impl Kernel {
                 {
                     return err(Errno::EINVAL);
                 }
+                let old_mnt = cx.cur.ns.mnt;
                 Self::join_namespace(&mut cx.cur.ns, kind, id);
                 if kind == NsKind::Mnt {
                     Self::reset_to_new_root(cx);
+                    self.carry_open_files(sh, cx, old_mnt);
                 }
                 0
             }
@@ -530,12 +532,25 @@ impl Kernel {
                     {
                         return err(Errno::EINVAL);
                     }
+                }
+                let old_mnt = cx.cur.ns.mnt;
+                for kind in [
+                    NsKind::Cgroup,
+                    NsKind::Ipc,
+                    NsKind::Mnt,
+                    NsKind::Net,
+                    NsKind::Pid,
+                    NsKind::Time,
+                    NsKind::User,
+                    NsKind::Uts,
+                ] {
                     if nstype & kind.flag() != 0 {
                         Self::join_namespace(&mut cx.cur.ns, kind, target.get(kind));
                     }
                 }
                 if nstype & CLONE_NEWNS != 0 {
                     Self::reset_to_new_root(cx);
+                    self.carry_open_files(sh, cx, old_mnt);
                 }
                 0
             }

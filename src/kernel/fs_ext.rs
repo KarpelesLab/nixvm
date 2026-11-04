@@ -271,6 +271,13 @@ impl Kernel {
                 *cwd = moved.translate(cwd);
             }
         }
+        Self::collect_unused_hidden_mounts(sh, cx, &mut vfs);
+        0
+    }
+
+    /// Drop the hidden mounts (detached, or carried across `setns`) that no open
+    /// file, mapping or working directory refers to any more.
+    pub(super) fn collect_unused_hidden_mounts(sh: &Shared, cx: &ServiceCtx, vfs: &mut MountTable) {
         let tables = sh.file_tables.iter().flatten().chain([&cx.cur.fds]);
         let open = tables
             .flat_map(FdTable::iter)
@@ -279,9 +286,53 @@ impl Kernel {
                 _ => None,
             });
         let dirs = sh.cwd_tables.iter().flatten().map(String::as_str);
-        let in_use: Vec<&str> = open.chain(dirs).chain([cx.cur.cwd.as_str()]).collect();
+        let maps = sh
+            .procs
+            .iter()
+            .flatten()
+            .flat_map(|p| p.info.shared_maps.iter())
+            .chain(cx.cur.shared_maps.iter())
+            .map(|m| m.path.as_str());
+        let in_use: Vec<&str> = open
+            .chain(dirs)
+            .chain(maps)
+            .chain([cx.cur.cwd.as_str()])
+            .collect();
         vfs.collect_detached(&in_use);
-        0
+    }
+
+    /// The task just joined mount namespace `cx.cur.ns.mnt` from `old`: keep its
+    /// open files and shared file mappings on the files they were opened on,
+    /// which the same paths may not name here.
+    pub(super) fn carry_open_files(&self, sh: &Shared, cx: &mut ServiceCtx, old: u32) {
+        if old == cx.cur.ns.mnt {
+            return;
+        }
+        let mut paths: Vec<String> = cx
+            .cur
+            .fds
+            .iter()
+            .filter_map(|(_, fd)| match fd {
+                Fd::File { path, .. } | Fd::Dir { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .chain(cx.cur.shared_maps.iter().map(|m| m.path.clone()))
+            .collect();
+        paths.sort();
+        paths.dedup();
+        let mut vfs = self.vfs_for(cx);
+        let carried = vfs.carry_from(old, &paths);
+        let moved: std::collections::BTreeMap<String, String> = paths
+            .into_iter()
+            .zip(carried)
+            .filter_map(|(from, to)| Some((from, to?)))
+            .collect();
+        let translate = |p: &str| moved.get(p).cloned().unwrap_or_else(|| p.to_string());
+        cx.cur.fds.rewrite_paths(&translate);
+        for m in &mut cx.cur.shared_maps {
+            m.path = translate(&m.path);
+        }
+        Self::collect_unused_hidden_mounts(sh, cx, &mut vfs);
     }
 
     /// `statfs(path, buf)` — write a plausible `struct statfs` for the
@@ -950,7 +1001,14 @@ fn write_statfs_or_fault(mem: &mut GuestMemory, addr: u64) -> i64 {
 /// kernel's spellings).
 fn fd_link_target(fd: &Fd) -> String {
     match fd {
-        Fd::File { path, .. } | Fd::Dir { path, .. } => path.clone(),
+        // A file on a hidden mount (detached, or kept from another mount
+        // namespace) reads as its path within that mount, as Linux shows it.
+        Fd::File { path, .. } | Fd::Dir { path, .. } => match path.strip_prefix("/\0") {
+            Some(rest) => rest
+                .find('/')
+                .map_or_else(|| "/".to_string(), |i| rest[i..].to_string()),
+            None => path.clone(),
+        },
         Fd::Stdin | Fd::Stdout | Fd::Stderr => "/dev/null".to_string(),
         Fd::Tty => "/dev/tty".to_string(),
         Fd::PipeRead(i) | Fd::PipeWrite(i) => format!("pipe:[{i}]"),
