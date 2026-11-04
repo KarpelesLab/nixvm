@@ -59,6 +59,7 @@ const PATHS: &[&str] = &[
     "sys/kernel/ostype",
     "sys/kernel/osrelease",
     "sys/kernel/hostname",
+    "sys/kernel/domainname",
     "sys/kernel/overflowuid",
     "sys/kernel/overflowgid",
     "sys/kernel/pid_max",
@@ -284,6 +285,7 @@ const SYS_KERNEL_FILES: &[&str] = &[
     "ostype",
     "osrelease",
     "hostname",
+    "domainname",
     "overflowuid",
     "overflowgid",
     "pid_max",
@@ -579,6 +581,12 @@ pub struct ProcData {
     pub gid_map: String,
     pub setgroups: String,
     pub timens_offsets: String,
+    /// Body of `self/limits`, and the UTS names for `sys/kernel/hostname` and
+    /// `domainname`. Each is empty until the kernel has said, when the fixed
+    /// text is shown instead.
+    pub limits: String,
+    pub hostname: String,
+    pub domainname: String,
     /// The reader's mounts, for `mounts` and `self/mountinfo`. Empty until the
     /// kernel has refreshed this, when the fixed text is shown instead.
     pub mounts: Vec<super::MountEntry>,
@@ -634,6 +642,9 @@ impl Default for ProcData {
             gid_map: String::new(),
             setgroups: String::new(),
             timens_offsets: String::new(),
+            limits: String::new(),
+            hostname: String::new(),
+            domainname: String::new(),
             mounts: Vec::new(),
             cmdline: Vec::new(),
             exe: "/bin/busybox".to_string(),
@@ -669,6 +680,10 @@ pub struct ProcSelf {
     pub gid_map: String,
     pub setgroups: String,
     pub timens_offsets: String,
+    /// `self/limits`, and the caller's UTS names.
+    pub limits: String,
+    pub hostname: String,
+    pub domainname: String,
     /// The caller's mounts, for `mounts` and `self/mountinfo`.
     pub mounts: Vec<super::MountEntry>,
     pub comm: String,
@@ -731,6 +746,9 @@ impl ProcFs {
         d.gid_map = live.gid_map;
         d.setgroups = live.setgroups;
         d.timens_offsets = live.timens_offsets;
+        d.limits = live.limits;
+        d.hostname = live.hostname;
+        d.domainname = live.domainname;
         d.comm = live.comm;
         d.cmdline = live.cmdline;
         d.exe = live.exe;
@@ -839,6 +857,15 @@ impl ProcFs {
             "self/timens_offsets" => {
                 return Some(self.data.timens_offsets.clone().into_bytes());
             }
+            "self/limits" if !self.data.limits.is_empty() => {
+                return Some(self.data.limits.clone().into_bytes());
+            }
+            "sys/kernel/hostname" if !self.data.hostname.is_empty() => {
+                return Some(format!("{}\n", self.data.hostname).into_bytes());
+            }
+            "sys/kernel/domainname" if !self.data.domainname.is_empty() => {
+                return Some(format!("{}\n", self.data.domainname).into_bytes());
+            }
             "cpuinfo" => {
                 return Some(cpuinfo_body(self.data.nproc, self.data.arch).into_bytes());
             }
@@ -928,6 +955,7 @@ fn static_content(rel: &str) -> Option<&'static [u8]> {
         "sys/kernel/ostype" => OSTYPE,
         "sys/kernel/osrelease" => OSRELEASE,
         "sys/kernel/hostname" => HOSTNAME,
+        "sys/kernel/domainname" => "(none)\n",
         "sys/kernel/overflowuid" | "sys/kernel/overflowgid" => "65534\n",
         "sys/kernel/pid_max" => PID_MAX,
         "sys/kernel/version" => KERNEL_VERSION,
@@ -1668,6 +1696,9 @@ mod tests {
             gid_map: String::new(),
             setgroups: String::new(),
             timens_offsets: String::new(),
+            limits: String::new(),
+            hostname: String::new(),
+            domainname: String::new(),
             mounts: Vec::new(),
             cmdline: b"prog\0--flag\0".to_vec(),
             exe: "/usr/bin/prog".to_string(),
@@ -1803,6 +1834,9 @@ mod tests {
             gid_map: String::new(),
             setgroups: String::new(),
             timens_offsets: String::new(),
+            limits: String::new(),
+            hostname: String::new(),
+            domainname: String::new(),
             mounts: Vec::new(),
             comm: "myprog".to_string(),
             cmdline: b"/bin/myprog\0-x\0".to_vec(),

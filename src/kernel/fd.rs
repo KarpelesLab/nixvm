@@ -162,9 +162,12 @@ pub enum Fd {
     PtySlave(usize),
     /// A POSIX message-queue descriptor (`mq_open`): queue `q` in the poll
     /// subsystem's table, opened with `flags` (`O_ACCMODE | O_NONBLOCK`).
+    /// `hold` is shared by every descriptor on the queue (dups and forks clone
+    /// it), so the queue can tell when the last one is closed.
     Mqueue {
         q: usize,
         flags: u64,
+        hold: std::sync::Arc<()>,
     },
 }
 

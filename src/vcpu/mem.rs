@@ -125,6 +125,9 @@ pub struct GuestMemory {
     /// [`FORK_DONT`] (`MADV_DONTFORK` — absent from a fork child) or
     /// [`FORK_WIPE`] (`MADV_WIPEONFORK` — zero-filled in a fork child).
     fork_policy: std::collections::BTreeMap<usize, u8>,
+    /// Pages locked by `mlock`/`mlockall`, what `RLIMIT_MEMLOCK` charges. Not
+    /// inherited by a fork child and dropped by `execve`, as on Linux.
+    locks: super::pagelocks::PageLocks,
     /// Set whenever a *present* page-table leaf is cleared or changed from the
     /// host (unmap, protect, copy-on-write privatize). A KVM vcpu running this
     /// address space must flush its TLB before its next run, or a stale entry
@@ -245,6 +248,7 @@ impl GuestMemory {
             file_backed: PageVec::new(npages, false),
             shared_anon: PageVec::new(npages, false),
             fork_policy: std::collections::BTreeMap::new(),
+            locks: super::pagelocks::PageLocks::default(),
             tlb_dirty: false,
             kstack_pa,
             shared: false,
@@ -334,6 +338,83 @@ impl GuestMemory {
     #[must_use]
     pub fn mapped_bytes(&self) -> u64 {
         self.mapped_count as u64 * PAGE_SIZE
+    }
+
+    /// Bytes locked by `mlock`/`mlockall`, what `RLIMIT_MEMLOCK` measures.
+    #[must_use]
+    pub fn locked_bytes(&self) -> u64 {
+        self.locks.pages() as u64 * PAGE_SIZE
+    }
+
+    /// The page range `[first, end)` covering `[addr, addr + len)`, if in bounds.
+    fn lock_span(&self, addr: u64, len: u64) -> Option<(usize, usize)> {
+        let start = addr - addr % PAGE_SIZE;
+        let end = round_up(addr.checked_add(len)?, PAGE_SIZE);
+        let (first, last) = self.page_range(start, (end - start) as usize).ok()?;
+        Some((first, last + 1))
+    }
+
+    /// How many bytes of `[addr, addr + len)` aren't locked yet.
+    #[must_use]
+    pub fn unlocked_bytes_in(&self, addr: u64, len: u64) -> u64 {
+        if len == 0 {
+            return 0;
+        }
+        self.lock_span(addr, len).map_or(0, |(first, end)| {
+            (end - first - self.locks.locked_within(first, end)) as u64 * PAGE_SIZE
+        })
+    }
+
+    /// Lock (`mlock`) or unlock (`munlock`) the pages of `[addr, addr + len)`.
+    pub fn set_locked(&mut self, addr: u64, len: u64, locked: bool) {
+        if len == 0 {
+            return;
+        }
+        if let Some((first, end)) = self.lock_span(addr, len) {
+            if locked {
+                self.locks.insert(first, end);
+            } else {
+                self.locks.remove(first, end);
+            }
+        }
+    }
+
+    /// `mlockall`: lock every page mapped now if `current`, and every one mapped
+    /// from now on if `future`.
+    pub fn lock_all(&mut self, current: bool, future: bool) {
+        if current {
+            let mut run: Option<(usize, usize)> = None;
+            let pages = self
+                .mapped
+                .non_default()
+                .filter(|&(_, m)| m)
+                .map(|(p, _)| p);
+            for p in pages {
+                run = match run {
+                    Some((s, e)) if e == p => Some((s, p + 1)),
+                    Some((s, e)) => {
+                        self.locks.insert(s, e);
+                        Some((p, p + 1))
+                    }
+                    None => Some((p, p + 1)),
+                };
+            }
+            if let Some((s, e)) = run {
+                self.locks.insert(s, e);
+            }
+        }
+        self.locks.future = future;
+    }
+
+    /// `munlockall`: unlock everything and stop locking new mappings.
+    pub fn unlock_all(&mut self) {
+        self.locks.clear();
+    }
+
+    /// Whether `mlockall(MCL_FUTURE)` is in force.
+    #[must_use]
+    pub fn locks_future(&self) -> bool {
+        self.locks.future
     }
 
     /// Number of live (allocated) frames in the shared pool — for leak checks.
@@ -439,6 +520,8 @@ impl GuestMemory {
             self.shared_anon[p] = false; // a fresh mapping is private until tagged
             self.fork_policy.remove(&p);
         }
+        // A mapping replaced by a new one is no longer locked.
+        self.locks.remove(first, last + 1);
         Ok(())
     }
 
@@ -744,6 +827,7 @@ impl GuestMemory {
             self.shared_anon[p] = false;
             self.fork_policy.remove(&p);
         }
+        self.locks.remove(first, last + 1);
         Ok(())
     }
 
@@ -1120,6 +1204,7 @@ impl GuestMemory {
             file_backed: self.file_backed.clone(),
             shared_anon,
             fork_policy,
+            locks: super::pagelocks::PageLocks::default(),
             tlb_dirty: false,
             kstack_pa: child_kstack,
             shared: self.shared,
@@ -1177,6 +1262,7 @@ impl GuestMemory {
         self.file_backed.clear();
         self.shared_anon.clear();
         self.fork_policy.clear();
+        self.locks.clear();
     }
 
     // ---- fixed-width helpers --------------------------------------------

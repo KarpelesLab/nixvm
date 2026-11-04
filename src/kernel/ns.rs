@@ -349,6 +349,12 @@ impl Kernel {
         let tasks = self.visible_tasks(cx);
         let mut live = self.proc_self_live(cx);
         live.tasks = tasks;
+        {
+            let mut sh = self.shared.lock().unwrap();
+            let uts = sh.uts(cx.cur.ns.uts);
+            live.hostname.clone_from(&uts.hostname);
+            live.domainname.clone_from(&uts.domainname);
+        }
         let mut vfs = self.vfs_for(cx);
         live.mounts = vfs.listing();
         vfs.with_procfs(|procfs| procfs.update_self(live.clone()));

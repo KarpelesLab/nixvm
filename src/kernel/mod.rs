@@ -611,6 +611,13 @@ impl ProcInfo {
         self.creds.euid == 0 || self.ns_caps
     }
 
+    /// Whether this task holds capabilities over the whole VM, not just inside a
+    /// user namespace of its own: what Linux's `capable()` asks for the
+    /// resource-limit overrides (`CAP_IPC_LOCK`, `CAP_SYS_NICE`, ...).
+    fn host_capable(&self) -> bool {
+        self.privileged() && self.ns.user == 0
+    }
+
     /// The earliest real-time timer deadline this task holds — its
     /// `ITIMER_REAL` (`alarm`/`setitimer`) or any armed POSIX timer — which the
     /// schedulers sleep until / wake the task at, like [`Self::wake_deadline`].
@@ -620,6 +627,13 @@ impl ProcInfo {
             .filter_map(|t| t.deadline)
             .chain(self.alarm_deadline)
             .min()
+    }
+
+    /// How many signals are queued for this task, what `RLIMIT_SIGPENDING`
+    /// counts (per user, across that user's tasks).
+    fn queued_signals(&self) -> usize {
+        self.rt_queue.values().map(VecDeque::len).sum::<usize>()
+            + self.queued_siginfo.iter().filter(|q| q.is_some()).count()
     }
 
     /// Record the siginfo for a just-posted signal. Real-time signals (`>=
@@ -3975,8 +3989,14 @@ impl Kernel {
             Sysno::MqTimedreceive => self.sys_mq_timedreceive(sh, cx, args, mem),
             // System V IPC (see `ipc.rs`).
             Sysno::Msgget => self.sys_msgget(sh, cx, args[0], args[1]),
-            Sysno::Msgsnd | Sysno::Msgrcv | Sysno::Msgctl | Sysno::Semop | Sysno::Semtimedop
-            | Sysno::Semctl | Sysno::Shmat | Sysno::Shmctl
+            Sysno::Msgsnd
+            | Sysno::Msgrcv
+            | Sysno::Msgctl
+            | Sysno::Semop
+            | Sysno::Semtimedop
+            | Sysno::Semctl
+            | Sysno::Shmat
+            | Sysno::Shmctl
                 if sh.ipc_is_foreign(cx, args[0] as i32) =>
             {
                 err(Errno::EINVAL)
@@ -4008,7 +4028,9 @@ impl Kernel {
             Sysno::Setitimer => self.sys_setitimer(cx, args[0], args[1], args[2], mem),
             Sysno::Getitimer => self.sys_getitimer(cx, args[0], args[1], mem),
             Sysno::Nanosleep => self.sys_nanosleep(cx, 0, 0, args[0], args[1], mem),
-            Sysno::ClockNanosleep => self.sys_nanosleep(cx, args[0], args[1], args[2], args[3], mem),
+            Sysno::ClockNanosleep => {
+                self.sys_nanosleep(cx, args[0], args[1], args[2], args[3], mem)
+            }
             // The guest does not own the host clock: refuse to set it. ptrace
             // is refused too (no debugging surface).
             Sysno::Settimeofday | Sysno::ClockSettime | Sysno::Ptrace => err(Errno::EPERM),
@@ -4054,11 +4076,28 @@ impl Kernel {
             Sysno::Setsid => self.sys_setsid(cx),
             Sysno::Getsid => self.sys_getsid(sh, cx, args[0] as i32),
             // Process lifecycle.
-            Sysno::Waitid => self.sys_waitid(sh, cx, args[0], i64::from(args[1] as i32), args[2], args[3], args[4], mem),
+            Sysno::Waitid => self.sys_waitid(
+                sh,
+                cx,
+                args[0],
+                i64::from(args[1] as i32),
+                args[2],
+                args[3],
+                args[4],
+                mem,
+            ),
             Sysno::Clone3 => self.sys_clone3(sh, cx, args[0], args[1], vcpu, mem),
-            Sysno::Execveat => {
-                self.sys_execveat(sh, cx, args[0] as i64, args[1], args[2], args[3], args[4], vcpu, mem)
-            }
+            Sysno::Execveat => self.sys_execveat(
+                sh,
+                cx,
+                args[0] as i64,
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+                vcpu,
+                mem,
+            ),
             // A watch descriptor the guest can pass to inotify_rm_watch (which
             // is a no-op in the always-succeed group below).
             Sysno::InotifyAddWatch => 1,
@@ -4085,28 +4124,14 @@ impl Kernel {
                 }
             }
             Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], args[2], mem),
-            // mlock/munlock/mlock2(addr, len[, flags]): nothing is ever paged
-            // out, so locking is a no-op — after Linux's checks: the range must
-            // be mapped (ENOMEM), mlock2 takes only MLOCK_ONFAULT, and mlockall
-            // needs MCL_CURRENT and/or MCL_FUTURE (MCL_ONFAULT alone is EINVAL).
-            Sysno::Mlock2 if args[2] & !1 != 0 => err(Errno::EINVAL),
-            Sysno::Mlock | Sysno::Munlock | Sysno::Mlock2 => {
-                let (start, end) = (page_down(args[0]), args[0].saturating_add(args[1]));
-                let mut p = start;
-                while p < end {
-                    if mem.page_prot(p).is_none() {
-                        return err(Errno::ENOMEM);
-                    }
-                    p += PAGE_SIZE;
-                }
+            // mlock/munlock/mlock2(addr, len[, flags]) and mlockall: nothing is
+            // ever paged out, so a lock only matters to RLIMIT_MEMLOCK, which is
+            // charged and enforced as on Linux.
+            Sysno::Mlock | Sysno::Munlock | Sysno::Mlock2 => self.sys_mlock(cx, sys, args, mem),
+            Sysno::Mlockall => self.sys_mlockall(cx, args[0], mem),
+            Sysno::Munlockall => {
+                mem.unlock_all();
                 0
-            }
-            Sysno::Mlockall => {
-                if args[0] & !7 != 0 || args[0] & 3 == 0 {
-                    err(Errno::EINVAL)
-                } else {
-                    0
-                }
             }
             Sysno::Ioctl => self.sys_ioctl(cx, args[0], args[1], args[2], mem),
             Sysno::Fcntl => self.sys_fcntl(sh, cx, args[0], args[1], args[2], mem),
@@ -4125,10 +4150,12 @@ impl Kernel {
             Sysno::Poll => self.sys_poll(cx, args[0], args[1], args[2] as i64, mem),
             Sysno::Ppoll => self.sys_ppoll(cx, args[0], args[1], args[2], args[3], args[4], mem),
             Sysno::Select => self.sys_select(cx, args[0], args[1], args[2], args[3], args[4], mem),
-            Sysno::Pselect6 => {
-                self.sys_pselect6(cx, args[0], args[1], args[2], args[3], args[4], args[5], mem)
+            Sysno::Pselect6 => self.sys_pselect6(
+                cx, args[0], args[1], args[2], args[3], args[4], args[5], mem,
+            ),
+            Sysno::EpollWait => {
+                self.sys_epoll_wait(cx, args[0], args[1], args[2], args[3] as i64, mem)
             }
-            Sysno::EpollWait => self.sys_epoll_wait(cx, args[0], args[1], args[2], args[3] as i64, mem),
             // epoll_pwait/pwait2 carry a sigmask (arg 4, a direct sigset pointer)
             // installed for the wait, exactly like ppoll.
             Sysno::EpollPwait => {
@@ -4168,13 +4195,19 @@ impl Kernel {
             // passed as a zero-extended `0xFFFF_FFFF` (else `waitpid(-1)` breaks).
             // WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WALL | __WCLONE.
             Sysno::Wait4 if args[2] & !(1 | 2 | 8 | 0xe000_0000) != 0 => err(Errno::EINVAL),
-            Sysno::Wait4 => self.sys_wait4(sh, cx, i64::from(args[0] as i32), args[1], args[2], args[3], mem),
+            Sysno::Wait4 => self.sys_wait4(
+                sh,
+                cx,
+                i64::from(args[0] as i32),
+                args[1],
+                args[2],
+                args[3],
+                mem,
+            ),
             Sysno::Exit => self.sys_exit(sh, cx, args[0] as i32, mem),
             Sysno::ExitGroup => self.sys_exit_group(sh, cx, args[0] as i32, mem),
             // The rt_sig* calls take the kernel sigset size, which must be 8.
-            Sysno::RtSigaction | Sysno::RtSigprocmask | Sysno::RtSigtimedwait
-                if args[3] != 8 =>
-            {
+            Sysno::RtSigaction | Sysno::RtSigprocmask | Sysno::RtSigtimedwait if args[3] != 8 => {
                 err(Errno::EINVAL)
             }
             Sysno::RtSigsuspend if args[1] != 8 => err(Errno::EINVAL),
@@ -4198,8 +4231,12 @@ impl Kernel {
             // sigqueue/pthread_sigqueue: deliver the signal and carry its
             // siginfo (si_code/si_value) so an SA_SIGINFO handler sees the real
             // payload. tgsigqueueinfo targets a tid (args: tgid, tid, sig, uinfo).
-            Sysno::RtSigqueueinfo => self.sys_rt_sigqueueinfo(sh, cx, i64::from(args[0] as i32), args[1], args[2], mem),
-            Sysno::RtTgsigqueueinfo => self.sys_rt_sigqueueinfo(sh, cx, i64::from(args[1] as i32), args[2], args[3], mem),
+            Sysno::RtSigqueueinfo => {
+                self.sys_rt_sigqueueinfo(sh, cx, i64::from(args[0] as i32), args[1], args[2], mem)
+            }
+            Sysno::RtTgsigqueueinfo => {
+                self.sys_rt_sigqueueinfo(sh, cx, i64::from(args[1] as i32), args[2], args[3], mem)
+            }
             // getpid = thread-group id; gettid = this task's id.
             Sysno::Getpid => i64::from(cx.cur.tgid),
             Sysno::Gettid => i64::from(cx.cur.pid),
@@ -4225,9 +4262,13 @@ impl Kernel {
                 sys_misc::sys_sched_getaffinity(bits, args[1], args[2], mem)
             }
             Sysno::SchedSetaffinity => self.sys_sched_setaffinity(cx, args[1], args[2], mem),
-            Sysno::SchedGetparam => sys_misc::sys_sched_getparam(cx.cur.sched_priority, args[1], mem),
+            Sysno::SchedGetparam => {
+                sys_misc::sys_sched_getparam(cx.cur.sched_priority, args[1], mem)
+            }
             Sysno::SchedGetscheduler => i64::from(cx.cur.sched_policy),
-            Sysno::SchedSetscheduler => self.sys_sched_setscheduler(cx, args[1] as i32, args[2], mem),
+            Sysno::SchedSetscheduler => {
+                self.sys_sched_setscheduler(sh, cx, args[0], args[1], args[2], mem)
+            }
             Sysno::SchedGetPriorityMax => self.sys_sched_priority_bound(args[0], true),
             Sysno::SchedGetPriorityMin => self.sys_sched_priority_bound(args[0], false),
             Sysno::Getrusage => self.sys_getrusage(sh, cx, args[0], args[1], mem),
@@ -4240,7 +4281,9 @@ impl Kernel {
             // membarrier / clock discipline / names / robust list / namespaces
             // (see `attrs.rs`).
             Sysno::SchedSetparam => self.sys_sched_setparam(sh, cx, args[0], args[1], mem),
-            Sysno::SchedRrGetInterval => self.sys_sched_rr_get_interval(sh, cx, args[0], args[1], mem),
+            Sysno::SchedRrGetInterval => {
+                self.sys_sched_rr_get_interval(sh, cx, args[0], args[1], mem)
+            }
             Sysno::SchedSetattr => self.sys_sched_setattr(sh, cx, args[0], args[1], args[2], mem),
             Sysno::SchedGetattr => {
                 self.sys_sched_getattr(sh, cx, args[0], args[1], args[2], args[3], mem)
@@ -4320,8 +4363,10 @@ impl Kernel {
             Sysno::Prctl => self.sys_prctl(cx, args, mem),
             // getpriority returns the kernel ABI value 20 - nice (glibc converts
             // it back to the nice value); setpriority records the nice.
-            Sysno::Getpriority => i64::from(20 - cx.cur.nice),
-            Sysno::Setpriority => self.sys_setpriority(cx, i64::from(args[2] as i32)),
+            Sysno::Getpriority => self.sys_getpriority(sh, cx, args[0], args[1]),
+            Sysno::Setpriority => {
+                self.sys_setpriority(sh, cx, args[0], args[1], i64::from(args[2] as i32))
+            }
             // arch_prctl(ARCH_SET_FS) — how an x86-64 guest installs its TLS
             // register (FS.base; aarch64 uses the MSR-like TPIDR_EL0 via
             // CLONE_SETTLS instead, so this arm only ever fires for x86-64).
@@ -4331,14 +4376,12 @@ impl Kernel {
             // permission/ownership/timestamp changes, socket options, clock
             // adjustment (TIME_OK), and scheduling/process-attr setters — none
             // modeled yet.
-            // Locking/sync setters: no-ops (there is no swap to keep pages from).
-            | Sysno::Munlockall
+            // Sync setters: no-ops.
             // Sync family: nothing is durably backed (in-memory / host
             // passthrough), so there's nothing to flush. `sync()` takes no fd;
             // the fd-taking members (fsync/fdatasync/syncfs/sync_file_range) are
             // handled separately below so a bad fd reports EBADF.
-            | Sysno::Sync
-            | Sysno::InotifyRmWatch => 0,
+            Sysno::Sync | Sysno::InotifyRmWatch => 0,
             Sysno::Setgroups => self.sys_setgroups(cx, args[0], args[1], mem),
             Sysno::Getgroups => self.sys_getgroups(cx, args[0], args[1], mem),
             Sysno::Syslog => self.sys_syslog(cx, args[0], args[1], args[2], mem),
@@ -7455,6 +7498,72 @@ impl Kernel {
         limit != sys_misc::RLIM_INFINITY && mem.mapped_bytes().saturating_add(len) > limit
     }
 
+    /// `RLIMIT_MEMLOCK`: whether this task may have `total` bytes locked.
+    /// `CAP_IPC_LOCK` (root of the first user namespace) has no limit.
+    fn memlock_allows(cx: &ServiceCtx, total: u64) -> bool {
+        let limit = cx.cur.rlimits.soft(sys_misc::RLIMIT_MEMLOCK);
+        cx.cur.host_capable() || limit == sys_misc::RLIM_INFINITY || total <= limit
+    }
+
+    /// `mlock`, `mlock2` and `munlock`.
+    #[allow(clippy::unused_self)]
+    fn sys_mlock(
+        &self,
+        cx: &mut ServiceCtx,
+        sys: Sysno,
+        args: &[u64; 6],
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        const MLOCK_ONFAULT: u64 = 1;
+        if sys == Sysno::Mlock2 && args[2] & !MLOCK_ONFAULT != 0 {
+            return err(Errno::EINVAL);
+        }
+        let (addr, len) = (args[0], args[1]);
+        let Some(end) = addr.checked_add(len) else {
+            return err(Errno::EINVAL);
+        };
+        let lock = sys != Sysno::Munlock;
+        // Locking at all takes a nonzero limit or CAP_IPC_LOCK.
+        if lock && cx.cur.rlimits.soft(sys_misc::RLIMIT_MEMLOCK) == 0 && !cx.cur.host_capable() {
+            return err(Errno::EPERM);
+        }
+        let mut p = page_down(addr);
+        while p < end {
+            if mem.page_prot(p).is_none() {
+                return err(Errno::ENOMEM);
+            }
+            p += PAGE_SIZE;
+        }
+        if lock {
+            let total = mem.locked_bytes() + mem.unlocked_bytes_in(addr, len);
+            if !Self::memlock_allows(cx, total) {
+                return err(Errno::ENOMEM);
+            }
+        }
+        mem.set_locked(addr, len, lock);
+        0
+    }
+
+    /// `mlockall(flags)`: lock what's mapped (`MCL_CURRENT`) and what will be
+    /// (`MCL_FUTURE`); `MCL_ONFAULT` changes nothing here.
+    #[allow(clippy::unused_self)]
+    fn sys_mlockall(&self, cx: &mut ServiceCtx, flags: u64, mem: &mut GuestMemory) -> i64 {
+        const MCL_CURRENT: u64 = 1;
+        const MCL_FUTURE: u64 = 2;
+        if flags & !7 != 0 || flags & (MCL_CURRENT | MCL_FUTURE) == 0 {
+            return err(Errno::EINVAL);
+        }
+        if cx.cur.rlimits.soft(sys_misc::RLIMIT_MEMLOCK) == 0 && !cx.cur.host_capable() {
+            return err(Errno::EPERM);
+        }
+        let current = flags & MCL_CURRENT != 0;
+        if current && !Self::memlock_allows(cx, mem.mapped_bytes()) {
+            return err(Errno::ENOMEM);
+        }
+        mem.lock_all(current, flags & MCL_FUTURE != 0);
+        0
+    }
+
     /// Whether a VM-wide time ceiling stopped the guest
     /// (see [`crate::limits::Limits::cpu_time`]).
     #[must_use]
@@ -8768,8 +8877,31 @@ impl Kernel {
     /// writable one is also written back to the file on `munmap`/`msync`/exit.
     /// `MAP_SHARED` of `/dev/zero` is a fresh shared anonymous region, as on
     /// Linux.
-    #[allow(clippy::unused_self)]
     fn sys_mmap(
+        &self,
+        sh: &mut Shared,
+        vfs: &mut MountTable,
+        cx: &mut ServiceCtx,
+        a: &[u64; 6],
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        // MAP_LOCKED, or anything mapped under mlockall(MCL_FUTURE), is locked
+        // and charged to RLIMIT_MEMLOCK; past it the mapping fails with EAGAIN.
+        const MAP_LOCKED: u64 = 0x2000;
+        let len = a[1].div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let locking = a[3] & MAP_LOCKED != 0 || mem.locks_future();
+        if locking && !Self::memlock_allows(cx, mem.locked_bytes().saturating_add(len)) {
+            return err(Errno::EAGAIN);
+        }
+        let r = self.sys_mmap_unlocked(sh, vfs, cx, a, mem);
+        if locking && r >= 0 {
+            mem.set_locked(r as u64, len, true);
+        }
+        r
+    }
+
+    #[allow(clippy::unused_self)]
+    fn sys_mmap_unlocked(
         &self,
         sh: &mut Shared,
         vfs: &mut MountTable,

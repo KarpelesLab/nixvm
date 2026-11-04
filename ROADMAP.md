@@ -466,8 +466,13 @@ must get the isolation it asks for.
   - CPU and run time: no default, kills the guest when reached
     (`NIXVM_LIMIT_CPU_SECONDS`, `NIXVM_LIMIT_WALL_SECONDS`).
   - Pipes, socket queues, ptys and queued signals hold fixed amounts, as on Linux.
-- **Per-process `rlimit`s:** `NOFILE`, `AS`, `DATA`, `STACK`, `FSIZE`, `CPU` and `NPROC` are
-  enforced. The others are stored and reported only.
+- **Per-process `rlimit`s:** `NOFILE`, `AS`, `DATA`, `STACK`, `FSIZE`, `CPU`, `NPROC`,
+  `MEMLOCK` (`mlock`, `mlockall`, `MAP_LOCKED`), `NICE` and `RTPRIO` (`setpriority`,
+  `sched_setscheduler`/`setparam`/`setattr`), `SIGPENDING` (per user, as Linux counts it)
+  and `MSGQUEUE` (per user; a queue unlinked and closed by everyone is freed) are
+  enforced, with Linux's defaults, and `/proc/<pid>/limits` shows them. `CORE` is moot,
+  since no core files are written; `RSS` and `LOCKS` do nothing on Linux either; `RTTIME`
+  is stored only, since real-time priorities don't change how tasks are scheduled here.
 - **Namespaces (`kernel/ns.rs`, `pidns.rs`, `userns.rs`):** UTS, IPC, network, mount, PID,
   user and time, with `setns` and `/proc/<pid>/ns`, plus real `chroot`, `pivot_root` and
   bind mounts. Bubblewrap and util-linux's `unshare` run inside the VM.

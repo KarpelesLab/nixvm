@@ -529,13 +529,27 @@ impl Kernel {
 
         // Single process (or a tkill/tgkill tid): the common path.
         if pid > 0 {
+            // RLIMIT_SIGPENDING, as Linux applies it: a real-time signal, or one
+            // a process queued itself, isn't queued past the limit. `sigqueue`
+            // of a real-time signal then fails; anything else still becomes
+            // pending, without its info.
+            let rt = sig >= super::SIGRTMIN;
+            let mut queue_info = true;
+            if deliver && (rt || sender.code < 0) && sigqueue_full(sh, cx, pid as i32) {
+                if rt && sender.code < 0 {
+                    return err(Errno::EAGAIN);
+                }
+                queue_info = false;
+            }
             if pid == cur_pid {
                 if !self.signal_reaches_init(cx, &cx.cur, sig) {
                     return 0;
                 }
                 cx.cur.pending |= bit;
                 if deliver {
-                    cx.cur.post_siginfo(sig, sender);
+                    if queue_info {
+                        cx.cur.post_siginfo(sig, sender);
+                    }
                     // The current task is Running (it's executing this syscall),
                     // so this never resumes it, but it still applies the
                     // stop/cont bit cancellation.
@@ -555,7 +569,9 @@ impl Kernel {
                     slot.info.pending |= bit;
                     slot.info.parked = false;
                     if deliver {
-                        slot.info.post_siginfo(sig, sender);
+                        if queue_info {
+                            slot.info.post_siginfo(sig, sender);
+                        }
                         resumed_ppid = apply_stop_cont(&mut slot.info, sig);
                     }
                     found = true;
@@ -1426,4 +1442,22 @@ fn notify_parent(sh: &mut Shared, cx: &mut ServiceCtx, ppid: i32) {
             return;
         }
     }
+}
+
+/// `RLIMIT_SIGPENDING`: whether the user owning task `pid` already has as many
+/// signals queued as the task's limit allows. Like Linux, only signals a
+/// process queued itself (`sigqueue`, negative `si_code`) are refused for it;
+/// `kill` and the kernel's own signals always get through.
+fn sigqueue_full(sh: &Shared, cx: &ServiceCtx, pid: i32) -> bool {
+    let tasks = || std::iter::once(&cx.cur).chain(sh.procs.iter().flatten().map(|s| &s.info));
+    let Some(target) = tasks().find(|p| p.pid == pid) else {
+        return false;
+    };
+    let limit = target.rlimits.soft(super::sys_misc::RLIMIT_SIGPENDING);
+    let uid = target.creds.ruid;
+    let queued: usize = tasks()
+        .filter(|p| p.creds.ruid == uid)
+        .map(super::ProcInfo::queued_signals)
+        .sum();
+    queued as u64 >= limit
 }

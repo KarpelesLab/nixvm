@@ -50,6 +50,114 @@ fn with_task<R>(
         .ok_or_else(|| err(Errno::ESRCH))
 }
 
+/// Run `f` on each live task `setpriority`/`getpriority`'s `(which, who)`
+/// names: `PRIO_PROCESS` a task, `PRIO_PGRP` a process group and `PRIO_USER`
+/// every task of a real uid, `0` meaning the caller's own. Unknown `which` is
+/// `EINVAL`.
+fn for_each_prio_target(
+    sh: &mut Shared,
+    cx: &mut ServiceCtx,
+    which: u64,
+    who: u64,
+    mut f: impl FnMut(&mut ProcInfo),
+) -> Result<(), i64> {
+    const PRIO_PROCESS: u64 = 0;
+    const PRIO_PGRP: u64 = 1;
+    const PRIO_USER: u64 = 2;
+    let who = who as u32;
+    let matches: Box<dyn Fn(&ProcInfo) -> bool> = match which {
+        PRIO_PROCESS => {
+            let pid = if who == 0 { cx.cur.pid } else { who as i32 };
+            Box::new(move |p| p.pid == pid)
+        }
+        PRIO_PGRP => {
+            let pg = if who == 0 {
+                super::pgid_of(&cx.cur)
+            } else {
+                who as i32
+            };
+            Box::new(move |p| super::pgid_of(p) == pg)
+        }
+        PRIO_USER => {
+            let uid = if who == 0 { cx.cur.creds.ruid } else { who };
+            Box::new(move |p| p.creds.ruid == uid)
+        }
+        _ => return Err(err(Errno::EINVAL)),
+    };
+    if matches(&cx.cur) {
+        f(&mut cx.cur);
+    }
+    for slot in sh.procs.iter_mut().flatten() {
+        if !matches!(slot.info.run, RunState::Zombie(_)) && matches(&slot.info) {
+            f(&mut slot.info);
+        }
+    }
+    Ok(())
+}
+
+/// Who is asking to change a task's scheduling: whether it holds
+/// `CAP_SYS_NICE` over the VM, and its effective uid.
+#[derive(Clone, Copy)]
+struct SchedCaller {
+    capable: bool,
+    euid: u32,
+}
+
+impl SchedCaller {
+    fn of(cx: &ServiceCtx) -> Self {
+        Self {
+            capable: cx.cur.host_capable(),
+            euid: cx.cur.creds.euid,
+        }
+    }
+
+    /// Whether the caller may change `p`'s scheduling at all: it's the owner,
+    /// or holds `CAP_SYS_NICE`.
+    fn owns(self, p: &ProcInfo) -> bool {
+        self.capable || self.euid == p.creds.euid || self.euid == p.creds.ruid
+    }
+}
+
+/// `RLIMIT_NICE`: whether `p` may run at `nice`, which allows nice values down
+/// to `20 - limit`.
+fn can_nice(p: &ProcInfo, nice: i32) -> bool {
+    let limit = p.rlimits.soft(super::sys_misc::RLIMIT_NICE);
+    u64::try_from(20 - nice).is_ok_and(|need| need <= limit)
+}
+
+/// Linux's `user_check_sched_setscheduler`: what an unprivileged owner may do.
+/// Lowering its nice value is bounded by `RLIMIT_NICE`, real-time priorities by
+/// `RLIMIT_RTPRIO`, leaving `SCHED_IDLE` by `RLIMIT_NICE`, and deadline
+/// scheduling takes `CAP_SYS_NICE`.
+fn sched_change_allowed(
+    caller: SchedCaller,
+    p: &ProcInfo,
+    policy: u32,
+    prio: u32,
+    nice: Option<i32>,
+) -> Result<(), i64> {
+    if !caller.owns(p) {
+        return Err(err(Errno::EPERM));
+    }
+    if caller.capable {
+        return Ok(());
+    }
+    let old_policy = p.sched_policy as u32;
+    let refused = match policy {
+        SCHED_FIFO | SCHED_RR => {
+            let limit = p.rlimits.soft(super::sys_misc::RLIMIT_RTPRIO);
+            (policy != old_policy && limit == 0)
+                || (prio > p.sched_priority as u32 && u64::from(prio) > limit)
+        }
+        SCHED_DEADLINE => true,
+        _ => nice.is_some_and(|n| n < p.nice && !can_nice(p, n)),
+    };
+    if refused || (old_policy == SCHED_IDLE && policy != SCHED_IDLE && !can_nice(p, p.nice)) {
+        return Err(err(Errno::EPERM));
+    }
+    Ok(())
+}
+
 /// The valid `sched_priority` range for a policy: 1..=99 for the real-time
 /// ones, exactly 0 otherwise.
 fn priority_ok(policy: u32, prio: u32) -> bool {
@@ -137,16 +245,115 @@ impl Kernel {
         let Ok(prio) = mem.read_u32(param) else {
             return err(Errno::EFAULT);
         };
+        let caller = SchedCaller::of(cx);
         match with_task(sh, cx, pid, |p| {
-            if priority_ok(p.sched_policy as u32, prio) {
-                p.sched_priority = prio as i32;
-                0
-            } else {
-                err(Errno::EINVAL)
+            let policy = p.sched_policy as u32;
+            if !priority_ok(policy, prio) {
+                return err(Errno::EINVAL);
             }
+            if let Err(e) = sched_change_allowed(caller, p, policy, prio, None) {
+                return e;
+            }
+            p.sched_priority = prio as i32;
+            0
         }) {
             Ok(r) | Err(r) => r,
         }
+    }
+
+    /// `sched_setscheduler(pid, policy, param)`: the policy and its priority.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_sched_setscheduler(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        pid: u64,
+        policy: u64,
+        param: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
+        let policy = policy as i32;
+        // A negative pid is with_task's EINVAL.
+        if policy < 0 || param == 0 {
+            return err(Errno::EINVAL);
+        }
+        let policy = (policy & !SCHED_RESET_ON_FORK) as u32;
+        if !matches!(
+            policy,
+            SCHED_OTHER | SCHED_FIFO | SCHED_RR | SCHED_BATCH | SCHED_IDLE
+        ) {
+            return err(Errno::EINVAL);
+        }
+        let Ok(prio) = mem.read_u32(param) else {
+            return err(Errno::EFAULT);
+        };
+        if !priority_ok(policy, prio) {
+            return err(Errno::EINVAL);
+        }
+        let caller = SchedCaller::of(cx);
+        match with_task(sh, cx, pid, |p| {
+            sched_change_allowed(caller, p, policy, prio, None)?;
+            p.sched_policy = policy as i32;
+            p.sched_priority = prio as i32;
+            Ok(0)
+        }) {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) | Err(e) => e,
+        }
+    }
+
+    /// `setpriority(which, who, nice)`: set the nice value of a task, a process
+    /// group or a user's tasks. Lowering it without `CAP_SYS_NICE` is bounded by
+    /// `RLIMIT_NICE` (`EACCES`), and only the owner may change it (`EPERM`).
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_setpriority(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        which: u64,
+        who: u64,
+        nice: i64,
+    ) -> i64 {
+        let nice = (nice as i32).clamp(-20, 19);
+        let caller = SchedCaller::of(cx);
+        let mut result = err(Errno::ESRCH);
+        let outcome = for_each_prio_target(sh, cx, which, who, |p| {
+            let r = if !caller.owns(p) {
+                err(Errno::EPERM)
+            } else if nice < p.nice && !caller.capable && !can_nice(p, nice) {
+                err(Errno::EACCES)
+            } else {
+                p.nice = nice;
+                0
+            };
+            // Like Linux, one success among several targets is a success.
+            if result != 0 {
+                result = r;
+            }
+        });
+        match outcome {
+            Ok(()) => result,
+            Err(e) => e,
+        }
+    }
+
+    /// `getpriority(which, who)`: `20 - nice` of the highest-priority target.
+    #[allow(clippy::unused_self)]
+    pub(super) fn sys_getpriority(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        which: u64,
+        who: u64,
+    ) -> i64 {
+        let mut best: Option<i32> = None;
+        if let Err(e) = for_each_prio_target(sh, cx, which, who, |p| {
+            best = Some(best.map_or(p.nice, |b| b.min(p.nice)));
+        }) {
+            return e;
+        }
+        best.map_or(err(Errno::ESRCH), |n| i64::from(20 - n))
     }
 
     /// `sched_rr_get_interval(pid, tp)`: the round-robin quantum — 100 ms for
@@ -240,7 +447,20 @@ impl Kernel {
         } else if !priority_ok(policy, prio) && sflags & SCHED_FLAG_KEEP_PARAMS == 0 {
             return err(Errno::EINVAL);
         }
+        let caller = SchedCaller::of(cx);
         match with_task(sh, cx, pid, |p| {
+            let new_policy = if sflags & SCHED_FLAG_KEEP_POLICY == 0 {
+                policy
+            } else {
+                p.sched_policy as u32
+            };
+            let fair = matches!(new_policy, SCHED_OTHER | SCHED_BATCH);
+            let (new_prio, new_nice) = if sflags & SCHED_FLAG_KEEP_PARAMS == 0 {
+                (prio, fair.then_some(nice.clamp(-20, 19)))
+            } else {
+                (p.sched_priority as u32, None)
+            };
+            sched_change_allowed(caller, p, new_policy, new_prio, new_nice)?;
             if sflags & SCHED_FLAG_KEEP_POLICY == 0 {
                 p.sched_policy = policy as i32;
             }
@@ -250,9 +470,10 @@ impl Kernel {
                     p.nice = nice.clamp(-20, 19);
                 }
             }
+            Ok(())
         }) {
-            Ok(()) => 0,
-            Err(e) => e,
+            Ok(Ok(())) => 0,
+            Ok(Err(e)) | Err(e) => e,
         }
     }
 

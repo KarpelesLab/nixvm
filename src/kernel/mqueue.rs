@@ -9,7 +9,9 @@
 //! while open descriptors keep the queue. Messages are kept by priority, FIFO
 //! within one; full/empty queues block (re-trap) until space/data appears or
 //! the absolute `CLOCK_REALTIME` timeout passes (`ETIMEDOUT`), or fail
-//! `EAGAIN` on an `O_NONBLOCK` descriptor. `mq_notify` with `SIGEV_SIGNAL`
+//! `EAGAIN` on an `O_NONBLOCK` descriptor. A queue that's been unlinked and
+//! closed by everyone is freed, and its slot reused. Creating one charges its
+//! size to the creator's `RLIMIT_MSGQUEUE`, as Linux does. `mq_notify` with `SIGEV_SIGNAL`
 //! signals the registered process when a message lands in an empty queue
 //! nobody is waiting on, then deregisters — POSIX's one-shot rule.
 
@@ -47,15 +49,56 @@ pub(super) struct MqInst {
     /// `mq_notify` registration: `(pid, signal, sigev_value)`; signal 0 =
     /// `SIGEV_NONE` (registered, but nothing is sent).
     notify: Option<(i32, u32, u64)>,
+    /// Whether a name still refers to this queue.
+    linked: bool,
+    /// The token every descriptor on this queue holds a strong reference to.
+    hold: std::sync::Weak<()>,
+    /// The creator's real uid and what the queue counts against its
+    /// `RLIMIT_MSGQUEUE`.
+    uid: u32,
+    charge: u64,
+    /// Freed: unlinked with no descriptor left. The slot may be reused.
+    dead: bool,
 }
 
 impl MqInst {
     fn full(&self) -> bool {
         self.msgs.len() as u64 >= self.maxmsg
     }
+
+    /// A strong reference for a new descriptor on this queue.
+    fn hold(&mut self) -> std::sync::Arc<()> {
+        self.hold.upgrade().unwrap_or_else(|| {
+            let h = std::sync::Arc::new(());
+            self.hold = std::sync::Arc::downgrade(&h);
+            h
+        })
+    }
+}
+
+/// What a queue of `maxmsg` messages of up to `msgsize` bytes counts against
+/// `RLIMIT_MSGQUEUE`: its messages plus Linux's bookkeeping for each.
+fn mq_bytes(maxmsg: u64, msgsize: u64) -> u64 {
+    const PER_MESSAGE_OVERHEAD: u64 = 48 + 40; // struct msg_msg + tree node
+    maxmsg.saturating_mul(msgsize.saturating_add(PER_MESSAGE_OVERHEAD))
 }
 
 impl PollFds {
+    /// Free every queue that's unlinked and no longer open, returning the bytes
+    /// its messages held.
+    fn mq_collect(&mut self) -> u64 {
+        let mut freed = 0;
+        for m in &mut self.mqueues {
+            if !m.dead && !m.linked && m.hold.strong_count() == 0 {
+                freed += m.msgs.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
+                m.msgs = Vec::new();
+                m.notify = None;
+                m.dead = true;
+            }
+        }
+        freed
+    }
+
     /// `poll` readiness of queue `q`.
     pub(super) fn mq_ready(&self, q: usize) -> u32 {
         const POLLIN: u32 = 0x0001;
@@ -96,7 +139,7 @@ fn check_name(mem: &GuestMemory, ptr: u64) -> Result<String, i64> {
 /// nonblock)`, or `EBADF` if `fd` is not a message queue.
 fn mq_fd(cx: &ServiceCtx, fd: u64) -> Result<(usize, bool, bool, bool), i64> {
     match cx.cur.fds.get(fd as i32) {
-        Some(Fd::Mqueue { q, flags }) => {
+        Some(Fd::Mqueue { q, flags, .. }) => {
             let acc = flags & O_ACCMODE;
             Ok((*q, acc != 1, acc != 0, flags & O_NONBLOCK != 0))
         }
@@ -143,6 +186,8 @@ impl Kernel {
         if oflag & O_ACCMODE == 3 {
             return err(Errno::EINVAL);
         }
+        let freed = pf.mq_collect();
+        self.memory_quota.release(freed);
         let q = match pf.mq_names.get(&format!("{}/{name}", cx.cur.ns.ipc)) {
             Some(&q) => {
                 if oflag & O_CREAT != 0 && oflag & O_EXCL != 0 {
@@ -178,21 +223,47 @@ impl Kernel {
                     }
                     (mx, sz)
                 };
-                pf.mqueues.push(MqInst {
+                // RLIMIT_MSGQUEUE bounds what all of a user's queues may hold.
+                let uid = cx.cur.creds.ruid;
+                let charge = mq_bytes(maxmsg, msgsize);
+                let held: u64 = pf
+                    .mqueues
+                    .iter()
+                    .filter(|m| !m.dead && m.uid == uid)
+                    .map(|m| m.charge)
+                    .sum();
+                let limit = cx.cur.rlimits.soft(super::sys_misc::RLIMIT_MSGQUEUE);
+                if held.saturating_add(charge) > limit {
+                    return err(Errno::EMFILE);
+                }
+                let inst = MqInst {
                     msgs: Vec::new(),
                     maxmsg,
                     msgsize,
                     mode: (mode & 0o777) as u32,
                     notify: None,
-                });
-                let q = pf.mqueues.len() - 1;
+                    linked: true,
+                    hold: std::sync::Weak::new(),
+                    uid,
+                    charge,
+                    dead: false,
+                };
+                let q = if let Some(q) = pf.mqueues.iter().position(|m| m.dead) {
+                    pf.mqueues[q] = inst;
+                    q
+                } else {
+                    pf.mqueues.push(inst);
+                    pf.mqueues.len() - 1
+                };
                 pf.mq_names.insert(format!("{}/{name}", cx.cur.ns.ipc), q);
                 q
             }
         };
+        let hold = pf.mqueues[q].hold();
         let fd = cx.cur.fds.alloc(Fd::Mqueue {
             q,
             flags: oflag & (O_ACCMODE | O_NONBLOCK),
+            hold,
         });
         cx.cur.fds.set_cloexec(fd, oflag & O_CLOEXEC != 0);
         i64::from(fd)
@@ -211,14 +282,14 @@ impl Kernel {
             Ok(n) => n,
             Err(e) => return e,
         };
-        if pf
-            .mq_names
-            .remove(&format!("{}/{name}", cx.cur.ns.ipc))
-            .is_some()
-        {
-            0
-        } else {
-            err(Errno::ENOENT)
+        match pf.mq_names.remove(&format!("{}/{name}", cx.cur.ns.ipc)) {
+            Some(q) => {
+                pf.mqueues[q].linked = false;
+                let freed = pf.mq_collect();
+                self.memory_quota.release(freed);
+                0
+            }
+            None => err(Errno::ENOENT),
         }
     }
 

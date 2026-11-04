@@ -214,35 +214,6 @@ impl Kernel {
         }
     }
 
-    /// `sched_setscheduler(pid, policy, param)` — record the policy and its
-    /// real-time priority (self only; other pids aren't modeled). Reported back
-    /// by `sched_getscheduler`/`sched_getparam`.
-    #[allow(clippy::unused_self)]
-    pub(super) fn sys_sched_setscheduler(
-        &self,
-        cx: &mut ServiceCtx,
-        policy: i32,
-        param: u64,
-        mem: &GuestMemory,
-    ) -> i64 {
-        cx.cur.sched_policy = policy;
-        if param != 0
-            && let Ok(prio) = mem.read_u32(param)
-        {
-            cx.cur.sched_priority = prio as i32;
-        }
-        0
-    }
-
-    /// `setpriority(which, who, prio)` — record the nice value (clamped to
-    /// −20..=19). `getpriority` reports it back as the kernel ABI `20 - nice`.
-    /// Only `PRIO_PROCESS` on self is modeled; other targets succeed as a no-op.
-    #[allow(clippy::unused_self)]
-    pub(super) fn sys_setpriority(&self, cx: &mut ServiceCtx, prio: i64) -> i64 {
-        cx.cur.nice = (prio as i32).clamp(-20, 19);
-        0
-    }
-
     /// `sched_setaffinity(pid, cpusetsize, mask)` — record the affinity mask
     /// (self only). `sched_getaffinity` reports it back.
     #[allow(clippy::unused_self)]
@@ -537,10 +508,14 @@ pub(super) const RLIMIT_CPU: u64 = 0;
 pub(super) const RLIMIT_FSIZE: u64 = 1;
 pub(super) const RLIMIT_DATA: u64 = 2;
 pub(super) const RLIMIT_STACK: u64 = 3;
+pub(super) const RLIMIT_CORE: u64 = 4;
 pub(super) const RLIMIT_NPROC: u64 = 6;
+pub(super) const RLIMIT_MEMLOCK: u64 = 8;
 pub(super) const RLIMIT_AS: u64 = 9;
 pub(super) const RLIMIT_SIGPENDING: u64 = 11;
 pub(super) const RLIMIT_MSGQUEUE: u64 = 12;
+pub(super) const RLIMIT_NICE: u64 = 13;
+pub(super) const RLIMIT_RTPRIO: u64 = 14;
 /// How many resources there are (`RLIM_NLIMITS`).
 pub(super) const RLIM_NLIMITS: usize = 16;
 pub(super) const RLIM_INFINITY: u64 = u64::MAX;
@@ -553,6 +528,12 @@ pub(super) fn default_rlimits() -> [(u64, u64); RLIM_NLIMITS] {
     limits[RLIMIT_NOFILE as usize] = (1024, NOFILE_HARD_CAP);
     limits[RLIMIT_SIGPENDING as usize] = (4096, 4096);
     limits[RLIMIT_MSGQUEUE as usize] = (819_200, 819_200);
+    // Linux's defaults: no core files, 8 MiB of locked memory, and no raising
+    // of priority or real-time scheduling without CAP_SYS_NICE.
+    limits[RLIMIT_CORE as usize] = (0, RLIM_INFINITY);
+    limits[RLIMIT_MEMLOCK as usize] = (8 << 20, 8 << 20);
+    limits[RLIMIT_NICE as usize] = (0, 0);
+    limits[RLIMIT_RTPRIO as usize] = (0, 0);
     limits
 }
 

@@ -19,6 +19,7 @@ use crate::abi::Arch;
 
 pub(crate) mod ctrl;
 pub mod mem;
+mod pagelocks;
 pub(crate) mod pagetable;
 mod pagevec;
 pub(crate) mod phys;

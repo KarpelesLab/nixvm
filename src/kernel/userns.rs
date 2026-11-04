@@ -547,6 +547,9 @@ impl Kernel {
         let inside = Self::as_seen_from_root(cx, path);
         // The proc mount can be anywhere; a container mid-setup has it at /oldroot/proc.
         let rest = &inside[inside.rfind("/proc/")? + "/proc/".len()..];
+        if let Some(name @ ("hostname" | "domainname")) = rest.strip_prefix("sys/kernel/") {
+            return Some(self.write_uts_file(cx, name == "domainname", buf, count, mem));
+        }
         let (who, file) = rest.split_once('/')?;
         if !matches!(file, "uid_map" | "gid_map" | "setgroups" | "timens_offsets") {
             return None;
@@ -589,6 +592,40 @@ impl Kernel {
             }
         };
         Some(written.map_or_else(err, |()| count as i64))
+    }
+
+    /// A write to `/proc/sys/kernel/hostname` or `domainname`: `sethostname` /
+    /// `setdomainname` on the writer's UTS namespace, taking the text up to the
+    /// first newline, at most 64 bytes. Sysctls are writable only by root of the
+    /// first user namespace (`EACCES` otherwise), as on Linux.
+    fn write_uts_file(
+        &self,
+        cx: &ServiceCtx,
+        domain: bool,
+        buf: u64,
+        count: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        if cx.cur.ns.user != 0 || cx.cur.creds.euid != 0 {
+            return err(Errno::EACCES);
+        }
+        let Ok(bytes) = mem.read_vec(buf, count.min(4096) as usize) else {
+            return err(Errno::EFAULT);
+        };
+        let end = bytes
+            .iter()
+            .position(|&b| b == b'\n' || b == 0)
+            .unwrap_or(bytes.len())
+            .min(64);
+        let name = String::from_utf8_lossy(&bytes[..end]).into_owned();
+        let mut sh = self.shared.lock().unwrap();
+        let uts = sh.uts(cx.cur.ns.uts);
+        if domain {
+            uts.domainname = name;
+        } else {
+            uts.hostname = name;
+        }
+        count as i64
     }
 
     /// `uid_map`/`gid_map`: record the map, then give every task in the namespace

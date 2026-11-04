@@ -41,6 +41,13 @@ int main(void) {
   char check[100]; sprintf(check, "/proc/self/fd/%d", fd); link_of(check, b); CHECK(strstr(b, "uts:[") == b, "fd link reads as the namespace: %s", b);
   CHECK(setns(fd, CLONE_NEWIPC) < 0 && errno == EINVAL, "setns with the wrong type EINVAL");
   CHECK(!setns(fd, CLONE_NEWUTS), "setns"); host(after); CHECK(!strcmp(after, "joinme"), "now sees its name: %s", after); write(q[1], &x, 1); waitpid(c, 0, 0);
+  { char t[80] = {0}; int f = open("/proc/sys/kernel/hostname", O_RDONLY); read(f, t, 79); close(f); CHECK(!strcmp(t, "joinme\n"), "/proc/sys/kernel/hostname is the namespace's: %s", t);
+    /* Only root of the first user namespace may write sysctls. */
+    int top = 0; f = open("/proc/self/uid_map", O_RDONLY); char um[100] = {0}; read(f, um, 99); close(f); unsigned a0, b0, c0; top = sscanf(um, "%u %u %u", &a0, &b0, &c0) == 3 && a0 == 0 && b0 == 0 && c0 == 4294967295u;
+    f = open("/proc/sys/kernel/hostname", O_WRONLY); long w = f < 0 ? -1 : write(f, "viaproc\n", 8); int we = errno; close(f);
+    if (top) { CHECK(w == 8, "write /proc/sys/kernel/hostname"); host(after); CHECK(!strcmp(after, "viaproc"), "uname sees it: %s", after);
+      f = open("/proc/sys/kernel/domainname", O_WRONLY); CHECK(f >= 0 && write(f, "dom.example", 11) == 11, "write domainname"); close(f); getdomainname(t, sizeof t); CHECK(!strcmp(t, "dom.example"), "getdomainname sees it: %s", t); }
+    else { CHECK(w < 0 && we == EACCES, "root of a user namespace can't write /proc/sys/kernel/hostname"); host(after); CHECK(!strcmp(after, "joinme"), "name unchanged: %s", after); } }
   CHECK(setns(0, 0) < 0 && errno == EINVAL, "setns on a non-namespace EINVAL"); CHECK(setns(9999, 0) < 0 && errno == EBADF, "setns bad fd EBADF");
   /* Directory listing */
   DIR *d = opendir("/proc/self/ns"); int n = 0, u = 0; struct dirent *e; while (d && (e = readdir(d))) { if (e->d_name[0] != '.') n++; if (!strcmp(e->d_name, "uts")) u = 1; } CHECK(n >= 8 && u, "/proc/self/ns lists %d entries", n);

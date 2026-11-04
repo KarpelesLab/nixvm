@@ -402,6 +402,9 @@ impl Kernel {
             gid_map,
             setgroups,
             timens_offsets: super::userns::render_time_offsets(self.time_offsets_for(cx)),
+            limits: render_limits(&cx.cur.rlimits),
+            hostname: String::new(),
+            domainname: String::new(),
             mounts: Vec::new(),
             comm: cx.cur.comm.clone(),
             cmdline: cx.cur.cmdline.clone(),
@@ -962,6 +965,49 @@ fn fd_link_target(fd: &Fd) -> String {
         Fd::PtySlave(i) => format!("/dev/pts/{i}"),
         Fd::Mqueue { q, .. } => format!("mqueue:[{q}]"),
     }
+}
+
+/// `/proc/<pid>/limits`, laid out exactly as Linux prints it.
+fn render_limits(limits: &super::RLimits) -> String {
+    const ROWS: [(&str, &str); super::sys_misc::RLIM_NLIMITS] = [
+        ("Max cpu time", "seconds"),
+        ("Max file size", "bytes"),
+        ("Max data size", "bytes"),
+        ("Max stack size", "bytes"),
+        ("Max core file size", "bytes"),
+        ("Max resident set", "bytes"),
+        ("Max processes", "processes"),
+        ("Max open files", "files"),
+        ("Max locked memory", "bytes"),
+        ("Max address space", "bytes"),
+        ("Max file locks", "locks"),
+        ("Max pending signals", "signals"),
+        ("Max msgqueue size", "bytes"),
+        ("Max nice priority", ""),
+        ("Max realtime priority", ""),
+        ("Max realtime timeout", "us"),
+    ];
+    use std::fmt::Write as _;
+    let show = |v: u64| {
+        if v == super::sys_misc::RLIM_INFINITY {
+            "unlimited".to_string()
+        } else {
+            v.to_string()
+        }
+    };
+    let mut out = format!(
+        "{:<25} {:<20} {:<20} {:<10}\n",
+        "Limit", "Soft Limit", "Hard Limit", "Units"
+    );
+    for (i, (name, unit)) in ROWS.iter().enumerate() {
+        let (soft, hard) = limits.get(i as u64);
+        let _ = write!(out, "{name:<25} {:<20} {:<20} ", show(soft), show(hard));
+        if !unit.is_empty() {
+            let _ = write!(out, "{unit:<10}");
+        }
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
