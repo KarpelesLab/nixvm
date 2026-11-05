@@ -509,6 +509,13 @@ mod browser {
         mounts.mount("/dev", Box::new(DevFs::new()));
         mounts.mount("/proc", Box::new(ProcFs::new(1)));
         mounts.mount("/sys", Box::new(SysFs::new(1)));
+        mounts.mount(
+            "/sys/fs/cgroup",
+            Box::new(crate::fs::CgroupFs::new(
+                crate::fs::CgroupTree::shared(),
+                crate::fs::cgroupfs::ROOT,
+            )),
+        );
 
         let stdout_buf = Arc::new(Mutex::new(Vec::new()));
         let stderr_buf = Arc::new(Mutex::new(Vec::new()));

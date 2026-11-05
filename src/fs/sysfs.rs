@@ -235,13 +235,8 @@ impl SysFs {
         b.file("class/net/lo/statistics/rx_packets", *b"0\n");
         b.file("class/net/lo/statistics/tx_packets", *b"0\n");
 
-        // ---- fs/cgroup (minimal presence) ----
+        // ---- fs/cgroup: where cgroup2 is mounted (see `fs::cgroupfs`) ----
         b.dir("fs/cgroup");
-        b.file(
-            "fs/cgroup/cgroup.controllers",
-            *b"cpuset cpu io memory hugetlb pids rdma misc\n",
-        );
-        b.file("fs/cgroup/cgroup.procs", *b"");
 
         // ---- power/ (present but minimal: no real suspend support) ----
         b.file("power/state", *b"freeze mem disk\n");
@@ -635,18 +630,11 @@ mod tests {
     }
 
     #[test]
-    fn power_and_cgroup_present() {
+    fn power_present() {
         let mut fs = SysFs::new(1);
         assert_eq!(fs.stat("power").unwrap().kind, NodeKind::Dir);
         let mut buf = [0u8; 32];
         let n = fs.read_at("power/state", 0, &mut buf).unwrap();
         assert!(String::from_utf8_lossy(&buf[..n]).contains("mem"));
-
-        assert!(fs.stat("fs/cgroup/cgroup.controllers").is_some());
-        assert!(fs.stat("fs/cgroup/cgroup.procs").is_some());
-        let n = fs
-            .read_at("fs/cgroup/cgroup.controllers", 0, &mut buf)
-            .unwrap();
-        assert!(String::from_utf8_lossy(&buf[..n]).contains("memory"));
     }
 }

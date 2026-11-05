@@ -155,6 +155,14 @@ jobs:
             exit 1
           fi
 
+      # The cgroups program needs root and a real cgroup v2 tree, which this
+      # runner has: run it on the host too, so its expectations are Linux's.
+      - name: Check the cgroups program against Linux
+        if: matrix.backend == 'kvm'
+        run: |
+          gcc -static -O2 -o "$RUNNER_TEMP/cgroups" tests/guest/cgroups.c
+          sudo "$RUNNER_TEMP/cgroups"
+
       # Real tools using every namespace at once find what targeted tests don't.
       - name: Run bubblewrap and util-linux in the VM
         if: matrix.backend == 'kvm'

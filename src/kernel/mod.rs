@@ -29,6 +29,7 @@ use crate::vcpu::mem::{PAGE_SIZE, Prot};
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 
 mod attrs;
+mod cgroup;
 pub mod egress;
 mod fcntl;
 mod fd;
@@ -361,6 +362,10 @@ struct ProcInfo {
     /// blocked task, and so "is another task runnable?" excludes parked
     /// siblings (else a thread group all parks itself into a false deadlock).
     parked: bool,
+    /// In a frozen cgroup (`cgroup.freeze`): not scheduled, though nothing
+    /// about it changes, until thawed. A pending `SIGKILL` still runs it, to
+    /// die. See [`ProcInfo::held`].
+    frozen: bool,
     /// Writable file-backed `MAP_SHARED` mappings, flushed back to their file
     /// on `munmap`/`msync`/exit. This is how `apk` (and `install`, `cp
     /// --sparse`, …) writes large extracted files: create → `ftruncate` →
@@ -549,6 +554,7 @@ impl Default for ProcInfo {
             pgid: 0,
             sid: 0,
             parked: false,
+            frozen: false,
             shared_maps: Vec::new(),
             wake_deadline: None,
             io_progress: 0,
@@ -609,6 +615,12 @@ impl ProcInfo {
     /// [`Kernel::may_administer`]'s question.
     fn privileged(&self) -> bool {
         self.creds.euid == 0 || self.ns_caps
+    }
+
+    /// Held back by a frozen cgroup: not to be scheduled. A task with `SIGKILL`
+    /// pending runs anyway, to die, as Linux's freezer lets it.
+    fn held(&self) -> bool {
+        self.frozen && self.pending & (1 << (9 - 1)) == 0
     }
 
     /// Whether this task holds capabilities over the whole VM, not just inside a
@@ -913,6 +925,8 @@ struct CloneArgs {
     exit_signal: u64,
     /// Guest address to write the allocated pidfd to (`CLONE_PIDFD`), else 0.
     pidfd_ptr: u64,
+    /// The cgroup `CLONE_INTO_CGROUP` puts the child in.
+    cgroup: Option<u32>,
 }
 
 /// One signal's disposition, as `rt_sigaction` records it.
@@ -1386,6 +1400,8 @@ pub struct Kernel {
     pids: Arc<Mutex<pidns::PidNamespaces>>,
     /// The maps and owners of user namespaces (see [`userns`]).
     users: Arc<Mutex<userns::UserNamespaces>>,
+    /// The cgroup hierarchy (see [`cgroup`] and [`crate::fs::cgroupfs`]).
+    cgroups: crate::fs::cgroupfs::SharedTree,
     /// The offsets of each time namespace that has any.
     time_offsets: Mutex<BTreeMap<u32, userns::TimeNs>>,
     /// Growth on the host's disk (see [`crate::limits::Limits::disk_bytes`]).
@@ -1405,6 +1421,9 @@ pub struct Kernel {
     denied: AtomicU64,
     /// Tasks that may exist at once (see [`crate::limits::Limits::tasks`]).
     max_tasks: AtomicUsize,
+    /// Something has been mounted as `cgroup2`, so opens and writes are
+    /// checked for cgroup files (never cleared: it only saves a lookup).
+    cgroup_mounted: std::sync::atomic::AtomicBool,
     /// Descriptors that may be open at once across the VM
     /// (see [`crate::limits::Limits::open_files`]).
     max_open_files: AtomicUsize,
@@ -1539,6 +1558,8 @@ pub(super) struct Shared {
     pids: Arc<Mutex<pidns::PidNamespaces>>,
     /// The same table as [`Kernel::users`], for namespaces being created.
     users: Arc<Mutex<userns::UserNamespaces>>,
+    /// The cgroup hierarchy (see [`cgroup`] and [`crate::fs::cgroupfs`]).
+    cgroups: crate::fs::cgroupfs::SharedTree,
     /// Slots of [`Self::spaces`] and [`Self::mmap_areas`] no task refers to.
     free_mm_slots: Vec<usize>,
     /// Slots of [`Self::file_tables`] no task refers to.
@@ -1651,6 +1672,10 @@ impl Shared {
             .lock()
             .unwrap()
             .remove_task(gone.info.pid, gone.info.ns.pid);
+        self.cgroups
+            .lock()
+            .unwrap()
+            .release(gone.info.pid, gone.info.cpu_ns as u64);
         // The caller is running, so it isn't in `procs` on the serial path.
         let in_use = |sh: &Self, id: fn(&ProcInfo) -> usize, slot: usize| {
             id(&cx.cur) == slot || sh.procs.iter().flatten().any(|p| id(&p.info) == slot)
@@ -1754,7 +1779,7 @@ impl Shared {
         self.procs
             .iter()
             .flatten()
-            .any(|p| p.info.run == RunState::Running && !p.info.parked)
+            .any(|p| p.info.run == RunState::Running && !p.info.parked && !p.info.held())
     }
 
     fn any_running(&self) -> bool {
@@ -1776,7 +1801,7 @@ impl Shared {
             .procs
             .iter()
             .flatten()
-            .filter(|p| p.info.run == RunState::Running)
+            .filter(|p| p.info.run == RunState::Running && !p.info.held())
             .flat_map(|p| [p.info.wake_deadline, p.info.timer_deadline()])
             .flatten()
             .min()
@@ -1799,7 +1824,7 @@ impl Shared {
         for p in self.procs.iter().flatten() {
             if p.info.run == RunState::Running {
                 any_live = true;
-                if !p.info.parked {
+                if !p.info.parked && !p.info.held() {
                     return false;
                 }
             }
@@ -1831,7 +1856,7 @@ impl Shared {
         self.procs
             .iter()
             .flatten()
-            .filter(|p| p.info.run == RunState::Running)
+            .filter(|p| p.info.run == RunState::Running && !p.info.held())
             .flat_map(|p| [p.info.wake_deadline, p.info.timer_deadline()])
             .flatten()
             .min()
@@ -1879,7 +1904,7 @@ impl Shared {
         let best = (0..self.procs.len())
             .filter(|&i| {
                 matches!(self.procs.get(i),
-                    Some(Some(p)) if p.info.run == RunState::Running && !p.info.parked && p.vcpu.is_some())
+                    Some(Some(p)) if p.info.run == RunState::Running && !p.info.parked && !p.info.held() && p.vcpu.is_some())
             })
             .min_by_key(|&i| self.procs[i].as_ref().unwrap().info.vruntime.max(floor));
         best.map(|i| self.admit_fair(i))
@@ -1903,6 +1928,7 @@ impl Shared {
                     return false;
                 };
                 p.info.run == RunState::Running
+                    && !p.info.held()
                     && p.vcpu.is_some()
                     && blocked_at.get(&i).copied() != Some(epoch)
             })
@@ -1956,9 +1982,15 @@ impl Kernel {
         mounts.attach_disk_quota(&disk_quota);
         let pids = Arc::new(Mutex::new(pidns::PidNamespaces::default()));
         let users = Arc::new(Mutex::new(userns::UserNamespaces::default()));
+        // The hierarchy a `cgroup2` mount made before the kernel shows, if any.
+        let cgroup_mounted = mounts.cgroup_tree().is_some();
+        let cgroups = mounts
+            .cgroup_tree()
+            .unwrap_or_else(crate::fs::CgroupTree::shared);
         Self {
             pids: pids.clone(),
             users: users.clone(),
+            cgroups: cgroups.clone(),
             time_offsets: Mutex::new(BTreeMap::new()),
             memory_quota,
             disk_quota,
@@ -1976,6 +2008,7 @@ impl Kernel {
             denials: Mutex::new(VecDeque::new()),
             denied: AtomicU64::new(0),
             max_tasks: AtomicUsize::new(limits.tasks as usize),
+            cgroup_mounted: std::sync::atomic::AtomicBool::new(cgroup_mounted),
             max_open_files: AtomicUsize::new(limits.open_files as usize),
             arch,
             trace: std::env::var_os("NIXVM_TRACE").is_some(),
@@ -2010,6 +2043,7 @@ impl Kernel {
                 free_proc_slots: Vec::new(),
                 pids,
                 users,
+                cgroups,
                 free_mm_slots: Vec::new(),
                 free_file_slots: Vec::new(),
                 free_cwd_slots: Vec::new(),
@@ -2554,7 +2588,7 @@ impl Kernel {
                     // A stop signal took effect at this syscall's return (the task
                     // stopped itself, or was stopped while it ran): its slice ends
                     // here, and only `SIGCONT` makes it runnable again.
-                    if matches!(cx.cur.run, RunState::Stopped(_)) {
+                    if matches!(cx.cur.run, RunState::Stopped(_)) || cx.cur.held() {
                         return Ok(true);
                     }
                     // `sched_yield`: the call succeeded but ends the slice so
@@ -3180,7 +3214,7 @@ impl Kernel {
         step_start: u128,
     ) -> SliceStep {
         // Checkout under `sh`, then release it before servicing.
-        let (mut proc, mut cx, out_pending, out_ppid) = {
+        let (mut proc, mut cx, out_pending, out_ppid, out_frozen) = {
             let mut sh = self.shared.lock().unwrap();
             let mut proc = sh.procs[i].take().expect("dispatched task is in the table");
             // Own the task's per-step servicing state. `yield_now`/`block`/
@@ -3200,8 +3234,8 @@ impl Kernel {
                 info: cx.cur.clone(),
             });
             sh.check_out_files(&mut cx);
-            let (pending, ppid) = (cx.cur.pending, cx.cur.ppid);
-            (proc, cx, pending, ppid)
+            let (pending, ppid, frozen) = (cx.cur.pending, cx.cur.ppid, cx.cur.frozen);
+            (proc, cx, pending, ppid, frozen)
         };
         if cx.cur.alarm_deadline.is_some() || !cx.cur.ptimers.is_empty() {
             fire_timers_if_due(&mut cx.cur, poll::now_ns());
@@ -3219,12 +3253,16 @@ impl Kernel {
         {
             let mut sh = self.shared.lock().unwrap();
             // Fold in what other workers did to the stand-in meanwhile: signals
-            // posted to this task, and a new parent (ours exited and reparented
-            // us to init). Anything else on it was a copy of our own state.
+            // posted to this task, a new parent (ours exited and reparented us
+            // to init), and its cgroup frozen or thawed. Anything else on it
+            // was a copy of our own state.
             if let Some(stand_in) = sh.procs[i].take() {
                 cx.cur.pending |= stand_in.info.pending & !out_pending;
                 if stand_in.info.ppid != out_ppid {
                     cx.cur.ppid = stand_in.info.ppid;
+                }
+                if stand_in.info.frozen != out_frozen {
+                    cx.cur.frozen = stand_in.info.frozen;
                 }
             }
             sh.check_in_files(&mut cx);
@@ -3233,7 +3271,7 @@ impl Kernel {
             // stand-in still read "running", so a parent whose `wait4` ran in
             // between parked on it and would otherwise wait for a stall retry.
             let ppid = matches!(cx.cur.run, RunState::Zombie(_)).then_some(cx.cur.ppid);
-            stopped = matches!(cx.cur.run, RunState::Stopped(_));
+            stopped = matches!(cx.cur.run, RunState::Stopped(_)) || cx.cur.held();
             proc.info = cx.cur;
             sh.procs[i] = Some(proc);
             if let Some(ppid) = ppid {
@@ -3367,6 +3405,12 @@ impl Kernel {
         }
         if let Some(result) = self.ns_path_syscall(cx, sys, args, mem) {
             return result;
+        }
+        if self
+            .cgroup_mounted
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.cgroup_open_hook(cx, sys, args, mem);
         }
         if cx.cur.ns.user != 0 {
             return self.dispatch_in_user_ns(cx, sys, raw, args, vcpu, mem);
@@ -4575,6 +4619,7 @@ impl Kernel {
             } else {
                 0
             },
+            cgroup: None,
         };
         self.do_clone(sh, cx, &ca, vcpu, mem)
     }
@@ -4658,6 +4703,9 @@ impl Kernel {
         if !self.pids.lock().unwrap().accepts_tasks(child_ns.pid) {
             return err(Errno::ENOMEM);
         }
+        if let Err(e) = self.cgroup_can_fork(cx, ca.cgroup) {
+            return e;
+        }
         let Ok(mut child_vcpu) = vcpu.fork() else {
             return err(Errno::EAGAIN);
         };
@@ -4679,9 +4727,9 @@ impl Kernel {
         // CLONE_FS shares the filesystem context (cwd); CLONE_THREAD implies it,
         // and every pthread sets it, so a `chdir` in one thread is seen by all.
         let share_fs = flags & CLONE_FS != 0;
-        // CLONE_SYSVSEM, CLONE_IO, CLONE_PTRACE, CLONE_UNTRACED, CLONE_DETACHED and
-        // CLONE_INTO_CGROUP need no code here: there's a single SysV semaphore-undo
-        // context, IO context and cgroup, and no ptrace.
+        // CLONE_SYSVSEM, CLONE_IO, CLONE_PTRACE, CLONE_UNTRACED and CLONE_DETACHED
+        // need no code here: there's a single SysV semaphore-undo context and IO
+        // context, and no ptrace.
 
         let pid = sh.alloc_pid();
         // The ids the guest sees: the parent's view and the child's differ when the
@@ -4694,8 +4742,16 @@ impl Kernel {
                 pids.to_local(pid, child_ns.pid),
             )
         };
+        let frozen = self.cgroup_fork(cx, pid, ca.cgroup);
+        if child_ns.cgroup != cx.cur.ns.cgroup {
+            // A new cgroup namespace is rooted where the child starts.
+            let mut tree = self.cgroups.lock().unwrap();
+            let node = tree.node_of(pid);
+            tree.set_ns_root(child_ns.cgroup, node);
+        }
         let mut info = cx.cur.clone();
         info.pid = pid;
+        info.frozen = frozen;
         info.run = RunState::Running;
         info.futex_wait = None;
         info.futex_waitv = Vec::new();
@@ -5513,17 +5569,28 @@ impl Kernel {
         let stack = rd(40);
         let stack_size = rd(48);
         let tls = rd(56);
-        // set_tid[] (request specific pids per namespace) and cgroup are read for
-        // completeness but not honored: nixvm assigns pids from its own counter
-        // and models a single global cgroup, so a set_tid request cannot be
-        // satisfied — Linux would return EINVAL if the requested pid is taken, but
-        // since we never reuse pids the field is simply ignored. `CLONE_INTO_CGROUP`
-        // (whose target lives in `cgroup`) is accepted as a no-op like the other
-        // namespace/context flags.
+        // set_tid[] (request specific pids per namespace) is read for
+        // completeness but not honored: nixvm assigns pids from its own counter,
+        // so a set_tid request cannot be satisfied — Linux would return EINVAL if
+        // the requested pid is taken, but since we never reuse pids the field is
+        // simply ignored.
         let set_tid = if size >= 80 { rd(64) } else { 0 };
         let set_tid_size = if size >= 80 { rd(72) } else { 0 };
-        let _cgroup = if size >= 88 { rd(80) } else { 0 };
+        let cgroup_fd = if size >= 88 { rd(80) } else { 0 };
         let _ = (set_tid, set_tid_size);
+        // `CLONE_INTO_CGROUP`: the child starts in the cgroup `cgroup_fd`, a
+        // directory in a cgroup2 mount, names.
+        let cgroup = if flags & CLONE_INTO_CGROUP != 0 {
+            if size < 88 {
+                return err(Errno::EINVAL);
+            }
+            match self.cgroup_of_fd(cx, cgroup_fd) {
+                Ok(node) => Some(node),
+                Err(e) => return e,
+            }
+        } else {
+            None
+        };
         // The child SP is the top of the provided stack region (grows down); a
         // zero stack means "inherit the caller's" (do_clone leaves SP untouched).
         let sp = if stack == 0 {
@@ -5540,6 +5607,7 @@ impl Kernel {
             tls,
             exit_signal,
             pidfd_ptr,
+            cgroup,
         };
         self.do_clone(sh, cx, &ca, vcpu, mem)
     }
@@ -6063,6 +6131,13 @@ impl Kernel {
         mem: &GuestMemory,
     ) -> i64 {
         if let Some(result) = self.proc_control_write(cx, fd, buf, count, mem) {
+            return result;
+        }
+        if self
+            .cgroup_mounted
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(result) = self.cgroup_control_write(cx, fd, buf, count, mem)
+        {
             return result;
         }
         match cx.cur.fds.get(fd as i32) {

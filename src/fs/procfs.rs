@@ -105,6 +105,7 @@ const PATHS: &[&str] = &[
     "self/smaps",
     "self/statm",
     "self/limits",
+    "self/cgroup",
     "self/io",
     "self/oom_score",
     "self/oom_score_adj",
@@ -186,6 +187,8 @@ pub struct ProcTask {
     pub state: char,
     pub uid: u32,
     pub gid: u32,
+    /// Body of its `cgroup` file (`0::/path\n`).
+    pub cgroup: String,
 }
 
 impl ProcTask {
@@ -194,6 +197,7 @@ impl ProcTask {
         Some(match name {
             "comm" => format!("{}\n", self.comm).into_bytes(),
             "cmdline" => self.cmdline.clone(),
+            "cgroup" => self.cgroup.clone().into_bytes(),
             "stat" => {
                 // Only the leading fields `ps` and friends read carry anything.
                 let rest = "0 ".repeat(45);
@@ -224,7 +228,7 @@ impl ProcTask {
 }
 
 /// Files under `/proc/<pid>` for a task other than the reader.
-const TASK_FILES: &[&str] = &["cmdline", "comm", "stat", "status"];
+const TASK_FILES: &[&str] = &["cgroup", "cmdline", "comm", "stat", "status"];
 
 /// A fixed inode range for `/proc/<pid>` entries, which have no table entry.
 fn task_inode(pid: u32, slot: u64) -> u64 {
@@ -264,6 +268,7 @@ const SELF_FILES: &[&str] = &[
     "smaps",
     "statm",
     "limits",
+    "cgroup",
     "io",
     "oom_score",
     "oom_score_adj",
@@ -344,7 +349,8 @@ const LOADAVG: &str = "0.00 0.00 0.00 1/1 1\n";
 const FILESYSTEMS: &str = "nodev\ttmpfs\n\
 nodev\tproc\n\
 nodev\tsysfs\n\
-nodev\tdevtmpfs\n";
+nodev\tdevtmpfs\n\
+nodev\tcgroup2\n";
 
 const MOUNTS: &str = "tmpfs / tmpfs rw 0 0\n\
 proc /proc proc rw 0 0\n\
@@ -598,6 +604,8 @@ pub struct ProcData {
     pub limits: String,
     pub hostname: String,
     pub domainname: String,
+    /// Body of `self/cgroup`; empty until the kernel has said.
+    pub cgroup: String,
     /// The reader's mounts, for `mounts` and `self/mountinfo`. Empty until the
     /// kernel has refreshed this, when the fixed text is shown instead.
     pub mounts: Vec<super::MountEntry>,
@@ -656,6 +664,7 @@ impl Default for ProcData {
             limits: String::new(),
             hostname: String::new(),
             domainname: String::new(),
+            cgroup: String::new(),
             mounts: Vec::new(),
             cmdline: Vec::new(),
             exe: "/bin/busybox".to_string(),
@@ -695,6 +704,8 @@ pub struct ProcSelf {
     pub limits: String,
     pub hostname: String,
     pub domainname: String,
+    /// Body of `self/cgroup`.
+    pub cgroup: String,
     /// The caller's mounts, for `mounts` and `self/mountinfo`.
     pub mounts: Vec<super::MountEntry>,
     pub comm: String,
@@ -760,6 +771,7 @@ impl ProcFs {
         d.limits = live.limits;
         d.hostname = live.hostname;
         d.domainname = live.domainname;
+        d.cgroup = live.cgroup;
         d.comm = live.comm;
         d.cmdline = live.cmdline;
         d.exe = live.exe;
@@ -870,6 +882,9 @@ impl ProcFs {
             }
             "self/limits" if !self.data.limits.is_empty() => {
                 return Some(self.data.limits.clone().into_bytes());
+            }
+            "self/cgroup" if !self.data.cgroup.is_empty() => {
+                return Some(self.data.cgroup.clone().into_bytes());
             }
             "sys/kernel/hostname" if !self.data.hostname.is_empty() => {
                 return Some(format!("{}\n", self.data.hostname).into_bytes());
@@ -1010,6 +1025,7 @@ fn static_content(rel: &str) -> Option<&'static [u8]> {
         "consoles" => CONSOLES,
         "self/mountinfo" => MOUNTINFO,
         "self/limits" => LIMITS,
+        "self/cgroup" => "0::/\n",
         "self/io" => IO,
         "self/oom_score" => OOM_SCORE,
         "self/oom_score_adj" => OOM_SCORE_ADJ,
@@ -1710,6 +1726,7 @@ mod tests {
             limits: String::new(),
             hostname: String::new(),
             domainname: String::new(),
+            cgroup: String::new(),
             mounts: Vec::new(),
             cmdline: b"prog\0--flag\0".to_vec(),
             exe: "/usr/bin/prog".to_string(),
@@ -1747,6 +1764,7 @@ mod tests {
             state: 'S',
             uid: 5,
             gid: 6,
+            cgroup: "0::/a\n".to_string(),
         }];
         fs
     }
@@ -1848,6 +1866,7 @@ mod tests {
             limits: String::new(),
             hostname: String::new(),
             domainname: String::new(),
+            cgroup: String::new(),
             mounts: Vec::new(),
             comm: "myprog".to_string(),
             cmdline: b"/bin/myprog\0-x\0".to_vec(),

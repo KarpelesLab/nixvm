@@ -20,6 +20,7 @@
 
 use std::io;
 
+pub mod cgroupfs;
 pub mod devfs;
 #[cfg(feature = "fstool")]
 pub mod fstoolfs;
@@ -32,6 +33,7 @@ pub mod sysfs;
 pub mod tar;
 pub mod tmpfs;
 
+pub use cgroupfs::{CgroupFs, CgroupTree};
 pub use devfs::DevFs;
 #[cfg(feature = "fstool")]
 pub use fstoolfs::FsToolMount;
@@ -226,6 +228,12 @@ pub trait MountFs: std::fmt::Debug + Send {
     /// kernel refreshes from live task state before each read. Every other
     /// backend keeps the default (`None`).
     fn as_procfs_mut(&mut self) -> Option<&mut ProcFs> {
+        None
+    }
+
+    /// Downcast hook for [`CgroupFs`], whose task-moving writes the kernel
+    /// handles itself.
+    fn as_cgroupfs_mut(&mut self) -> Option<&mut CgroupFs> {
         None
     }
 }

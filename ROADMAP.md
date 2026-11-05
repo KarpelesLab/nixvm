@@ -480,8 +480,22 @@ must get the isolation it asks for.
   into another mount namespace stay the files they were opened on, as on Linux.
   Mount propagation works: shared, slave, private and unbindable mounts, peer groups
   across namespaces and bind mounts, and `shared:`/`master:` in `mountinfo`.
-  Known limits: cgroup namespaces only change the id; a pid recorded for an exited process (`msg_lspid`, say) reads
-  as 0 inside a nested PID namespace.
+  A pid recorded for a process that has since exited (`msg_lspid`, say) keeps its number
+  inside a nested PID namespace, as Linux's `struct pid` does.
+- **cgroups (`fs/cgroupfs.rs`, `kernel/cgroup.rs`):** one cgroup v2 hierarchy, mounted at
+  `/sys/fs/cgroup` and mountable as `cgroup2`: `mkdir`/`rmdir`/`rename` of cgroups, moving
+  processes through `cgroup.procs` (with v2's delegation and no-internal-process rules),
+  `cgroup.events`, `cgroup.kill`, `cgroup.freeze`, `cgroup.max.depth`/`max.descendants`,
+  `cgroup.stat`, `cpu.stat`, `clone3`'s `CLONE_INTO_CGROUP`, cgroup namespaces rooted where
+  they're made, and `/proc/<pid>/cgroup`. The `pids` controller is the one offered, and
+  `pids.max` stops `fork`; others (`cpu`, `memory`, `io`) aren't listed, since nothing would
+  enforce them. Threaded subtrees aren't supported (`EOPNOTSUPP`). `statfs` reports each
+  filesystem's own magic, which is how tools find cgroup v2.
+- **Signals:** a signal sent to a task that ignores it (and doesn't block it) is discarded
+  as it's sent, and making a signal ignored drops it if pending, as on Linux.
+- **Multicast:** UDP multicast between the VM's sockets in a network namespace (joining and
+  leaving groups, `IP_MULTICAST_LOOP`/`ALL`, binding a group's address). It never leaves
+  the VM.
 - **Syscall policy (`policy::SyscallPolicy`):** the embedder's list of syscalls no guest
   task may make, by name or group (`@mount`, `@namespaces`, `@network`, `@debug`, `@clock`,
   `@keyring`), each failing with an errno or killing the process. It's checked before the

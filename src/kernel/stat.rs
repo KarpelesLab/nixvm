@@ -114,14 +114,30 @@ pub fn encode_statx(attrs: &Attrs) -> [u8; 256] {
     b
 }
 
-/// The 120-byte `struct statfs` (arm64 / x86-64 layout). Reports a large,
-/// mostly-empty in-memory filesystem with 4 KiB blocks.
-pub fn encode_statfs() -> [u8; 120] {
+/// The `f_type` `statfs` reports for a filesystem of type `fs_type` (as
+/// `/proc/self/mountinfo` names it). Programs tell filesystems apart by it:
+/// systemd, runc and Docker find cgroup v2 that way. Anything else in memory is
+/// tmpfs.
+pub fn fs_magic(fs_type: &str) -> u64 {
+    match fs_type {
+        "proc" => 0x9fa0,
+        "sysfs" => 0x6265_6572,
+        "cgroup2" => 0x6367_7270,
+        "overlay" => 0x794c_7630,
+        "squashfs" => 0x7371_7368,
+        _ => 0x0102_1994, // TMPFS_MAGIC
+    }
+}
+
+/// The 120-byte `struct statfs` (arm64 / x86-64 layout) of a filesystem with
+/// magic number `magic`. Reports a large, mostly-empty filesystem with 4 KiB
+/// blocks.
+pub fn encode_statfs(magic: u64) -> [u8; 120] {
     let mut b = [0u8; 120];
     let put64 =
         |b: &mut [u8; 120], off: usize, v: u64| b[off..off + 8].copy_from_slice(&v.to_le_bytes());
 
-    put64(&mut b, 0, 0x0102_1994); // f_type (TMPFS_MAGIC)
+    put64(&mut b, 0, magic); // f_type
     put64(&mut b, 8, 4096); // f_bsize
     put64(&mut b, 16, 1 << 20); // f_blocks
     put64(&mut b, 24, 1 << 19); // f_bfree

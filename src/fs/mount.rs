@@ -316,6 +316,37 @@ impl MountTable {
         }
     }
 
+    /// The cgroup `abs_path` names in a `cgroup2` mount, with the file in it
+    /// if it names one, and the hierarchy it's in; `None` anywhere else.
+    pub fn cgroup_at(
+        &mut self,
+        abs_path: &str,
+    ) -> Option<(super::cgroupfs::SharedTree, u32, Option<String>)> {
+        let abs_path = self.canonical(abs_path);
+        let i = self.best_mount(&abs_path)?;
+        let m = &self.mounts[i];
+        let rel = m.fs_path(&relative_to(&abs_path, &m.point));
+        let mut fs = m.lock();
+        let cg = fs.as_cgroupfs_mut()?;
+        let (node, file) = cg.resolve(&rel)?;
+        Some((cg.tree().clone(), node, file))
+    }
+
+    /// The type of the filesystem `abs_path` is on (`"tmpfs"`, `"proc"`, ...).
+    pub fn fs_type_at(&mut self, abs_path: &str) -> Option<&'static str> {
+        let abs_path = self.canonical(abs_path);
+        let i = self.best_mount(&abs_path)?;
+        Some(self.mounts[i].lock().fs_type())
+    }
+
+    /// The hierarchy a `cgroup2` mount shows, if there is one.
+    #[must_use]
+    pub fn cgroup_tree(&self) -> Option<super::cgroupfs::SharedTree> {
+        self.mounts
+            .iter()
+            .find_map(|m| m.lock().as_cgroupfs_mut().map(|c| c.tree().clone()))
+    }
+
     /// Run `f` on each mounted procfs, so the kernel can refresh its live
     /// per-process data before serving a `/proc` read.
     pub fn with_procfs(&mut self, mut f: impl FnMut(&mut super::ProcFs)) {

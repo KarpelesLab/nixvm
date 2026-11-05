@@ -116,9 +116,19 @@ impl Kernel {
             "proc" => Box::new(crate::fs::ProcFs::new(self.ncpus)),
             "sysfs" => Box::new(crate::fs::SysFs::new(self.ncpus)),
             "devtmpfs" => Box::new(crate::fs::DevFs::new()),
-            "devpts" | "mqueue" | "cgroup" | "cgroup2" | "securityfs" | "debugfs" | "tracefs"
-            | "bpf" | "fusectl" | "configfs" | "pstore" | "efivarfs" | "binfmt_misc"
-            | "hugetlbfs" | "autofs" | "rpc_pipefs" | "nsfs" => return 0,
+            "cgroup2" => {
+                self.cgroup_mounted
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                Box::new(crate::fs::CgroupFs::new(
+                    self.cgroups.clone(),
+                    self.cgroup_mount_root(cx),
+                ))
+            }
+            "devpts" | "mqueue" | "securityfs" | "debugfs" | "tracefs" | "bpf" | "fusectl"
+            | "configfs" | "pstore" | "efivarfs" | "binfmt_misc" | "hugetlbfs" | "autofs"
+            | "rpc_pipefs" | "nsfs" => return 0,
+            // cgroup v1 isn't offered either: there's one v2 hierarchy, as on a
+            // system booted with cgroup_no_v1=all.
             _ => return err(Errno::ENODEV),
         };
         vfs.mount_guest(&abs, fs);
@@ -368,11 +378,11 @@ impl Kernel {
         if vfs.stat(&abs).is_none() {
             return err(Errno::ENOENT);
         }
-        write_statfs_or_fault(mem, buf)
+        let magic = stat::fs_magic(vfs.fs_type_at(&abs).unwrap_or("tmpfs"));
+        write_statfs_or_fault(mem, buf, magic)
     }
 
     /// `fstatfs(fd, buf)` — as `statfs`, keyed by an open fd.
-    #[allow(clippy::unused_self)]
     pub(super) fn sys_fstatfs(
         &self,
         cx: &mut ServiceCtx,
@@ -380,10 +390,13 @@ impl Kernel {
         buf: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        if cx.cur.fds.get(fd as i32).is_none() {
-            return err(Errno::EBADF);
-        }
-        write_statfs_or_fault(mem, buf)
+        let path = match cx.cur.fds.get(fd as i32) {
+            None => return err(Errno::EBADF),
+            Some(super::Fd::File { path, .. }) => Some(path.clone()),
+            Some(_) => None,
+        };
+        let fs_type = path.and_then(|p| self.vfs_for(cx).fs_type_at(&p));
+        write_statfs_or_fault(mem, buf, stat::fs_magic(fs_type.unwrap_or("tmpfs")))
     }
 
     /// `readlinkat(dirfd, path, buf, bufsz)` — copy the link target (truncated
@@ -437,6 +450,7 @@ impl Kernel {
                 },
                 uid: info.creds.ruid,
                 gid: info.creds.rgid,
+                cgroup: self.cgroup_line(cx, info.pid),
             })
         };
         let others = sh.procs.iter().flatten().map(|p| &p.info);
@@ -468,6 +482,7 @@ impl Kernel {
             limits: render_limits(&cx.cur.rlimits),
             hostname: String::new(),
             domainname: String::new(),
+            cgroup: self.cgroup_line(cx, cx.cur.pid),
             mounts: Vec::new(),
             comm: cx.cur.comm.clone(),
             cmdline: cx.cur.cmdline.clone(),
@@ -551,7 +566,18 @@ impl Kernel {
         };
         let abs = self.resolve_path(cx, dirfd, &rel);
         match vfs.mkdir(&abs, (mode & 0o777) as u32) {
-            Ok(()) => 0,
+            Ok(()) => {
+                // A new cgroup belongs to whoever made it, so a delegate can
+                // manage what it creates.
+                if self
+                    .cgroup_mounted
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    && vfs.cgroup_at(&abs).is_some()
+                {
+                    let _ = vfs.set_owner(&abs, Some(cx.cur.creds.euid), Some(cx.cur.creds.egid));
+                }
+                0
+            }
             Err(e) => io_errno(&e),
         }
     }
@@ -999,8 +1025,8 @@ fn decode_id(v: u64) -> Option<u32> {
 }
 
 /// Write a `struct statfs` at `addr`, or return `-EFAULT`.
-fn write_statfs_or_fault(mem: &mut GuestMemory, addr: u64) -> i64 {
-    let buf = stat::encode_statfs();
+fn write_statfs_or_fault(mem: &mut GuestMemory, addr: u64, magic: u64) -> i64 {
+    let buf = stat::encode_statfs(magic);
     if mem.write(addr, &buf).is_err() {
         err(Errno::EFAULT)
     } else {

@@ -551,6 +551,13 @@ impl Sandbox {
         mounts.mount("/dev", Box::new(DevFs::new()));
         mounts.mount("/proc", Box::new(ProcFs::new(self.config.ncpus)));
         mounts.mount("/sys", Box::new(SysFs::new(self.config.ncpus)));
+        mounts.mount(
+            "/sys/fs/cgroup",
+            Box::new(crate::fs::CgroupFs::new(
+                crate::fs::CgroupTree::shared(),
+                crate::fs::cgroupfs::ROOT,
+            )),
+        );
 
         #[cfg(unix)]
         {

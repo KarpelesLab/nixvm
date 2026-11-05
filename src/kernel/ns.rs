@@ -232,6 +232,11 @@ impl Shared {
         }
         if flags & CLONE_NEWCGROUP != 0 {
             ns.cgroup = self.fresh_ns_id();
+            // Rooted at the caller's cgroup (a new task's own is set once it
+            // has one, in `do_clone`).
+            let mut tree = self.cgroups.lock().unwrap();
+            let node = tree.node_of(cx.cur.pid);
+            tree.set_ns_root(ns.cgroup, node);
         }
         if flags & CLONE_NEWPID != 0 {
             ns.pid_for_children = self.fresh_ns_id();
