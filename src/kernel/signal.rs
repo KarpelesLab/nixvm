@@ -236,13 +236,65 @@ pub(super) fn is_stop_signal(sig: u64) -> bool {
     matches!(sig, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
 }
 
+impl super::ProcInfo {
+    /// Whether Linux throws `sig` away as it is sent to this task: it is
+    /// ignored (`SIG_IGN`, or `SIG_DFL` where the default is to ignore it) and
+    /// not blocked. A blocked one is kept, as the mask or handler may change
+    /// before it's unblocked; `SIGKILL` and `SIGSTOP` are never ignored.
+    pub(super) fn discards(&self, sig: u64) -> bool {
+        if !(1..=NSIG).contains(&sig) || sig == SIGKILL || sig == SIGSTOP {
+            return false;
+        }
+        if self.blocked & (1u64 << (sig - 1)) != 0 {
+            return false;
+        }
+        match self.handlers.get(sig as usize).handler {
+            SIG_IGN => true,
+            SIG_DFL => is_default_ignored(sig),
+            _ => false,
+        }
+    }
+
+    /// Make `sig` pending unless [`Self::discards`] says it's thrown away.
+    /// Returns whether it is now pending.
+    pub(super) fn raise(&mut self, sig: u64) -> bool {
+        if !(1..=NSIG).contains(&sig) || self.discards(sig) {
+            return false;
+        }
+        self.pending |= 1u64 << (sig - 1);
+        true
+    }
+
+    /// Post `sig` with its info, unless it's discarded.
+    pub(super) fn raise_with(&mut self, sig: u64, qs: super::QueuedSig) -> bool {
+        let raised = self.raise(sig);
+        if raised {
+            self.post_siginfo(sig, qs);
+        }
+        raised
+    }
+
+    /// A handler just became `SIG_IGN` (or a default-ignored `SIG_DFL`): like
+    /// Linux, a pending `sig` is dropped, blocked or not.
+    fn flush_ignored(&mut self, sig: u64) {
+        let ignored = match self.handlers.get(sig as usize).handler {
+            SIG_IGN => true,
+            SIG_DFL => is_default_ignored(sig),
+            _ => false,
+        };
+        if ignored {
+            self.pending &= !(1u64 << (sig - 1));
+            self.drain_rt(sig);
+            let _ = self.take_siginfo(sig);
+        }
+    }
+}
+
 /// Bit-mask of the four stop signals' pending bits.
 pub(super) const STOP_SIG_BITS: u64 =
     (1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)) | (1 << (SIGTTIN - 1)) | (1 << (SIGTTOU - 1));
 /// The SIGCONT pending bit.
 pub(super) const CONT_SIG_BIT: u64 = 1 << (SIGCONT - 1);
-/// The SIGCHLD pending bit.
-const CHLD_SIG_BIT: u64 = 1 << (SIGCHLD - 1);
 
 impl Kernel {
     /// `rt_sigaction(sig, act, oldact, sigsetsize)` — store the disposition for
@@ -291,6 +343,7 @@ impl Kernel {
                     mask: word(24),
                 },
             );
+            cx.cur.flush_ignored(sig);
         }
         0
     }
@@ -524,7 +577,6 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         let deliver = sig != 0; // sig == 0 is an existence/permission probe
-        let bit = if deliver { 1u64 << (sig - 1) } else { 0 };
         let cur_pid = i64::from(cx.cur.pid);
 
         // Single process (or a tkill/tgkill tid): the common path.
@@ -545,11 +597,11 @@ impl Kernel {
                 if !self.signal_reaches_init(cx, &cx.cur, sig) {
                     return 0;
                 }
-                cx.cur.pending |= bit;
                 if deliver {
                     if queue_info {
-                        cx.cur
-                            .post_siginfo(sig, self.seen_by(cx.cur.ns.pid, sender));
+                        cx.cur.raise_with(sig, self.seen_by(cx.cur.ns.pid, sender));
+                    } else {
+                        cx.cur.raise(sig);
                     }
                     // The current task is Running (it's executing this syscall),
                     // so this never resumes it, but it still applies the
@@ -567,12 +619,15 @@ impl Kernel {
                     if !self.signal_reaches_init(cx, &slot.info, sig) {
                         return 0;
                     }
-                    slot.info.pending |= bit;
-                    slot.info.parked = false;
                     if deliver {
-                        if queue_info {
-                            slot.info
-                                .post_siginfo(sig, self.seen_by(slot.info.ns.pid, sender));
+                        let qs = self.seen_by(slot.info.ns.pid, sender);
+                        let raised = if queue_info {
+                            slot.info.raise_with(sig, qs)
+                        } else {
+                            slot.info.raise(sig)
+                        };
+                        if raised {
+                            slot.info.parked = false;
                         }
                         resumed_ppid = apply_stop_cont(&mut slot.info, sig);
                     }
@@ -602,10 +657,8 @@ impl Kernel {
         if target_pgrp.is_none_or(|pg| pgid_of(&cx.cur) == pg)
             && self.signal_reaches_init(cx, &cx.cur, sig)
         {
-            cx.cur.pending |= bit;
             if deliver {
-                cx.cur
-                    .post_siginfo(sig, self.seen_by(cx.cur.ns.pid, sender));
+                cx.cur.raise_with(sig, self.seen_by(cx.cur.ns.pid, sender));
                 if let Some(ppid) = apply_stop_cont(&mut cx.cur, sig) {
                     resumed_ppids.push(ppid);
                 }
@@ -618,11 +671,11 @@ impl Kernel {
                 Some(pg) => pgid_of(&slot.info) == pg,
             };
             if is_target && self.signal_reaches_init(cx, &slot.info, sig) {
-                slot.info.pending |= bit;
-                slot.info.parked = false;
                 if deliver {
-                    slot.info
-                        .post_siginfo(sig, self.seen_by(slot.info.ns.pid, sender));
+                    let qs = self.seen_by(slot.info.ns.pid, sender);
+                    if slot.info.raise_with(sig, qs) {
+                        slot.info.parked = false;
+                    }
                     if let Some(ppid) = apply_stop_cont(&mut slot.info, sig) {
                         resumed_ppids.push(ppid);
                     }
@@ -788,7 +841,7 @@ impl Kernel {
         let mut sh = self.shared.lock().unwrap();
         for slot in sh.procs.iter_mut().flatten() {
             if slot.info.pid == ppid {
-                slot.info.pending |= CHLD_SIG_BIT;
+                slot.info.raise(SIGCHLD);
                 slot.info.parked = false;
                 break;
             }
@@ -1455,12 +1508,12 @@ fn apply_stop_cont(info: &mut super::ProcInfo, sig: u64) -> Option<i32> {
 /// into `cx.cur` — the parent may be either, so both are searched.
 fn notify_parent(sh: &mut Shared, cx: &mut ServiceCtx, ppid: i32) {
     if cx.cur.pid == ppid {
-        cx.cur.pending |= CHLD_SIG_BIT;
+        cx.cur.raise(SIGCHLD);
         return;
     }
     for slot in sh.procs.iter_mut().flatten() {
         if slot.info.pid == ppid {
-            slot.info.pending |= CHLD_SIG_BIT;
+            slot.info.raise(SIGCHLD);
             slot.info.parked = false;
             return;
         }

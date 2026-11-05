@@ -120,9 +120,9 @@ pub(super) fn fire_ptimers(info: &mut ProcInfo, now: u128) {
                 value: t.value,
             },
         );
-        info.pending |= 1u64 << (sig - 1);
-        info.post_siginfo(sig, qs);
-        info.parked = false;
+        if info.raise_with(sig, qs) {
+            info.parked = false;
+        }
     }
 }
 

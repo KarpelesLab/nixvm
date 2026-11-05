@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 
 const PROGRAMS: &[&str] = &[
     "sigshare",
+    "ignored_signals",
     "sockopt",
     "queues",
     "rlimits",

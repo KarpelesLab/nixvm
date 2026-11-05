@@ -2380,12 +2380,13 @@ impl Kernel {
     /// `&` have `SIGINT` ignored by the shell, so they carry on. Returns
     /// whether any process was signalled (i.e. a command was running).
     pub fn interrupt(&mut self) -> bool {
-        const SIGINT_BIT: u64 = 1 << (2 - 1);
+        const SIGINT: u64 = 2;
         let mut any = false;
         for p in self.shared.get_mut().unwrap().procs.iter_mut().flatten() {
             if p.info.pid != 1 && p.info.run == RunState::Running {
-                p.info.pending |= SIGINT_BIT;
-                p.info.parked = false;
+                if p.info.raise(SIGINT) {
+                    p.info.parked = false;
+                }
                 any = true;
             }
         }
@@ -2550,6 +2551,12 @@ impl Kernel {
                     // advance for the interpreter (it steps past the 2-byte
                     // `syscall`), drifting into the middle of the next instruction.
                     progressed = true;
+                    // A stop signal took effect at this syscall's return (the task
+                    // stopped itself, or was stopped while it ran): its slice ends
+                    // here, and only `SIGCONT` makes it runnable again.
+                    if matches!(cx.cur.run, RunState::Stopped(_)) {
+                        return Ok(true);
+                    }
                     // `sched_yield`: the call succeeded but ends the slice so
                     // siblings run. The task is *not* parked — `cx.block` stays clear.
                     if cx.yield_now {
@@ -3208,6 +3215,7 @@ impl Kernel {
         cx.cur.cpu_ns = cx.cur.cpu_ns.saturating_add(delta);
         charge_vruntime(&mut cx.cur, delta);
         self.charge_cpu_time(&mut cx, delta);
+        let stopped;
         {
             let mut sh = self.shared.lock().unwrap();
             // Fold in what other workers did to the stand-in meanwhile: signals
@@ -3225,6 +3233,7 @@ impl Kernel {
             // stand-in still read "running", so a parent whose `wait4` ran in
             // between parked on it and would otherwise wait for a stall retry.
             let ppid = matches!(cx.cur.run, RunState::Zombie(_)).then_some(cx.cur.ppid);
+            stopped = matches!(cx.cur.run, RunState::Stopped(_));
             proc.info = cx.cur;
             sh.procs[i] = Some(proc);
             if let Some(ppid) = ppid {
@@ -3239,7 +3248,8 @@ impl Kernel {
             Serviced::SetRet => {
                 // Result already written in `service` (see the serial path); do
                 // NOT re-write it — that double-advances the interpreter's pc.
-                if cx.yield_now {
+                // A task that just stopped ends its slice, as on the serial path.
+                if cx.yield_now || stopped {
                     SliceStep::Yielded
                 } else {
                     SliceStep::Continue
@@ -5923,9 +5933,8 @@ impl Kernel {
         for slot in sh.procs.iter_mut().flatten() {
             if slot.info.pid == ppid {
                 if (1..=64).contains(&exit_sig) {
-                    slot.info.pending |= 1u64 << (exit_sig - 1);
                     let info = self.seen_by(slot.info.ns.pid, chld_info);
-                    slot.info.post_siginfo(exit_sig, info);
+                    slot.info.raise_with(exit_sig, info);
                 }
                 slot.info.parked = false;
             }
@@ -5936,8 +5945,7 @@ impl Kernel {
             if slot.info.ppid == me && slot.info.pid != me {
                 slot.info.ppid = new_parent;
                 let ds = slot.info.pdeathsig;
-                if (1..=64).contains(&ds) {
-                    slot.info.pending |= 1u64 << (ds - 1);
+                if (1..=64).contains(&ds) && slot.info.raise(ds) {
                     slot.info.parked = false;
                 }
             }
@@ -6149,13 +6157,12 @@ impl Kernel {
         if sig == 0 || u64::from(sig) > signal::NSIG {
             return;
         }
-        let bit = 1u64 << (sig - 1);
+        let sig = u64::from(sig);
         if pgid_of(&cx.cur) == pgrp {
-            cx.cur.pending |= bit;
+            cx.cur.raise(sig);
         }
         for slot in sh.procs.iter_mut().flatten() {
-            if pgid_of(&slot.info) == pgrp {
-                slot.info.pending |= bit;
+            if pgid_of(&slot.info) == pgrp && slot.info.raise(sig) {
                 slot.info.parked = false;
             }
         }
@@ -9757,8 +9764,9 @@ fn fire_alarm_if_due(info: &mut ProcInfo, now: u128) -> bool {
     if now < dl {
         return false;
     }
-    info.pending |= 1u64 << (SIGALRM - 1);
-    info.parked = false;
+    if info.raise(SIGALRM) {
+        info.parked = false;
+    }
     info.alarm_deadline = if info.alarm_interval_ns > 0 {
         // Advance past any deadlines missed while descheduled (no signal coalescing
         // beyond one pending bit, as on Linux).
@@ -11011,6 +11019,13 @@ mod tests {
             .unwrap()
             .procs
             .push(Some(make_proc(1, 1, 0, false)));
+        // The parent blocks SIGCHLD, so it stays pending to be seen (at its
+        // default and unblocked, it would be discarded as it's sent).
+        k.shared.lock().unwrap().procs[0]
+            .as_mut()
+            .unwrap()
+            .info
+            .blocked = 1 << (17 - 1);
         cx.cur.pid = 2;
         cx.cur.ppid = 1;
         // SIGSTOP (19) pending → deliver_pending_signals stops it (uncatchable).
@@ -11111,6 +11126,7 @@ mod tests {
     #[test]
     fn sigcont_resumes_a_stopped_child_and_wcontinued_reports_it() {
         let (k, mut mem, mut v, mut cx) = setup();
+        cx.cur.blocked = 1 << (17 - 1); // keep SIGCHLD pending to be seen
         let child = call(
             &k,
             &mut cx,
