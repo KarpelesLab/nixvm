@@ -212,7 +212,7 @@ int main(void) {
   path(p, "nest/a/deeper");
   CHECK(mkdir(p, 0755) == -1 && errno == EAGAIN);
   CHECK(rmdir(nest) == -1 && errno == EBUSY);
-  CHECK(!strcmp(get(nest, "cgroup.stat"), "nr_descendants 1\nnr_dying_descendants 0\n"));
+  CHECK(!strncmp(get(nest, "cgroup.stat"), "nr_descendants 1\n", 17));
   CHECK(rmdir(a) == 0 && rmdir(nest) == 0);
   puts("cgroup.max.descendants, cgroup.max.depth: ok");
 

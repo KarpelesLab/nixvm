@@ -695,10 +695,26 @@ impl CgroupTree {
             "cgroup.type" => "domain\n".to_string(),
             "cgroup.max.depth" => limit(n.max_depth),
             "cgroup.max.descendants" => limit(n.max_descendants),
-            "cgroup.stat" => format!(
-                "nr_descendants {}\nnr_dying_descendants 0\n",
-                self.descendants(node)
-            ),
+            // Linux's layout: the controller counts are how many cgroups from
+            // here down have that controller (`css`), this one included.
+            "cgroup.stat" => {
+                let has_pids = |c: &u32| {
+                    *c == ROOT
+                        || self.nodes[c]
+                            .parent
+                            .is_some_and(|p| self.nodes.get(&p).is_some_and(|p| p.pids_below))
+                };
+                let pids = if has_pids(&node) {
+                    self.subtree(node).iter().filter(|c| has_pids(c)).count()
+                } else {
+                    0
+                };
+                format!(
+                    "nr_descendants {}\nnr_subsys_pids {pids}\nnr_dying_descendants 0\n\
+                     nr_dying_subsys_pids 0\n",
+                    self.descendants(node)
+                )
+            }
             "cgroup.freeze" => format!("{}\n", u8::from(n.freeze)),
             "cpu.stat" => {
                 let usec = self
