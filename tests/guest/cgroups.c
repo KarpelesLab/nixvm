@@ -33,7 +33,7 @@ static int put(const char *dir, const char *file, const char *text) {
   int n = write(fd, text, strlen(text));
   int e = errno;
   close(fd);
-  errno = e;
+  errno = n < 0 ? e : 0; /* a stale errno would mislead a failing check */
   return n < 0 ? -1 : 0;
 }
 
@@ -103,9 +103,13 @@ int main(void) {
   CHECK(!strcmp(get(base, "cgroup.events"), "populated 1\nfrozen 0\n"));
   CHECK(put(self, "cgroup.subtree_control", "+pids") == -1 && errno == ENOENT); /* base hasn't */
   CHECK(put(base, "cgroup.subtree_control", "+pids") == 0);
-  CHECK(put(self, "cgroup.subtree_control", "+pids") == -1 && errno == EBUSY); /* self has us */
+  /* pids is a threaded controller, so a cgroup with processes may enable it. */
+  CHECK(put(self, "cgroup.subtree_control", "+pids") == 0);
+  CHECK(put(self, "cgroup.subtree_control", "-pids") == 0);
   CHECK(!strcmp(get(base, "cgroup.subtree_control"), "pids\n"));
-  CHECK(put(base, "cgroup.subtree_control", "+nosuch") == -1 && errno == ENOENT);
+  /* But base hands pids to a populated child: no processes go in base. */
+  CHECK(put(base, "cgroup.procs", "0") == -1 && errno == EBUSY);
+  CHECK(put(base, "cgroup.subtree_control", "+nosuch") == -1 && errno == EINVAL);
   CHECK(rmdir(self) == -1 && errno == EBUSY);
   puts("moving ourselves, populated, no internal processes: ok");
 

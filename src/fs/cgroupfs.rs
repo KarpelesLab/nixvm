@@ -244,13 +244,29 @@ impl CgroupTree {
         self.nodes.get(&node).map_or((0, 0), |n| (n.uid, n.gid))
     }
 
-    /// Whether a task can be put in `node`: one whose `cgroup.subtree_control`
-    /// enables a controller has children for its tasks, not tasks of its own
-    /// (cgroup v2's "no internal processes" rule; the root is exempt).
+    /// Whether one of `node`'s children has live tasks in it or below.
+    fn has_populated_child(&self, node: u32) -> bool {
+        self.nodes.get(&node).is_some_and(|n| {
+            n.children
+                .values()
+                .any(|c| self.nodes.get(c).is_some_and(|c| c.live > 0))
+        })
+    }
+
+    /// Whether `node` has live tasks directly in it.
+    fn has_own_tasks(&self, node: u32) -> bool {
+        self.members.values().any(|m| m.node == node && m.live)
+    }
+
+    /// Whether a task can be put in `node`, by cgroup v2's "no internal
+    /// processes" rule (Linux's `cgroup_migrate_vet_dst`). The only controller
+    /// here, `pids`, is a threaded one, which may share a cgroup with tasks:
+    /// so the rule only refuses a cgroup that already hands a controller to
+    /// populated children. The root is exempt.
     pub fn check_attach(&self, node: u32) -> Result<(), i32> {
         match self.nodes.get(&node) {
             None => Err(ENOENT),
-            Some(n) if node != ROOT && n.pids_below => Err(EBUSY),
+            Some(n) if node != ROOT && n.pids_below && self.has_populated_child(node) => Err(EBUSY),
             Some(_) => Ok(()),
         }
     }
@@ -613,7 +629,12 @@ impl CgroupTree {
                 ("-", n) => (false, n),
                 _ => return Err(EINVAL),
             };
-            if !available.contains(&name) {
+            // A controller the kernel doesn't have is EINVAL; one it has, but
+            // that the parent doesn't hand down, is ENOENT.
+            if !CONTROLLERS.contains(&name) {
+                return Err(EINVAL);
+            }
+            if on && !available.contains(&name) {
                 return Err(ENOENT);
             }
             enable = Some(on);
@@ -626,10 +647,11 @@ impl CgroupTree {
             return Ok(());
         }
         if on {
-            // No internal processes: a non-root cgroup with tasks of its own
-            // can't hand controllers to children.
-            let own = self.members.values().any(|m| m.node == node && m.live);
-            if node != ROOT && own {
+            // No internal processes (Linux's
+            // `cgroup_vet_subtree_control_enable`): a threaded controller may be
+            // enabled alongside tasks, unless the cgroup also has populated
+            // children, which it would then compete with.
+            if node != ROOT && self.has_own_tasks(node) && self.has_populated_child(node) {
                 return Err(EBUSY);
             }
         } else if n
@@ -991,17 +1013,28 @@ mod tests {
         let mut t = tree.lock().unwrap();
         let a = t.mkdir(ROOT, "a", 0, 0).unwrap();
         t.migrate(&[(5, true)], a);
-        t.write_file(ROOT, "cgroup.subtree_control", "+pids")
-            .unwrap();
         assert_eq!(
             t.write_file(a, "cgroup.subtree_control", "+pids"),
-            Err(EBUSY),
-            "a has a task of its own"
+            Err(ENOENT),
+            "the root doesn't hand it down yet"
         );
+        t.write_file(ROOT, "cgroup.subtree_control", "+pids")
+            .unwrap();
+        // pids is threaded: it may be enabled where there are tasks...
+        t.write_file(a, "cgroup.subtree_control", "+pids").unwrap();
         assert_eq!(
             t.write_file(a, "cgroup.subtree_control", "+cpu"),
-            Err(ENOENT)
+            Err(EINVAL)
         );
+        // ...but then nothing more goes into a once a child is populated.
+        let kid = t.mkdir(a, "kid", 0, 0).unwrap();
+        t.migrate(&[(6, true)], kid);
+        assert_eq!(t.check_attach(a), Err(EBUSY));
+        assert_eq!(t.check_attach(kid), Ok(()));
+        t.write_file(a, "cgroup.subtree_control", "-pids").unwrap();
+        assert_eq!(t.check_attach(a), Ok(()));
+        t.migrate(&[(6, true)], ROOT);
+        t.rmdir(kid).unwrap();
         t.write_file(a, "cgroup.max.depth", "1").unwrap();
         let b = t.mkdir(a, "b", 0, 0).unwrap();
         assert_eq!(t.mkdir(b, "c", 0, 0), Err(EAGAIN), "max.depth");
