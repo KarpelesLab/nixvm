@@ -19,6 +19,10 @@ use crate::vcpu::GuestMemory;
 /// How deeply PID namespaces nest (Linux's `MAX_PID_NS_LEVEL`).
 const MAX_DEPTH: usize = 32;
 
+/// How many gone tasks' numbers a namespace remembers. Past this the oldest
+/// read as 0, as everything did before; it only bounds a fork loop's cost.
+const MAX_GONE: usize = 1 << 16;
+
 /// One PID namespace below the initial one.
 #[derive(Debug)]
 struct PidNs {
@@ -28,6 +32,13 @@ struct PidNs {
     local: BTreeMap<i32, i32>,
     /// The reverse of [`Self::local`].
     global: BTreeMap<i32, i32>,
+    /// The numbers tasks that have gone had here, by global id, so a pid the
+    /// kernel recorded (a message queue's last sender, a segment's creator)
+    /// still reads as what it was, as Linux's `struct pid` keeps its numbers
+    /// while referenced. Numbers here aren't reused, so these can't mislead.
+    gone: BTreeMap<i32, i32>,
+    /// [`Self::gone`] by number, oldest first, to bound it.
+    gone_by_local: BTreeMap<i32, i32>,
     next: i32,
     /// The global id of its first process, its PID 1.
     init: Option<i32>,
@@ -63,6 +74,8 @@ impl PidNamespaces {
                 parent,
                 local: BTreeMap::new(),
                 global: BTreeMap::new(),
+                gone: BTreeMap::new(),
+                gone_by_local: BTreeMap::new(),
                 next: 1,
                 init: None,
                 dead: false,
@@ -98,6 +111,10 @@ impl PidNamespaces {
             entry.next += 1;
             entry.local.insert(global, local);
             entry.global.insert(local, global);
+            // A reused global id names this task now, not the one that had it.
+            if let Some(old) = entry.gone.remove(&global) {
+                entry.gone_by_local.remove(&old);
+            }
             if id == ns && entry.init.is_none() {
                 entry.init = Some(global);
             }
@@ -110,8 +127,32 @@ impl PidNamespaces {
             let entry = self.table.get_mut(&id).expect("from chain");
             if let Some(local) = entry.local.remove(&global) {
                 entry.global.remove(&local);
+                entry.gone.insert(global, local);
+                entry.gone_by_local.insert(local, global);
+                if entry.gone_by_local.len() > MAX_GONE
+                    && let Some((_, g)) = entry.gone_by_local.pop_first()
+                {
+                    entry.gone.remove(&g);
+                }
             }
         }
+    }
+
+    /// Like [`Self::to_local`], for an id the kernel recorded earlier: a task
+    /// that has gone since still reads as the number it had.
+    pub(super) fn recorded_to_local(&self, global: i32, ns: u32) -> i32 {
+        if ns == 0 {
+            return global;
+        }
+        let Some(entry) = self.table.get(&ns) else {
+            return 0;
+        };
+        entry
+            .local
+            .get(&global)
+            .or_else(|| entry.gone.get(&global))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The number task `global` has in `ns`, or 0 if it isn't visible there.
@@ -383,10 +424,14 @@ impl Kernel {
         const F_SETOWN_EX: u64 = 15;
         const F_GETOWN_EX: u64 = 16;
         const F_UNLCK: i16 = 2;
+        // Every pid these report was recorded earlier, and may be of a task
+        // that has gone since.
         let seen = |this: &Self, cx: &ServiceCtx, global: i32| -> i32 {
+            let pids = this.pids.lock().unwrap();
+            let local = |g: i32| pids.recorded_to_local(g, cx.cur.ns.pid);
             match global.cmp(&0) {
-                std::cmp::Ordering::Greater => this.visible_pid(cx, global),
-                std::cmp::Ordering::Less => -this.visible_pid(cx, -global),
+                std::cmp::Ordering::Greater => local(global),
+                std::cmp::Ordering::Less => -local(-global),
                 std::cmp::Ordering::Equal => 0,
             }
         };
@@ -545,6 +590,20 @@ mod tests {
         assert_eq!(t.to_local(101, 2), 0, "not visible from the nested one");
         assert_eq!(t.to_global(2, 1), Some(101));
         assert_eq!(t.to_global(2, 2), None);
+    }
+
+    #[test]
+    fn a_gone_task_keeps_its_recorded_number_until_its_id_is_reused() {
+        let mut t = table();
+        t.add_task(100, 2);
+        t.add_task(101, 2);
+        t.remove_task(101, 2);
+        assert_eq!(t.to_local(101, 2), 0, "not a live task any more");
+        assert_eq!(t.recorded_to_local(101, 2), 2, "but recorded as 2 there");
+        assert_eq!(t.recorded_to_local(101, 1), 2, "and in the parent");
+        t.add_task(101, 1); // the global id is reused, outside namespace 2
+        assert_eq!(t.recorded_to_local(101, 1), 3, "the new task in the parent");
+        assert_eq!(t.recorded_to_local(101, 2), 2, "invisible in 2, as before");
     }
 
     #[test]

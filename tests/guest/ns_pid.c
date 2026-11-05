@@ -72,7 +72,8 @@ static int init_main(int outer_pid) {
     int as = accept(ls, 0, 0); struct ucred u; socklen_t ul = sizeof u; getsockopt(as, SOL_SOCKET, SO_PEERCRED, &u, &ul); char x = 0; read(rp[0], &x, 1);
     CHECK(u.pid == c && x == 1, "SO_PEERCRED names the other end (%d, want %d), and the client sees the listener (%d)", u.pid, c, x); close(as); status_of(c); close(ls); }
   { int q = msgget(IPC_PRIVATE, 0600), rp[2]; pipe(rp); c = fork(); if (!c) { struct { long t; char b[4]; } mm = {1, "hi"}; msgsnd(q, &mm, 4, 0); char x = 1; write(rp[1], &x, 1); pause(); _exit(0); }
-    char x; read(rp[0], &x, 1); struct msqid_ds ds; msgctl(q, IPC_STAT, &ds); CHECK(ds.msg_lspid == c, "msg_lspid is local (%d, want %d)", ds.msg_lspid, c); kill(c, SIGKILL); status_of(c); msgctl(q, IPC_RMID, 0);
+    char x; read(rp[0], &x, 1); struct msqid_ds ds; msgctl(q, IPC_STAT, &ds); CHECK(ds.msg_lspid == c, "msg_lspid is local (%d, want %d)", ds.msg_lspid, c); kill(c, SIGKILL); status_of(c);
+    msgctl(q, IPC_STAT, &ds); CHECK(ds.msg_lspid == c, "msg_lspid still names a sender that has exited (%d, want %d)", ds.msg_lspid, c); msgctl(q, IPC_RMID, 0);
     int sh = shmget(IPC_PRIVATE, 4096, 0600); struct shmid_ds sd; shmctl(sh, IPC_STAT, &sd); CHECK(sd.shm_cpid == 1, "shm_cpid is local (%d)", sd.shm_cpid); shmctl(sh, IPC_RMID, 0); }
   { int f = open("/tmp/nslock", O_CREAT | O_RDWR, 0600); int rp[2]; pipe(rp);
     c = fork(); if (!c) { struct flock fl = {.l_type = F_WRLCK, .l_whence = SEEK_SET}; fcntl(f, F_SETLK, &fl); char x = 1; write(rp[1], &x, 1); pause(); _exit(0); }
