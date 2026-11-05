@@ -242,7 +242,7 @@ impl super::ProcInfo {
     /// not blocked. A blocked one is kept, as the mask or handler may change
     /// before it's unblocked; `SIGKILL` and `SIGSTOP` are never ignored.
     pub(super) fn discards(&self, sig: u64) -> bool {
-        if !(1..=NSIG).contains(&sig) || sig == SIGKILL || sig == SIGSTOP {
+        if !(1..=NSIG).contains(&sig) || sig == SIGKILL || sig == SIGSTOP || self.in_flight {
             return false;
         }
         if self.blocked & (1u64 << (sig - 1)) != 0 {

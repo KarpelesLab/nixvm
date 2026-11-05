@@ -451,6 +451,10 @@ struct ProcInfo {
     /// signal number; the `pending` bit for an RT signal mirrors "its queue is
     /// non-empty".
     rt_queue: BTreeMap<u32, VecDeque<QueuedSig>>,
+    /// This is the copy left in the table while the task runs on an SMP worker:
+    /// its handlers and mask may be stale, so a signal posted to it is never
+    /// discarded here, only when the running task acts on it.
+    in_flight: bool,
     /// POSIX timers (`timer_create`) whose expirations are delivered to this
     /// task — see [`ptimer`]. Like `ITIMER_REAL` they wake the task at their
     /// deadline ([`ProcInfo::timer_deadline`]); unlike it, neither `fork`
@@ -573,6 +577,7 @@ impl Default for ProcInfo {
             dumpable: 1,
             queued_siginfo: [None; NSIG_SLOTS],
             rt_queue: BTreeMap::new(),
+            in_flight: false,
             ptimers: Vec::new(),
             ioprio: 0,
             mempolicy: (0, 0),
@@ -3214,7 +3219,7 @@ impl Kernel {
         step_start: u128,
     ) -> SliceStep {
         // Checkout under `sh`, then release it before servicing.
-        let (mut proc, mut cx, out_pending, out_ppid, out_frozen) = {
+        let (mut proc, mut cx, out_pending, out_ppid, out_frozen, out_rt_lens) = {
             let mut sh = self.shared.lock().unwrap();
             let mut proc = sh.procs[i].take().expect("dispatched task is in the table");
             // Own the task's per-step servicing state. `yield_now`/`block`/
@@ -3229,13 +3234,17 @@ impl Kernel {
             // must still see this task — a parent's `wait4` otherwise found a
             // child mid-`exit` missing, got ECHILD, and exited early (the flaky
             // smp_e2e sum); `kill` by pid and reparenting look it up too.
+            let mut stand_in = cx.cur.clone();
+            stand_in.in_flight = true;
             sh.procs[i] = Some(Process {
                 vcpu: None,
-                info: cx.cur.clone(),
+                info: stand_in,
             });
             sh.check_out_files(&mut cx);
             let (pending, ppid, frozen) = (cx.cur.pending, cx.cur.ppid, cx.cur.frozen);
-            (proc, cx, pending, ppid, frozen)
+            let rt_lens: BTreeMap<u32, usize> =
+                cx.cur.rt_queue.iter().map(|(&s, q)| (s, q.len())).collect();
+            (proc, cx, pending, ppid, frozen, rt_lens)
         };
         if cx.cur.alarm_deadline.is_some() || !cx.cur.ptimers.is_empty() {
             fire_timers_if_due(&mut cx.cur, poll::now_ns());
@@ -3257,7 +3266,23 @@ impl Kernel {
             // to init), and its cgroup frozen or thawed. Anything else on it
             // was a copy of our own state.
             if let Some(stand_in) = sh.procs[i].take() {
-                cx.cur.pending |= stand_in.info.pending & !out_pending;
+                let new = stand_in.info.pending & !out_pending;
+                cx.cur.pending |= new;
+                // The info posted with them: a standard signal's, and each
+                // real-time signal queued past what the copy started with.
+                for sig in 1..NSIG_SLOTS.min(SIGRTMIN as usize) {
+                    if new & (1 << (sig - 1)) != 0
+                        && let Some(q) = stand_in.info.queued_siginfo[sig]
+                    {
+                        cx.cur.queued_siginfo[sig] = Some(q);
+                    }
+                }
+                for (sig, q) in &stand_in.info.rt_queue {
+                    let had = out_rt_lens.get(sig).copied().unwrap_or(0);
+                    let mine = cx.cur.rt_queue.entry(*sig).or_default();
+                    mine.extend(q.iter().skip(had).copied());
+                }
+                cx.cur.rt_queue.retain(|_, q| !q.is_empty());
                 if stand_in.info.ppid != out_ppid {
                     cx.cur.ppid = stand_in.info.ppid;
                 }
