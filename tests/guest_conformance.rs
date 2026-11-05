@@ -15,6 +15,7 @@ const PROGRAMS: &[&str] = &[
     "sigshare",
     "ignored_signals",
     "sockopt",
+    "multicast",
     "queues",
     "rlimits",
     "async_signals",

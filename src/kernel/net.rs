@@ -18,6 +18,11 @@
 //! transport protocol (`tcp4`/`tcp6`/`udp4`/`udp6`), keyed only by family and
 //! port — since only loopback/wildcard binds are accepted, the specific
 //! address never needs to distinguish two sockets on the same port.
+//!
+//! UDP multicast works between the VM's sockets: a datagram to a group reaches
+//! every socket in the network namespace bound to its port that is in the
+//! group (see [`Net::multicast_receivers`]). It never leaves the VM, egress or
+//! not, so a guest can't reach the host's local network this way.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -464,6 +469,19 @@ struct SockOpts {
     extra: BTreeMap<(u64, u64), Vec<u8>>,
 }
 
+impl SockOpts {
+    /// A stored option's value as an integer: an `int`, or the single byte
+    /// some IP options accept instead. `None` if it was never set.
+    fn int_opt(&self, key: (u64, u64)) -> Option<i32> {
+        let raw = self.extra.get(&key)?;
+        Some(match raw.len() {
+            0 => 0,
+            1..=3 => i32::from(raw[0]),
+            _ => i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+        })
+    }
+}
+
 impl Default for SockOpts {
     fn default() -> Self {
         Self {
@@ -665,6 +683,9 @@ struct Dgram {
     /// are ICMP messages, carried by the egress backend's ICMP endpoint (in
     /// `host`) or answered locally for a loopback echo.
     icmp: Option<Icmp>,
+    /// The multicast groups joined (`IP_ADD_MEMBERSHIP`, `IPV6_JOIN_GROUP`,
+    /// `MCAST_JOIN_GROUP`), as addresses with port 0.
+    groups: Vec<InetAddr>,
 }
 
 /// What a queued datagram costs against a socket's receive buffer. The overhead
@@ -708,6 +729,7 @@ impl std::fmt::Debug for Dgram {
             .field("queued_bytes", &self.queued_bytes)
             .field("host", &self.host.is_some())
             .field("icmp", &self.icmp)
+            .field("groups", &self.groups)
             .finish()
     }
 }
@@ -767,6 +789,29 @@ impl InetAddr {
     /// address may be bound (or connected to).
     fn valid_bind(&self) -> bool {
         self.is_any() || self.is_loopback()
+    }
+
+    /// `224.0.0.0/4` (v4) or `ff00::/8` (v6).
+    fn is_multicast(&self) -> bool {
+        if self.v6 {
+            self.ip[0] == 0xff
+        } else {
+            self.ip[0] & 0xf0 == 0xe0
+        }
+    }
+
+    /// The all-hosts group every interface is in without joining:
+    /// `224.0.0.1` or `ff02::1`.
+    fn is_all_hosts(&self) -> bool {
+        let mut all = [0u8; 16];
+        if self.v6 {
+            all[0] = 0xff;
+            all[1] = 0x02;
+            all[15] = 1;
+        } else {
+            all[..4].copy_from_slice(&[224, 0, 0, 1]);
+        }
+        self.ip == all
     }
 }
 
@@ -968,12 +1013,62 @@ impl Net {
     /// group spreads by source, so one flow stays on one socket; otherwise the
     /// most recent bind wins, as it does with `SO_REUSEADDR` on Linux.
     fn pick_dgram_target(&self, key: &str, src_port: u16) -> Option<usize> {
-        let group = self.dgram_ports.get(key)?;
+        // A socket bound to a multicast group's address takes only that
+        // group's datagrams.
+        let group: Vec<usize> = self
+            .dgram_ports
+            .get(key)?
+            .iter()
+            .copied()
+            .filter(|&i| {
+                !matches!(&self.socks[i].kind, Kind::Dgram(Dgram { local: Some(l), .. }) if l.is_multicast())
+            })
+            .collect();
+        if group.is_empty() {
+            return None;
+        }
         if group.iter().all(|&i| self.socks[i].opts.reuseport) {
             group.get(usize::from(src_port) % group.len()).copied()
         } else {
             group.last().copied()
         }
+    }
+
+    /// The sockets in `sock`'s network namespace a datagram to multicast group
+    /// `dest` reaches: bound to its port, at the wildcard address or the
+    /// group's own, and in the group. A socket is in it if it joined it, or,
+    /// with `IP_MULTICAST_ALL` (on by default, as on Linux), if any socket in
+    /// the namespace did; everything is in the all-hosts group.
+    fn multicast_receivers(&self, sock: usize, dest: InetAddr) -> Vec<usize> {
+        let netns = self.socks[sock].netns;
+        let group = InetAddr { port: 0, ..dest };
+        let joined =
+            |i: usize| matches!(&self.socks[i].kind, Kind::Dgram(d) if d.groups.contains(&group));
+        let anyone_joined = dest.is_all_hosts()
+            || self
+                .socks
+                .iter()
+                .enumerate()
+                .any(|(i, s)| s.netns == netns && joined(i));
+        let Some(bound) = self.dgram_ports.get(&route_key(netns, "udp", dest)) else {
+            return Vec::new();
+        };
+        bound
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let Kind::Dgram(d) = &self.socks[i].kind else {
+                    return false;
+                };
+                let at = d.local.is_some_and(|l| l.is_any() || l.ip == dest.ip);
+                let all = self.socks[i]
+                    .opts
+                    .int_opt(if dest.v6 { (41, 29) } else { (0, 49) })
+                    .unwrap_or(1)
+                    != 0;
+                at && (joined(i) || dest.is_all_hosts() || (all && anyone_joined))
+            })
+            .collect()
     }
 
     /// The lowest free port >= 32768 for `proto`/`v6` (the standard Linux
@@ -1023,6 +1118,98 @@ impl Kernel {
             Fd::Socket { .. } => net.bump(fd, inc),
             other => self.bump_pipe(other, inc),
         }
+    }
+
+    /// Send a datagram to multicast group `dest`: it reaches the group's
+    /// members in this network namespace, the sender included, unless the
+    /// sender turned `IP_MULTICAST_LOOP` off. It never leaves the VM, even with
+    /// egress: a guest doesn't get to talk to the host's local network.
+    fn multicast_send(&self, net: &mut Net, sock: usize, data: &[u8], dest: InetAddr) -> i64 {
+        if !net.lo_up(net.socks[sock].netns) {
+            return err(Errno::ENETUNREACH);
+        }
+        let mut src = self.ensure_dgram_bound(net, sock);
+        if src.is_any() || src.is_multicast() {
+            src.ip = loopback_ip(src.v6);
+        }
+        let lo = if dest.v6 { (41, 19) } else { (0, 34) };
+        if net.socks[sock].opts.int_opt(lo).unwrap_or(1) != 0 {
+            for tgt in net.multicast_receivers(sock, dest) {
+                if let Kind::Dgram(td) = &mut net.socks[tgt].kind {
+                    td.enqueue(src, data.to_vec());
+                }
+            }
+        }
+        data.len() as i64
+    }
+
+    /// `IP_ADD_MEMBERSHIP`/`IP_DROP_MEMBERSHIP`, `IPV6_JOIN_GROUP`/
+    /// `IPV6_LEAVE_GROUP` and `MCAST_JOIN_GROUP`/`MCAST_LEAVE_GROUP`: join or
+    /// leave a multicast group, or `None` when `(level, optname)` isn't one.
+    /// The interface named is ignored: the VM's sockets share one segment.
+    fn set_membership(
+        net: &mut Net,
+        sock: usize,
+        level: u64,
+        optname: u64,
+        optval: u64,
+        optlen: u64,
+        mem: &GuestMemory,
+    ) -> Option<i64> {
+        /// `IP_MAX_MEMBERSHIPS`, and the same for IPv6.
+        const MAX_GROUPS: usize = 20;
+        // (join, address family, offset of the group address, minimum optlen)
+        let (join, v6, at, min) = match (level, optname) {
+            (IPPROTO_IP, 35 | 36) => (optname == 35, false, 0, 8),
+            (IPPROTO_IPV6, 20 | 21) => (optname == 20, true, 0, 20),
+            // struct group_req: an interface index, then a sockaddr_storage
+            // at offset 8, its address after the family and port.
+            (IPPROTO_IP | IPPROTO_IPV6, 42 | 45) => {
+                let v6 = mem.read_u32(optval + 8).ok()? as u16 == AF_INET6;
+                (optname == 42, v6, if v6 { 16 } else { 12 }, 136)
+            }
+            _ => return None,
+        };
+        let domain = net.socks[sock].domain;
+        if domain != AF_INET && domain != AF_INET6 {
+            return Some(err(Errno::ENOPROTOOPT));
+        }
+        if !matches!(net.socks[sock].kind, Kind::Dgram(_)) {
+            return Some(err(Errno::EPROTO));
+        }
+        if optlen < min {
+            return Some(err(Errno::EINVAL));
+        }
+        let len = if v6 { 16 } else { 4 };
+        let Ok(raw) = mem.read_vec(optval + at, len) else {
+            return Some(err(Errno::EFAULT));
+        };
+        let mut group = InetAddr {
+            v6,
+            port: 0,
+            ip: [0; 16],
+        };
+        group.ip[..len].copy_from_slice(&raw);
+        if !group.is_multicast() {
+            return Some(err(Errno::EINVAL));
+        }
+        let Kind::Dgram(d) = &mut net.socks[sock].kind else {
+            unreachable!("checked above")
+        };
+        let had = d.groups.iter().position(|g| *g == group);
+        Some(match (join, had) {
+            (true, Some(_)) => err(Errno::EADDRINUSE),
+            (true, None) if d.groups.len() >= MAX_GROUPS => err(Errno::ENOBUFS),
+            (true, None) => {
+                d.groups.push(group);
+                0
+            }
+            (false, Some(i)) => {
+                d.groups.remove(i);
+                0
+            }
+            (false, None) => err(Errno::EADDRNOTAVAIL),
+        })
     }
 
     /// Ensure `SOCK_DGRAM` socket `sock` has a local address, lazily
@@ -1301,14 +1488,16 @@ impl Kernel {
                 if (a.v6 && domain != AF_INET6) || (!a.v6 && domain != AF_INET) {
                     return err(Errno::EINVAL);
                 }
-                if !a.valid_bind() {
-                    return err(Errno::EADDRNOTAVAIL);
-                }
                 let proto = match &net.socks[sock].kind {
                     Kind::Idle { .. } => "tcp",
                     Kind::Dgram(_) => "udp",
                     _ => return err(Errno::EINVAL),
                 };
+                // A UDP socket may bind a multicast group's address, to receive
+                // only that group's datagrams on the port.
+                if !a.valid_bind() && (proto != "udp" || !a.is_multicast()) {
+                    return err(Errno::EADDRNOTAVAIL);
+                }
                 if a.port == 0 {
                     a.port = net.ephemeral_port(net.socks[sock].netns, proto, a.v6);
                 } else if net.addr_in_use(net.socks[sock].netns, proto, a, sock) {
@@ -1443,6 +1632,18 @@ impl Kernel {
         // A routable (non-loopback) destination: with a host-egress backend
         // installed, bridge it to the real internet; without one, it's
         // unreachable (loopback-only VM).
+        // A multicast group is a peer a datagram socket can have without
+        // egress: its datagrams go to the group's members in this VM.
+        if let Addr::Inet(dest) = &target
+            && dest.is_multicast()
+            && matches!(net.socks[sock].kind, Kind::Dgram(Dgram { icmp: None, .. }))
+        {
+            self.ensure_dgram_bound(net, sock);
+            if let Kind::Dgram(d) = &mut net.socks[sock].kind {
+                d.peer = Some(*dest);
+            }
+            return 0;
+        }
         let routable = matches!(&target, Addr::Inet(a) if !a.valid_bind());
         if routable {
             let Addr::Inet(dest) = target else {
@@ -1873,7 +2074,9 @@ impl Kernel {
         if let Some(errno) = super::sockopt::refused(level, optname) {
             return err(errno);
         }
-        if super::sockopt::is_int(level, optname) && optlen < 4 {
+        // Linux takes a single byte for an IP-level integer option too.
+        let int_len = if level == IPPROTO_IP { 1 } else { 4 };
+        if super::sockopt::is_int(level, optname) && optlen < int_len {
             return err(Errno::EINVAL);
         }
         // SO_PRIORITY above 6 needs CAP_NET_ADMIN.
@@ -1912,10 +2115,17 @@ impl Kernel {
         {
             return err(Errno::EINVAL);
         }
+        if let Some(ret) = Self::set_membership(net, sock, level, optname, optval, optlen, mem) {
+            return ret;
+        }
         let opts = &mut net.socks[sock].opts;
         if optlen <= 256
-            && let Ok(raw) = mem.read_vec(optval, optlen as usize)
+            && let Ok(mut raw) = mem.read_vec(optval, optlen as usize)
         {
+            // Stored as the int getsockopt reads back.
+            if raw.len() < 4 && super::sockopt::is_int(level, optname) {
+                raw = i32::from(raw[0]).to_le_bytes().to_vec();
+            }
             opts.extra.insert((level, optname), raw);
         }
         if level == SOL_SOCKET {
@@ -1979,10 +2189,9 @@ impl Kernel {
             }
         } else if level == IPPROTO_IP
             && optname == IP_TOS
-            && optlen >= 4
-            && let Ok(v) = mem.read_u32(optval)
+            && let Some(v) = opts.int_opt((IPPROTO_IP, IP_TOS))
         {
-            opts.tos = v;
+            opts.tos = v as u32;
         }
         // Options with a meaning on the real connection go to it too.
         if let Some(opt) = conn_option(&net.socks[sock].opts, level, optname)
@@ -2251,6 +2460,9 @@ impl Kernel {
             Kind::Dgram(Dgram { icmp: Some(_), .. })
         ) {
             return self.icmp_send(net, sock, data, dest);
+        }
+        if dest.is_multicast() {
+            return self.multicast_send(net, sock, data, dest);
         }
         // A routable destination (DNS, chiefly) goes out through a real host
         // UDP socket when egress is enabled; without egress it's unreachable.
@@ -3307,6 +3519,9 @@ impl Kernel {
             }
             // A connected socket's routable peer is reached through egress,
             // exactly like a `sendto` to it.
+            if peer.is_multicast() {
+                return self.multicast_send(net, sock, data, peer);
+            }
             if !peer.valid_bind() {
                 return self.host_udp_send(net, sock, data, peer);
             }

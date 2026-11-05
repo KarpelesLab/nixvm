@@ -77,6 +77,7 @@ errnos! {
     ENOMSG = 42,
     EIDRM = 43,
     ENODATA = 61,
+    EPROTO = 71,
     ETIME = 62,
     EOVERFLOW = 75,
     EBADFD = 77,
