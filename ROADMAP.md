@@ -483,7 +483,7 @@ must get the isolation it asks for.
   A pid recorded for a process that has since exited (`msg_lspid`, say) keeps its number
   inside a nested PID namespace, as Linux's `struct pid` does.
 - **cgroups (`fs/cgroupfs.rs`, `kernel/cgroup.rs`):** one cgroup v2 hierarchy, mounted at
-  `/sys/fs/cgroup` and mountable as `cgroup2`: `mkdir`/`rmdir`/`rename` of cgroups, moving
+  `/sys/fs/cgroup` and mountable as `cgroup2`: `mkdir`/`rmdir` of cgroups, moving
   processes through `cgroup.procs` (with v2's delegation and no-internal-process rules),
   `cgroup.events`, `cgroup.kill`, `cgroup.freeze`, `cgroup.max.depth`/`max.descendants`,
   `cgroup.stat`, `cpu.stat`, `clone3`'s `CLONE_INTO_CGROUP`, cgroup namespaces rooted where

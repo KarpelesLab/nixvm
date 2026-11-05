@@ -926,29 +926,9 @@ impl MountFs for CgroupFs {
         }
     }
 
-    fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
-        // Linux renames a cgroup only within its parent.
-        let (from_dir, from_name) = split_last(from);
-        let (to_dir, to_name) = split_last(to);
-        if from_dir != to_dir {
-            return Err(errno(18)); // EXDEV
-        }
-        let mut tree = self.tree.lock().unwrap();
-        let (node, file) = tree.lookup(self.root, from).ok_or_else(|| errno(ENOENT))?;
-        if file.is_some() || node == self.root {
-            return Err(errno(EPERM));
-        }
-        let (parent, _) = tree
-            .lookup(self.root, from_dir)
-            .ok_or_else(|| errno(ENOENT))?;
-        if tree.lookup(self.root, to).is_some() {
-            return Err(errno(EEXIST));
-        }
-        let p = tree.nodes.get_mut(&parent).expect("found");
-        p.children.remove(from_name);
-        p.children.insert(to_name.to_string(), node);
-        tree.nodes.get_mut(&node).expect("found").name = to_name.to_string();
-        Ok(())
+    // cgroup v2 has no rename (only v1 does): kernfs refuses it.
+    fn rename(&mut self, _from: &str, _to: &str) -> io::Result<()> {
+        Err(errno(EPERM))
     }
 
     fn set_owner(&mut self, rel: &str, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {

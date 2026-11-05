@@ -54,7 +54,7 @@ static void path(char *out, const char *name) { snprintf(out, 256, "%.200s/%.50s
 static void cleanup(void) {
   if (!*base) return;
   put(home, "cgroup.procs", "0");
-  const char *kids[] = {"zz/inner", "self", "lim", "kd", "fz", "nest/a", "nest", "into", "ns", "zz", 0};
+  const char *kids[] = {"self", "lim", "kd", "fz", "nest/a", "nest", "into", "ns", "zz", 0};
   for (int i = 0; kids[i]; i++) {
     char p[256];
     path(p, kids[i]);
@@ -269,17 +269,14 @@ int main(void) {
   CHECK(rmdir(ns) == 0);
   puts("cgroup namespaces: ok");
 
-  /* Renaming within the parent. */
+  /* cgroup v2 can't rename a cgroup (v1 could). */
   char zz[256];
   path(zz, "zz");
   CHECK(mkdir(zz, 0755) == 0);
-  path(p, "zz/inner");
-  CHECK(mkdir(p, 0755) == 0);
-  char renamed[256];
-  path(renamed, "zz/outer");
-  CHECK(rename(p, renamed) == 0);
-  CHECK(rmdir(renamed) == 0);
-  puts("rename: ok");
+  path(p, "zz2");
+  CHECK(rename(zz, p) == -1 && errno == EPERM);
+  CHECK(rmdir(zz) == 0);
+  puts("no rename: ok");
 
   cleanup();
   CHECK(access(base, F_OK) == -1);
