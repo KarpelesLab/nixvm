@@ -7,6 +7,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/KarpelesLab/nixvm/compare/v0.0.3...v0.0.4) - 2026-11-07
+
+### Other
+
+- enforce RLIMIT_RTTIME; a fork child's CPU time starts at zero
+- no rename, as in cgroup v2 (EPERM)
+- signal info posted to a running task isn't lost
+- cgroup.stat in Linux's layout, with the pids controller's counts
+- Linux's no-internal-process rule for a threaded controller
+- a real cgroup v2 hierarchy, with the pids controller
+- UDP multicast between the VM's sockets
+- pid namespaces: a recorded pid of a task that has gone keeps its number
+- an ignored signal is discarded as it's sent; a self-stop stops
+- a reaped task's vcpu no longer replaces a new task's
+- the embedder's syscall policy, with logged denials
+- mount namespaces: propagation (shared, slave, private, unbindable)
+- the conformance programs run on an aarch64 guest too
+- mount namespaces: open files survive setns into another one
+- net namespaces: lo starts down; empty buffers never fault
+- signals and ids: si_pid, SIGCHLD info, signalfd, SO_PEERCRED, PID translation
+- keepalive and abortive linger reach host connections
+- enforce MEMLOCK, NICE, RTPRIO, SIGPENDING and MSGQUEUE
+- real bubblewrap runs in the VM; /proc/<pid> and tests in CI
+- user and time namespaces
+- mount isolation, real chroot, pivot_root and bind mounts
+- PID isolation
+- network isolation
+- real UTS and IPC isolation, /proc/<pid>/ns and setns
+- set them through the Sandbox and Vm APIs; fix a macOS lint
+- deliver signals to code that makes no syscalls on KVM
+- disk protection and VM-wide time limits
+- real per-process rlimits
+- bound the kernel's other queues; fit guest RAM to the host
+- bounded pipes and socket queues; enforce descriptor limits
+- survive any number of forks; a full pool no longer crashes
+- a VM-wide kernel memory quota; bound guest-sized allocations
+- make everyday socket options work; refuse the dangerous ones
+- threads share one live handler table (CLONE_SIGHAND)
+- fix the invalid alpine job (runner context in job-level env)
+- boot a real Alpine image on KVM and on the interpreter
+- pump_for test grows its workload until it outlasts the budget
+- bump GitHub Actions to current majors; build Pages on Node 24
+- bump vue, vite and @vitejs/plugin-vue, and refresh the lockfile
+- fstool 0.5, compcol 0.7, ureq 3; raise MSRV to 1.95
+- refresh Cargo.lock to the latest semver-compatible versions
+- resolve PID 1 symlinks inside the guest root; pick the guest arch from the ELF
+- XSAVE signal frames with the full extended state; Linux fault signals
+- on hosts without FEAT_AFP, accept Rosetta's NaN sign and RCP estimates
+- Merge branch 'worktree-agent-a3b22575688121458'
+- x86 interpreter: RORX requires VEX.vvvv = 1111; coverage scan checks invalid encodings too
+- deliver signals at preemption points; time-slice the serial scheduler
+- /dev/tty is the controlling terminal, with working termios
+- cpuinfo Features derived from the advertised HWCAPs; real /proc/self/auxv
+- Linux-accurate arm64/x86-64 frames with FP/SIMD state; SIGTRAP/SIGBUS fault kinds
+- x86_diff covers the YMM state, VEX (AVX/AVX2/FMA/F16C/BMI) and XSAVE
+- x86 interpreter: x86-64-v3 — AVX, AVX2, FMA, F16C, BMI1/2, LZCNT, MOVBE, XSAVE
+- tolerate the M1's FJCVTZS Z flag for FZ-flushed subnormals
+- x86 interpreter: factor SSE lane math into pure helpers; exact f64 fast path near underflow
+- don't link private items from public docs (rustdoc -D warnings)
+- curated default word list for the aarch64 diff test; skip host-missing features
+- a 32 GiB virtual window over the physical pool, so Go runs
+- *(aarch64)* regression tests for instructions real programs hit
+- x86 interpreter: unit-test 0x67 addressing, 32-bit string registers, fs: RIP-relative
+- x86 interpreter: group-7 UMIP spoofing, prefix-tolerant group 15/MOVNTI/EMMS
+- x86_diff covers branches (Jcc/LOOPcc/JrCXZ/JMP) via skippable filler
+- a fork child's close keeps the parent's registrations
+- x86 interpreter: cache the executing code page within a run
+- Linux argument checks, keep protection, move shared frames, MREMAP_DONTUNMAP
+- *(aarch64)* FP16 arithmetic; advertise the verified extensions
+- x86 interpreter: x86-64-v2 (SSE3, SSSE3, SSE4.1, SSE4.2) and an e2e program test
+- *(aarch64)* cache decoded code pages for instruction fetch
+- real hard links in tmpfs and the overlay; reflink ioctls answer EOPNOTSUPP
+- x86-64 differential tester against real execution (Rosetta 2)
+- x86 interpreter: complete baseline ISA, true 80-bit x87, MMX, SSE/SSE2
+- *(aarch64)* implement post-v8.0 extensions, and LSE2/SP alignment faults
+- never let a guest-supplied length size a host allocation
+- real mount/umount of pseudo filesystems, supplementary groups, syslog, arch_prctl
+- argument validation and subcommand fixes across mm, signals, clone, ioctl
+- the full socket-option namespace, Linux's defaults, truncating getsockopt
+- complete prctl, enforced seccomp, child subreapers
+- real file locks, complete fcntl, O_APPEND per open file, memfd flags and seals
+- newfstatat/statx share one resolver: AT_EMPTY_PATH on any fd, statx follows links
+- dup'd and inherited descriptors share their file offset
+- orphans fall back to their own directory when the mount root refuses
+- open files survive unlink and rename; real O_TMPFILE
+- a page cache makes MAP_SHARED file mappings really shared
+- /dev/shm is a real writable tmpfs
+- futex timeouts, process-shared keys, futex_waitv, futex2, WAKE_OP, PI locks
+- *(aarch64)* rewrite the A64 decoder as a complete, verified Armv8.0 EL0 ISA
+- POSIX message queues as pollable descriptors
+- System V IPC — message queues, semaphores, and truly shared memory
+- real state for scheduling, ioprio, NUMA, pkeys, mseal, rseq, membarrier, caps
+- pidfd_open/send_signal/getfd, waitid(P_PIDFD), kcmp, process_vm_*
+- POSIX timers with real signal delivery; fix timer/signal inheritance
+- splice/tee/vmsplice, preadv2/pwritev2, openat2, cachestat
+- real extended attributes on the in-memory filesystems
+- decode every syscall number on both arches; refuse the unavailable set deliberately
+- Make nginx run: directory symlinks, NEON/FP gaps, socket and epoll lifetimes
+- show the tunnel as tun0 in ip addr/ip route/ifconfig
+- getsockname on netlink sockets returns a full sockaddr_nl (fixes `ip addr`)
+- clicking the net address copies it; on/off moves to a separate ⏻ toggle
+
 ## [0.0.3](https://github.com/KarpelesLab/nixvm/compare/v0.0.2...v0.0.3) - 2026-10-03
 
 ### Other
