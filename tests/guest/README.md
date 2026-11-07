@@ -16,6 +16,8 @@ unshare -Urm /tmp/ns_pid                  # the ns_* programs want root in a use
 `ns_user` starts as an ordinary user, so run that one with no `unshare` at all, and
 `ns_mount` with `unshare -Urmp --fork --mount-proc`, and `ns_net` with
 `unshare -Urn sh -c 'ip link set lo up && ./ns_net'` (a new namespace's `lo` starts down). `cgroups` wants root and cgroup v2 (`sudo ./cgroups`; it makes a subtree of its own under
-the root cgroup and removes it again); CI runs it on the runner as well as in the VM.
+the root cgroup and removes it again). `rlimits` wants root too (`sudo ./rlimits`: it
+raises hard limits and runs `SCHED_FIFO` tasks). CI runs both on the runner as well as
+in the VM.
 `attacks.c` isn't a pass/fail
 program: the Rust test checks that each thing it tries is contained.

@@ -155,13 +155,17 @@ jobs:
             exit 1
           fi
 
-      # The cgroups program needs root and a real cgroup v2 tree, which this
-      # runner has: run it on the host too, so its expectations are Linux's.
-      - name: Check the cgroups program against Linux
+      # The cgroups and rlimits programs need root (and cgroups a real cgroup v2
+      # tree), which this runner has: run them on the host too, so their
+      # expectations are Linux's.
+      - name: Check the root-only programs against Linux
         if: matrix.backend == 'kvm'
         run: |
-          gcc -static -O2 -o "$RUNNER_TEMP/cgroups" tests/guest/cgroups.c
-          sudo "$RUNNER_TEMP/cgroups"
+          for p in cgroups rlimits; do
+            gcc -static -O2 -pthread -o "$RUNNER_TEMP/$p" "tests/guest/$p.c"
+            echo "== $p"
+            sudo "$RUNNER_TEMP/$p"
+          done
 
       # Real tools using every namespace at once find what targeted tests don't.
       - name: Run bubblewrap and util-linux in the VM

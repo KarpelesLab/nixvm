@@ -471,8 +471,10 @@ must get the isolation it asks for.
   `sched_setscheduler`/`setparam`/`setattr`), `SIGPENDING` (per user, as Linux counts it)
   and `MSGQUEUE` (per user; a queue unlinked and closed by everyone is freed) are
   enforced, with Linux's defaults, and `/proc/<pid>/limits` shows them. `CORE` is moot,
-  since no core files are written; `RSS` and `LOCKS` do nothing on Linux either; `RTTIME`
-  is stored only, since real-time priorities don't change how tasks are scheduled here.
+  since no core files are written; `RSS` and `LOCKS` do nothing on Linux either. `RTTIME`
+  is enforced as Linux's real-time watchdog does it (CPU time a `SCHED_FIFO`/`SCHED_RR`
+  task runs without blocking), though real-time priorities don't otherwise change how
+  tasks are scheduled here.
 - **Namespaces (`kernel/ns.rs`, `pidns.rs`, `userns.rs`):** UTS, IPC, network, mount, PID,
   user and time, with `setns` and `/proc/<pid>/ns`, plus real `chroot`, `pivot_root` and
   bind mounts. Bubblewrap and util-linux's `unshare` run inside the VM.

@@ -516,6 +516,7 @@ pub(super) const RLIMIT_SIGPENDING: u64 = 11;
 pub(super) const RLIMIT_MSGQUEUE: u64 = 12;
 pub(super) const RLIMIT_NICE: u64 = 13;
 pub(super) const RLIMIT_RTPRIO: u64 = 14;
+pub(super) const RLIMIT_RTTIME: u64 = 15;
 /// How many resources there are (`RLIM_NLIMITS`).
 pub(super) const RLIM_NLIMITS: usize = 16;
 pub(super) const RLIM_INFINITY: u64 = u64::MAX;

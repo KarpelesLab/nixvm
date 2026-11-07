@@ -96,6 +96,22 @@ static void proc_limits_child(void) {
   if (strncmp(b, "Limit                     Soft Limit           Hard Limit           Units     \n", 79)) _exit(4);
   _exit(s == 1234 && h == 5678 ? 18 : 5);
 }
+static double cpu_s(clockid_t c) { struct timespec t; clock_gettime(c, &t); return t.tv_sec + t.tv_nsec / 1e9; }
+static void spin_cpu(double s) { double end = cpu_s(CLOCK_THREAD_CPUTIME_ID) + s; while (cpu_s(CLOCK_THREAD_CPUTIME_ID) < end && !got) ; }
+static void go_fifo(void) { struct sched_param sp = {1}; if (sched_setscheduler(0, SCHED_FIFO, &sp)) _exit(2); }
+static void rttime_child(void) {
+  struct rlimit r = {100000, RLIM_INFINITY}; setrlimit(RLIMIT_RTTIME, &r); signal(SIGXCPU, h); go_fifo();
+  time_t s = time(0); while (!got && time(0) - s < 5) ;
+  getrlimit(RLIMIT_RTTIME, &r); _exit(got == SIGXCPU && r.rlim_cur == 1100000 ? 19 : 1); /* the soft limit moves on a second */
+}
+static void rttime_kill_child(void) { struct rlimit r = {100000, 300000}; setrlimit(RLIMIT_RTTIME, &r); signal(SIGXCPU, SIG_IGN); go_fifo(); time_t s = time(0); while (time(0) - s < 5) ; _exit(1); }
+static void rttime_sleep_child(void) {
+  struct rlimit r = {200000, 400000}; setrlimit(RLIMIT_RTTIME, &r); signal(SIGXCPU, h); go_fifo();
+  for (int i = 0; i < 12 && !got; i++) { spin_cpu(0.05); usleep(1000); } /* 600 ms of CPU, never 200 ms at a stretch */
+  _exit(got ? 3 : 20);
+}
+static void rttime_fair_child(void) { struct rlimit r = {100000, 200000}; setrlimit(RLIMIT_RTTIME, &r); spin_cpu(0.4); _exit(21); } /* only real-time tasks count */
+static void fork_cpu_child(void) { spin_cpu(0.3); fflush(stdout); pid_t c = fork(); if (!c) _exit(cpu_s(CLOCK_PROCESS_CPUTIME_ID) < 0.1 && cpu_s(CLOCK_THREAD_CPUTIME_ID) < 0.1 ? 22 : 1); int st; waitpid(c, &st, 0); _exit(WEXITSTATUS(st)); }
 int main(void) {
   struct rlimit r, q; CHECK(getrlimit(99, &r) < 0 && errno == EINVAL, "unknown resource EINVAL");
   getrlimit(RLIMIT_CORE, &r); q = r; q.rlim_cur = 5; q.rlim_max = 2; CHECK(setrlimit(RLIMIT_CORE, &q) < 0 && errno == EINVAL, "soft above hard EINVAL");
@@ -115,6 +131,11 @@ int main(void) {
   st = child_status(memlock_child); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 13, "RLIMIT_MEMLOCK: mlock, MAP_LOCKED and mlockall (%#x)", st);
   st = child_status(nice_child); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 14, "RLIMIT_NICE bounds lowering the nice value (%#x)", st);
   st = child_status(rtprio_child); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 15, "RLIMIT_RTPRIO bounds real-time priority (%#x)", st);
+  st = child_status(rttime_child); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 19, "RLIMIT_RTTIME soft: SIGXCPU, then a second more (%#x)", st);
+  st = child_status(rttime_kill_child); CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL, "RLIMIT_RTTIME hard: SIGKILL (%#x)", st);
+  st = child_status(rttime_sleep_child); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 20, "RLIMIT_RTTIME: blocking starts the count over (%#x)", st);
+  st = child_status(rttime_fair_child); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 21, "RLIMIT_RTTIME: a fair-class task isn't limited (%#x)", st);
+  st = child_status(fork_cpu_child); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 22, "a fork child's CPU time starts at zero (%#x)", st);
   st = child_status(sigpending_child); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 16, "RLIMIT_SIGPENDING: sigqueue EAGAIN (%#x)", st);
   st = child_status(msgqueue_child); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 17, "RLIMIT_MSGQUEUE: mq_open EMFILE, freed by unlink and close (%#x)", st);
   st = child_status(proc_limits_child); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 18, "/proc/self/limits shows the limits (%#x)", st);

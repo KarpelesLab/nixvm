@@ -213,6 +213,38 @@ impl RLimits {
     }
 }
 
+/// Count `ns` of CPU time against `RLIMIT_RTTIME` (microseconds a real-time
+/// task may run without blocking) and say which signal it calls for, as
+/// Linux's RT watchdog does: `SIGKILL` at the hard limit; at the soft limit
+/// `SIGXCPU`, with the soft limit then raised by a second so the next one comes
+/// a second later. Only `SCHED_FIFO`/`SCHED_RR` time counts, and only while a
+/// soft limit is set; a step that ended blocked starts the count over.
+fn charge_rt_time(p: &mut ProcInfo, ns: u64, blocked: bool) -> Option<u64> {
+    let realtime = matches!(p.sched_policy, 1 | 2);
+    let (soft, hard) = p.rlimits.get(sys_misc::RLIMIT_RTTIME);
+    if !realtime || soft == sys_misc::RLIM_INFINITY {
+        p.rt_run_ns = 0;
+        return None;
+    }
+    p.rt_run_ns = p.rt_run_ns.saturating_add(ns);
+    let used_us = p.rt_run_ns / 1000;
+    let sig = if hard != sys_misc::RLIM_INFINITY && used_us >= hard {
+        Some(9) // SIGKILL
+    } else if used_us >= soft {
+        p.rlimits.set(
+            sys_misc::RLIMIT_RTTIME,
+            (soft.saturating_add(1_000_000), hard),
+        );
+        Some(SIGXCPU)
+    } else {
+        None
+    };
+    if blocked {
+        p.rt_run_ns = 0;
+    }
+    sig
+}
+
 /// A clock reading moved by a time namespace's offset.
 fn offset_clock(now: std::time::Duration, offset_ns: i64) -> std::time::Duration {
     let moved = i128::try_from(now.as_nanos()).unwrap_or(0) + i128::from(offset_ns);
@@ -390,6 +422,10 @@ struct ProcInfo {
     /// (the thread-group sum) measure CPU rather than wall time, per task rather
     /// than per host process.
     cpu_ns: u128,
+    /// CPU time (ns) run under `SCHED_FIFO`/`SCHED_RR` since the task last
+    /// blocked: what `RLIMIT_RTTIME` limits (Linux's `rt.timeout`). Zero for a
+    /// task in a fair class, and for a new task.
+    rt_run_ns: u64,
     /// Weighted *virtual* runtime for fair scheduling (CFS-style), in nice-0
     /// nanosecond units: each executed step adds its CPU delta scaled by
     /// `NICE0_WEIGHT / nice_weight(nice)`, so a low-priority (higher-`nice`) task's
@@ -563,6 +599,7 @@ impl Default for ProcInfo {
             wake_deadline: None,
             io_progress: 0,
             cpu_ns: 0,
+            rt_run_ns: 0,
             vruntime: 0,
             child_cpu_ns: 0,
             alarm_deadline: None,
@@ -4795,6 +4832,13 @@ impl Kernel {
         info.alarm_deadline = None;
         info.alarm_interval_ns = 0;
         info.ptimers = Vec::new();
+        // CPU time is counted per task from zero; a new process also starts
+        // with no reaped children's time (a thread shares its group's).
+        info.cpu_ns = 0;
+        info.rt_run_ns = 0;
+        if flags & CLONE_THREAD == 0 {
+            info.child_cpu_ns = 0;
+        }
         // The robust-futex head is per thread and reset for every new task
         // (the new thread's libc registers its own); an rseq registration
         // survives into a fork child (same address in its copied memory) but
@@ -7832,13 +7876,16 @@ impl Kernel {
     }
 
     /// Charge `ns` of CPU time to the VM and to the current thread group, raising
-    /// whatever `RLIMIT_CPU` calls for.
+    /// whatever `RLIMIT_CPU` and `RLIMIT_RTTIME` call for.
     fn charge_cpu_time(&self, cx: &mut ServiceCtx, ns: u128) {
         let ns = u64::try_from(ns).unwrap_or(u64::MAX);
         self.total_cpu_ns
             .fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
         if let Some(sig) = cx.cur.rlimits.charge_cpu(ns) {
-            cx.cur.pending |= 1u64 << (sig - 1);
+            cx.cur.raise(sig);
+        }
+        if let Some(sig) = charge_rt_time(&mut cx.cur, ns, cx.block) {
+            cx.cur.raise(sig);
         }
     }
 
@@ -11947,6 +11994,28 @@ mod tests {
         k.enforce_time_limits(&mut k.shared.lock().unwrap());
         assert!(k.time_limit_reached());
         assert_ne!(pending(&k) & (1 << 8), 0, "SIGKILL is pending");
+    }
+
+    #[test]
+    fn rlimit_rttime_counts_real_time_cpu_until_the_task_blocks() {
+        let (_k, _mem, _v, mut cx) = setup();
+        let p = &mut cx.cur;
+        p.rlimits.set(sys_misc::RLIMIT_RTTIME, (100_000, 300_000)); // 100 ms, 300 ms
+        assert_eq!(charge_rt_time(p, 500_000_000, false), None, "fair class");
+        p.sched_policy = 1; // SCHED_FIFO
+        assert_eq!(charge_rt_time(p, 90_000_000, true), None);
+        assert_eq!(
+            charge_rt_time(p, 90_000_000, false),
+            None,
+            "blocking reset it"
+        );
+        assert_eq!(charge_rt_time(p, 20_000_000, false), Some(SIGXCPU));
+        assert_eq!(p.rlimits.get(sys_misc::RLIMIT_RTTIME).0, 1_100_000);
+        assert_eq!(
+            charge_rt_time(p, 200_000_000, false),
+            Some(9),
+            "hard: SIGKILL"
+        );
     }
 
     #[test]
