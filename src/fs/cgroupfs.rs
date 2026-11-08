@@ -7,9 +7,10 @@
 //!
 //! Only controllers nixvm enforces are offered: `cpu` (a `cpu.max` bandwidth
 //! limit, which holds a cgroup's tasks off the CPU once its quota for the
-//! period is used, and `cpu.weight`, which scales its tasks' share of the CPU)
-//! and `pids` (a `pids.max` that `fork` and `clone` honour), next to the core
-//! files every cgroup has:
+//! period is used, and `cpu.weight`, which scales its tasks' share of the CPU),
+//! `memory` (pages charged to the cgroup by the frame allocator, and a
+//! `memory.max` past which a task is killed) and `pids` (a `pids.max` that
+//! `fork` and `clone` honour), next to the core files every cgroup has:
 //! moving processes (`cgroup.procs`), `cgroup.kill`, `cgroup.freeze`, the
 //! `cgroup.max.*` limits and `cpu.stat`. Writes that act on tasks (moving,
 //! killing, freezing) need the writer's identity and the task table, so the
@@ -31,9 +32,13 @@ pub const ROOT: u32 = 0;
 
 /// The controllers there are, as `cgroup.controllers` lists them, with the
 /// bit each has in a cgroup's set of enabled controllers.
-const CONTROLLERS: &[(&str, u8)] = &[("cpu", CPU), ("pids", PIDS)];
+const CONTROLLERS: &[(&str, u8)] = &[("cpu", CPU), ("memory", MEMORY), ("pids", PIDS)];
 const CPU: u8 = 1;
 const PIDS: u8 = 2;
+const MEMORY: u8 = 4;
+/// The threaded controllers, which may share a cgroup with tasks; the others
+/// (`memory`) are domain controllers, held to the no-internal-process rule.
+const THREADED: u8 = CPU | PIDS;
 
 /// Files every cgroup has, and whether a write is accepted.
 const CORE_FILES: &[(&str, bool)] = &[
@@ -76,10 +81,26 @@ const CPU_FILES: &[(&str, bool)] = &[
     ("cpu.weight.nice", true),
 ];
 
-/// Writes that change how the cgroup's tasks are scheduled, which the kernel
-/// passes on to them once the write is done.
+/// The `memory` controller's files, in a cgroup whose parent enables it.
+const MEMORY_FILES: &[(&str, bool)] = &[
+    ("memory.current", false),
+    ("memory.events", false),
+    ("memory.events.local", false),
+    ("memory.high", true),
+    ("memory.low", true),
+    ("memory.max", true),
+    ("memory.min", true),
+    ("memory.oom.group", true),
+    ("memory.peak", false),
+    ("memory.stat", false),
+];
+
+/// Writes that change how the cgroup's tasks are scheduled or charged, which
+/// the kernel passes on to them once the write is done.
 pub const SCHED_FILES: &[&str] = &[
     "cgroup.subtree_control",
+    "memory.high",
+    "memory.max",
     "cpu.idle",
     "cpu.max",
     "cpu.max.burst",
@@ -222,6 +243,59 @@ impl Bandwidth {
     }
 }
 
+/// What the tree needs of the frame allocator to keep its memory cgroups (see
+/// [`CgroupTree::sync_memcgs`]).
+pub trait MemcgHost {
+    /// A new memory cgroup below `parent`; `None` if there's no room.
+    fn memcg_create(&mut self, parent: u16) -> Option<u16>;
+    fn memcg_drop(&mut self, slot: u16);
+    /// `memory.max` and `memory.high`, in pages (`u64::MAX` for none).
+    fn memcg_limits(&mut self, slot: u16, max: u64, high: u64);
+    /// What's charged to `slot` and below.
+    fn memcg_use(&self, slot: u16) -> MemUse;
+}
+
+/// The guest's page size, the unit memory is charged in.
+const PAGE: u64 = 4096;
+
+/// A memory size as Linux's `memparse` takes one: a number (decimal, `0x`
+/// hex, `0` octal) with an optional `K`, `M`, `G`, `T`, `P` or `E` suffix, or
+/// "max". Rounded down to whole pages, as `page_counter_memparse` does.
+fn mem_limit(text: &str) -> Result<Option<u64>, i32> {
+    if text == "max" {
+        return Ok(None);
+    }
+    let hex = text.starts_with("0x") || text.starts_with("0X");
+    let digits = if hex { 2 } else { 0 };
+    let split = text[digits..]
+        .find(|c: char| {
+            if hex {
+                !c.is_ascii_hexdigit()
+            } else {
+                !c.is_ascii_digit()
+            }
+        })
+        .map_or(text.len(), |i| i + digits);
+    let (num, suffix) = text.split_at(split);
+    let n: u64 = parse_int(num)?;
+    let shift = match suffix {
+        "" => 0,
+        "k" | "K" => 10,
+        "m" | "M" => 20,
+        "g" | "G" => 30,
+        "t" | "T" => 40,
+        "p" | "P" => 50,
+        "e" | "E" => 60,
+        _ => return Err(EINVAL),
+    };
+    Ok(Some(
+        n.checked_shl(shift)
+            .filter(|v| v >> shift == n)
+            .unwrap_or(u64::MAX)
+            / PAGE,
+    ))
+}
+
 /// An integer as a kernfs file takes one: decimal, or `0x` hex or `0` octal.
 fn parse_int<T: TryFrom<i128>>(text: &str) -> Result<T, i32> {
     let (neg, t) = match text.strip_prefix('-') {
@@ -270,6 +344,11 @@ fn set_bandwidth(
     Ok(())
 }
 
+/// A memory limit in pages as its file shows it: bytes, or "max".
+fn mem_bytes(pages: Option<u64>) -> String {
+    pages.map_or_else(|| "max\n".to_string(), |p| format!("{}\n", p * PAGE))
+}
+
 /// The weights Linux gives each nice level, for `cpu.weight.nice`: nice 0 is
 /// 1024, and each level is about 1.25 times the next.
 fn nice_shares(nice: i64) -> u64 {
@@ -294,6 +373,20 @@ struct Node {
     /// `cpu.idle`.
     idle: bool,
     bandwidth: Bandwidth,
+    /// `memory.max`, `memory.high` in bytes (`None` is "max"), and
+    /// `memory.low`, `memory.min` (protections, which mean nothing without
+    /// reclaim, but are kept).
+    mem_max: Option<u64>,
+    mem_high: Option<u64>,
+    mem_low: Option<u64>,
+    mem_min: Option<u64>,
+    /// `memory.oom.group`: an out-of-memory kill takes every task in it.
+    oom_group: bool,
+    /// The memory cgroup the frame allocator charges for this one, once
+    /// the kernel has made one (see [`CgroupTree::memcg_of`]).
+    memcg: Option<u16>,
+    /// Out-of-memory events here: `oom`, `oom_kill`, `oom_group_kill`.
+    oom_events: [u64; 3],
     max_depth: Option<u64>,
     max_descendants: Option<u64>,
     /// `cgroup.freeze` was set here (a task is frozen if any ancestor's is).
@@ -322,6 +415,14 @@ impl Node {
             self.pids_max = None;
             self.pids_events = 0;
         }
+        if controllers & MEMORY != 0 {
+            self.mem_max = None;
+            self.mem_high = None;
+            self.mem_low = Some(0);
+            self.mem_min = Some(0);
+            self.oom_group = false;
+            self.oom_events = [0; 3];
+        }
     }
 
     fn new(name: &str, parent: Option<u32>, uid: u32, gid: u32) -> Self {
@@ -335,6 +436,13 @@ impl Node {
             shares: NICE0_SHARES,
             idle: false,
             bandwidth: Bandwidth::default(),
+            mem_max: None,
+            mem_high: None,
+            mem_low: Some(0),
+            mem_min: Some(0),
+            oom_group: false,
+            memcg: None,
+            oom_events: [0; 3],
             max_depth: None,
             max_descendants: None,
             freeze: false,
@@ -375,6 +483,20 @@ pub struct View {
     pub threads: BTreeMap<u32, Vec<i32>>,
     /// CPU time of each cgroup and below, live tasks and exited ones.
     pub cpu_ns: BTreeMap<u32, u64>,
+    /// Each memory cgroup's use as the frame allocator has it.
+    pub memory: BTreeMap<u32, MemUse>,
+}
+
+/// A memory cgroup's use, as the frame allocator counts it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemUse {
+    /// Bytes charged here and below, and the most there have been.
+    pub current: u64,
+    pub peak: u64,
+    /// Times an allocation here went past `memory.high`, or was refused at
+    /// `memory.max`.
+    pub high_events: u64,
+    pub max_events: u64,
 }
 
 /// The VM's cgroup hierarchy.
@@ -391,6 +513,8 @@ pub struct CgroupTree {
     /// How many cgroups have a `cpu.max` quota: while none do, the kernel
     /// needn't charge CPU time to cgroups as it goes.
     quotas: Arc<AtomicUsize>,
+    /// Memory cgroups of cgroups that went away, for the kernel to drop.
+    dead_memcgs: Vec<u16>,
 }
 
 /// How a cgroup's tasks are to be scheduled, from its own settings and its
@@ -404,6 +528,8 @@ pub struct SchedState {
     pub scale: u64,
     /// A `cpu.max` holds them until then.
     pub throttled_until: Option<u128>,
+    /// The memory cgroup what they allocate is charged to.
+    pub memcg: u16,
 }
 
 /// [`SchedState::scale`] for a cgroup with the default weight.
@@ -420,6 +546,7 @@ impl Default for CgroupTree {
             ns_roots: BTreeMap::new(),
             view: View::default(),
             quotas: Arc::new(AtomicUsize::new(0)),
+            dead_memcgs: Vec::new(),
         }
     }
 }
@@ -472,6 +599,7 @@ impl CgroupTree {
             frozen: self.frozen(node),
             scale: u64::try_from(scale).unwrap_or(u64::MAX),
             throttled_until,
+            memcg: self.memcg_of(node),
         }
     }
 
@@ -497,6 +625,84 @@ impl CgroupTree {
             until = until.max(b.throttled_until(now));
         }
         (until, newly)
+    }
+
+    /// The memory cgroup tasks in `node` are charged to: its own, or the
+    /// nearest one above it (0, the root's, if none).
+    #[must_use]
+    pub fn memcg_of(&self, node: u32) -> u16 {
+        self.chain(node)
+            .into_iter()
+            .find_map(|n| self.nodes.get(&n).and_then(|x| x.memcg))
+            .unwrap_or(0)
+    }
+
+    /// The cgroup memory cgroup `slot` belongs to.
+    #[must_use]
+    pub fn node_of_memcg(&self, slot: u16) -> Option<u32> {
+        self.nodes
+            .iter()
+            .find(|(_, n)| n.memcg == Some(slot))
+            .map(|(&id, _)| id)
+    }
+
+    /// Give each cgroup with the `memory` controller a memory cgroup in the
+    /// frame allocator, with its limits, and drop those of cgroups that lost
+    /// it or are gone.
+    pub fn sync_memcgs(&mut self, host: &mut dyn MemcgHost) {
+        for slot in std::mem::take(&mut self.dead_memcgs) {
+            host.memcg_drop(slot);
+        }
+        for node in self.subtree(ROOT) {
+            let want = node != ROOT && self.has(node, MEMORY);
+            let parent = self.nodes[&node].parent.map_or(0, |p| self.memcg_of(p));
+            let n = self.nodes.get_mut(&node).expect("in the tree");
+            match (want, n.memcg) {
+                (true, None) => n.memcg = host.memcg_create(parent),
+                (false, Some(slot)) => {
+                    host.memcg_drop(slot);
+                    n.memcg = None;
+                }
+                _ => {}
+            }
+            if let Some(slot) = n.memcg {
+                host.memcg_limits(
+                    slot,
+                    n.mem_max.unwrap_or(u64::MAX),
+                    n.mem_high.unwrap_or(u64::MAX),
+                );
+            }
+        }
+    }
+
+    /// Bring [`View::memory`] up to date from the frame allocator.
+    pub fn refresh_memory(&mut self, host: &dyn MemcgHost) {
+        self.view.memory = self
+            .nodes
+            .iter()
+            .filter_map(|(&id, n)| Some((id, host.memcg_use(n.memcg?))))
+            .collect();
+    }
+
+    /// A task in `victim` is being killed because memory cgroup `slot`'s
+    /// `memory.max` was reached: count it, and say which cgroup to kill
+    /// whole, if `memory.oom.group` asks for that (the highest cgroup from
+    /// the victim's up to the one out of memory that has it set).
+    pub fn record_oom(&mut self, victim: u32, slot: u16) -> Option<u32> {
+        let domain = self.node_of_memcg(slot)?;
+        let group = self
+            .chain(victim)
+            .into_iter()
+            .take_while(|&n| self.is_within(n, domain))
+            .filter(|n| self.nodes.get(n).is_some_and(|x| x.oom_group))
+            .last();
+        let d = self.nodes.get_mut(&domain)?;
+        d.oom_events[0] += 1; // oom
+        d.oom_events[1] += 1; // oom_kill
+        if group.is_some() {
+            d.oom_events[2] += 1; // oom_group_kill
+        }
+        group
     }
 
     /// The cgroup task `tid` is in.
@@ -568,14 +774,18 @@ impl CgroupTree {
     }
 
     /// Whether a task can be put in `node`, by cgroup v2's "no internal
-    /// processes" rule (Linux's `cgroup_migrate_vet_dst`). The controllers
-    /// here, `cpu` and `pids`, are threaded ones, which may share a cgroup with
-    /// tasks: so the rule only refuses a cgroup that already hands a controller
-    /// to populated children. The root is exempt.
+    /// processes" rule (Linux's `cgroup_migrate_vet_dst`): a cgroup that hands
+    /// controllers to its children takes no tasks, unless they're all threaded
+    /// ones (`cpu`, `pids`), which may share a cgroup with tasks, and no child
+    /// is populated yet. The root is exempt.
     pub fn check_attach(&self, node: u32) -> Result<(), i32> {
         match self.nodes.get(&node) {
             None => Err(ENOENT),
-            Some(n) if node != ROOT && n.subtree != 0 && self.has_populated_child(node) => {
+            Some(n)
+                if node != ROOT
+                    && n.subtree != 0
+                    && (self.has_populated_child(node) || n.subtree & !THREADED != 0) =>
+            {
                 Err(EBUSY)
             }
             Some(_) => Ok(()),
@@ -801,6 +1011,9 @@ impl CgroupTree {
         if node != ROOT && self.has(node, PIDS) {
             out.extend_from_slice(PIDS_FILES);
         }
+        if node != ROOT && self.has(node, MEMORY) {
+            out.extend_from_slice(MEMORY_FILES);
+        }
         out.sort_unstable();
         out
     }
@@ -901,6 +1114,7 @@ impl CgroupTree {
             }
         }
         let tasks = n.tasks;
+        let n_memcg = n.memcg;
         self.nodes.remove(&node);
         if let Some(p) = self.nodes.get_mut(&parent) {
             p.children.remove(&name);
@@ -910,6 +1124,7 @@ impl CgroupTree {
             let _ = tasks;
         }
         self.ns_roots.retain(|_, r| *r != node);
+        self.dead_memcgs.extend(n_memcg);
         self.update_quota_gate();
         Ok(())
     }
@@ -982,6 +1197,17 @@ impl CgroupTree {
                 set_bandwidth(&mut n.bandwidth, quota, period, burst)?;
                 self.update_quota_gate();
             }
+            "memory.max" => n.mem_max = mem_limit(text)?,
+            "memory.high" => n.mem_high = mem_limit(text)?,
+            "memory.low" => n.mem_low = mem_limit(text)?,
+            "memory.min" => n.mem_min = mem_limit(text)?,
+            "memory.oom.group" => {
+                n.oom_group = match parse_int::<i32>(text)? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(EINVAL),
+                };
+            }
             "cpu.max.burst" => {
                 let burst: u64 = parse_int(text)?;
                 let (quota, period) = (n.bandwidth.quota_us, n.bandwidth.period_us);
@@ -1029,15 +1255,14 @@ impl CgroupTree {
         let enabling = on & !old;
         let disabling = off & old;
         // No internal processes (Linux's `cgroup_vet_subtree_control_enable`):
-        // a threaded controller may be enabled alongside tasks, unless the
-        // cgroup also has populated children, which it would then compete
-        // with.
-        if enabling != 0
-            && node != ROOT
-            && self.has_own_tasks(node)
-            && self.has_populated_child(node)
-        {
-            return Err(EBUSY);
+        // a domain controller can't be enabled where there are tasks; a
+        // threaded one may be, unless the cgroup also has populated children,
+        // or domain controllers enabled, which they'd then compete with.
+        if enabling != 0 && node != ROOT && self.has_own_tasks(node) {
+            let domain = enabling & !THREADED != 0;
+            if domain || self.has_populated_child(node) || old & !THREADED != 0 {
+                return Err(EBUSY);
+            }
         }
         // A child still hands a controller on to its own children.
         let children: Vec<u32> = self.nodes[&node].children.values().copied().collect();
@@ -1157,11 +1382,73 @@ impl CgroupTree {
                 }
             }
             "cpu.max.burst" => format!("{}\n", n.bandwidth.burst_us),
+            "memory.current" => format!("{}\n", self.mem_use(node).current),
+            "memory.peak" => format!("{}\n", self.mem_use(node).peak),
+            "memory.max" => mem_bytes(n.mem_max),
+            "memory.high" => mem_bytes(n.mem_high),
+            "memory.low" => mem_bytes(n.mem_low),
+            "memory.min" => mem_bytes(n.mem_min),
+            "memory.oom.group" => format!("{}\n", u8::from(n.oom_group)),
+            "memory.events" => self.mem_events(&self.subtree(node)),
+            "memory.events.local" => self.mem_events(&[node]),
+            "memory.stat" => {
+                // Everything charged here is a process's own memory (or the
+                // page tables for it): nixvm's file data lives apart.
+                let anon = self.mem_use(node).current;
+                let mut out = format!("anon {anon}\n");
+                for key in [
+                    "file",
+                    "kernel",
+                    "kernel_stack",
+                    "pagetables",
+                    "sec_pagetables",
+                    "percpu",
+                    "sock",
+                    "vmalloc",
+                    "shmem",
+                    "file_mapped",
+                    "file_dirty",
+                    "file_writeback",
+                    "swapcached",
+                    "anon_thp",
+                    "file_thp",
+                    "shmem_thp",
+                    "inactive_anon",
+                ] {
+                    let _ = writeln!(out, "{key} 0");
+                }
+                let _ = writeln!(out, "active_anon {anon}");
+                out
+            }
             "pids.max" => limit(n.pids_max),
             "pids.current" => format!("{}\n", n.tasks),
             "pids.events" => format!("max {}\n", n.pids_events),
             _ => String::new(),
         }
+    }
+
+    fn mem_use(&self, node: u32) -> MemUse {
+        self.view.memory.get(&node).copied().unwrap_or_default()
+    }
+
+    /// `memory.events` for `nodes` together: one cgroup's own events, or a
+    /// subtree's.
+    fn mem_events(&self, nodes: &[u32]) -> String {
+        let (mut high, mut max, mut oom) = (0, 0, [0u64; 3]);
+        for n in nodes {
+            let u = self.mem_use(*n);
+            high += u.high_events;
+            max += u.max_events;
+            if let Some(x) = self.nodes.get(n) {
+                for (total, e) in oom.iter_mut().zip(x.oom_events) {
+                    *total += e;
+                }
+            }
+        }
+        format!(
+            "low 0\nhigh {high}\nmax {max}\noom {}\noom_kill {}\noom_group_kill {}\n",
+            oom[0], oom[1], oom[2]
+        )
     }
 
     fn inode(node: u32, file: Option<&str>) -> u64 {
@@ -1171,6 +1458,7 @@ impl CgroupTree {
                 .iter()
                 .chain(PIDS_FILES)
                 .chain(CPU_FILES)
+                .chain(MEMORY_FILES)
                 .position(|(n, _)| *n == f)
                 .map_or(0, |i| i as u64 + 1)
         });
@@ -1405,7 +1693,7 @@ mod tests {
     fn a_hierarchy_with_the_pids_controller() {
         let tree = CgroupTree::shared();
         let mut fs = CgroupFs::new(tree.clone(), ROOT);
-        assert_eq!(read(&mut fs, "cgroup.controllers"), "cpu pids\n");
+        assert_eq!(read(&mut fs, "cgroup.controllers"), "cpu memory pids\n");
         assert!(fs.stat("cgroup.events").is_none(), "the root has none");
         fs.mkdir("a", 0o755).unwrap();
         assert!(fs.stat("a/pids.max").is_none(), "not enabled yet");
@@ -1499,6 +1787,46 @@ mod tests {
     }
 
     #[test]
+    fn the_memory_controller_is_a_domain_one() {
+        let tree = CgroupTree::shared();
+        let mut t = tree.lock().unwrap();
+        let a = t.mkdir(ROOT, "a", 0, 0).unwrap();
+        let b = t.mkdir(a, "b", 0, 0).unwrap();
+        t.write_file(ROOT, "cgroup.subtree_control", "+memory +pids")
+            .unwrap();
+        t.migrate(&[(7, true)], a);
+        // Not where there are tasks, unlike pids...
+        assert_eq!(
+            t.write_file(a, "cgroup.subtree_control", "+memory"),
+            Err(EBUSY)
+        );
+        t.write_file(a, "cgroup.subtree_control", "+pids").unwrap();
+        t.migrate(&[(7, true)], ROOT);
+        t.write_file(a, "cgroup.subtree_control", "+memory")
+            .unwrap();
+        // ...and then no task goes in, even with no child populated.
+        assert_eq!(t.check_attach(a), Err(EBUSY));
+        assert_eq!(t.check_attach(b), Ok(()));
+        // Sizes: memparse suffixes, whole pages.
+        assert_eq!(mem_limit("16M"), Ok(Some(4096)));
+        assert_eq!(mem_limit("0x2000"), Ok(Some(2)));
+        assert_eq!(mem_limit("4097"), Ok(Some(1)));
+        assert_eq!(mem_limit("max"), Ok(None));
+        assert_eq!(mem_limit("1Q"), Err(EINVAL));
+        // A kill in b, out of a's memory: oom.group on b takes b whole.
+        t.nodes.get_mut(&a).unwrap().memcg = Some(1);
+        t.nodes.get_mut(&b).unwrap().memcg = Some(2);
+        assert_eq!(t.memcg_of(b), 2);
+        assert_eq!(t.record_oom(b, 1), None);
+        t.write_file(b, "memory.oom.group", "1").unwrap();
+        assert_eq!(t.record_oom(b, 1), Some(b));
+        assert_eq!(
+            t.render(a, "memory.events.local"),
+            "low 0\nhigh 0\nmax 0\noom 2\noom_kill 2\noom_group_kill 1\n"
+        );
+    }
+
+    #[test]
     fn no_internal_processes_and_limits_on_the_tree() {
         let tree = CgroupTree::shared();
         let mut t = tree.lock().unwrap();
@@ -1514,7 +1842,7 @@ mod tests {
         // pids is threaded: it may be enabled where there are tasks...
         t.write_file(a, "cgroup.subtree_control", "+pids").unwrap();
         assert_eq!(
-            t.write_file(a, "cgroup.subtree_control", "+memory"),
+            t.write_file(a, "cgroup.subtree_control", "+io"),
             Err(EINVAL)
         );
         assert_eq!(

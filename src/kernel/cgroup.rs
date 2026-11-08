@@ -1,15 +1,16 @@
 //! The kernel's side of cgroups (see [`crate::fs::cgroupfs`]): putting new
 //! tasks in their cgroup and enforcing `pids.max`, charging CPU time to
-//! `cpu.max` and handing tasks their cgroup's `cpu` settings, the writes that act on tasks
+//! `cpu.max` and handing tasks their cgroup's `cpu` settings, keeping the
+//! frame allocator's memory cgroups in step and killing a task when one is out
+//! of memory, the writes that act on tasks
 //! (`cgroup.procs`, `cgroup.threads`, `cgroup.kill`, `cgroup.freeze`), the pids
 //! a reader of `cgroup.procs` sees, and `/proc/<pid>/cgroup`.
 //!
 //! The tree's lock is a leaf, taken after `shared` when both are needed.
 
-use super::{Fd, Kernel, ProcInfo, RunState, ServiceCtx, Shared, err, poll};
+use super::{Fd, GuestMemory, Kernel, ProcInfo, RunState, ServiceCtx, Shared, err, poll};
 use crate::abi::errno::Errno;
 use crate::fs::cgroupfs::{CgroupTree, KERNEL_FILES, ROOT, SCHED_FILES, SchedState};
-use crate::vcpu::GuestMemory;
 
 const SIGKILL_BIT: u64 = 1 << (9 - 1);
 
@@ -90,21 +91,66 @@ impl Kernel {
     }
 
     /// Hand every task its cgroup's current settings (frozen, `cpu.weight`,
-    /// `cpu.max`), after a write that may have changed them.
-    pub(super) fn cgroup_resync(&self, cx: &mut ServiceCtx) {
+    /// `cpu.max`, memory cgroup), after a write that may have changed them,
+    /// first giving the frame allocator the memory cgroups and limits there
+    /// now are.
+    pub(super) fn cgroup_resync(&self, cx: &mut ServiceCtx, mem: &GuestMemory) {
         let mut sh = self.shared.lock().unwrap();
-        let tree = self.cgroups.lock().unwrap();
+        let mut tree = self.cgroups.lock().unwrap();
+        mem.with_allocator(|fa| tree.sync_memcgs(fa));
         let now = poll::now_ns();
         let apply = |p: &mut ProcInfo| {
             let st = tree.sched_state(tree.node_of(p.pid), now);
             p.frozen = st.frozen;
             p.cg_scale = st.scale;
             p.throttled_until = st.throttled_until;
+            p.memcg = st.memcg;
         };
         for p in sh.procs.iter_mut().flatten() {
             apply(&mut p.info);
         }
         apply(&mut cx.cur);
+    }
+
+    /// Memory cgroup `slot` refused memory at its `memory.max`, while the
+    /// caller ran: kill a task in it, as Linux's out-of-memory killer does —
+    /// the caller, if it's in there (it asked for the memory), or else another
+    /// task of that cgroup — and, with `memory.oom.group`, every task of the
+    /// cgroup that asks for it. Returns whether the caller is to die.
+    pub(super) fn memcg_oom(&self, cx: &mut ServiceCtx, slot: u16) -> bool {
+        let mut sh = self.shared.lock().unwrap();
+        let mut tree = self.cgroups.lock().unwrap();
+        let Some(domain) = tree.node_of_memcg(slot) else {
+            return false;
+        };
+        let me = tree.node_of(cx.cur.pid);
+        let live = |p: &ProcInfo| !matches!(p.run, RunState::Zombie(_));
+        let (victim, victim_node) = if tree.is_within(me, domain) {
+            (cx.cur.pid, me)
+        } else {
+            match sh
+                .procs
+                .iter()
+                .flatten()
+                .map(|p| &p.info)
+                .find(|p| live(p) && tree.is_within(tree.node_of(p.pid), domain))
+            {
+                Some(p) => (p.pid, tree.node_of(p.pid)),
+                None => return false,
+            }
+        };
+        let group = tree.record_oom(victim_node, slot);
+        let doomed =
+            |pid: i32| pid == victim || group.is_some_and(|g| tree.is_within(tree.node_of(pid), g));
+        for p in sh.procs.iter_mut().flatten() {
+            if doomed(p.info.pid) && live(&p.info) && p.info.pid != cx.cur.pid {
+                p.info.pending |= SIGKILL_BIT;
+                p.info.parked = false;
+                p.info.frozen = false;
+                p.info.run = RunState::Running;
+            }
+        }
+        doomed(cx.cur.pid)
     }
 
     /// Whether `fd` is a cgroup file whose writes change how tasks are
@@ -135,7 +181,7 @@ impl Kernel {
     /// Work out what readers of the cgroup files see, from the caller's point
     /// of view: the pids in each cgroup by its numbers, and CPU time used.
     /// Done when the caller opens a file in a `cgroup2` mount.
-    pub(super) fn cgroup_refresh(&self, cx: &ServiceCtx) {
+    pub(super) fn cgroup_refresh(&self, cx: &ServiceCtx, mem: &GuestMemory) {
         let (tasks, threads) = {
             let sh = self.shared.lock().unwrap();
             let threads: Vec<bool> = sh
@@ -170,6 +216,10 @@ impl Kernel {
             *cpu += tree.dead_cpu_ns(*node);
         }
         tree.view = view;
+        mem.with_allocator(|fa| {
+            tree.sync_memcgs(fa);
+            tree.refresh_memory(fa);
+        });
     }
 
     /// Before an open: if it's of a file in a `cgroup2` mount, bring what it
@@ -194,7 +244,7 @@ impl Kernel {
         let abs = self.resolve_path(cx, dirfd, &raw);
         let in_cgroup = self.vfs_for(cx).cgroup_at(&abs).is_some();
         if in_cgroup {
-            self.cgroup_refresh(cx);
+            self.cgroup_refresh(cx, mem);
         }
     }
 
@@ -299,6 +349,7 @@ impl Kernel {
                 p.frozen = st.frozen;
                 p.cg_scale = st.scale;
                 p.throttled_until = st.throttled_until;
+                p.memcg = st.memcg;
             }
         };
         for p in sh.procs.iter_mut().flatten() {

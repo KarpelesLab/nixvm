@@ -492,16 +492,24 @@ must get the isolation it asks for.
   processes through `cgroup.procs` (with v2's delegation and no-internal-process rules),
   `cgroup.events`, `cgroup.kill`, `cgroup.freeze`, `cgroup.max.depth`/`max.descendants`,
   `cgroup.stat`, `cpu.stat`, `clone3`'s `CLONE_INTO_CGROUP`, cgroup namespaces rooted where
-  they're made, and `/proc/<pid>/cgroup`. Two controllers are offered:
+  they're made, and `/proc/<pid>/cgroup`. Three controllers are offered:
   - `pids`: `pids.max` stops `fork`.
   - `cpu`: `cpu.max` (with `cpu.max.burst`) is Linux's bandwidth control, holding a
     cgroup's tasks off the CPU once its quota for the period is used, with the throttling
     counts in `cpu.stat`; `cpu.weight` (`cpu.weight.nice`, `cpu.idle`) scales each task's
     share of the CPU. Unlike Linux's group scheduling, a cgroup with several busy tasks
     gets that share for each of them, rather than splitting one among them.
+  - `memory`: each page a process allocates (its own memory and page tables) is
+    charged to its cgroup in the frame allocator, as Linux charges a page to the cgroup
+    that faulted it in; `memory.current`, `memory.peak` and `memory.stat` show it. Past
+    `memory.max` a page is refused and a task of the cgroup is killed, counted in
+    `memory.events` (the whole cgroup with `memory.oom.group`). There is no reclaim or
+    swap, so `memory.high` is only counted, `memory.low`/`min` protect nothing, and
+    lowering `memory.max` under what's in use doesn't kill anything until the next
+    page is asked for. As a domain controller it follows v2's no-internal-process rule.
 
-  `memory` and `io` aren't listed, since nothing would enforce them (nothing counts a
-  process's memory yet). Threaded subtrees aren't supported (`EOPNOTSUPP`). `statfs` reports each
+  `io` isn't listed, since nothing would enforce it. Threaded subtrees aren't supported
+  (`EOPNOTSUPP`). `statfs` reports each
   filesystem's own magic, which is how tools find cgroup v2.
 - **Signals:** a signal sent to a task that ignores it (and doesn't block it) is discarded
   as it's sent, and making a signal ignored drops it if pending, as on Linux.

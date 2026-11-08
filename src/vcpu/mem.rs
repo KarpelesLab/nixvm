@@ -150,6 +150,9 @@ pub struct GuestMemory {
     /// distinct spaces/locks, so cross-process parallelism is unaffected. Sticky:
     /// stays set after a thread exits (harmless — just keeps that space serial).
     shared: bool,
+    /// The memory cgroup (allocator slot) frames this address space allocates
+    /// are charged to: its tasks' cgroup's, set by the kernel as they run.
+    memcg: u16,
 }
 
 impl std::fmt::Debug for GuestMemory {
@@ -166,6 +169,14 @@ impl std::fmt::Debug for GuestMemory {
 pub const FORK_DONT: u8 = 1;
 /// [`GuestMemory::set_fork_policy`]: a fork child sees the page zero-filled.
 pub const FORK_WIPE: u8 = 2;
+
+/// Take the frame allocator `fa`, charging what's allocated to memory cgroup
+/// `memcg` (an address space's: see [`GuestMemory::set_memcg`]).
+fn lock_fa(fa: &Mutex<FrameAllocator>, memcg: u16) -> std::sync::MutexGuard<'_, FrameAllocator> {
+    let mut fa = fa.lock().unwrap();
+    fa.charge_to = memcg;
+    fa
+}
 
 const fn round_up(v: u64, align: u64) -> u64 {
     v.div_ceil(align) * align
@@ -252,7 +263,27 @@ impl GuestMemory {
             tlb_dirty: false,
             kstack_pa,
             shared: false,
+            memcg: 0,
         }
+    }
+
+    /// Charge frames this address space allocates from now on to memory cgroup
+    /// `slot` (what it already has stays where it was charged, as on Linux).
+    pub fn set_memcg(&mut self, slot: u16) {
+        self.memcg = slot;
+    }
+
+    /// The memory cgroup whose `memory.max` refused a frame since the last
+    /// call, if one did (see [`FrameAllocator::take_memcg_oom`]).
+    #[must_use]
+    pub fn take_memcg_oom(&self) -> Option<u16> {
+        self.fa.lock().unwrap().take_memcg_oom()
+    }
+
+    /// Run `f` on the frame allocator every address space shares, for the
+    /// kernel's memory cgroup bookkeeping.
+    pub fn with_allocator<T>(&self, f: impl FnOnce(&mut FrameAllocator) -> T) -> T {
+        f(&mut self.fa.lock().unwrap())
     }
 
     // ---- KVM/backend hooks (crate-internal) ------------------------------
@@ -421,7 +452,7 @@ impl GuestMemory {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn frames_in_use(&self) -> usize {
-        self.fa.lock().unwrap().alloc_count()
+        lock_fa(&self.fa, self.memcg).alloc_count()
     }
 
     // ---- geometry --------------------------------------------------------
@@ -504,7 +535,7 @@ impl GuestMemory {
         let start = addr - addr % PAGE_SIZE;
         let end = round_up(addr + len, PAGE_SIZE);
         let (first, last) = self.page_range(start, (end - start) as usize)?;
-        let mut fa = self.fa.lock().unwrap();
+        let mut fa = lock_fa(&self.fa, self.memcg);
         for p in first..=last {
             // Fresh mapping: drop any existing backing so the page reads as zero.
             if self.mapped[p] {
@@ -560,7 +591,7 @@ impl GuestMemory {
         let start = addr - addr % PAGE_SIZE;
         let end = round_up(addr + len, PAGE_SIZE);
         let (first, last) = self.page_range(start, (end - start) as usize)?;
-        let mut fa = self.fa.lock().unwrap();
+        let mut fa = lock_fa(&self.fa, self.memcg);
         for p in first..=last {
             self.shared_anon[p] = true;
             let va = self.base + (p as u64) * PAGE_SIZE;
@@ -578,7 +609,7 @@ impl GuestMemory {
     /// taken so far is returned and `None` comes back.
     #[must_use]
     pub fn alloc_frames(&self, n: usize) -> Option<Vec<u64>> {
-        let mut fa = self.fa.lock().unwrap();
+        let mut fa = lock_fa(&self.fa, self.memcg);
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
             if let Some(f) = fa.alloc(&self.phys) {
@@ -597,7 +628,7 @@ impl GuestMemory {
     /// [`Self::alloc_frames`]); a frame still mapped somewhere lives on until
     /// its last mapping goes.
     pub fn release_frames(&self, frames: &[u64]) {
-        let mut fa = self.fa.lock().unwrap();
+        let mut fa = lock_fa(&self.fa, self.memcg);
         for &f in frames {
             fa.free(f);
         }
@@ -608,7 +639,7 @@ impl GuestMemory {
     /// owner seeing 1 knows no address space maps the frame any more.
     #[must_use]
     pub fn frame_refcount(&self, frame: u64) -> u32 {
-        self.fa.lock().unwrap().refcount(frame)
+        lock_fa(&self.fa, self.memcg).refcount(frame)
     }
 
     /// The frames behind `[addr, addr + len)` if *every* page there is a
@@ -654,7 +685,7 @@ impl GuestMemory {
         }
         let len = frames.len() as u64 * PAGE_SIZE;
         let (first, last) = self.page_range(addr, len as usize)?;
-        let mut fa = self.fa.lock().unwrap();
+        let mut fa = lock_fa(&self.fa, self.memcg);
         for (i, p) in (first..=last).enumerate() {
             let va = self.page_base(p);
             if self.mapped[p]
@@ -728,7 +759,7 @@ impl GuestMemory {
         if self.prot[p] == Prot::NONE {
             return false;
         }
-        let mut fa = self.fa.lock().unwrap();
+        let mut fa = lock_fa(&self.fa, self.memcg);
         Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, page)
     }
 
@@ -785,7 +816,7 @@ impl GuestMemory {
         let start = addr - addr % PAGE_SIZE;
         let end = round_up(addr + len, PAGE_SIZE);
         let (first, last) = self.page_range(start, (end - start) as usize)?;
-        let fa = self.fa.lock().unwrap();
+        let fa = lock_fa(&self.fa, self.memcg);
         for p in first..=last {
             if !self.mapped[p] {
                 return Err(MemError::Unmapped(self.page_base(p)));
@@ -812,7 +843,7 @@ impl GuestMemory {
         let start = addr - addr % PAGE_SIZE;
         let end = round_up(addr + len, PAGE_SIZE);
         let (first, last) = self.page_range(start, (end - start) as usize)?;
-        let mut fa = self.fa.lock().unwrap();
+        let mut fa = lock_fa(&self.fa, self.memcg);
         for p in first..=last {
             if self.mapped[p]
                 && let Some(frame) = self.space.unmap(self.page_base(p), &mut fa, &self.phys)
@@ -996,7 +1027,7 @@ impl GuestMemory {
     fn copy_in(&mut self, addr: u64, buf: &[u8]) -> Result<(), MemError> {
         let (first, last) = self.page_range(addr, buf.len())?;
         {
-            let mut fa = self.fa.lock().unwrap();
+            let mut fa = lock_fa(&self.fa, self.memcg);
             let mut changed = false;
             for p in first..=last {
                 let va = self.base + (p as u64) * PAGE_SIZE;
@@ -1064,7 +1095,7 @@ impl GuestMemory {
             return false;
         }
         let va = self.base + (p as u64) * PAGE_SIZE;
-        let mut fa = self.fa.lock().unwrap();
+        let mut fa = lock_fa(&self.fa, self.memcg);
         // Out of frames is a real fault: reporting success here would retry the
         // store forever.
         Self::make_writable(
@@ -1093,7 +1124,7 @@ impl GuestMemory {
         // straight to the frames (bypassing the leaf's protection — the host write
         // goes to the pool, not through the guest MMU).
         {
-            let mut fa = self.fa.lock().unwrap();
+            let mut fa = lock_fa(&self.fa, self.memcg);
             let mut changed = false;
             for p in first..=last {
                 let va = self.base + (p as u64) * PAGE_SIZE;
@@ -1146,7 +1177,7 @@ impl GuestMemory {
     #[must_use]
     pub fn try_fork(&mut self) -> Option<Self> {
         let (child_space, parent_kstack, child_kstack) = {
-            let mut fa = self.fa.lock().unwrap();
+            let mut fa = lock_fa(&self.fa, self.memcg);
             let mut child = self.space.fork_cow(&mut fa, &self.phys)?;
             // Past this point the fork can't fail, and it needs a couple more
             // frames: `fork_cow` just left us above the reserve, so these dip into
@@ -1220,6 +1251,7 @@ impl GuestMemory {
             tlb_dirty: false,
             kstack_pa: child_kstack,
             shared: self.shared,
+            memcg: self.memcg,
         })
     }
 
@@ -1236,7 +1268,7 @@ impl GuestMemory {
     /// task never runs again, but the slot outlives it, so anything kept here
     /// would add up over a long-lived process tree until the pool ran dry.
     pub(crate) fn retire(&mut self) {
-        let mut fa = self.fa.lock().unwrap();
+        let mut fa = lock_fa(&self.fa, self.memcg);
         let old = std::mem::replace(&mut self.space, AddrSpace::retired());
         old.destroy(&mut fa, &self.phys);
         drop(fa);
@@ -1251,7 +1283,7 @@ impl GuestMemory {
     }
 
     fn reset_space(&mut self) {
-        let mut fa = self.fa.lock().unwrap();
+        let mut fa = lock_fa(&self.fa, self.memcg);
         // Exit and exec must always work, and this is what frees the frames a
         // full pool needs: the reserve guarantees the few it takes first. The
         // allocator lock is held throughout, so the old space's frames are back

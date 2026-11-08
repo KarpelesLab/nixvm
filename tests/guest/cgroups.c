@@ -1,5 +1,6 @@
 /* cgroup v2: a hierarchy of our own under the root cgroup, moving processes,
- * pids.max, the cpu controller (weights, cpu.max bandwidth), cgroup.events,
+ * pids.max, the cpu controller (weights, cpu.max bandwidth), the memory
+ * controller (memory.max and its out-of-memory kills), cgroup.events,
  * cgroup.kill, cgroup.freeze, the limits on the
  * tree, CLONE_INTO_CGROUP, cgroup namespaces and /proc/<pid>/cgroup.
  *
@@ -67,7 +68,7 @@ static void path(char *out, const char *name) { snprintf(out, 256, "%.200s/%.50s
 static void cleanup(void) {
   if (!*base) return;
   put(home, "cgroup.procs", "0");
-  const char *kids[] = {"self", "lim", "kd", "fz", "cq", "nest/a", "nest", "into", "ns", "zz", 0};
+  const char *kids[] = {"self", "lim", "kd", "fz", "cq", "mm/kid", "mm", "nest/a", "nest", "into", "ns", "zz", 0};
   for (int i = 0; kids[i]; i++) {
     char p[256];
     path(p, kids[i]);
@@ -267,6 +268,77 @@ int main(void) {
   CHECK(!strcmp(get(cq, "cpu.max"), "max 100000\n"));
   CHECK(rmdir(cq) == 0);
   puts("cpu.weight, cpu.idle, cpu.max, cpu.stat: ok");
+
+  /* The memory controller: what a cgroup's processes use, and memory.max,
+   * past which one is killed. memory is a domain controller: it can't share a
+   * cgroup with processes. */
+  if (!strstr(get("/sys/fs/cgroup", "cgroup.subtree_control"), "memory"))
+    CHECK(put("/sys/fs/cgroup", "cgroup.subtree_control", "+memory") == 0);
+  CHECK(put(base, "cgroup.subtree_control", "+memory") == 0);
+  CHECK(put(self, "cgroup.subtree_control", "+memory") == -1 && errno == EBUSY); /* we're in it */
+  char mm[256], mk[256];
+  path(mm, "mm");
+  CHECK(mkdir(mm, 0755) == 0);
+  CHECK(!strcmp(get(mm, "memory.max"), "max\n") && !strcmp(get(mm, "memory.high"), "max\n"));
+  CHECK(!strcmp(get(mm, "memory.min"), "0\n") && !strcmp(get(mm, "memory.oom.group"), "0\n"));
+  CHECK(get(mm, "memory.current")[0] >= '0');
+  CHECK(put(mm, "memory.max", "4097") == 0 && !strcmp(get(mm, "memory.max"), "4096\n")); /* whole pages */
+  CHECK(put(mm, "memory.max", "lots") == -1 && errno == EINVAL);
+  CHECK(put(mm, "memory.high", "1G") == 0 && !strcmp(get(mm, "memory.high"), "1073741824\n"));
+  CHECK(put(mm, "memory.oom.group", "2") == -1 && errno == EINVAL);
+  CHECK(put(mm, "memory.max", "24M") == 0 && !strcmp(get(mm, "memory.max"), "25165824\n"));
+  char sm[300];
+  snprintf(sm, sizeof sm, "%s/memory.swap.max", mm);
+  if (access(sm, F_OK) == 0) CHECK(put(mm, "memory.swap.max", "0") == 0); /* no swapping out of it */
+  /* No processes where a domain controller is handed on. */
+  path(mk, "mm/kid");
+  CHECK(mkdir(mk, 0755) == 0);
+  CHECK(put(mm, "cgroup.subtree_control", "+memory") == 0);
+  CHECK(put(mm, "cgroup.procs", "0") == -1 && errno == EBUSY);
+  CHECK(put(mm, "cgroup.subtree_control", "-memory") == 0);
+  CHECK(rmdir(mk) == 0);
+  int up[2], go[2];
+  CHECK(pipe(up) == 0 && pipe(go) == 0);
+  c = fork();
+  if (!c) {
+    if (put(mm, "cgroup.procs", "0")) _exit(1);
+    char *m = mmap(0, 64 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    for (long i = 0; i < 8 << 20; i += 4096) m[i] = 1;
+    char x = 'y';
+    if (write(up[1], &x, 1) != 1 || read(go[0], &x, 1) != 1) _exit(2);
+    for (long i = 0; i < 64 << 20; i += 4096) m[i] = 1; /* past memory.max */
+    _exit(3);
+  }
+  CHECK(read(up[0], &r, 1) == 1);
+  long long cur = atoll(get(mm, "memory.current"));
+  printf("8 MiB touched: memory.current %lld\n", cur);
+  CHECK(cur >= 8 << 20 && cur < 24 << 20);
+  CHECK(field(get(mm, "memory.stat"), "anon") >= 8 << 20);
+  CHECK(write(go[1], "g", 1) == 1);
+  CHECK(waitpid(c, &st, 0) == c && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+  const char *ev = get(mm, "memory.events");
+  CHECK(field(ev, "oom") >= 1 && field(ev, "oom_kill") == 1 && field(ev, "max") >= 1);
+  CHECK(field(get(mm, "memory.events.local"), "oom_kill") == 1);
+  long long peak = atoll(get(mm, "memory.peak"));
+  CHECK(peak >= 20 << 20 && peak <= 25 << 20);
+  CHECK(atoll(get(mm, "memory.current")) < 4 << 20); /* freed as it died */
+  /* memory.oom.group: the kill takes the whole cgroup. */
+  CHECK(put(mm, "memory.oom.group", "1") == 0);
+  c = fork();
+  if (!c) {
+    if (put(mm, "cgroup.procs", "0")) _exit(1);
+    pid_t g = fork();
+    if (!g) { pause(); _exit(0); }
+    char *m = mmap(0, 64 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    for (long i = 0; i < 64 << 20; i += 4096) m[i] = 1;
+    _exit(3);
+  }
+  CHECK(waitpid(c, &st, 0) == c && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+  for (int i = 0; i < 100 && strcmp(get(mm, "cgroup.events"), "populated 0\nfrozen 0\n"); i++) usleep(10000);
+  CHECK(!strcmp(get(mm, "cgroup.events"), "populated 0\nfrozen 0\n")); /* the grandchild too */
+  CHECK(field(get(mm, "memory.events"), "oom_group_kill") == 1);
+  CHECK(rmdir(mm) == 0);
+  puts("memory.max, memory.current, memory.events, memory.oom.group: ok");
 
   /* Limits on the tree. */
   char nest[256], a[256];

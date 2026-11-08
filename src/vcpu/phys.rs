@@ -243,6 +243,51 @@ pub struct FrameAllocator {
     reserve: usize,
     /// Whether allocations may currently dip into [`Self::reserve`].
     use_reserve: bool,
+    /// The memory cgroup each live frame is charged to (an index into
+    /// [`Self::memcgs`]; 0, the root, for most).
+    owner: Vec<u16>,
+    /// Memory cgroups: what each has charged, and its limits.
+    memcgs: Vec<Memcg>,
+    /// The memory cgroup new frames are charged to: the one of the address
+    /// space allocating, set as it takes the allocator.
+    pub charge_to: u16,
+    /// The memory cgroup whose `memory.max` last refused a frame, until
+    /// [`Self::take_memcg_oom`] collects it.
+    oom: Option<u16>,
+}
+
+/// One memory cgroup as the allocator keeps it (see [`FrameAllocator::charge_to`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Memcg {
+    /// The memory cgroup above, whose use includes this one's (0 at the top).
+    pub parent: u16,
+    /// Frames charged here and below.
+    pub frames: u64,
+    /// The most there have been.
+    pub peak: u64,
+    /// `memory.max` in frames: a frame past it is refused.
+    pub max: u64,
+    /// `memory.high` in frames: going past it is counted.
+    pub high: u64,
+    /// How often a frame was refused at `max` (`memory.events` `max`).
+    pub max_events: u64,
+    /// How often an allocation went past `high`.
+    pub high_events: u64,
+    /// The slot is in use.
+    pub live: bool,
+}
+
+impl Memcg {
+    const ROOT: Self = Self {
+        parent: 0,
+        frames: 0,
+        peak: 0,
+        max: u64::MAX,
+        high: u64::MAX,
+        max_events: 0,
+        high_events: 0,
+        live: true,
+    };
 }
 
 impl FrameAllocator {
@@ -266,7 +311,116 @@ impl FrameAllocator {
             allocated: 0,
             reserve: 0,
             use_reserve: false,
+            owner: vec![0; nframes],
+            memcgs: vec![Memcg::ROOT],
+            charge_to: 0,
+            oom: None,
         }
+    }
+
+    /// The memory cgroups from `slot` up to the root (which isn't included:
+    /// it has no limit, and its use is the pool's).
+    fn memcg_chain(&self, slot: u16) -> impl Iterator<Item = usize> + '_ {
+        let mut at = slot;
+        std::iter::from_fn(move || {
+            if at == 0 {
+                return None;
+            }
+            let here = at as usize;
+            at = self.memcgs.get(here).map_or(0, |m| m.parent);
+            Some(here)
+        })
+    }
+
+    /// Charge one frame to `slot` and those above it, unless that would pass a
+    /// `memory.max` (counted, and remembered for [`Self::take_memcg_oom`]).
+    /// Allocations made from the reserve, to tear an address space down, are
+    /// never refused.
+    fn charge(&mut self, slot: u16) -> bool {
+        let chain: Vec<usize> = self.memcg_chain(slot).collect();
+        if !self.use_reserve
+            && let Some(&full) = chain
+                .iter()
+                .find(|&&m| self.memcgs[m].frames >= self.memcgs[m].max)
+        {
+            self.memcgs[full].max_events += 1;
+            self.oom = Some(full as u16);
+            return false;
+        }
+        for m in chain {
+            let g = &mut self.memcgs[m];
+            g.frames += 1;
+            g.peak = g.peak.max(g.frames);
+            if g.frames > g.high {
+                g.high_events += 1;
+            }
+        }
+        true
+    }
+
+    fn uncharge(&mut self, slot: u16) {
+        let chain: Vec<usize> = self.memcg_chain(slot).collect();
+        for m in chain {
+            let g = &mut self.memcgs[m];
+            g.frames = g.frames.saturating_sub(1);
+        }
+    }
+
+    /// A new memory cgroup below `parent`, or `None` if there are no slots
+    /// left. A slot is reused once whatever was charged to it is gone.
+    pub fn memcg_new(&mut self, parent: u16) -> Option<u16> {
+        let fresh = Memcg {
+            parent,
+            ..Memcg::ROOT
+        };
+        if let Some(i) =
+            (1..self.memcgs.len()).find(|&i| !self.memcgs[i].live && self.memcgs[i].frames == 0)
+        {
+            self.memcgs[i] = fresh;
+            return u16::try_from(i).ok();
+        }
+        let i = u16::try_from(self.memcgs.len()).ok()?;
+        self.memcgs.push(fresh);
+        Some(i)
+    }
+
+    /// Memory cgroup `slot` is gone. What's still charged to it stays counted
+    /// above it until freed (Linux moves it to the parent; the totals are the
+    /// same).
+    pub fn memcg_remove(&mut self, slot: u16) {
+        if let Some(m) = self.memcgs.get_mut(slot as usize).filter(|_| slot != 0) {
+            m.live = false;
+            m.max = u64::MAX;
+            m.high = u64::MAX;
+        }
+    }
+
+    /// Set memory cgroup `slot`'s `memory.max` and `memory.high`, in frames.
+    pub fn memcg_set_limits(&mut self, slot: u16, max: u64, high: u64) {
+        if let Some(m) = self.memcgs.get_mut(slot as usize).filter(|_| slot != 0) {
+            m.max = max;
+            m.high = high;
+        }
+    }
+
+    /// Reset memory cgroup `slot`'s peak to what it uses now (a write to
+    /// `memory.peak`).
+    pub fn memcg_reset_peak(&mut self, slot: u16) {
+        if let Some(m) = self.memcgs.get_mut(slot as usize) {
+            m.peak = m.frames;
+        }
+    }
+
+    /// Memory cgroup `slot` as it stands.
+    #[must_use]
+    pub fn memcg(&self, slot: u16) -> Option<Memcg> {
+        self.memcgs.get(slot as usize).copied()
+    }
+
+    /// The memory cgroup whose `memory.max` refused a frame since the last
+    /// call, if one did.
+    pub fn take_memcg_oom(&mut self) -> Option<u16> {
+        self.oom.take()
     }
 
     /// Validate `pa`, returning its frame number, or `None` if `pa` is not
@@ -293,9 +447,13 @@ impl FrameAllocator {
         if !self.use_reserve && self.free_list.len() <= self.reserve {
             return None;
         }
+        if self.free_list.is_empty() || !self.charge(self.charge_to) {
+            return None;
+        }
         let f = self.free_list.pop()?;
         debug_assert_eq!(self.refcount[f as usize], 0, "free-list frame was not free");
         self.refcount[f as usize] = 1;
+        self.owner[f as usize] = self.charge_to;
         self.allocated += 1;
         let pa = u64::from(f) * FRAME;
         phys.zero_frame(pa);
@@ -352,6 +510,8 @@ impl FrameAllocator {
         if rc == 1 {
             self.allocated -= 1;
             self.free_list.push(f as u32);
+            let owner = std::mem::take(&mut self.owner[f]);
+            self.uncharge(owner);
         }
     }
 
@@ -395,6 +555,8 @@ impl FrameAllocator {
                 // pinned. (Bootstrap normally reserves free frames, but stay
                 // consistent if a caller pins something it allocated.)
                 self.allocated -= 1;
+                let owner = std::mem::take(&mut self.owner[f]);
+                self.uncharge(owner);
             }
             self.refcount[f] = PINNED;
         }
@@ -413,6 +575,28 @@ impl FrameAllocator {
     #[must_use]
     pub fn free_count(&self) -> usize {
         self.free_list.len()
+    }
+}
+
+impl crate::fs::cgroupfs::MemcgHost for FrameAllocator {
+    fn memcg_create(&mut self, parent: u16) -> Option<u16> {
+        self.memcg_new(parent)
+    }
+    fn memcg_drop(&mut self, slot: u16) {
+        self.memcg_remove(slot);
+    }
+    fn memcg_limits(&mut self, slot: u16, max: u64, high: u64) {
+        self.memcg_set_limits(slot, max, high);
+    }
+    fn memcg_use(&self, slot: u16) -> crate::fs::cgroupfs::MemUse {
+        self.memcg(slot)
+            .map(|m| crate::fs::cgroupfs::MemUse {
+                current: m.frames * FRAME,
+                peak: m.peak * FRAME,
+                high_events: m.high_events,
+                max_events: m.max_events,
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -542,6 +726,46 @@ mod tests {
         // The very next alloc reuses the just-freed frame (LIFO).
         let b = alloc.alloc(&phys).unwrap();
         assert_eq!(a, b, "freed frame is reused");
+    }
+
+    #[test]
+    fn memory_cgroups_are_charged_and_limited() {
+        let (phys, mut fa) = pool(64);
+        let a = fa.memcg_new(0).unwrap();
+        let b = fa.memcg_new(a).unwrap();
+        fa.memcg_set_limits(a, 3, 2);
+        fa.charge_to = b;
+        let f1 = fa.alloc(&phys).unwrap();
+        let f2 = fa.alloc(&phys).unwrap();
+        fa.charge_to = a;
+        let f3 = fa.alloc(&phys).unwrap();
+        assert_eq!(fa.memcg(a).unwrap().frames, 3, "b's count in a's");
+        assert_eq!(fa.memcg(b).unwrap().frames, 2);
+        assert_eq!(fa.memcg(a).unwrap().high_events, 1);
+        fa.charge_to = b;
+        assert_eq!(fa.alloc(&phys), None, "a's memory.max");
+        assert_eq!(fa.take_memcg_oom(), Some(a));
+        assert_eq!(fa.take_memcg_oom(), None);
+        assert_eq!(fa.memcg(a).unwrap().max_events, 1);
+        // A shared frame is charged once, to whoever allocated it, until its
+        // last reference goes.
+        fa.incref(f1);
+        fa.free(f1);
+        assert_eq!(fa.memcg(b).unwrap().frames, 2);
+        fa.free(f1);
+        assert_eq!(fa.memcg(b).unwrap().frames, 1);
+        assert!(fa.alloc(&phys).is_some(), "room again");
+        // Tearing down never fails on a limit.
+        fa.set_use_reserve(true);
+        assert!(fa.alloc(&phys).is_some());
+        fa.set_use_reserve(false);
+        assert_eq!(fa.memcg(a).unwrap().peak, 4);
+        // A removed group's slot comes back once nothing is charged to it.
+        fa.memcg_remove(b);
+        assert_ne!(fa.memcg_new(a), Some(b));
+        fa.free(f2);
+        fa.free(f3);
+        let _ = f3;
     }
 
     #[test]

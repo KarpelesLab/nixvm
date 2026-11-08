@@ -431,6 +431,9 @@ struct ProcInfo {
     /// What its CPU time counts for in fair scheduling because of its
     /// cgroup's `cpu.weight` (see [`crate::fs::cgroupfs::SchedState::scale`]).
     cg_scale: u64,
+    /// The memory cgroup (frame allocator slot) what it allocates is charged
+    /// to: its cgroup's.
+    memcg: u16,
     /// Weighted *virtual* runtime for fair scheduling (CFS-style), in nice-0
     /// nanosecond units: each executed step adds its CPU delta scaled by
     /// `NICE0_WEIGHT / nice_weight(nice)`, so a low-priority (higher-`nice`) task's
@@ -607,6 +610,7 @@ impl Default for ProcInfo {
             rt_run_ns: 0,
             throttled_until: None,
             cg_scale: crate::fs::cgroupfs::UNSCALED,
+            memcg: 0,
             vruntime: 0,
             child_cpu_ns: 0,
             alarm_deadline: None,
@@ -2700,6 +2704,28 @@ impl Kernel {
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
     ) -> Serviced {
+        // What this step allocates is charged to the task's memory cgroup.
+        mem.set_memcg(cx.cur.memcg);
+        let flow = self.service_exit(cx, exit, vcpu, mem);
+        // A memory cgroup refused memory the kernel needed for the task (a
+        // buffer it wrote to, a page it copied): Linux's out-of-memory kill.
+        if !matches!(flow, Serviced::Ended)
+            && let Some(slot) = mem.take_memcg_oom()
+            && self.memcg_oom(cx, slot)
+        {
+            self.die_of_signal(cx, 9, mem); // SIGKILL
+            return Serviced::Ended;
+        }
+        flow
+    }
+
+    fn service_exit(
+        &self,
+        cx: &mut ServiceCtx,
+        exit: Exit,
+        vcpu: &mut dyn Vcpu,
+        mem: &mut GuestMemory,
+    ) -> Serviced {
         match exit {
             Exit::Syscall => {
                 let raw = vcpu.syscall_nr();
@@ -2860,6 +2886,17 @@ impl Kernel {
                     // and re-runs the faulting instruction.
                     vcpu.flush_tlb();
                     Serviced::Resume
+                } else if let Some(slot) = mem.take_memcg_oom() {
+                    // The page couldn't be had because the task's memory cgroup
+                    // is at its `memory.max`: an out-of-memory kill, not a
+                    // segfault. If the victim is another task, this one tries
+                    // again once that has gone.
+                    if self.memcg_oom(cx, slot) {
+                        self.die_of_signal(cx, 9, mem); // SIGKILL
+                        Serviced::Ended
+                    } else {
+                        Serviced::Resume
+                    }
                 } else if vcpu.shadow_stale(mem, addr) {
                     // SMP/KVM only: a sibling mapped or re-protected this page
                     // (serviced here on the main thread) while this vcpu was mid
@@ -3303,7 +3340,7 @@ impl Kernel {
             });
             sh.check_out_files(&mut cx);
             let (pending, ppid, frozen) = (cx.cur.pending, cx.cur.ppid, cx.cur.frozen);
-            let cpu = (cx.cur.cg_scale, cx.cur.throttled_until);
+            let cpu = (cx.cur.cg_scale, cx.cur.throttled_until, cx.cur.memcg);
             let rt_lens: BTreeMap<u32, usize> =
                 cx.cur.rt_queue.iter().map(|(&s, q)| (s, q.len())).collect();
             (proc, cx, pending, ppid, frozen, cpu, rt_lens)
@@ -3352,9 +3389,15 @@ impl Kernel {
                     cx.cur.frozen = stand_in.info.frozen;
                 }
                 // Its cgroup's `cpu` settings changed meanwhile.
-                if (stand_in.info.cg_scale, stand_in.info.throttled_until) != out_cpu {
+                if (
+                    stand_in.info.cg_scale,
+                    stand_in.info.throttled_until,
+                    stand_in.info.memcg,
+                ) != out_cpu
+                {
                     cx.cur.cg_scale = stand_in.info.cg_scale;
                     cx.cur.throttled_until = stand_in.info.throttled_until;
+                    cx.cur.memcg = stand_in.info.memcg;
                 }
             }
             sh.check_in_files(&mut cx);
@@ -4858,6 +4901,7 @@ impl Kernel {
         info.frozen = sched.frozen;
         info.cg_scale = sched.scale;
         info.throttled_until = sched.throttled_until;
+        info.memcg = sched.memcg;
         info.run = RunState::Running;
         info.futex_wait = None;
         info.futex_waitv = Vec::new();
@@ -6265,7 +6309,7 @@ impl Kernel {
                 // A cgroup's `cpu` settings or controllers changed: its tasks
                 // take them on now.
                 if resync && r >= 0 {
-                    self.cgroup_resync(cx);
+                    self.cgroup_resync(cx, mem);
                 }
                 r
             }
