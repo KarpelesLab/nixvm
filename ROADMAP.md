@@ -435,7 +435,10 @@ under policy. DNS.
     `std::net`, behind `cfg(not(wasm32))` and the `NIXVM_NET=host` policy
     (off by default = loopback-only, ENETUNREACH). `poll`/`select` readiness
     is a precise non-blocking peek for host sockets (apk's http client trusts
-    poll). `Vm`/`run-elf-x86` inject `/etc/resolv.conf` (the minirootfs ships
+    poll). Keepalive and linger options reach the host socket; a nonzero
+    `SO_LINGER` makes the guest's last `close` wait until the peer has
+    acknowledged everything, or the timeout passes, without the host socket
+    ever blocking. `Vm`/`run-elf-x86` inject `/etc/resolv.conf` (the minirootfs ships
     none). **Verified: `apk update` (24171 pkgs) and `apk add jq` download +
     install from the real Alpine mirror and `jq` runs**, on x86-64
     (`tests/alpine_boot.rs::apk_update_over_host_egress`, gated on

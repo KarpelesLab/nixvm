@@ -548,6 +548,9 @@ struct HostSock {
     /// Cleared when a (re-trapped or repeated) `connect` or
     /// `getsockopt(SO_ERROR)` reports the result.
     connecting: bool,
+    /// When a lingering `close` (a nonzero `SO_LINGER`) gives up waiting for
+    /// the peer to acknowledge what was sent, once one has started.
+    linger_until: Option<u128>,
 }
 
 // Only `peer` is meaningful in a dump; the boxed conn and flags are noise.
@@ -916,6 +919,38 @@ impl Net {
                 self.release(sock);
             }
         }
+    }
+
+    /// One step of a lingering `close` of `fd` at time `now`: `Some(when)` to
+    /// wait and try again then, `None` to close now. Only the last fd on a
+    /// connection to the host with a nonzero `SO_LINGER` waits: the first step
+    /// sends the FIN, and the wait ends once the peer has acknowledged
+    /// everything (as Linux's waits for the FIN's ack) or the timeout passes.
+    /// A negative timeout is as good as forever, as on Linux.
+    pub(super) fn linger_step(&mut self, fd: &Fd, now: u128) -> Option<u128> {
+        const POLL_NS: u128 = 5_000_000;
+        let Fd::Socket { sock, .. } = *fd else {
+            return None;
+        };
+        let s = self.socks.get_mut(sock)?;
+        let (on, secs) = (s.opts.linger_on, s.opts.linger_secs);
+        let Kind::Host(h) = &mut s.kind else {
+            return None;
+        };
+        if s.refs != 1 || !on || secs == 0 || h.connecting {
+            return None;
+        }
+        let until = *h
+            .linger_until
+            .get_or_insert_with(|| now + u128::from(secs.cast_unsigned()) * 1_000_000_000);
+        if !h.wr_shut {
+            h.conn.shutdown_write();
+            h.wr_shut = true;
+        }
+        if now >= until || h.conn.unsent().is_none_or(|n| n == 0) {
+            return None;
+        }
+        Some(until.min(now + POLL_NS))
     }
 
     /// The last fd on (non-pair) socket `sock` closed: free what it holds. A
@@ -1780,6 +1815,7 @@ impl Kernel {
                     wr_shut: false,
                     nonblock,
                     connecting: pending,
+                    linger_until: None,
                 });
                 match (pending, nonblock) {
                     (false, _) => 0,
@@ -6444,6 +6480,112 @@ mod tests {
                 ConnOption::ResetOnClose(true)
             ]
         );
+    }
+
+    /// An egress whose connection reports a settable count of unacknowledged
+    /// bytes, and whether its write side was shut.
+    #[derive(Debug, Default, Clone)]
+    struct Unacked(
+        std::sync::Arc<(
+            std::sync::atomic::AtomicUsize,
+            std::sync::atomic::AtomicBool,
+        )>,
+    );
+    use std::sync::atomic::Ordering;
+    impl HostConn for Unacked {
+        fn recv(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::WouldBlock.into())
+        }
+        fn send(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            Ok(b.len())
+        }
+        fn shutdown_write(&mut self) {
+            self.0.1.store(true, Ordering::Relaxed);
+        }
+        fn poll_readable(&mut self) -> bool {
+            false
+        }
+        fn unsent(&mut self) -> Option<usize> {
+            Some(self.0.0.load(Ordering::Relaxed))
+        }
+    }
+    impl Egress for Unacked {
+        fn connect_tcp(&self, _: [u8; 16], _: bool, _: u16) -> std::io::Result<Box<dyn HostConn>> {
+            Ok(Box::new(self.clone()))
+        }
+        fn open_udp(&self) -> std::io::Result<Box<dyn HostDgram>> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    }
+
+    #[test]
+    fn a_nonzero_linger_makes_close_wait_for_the_peer_to_acknowledge() {
+        use std::sync::atomic::Ordering;
+        let (mut k, mut mem, mut v, mut cx) = setup();
+        let conn = Unacked::default();
+        conn.0.0.store(100, Ordering::Relaxed);
+        k.set_egress(Box::new(conn.clone()));
+        let fd = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Socket,
+            [u64::from(AF_INET), SOCK_STREAM, 0, 0, 0, 0],
+        ) as u64;
+        mem.write(0x1_1000, &[1, 0, 0, 0, 2, 0, 0, 0]).unwrap(); // on, 2 s
+        let r = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Setsockopt,
+            [fd, SOL_SOCKET, SO_LINGER, 0x1_1000, 8, 0],
+        );
+        assert_eq!(r, 0);
+        write_sockaddr_in(&mut mem, 0x1_2000, [93, 184, 216, 34], 80);
+        let r = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Connect,
+            [fd, 0x1_2000, 16, 0, 0, 0],
+        );
+        assert_eq!(r, 0);
+        // Something is unacknowledged: the FIN goes out, and close waits.
+        call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Close,
+            [fd, 0, 0, 0, 0, 0],
+        );
+        assert!(cx.block && cx.cur.fds.get(fd as i32).is_some());
+        assert!(conn.0.1.load(Ordering::Relaxed), "the FIN was sent");
+        let wake = cx.cur.wake_deadline.unwrap();
+        assert!(
+            wake <= super::super::poll::now_ns() + 10_000_000,
+            "polled, not slept"
+        );
+        // Past the timeout, the wait ends even though it never drained.
+        let f = cx.cur.fds.get(fd as i32).cloned().unwrap();
+        let later = super::super::poll::now_ns() + 3_000_000_000;
+        assert_eq!(k.net.lock().unwrap().linger_step(&f, later), None);
+        // Once acknowledged, the close goes ahead.
+        cx.block = false;
+        conn.0.0.store(0, Ordering::Relaxed);
+        let r = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Close,
+            [fd, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(r, 0);
+        assert!(!cx.block && cx.cur.fds.get(fd as i32).is_none());
     }
 
     #[test]

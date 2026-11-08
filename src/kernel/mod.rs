@@ -4258,6 +4258,18 @@ impl Kernel {
             // last descriptor of an unlinked file deletes it.
             Sysno::Close => {
                 let closed = cx.cur.fds.get(args[0] as i32).cloned();
+                // A nonzero `SO_LINGER` on the last fd of a connection to the
+                // host: wait (until the peer acknowledged everything, or the
+                // timeout) before closing. A signal ends the wait, and the
+                // close goes ahead, as on Linux.
+                if let Some(f @ Fd::Socket { .. }) = &closed
+                    && self.first_handled_signal(cx).is_none()
+                    && let Some(wake) = self.net.lock().unwrap().linger_step(f, poll::now_ns())
+                {
+                    cx.cur.wake_deadline = Some(wake);
+                    cx.block = true;
+                    return 0;
+                }
                 let r = self.sys_close(cx, args[0] as i32);
                 if let Some(f) = closed {
                     self.release_fd_locks(sh, cx, &f);

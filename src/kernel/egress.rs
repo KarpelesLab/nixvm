@@ -62,6 +62,12 @@ pub trait HostConn: Send + Debug {
     fn set_option(&mut self, opt: ConnOption) {
         let _ = opt;
     }
+    /// Bytes written but not yet acknowledged by the peer, if the transport can
+    /// tell: what a lingering `close` waits to see drain. `None` means unknown,
+    /// and then `close` doesn't wait.
+    fn unsent(&mut self) -> Option<usize> {
+        None
+    }
 }
 
 /// A socket option a guest sets that also has to reach the real connection.
@@ -77,8 +83,9 @@ pub enum ConnOption {
     KeepInterval(u32),
     KeepCount(u32),
     /// `SO_LINGER` with a zero timeout: closing resets the connection rather
-    /// than ending it cleanly. A nonzero timeout makes `close` wait on Linux,
-    /// which the host can't do for a guest, so that one never reaches it.
+    /// than ending it cleanly. A nonzero timeout makes the guest's `close` wait
+    /// for what it sent to be acknowledged (see [`HostConn::unsent`]); the host
+    /// socket itself never lingers, since that would block the VM.
     ResetOnClose(bool),
 }
 
@@ -217,6 +224,10 @@ mod native {
                 _ => {}
             }
         }
+        #[cfg(unix)]
+        fn unsent(&mut self) -> Option<usize> {
+            super::sockopt::unsent(&self.0)
+        }
         fn poll_readable(&mut self) -> bool {
             // A non-blocking peek: any bytes (or a clean EOF, reported as
             // `Ok(0)`) means a subsequent recv won't block. `WouldBlock` means
@@ -272,6 +283,44 @@ mod sockopt {
 
     unsafe extern "C" {
         fn setsockopt(fd: c_int, level: c_int, name: c_int, val: *const c_void, len: u32) -> c_int;
+        #[cfg(target_os = "linux")]
+        fn ioctl(fd: c_int, request: std::os::raw::c_ulong, ...) -> c_int;
+        #[cfg(not(target_os = "linux"))]
+        fn getsockopt(
+            fd: c_int,
+            level: c_int,
+            name: c_int,
+            val: *mut c_void,
+            len: *mut u32,
+        ) -> c_int;
+    }
+
+    /// Bytes sent on `sock` that the peer hasn't acknowledged yet (Linux's
+    /// `SIOCOUTQ`, which counts the FIN too; the BSDs' `SO_NWRITE`).
+    pub(super) fn unsent(sock: &impl AsRawFd) -> Option<usize> {
+        let mut n: c_int = 0;
+        #[cfg(target_os = "linux")]
+        // SAFETY: a live descriptor, and `SIOCOUTQ` writes one int to `n`.
+        let r = unsafe { ioctl(sock.as_raw_fd(), 0x5411, &raw mut n) };
+        #[cfg(not(target_os = "linux"))]
+        let r = {
+            let mut len = std::mem::size_of::<c_int>() as u32;
+            // SAFETY: a live descriptor, and `n` is `len` writable bytes.
+            unsafe {
+                getsockopt(
+                    sock.as_raw_fd(),
+                    consts::SOL_SOCKET,
+                    0x1024, // SO_NWRITE
+                    (&raw mut n).cast(),
+                    &raw mut len,
+                )
+            }
+        };
+        if r == 0 {
+            usize::try_from(n).ok()
+        } else {
+            None
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -379,6 +428,29 @@ mod sockopt {
             assert_eq!(get(&s, super::IPPROTO_TCP, super::TCP_KEEPCNT)[0], 3);
             apply(&s, ConnOption::ResetOnClose(true));
             assert_ne!(get(&s, super::SOL_SOCKET, super::SO_LINGER)[0], 0);
+        }
+
+        #[test]
+        fn unsent_counts_what_the_peer_has_not_acknowledged() {
+            use std::io::Write;
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut s = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+            let (mut peer, _) = l.accept().unwrap();
+            assert_eq!(super::unsent(&s), Some(0));
+            // The peer never reads: once its window is full, sent bytes stay
+            // unacknowledged.
+            s.set_nonblocking(true).unwrap();
+            let chunk = vec![7u8; 65536];
+            while s.write(&chunk).is_ok() {}
+            assert!(super::unsent(&s).unwrap() > 0);
+            // Reading it all lets the rest be acknowledged.
+            peer.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut buf = vec![0u8; 1 << 20];
+            while super::unsent(&s) != Some(0) {
+                assert!(std::time::Instant::now() < deadline, "never drained");
+                let _ = std::io::Read::read(&mut peer, &mut buf);
+            }
         }
     }
 }

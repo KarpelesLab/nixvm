@@ -188,7 +188,9 @@ Useful environment variables (both harnesses):
   with `O_NOFOLLOW`, so even a symlink swapped in mid-race fails safely
   instead of redirecting the I/O.
   (4) `kernel::egress` — `setsockopt(2)` on a host socket, for the keepalive
-  and linger options a guest sets that `std` has no call for.
+  and linger options a guest sets that `std` has no call for, and `ioctl(2)`
+  (`SIOCOUTQ`; `getsockopt(SO_NWRITE)` on macOS) to see what the peer hasn't
+  acknowledged yet, which a guest's lingering `close` waits for.
 
 ## Limits and isolation
 
