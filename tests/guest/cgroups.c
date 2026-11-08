@@ -369,10 +369,14 @@ int main(void) {
   int small_gone = waitpid(small, &st, WNOHANG) == small;
   printf("memory.max lowered: %lld kill(s), the small one %s\n", now_kills - kills,
          small_gone ? "killed too" : "kept");
-  CHECK(now_kills == kills + 1);
-  CHECK(!small_gone); /* the small one stays */
-  kill(small, SIGKILL);
-  CHECK(waitpid(small, &st, 0) == small);
+  /* The big one goes first. Linux may take the small one too, if it looks
+   * again before the big one's memory is all freed; nixvm frees it as the task
+   * dies, so it stops at one. */
+  CHECK(now_kills == kills + 1 + small_gone);
+  if (!small_gone) {
+    kill(small, SIGKILL);
+    CHECK(waitpid(small, &st, 0) == small);
+  }
   /* memory.high: past it, with nothing to reclaim, an allocating task sleeps
    * off its overage, longer the further over it is. */
   CHECK(put(mm, "memory.max", "max") == 0 && put(mm, "memory.high", "8M") == 0);
