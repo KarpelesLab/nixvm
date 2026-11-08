@@ -5,8 +5,11 @@
 //! ([`CgroupFs`]) and the kernel. A mount shows the tree from a node down: the
 //! root for the first cgroup namespace, a namespace's own root otherwise.
 //!
-//! Only controllers nixvm enforces are offered. That is `pids` (a `pids.max`
-//! that `fork` and `clone` honour), next to the core files every cgroup has:
+//! Only controllers nixvm enforces are offered: `cpu` (a `cpu.max` bandwidth
+//! limit, which holds a cgroup's tasks off the CPU once its quota for the
+//! period is used, and `cpu.weight`, which scales its tasks' share of the CPU)
+//! and `pids` (a `pids.max` that `fork` and `clone` honour), next to the core
+//! files every cgroup has:
 //! moving processes (`cgroup.procs`), `cgroup.kill`, `cgroup.freeze`, the
 //! `cgroup.max.*` limits and `cpu.stat`. Writes that act on tasks (moving,
 //! killing, freezing) need the writer's identity and the task table, so the
@@ -18,6 +21,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{Attrs, DirEntry, MountFs, NodeKind};
@@ -25,8 +29,11 @@ use super::{Attrs, DirEntry, MountFs, NodeKind};
 /// The root cgroup's id.
 pub const ROOT: u32 = 0;
 
-/// The controllers there are, as `cgroup.controllers` lists them.
-const CONTROLLERS: &[&str] = &["pids"];
+/// The controllers there are, as `cgroup.controllers` lists them, with the
+/// bit each has in a cgroup's set of enabled controllers.
+const CONTROLLERS: &[(&str, u8)] = &[("cpu", CPU), ("pids", PIDS)];
+const CPU: u8 = 1;
+const PIDS: u8 = 2;
 
 /// Files every cgroup has, and whether a write is accepted.
 const CORE_FILES: &[(&str, bool)] = &[
@@ -42,6 +49,7 @@ const CORE_FILES: &[(&str, bool)] = &[
     ("cgroup.threads", true),
     ("cgroup.type", true),
     ("cpu.stat", false),
+    ("cpu.stat.local", false),
 ];
 
 /// Core files the root doesn't have.
@@ -57,6 +65,26 @@ const PIDS_FILES: &[(&str, bool)] = &[
     ("pids.current", false),
     ("pids.events", false),
     ("pids.max", true),
+];
+
+/// The `cpu` controller's files, in a cgroup whose parent enables it.
+const CPU_FILES: &[(&str, bool)] = &[
+    ("cpu.idle", true),
+    ("cpu.max", true),
+    ("cpu.max.burst", true),
+    ("cpu.weight", true),
+    ("cpu.weight.nice", true),
+];
+
+/// Writes that change how the cgroup's tasks are scheduled, which the kernel
+/// passes on to them once the write is done.
+pub const SCHED_FILES: &[&str] = &[
+    "cgroup.subtree_control",
+    "cpu.idle",
+    "cpu.max",
+    "cpu.max.burst",
+    "cpu.weight",
+    "cpu.weight.nice",
 ];
 
 /// Writes the kernel handles, since they act on tasks.
@@ -78,7 +106,175 @@ const EBUSY: i32 = 16;
 const EEXIST: i32 = 17;
 const ENOTDIR: i32 = 20;
 const EINVAL: i32 = 22;
+const ERANGE: i32 = 34;
 const EOPNOTSUPP: i32 = 95;
+
+/// The default scheduling weight (a nice-0 task's), which `cpu.weight` 100 is.
+const NICE0_SHARES: u64 = 1024;
+/// An idle cgroup's weight (Linux's `WEIGHT_IDLEPRIO`).
+const IDLE_SHARES: u64 = 3;
+const NS_PER_US: u128 = 1000;
+
+/// `cpu.max`, `cpu.max.burst` and the state of the bandwidth they allow, as
+/// Linux's CFS bandwidth control keeps it: each period the cgroup gets its
+/// quota of CPU time (plus what it saved, up to the burst); used up, its tasks
+/// wait for the next period.
+#[derive(Debug, Clone)]
+struct Bandwidth {
+    /// Microseconds of CPU time per period; `None` is "max".
+    quota_us: Option<u64>,
+    period_us: u64,
+    burst_us: u64,
+    /// When the current period started (ns, as `poll::now_ns`), once the
+    /// cgroup has used CPU time under a quota.
+    period_start: u128,
+    /// CPU time left this period (ns); negative when overdrawn.
+    runtime: i128,
+    /// `runtime` as the period began, to tell how much of a burst was used.
+    snap: i128,
+    /// Throttled since this time, until the period ends.
+    throttled_since: Option<u128>,
+    nr_periods: u64,
+    nr_throttled: u64,
+    throttled_ns: u128,
+    nr_bursts: u64,
+    burst_ns: u128,
+}
+
+impl Default for Bandwidth {
+    fn default() -> Self {
+        Self {
+            quota_us: None,
+            period_us: 100_000,
+            burst_us: 0,
+            period_start: 0,
+            runtime: 0,
+            snap: 0,
+            throttled_since: None,
+            nr_periods: 0,
+            nr_throttled: 0,
+            throttled_ns: 0,
+            nr_bursts: 0,
+            burst_ns: 0,
+        }
+    }
+}
+
+impl Bandwidth {
+    fn period_ns(&self) -> u128 {
+        u128::from(self.period_us) * NS_PER_US
+    }
+
+    fn end(&self) -> u128 {
+        self.period_start + self.period_ns()
+    }
+
+    /// Move on to the period `now` is in, refilling the quota for it.
+    fn roll(&mut self, now: u128) {
+        let Some(quota) = self.quota_us else {
+            return;
+        };
+        let quota = i128::from(quota) * NS_PER_US as i128;
+        let cap = quota + i128::from(self.burst_us) * NS_PER_US as i128;
+        if self.period_start == 0 {
+            self.period_start = now;
+            self.runtime = quota;
+            self.snap = quota;
+            self.nr_periods = 1;
+            return;
+        }
+        if now < self.end() {
+            return;
+        }
+        if let Some(since) = self.throttled_since.take() {
+            self.throttled_ns += self.end().saturating_sub(since);
+        }
+        let periods = (now - self.period_start) / self.period_ns();
+        self.period_start += periods * self.period_ns();
+        // Linux counts the periods its timer ran for, which stops once the
+        // cgroup goes idle: a long idle gap counts once.
+        self.nr_periods += 1;
+        // A burst is the saved runtime the last period drew on. Overdrawing
+        // (a task runs a little past the end of the quota) isn't one: Linux
+        // keeps that debt per CPU, apart from the pool, and repays it from
+        // the next period's quota, as it is here.
+        let used_beyond_quota = self.snap - (self.runtime.max(0) + quota);
+        self.runtime += quota;
+        if used_beyond_quota > 0 {
+            self.nr_bursts += 1;
+            self.burst_ns += used_beyond_quota.cast_unsigned();
+        }
+        self.runtime = self.runtime.min(cap);
+        self.snap = self.runtime;
+    }
+
+    /// Throttled time, the current throttle's elapsed part included.
+    fn throttled_ns(&self, now: u128) -> u128 {
+        self.throttled_ns
+            + self
+                .throttled_since
+                .map_or(0, |s| now.min(self.end()).saturating_sub(s))
+    }
+
+    /// Until when the cgroup is throttled, if it is at `now`.
+    fn throttled_until(&self, now: u128) -> Option<u128> {
+        (self.throttled_since.is_some() && now < self.end()).then(|| self.end())
+    }
+}
+
+/// An integer as a kernfs file takes one: decimal, or `0x` hex or `0` octal.
+fn parse_int<T: TryFrom<i128>>(text: &str) -> Result<T, i32> {
+    let (neg, t) = match text.strip_prefix('-') {
+        Some(t) => (true, t),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let v = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        i128::from_str_radix(h, 16)
+    } else if t.len() > 1 && t.starts_with('0') {
+        i128::from_str_radix(&t[1..], 8)
+    } else {
+        t.parse()
+    }
+    .map_err(|_| EINVAL)?;
+    T::try_from(if neg { -v } else { v }).map_err(|_| ERANGE)
+}
+
+/// Set a cgroup's bandwidth, with the bounds Linux's `tg_set_bandwidth` has:
+/// a period from 1 ms to 1 s, a quota of at least 1 ms, and no more burst than
+/// quota. The period starts over.
+fn set_bandwidth(
+    bw: &mut Bandwidth,
+    quota: Option<u64>,
+    period: u64,
+    burst: u64,
+) -> Result<(), i32> {
+    const MAX_RUNTIME_US: u64 = (1 << 44) - 1;
+    if !(1000..=1_000_000).contains(&period)
+        || quota.is_some_and(|q| !(1000..=MAX_RUNTIME_US).contains(&q))
+        || quota.is_some_and(|q| burst > q || burst + q > MAX_RUNTIME_US)
+        || burst > u64::MAX / 1000
+    {
+        return Err(EINVAL);
+    }
+    *bw = Bandwidth {
+        quota_us: quota,
+        period_us: period,
+        burst_us: burst,
+        nr_periods: bw.nr_periods,
+        nr_throttled: bw.nr_throttled,
+        throttled_ns: bw.throttled_ns,
+        nr_bursts: bw.nr_bursts,
+        burst_ns: bw.burst_ns,
+        ..Bandwidth::default()
+    };
+    Ok(())
+}
+
+/// The weights Linux gives each nice level, for `cpu.weight.nice`: nice 0 is
+/// 1024, and each level is about 1.25 times the next.
+fn nice_shares(nice: i64) -> u64 {
+    (1024.0 / 1.25f64.powi(nice.clamp(-20, 19) as i32)).round() as u64
+}
 
 /// One cgroup.
 #[derive(Debug, Clone)]
@@ -86,12 +282,18 @@ struct Node {
     name: String,
     parent: Option<u32>,
     children: BTreeMap<String, u32>,
-    /// `cgroup.subtree_control` has `pids`.
-    pids_below: bool,
+    /// The controllers `cgroup.subtree_control` enables for the children.
+    subtree: u8,
     /// `pids.max`; `None` is "max".
     pids_max: Option<u64>,
     /// How often a fork failed on this cgroup's `pids.max` (`pids.events`).
     pids_events: u64,
+    /// The scheduling weight `cpu.weight` sets (in Linux's units, 1024 being
+    /// `cpu.weight` 100).
+    shares: u64,
+    /// `cpu.idle`.
+    idle: bool,
+    bandwidth: Bandwidth,
     max_depth: Option<u64>,
     max_descendants: Option<u64>,
     /// `cgroup.freeze` was set here (a task is frozen if any ancestor's is).
@@ -108,14 +310,31 @@ struct Node {
 }
 
 impl Node {
+    /// Back to what a controller's files start with, as when Linux makes the
+    /// controller's state for the cgroup anew.
+    fn reset(&mut self, controllers: u8) {
+        if controllers & CPU != 0 {
+            self.shares = NICE0_SHARES;
+            self.idle = false;
+            self.bandwidth = Bandwidth::default();
+        }
+        if controllers & PIDS != 0 {
+            self.pids_max = None;
+            self.pids_events = 0;
+        }
+    }
+
     fn new(name: &str, parent: Option<u32>, uid: u32, gid: u32) -> Self {
         Self {
             name: name.to_string(),
             parent,
             children: BTreeMap::new(),
-            pids_below: false,
+            subtree: 0,
             pids_max: None,
             pids_events: 0,
+            shares: NICE0_SHARES,
+            idle: false,
+            bandwidth: Bandwidth::default(),
             max_depth: None,
             max_descendants: None,
             freeze: false,
@@ -131,6 +350,11 @@ impl Node {
 
 fn now() -> i64 {
     crate::clock::now_unix().as_secs() as i64
+}
+
+/// The time the bandwidth periods run on: the kernel's `poll::now_ns` clock.
+fn now_ns() -> u128 {
+    crate::clock::now_unix().as_nanos()
 }
 
 /// A task with a cgroup other than the root.
@@ -164,7 +388,26 @@ pub struct CgroupTree {
     ns_roots: BTreeMap<u32, u32>,
     /// What [`CgroupFs`] renders (see [`View`]).
     pub view: View,
+    /// How many cgroups have a `cpu.max` quota: while none do, the kernel
+    /// needn't charge CPU time to cgroups as it goes.
+    quotas: Arc<AtomicUsize>,
 }
+
+/// How a cgroup's tasks are to be scheduled, from its own settings and its
+/// ancestors'.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedState {
+    /// `cgroup.freeze` holds them.
+    pub frozen: bool,
+    /// What each nanosecond they run counts for in fair scheduling, against a
+    /// task in the root, in units of 1/65536: from `cpu.weight` on the way up.
+    pub scale: u64,
+    /// A `cpu.max` holds them until then.
+    pub throttled_until: Option<u128>,
+}
+
+/// [`SchedState::scale`] for a cgroup with the default weight.
+pub const UNSCALED: u64 = 1 << 16;
 
 impl Default for CgroupTree {
     fn default() -> Self {
@@ -176,6 +419,7 @@ impl Default for CgroupTree {
             members: BTreeMap::new(),
             ns_roots: BTreeMap::new(),
             view: View::default(),
+            quotas: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -188,6 +432,71 @@ impl CgroupTree {
     #[must_use]
     pub fn shared() -> SharedTree {
         Arc::new(Mutex::new(Self::default()))
+    }
+
+    /// A count, kept up to date, of the cgroups with a `cpu.max` quota.
+    #[must_use]
+    pub fn quota_gate(&self) -> Arc<AtomicUsize> {
+        self.quotas.clone()
+    }
+
+    fn update_quota_gate(&self) {
+        let n = self
+            .nodes
+            .iter()
+            .filter(|&(&id, x)| x.bandwidth.quota_us.is_some() && self.has(id, CPU))
+            .count();
+        self.quotas.store(n, Ordering::Relaxed);
+    }
+
+    /// The cgroups from `node` up whose `cpu` settings apply.
+    fn cpu_chain(&self, node: u32) -> Vec<u32> {
+        self.chain(node)
+            .into_iter()
+            .filter(|&n| n != ROOT && self.has(n, CPU))
+            .collect()
+    }
+
+    /// How tasks in `node` are to be scheduled at `now`.
+    #[must_use]
+    pub fn sched_state(&self, node: u32, now: u128) -> SchedState {
+        let mut scale = u128::from(UNSCALED);
+        let mut throttled_until = None;
+        for n in self.cpu_chain(node) {
+            let x = &self.nodes[&n];
+            scale = (scale * u128::from(NICE0_SHARES) / u128::from(x.shares.max(1)))
+                .min(u128::from(u64::MAX));
+            throttled_until = throttled_until.max(x.bandwidth.throttled_until(now));
+        }
+        SchedState {
+            frozen: self.frozen(node),
+            scale: u64::try_from(scale).unwrap_or(u64::MAX),
+            throttled_until,
+        }
+    }
+
+    /// Charge `ns` of CPU time a task in `node` used to each `cpu.max` on the
+    /// way up, at `now`. Returns until when the task is now throttled, if it
+    /// is, and the highest cgroup this throttled anew, whose other tasks are
+    /// to be held as well.
+    pub fn charge_cpu(&mut self, node: u32, ns: u64, now: u128) -> (Option<u128>, Option<u32>) {
+        let mut until = None;
+        let mut newly = None;
+        for n in self.cpu_chain(node) {
+            let b = &mut self.nodes.get_mut(&n).expect("in the chain").bandwidth;
+            if b.quota_us.is_none() {
+                continue;
+            }
+            b.roll(now);
+            b.runtime -= i128::from(ns);
+            if b.throttled_since.is_none() && b.runtime <= 0 {
+                b.throttled_since = Some(now);
+                b.nr_throttled += 1;
+                newly = Some(n);
+            }
+            until = until.max(b.throttled_until(now));
+        }
+        (until, newly)
     }
 
     /// The cgroup task `tid` is in.
@@ -259,14 +568,16 @@ impl CgroupTree {
     }
 
     /// Whether a task can be put in `node`, by cgroup v2's "no internal
-    /// processes" rule (Linux's `cgroup_migrate_vet_dst`). The only controller
-    /// here, `pids`, is a threaded one, which may share a cgroup with tasks:
-    /// so the rule only refuses a cgroup that already hands a controller to
-    /// populated children. The root is exempt.
+    /// processes" rule (Linux's `cgroup_migrate_vet_dst`). The controllers
+    /// here, `cpu` and `pids`, are threaded ones, which may share a cgroup with
+    /// tasks: so the rule only refuses a cgroup that already hands a controller
+    /// to populated children. The root is exempt.
     pub fn check_attach(&self, node: u32) -> Result<(), i32> {
         match self.nodes.get(&node) {
             None => Err(ENOENT),
-            Some(n) if node != ROOT && n.pids_below && self.has_populated_child(node) => Err(EBUSY),
+            Some(n) if node != ROOT && n.subtree != 0 && self.has_populated_child(node) => {
+                Err(EBUSY)
+            }
             Some(_) => Ok(()),
         }
     }
@@ -484,24 +795,43 @@ impl CgroupTree {
             .filter(|(f, _)| node != ROOT || !NOT_AT_ROOT.contains(f))
             .copied()
             .collect();
-        let parent = self.nodes.get(&node).and_then(|n| n.parent);
-        if parent
-            .and_then(|p| self.nodes.get(&p))
-            .is_some_and(|p| p.pids_below)
-        {
+        if node != ROOT && self.has(node, CPU) {
+            out.extend_from_slice(CPU_FILES);
+        }
+        if node != ROOT && self.has(node, PIDS) {
             out.extend_from_slice(PIDS_FILES);
         }
         out.sort_unstable();
         out
     }
 
-    /// The controllers `node` may enable for its children.
-    fn controllers(&self, node: u32) -> Vec<&'static str> {
+    /// The controllers `node` has: all of them at the root, elsewhere those
+    /// its parent enables.
+    fn controller_bits(&self, node: u32) -> u8 {
         match self.nodes.get(&node).and_then(|n| n.parent) {
-            None => CONTROLLERS.to_vec(),
-            Some(p) if self.nodes.get(&p).is_some_and(|p| p.pids_below) => vec!["pids"],
-            Some(_) => Vec::new(),
+            None => CONTROLLERS.iter().fold(0, |a, (_, b)| a | b),
+            Some(p) => self.nodes.get(&p).map_or(0, |p| p.subtree),
         }
+    }
+
+    /// Whether `node` has `controller`.
+    fn has(&self, node: u32, controller: u8) -> bool {
+        self.controller_bits(node) & controller != 0
+    }
+
+    /// The names of the controllers in `bits`.
+    fn names(bits: u8) -> String {
+        CONTROLLERS
+            .iter()
+            .filter(|(_, b)| bits & b != 0)
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The controllers `node` may enable for its children.
+    fn controllers(&self, node: u32) -> String {
+        Self::names(self.controller_bits(node))
     }
 
     fn depth(&self, node: u32) -> u64 {
@@ -580,11 +910,12 @@ impl CgroupTree {
             let _ = tasks;
         }
         self.ns_roots.retain(|_, r| *r != node);
+        self.update_quota_gate();
         Ok(())
     }
 
     /// A write to one of the files handled here.
-    fn write_file(&mut self, node: u32, file: &str, text: &str) -> Result<(), i32> {
+    pub fn write_file(&mut self, node: u32, file: &str, text: &str) -> Result<(), i32> {
         let text = text.trim();
         let limit = |t: &str| -> Result<Option<u64>, i32> {
             if t == "max" {
@@ -593,76 +924,139 @@ impl CgroupTree {
                 t.parse().map(Some).map_err(|_| EINVAL)
             }
         };
+        match self.files(node).iter().find(|(f, _)| *f == file) {
+            None => return Err(ENOENT),
+            Some((_, false)) => return Err(EACCES),
+            Some(_) => {}
+        }
+        let n = self.nodes.get_mut(&node).ok_or(ENOENT)?;
         match file {
-            "cgroup.subtree_control" => self.write_subtree_control(node, text),
-            "cgroup.max.depth" => {
-                let v = limit(text)?;
-                self.nodes.get_mut(&node).ok_or(ENOENT)?.max_depth = v;
-                Ok(())
+            "cgroup.subtree_control" => return self.write_subtree_control(node, text),
+            "cgroup.max.depth" => n.max_depth = limit(text)?,
+            "cgroup.max.descendants" => n.max_descendants = limit(text)?,
+            "pids.max" => n.pids_max = limit(text)?,
+            "cpu.weight" => {
+                let w: u64 = parse_int(text)?;
+                if !(1..=10_000).contains(&w) {
+                    return Err(ERANGE);
+                }
+                if n.idle {
+                    return Err(EINVAL);
+                }
+                n.shares = (w * NICE0_SHARES + 50) / 100;
             }
-            "cgroup.max.descendants" => {
-                let v = limit(text)?;
-                self.nodes.get_mut(&node).ok_or(ENOENT)?.max_descendants = v;
-                Ok(())
+            "cpu.weight.nice" => {
+                let nice: i64 = parse_int(text)?;
+                if !(-20..=19).contains(&nice) {
+                    return Err(ERANGE);
+                }
+                if n.idle {
+                    return Err(EINVAL);
+                }
+                n.shares = nice_shares(nice);
             }
-            "pids.max" => {
-                let v = limit(text)?;
-                self.nodes.get_mut(&node).ok_or(ENOENT)?.pids_max = v;
-                Ok(())
+            "cpu.idle" => {
+                let idle = match parse_int::<i64>(text)? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(EINVAL),
+                };
+                if idle != n.idle {
+                    // Leaving idle goes back to the default weight, as on Linux.
+                    n.idle = idle;
+                    n.shares = if idle { IDLE_SHARES } else { NICE0_SHARES };
+                }
+            }
+            "cpu.max" => {
+                // "$MAX [$PERIOD]": the period stays as it was if not given.
+                let mut words = text.split_whitespace();
+                let quota = match words.next().ok_or(EINVAL)? {
+                    "max" => None,
+                    q => Some(q.parse::<u64>().map_err(|_| EINVAL)?),
+                };
+                let period = match words.next() {
+                    Some(p) => p.parse::<u64>().map_err(|_| EINVAL)?,
+                    None => n.bandwidth.period_us,
+                };
+                let burst = n.bandwidth.burst_us;
+                set_bandwidth(&mut n.bandwidth, quota, period, burst)?;
+                self.update_quota_gate();
+            }
+            "cpu.max.burst" => {
+                let burst: u64 = parse_int(text)?;
+                let (quota, period) = (n.bandwidth.quota_us, n.bandwidth.period_us);
+                set_bandwidth(&mut n.bandwidth, quota, period, burst)?;
             }
             // Threaded subtrees aren't supported; "domain" isn't something to
             // write, as on Linux.
-            "cgroup.type" if text == "threaded" => Err(EOPNOTSUPP),
-            "cgroup.type" => Err(EINVAL),
-            f if KERNEL_FILES.contains(&f) => Err(EOPNOTSUPP),
-            _ => Err(EACCES),
+            "cgroup.type" if text == "threaded" => return Err(EOPNOTSUPP),
+            "cgroup.type" => return Err(EINVAL),
+            f if KERNEL_FILES.contains(&f) => return Err(EOPNOTSUPP),
+            _ => return Err(EACCES),
         }
+        Ok(())
     }
 
-    /// `+pids`/`-pids`, space separated, all or nothing.
+    /// `+name`/`-name` words, space separated, all or nothing.
     fn write_subtree_control(&mut self, node: u32, text: &str) -> Result<(), i32> {
-        let available = self.controllers(node);
-        let mut enable = None;
+        let available = self.controller_bits(node);
+        let old = self.nodes[&node].subtree;
+        let (mut on, mut off) = (0u8, 0u8);
         for word in text.split_whitespace() {
-            let (on, name) = match word.split_at(1) {
+            let (enable, name) = match word.split_at(1) {
                 ("+", n) => (true, n),
                 ("-", n) => (false, n),
                 _ => return Err(EINVAL),
             };
             // A controller the kernel doesn't have is EINVAL; one it has, but
             // that the parent doesn't hand down, is ENOENT.
-            if !CONTROLLERS.contains(&name) {
-                return Err(EINVAL);
+            let bit = CONTROLLERS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .ok_or(EINVAL)?
+                .1;
+            if enable {
+                if available & bit == 0 {
+                    return Err(ENOENT);
+                }
+                on |= bit;
+                off &= !bit;
+            } else {
+                off |= bit;
+                on &= !bit;
             }
-            if on && !available.contains(&name) {
-                return Err(ENOENT);
-            }
-            enable = Some(on);
         }
-        let Some(on) = enable else {
-            return Ok(());
-        };
-        let n = &self.nodes[&node];
-        if on == n.pids_below {
-            return Ok(());
-        }
-        if on {
-            // No internal processes (Linux's
-            // `cgroup_vet_subtree_control_enable`): a threaded controller may be
-            // enabled alongside tasks, unless the cgroup also has populated
-            // children, which it would then compete with.
-            if node != ROOT && self.has_own_tasks(node) && self.has_populated_child(node) {
-                return Err(EBUSY);
-            }
-        } else if n
-            .children
-            .values()
-            .any(|c| self.nodes.get(c).is_some_and(|c| c.pids_below))
+        let enabling = on & !old;
+        let disabling = off & old;
+        // No internal processes (Linux's `cgroup_vet_subtree_control_enable`):
+        // a threaded controller may be enabled alongside tasks, unless the
+        // cgroup also has populated children, which it would then compete
+        // with.
+        if enabling != 0
+            && node != ROOT
+            && self.has_own_tasks(node)
+            && self.has_populated_child(node)
         {
-            // A child still hands it on.
             return Err(EBUSY);
         }
-        self.nodes.get_mut(&node).expect("checked").pids_below = on;
+        // A child still hands a controller on to its own children.
+        let children: Vec<u32> = self.nodes[&node].children.values().copied().collect();
+        if children.iter().any(|c| {
+            self.nodes
+                .get(c)
+                .is_some_and(|c| c.subtree & disabling != 0)
+        }) {
+            return Err(EBUSY);
+        }
+        // The children's state for a controller that comes or goes starts
+        // over, as Linux makes it anew.
+        for c in children {
+            if let Some(c) = self.nodes.get_mut(&c) {
+                c.reset(enabling | disabling);
+            }
+        }
+        self.nodes.get_mut(&node).expect("checked").subtree = (old | enabling) & !disabling;
+        self.update_quota_gate();
         Ok(())
     }
 
@@ -681,10 +1075,8 @@ impl CgroupTree {
         };
         let limit = |v: Option<u64>| v.map_or_else(|| "max\n".to_string(), |v| format!("{v}\n"));
         match file {
-            "cgroup.controllers" => format!("{}\n", self.controllers(node).join(" ")),
-            "cgroup.subtree_control" => {
-                format!("{}\n", if n.pids_below { "pids" } else { "" })
-            }
+            "cgroup.controllers" => format!("{}\n", self.controllers(node)),
+            "cgroup.subtree_control" => format!("{}\n", Self::names(n.subtree)),
             "cgroup.procs" => list(&self.view.procs),
             "cgroup.threads" => list(&self.view.threads),
             "cgroup.events" => format!(
@@ -698,22 +1090,23 @@ impl CgroupTree {
             // Linux's layout: the controller counts are how many cgroups from
             // here down have that controller (`css`), this one included.
             "cgroup.stat" => {
-                let has_pids = |c: &u32| {
-                    *c == ROOT
-                        || self.nodes[c]
-                            .parent
-                            .is_some_and(|p| self.nodes.get(&p).is_some_and(|p| p.pids_below))
-                };
-                let pids = if has_pids(&node) {
-                    self.subtree(node).iter().filter(|c| has_pids(c)).count()
-                } else {
-                    0
-                };
-                format!(
-                    "nr_descendants {}\nnr_subsys_pids {pids}\nnr_dying_descendants 0\n\
-                     nr_dying_subsys_pids 0\n",
-                    self.descendants(node)
-                )
+                let mut out = format!("nr_descendants {}\n", self.descendants(node));
+                for &(name, bit) in CONTROLLERS {
+                    let count = if self.has(node, bit) {
+                        self.subtree(node)
+                            .iter()
+                            .filter(|&&c| self.has(c, bit))
+                            .count()
+                    } else {
+                        0
+                    };
+                    let _ = writeln!(out, "nr_subsys_{name} {count}");
+                }
+                out.push_str("nr_dying_descendants 0\n");
+                for (name, _) in CONTROLLERS {
+                    let _ = writeln!(out, "nr_dying_subsys_{name} 0");
+                }
+                out
             }
             "cgroup.freeze" => format!("{}\n", u8::from(n.freeze)),
             "cpu.stat" => {
@@ -724,8 +1117,46 @@ impl CgroupTree {
                     .copied()
                     .unwrap_or(n.dead_cpu_ns)
                     / 1000;
-                format!("usage_usec {usec}\nuser_usec {usec}\nsystem_usec 0\n")
+                let mut out = format!("usage_usec {usec}\nuser_usec {usec}\nsystem_usec 0\n");
+                if self.has(node, CPU) {
+                    let b = &n.bandwidth;
+                    let _ = write!(
+                        out,
+                        "nr_periods {}\nnr_throttled {}\nthrottled_usec {}\nnr_bursts {}\n\
+                         burst_usec {}\n",
+                        b.nr_periods,
+                        b.nr_throttled,
+                        b.throttled_ns(now_ns()) / NS_PER_US,
+                        b.nr_bursts,
+                        b.burst_ns / NS_PER_US
+                    );
+                }
+                out
             }
+            "cpu.stat.local" if self.has(node, CPU) => format!(
+                "throttled_usec {}\n",
+                n.bandwidth.throttled_ns(now_ns()) / NS_PER_US
+            ),
+            "cpu.weight" => format!(
+                "{}\n",
+                ((n.shares * 100 + NICE0_SHARES / 2) / NICE0_SHARES).clamp(1, 10_000)
+            ),
+            "cpu.weight.nice" => {
+                // The nice level whose weight is closest.
+                let nice = (-20..=19)
+                    .min_by_key(|&l| nice_shares(l).abs_diff(n.shares))
+                    .unwrap_or(0);
+                format!("{nice}\n")
+            }
+            "cpu.idle" => format!("{}\n", u8::from(n.idle)),
+            "cpu.max" => {
+                let b = &n.bandwidth;
+                match b.quota_us {
+                    Some(q) => format!("{q} {}\n", b.period_us),
+                    None => format!("max {}\n", b.period_us),
+                }
+            }
+            "cpu.max.burst" => format!("{}\n", n.bandwidth.burst_us),
             "pids.max" => limit(n.pids_max),
             "pids.current" => format!("{}\n", n.tasks),
             "pids.events" => format!("max {}\n", n.pids_events),
@@ -739,6 +1170,7 @@ impl CgroupTree {
             CORE_FILES
                 .iter()
                 .chain(PIDS_FILES)
+                .chain(CPU_FILES)
                 .position(|(n, _)| *n == f)
                 .map_or(0, |i| i as u64 + 1)
         });
@@ -973,7 +1405,7 @@ mod tests {
     fn a_hierarchy_with_the_pids_controller() {
         let tree = CgroupTree::shared();
         let mut fs = CgroupFs::new(tree.clone(), ROOT);
-        assert_eq!(read(&mut fs, "cgroup.controllers"), "pids\n");
+        assert_eq!(read(&mut fs, "cgroup.controllers"), "cpu pids\n");
         assert!(fs.stat("cgroup.events").is_none(), "the root has none");
         fs.mkdir("a", 0o755).unwrap();
         assert!(fs.stat("a/pids.max").is_none(), "not enabled yet");
@@ -1004,6 +1436,69 @@ mod tests {
     }
 
     #[test]
+    fn the_cpu_controller_weights_and_bandwidth() {
+        let tree = CgroupTree::shared();
+        let mut t = tree.lock().unwrap();
+        let gate = t.quota_gate();
+        let a = t.mkdir(ROOT, "a", 0, 0).unwrap();
+        assert!(!t.files(a).iter().any(|(f, _)| *f == "cpu.max"));
+        t.write_file(ROOT, "cgroup.subtree_control", "+cpu +pids")
+            .unwrap();
+        assert_eq!(t.render(ROOT, "cgroup.subtree_control"), "cpu pids\n");
+        assert_eq!(t.render(a, "cpu.weight"), "100\n");
+        assert_eq!(t.render(a, "cpu.max"), "max 100000\n");
+        // Weights: the scale is relative to a task in the root.
+        t.write_file(a, "cpu.weight", "200").unwrap();
+        assert_eq!(t.sched_state(a, 0).scale, UNSCALED / 2);
+        assert_eq!(t.write_file(a, "cpu.weight", "0"), Err(ERANGE));
+        assert_eq!(t.write_file(a, "cpu.weight", "x"), Err(EINVAL));
+        t.write_file(a, "cpu.weight.nice", "0").unwrap();
+        assert_eq!(t.render(a, "cpu.weight"), "100\n");
+        t.write_file(a, "cpu.weight.nice", "5").unwrap();
+        assert_eq!(t.render(a, "cpu.weight.nice"), "5\n");
+        t.write_file(a, "cpu.idle", "1").unwrap();
+        assert_eq!(t.render(a, "cpu.weight"), "1\n");
+        assert_eq!(t.write_file(a, "cpu.weight", "50"), Err(EINVAL), "idle");
+        t.write_file(a, "cpu.idle", "0").unwrap();
+        assert_eq!(t.render(a, "cpu.weight"), "100\n", "back to the default");
+        // Bandwidth: 10 ms every 50 ms.
+        assert_eq!(t.write_file(a, "cpu.max", "500 100000"), Err(EINVAL));
+        assert_eq!(t.write_file(a, "cpu.max", "10000 2000000"), Err(EINVAL));
+        assert_eq!(t.write_file(ROOT, "cpu.max", "10000"), Err(ENOENT));
+        t.write_file(a, "cpu.max", "10000 50000").unwrap();
+        assert_eq!(gate.load(Ordering::Relaxed), 1);
+        assert_eq!(t.render(a, "cpu.max"), "10000 50000\n");
+        assert_eq!(t.write_file(a, "cpu.max.burst", "20000"), Err(EINVAL));
+        let ms = 1_000_000u128;
+        let start = 1000 * ms;
+        assert_eq!(t.charge_cpu(a, 4_000_000, start), (None, None));
+        let (until, newly) = t.charge_cpu(a, 6_000_000, start + 5 * ms);
+        assert_eq!((until, newly), (Some(start + 50 * ms), Some(a)));
+        assert_eq!(t.sched_state(a, start + 6 * ms).throttled_until, until);
+        assert_eq!(t.sched_state(a, start + 50 * ms).throttled_until, None);
+        // The next period has its quota again.
+        assert_eq!(t.charge_cpu(a, 1_000_000, start + 51 * ms), (None, None));
+        let stat = t.render(a, "cpu.stat");
+        assert!(
+            stat.contains("nr_periods 2\nnr_throttled 1\nthrottled_usec 45000\n"),
+            "{stat}"
+        );
+        // A child's time counts against its parent's quota.
+        let b = t.mkdir(a, "b", 0, 0).unwrap();
+        t.write_file(a, "cgroup.subtree_control", "+cpu").unwrap();
+        let (until, newly) = t.charge_cpu(b, 20_000_000, start + 52 * ms);
+        assert_eq!((until, newly), (Some(start + 100 * ms), Some(a)));
+        // Taking the controller away from the children resets them.
+        t.write_file(a, "cgroup.subtree_control", "-cpu").unwrap();
+        t.write_file(ROOT, "cgroup.subtree_control", "-cpu")
+            .unwrap();
+        assert_eq!(gate.load(Ordering::Relaxed), 0);
+        t.write_file(ROOT, "cgroup.subtree_control", "+cpu")
+            .unwrap();
+        assert_eq!(t.render(a, "cpu.max"), "max 100000\n");
+    }
+
+    #[test]
     fn no_internal_processes_and_limits_on_the_tree() {
         let tree = CgroupTree::shared();
         let mut t = tree.lock().unwrap();
@@ -1019,8 +1514,13 @@ mod tests {
         // pids is threaded: it may be enabled where there are tasks...
         t.write_file(a, "cgroup.subtree_control", "+pids").unwrap();
         assert_eq!(
-            t.write_file(a, "cgroup.subtree_control", "+cpu"),
+            t.write_file(a, "cgroup.subtree_control", "+memory"),
             Err(EINVAL)
+        );
+        assert_eq!(
+            t.write_file(a, "cgroup.subtree_control", "+cpu"),
+            Err(ENOENT),
+            "not handed down"
         );
         // ...but then nothing more goes into a once a child is populated.
         let kid = t.mkdir(a, "kid", 0, 0).unwrap();

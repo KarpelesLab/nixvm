@@ -1,13 +1,14 @@
 //! The kernel's side of cgroups (see [`crate::fs::cgroupfs`]): putting new
-//! tasks in their cgroup and enforcing `pids.max`, the writes that act on tasks
+//! tasks in their cgroup and enforcing `pids.max`, charging CPU time to
+//! `cpu.max` and handing tasks their cgroup's `cpu` settings, the writes that act on tasks
 //! (`cgroup.procs`, `cgroup.threads`, `cgroup.kill`, `cgroup.freeze`), the pids
 //! a reader of `cgroup.procs` sees, and `/proc/<pid>/cgroup`.
 //!
 //! The tree's lock is a leaf, taken after `shared` when both are needed.
 
-use super::{Fd, Kernel, RunState, ServiceCtx, Shared, err};
+use super::{Fd, Kernel, ProcInfo, RunState, ServiceCtx, Shared, err, poll};
 use crate::abi::errno::Errno;
-use crate::fs::cgroupfs::{CgroupTree, KERNEL_FILES, ROOT};
+use crate::fs::cgroupfs::{CgroupTree, KERNEL_FILES, ROOT, SCHED_FILES, SchedState};
 use crate::vcpu::GuestMemory;
 
 const SIGKILL_BIT: u64 = 1 << (9 - 1);
@@ -57,11 +58,66 @@ impl Kernel {
             .map_err(|e| err(Errno(e)))
     }
 
-    /// Put new task `tid` in its cgroup. Returns whether it starts frozen.
-    pub(super) fn cgroup_fork(&self, cx: &ServiceCtx, tid: i32, into: Option<u32>) -> bool {
+    /// Put new task `tid` in its cgroup. Returns how it's to be scheduled.
+    pub(super) fn cgroup_fork(&self, cx: &ServiceCtx, tid: i32, into: Option<u32>) -> SchedState {
         let mut tree = self.cgroups.lock().unwrap();
         let node = into.unwrap_or_else(|| tree.node_of(cx.cur.pid));
-        tree.attach_new(tid, node)
+        tree.attach_new(tid, node);
+        tree.sched_state(node, poll::now_ns())
+    }
+
+    /// Charge `ns` of CPU time the running task used to the `cpu.max` quotas
+    /// of its cgroup and those above. One that runs out holds every task below
+    /// it until its next period.
+    pub(super) fn cgroup_charge_cpu(&self, cx: &mut ServiceCtx, ns: u64) {
+        let now = poll::now_ns();
+        let (until, newly) = {
+            let mut tree = self.cgroups.lock().unwrap();
+            let node = tree.node_of(cx.cur.pid);
+            tree.charge_cpu(node, ns, now)
+        };
+        cx.cur.throttled_until = until;
+        if let Some(node) = newly {
+            let mut sh = self.shared.lock().unwrap();
+            let tree = self.cgroups.lock().unwrap();
+            let below = tree.subtree(node);
+            for p in sh.procs.iter_mut().flatten() {
+                if below.contains(&tree.node_of(p.info.pid)) {
+                    p.info.throttled_until = p.info.throttled_until.max(until);
+                }
+            }
+        }
+    }
+
+    /// Hand every task its cgroup's current settings (frozen, `cpu.weight`,
+    /// `cpu.max`), after a write that may have changed them.
+    pub(super) fn cgroup_resync(&self, cx: &mut ServiceCtx) {
+        let mut sh = self.shared.lock().unwrap();
+        let tree = self.cgroups.lock().unwrap();
+        let now = poll::now_ns();
+        let apply = |p: &mut ProcInfo| {
+            let st = tree.sched_state(tree.node_of(p.pid), now);
+            p.frozen = st.frozen;
+            p.cg_scale = st.scale;
+            p.throttled_until = st.throttled_until;
+        };
+        for p in sh.procs.iter_mut().flatten() {
+            apply(&mut p.info);
+        }
+        apply(&mut cx.cur);
+    }
+
+    /// Whether `fd` is a cgroup file whose writes change how tasks are
+    /// scheduled, so [`Self::cgroup_resync`] is due after one.
+    pub(super) fn is_cgroup_sched_file(&self, cx: &ServiceCtx, fd: u64) -> bool {
+        let Some(Fd::File { path, .. }) = cx.cur.fds.get(fd as i32) else {
+            return false;
+        };
+        let path = path.clone();
+        matches!(
+            self.vfs_for(cx).cgroup_at(&path),
+            Some((_, _, Some(f))) if SCHED_FILES.contains(&f.as_str())
+        )
     }
 
     /// The cgroup a `clone3` `CLONE_INTO_CGROUP` descriptor names.
@@ -235,16 +291,20 @@ impl Kernel {
             .filter(|t| t.tgid == tgid)
             .map(|t| (t.pid, !t.zombie))
             .collect();
-        let frozen = tree.migrate(&moving, node);
+        tree.migrate(&moving, node);
+        let st = tree.sched_state(node, poll::now_ns());
         drop(tree);
-        for p in sh.procs.iter_mut().flatten() {
-            if p.info.tgid == tgid {
-                p.info.frozen = frozen;
+        let apply = |p: &mut ProcInfo| {
+            if p.tgid == tgid {
+                p.frozen = st.frozen;
+                p.cg_scale = st.scale;
+                p.throttled_until = st.throttled_until;
             }
+        };
+        for p in sh.procs.iter_mut().flatten() {
+            apply(&mut p.info);
         }
-        if cx.cur.tgid == tgid {
-            cx.cur.frozen = frozen;
-        }
+        apply(&mut cx.cur);
         Ok(())
     }
 

@@ -1,5 +1,6 @@
 /* cgroup v2: a hierarchy of our own under the root cgroup, moving processes,
- * pids.max, cgroup.events, cgroup.kill, cgroup.freeze, the limits on the
+ * pids.max, the cpu controller (weights, cpu.max bandwidth), cgroup.events,
+ * cgroup.kill, cgroup.freeze, the limits on the
  * tree, CLONE_INTO_CGROUP, cgroup namespaces and /proc/<pid>/cgroup.
  *
  * Needs root and cgroup2 at /sys/fs/cgroup: run it as root on a real system
@@ -19,6 +20,7 @@
 #include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL: %s (line %d, errno %d)\n", #c, __LINE__, errno); cleanup(); exit(1); } } while (0)
@@ -49,12 +51,23 @@ static const char *get(const char *dir, const char *file) {
   return buf;
 }
 
+static double secs(clockid_t c) { struct timespec t; clock_gettime(c, &t); return t.tv_sec + t.tv_nsec / 1e9; }
+
+/* A number from a "key value" line of a flat-keyed file. */
+static long long field(const char *text, const char *key) {
+  char k[64];
+  snprintf(k, sizeof k, "%s ", key);
+  for (const char *l = text; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : 0)
+    if (!strncmp(l, k, strlen(k))) return atoll(l + strlen(k));
+  return -1;
+}
+
 static void path(char *out, const char *name) { snprintf(out, 256, "%.200s/%.50s", base, name); }
 
 static void cleanup(void) {
   if (!*base) return;
   put(home, "cgroup.procs", "0");
-  const char *kids[] = {"self", "lim", "kd", "fz", "nest/a", "nest", "into", "ns", "zz", 0};
+  const char *kids[] = {"self", "lim", "kd", "fz", "cq", "nest/a", "nest", "into", "ns", "zz", 0};
   for (int i = 0; kids[i]; i++) {
     char p[256];
     path(p, kids[i]);
@@ -198,6 +211,62 @@ int main(void) {
   CHECK(waitpid(c, &st, 0) == c && WIFSIGNALED(st));
   CHECK(rmdir(fz) == 0);
   puts("cgroup.freeze: ok");
+
+  /* The cpu controller: weights, and a cpu.max that holds a spinning child
+   * to its share of each period. */
+  if (!strstr(get("/sys/fs/cgroup", "cgroup.subtree_control"), "cpu"))
+    CHECK(put("/sys/fs/cgroup", "cgroup.subtree_control", "+cpu") == 0);
+  CHECK(put(base, "cgroup.subtree_control", "+cpu") == 0);
+  CHECK(strstr(get(base, "cgroup.subtree_control"), "cpu pids"));
+  char cq[256];
+  path(cq, "cq");
+  CHECK(mkdir(cq, 0755) == 0);
+  CHECK(!strcmp(get(cq, "cpu.weight"), "100\n"));
+  CHECK(!strcmp(get(cq, "cpu.max"), "max 100000\n"));
+  CHECK(!strcmp(get(cq, "cpu.max.burst"), "0\n"));
+  CHECK(!strcmp(get(cq, "cpu.idle"), "0\n"));
+  CHECK(access("/sys/fs/cgroup/cpu.max", F_OK) == -1); /* not at the root */
+  CHECK(put(cq, "cpu.weight", "300") == 0 && !strcmp(get(cq, "cpu.weight"), "300\n"));
+  CHECK(put(cq, "cpu.weight", "0") == -1 && errno == ERANGE);
+  CHECK(put(cq, "cpu.weight", "10001") == -1 && errno == ERANGE);
+  CHECK(put(cq, "cpu.weight.nice", "0") == 0 && !strcmp(get(cq, "cpu.weight"), "100\n"));
+  CHECK(put(cq, "cpu.weight.nice", "20") == -1 && errno == ERANGE);
+  CHECK(put(cq, "cpu.idle", "1") == 0 && !strcmp(get(cq, "cpu.weight"), "1\n"));
+  CHECK(put(cq, "cpu.weight", "50") == -1 && errno == EINVAL); /* idle */
+  CHECK(put(cq, "cpu.idle", "0") == 0 && !strcmp(get(cq, "cpu.weight"), "100\n"));
+  CHECK(put(cq, "cpu.idle", "2") == -1 && errno == EINVAL);
+  CHECK(put(cq, "cpu.max", "500") == -1 && errno == EINVAL);           /* under 1 ms */
+  CHECK(put(cq, "cpu.max", "10000 2000000") == -1 && errno == EINVAL); /* period over 1 s */
+  CHECK(put(cq, "cpu.max", "lots") == -1 && errno == EINVAL);
+  CHECK(put(cq, "cpu.max", "20000 100000") == 0 && !strcmp(get(cq, "cpu.max"), "20000 100000\n"));
+  CHECK(put(cq, "cpu.max.burst", "30000") == -1 && errno == EINVAL);  /* more than the quota */
+  CHECK(put(cq, "cpu.max.burst", "5000") == 0 && !strcmp(get(cq, "cpu.max.burst"), "5000\n"));
+  CHECK(put(cq, "cpu.max.burst", "0") == 0);
+  CHECK(put(cq, "cpu.max", "10000") == 0 && !strcmp(get(cq, "cpu.max"), "10000 100000\n")); /* period kept */
+  volatile double *used = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  c = fork();
+  if (!c) {
+    if (put(cq, "cgroup.procs", "0")) _exit(1);
+    double end = secs(CLOCK_MONOTONIC) + 1.0;
+    while (secs(CLOCK_MONOTONIC) < end) ;
+    *used = secs(CLOCK_THREAD_CPUTIME_ID);
+    _exit(0);
+  }
+  CHECK(waitpid(c, &st, 0) == c && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+  printf("10%% of a CPU for 1 s: %.3f s of CPU time\n", *used);
+  CHECK(*used > 0.02 && *used < 0.3);
+  const char *cs = get(cq, "cpu.stat");
+  CHECK(field(cs, "nr_periods") >= 5 && field(cs, "nr_throttled") >= 5);
+  CHECK(field(cs, "throttled_usec") > 300000 && field(cs, "nr_bursts") == 0);
+  CHECK(field(get(cq, "cpu.stat.local"), "throttled_usec") > 300000);
+  CHECK(field(get(base, "cgroup.stat"), "nr_subsys_cpu") >= 2);
+  /* Taking cpu away from the children resets their settings. */
+  CHECK(put(base, "cgroup.subtree_control", "-cpu") == 0);
+  CHECK(access(cq, F_OK) == 0 && get(cq, "cpu.max")[0] == 0);
+  CHECK(put(base, "cgroup.subtree_control", "+cpu") == 0);
+  CHECK(!strcmp(get(cq, "cpu.max"), "max 100000\n"));
+  CHECK(rmdir(cq) == 0);
+  puts("cpu.weight, cpu.idle, cpu.max, cpu.stat: ok");
 
   /* Limits on the tree. */
   char nest[256], a[256];

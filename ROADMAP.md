@@ -492,9 +492,16 @@ must get the isolation it asks for.
   processes through `cgroup.procs` (with v2's delegation and no-internal-process rules),
   `cgroup.events`, `cgroup.kill`, `cgroup.freeze`, `cgroup.max.depth`/`max.descendants`,
   `cgroup.stat`, `cpu.stat`, `clone3`'s `CLONE_INTO_CGROUP`, cgroup namespaces rooted where
-  they're made, and `/proc/<pid>/cgroup`. The `pids` controller is the one offered, and
-  `pids.max` stops `fork`; others (`cpu`, `memory`, `io`) aren't listed, since nothing would
-  enforce them. Threaded subtrees aren't supported (`EOPNOTSUPP`). `statfs` reports each
+  they're made, and `/proc/<pid>/cgroup`. Two controllers are offered:
+  - `pids`: `pids.max` stops `fork`.
+  - `cpu`: `cpu.max` (with `cpu.max.burst`) is Linux's bandwidth control, holding a
+    cgroup's tasks off the CPU once its quota for the period is used, with the throttling
+    counts in `cpu.stat`; `cpu.weight` (`cpu.weight.nice`, `cpu.idle`) scales each task's
+    share of the CPU. Unlike Linux's group scheduling, a cgroup with several busy tasks
+    gets that share for each of them, rather than splitting one among them.
+
+  `memory` and `io` aren't listed, since nothing would enforce them (nothing counts a
+  process's memory yet). Threaded subtrees aren't supported (`EOPNOTSUPP`). `statfs` reports each
   filesystem's own magic, which is how tools find cgroup v2.
 - **Signals:** a signal sent to a task that ignores it (and doesn't block it) is discarded
   as it's sent, and making a signal ignored drops it if pending, as on Linux.

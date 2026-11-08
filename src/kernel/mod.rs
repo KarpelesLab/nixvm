@@ -426,6 +426,11 @@ struct ProcInfo {
     /// blocked: what `RLIMIT_RTTIME` limits (Linux's `rt.timeout`). Zero for a
     /// task in a fair class, and for a new task.
     rt_run_ns: u64,
+    /// A `cpu.max` of the task's cgroup holds it off the CPU until then.
+    throttled_until: Option<u128>,
+    /// What its CPU time counts for in fair scheduling because of its
+    /// cgroup's `cpu.weight` (see [`crate::fs::cgroupfs::SchedState::scale`]).
+    cg_scale: u64,
     /// Weighted *virtual* runtime for fair scheduling (CFS-style), in nice-0
     /// nanosecond units: each executed step adds its CPU delta scaled by
     /// `NICE0_WEIGHT / nice_weight(nice)`, so a low-priority (higher-`nice`) task's
@@ -600,6 +605,8 @@ impl Default for ProcInfo {
             io_progress: 0,
             cpu_ns: 0,
             rt_run_ns: 0,
+            throttled_until: None,
+            cg_scale: crate::fs::cgroupfs::UNSCALED,
             vruntime: 0,
             child_cpu_ns: 0,
             alarm_deadline: None,
@@ -659,10 +666,22 @@ impl ProcInfo {
         self.creds.euid == 0 || self.ns_caps
     }
 
-    /// Held back by a frozen cgroup: not to be scheduled. A task with `SIGKILL`
-    /// pending runs anyway, to die, as Linux's freezer lets it.
+    /// Held back by a frozen cgroup, or one whose `cpu.max` quota is used up
+    /// for now: not to be scheduled. A task with `SIGKILL` pending runs anyway,
+    /// to die, as Linux's freezer lets it.
     fn held(&self) -> bool {
-        self.frozen && self.pending & (1 << (9 - 1)) == 0
+        (self.frozen || self.throttled_until.is_some_and(|t| t > poll::now_ns()))
+            && self.pending & (1 << (9 - 1)) == 0
+    }
+
+    /// When this task next has to be looked at, if it's waiting on time: its
+    /// timed wait and timers, or, held by a `cpu.max`, the end of that.
+    fn deadlines(&self) -> [Option<u128>; 2] {
+        if self.held() {
+            [self.throttled_until.filter(|_| !self.frozen), None]
+        } else {
+            [self.wake_deadline, self.timer_deadline()]
+        }
     }
 
     /// Whether this task holds capabilities over the whole VM, not just inside a
@@ -1444,6 +1463,9 @@ pub struct Kernel {
     users: Arc<Mutex<userns::UserNamespaces>>,
     /// The cgroup hierarchy (see [`cgroup`] and [`crate::fs::cgroupfs`]).
     cgroups: crate::fs::cgroupfs::SharedTree,
+    /// How many cgroups have a `cpu.max` quota, so CPU time is only charged
+    /// to cgroups while one does.
+    cpu_quotas: Arc<std::sync::atomic::AtomicUsize>,
     /// The offsets of each time namespace that has any.
     time_offsets: Mutex<BTreeMap<u32, userns::TimeNs>>,
     /// Growth on the host's disk (see [`crate::limits::Limits::disk_bytes`]).
@@ -1843,8 +1865,8 @@ impl Shared {
             .procs
             .iter()
             .flatten()
-            .filter(|p| p.info.run == RunState::Running && !p.info.held())
-            .flat_map(|p| [p.info.wake_deadline, p.info.timer_deadline()])
+            .filter(|p| p.info.run == RunState::Running)
+            .flat_map(|p| p.info.deadlines())
             .flatten()
             .min()
         else {
@@ -1898,8 +1920,8 @@ impl Shared {
         self.procs
             .iter()
             .flatten()
-            .filter(|p| p.info.run == RunState::Running && !p.info.held())
-            .flat_map(|p| [p.info.wake_deadline, p.info.timer_deadline()])
+            .filter(|p| p.info.run == RunState::Running)
+            .flat_map(|p| p.info.deadlines())
             .flatten()
             .min()
     }
@@ -2029,10 +2051,12 @@ impl Kernel {
         let cgroups = mounts
             .cgroup_tree()
             .unwrap_or_else(crate::fs::CgroupTree::shared);
+        let cpu_quotas = cgroups.lock().unwrap().quota_gate();
         Self {
             pids: pids.clone(),
             users: users.clone(),
             cgroups: cgroups.clone(),
+            cpu_quotas: cpu_quotas.clone(),
             time_offsets: Mutex::new(BTreeMap::new()),
             memory_quota,
             disk_quota,
@@ -3256,7 +3280,7 @@ impl Kernel {
         step_start: u128,
     ) -> SliceStep {
         // Checkout under `sh`, then release it before servicing.
-        let (mut proc, mut cx, out_pending, out_ppid, out_frozen, out_rt_lens) = {
+        let (mut proc, mut cx, out_pending, out_ppid, out_frozen, out_cpu, out_rt_lens) = {
             let mut sh = self.shared.lock().unwrap();
             let mut proc = sh.procs[i].take().expect("dispatched task is in the table");
             // Own the task's per-step servicing state. `yield_now`/`block`/
@@ -3279,9 +3303,10 @@ impl Kernel {
             });
             sh.check_out_files(&mut cx);
             let (pending, ppid, frozen) = (cx.cur.pending, cx.cur.ppid, cx.cur.frozen);
+            let cpu = (cx.cur.cg_scale, cx.cur.throttled_until);
             let rt_lens: BTreeMap<u32, usize> =
                 cx.cur.rt_queue.iter().map(|(&s, q)| (s, q.len())).collect();
-            (proc, cx, pending, ppid, frozen, rt_lens)
+            (proc, cx, pending, ppid, frozen, cpu, rt_lens)
         };
         if cx.cur.alarm_deadline.is_some() || !cx.cur.ptimers.is_empty() {
             fire_timers_if_due(&mut cx.cur, poll::now_ns());
@@ -3325,6 +3350,11 @@ impl Kernel {
                 }
                 if stand_in.info.frozen != out_frozen {
                     cx.cur.frozen = stand_in.info.frozen;
+                }
+                // Its cgroup's `cpu` settings changed meanwhile.
+                if (stand_in.info.cg_scale, stand_in.info.throttled_until) != out_cpu {
+                    cx.cur.cg_scale = stand_in.info.cg_scale;
+                    cx.cur.throttled_until = stand_in.info.throttled_until;
                 }
             }
             sh.check_in_files(&mut cx);
@@ -4816,7 +4846,7 @@ impl Kernel {
                 pids.to_local(pid, child_ns.pid),
             )
         };
-        let frozen = self.cgroup_fork(cx, pid, ca.cgroup);
+        let sched = self.cgroup_fork(cx, pid, ca.cgroup);
         if child_ns.cgroup != cx.cur.ns.cgroup {
             // A new cgroup namespace is rooted where the child starts.
             let mut tree = self.cgroups.lock().unwrap();
@@ -4825,7 +4855,9 @@ impl Kernel {
         }
         let mut info = cx.cur.clone();
         info.pid = pid;
-        info.frozen = frozen;
+        info.frozen = sched.frozen;
+        info.cg_scale = sched.scale;
+        info.throttled_until = sched.throttled_until;
         info.run = RunState::Running;
         info.futex_wait = None;
         info.futex_waitv = Vec::new();
@@ -6223,8 +6255,19 @@ impl Kernel {
         }
         match cx.cur.fds.get(fd as i32) {
             Some(Fd::File { .. }) => {
+                let resync = self
+                    .cgroup_mounted
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    && self.is_cgroup_sched_file(cx, fd);
                 let mut vfs = self.vfs_for(cx);
-                self.write_file_fd(&mut vfs, cx, fd, buf, count, mem)
+                let r = self.write_file_fd(&mut vfs, cx, fd, buf, count, mem);
+                drop(vfs);
+                // A cgroup's `cpu` settings or controllers changed: its tasks
+                // take them on now.
+                if resync && r >= 0 {
+                    self.cgroup_resync(cx);
+                }
+                r
             }
             Some(Fd::Socket { .. }) => {
                 let mut net = self.net.lock().unwrap();
@@ -7898,6 +7941,9 @@ impl Kernel {
         }
         if let Some(sig) = charge_rt_time(&mut cx.cur, ns, cx.block) {
             cx.cur.raise(sig);
+        }
+        if self.cpu_quotas.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            self.cgroup_charge_cpu(cx, ns);
         }
     }
 
@@ -10083,9 +10129,9 @@ fn nice_weight(nice: i32) -> u128 {
 /// nanoseconds it consumed. Shared by the serial and SMP accounting sites so the
 /// two paths order their run queues identically.
 fn charge_vruntime(p: &mut ProcInfo, cpu_delta_ns: u128) {
-    p.vruntime = p
-        .vruntime
-        .saturating_add(cpu_delta_ns.saturating_mul(NICE0_WEIGHT) / nice_weight(p.nice));
+    let weighted = cpu_delta_ns.saturating_mul(NICE0_WEIGHT) / nice_weight(p.nice);
+    let scaled = weighted.saturating_mul(u128::from(p.cg_scale)) >> 16;
+    p.vruntime = p.vruntime.saturating_add(scaled);
 }
 
 /// Join `argv` into the NUL-separated, NUL-terminated blob the kernel exposes
@@ -12006,6 +12052,23 @@ mod tests {
         k.enforce_time_limits(&mut k.shared.lock().unwrap());
         assert!(k.time_limit_reached());
         assert_ne!(pending(&k) & (1 << 8), 0, "SIGKILL is pending");
+    }
+
+    #[test]
+    fn a_cgroup_weight_scales_fair_scheduling_time_and_a_quota_holds_the_task() {
+        let (_k, _mem, _v, mut cx) = setup();
+        let p = &mut cx.cur;
+        charge_vruntime(p, 1_000_000);
+        assert_eq!(p.vruntime, 1_000_000, "the root's weight");
+        p.cg_scale = crate::fs::cgroupfs::UNSCALED / 4; // cpu.weight 400
+        charge_vruntime(p, 1_000_000);
+        assert_eq!(p.vruntime, 1_250_000);
+        assert!(!p.held());
+        p.throttled_until = Some(poll::now_ns() + 1_000_000_000);
+        assert!(p.held());
+        assert_eq!(p.deadlines(), [p.throttled_until, None]);
+        p.pending |= 1 << 8; // SIGKILL: runs, to die
+        assert!(!p.held());
     }
 
     #[test]
