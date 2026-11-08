@@ -365,8 +365,12 @@ int main(void) {
   CHECK(put(mm, "memory.max", "4M") == 0);
   CHECK(atoll(get(mm, "memory.current")) <= 4 << 20);
   CHECK(waitpid(c, &st, 0) == c && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
-  CHECK(field(get(mm, "memory.events"), "oom_kill") == kills + 1);
-  CHECK(waitpid(small, &st, WNOHANG) == 0); /* the small one stays */
+  long long now_kills = field(get(mm, "memory.events"), "oom_kill");
+  int small_gone = waitpid(small, &st, WNOHANG) == small;
+  printf("memory.max lowered: %lld kill(s), the small one %s\n", now_kills - kills,
+         small_gone ? "killed too" : "kept");
+  CHECK(now_kills == kills + 1);
+  CHECK(!small_gone); /* the small one stays */
   kill(small, SIGKILL);
   CHECK(waitpid(small, &st, 0) == small);
   /* memory.high: past it, with nothing to reclaim, an allocating task sleeps
