@@ -274,7 +274,7 @@ impl GuestMemory {
     }
 
     /// The memory cgroup whose `memory.max` refused a frame since the last
-    /// call, if one did (see [`FrameAllocator::take_memcg_oom`]).
+    /// call, if one did.
     #[must_use]
     pub fn take_memcg_oom(&self) -> Option<u16> {
         self.fa.lock().unwrap().take_memcg_oom()
