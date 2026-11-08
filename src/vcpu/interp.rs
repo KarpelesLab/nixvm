@@ -368,6 +368,11 @@ impl Vcpu for Aarch64Interp {
             {
                 return Ok(Exit::Interrupted);
             }
+            // The kernel wanting the task back (a `memory.high` penalty) is
+            // one relaxed load, so it's looked at more often.
+            if i & 255 == 255 && mem.kernel_due() {
+                return Ok(Exit::Interrupted);
+            }
             // A misaligned PC is a PC alignment fault (SIGBUS on Linux).
             let fetched = if self.pc & 3 == 0 {
                 self.fetch.fetch(self.pc, mem)

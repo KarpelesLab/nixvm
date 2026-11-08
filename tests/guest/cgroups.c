@@ -1,6 +1,7 @@
 /* cgroup v2: a hierarchy of our own under the root cgroup, moving processes,
  * pids.max, the cpu controller (weights, cpu.max bandwidth), the memory
- * controller (memory.max and its out-of-memory kills), cgroup.events,
+ * controller (memory.max and its out-of-memory kills, also on lowering it;
+ * memory.high's throttling), cgroup.events,
  * cgroup.kill, cgroup.freeze, the limits on the
  * tree, CLONE_INTO_CGROUP, cgroup namespaces and /proc/<pid>/cgroup.
  *
@@ -337,6 +338,59 @@ int main(void) {
   for (int i = 0; i < 100 && strcmp(get(mm, "cgroup.events"), "populated 0\nfrozen 0\n"); i++) usleep(10000);
   CHECK(!strcmp(get(mm, "cgroup.events"), "populated 0\nfrozen 0\n")); /* the grandchild too */
   CHECK(field(get(mm, "memory.events"), "oom_group_kill") == 1);
+  /* Lowering memory.max below what's in use kills, biggest first, until the
+   * cgroup fits; the write returns once it does. */
+  CHECK(put(mm, "memory.oom.group", "0") == 0 && put(mm, "memory.max", "max") == 0);
+  long long kills = field(get(mm, "memory.events"), "oom_kill");
+  pid_t small = fork();
+  if (!small) {
+    char x = 'y';
+    if (put(mm, "cgroup.procs", "0") || write(up[1], &x, 1) != 1) _exit(1);
+    pause();
+    _exit(0);
+  }
+  CHECK(read(up[0], &r, 1) == 1);
+  c = fork();
+  if (!c) {
+    if (put(mm, "cgroup.procs", "0")) _exit(1);
+    char *m = mmap(0, 64 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    for (long i = 0; i < 8 << 20; i += 4096) m[i] = 1;
+    char x = 'y';
+    if (write(up[1], &x, 1) != 1) _exit(2);
+    pause();
+    _exit(3);
+  }
+  CHECK(read(up[0], &r, 1) == 1);
+  CHECK(atoll(get(mm, "memory.current")) >= 8 << 20);
+  CHECK(put(mm, "memory.max", "4M") == 0);
+  CHECK(atoll(get(mm, "memory.current")) <= 4 << 20);
+  CHECK(waitpid(c, &st, 0) == c && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+  CHECK(field(get(mm, "memory.events"), "oom_kill") == kills + 1);
+  CHECK(waitpid(small, &st, WNOHANG) == 0); /* the small one stays */
+  kill(small, SIGKILL);
+  CHECK(waitpid(small, &st, 0) == small);
+  /* memory.high: past it, with nothing to reclaim, an allocating task sleeps
+   * off its overage, longer the further over it is. */
+  CHECK(put(mm, "memory.max", "max") == 0 && put(mm, "memory.high", "8M") == 0);
+  long long highs = field(get(mm, "memory.events"), "high");
+  c = fork();
+  if (!c) {
+    if (put(mm, "cgroup.procs", "0")) _exit(1);
+    char *m = mmap(0, 16 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (long i = 0; i < (8 << 20) + (512 << 10); i += 4096) m[i] = 1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    if (write(up[1], &ms, sizeof ms) != sizeof ms) _exit(2);
+    _exit(0);
+  }
+  long ms = 0;
+  CHECK(read(up[0], &ms, sizeof ms) == sizeof ms);
+  CHECK(waitpid(c, &st, 0) == c && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+  printf("half a MiB past memory.high: %ld ms\n", ms);
+  CHECK(ms >= 150 && ms < 20000);
+  CHECK(field(get(mm, "memory.events"), "high") > highs);
   CHECK(rmdir(mm) == 0);
   puts("memory.max, memory.current, memory.events, memory.oom.group: ok");
 

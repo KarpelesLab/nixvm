@@ -35,6 +35,8 @@
 
 use super::mem::PAGE_SIZE;
 use super::region::Region;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Frame size — the guest page size, 4 KiB. A physical frame is one of these.
 const FRAME: u64 = PAGE_SIZE;
@@ -254,7 +256,15 @@ pub struct FrameAllocator {
     /// The memory cgroup whose `memory.max` last refused a frame, until
     /// [`Self::take_memcg_oom`] collects it.
     oom: Option<u16>,
+    /// Bit `slot % 64` is set while memory cgroup `slot` has a batch charged
+    /// past `memory.high` waiting for [`Self::take_over_high`]; shared outside
+    /// the lock so an interpreter can notice and hand the task to the kernel.
+    pub due: Arc<AtomicU64>,
 }
+
+/// Pages Linux charges a memory cgroup at a time (`MEMCG_CHARGE_BATCH`): the
+/// unit a `memory.high` penalty is reckoned in.
+pub const MEMCG_CHARGE_BATCH: u64 = 64;
 
 /// One memory cgroup as the allocator keeps it (see [`FrameAllocator::charge_to`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +283,9 @@ pub struct Memcg {
     pub max_events: u64,
     /// How often an allocation went past `high`.
     pub high_events: u64,
+    /// Frames charged here while this or a memory cgroup above was over its
+    /// `high`, not yet paid for (see [`FrameAllocator::take_over_high`]).
+    pub over_high: u64,
     /// The slot is in use.
     pub live: bool,
 }
@@ -286,6 +299,7 @@ impl Memcg {
         high: u64::MAX,
         max_events: 0,
         high_events: 0,
+        over_high: 0,
         live: true,
     };
 }
@@ -315,6 +329,7 @@ impl FrameAllocator {
             memcgs: vec![Memcg::ROOT],
             charge_to: 0,
             oom: None,
+            due: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -347,15 +362,45 @@ impl FrameAllocator {
             self.oom = Some(full as u16);
             return false;
         }
+        let mut over = false;
         for m in chain {
             let g = &mut self.memcgs[m];
             g.frames += 1;
             g.peak = g.peak.max(g.frames);
             if g.frames > g.high {
                 g.high_events += 1;
+                over = true;
+            }
+        }
+        if over {
+            let g = &mut self.memcgs[slot as usize];
+            g.over_high += 1;
+            if g.over_high == MEMCG_CHARGE_BATCH {
+                self.due.fetch_or(1 << (slot % 64), Ordering::Relaxed);
             }
         }
         true
+    }
+
+    /// Once [`MEMCG_CHARGE_BATCH`] or more frames have been charged to `slot` past a
+    /// `memory.high` (its own or one above), take them: how many, and how far
+    /// over its `high` the worst memory cgroup up the chain is now, as Linux's
+    /// `calculate_overage` puts it (the excess over `high`, `<< 20`).
+    pub fn take_over_high(&mut self, slot: u16) -> Option<(u64, u64)> {
+        let pages = self.memcgs.get(slot as usize)?.over_high;
+        if pages < MEMCG_CHARGE_BATCH {
+            return None;
+        }
+        self.memcgs[slot as usize].over_high = 0;
+        self.due.fetch_and(!(1 << (slot % 64)), Ordering::Relaxed);
+        let overage = self
+            .memcg_chain(slot)
+            .map(|m| &self.memcgs[m])
+            .filter(|g| g.frames > g.high)
+            .map(|g| ((g.frames - g.high) << 20) / g.high.max(1))
+            .max()
+            .unwrap_or(0);
+        Some((pages, overage))
     }
 
     fn uncharge(&mut self, slot: u16) {
@@ -766,6 +811,31 @@ mod tests {
         fa.free(f2);
         fa.free(f3);
         let _ = f3;
+    }
+
+    #[test]
+    fn frames_charged_past_memory_high_are_handed_over_by_the_batch() {
+        let (phys, mut fa) = pool(256);
+        let a = fa.memcg_new(0).unwrap();
+        let b = fa.memcg_new(a).unwrap();
+        fa.memcg_set_limits(a, u64::MAX, 100);
+        fa.charge_to = b;
+        for _ in 0..100 {
+            fa.alloc(&phys).unwrap();
+        }
+        assert_eq!(fa.take_over_high(b), None, "at memory.high, not past it");
+        let bit = 1 << (b % 64);
+        for _ in 0..MEMCG_CHARGE_BATCH - 1 {
+            fa.alloc(&phys).unwrap();
+        }
+        assert_eq!(fa.due.load(Ordering::Relaxed) & bit, 0);
+        assert_eq!(fa.take_over_high(b), None, "less than a batch");
+        fa.alloc(&phys).unwrap();
+        assert_ne!(fa.due.load(Ordering::Relaxed) & bit, 0, "a batch is due");
+        // 164 frames against a's 100: 64% over, as a fraction << 20.
+        assert_eq!(fa.take_over_high(b), Some((64, (64 << 20) / 100)));
+        assert_eq!(fa.due.load(Ordering::Relaxed) & bit, 0);
+        assert_eq!(fa.take_over_high(b), None);
     }
 
     #[test]

@@ -14,6 +14,45 @@ use crate::fs::cgroupfs::{CgroupTree, KERNEL_FILES, ROOT, SCHED_FILES, SchedStat
 
 const SIGKILL_BIT: u64 = 1 << (9 - 1);
 
+/// What a write to `memory.max` is to do next (see [`Kernel::memcg_shrink`]).
+pub(super) enum Shrink {
+    /// The cgroup fits, or there's no one left to kill.
+    Done,
+    /// A task was killed to make room: try again once it's gone.
+    Wait,
+    /// The writer itself was picked.
+    KillSelf,
+}
+
+fn live(p: &ProcInfo) -> bool {
+    !matches!(p.run, RunState::Zombie(_))
+}
+
+/// Kill `victim` for memory cgroup `slot`'s `memory.max` (and, with
+/// `memory.oom.group`, the cgroup asking for that), counting it in
+/// `memory.events`. Returns whether the caller is among them.
+fn oom_kill(
+    sh: &mut Shared,
+    tree: &mut CgroupTree,
+    cx: &ServiceCtx,
+    victim: i32,
+    slot: u16,
+) -> bool {
+    let node = tree.node_of(victim);
+    let group = tree.record_oom(node, slot);
+    let doomed =
+        |pid: i32| pid == victim || group.is_some_and(|g| tree.is_within(tree.node_of(pid), g));
+    for p in sh.procs.iter_mut().flatten() {
+        if doomed(p.info.pid) && live(&p.info) && p.info.pid != cx.cur.pid {
+            p.info.pending |= SIGKILL_BIT;
+            p.info.parked = false;
+            p.info.frozen = false;
+            p.info.run = RunState::Running;
+        }
+    }
+    doomed(cx.cur.pid)
+}
+
 /// What the cgroup code needs of a task.
 struct TaskState {
     pid: i32,
@@ -124,46 +163,78 @@ impl Kernel {
             return false;
         };
         let me = tree.node_of(cx.cur.pid);
-        let live = |p: &ProcInfo| !matches!(p.run, RunState::Zombie(_));
-        let (victim, victim_node) = if tree.is_within(me, domain) {
-            (cx.cur.pid, me)
+        let victim = if tree.is_within(me, domain) {
+            Some(cx.cur.pid)
         } else {
-            match sh
-                .procs
+            sh.procs
                 .iter()
                 .flatten()
                 .map(|p| &p.info)
                 .find(|p| live(p) && tree.is_within(tree.node_of(p.pid), domain))
-            {
-                Some(p) => (p.pid, tree.node_of(p.pid)),
-                None => return false,
-            }
+                .map(|p| p.pid)
         };
-        let group = tree.record_oom(victim_node, slot);
-        let doomed =
-            |pid: i32| pid == victim || group.is_some_and(|g| tree.is_within(tree.node_of(pid), g));
-        for p in sh.procs.iter_mut().flatten() {
-            if doomed(p.info.pid) && live(&p.info) && p.info.pid != cx.cur.pid {
-                p.info.pending |= SIGKILL_BIT;
-                p.info.parked = false;
-                p.info.frozen = false;
-                p.info.run = RunState::Running;
-            }
-        }
-        doomed(cx.cur.pid)
+        victim.is_some_and(|v| oom_kill(&mut sh, &mut tree, cx, v, slot))
     }
 
-    /// Whether `fd` is a cgroup file whose writes change how tasks are
-    /// scheduled, so [`Self::cgroup_resync`] is due after one.
-    pub(super) fn is_cgroup_sched_file(&self, cx: &ServiceCtx, fd: u64) -> bool {
+    /// After a write to `memory.max` of cgroup `node`: while what it's
+    /// charged is over the new limit, kill its tasks, biggest first, as
+    /// Linux's `memory_max_write` does (there's no reclaim to try first).
+    /// One victim at a time: while one is dying, the writer waits for it.
+    pub(super) fn memcg_shrink(&self, cx: &mut ServiceCtx, node: u32, mem: &GuestMemory) -> Shrink {
+        let mut sh = self.shared.lock().unwrap();
+        let mut tree = self.cgroups.lock().unwrap();
+        let Some(slot) = tree.memcg_slot(node) else {
+            return Shrink::Done;
+        };
+        let over = mem.with_allocator(|fa| fa.memcg(slot).is_some_and(|m| m.frames > m.max));
+        if !over {
+            return Shrink::Done;
+        }
+        let tasks: Vec<&ProcInfo> = sh
+            .procs
+            .iter()
+            .flatten()
+            .map(|p| &p.info)
+            .chain([&cx.cur])
+            .filter(|p| live(p) && tree.is_within(tree.node_of(p.pid), node))
+            .collect();
+        if tasks.iter().any(|p| p.pending & SIGKILL_BIT != 0) {
+            return Shrink::Wait;
+        }
+        // Linux's `oom_badness` ranks processes by what they hold; here that's
+        // what their address space maps (one that's busy elsewhere counts 0).
+        let size = |p: &ProcInfo| {
+            if p.mm == cx.cur.mm {
+                mem.mapped_bytes()
+            } else {
+                sh.spaces
+                    .get(p.mm)
+                    .and_then(|s| s.try_lock().ok().map(|m| m.mapped_bytes()))
+                    .unwrap_or(0)
+            }
+        };
+        let Some(victim) = tasks.iter().max_by_key(|p| (size(p), p.pid)).map(|p| p.pid) else {
+            tree.record_oom_attempt(slot);
+            return Shrink::Done;
+        };
+        if oom_kill(&mut sh, &mut tree, cx, victim, slot) {
+            Shrink::KillSelf
+        } else {
+            Shrink::Wait
+        }
+    }
+
+    /// If `fd` is a cgroup file whose writes change how tasks are scheduled,
+    /// so [`Self::cgroup_resync`] is due after one: its cgroup and name.
+    pub(super) fn cgroup_sched_file(&self, cx: &ServiceCtx, fd: u64) -> Option<(u32, String)> {
         let Some(Fd::File { path, .. }) = cx.cur.fds.get(fd as i32) else {
-            return false;
+            return None;
         };
         let path = path.clone();
-        matches!(
-            self.vfs_for(cx).cgroup_at(&path),
-            Some((_, _, Some(f))) if SCHED_FILES.contains(&f.as_str())
-        )
+        match self.vfs_for(cx).cgroup_at(&path) {
+            Some((_, node, Some(f))) if SCHED_FILES.contains(&f.as_str()) => Some((node, f)),
+            _ => None,
+        }
     }
 
     /// The cgroup a `clone3` `CLONE_INTO_CGROUP` descriptor names.

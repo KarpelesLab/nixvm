@@ -637,6 +637,23 @@ impl CgroupTree {
             .unwrap_or(0)
     }
 
+    /// Cgroup `node`'s own memory cgroup, if it has the controller.
+    #[must_use]
+    pub fn memcg_slot(&self, node: u32) -> Option<u16> {
+        self.nodes.get(&node).and_then(|n| n.memcg)
+    }
+
+    /// Memory cgroup `slot` was over its `memory.max` with no task left to
+    /// kill: still an `oom` event.
+    pub fn record_oom_attempt(&mut self, slot: u16) {
+        if let Some(d) = self
+            .node_of_memcg(slot)
+            .and_then(|n| self.nodes.get_mut(&n))
+        {
+            d.oom_events[0] += 1;
+        }
+    }
+
     /// The cgroup memory cgroup `slot` belongs to.
     #[must_use]
     pub fn node_of_memcg(&self, slot: u16) -> Option<u32> {

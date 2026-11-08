@@ -70,6 +70,9 @@ const MAX_STEPS: u64 = 50_000_000;
 /// is negligible next to a millisecond quantum.
 const QUANTUM_STRIDE: u64 = 4096;
 
+/// How often [`GuestMemory::kernel_due`] is polled, in instructions.
+const KERNEL_DUE_STRIDE: u64 = 256;
+
 /// The architectural maximum instruction length; anything longer is `#GP`.
 const MAX_INSN_LEN: usize = 15;
 
@@ -3106,6 +3109,11 @@ impl Vcpu for X86Interp {
             if i & (QUANTUM_STRIDE - 1) == 0
                 && (deadline.is_some_and(|d| Instant::now() >= d) || super::yield_due())
             {
+                return Ok(Exit::Interrupted);
+            }
+            // The kernel wanting the task back (a `memory.high` penalty) is
+            // one relaxed load, so it's looked at more often.
+            if i & (KERNEL_DUE_STRIDE - 1) == 0 && mem.kernel_due() {
                 return Ok(Exit::Interrupted);
             }
         }

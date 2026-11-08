@@ -428,6 +428,9 @@ struct ProcInfo {
     rt_run_ns: u64,
     /// A `cpu.max` of the task's cgroup holds it off the CPU until then.
     throttled_until: Option<u128>,
+    /// Allocating past its memory cgroup's `memory.high` has it sleep until
+    /// then (see [`memcg_high_delay`]); only `SIGKILL` cuts that short.
+    high_delay_until: Option<u128>,
     /// What its CPU time counts for in fair scheduling because of its
     /// cgroup's `cpu.weight` (see [`crate::fs::cgroupfs::SchedState::scale`]).
     cg_scale: u64,
@@ -609,6 +612,7 @@ impl Default for ProcInfo {
             cpu_ns: 0,
             rt_run_ns: 0,
             throttled_until: None,
+            high_delay_until: None,
             cg_scale: crate::fs::cgroupfs::UNSCALED,
             memcg: 0,
             vruntime: 0,
@@ -674,15 +678,20 @@ impl ProcInfo {
     /// for now: not to be scheduled. A task with `SIGKILL` pending runs anyway,
     /// to die, as Linux's freezer lets it.
     fn held(&self) -> bool {
-        (self.frozen || self.throttled_until.is_some_and(|t| t > poll::now_ns()))
+        let now = poll::now_ns();
+        (self.frozen
+            || self.throttled_until.is_some_and(|t| t > now)
+            || self.high_delay_until.is_some_and(|t| t > now))
             && self.pending & (1 << (9 - 1)) == 0
     }
 
     /// When this task next has to be looked at, if it's waiting on time: its
-    /// timed wait and timers, or, held by a `cpu.max`, the end of that.
+    /// timed wait and timers, or, held by a `cpu.max` or `memory.high`, the
+    /// end of that.
     fn deadlines(&self) -> [Option<u128>; 2] {
         if self.held() {
-            [self.throttled_until.filter(|_| !self.frozen), None]
+            let thawed = |t: Option<u128>| t.filter(|_| !self.frozen);
+            [thawed(self.throttled_until), thawed(self.high_delay_until)]
         } else {
             [self.wake_deadline, self.timer_deadline()]
         }
@@ -1356,6 +1365,19 @@ fn run_slice_smp(
 struct Process {
     vcpu: Option<Box<dyn Vcpu>>,
     info: ProcInfo,
+}
+
+/// How long a task that charged `pages` past `memory.high` sleeps, with the
+/// worst cgroup up its chain `overage` over (`calculate_overage`'s fraction,
+/// `<< 20`): Linux's `calculate_high_delay`, quadratic in the overage and
+/// prorated to the batch, at most 2 s, and nothing at 10 ms or less.
+fn memcg_high_delay(pages: u64, overage: u64) -> Option<u128> {
+    const SEC: u128 = 1_000_000_000;
+    let o = u128::from(overage);
+    let penalty = (o.saturating_mul(o).saturating_mul(SEC) >> 34).saturating_mul(u128::from(pages))
+        / u128::from(crate::vcpu::phys::MEMCG_CHARGE_BATCH);
+    let penalty = penalty.min(2 * SEC);
+    (penalty > SEC / 100).then_some(penalty)
 }
 
 /// An in-kernel pipe: a byte buffer with reference counts for the open ends.
@@ -2331,6 +2353,13 @@ impl Kernel {
                 if sh.has_runnable() {
                     continue;
                 }
+                // Held, not parked (a `cpu.max` or `memory.high` penalty):
+                // sleep until it's over.
+                drop(sh);
+                if self.shared.lock().unwrap().wait_for_timer() {
+                    continue;
+                }
+                let sh = self.shared.lock().unwrap();
                 if sh.any_running() {
                     return Err(VcpuError::Backend(
                         "deadlock: every process is blocked".into(),
@@ -2668,7 +2697,9 @@ impl Kernel {
                         return Ok(true);
                     }
                 }
-                Serviced::Resume if is_interrupt => return Ok(true),
+                // An interrupt ends the slice; so does a fault that left the
+                // task held (allocating past `memory.high`).
+                Serviced::Resume if is_interrupt || cx.cur.held() => return Ok(true),
                 Serviced::Resume => progressed = true,
                 // A write that moved data before blocking made progress, even
                 // though the call hasn't returned: counting it as none let a
@@ -2715,6 +2746,15 @@ impl Kernel {
         {
             self.die_of_signal(cx, 9, mem); // SIGKILL
             return Serviced::Ended;
+        }
+        // Past `memory.high`, with nothing to reclaim: the task sleeps off
+        // its overage on the way back to user space, as on Linux.
+        if !matches!(flow, Serviced::Ended)
+            && cx.cur.pending & (1 << (9 - 1)) == 0
+            && let Some((pages, overage)) = mem.take_memcg_over_high(cx.cur.memcg)
+            && let Some(delay) = memcg_high_delay(pages, overage)
+        {
+            cx.cur.high_delay_until = Some(poll::now_ns() + delay);
         }
         flow
     }
@@ -3428,6 +3468,8 @@ impl Kernel {
                     SliceStep::Continue
                 }
             }
+            // A fault that left the task held (past `memory.high`) ends it too.
+            Serviced::Resume if stopped => SliceStep::Yielded,
             Serviced::Resume => SliceStep::Continue,
             Serviced::Blocked => SliceStep::Blocked,
             Serviced::Ended => SliceStep::Ended,
@@ -6299,17 +6341,39 @@ impl Kernel {
         }
         match cx.cur.fds.get(fd as i32) {
             Some(Fd::File { .. }) => {
-                let resync = self
+                let resync = if self
                     .cgroup_mounted
                     .load(std::sync::atomic::Ordering::Relaxed)
-                    && self.is_cgroup_sched_file(cx, fd);
+                {
+                    self.cgroup_sched_file(cx, fd)
+                } else {
+                    None
+                };
                 let mut vfs = self.vfs_for(cx);
                 let r = self.write_file_fd(&mut vfs, cx, fd, buf, count, mem);
                 drop(vfs);
-                // A cgroup's `cpu` settings or controllers changed: its tasks
-                // take them on now.
-                if resync && r >= 0 {
+                // A cgroup's settings or controllers changed: its tasks take
+                // them on now.
+                if let Some((node, file)) = resync
+                    && r >= 0
+                {
                     self.cgroup_resync(cx, mem);
+                    // A `memory.max` below what the cgroup holds: tasks are
+                    // killed until it fits, the write waiting for each to go
+                    // (and re-run after; writing the same limit again is
+                    // harmless). A signal ends the wait, the write done.
+                    if file == "memory.max" {
+                        match self.memcg_shrink(cx, node, mem) {
+                            cgroup::Shrink::Done => {}
+                            cgroup::Shrink::Wait if self.first_handled_signal(cx).is_some() => {}
+                            cgroup::Shrink::Wait => {
+                                cx.cur.wake_deadline = Some(poll::now_ns() + 2_000_000);
+                                cx.block = true;
+                                return 0;
+                            }
+                            cgroup::Shrink::KillSelf => cx.cur.pending |= 1 << (9 - 1),
+                        }
+                    }
                 }
                 r
             }
@@ -12113,6 +12177,27 @@ mod tests {
         assert_eq!(p.deadlines(), [p.throttled_until, None]);
         p.pending |= 1 << 8; // SIGKILL: runs, to die
         assert!(!p.held());
+    }
+
+    #[test]
+    fn memory_high_penalties_follow_linux() {
+        const MS: u128 = 1_000_000;
+        // 3.125% over: 62.5 ms a batch; 6.25%: four times that.
+        assert_eq!(memcg_high_delay(64, 1 << 15), Some(1000 * MS / 16));
+        assert_eq!(memcg_high_delay(64, 1 << 16), Some(250 * MS));
+        // Prorated to the batch; at most 2 s; nothing at 10 ms or less.
+        assert_eq!(memcg_high_delay(32, 1 << 16), Some(125 * MS));
+        assert_eq!(memcg_high_delay(64, 1 << 20), Some(2000 * MS));
+        assert_eq!(memcg_high_delay(64, u64::MAX), Some(2000 * MS));
+        assert_eq!(memcg_high_delay(64, 13_000), None);
+        let mut p = ProcInfo {
+            high_delay_until: Some(poll::now_ns() + 1_000_000_000),
+            ..ProcInfo::default()
+        };
+        assert!(p.held());
+        assert_eq!(p.deadlines(), [None, p.high_delay_until]);
+        p.pending |= 1 << (9 - 1);
+        assert!(!p.held(), "SIGKILL cuts it short");
     }
 
     #[test]

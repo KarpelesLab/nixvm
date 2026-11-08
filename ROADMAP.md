@@ -503,10 +503,14 @@ must get the isolation it asks for.
     charged to its cgroup in the frame allocator, as Linux charges a page to the cgroup
     that faulted it in; `memory.current`, `memory.peak` and `memory.stat` show it. Past
     `memory.max` a page is refused and a task of the cgroup is killed, counted in
-    `memory.events` (the whole cgroup with `memory.oom.group`). There is no reclaim or
-    swap, so `memory.high` is only counted, `memory.low`/`min` protect nothing, and
-    lowering `memory.max` under what's in use doesn't kill anything until the next
-    page is asked for. As a domain controller it follows v2's no-internal-process rule.
+    `memory.events` (the whole cgroup with `memory.oom.group`). Lowering `memory.max`
+    under what's in use kills the cgroup's biggest task, one at a time, until it fits,
+    and the write returns once it does. Past `memory.high`, a task that allocates sleeps
+    on its way back to user space, as Linux's `calculate_high_delay` reckons (quadratic
+    in the overage, at most 2 s per 64 pages). There is no reclaim or swap, so those
+    kills and sleeps come at once, where Linux would first try to reclaim, and
+    `memory.low`/`min` protect nothing. As a domain controller it follows v2's
+    no-internal-process rule.
 
   `io` isn't listed, since nothing would enforce it. Threaded subtrees aren't supported
   (`EOPNOTSUPP`). `statfs` reports each

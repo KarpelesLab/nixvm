@@ -101,6 +101,8 @@ pub struct GuestMemory {
     phys: Arc<PhysMem>,
     /// The shared frame allocator, locked briefly for map/unmap/fork/CoW.
     fa: Arc<Mutex<FrameAllocator>>,
+    /// The allocator's [`FrameAllocator::due`], readable without its lock.
+    due: Arc<std::sync::atomic::AtomicU64>,
     /// This process's page tables (its `CR3`).
     space: AddrSpace,
     /// Per-page *intended* protection (what `map`/`protect` requested), meaningful
@@ -251,6 +253,7 @@ impl GuestMemory {
             base,
             size,
             phys,
+            due: Arc::clone(&fa.due),
             fa: Arc::new(Mutex::new(fa)),
             space,
             prot: PageVec::new(npages, Prot::NONE),
@@ -278,6 +281,22 @@ impl GuestMemory {
     #[must_use]
     pub fn take_memcg_oom(&self) -> Option<u16> {
         self.fa.lock().unwrap().take_memcg_oom()
+    }
+
+    /// Whether the kernel wants this space's task back as soon as it can be
+    /// had: a batch was charged past its memory cgroup's `memory.high`, a
+    /// penalty to pay (the frame allocator's `due`). Lock-free, for an
+    /// interpreter to poll.
+    #[must_use]
+    pub fn kernel_due(&self) -> bool {
+        self.due.load(std::sync::atomic::Ordering::Relaxed) & (1 << (self.memcg % 64)) != 0
+    }
+
+    /// The frame allocator's `take_over_high`: frames charged to `slot` past
+    /// `memory.high` and the overage, once a batch is due.
+    #[must_use]
+    pub fn take_memcg_over_high(&self, slot: u16) -> Option<(u64, u64)> {
+        self.fa.lock().unwrap().take_over_high(slot)
     }
 
     /// Run `f` on the frame allocator every address space shares, for the
@@ -1240,6 +1259,7 @@ impl GuestMemory {
             size: self.size,
             phys: Arc::clone(&self.phys),
             fa: Arc::clone(&self.fa),
+            due: Arc::clone(&self.due),
             space: child_space,
             prot: self.prot.clone(),
             mapped,
