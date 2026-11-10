@@ -590,6 +590,56 @@ impl CgroupTree {
             .collect()
     }
 
+    /// Whether any cgroup has the `cpu` controller, so its weights matter.
+    #[must_use]
+    pub fn weights_active(&self) -> bool {
+        self.nodes.get(&ROOT).is_some_and(|r| r.subtree & CPU != 0)
+    }
+
+    /// The [`SchedState::scale`] of each of `tasks` (task id, its own
+    /// weight from its nice value), the tasks that are runnable now, as
+    /// Linux's group scheduling shares out the CPU: a cgroup gets its
+    /// `cpu.weight`'s part of what's runnable beside it, and splits that among
+    /// what's runnable in it. That's a task getting
+    /// `Π shares(G) / Σ weights runnable in G` over its cgroups `G` with the
+    /// controller, against a task in the root; the scale is the inverse, so
+    /// its virtual runtime moves as fast as everyone's at its fair share.
+    #[must_use]
+    pub fn group_scales(&self, tasks: &[(i32, u128)]) -> Vec<u64> {
+        let chains: Vec<Vec<u32>> = tasks
+            .iter()
+            .map(|&(tid, _)| self.cpu_chain(self.node_of(tid)))
+            .collect();
+        // What's runnable in each cgroup: its own tasks' weights, and the
+        // shares of each child cgroup with something runnable below it.
+        let mut inside: BTreeMap<u32, u128> = BTreeMap::new();
+        let mut active = std::collections::BTreeSet::new();
+        for (chain, &(_, w)) in chains.iter().zip(tasks) {
+            // `cpu_chain` runs from the cgroup up.
+            if let Some(&g) = chain.first() {
+                *inside.entry(g).or_default() += w;
+            }
+            for (k, &g) in chain.iter().enumerate() {
+                if active.insert(g)
+                    && let Some(&parent) = chain.get(k + 1)
+                {
+                    *inside.entry(parent).or_default() += u128::from(self.nodes[&g].shares.max(1));
+                }
+            }
+        }
+        chains
+            .iter()
+            .map(|chain| {
+                let scale = chain.iter().fold(u128::from(UNSCALED), |scale, g| {
+                    (scale * inside.get(g).copied().unwrap_or(1)
+                        / u128::from(self.nodes[g].shares.max(1)))
+                    .min(u128::from(u64::MAX))
+                });
+                u64::try_from(scale).unwrap_or(u64::MAX)
+            })
+            .collect()
+    }
+
     /// How tasks in `node` are to be scheduled at `now`.
     #[must_use]
     pub fn sched_state(&self, node: u32, now: u128) -> SchedState {
@@ -1974,6 +2024,42 @@ mod tests {
         assert_eq!(
             t.render(a, "memory.events.local"),
             "low 0\nhigh 0\nmax 0\noom 2\noom_kill 2\noom_group_kill 1\n"
+        );
+    }
+
+    #[test]
+    fn cpu_weights_are_shared_by_the_group() {
+        let tree = CgroupTree::shared();
+        let mut t = tree.lock().unwrap();
+        t.write_file(ROOT, "cgroup.subtree_control", "+cpu")
+            .unwrap();
+        assert!(t.weights_active());
+        let a = t.mkdir(ROOT, "a", 0, 0).unwrap();
+        let b = t.mkdir(ROOT, "b", 0, 0).unwrap();
+        t.write_file(a, "cpu.weight", "200").unwrap();
+        t.migrate(&[(1, true), (2, true)], a);
+        t.migrate(&[(3, true)], b);
+        let w = u128::from(NICE0_SHARES);
+        // Two tasks splitting weight 200 run as fast as one at 100: the
+        // scheduler gives all three the same third.
+        assert_eq!(
+            t.group_scales(&[(1, w), (2, w), (3, w), (4, w)]),
+            [UNSCALED; 4]
+        );
+        // Alone in a, a task has all of a's 200: half the virtual runtime.
+        assert_eq!(t.group_scales(&[(1, w), (3, w)]), [UNSCALED / 2, UNSCALED]);
+        // Nested: b's share is split again by its child.
+        t.write_file(b, "cgroup.subtree_control", "+cpu").unwrap();
+        let c = t.mkdir(b, "c", 0, 0).unwrap();
+        t.migrate(&[(3, true)], c);
+        t.migrate(&[(5, true)], b);
+        t.write_file(c, "cpu.weight", "300").unwrap();
+        // In b: task 5 (1024) against c (3072); c's 3072 holds task 3 (1024).
+        let s = t.group_scales(&[(3, w), (5, w)]);
+        assert_eq!(
+            s,
+            [UNSCALED / 3 * 4, UNSCALED * 4],
+            "4/3, rounded down step by step"
         );
     }
 

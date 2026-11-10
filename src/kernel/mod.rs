@@ -380,10 +380,11 @@ struct ProcInfo {
     /// after which regaining them is `EPERM` — so a dropped-privilege program
     /// behaves correctly instead of silently staying root.
     creds: Creds,
-    /// Scheduling attributes, reported back to the guest (the cooperative
-    /// scheduler doesn't actually honor them, but a program that sets and reads
-    /// them back must see what it set): policy (`SCHED_OTHER`=0/`FIFO`=1/`RR`=2/
-    /// …), real-time priority, `nice` (−20..19), and CPU-affinity mask.
+    /// Scheduling attributes: policy (`SCHED_OTHER`=0/`FIFO`=1/`RR`=2/…) and
+    /// real-time priority (recorded and reported back, but not preempting:
+    /// there are no real-time run queues), `nice` (−20..19, which weights fair
+    /// scheduling), and the CPU-affinity mask (0 for all CPUs; the SMP
+    /// scheduler runs the task only on those, see [`ProcInfo::home_cpu`]).
     sched_policy: i32,
     sched_priority: i32,
     nice: i32,
@@ -683,6 +684,19 @@ impl ProcInfo {
             || self.throttled_until.is_some_and(|t| t > now)
             || self.high_delay_until.is_some_and(|t| t > now))
             && self.pending & (1 << (9 - 1)) == 0
+    }
+
+    /// The SMP worker (CPU) task slot `slot` runs on, of `ncpus`: its home,
+    /// `slot % ncpus` (a KVM vcpu is best kept on one thread), if its
+    /// `sched_setaffinity` mask allows that, or else the first CPU it does.
+    fn home_cpu(&self, slot: usize, ncpus: usize) -> usize {
+        let home = slot % ncpus.max(1);
+        let allowed = |c: usize| self.affinity == 0 || (c < 64 && self.affinity & (1 << c) != 0);
+        if allowed(home) {
+            home
+        } else {
+            (0..ncpus).find(|&c| allowed(c)).unwrap_or(home)
+        }
     }
 
     /// When this task next has to be looked at, if it's waiting on time: its
@@ -1238,6 +1252,10 @@ enum SliceOutcome {
     Err(VcpuError),
 }
 
+/// How often the serial scheduler has parked tasks re-check their waits while
+/// others keep running: the scheduling quantum's default.
+const RECHECK_NS: u128 = 10_000_000;
+
 /// Poll interval while every task is parked but a host connection is live: the
 /// scheduler sleeps this long, then retries a round that re-checks host-socket
 /// readiness. Short enough that an arriving HTTP response is picked up promptly,
@@ -1688,6 +1706,9 @@ pub(super) struct Shared {
     /// parked) rejoins at the current front of the queue instead of monopolizing
     /// the CPU until its stale vruntime catches up. See [`ProcInfo::vruntime`].
     min_vruntime: u128,
+    /// When the serial scheduler last had every parked task re-check its
+    /// wait (see [`Shared::pick_serial_runnable`]).
+    rechecked_at: u128,
     /// `NIXVM_WATCHCODE` debug watch: address whose 8 bytes are checked after
     /// every syscall, and the last value seen there.
     watch_addr: Option<u64>,
@@ -1990,6 +2011,15 @@ impl Shared {
                 p.info.parked = false;
             }
         }
+        // And once a quantum, every parked task re-checks its wait, as the
+        // SMP scheduler has blocked tasks do after others' slices: a pipe
+        // write or the like doesn't unpark its waiters, so without this a
+        // sibling that never blocks (a spinner, preempted again and again)
+        // would keep them asleep until it stopped.
+        if now.saturating_sub(self.rechecked_at) >= RECHECK_NS {
+            self.rechecked_at = now;
+            self.unpark_all();
+        }
         let floor = self.min_vruntime;
         let best = (0..self.procs.len())
             .filter(|&i| {
@@ -2010,6 +2040,7 @@ impl Shared {
         &mut self,
         blocked_at: &BTreeMap<usize, u64>,
         epoch: u64,
+        idle: &dyn Fn(usize, &ProcInfo) -> bool,
     ) -> Option<usize> {
         let floor = self.min_vruntime;
         let best = (0..self.procs.len())
@@ -2021,6 +2052,7 @@ impl Shared {
                     && !p.info.held()
                     && p.vcpu.is_some()
                     && blocked_at.get(&i).copied() != Some(epoch)
+                    && idle(i, &p.info)
             })
             .min_by_key(|&i| self.procs[i].as_ref().unwrap().info.vruntime.max(floor));
         best.map(|i| self.admit_fair(i))
@@ -2140,6 +2172,7 @@ impl Kernel {
                 free_file_slots: Vec::new(),
                 free_cwd_slots: Vec::new(),
                 min_vruntime: 0,
+                rechecked_at: 0,
                 spaces: Vec::new(),
                 file_tables: Vec::new(),
                 cwd_tables: Vec::new(),
@@ -2421,6 +2454,7 @@ impl Kernel {
             // slice's syscalls can take their own per-handler locks.
             let Some((i, mut proc, mut vcpu, space_arc, mut cx)) = ({
                 let mut sh = self.shared.lock().unwrap();
+                self.rebalance_cpu_weights(&mut sh);
                 sh.pick_serial_runnable().map(|i| {
                     let mut proc = sh.procs[i].take().unwrap();
                     let mm = proc.info.mm;
@@ -3138,12 +3172,16 @@ impl Kernel {
             }
             drop(done_tx);
 
-            // Route a run to its home worker (`task index % nworkers`).
-            let push_run = |i: usize, vcpu, space| {
-                let (lock, cv) = &*queues[i % nworkers];
+            // Route a run to its worker (see `ProcInfo::home_cpu`).
+            let push_run = |w: usize, i: usize, vcpu, space| {
+                let (lock, cv) = &*queues[w];
                 lock.lock().unwrap().push_back(Work::Run(i, vcpu, space));
                 cv.notify_one();
             };
+            // The workers running a slice now. One at a time each, so the
+            // tasks that share a CPU are picked by virtual runtime, not
+            // queued in turn.
+            let mut busy = vec![false; nworkers];
 
             // A task that blocked records the progress epoch at which it did; it
             // is not re-dispatched until the epoch advances (some other slice
@@ -3153,10 +3191,10 @@ impl Kernel {
             // a genuinely deadlocked machine is detected after exactly one
             // fruitless retry instead of spinning or erroring prematurely.
             let mut blocked_at: BTreeMap<usize, u64> = BTreeMap::new();
-            // The task (by pid) each in-flight run of a slot is for, in dispatch
-            // order. A slot's runs go to one worker and come back in order, so
-            // the front is the task the next result for that slot belongs to.
-            let mut dispatched: BTreeMap<usize, VecDeque<i32>> = BTreeMap::new();
+            // The task (by pid) each in-flight run of a slot is for, and its
+            // worker. A slot has one run in flight at most (a reaped task's slot
+            // waits for its last run to come back before a new task's goes).
+            let mut dispatched: BTreeMap<usize, (i32, usize)> = BTreeMap::new();
             let mut epoch: u64 = 0;
             let mut inflight = 0usize;
             let mut stalled = false;
@@ -3169,22 +3207,28 @@ impl Kernel {
                     if let Some(code) = sh.pid1_code() {
                         break Ok(code);
                     }
+                    self.rebalance_cpu_weights(&mut sh);
                     let mut batch = Vec::new();
                     while inflight + batch.len() < nworkers {
-                        let Some(i) = sh.pick_smp_runnable(&blocked_at, epoch) else {
+                        let idle = |i: usize, p: &ProcInfo| {
+                            !busy[p.home_cpu(i, nworkers)] && !dispatched.contains_key(&i)
+                        };
+                        let Some(i) = sh.pick_smp_runnable(&blocked_at, epoch, &idle) else {
                             break;
                         };
                         let mm = sh.procs[i].as_ref().unwrap().info.mm;
                         let space = Arc::clone(&sh.spaces[mm]);
                         let p = sh.procs[i].as_mut().unwrap();
-                        dispatched.entry(i).or_default().push_back(p.info.pid);
+                        let w = p.info.home_cpu(i, nworkers);
+                        busy[w] = true;
+                        dispatched.insert(i, (p.info.pid, w));
                         let vcpu = p.vcpu.take().unwrap();
-                        batch.push((i, vcpu, space));
+                        batch.push((w, i, vcpu, space));
                     }
                     batch
                 };
-                for (i, vcpu, space) in dispatch {
-                    push_run(i, vcpu, space);
+                for (w, i, vcpu, space) in dispatch {
+                    push_run(w, i, vcpu, space);
                     inflight += 1;
                 }
 
@@ -3248,7 +3292,10 @@ impl Kernel {
                 let (i, vcpu, out) = done_rx.recv().expect("workers outlive the scheduler");
                 inflight -= 1;
                 let mut sh = self.shared.lock().unwrap();
-                let ran = dispatched.get_mut(&i).and_then(VecDeque::pop_front);
+                let ran = dispatched.remove(&i).map(|(pid, w)| {
+                    busy[w] = false;
+                    pid
+                });
                 // The task this ran for exited and was reaped while the result was
                 // on its way, and the slot may already hold a new task (a fork
                 // takes the lowest free slot). That one has a vcpu of its own: this
@@ -3316,7 +3363,7 @@ impl Kernel {
             // `None` slot.
             while inflight > 0 {
                 if let Ok((i, vcpu, _)) = done_rx.recv() {
-                    let ran = dispatched.get_mut(&i).and_then(VecDeque::pop_front);
+                    let ran = dispatched.remove(&i).map(|(pid, _)| pid);
                     if let Some(p) = self.shared.lock().unwrap().procs[i].as_mut()
                         && Some(p.info.pid) == ran
                         && p.vcpu.is_none()
@@ -4592,22 +4639,14 @@ impl Kernel {
                 i64::from(cx.cur.pid)
             }
             Sysno::Getppid => i64::from(cx.cur.ppid),
-            // Resource / scheduling / process-attribute syscalls. The scheduling
-            // attrs (policy/priority/nice/affinity) are recorded and reported
-            // back — the cooperative scheduler doesn't honor them, but a program
-            // that sets and re-reads them must see what it set.
+            // Resource / scheduling / process-attribute syscalls (see
+            // `ProcInfo::sched_policy` for what the scheduler makes of them).
             Sysno::SchedGetaffinity => {
-                // The task's mask, or the default all-CPUs set when unset.
-                let bits = if cx.cur.affinity != 0 {
-                    cx.cur.affinity
-                } else if self.ncpus >= 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << self.ncpus) - 1
-                };
-                sys_misc::sys_sched_getaffinity(bits, args[1], args[2], mem)
+                self.sys_sched_getaffinity(sh, cx, args[0], args[1], args[2], mem)
             }
-            Sysno::SchedSetaffinity => self.sys_sched_setaffinity(cx, args[1], args[2], mem),
+            Sysno::SchedSetaffinity => {
+                self.sys_sched_setaffinity(sh, cx, args[0], args[1], args[2], mem)
+            }
             Sysno::SchedGetparam => {
                 sys_misc::sys_sched_getparam(cx.cur.sched_priority, args[1], mem)
             }
@@ -13748,6 +13787,7 @@ mod tests {
                 info,
             }));
         }
+        sh.rechecked_at = poll::now_ns();
         assert_eq!(
             sh.pick_serial_runnable(),
             Some(1),
@@ -13758,6 +13798,10 @@ mod tests {
             sh.procs[2].as_ref().unwrap().info.parked,
             "an untimed wait stays parked"
         );
+        // Until the quantum's recheck, when every parked task looks again.
+        sh.rechecked_at = poll::now_ns() - RECHECK_NS;
+        sh.pick_serial_runnable();
+        assert!(!sh.procs[2].as_ref().unwrap().info.parked);
     }
 
     /// `/dev/tty` is the controlling terminal: the console (with working

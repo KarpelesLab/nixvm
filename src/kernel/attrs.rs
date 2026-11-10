@@ -1359,11 +1359,148 @@ fn task_caps(p: &ProcInfo) -> [u64; 3] {
     })
 }
 
+impl Kernel {
+    /// The CPUs the VM has, as an affinity mask.
+    pub(super) fn online_cpus(&self) -> u64 {
+        if self.ncpus >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << self.ncpus) - 1
+        }
+    }
+
+    /// `sched_setaffinity(pid, cpusetsize, mask)`: the CPUs task `pid` (0
+    /// for the caller) may run on, of those the VM has (`EINVAL` if none of
+    /// them). Only its owner, or a caller with `CAP_SYS_NICE`, may (`EPERM`).
+    /// The SMP scheduler runs it only on those (see
+    /// [`ProcInfo::home_cpu`]).
+    pub(super) fn sys_sched_setaffinity(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        pid: u64,
+        size: u64,
+        mask: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        let n = (size as usize).min(8);
+        let mut bytes = [0u8; 8];
+        if n > 0 {
+            let Ok(v) = mem.read_vec(mask, n) else {
+                return err(Errno::EFAULT);
+            };
+            bytes[..n].copy_from_slice(&v);
+        }
+        let m = u64::from_le_bytes(bytes) & self.online_cpus();
+        if m == 0 {
+            return err(Errno::EINVAL);
+        }
+        let caller = SchedCaller::of(cx);
+        match with_task(sh, cx, pid, |p| {
+            if !caller.owns(p) {
+                return err(Errno::EPERM);
+            }
+            p.affinity = m;
+            0
+        }) {
+            Ok(r) | Err(r) => r,
+        }
+    }
+
+    /// `sched_getaffinity(pid, cpusetsize, mask)`: task `pid`'s CPUs. The size
+    /// must be whole longs holding every CPU the VM has (`EINVAL`); one long
+    /// is written, and its size returned, as Linux's `cpumask_size()`.
+    pub(super) fn sys_sched_getaffinity(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        pid: u64,
+        size: u64,
+        mask: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        let online = self.online_cpus();
+        let bits = match with_task(sh, cx, pid, |p| p.affinity) {
+            Ok(0) => online,
+            Ok(a) => a & online,
+            Err(e) => return e,
+        };
+        // Linux wants room for `nr_cpu_ids`, in whole longs.
+        if size < 8 || !size.is_multiple_of(8) {
+            return err(Errno::EINVAL);
+        }
+        if mem.write(mask, &bits.to_le_bytes()).is_err() {
+            return err(Errno::EFAULT);
+        }
+        8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::testutil::{BASE, call, e, setup};
     use crate::abi::arch::Sysno;
     use crate::abi::errno::Errno;
+
+    #[test]
+    fn affinity_is_limited_to_the_vm_cpus() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let m = BASE;
+        let mut go = |sys, args| call(&k, &mut cx, &mut mem, &mut v, sys, args);
+        let all = go(Sysno::SchedGetaffinity, [0, 8, m, 0, 0, 0]);
+        assert_eq!(all, 8);
+        assert_eq!(
+            go(Sysno::SchedGetaffinity, [0, 4, m, 0, 0, 0]),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(
+            go(Sysno::SchedGetaffinity, [0, 12, m, 0, 0, 0]),
+            e(Errno::EINVAL)
+        );
+        assert_eq!(
+            go(Sysno::SchedGetaffinity, [99_999, 8, m, 0, 0, 0]),
+            e(Errno::ESRCH)
+        );
+        let online = k.online_cpus();
+        mem.write(m, &(!online).to_le_bytes()).unwrap();
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::SchedSetaffinity,
+                [0, 8, m, 0, 0, 0]
+            ),
+            e(Errno::EINVAL),
+            "no CPU the VM has"
+        );
+        mem.write(m, &u64::MAX.to_le_bytes()).unwrap();
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::SchedSetaffinity,
+                [0, 8, m, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &k,
+                &mut cx,
+                &mut mem,
+                &mut v,
+                Sysno::SchedGetaffinity,
+                [0, 8, m, 0, 0, 0]
+            ),
+            8
+        );
+        assert_eq!(mem.read_u64(m).unwrap(), online, "only the CPUs there are");
+        assert_eq!(cx.cur.home_cpu(5, 1), 0);
+    }
 
     #[test]
     fn sched_attr_param_and_rr_interval_roundtrip() {

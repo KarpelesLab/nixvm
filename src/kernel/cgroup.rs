@@ -141,6 +141,37 @@ impl Kernel {
         }
     }
 
+    /// Share the CPU among cgroups by their `cpu.weight`, as runnable tasks
+    /// stand now (see [`CgroupTree::group_scales`]): done before the
+    /// schedulers pick, when some cgroup has the `cpu` controller.
+    pub(super) fn rebalance_cpu_weights(&self, sh: &mut Shared) {
+        let tree = self.cgroups.lock().unwrap();
+        if !tree.weights_active() {
+            return;
+        }
+        let runnable = |p: &ProcInfo| p.run == RunState::Running && !p.parked && !p.held();
+        let tasks: Vec<(i32, u128)> = sh
+            .procs
+            .iter()
+            .flatten()
+            .filter(|p| runnable(&p.info))
+            .map(|p| (p.info.pid, super::nice_weight(p.info.nice)))
+            .collect();
+        let scales = tree.group_scales(&tasks);
+        drop(tree);
+        let mut scales = tasks.iter().map(|t| t.0).zip(scales);
+        let mut next = scales.next();
+        for p in sh.procs.iter_mut().flatten() {
+            match next {
+                Some((pid, scale)) if pid == p.info.pid => {
+                    p.info.cg_scale = scale;
+                    next = scales.next();
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Hand every task its cgroup's current settings (frozen, `cpu.weight`,
     /// `cpu.max`, memory cgroup), after a write that may have changed them,
     /// first giving the frame allocator the memory cgroups and limits there

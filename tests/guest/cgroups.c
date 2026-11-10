@@ -70,7 +70,7 @@ static void path(char *out, const char *name) { snprintf(out, 256, "%.200s/%.50s
 static void cleanup(void) {
   if (!*base) return;
   put(home, "cgroup.procs", "0");
-  const char *kids[] = {"self", "lim", "kd", "fz", "cq", "mm/kid", "mm", "td/t1/t3", "td/t1", "td/t2", "td", "nest/a", "nest", "into", "ns", "zz", 0};
+  const char *kids[] = {"self", "lim", "kd", "fz", "cq", "ga", "gb", "mm/kid", "mm", "td/t1/t3", "td/t1", "td/t2", "td", "nest/a", "nest", "into", "ns", "zz", 0};
   for (int i = 0; kids[i]; i++) {
     char p[256];
     path(p, kids[i]);
@@ -279,6 +279,44 @@ int main(void) {
   CHECK(field(cs, "throttled_usec") > 300000 && field(cs, "nr_bursts") == 0);
   CHECK(field(get(cq, "cpu.stat.local"), "throttled_usec") > 300000);
   CHECK(field(get(base, "cgroup.stat"), "nr_subsys_cpu") >= 2);
+  /* cpu.weight shares the CPU between cgroups, each splitting its share among
+   * its own tasks: on one CPU, two spinners in a cgroup of weight 200 get as
+   * much together as twice one spinner of a cgroup of weight 100. */
+  {
+    char ga[256], gb[256];
+    path(ga, "ga");
+    path(gb, "gb");
+    CHECK(mkdir(ga, 0755) == 0 && mkdir(gb, 0755) == 0);
+    CHECK(put(ga, "cpu.weight", "200") == 0);
+    volatile double *cpu = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    int ready[2], start[2];
+    CHECK(pipe(ready) == 0 && pipe(start) == 0);
+    pid_t kids[3];
+    for (int k = 0; k < 3; k++) {
+      kids[k] = fork();
+      if (!kids[k]) {
+        cpu_set_t one;
+        CPU_ZERO(&one);
+        CPU_SET(0, &one);
+        if (put(k < 2 ? ga : gb, "cgroup.procs", "0") || sched_setaffinity(0, sizeof one, &one)) _exit(1);
+        char x = 'r';
+        if (write(ready[1], &x, 1) != 1 || read(start[0], &x, 1) != 1) _exit(2);
+        double end = cpu[3];
+        while (secs(CLOCK_MONOTONIC) < end) ;
+        cpu[k] = secs(CLOCK_THREAD_CPUTIME_ID);
+        _exit(0);
+      }
+    }
+    for (int k = 0; k < 3; k++) CHECK(read(ready[0], &r, 1) == 1);
+    cpu[3] = secs(CLOCK_MONOTONIC) + 1.5;
+    CHECK(write(start[1], "ggg", 3) == 3);
+    for (int k = 0; k < 3; k++) CHECK(waitpid(kids[k], &st, 0) == kids[k] && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    double a = cpu[0] + cpu[1], b = cpu[2];
+    printf("two tasks at weight 200 against one at 100: %.3f s and %.3f s of CPU (%.3f %.3f)\n", a, b, cpu[0], cpu[1]);
+    CHECK(b > 0.1 && a / b > 1.4 && a / b < 2.8);
+    close(ready[0]); close(ready[1]); close(start[0]); close(start[1]);
+    CHECK(rmdir(ga) == 0 && rmdir(gb) == 0);
+  }
   /* Taking cpu away from the children resets their settings. */
   CHECK(put(base, "cgroup.subtree_control", "-cpu") == 0);
   CHECK(access(cq, F_OK) == 0 && get(cq, "cpu.max")[0] == 0);

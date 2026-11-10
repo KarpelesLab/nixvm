@@ -213,33 +213,6 @@ impl Kernel {
             _ => 0,
         }
     }
-
-    /// `sched_setaffinity(pid, cpusetsize, mask)` — record the affinity mask
-    /// (self only). `sched_getaffinity` reports it back.
-    #[allow(clippy::unused_self)]
-    pub(super) fn sys_sched_setaffinity(
-        &self,
-        cx: &mut ServiceCtx,
-        size: u64,
-        mask: u64,
-        mem: &GuestMemory,
-    ) -> i64 {
-        let n = (size as usize).min(8);
-        if n == 0 {
-            return err(Errno::EINVAL);
-        }
-        let mut bytes = [0u8; 8];
-        let Ok(v) = mem.read_vec(mask, n) else {
-            return err(Errno::EFAULT);
-        };
-        bytes[..n].copy_from_slice(&v);
-        let m = u64::from_le_bytes(bytes);
-        if m == 0 {
-            return err(Errno::EINVAL); // an empty set is rejected
-        }
-        cx.cur.affinity = m;
-        0
-    }
 }
 
 impl Kernel {
@@ -393,21 +366,6 @@ impl Kernel {
             }
         }
     }
-}
-
-/// `sched_getaffinity(pid, size, mask)` — report a single online CPU (bit 0),
-/// returning the number of bytes written (`min(size, 8)`).
-pub(super) fn sys_sched_getaffinity(bits: u64, size: u64, mask: u64, mem: &mut GuestMemory) -> i64 {
-    let n = size.min(8) as usize;
-    if n == 0 {
-        return err(Errno::EINVAL);
-    }
-    // Report the task's affinity mask (its set, or the default all-CPUs set).
-    let buf = bits.to_le_bytes();
-    if mem.write(mask, &buf[..n]).is_err() {
-        return err(Errno::EFAULT);
-    }
-    n as i64
 }
 
 /// `sched_getparam(pid, param)` — write a `sched_param { sched_priority = 0 }`.
@@ -573,7 +531,7 @@ fn encode_sysinfo() -> [u8; 112] {
 
 #[cfg(test)]
 mod tests {
-    use super::{Errno, Kernel, ServiceCtx, err, sys_sched_getaffinity, sys_sysinfo};
+    use super::{Errno, Kernel, ServiceCtx, err, sys_sysinfo};
     use crate::abi::Arch;
     use crate::fs::{MountTable, TmpFs};
     use crate::vcpu::GuestMemory;
@@ -595,18 +553,6 @@ mod tests {
         assert_eq!(sys_sysinfo(buf, &mut mem), 0);
         assert_eq!(mem.read_u64(buf + 32).unwrap(), 2 * 1024 * 1024 * 1024);
         assert_eq!(mem.read_u32(buf + 104).unwrap(), 1);
-    }
-
-    #[test]
-    fn sched_getaffinity_writes_the_mask() {
-        let (_k, mut mem) = setup();
-        let mask = 0x1_0000;
-        // The effective mask bits are written out (the dispatcher passes the
-        // task's mask, or the default all-CPUs set).
-        assert_eq!(sys_sched_getaffinity(0b1, 128, mask, &mut mem), 8);
-        assert_eq!(mem.read_vec(mask, 1).unwrap()[0], 1);
-        assert_eq!(sys_sched_getaffinity(0xf, 128, mask, &mut mem), 8);
-        assert_eq!(mem.read_vec(mask, 1).unwrap()[0], 0xf);
     }
 
     #[test]

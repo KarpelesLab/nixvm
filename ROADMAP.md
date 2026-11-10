@@ -183,7 +183,8 @@ go through `MountTable`.
   `renameat`/`renameat2`, `faccessat`/`faccessat2`/`access`, `umask`, `fcntl`
   (`F_DUPFD`/`F_GETFL` subset), `uname`, `getpid`/`gettid`/`getppid`,
   `clock_gettime`/`gettimeofday`/`clock_getres`/`nanosleep`/
-  `clock_nanosleep`/`time`, `sched_getaffinity`/`sched_getparam`,
+  `clock_nanosleep`/`time`, `sched_getaffinity`/`sched_setaffinity` (honored by the SMP
+  scheduler: a task runs only on the CPUs its mask allows)/`sched_getparam`,
   `getrusage`/`sysinfo`/`times`/`getcpu`/`capget`/`prlimit64`/`getrlimit`,
   `prctl`. `ioctl` returns `ENOTTY` (no terminal-control modeling yet).
 - **Exit criteria:** static `busybox` multi-applet (`ls`, `cat`, `sha256sum`)
@@ -496,9 +497,11 @@ must get the isolation it asks for.
   - `pids`: `pids.max` stops `fork`.
   - `cpu`: `cpu.max` (with `cpu.max.burst`) is Linux's bandwidth control, holding a
     cgroup's tasks off the CPU once its quota for the period is used, with the throttling
-    counts in `cpu.stat`; `cpu.weight` (`cpu.weight.nice`, `cpu.idle`) scales each task's
-    share of the CPU. Unlike Linux's group scheduling, a cgroup with several busy tasks
-    gets that share for each of them, rather than splitting one among them.
+    counts in `cpu.stat`; `cpu.weight` (`cpu.weight.nice`, `cpu.idle`) shares the CPU out
+    as Linux's group scheduling does: a cgroup gets its weight's part beside what else is
+    runnable at its level, and splits that among what's runnable in it. The share is
+    worked out afresh before each pick, from the tasks runnable then, and applied as a
+    task's virtual-runtime rate in the one flat run queue (no per-group queues).
   - `memory`: each page a process allocates (its own memory and page tables) is
     charged to its cgroup in the frame allocator, as Linux charges a page to the cgroup
     that faulted it in; `memory.current`, `memory.peak` and `memory.stat` show it. Past
