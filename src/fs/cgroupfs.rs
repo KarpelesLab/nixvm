@@ -99,6 +99,7 @@ const MEMORY_FILES: &[(&str, bool)] = &[
 /// the kernel passes on to them once the write is done.
 pub const SCHED_FILES: &[&str] = &[
     "cgroup.subtree_control",
+    "cgroup.type",
     "memory.high",
     "memory.max",
     "cpu.idle",
@@ -357,12 +358,16 @@ fn nice_shares(nice: i64) -> u64 {
 
 /// One cgroup.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent per-cgroup settings
 struct Node {
     name: String,
     parent: Option<u32>,
     children: BTreeMap<String, u32>,
     /// The controllers `cgroup.subtree_control` enables for the children.
     subtree: u8,
+    /// `cgroup.type` "threaded": the cgroup is part of the resource domain of
+    /// its nearest non-threaded ancestor, its thread root (Linux's `dom_cgrp`).
+    threaded: bool,
     /// `pids.max`; `None` is "max".
     pids_max: Option<u64>,
     /// How often a fork failed on this cgroup's `pids.max` (`pids.events`).
@@ -431,6 +436,7 @@ impl Node {
             parent,
             children: BTreeMap::new(),
             subtree: 0,
+            threaded: false,
             pids_max: None,
             pids_events: 0,
             shares: NICE0_SHARES,
@@ -776,12 +782,13 @@ impl CgroupTree {
         self.nodes.get(&node).map_or((0, 0), |n| (n.uid, n.gid))
     }
 
-    /// Whether one of `node`'s children has live tasks in it or below.
-    fn has_populated_child(&self, node: u32) -> bool {
+    /// Whether one of `node`'s children that isn't threaded has live tasks
+    /// in it or below (Linux's `nr_populated_domain_children`).
+    fn has_populated_domain_child(&self, node: u32) -> bool {
         self.nodes.get(&node).is_some_and(|n| {
             n.children
                 .values()
-                .any(|c| self.nodes.get(c).is_some_and(|c| c.live > 0))
+                .any(|c| self.nodes.get(c).is_some_and(|c| c.live > 0 && !c.threaded))
         })
     }
 
@@ -790,22 +797,125 @@ impl CgroupTree {
         self.members.values().any(|m| m.node == node && m.live)
     }
 
-    /// Whether a task can be put in `node`, by cgroup v2's "no internal
-    /// processes" rule (Linux's `cgroup_migrate_vet_dst`): a cgroup that hands
-    /// controllers to its children takes no tasks, unless they're all threaded
-    /// ones (`cpu`, `pids`), which may share a cgroup with tasks, and no child
-    /// is populated yet. The root is exempt.
+    /// Whether `node`'s `cgroup.type` is "threaded".
+    #[must_use]
+    pub fn is_threaded(&self, node: u32) -> bool {
+        self.nodes.get(&node).is_some_and(|n| n.threaded)
+    }
+
+    /// The resource domain `node` is part of: itself, or for a threaded
+    /// cgroup its thread root, the nearest ancestor that isn't threaded.
+    #[must_use]
+    pub fn domain_of(&self, node: u32) -> u32 {
+        self.chain(node)
+            .into_iter()
+            .find(|&n| !self.is_threaded(n))
+            .unwrap_or(ROOT)
+    }
+
+    /// Whether `node` is the root of a threaded subtree: a domain with
+    /// threaded children, or with tasks and threaded controllers enabled
+    /// (Linux's `cgroup_is_thread_root`).
+    fn is_thread_root(&self, node: u32) -> bool {
+        let Some(n) = self.nodes.get(&node) else {
+            return false;
+        };
+        !n.threaded
+            && (n.children.values().any(|&c| self.is_threaded(c))
+                || (self.has_own_tasks(node) && n.subtree & THREADED != 0))
+    }
+
+    /// Whether `node` could serve as a thread root (Linux's
+    /// `cgroup_can_be_thread_root`): the root always can; otherwise a domain
+    /// with no populated domain children and no domain controllers enabled.
+    fn can_be_thread_root(&self, node: u32) -> bool {
+        if node == ROOT {
+            return true;
+        }
+        let Some(n) = self.nodes.get(&node) else {
+            return false;
+        };
+        !n.threaded && !self.has_populated_domain_child(node) && n.subtree & !THREADED == 0
+    }
+
+    /// Whether `node` is a domain that can hold resources (Linux's
+    /// `cgroup_is_valid_domain`): not threaded, and no ancestor below the
+    /// root is threaded or a thread root. One that isn't is "domain invalid".
+    fn is_valid_domain(&self, node: u32) -> bool {
+        !self.is_threaded(node)
+            && self
+                .chain(node)
+                .into_iter()
+                .skip(1)
+                .all(|a| !self.is_threaded(a) && (a == ROOT || !self.is_thread_root(a)))
+    }
+
+    /// Whether a task can be put in `node` (Linux's `cgroup_migrate_vet_dst`):
+    /// its domain must be a valid one (`EOPNOTSUPP`), and, by cgroup v2's "no
+    /// internal processes" rule, a cgroup that hands controllers to its
+    /// children takes no tasks (`EBUSY`), unless it is or could be a thread
+    /// root, or is threaded: threaded controllers (`cpu`, `pids`) may share
+    /// a cgroup with tasks.
     pub fn check_attach(&self, node: u32) -> Result<(), i32> {
-        match self.nodes.get(&node) {
-            None => Err(ENOENT),
-            Some(n)
-                if node != ROOT
-                    && n.subtree != 0
-                    && (self.has_populated_child(node) || n.subtree & !THREADED != 0) =>
-            {
-                Err(EBUSY)
-            }
-            Some(_) => Ok(()),
+        let Some(n) = self.nodes.get(&node) else {
+            return Err(ENOENT);
+        };
+        if !self.is_valid_domain(self.domain_of(node)) {
+            return Err(EOPNOTSUPP);
+        }
+        if self.can_be_thread_root(node) || n.threaded || n.subtree == 0 {
+            return Ok(());
+        }
+        Err(EBUSY)
+    }
+
+    /// Whether thread `tid` may move to `node` on its own (`cgroup.threads`,
+    /// or `CLONE_INTO_CGROUP` with `CLONE_THREAD`): only within its resource
+    /// domain (`EOPNOTSUPP` otherwise), on top of [`Self::check_attach`].
+    pub fn check_thread_attach(&self, tid: i32, node: u32) -> Result<(), i32> {
+        self.check_attach(node)?;
+        if self.domain_of(self.node_of(tid)) == self.domain_of(node) {
+            Ok(())
+        } else {
+            Err(EOPNOTSUPP)
+        }
+    }
+
+    /// `cgroup.type`: "threaded" makes `node` join its parent's resource
+    /// domain (Linux's `cgroup_enable_threaded`); there's no going back.
+    fn enable_threaded(&mut self, node: u32) -> Result<(), i32> {
+        let n = self.nodes.get(&node).ok_or(ENOENT)?;
+        if n.threaded {
+            return Ok(());
+        }
+        // Populated, or with domain controllers enabled: it can't be switched.
+        if n.live > 0 || n.subtree & !THREADED != 0 {
+            return Err(EOPNOTSUPP);
+        }
+        let dom = self.domain_of(n.parent.ok_or(EINVAL)?);
+        if !self.is_valid_domain(dom) || !self.can_be_thread_root(dom) {
+            return Err(EOPNOTSUPP);
+        }
+        let n = self.nodes.get_mut(&node).expect("checked");
+        n.threaded = true;
+        // Only threaded controllers are left to it; a domain one's state
+        // goes, as Linux drops it.
+        n.reset(!THREADED);
+        n.subtree &= THREADED;
+        self.update_quota_gate();
+        Ok(())
+    }
+
+    /// The "cgroup.type" of `node`.
+    fn type_name(&self, node: u32) -> &'static str {
+        if self.is_threaded(node) {
+            "threaded"
+        } else if !self.is_valid_domain(node) {
+            "domain invalid"
+        } else if self.is_thread_root(node) {
+            "domain threaded"
+        } else {
+            "domain"
         }
     }
 
@@ -1040,7 +1150,14 @@ impl CgroupTree {
     fn controller_bits(&self, node: u32) -> u8 {
         match self.nodes.get(&node).and_then(|n| n.parent) {
             None => CONTROLLERS.iter().fold(0, |a, (_, b)| a | b),
-            Some(p) => self.nodes.get(&p).map_or(0, |p| p.subtree),
+            Some(p) => {
+                let bits = self.nodes.get(&p).map_or(0, |p| p.subtree);
+                if self.is_threaded(node) {
+                    bits & THREADED
+                } else {
+                    bits
+                }
+            }
         }
     }
 
@@ -1230,9 +1347,8 @@ impl CgroupTree {
                 let (quota, period) = (n.bandwidth.quota_us, n.bandwidth.period_us);
                 set_bandwidth(&mut n.bandwidth, quota, period, burst)?;
             }
-            // Threaded subtrees aren't supported; "domain" isn't something to
-            // write, as on Linux.
-            "cgroup.type" if text == "threaded" => return Err(EOPNOTSUPP),
+            // "domain" isn't something to write, as on Linux.
+            "cgroup.type" if text == "threaded" => return self.enable_threaded(node),
             "cgroup.type" => return Err(EINVAL),
             f if KERNEL_FILES.contains(&f) => return Err(EOPNOTSUPP),
             _ => return Err(EACCES),
@@ -1271,14 +1387,28 @@ impl CgroupTree {
         }
         let enabling = on & !old;
         let disabling = off & old;
-        // No internal processes (Linux's `cgroup_vet_subtree_control_enable`):
-        // a domain controller can't be enabled where there are tasks; a
-        // threaded one may be, unless the cgroup also has populated children,
-        // or domain controllers enabled, which they'd then compete with.
-        if enabling != 0 && node != ROOT && self.has_own_tasks(node) {
-            let domain = enabling & !THREADED != 0;
-            if domain || self.has_populated_child(node) || old & !THREADED != 0 {
-                return Err(EBUSY);
+        // Linux's `cgroup_vet_subtree_control_enable`: nothing in a domain
+        // that can't hold resources; no domain controller inside a threaded
+        // subtree; and no internal processes: a domain controller can't be
+        // enabled where there are tasks; a threaded one may be, where the
+        // cgroup is or could be a thread root.
+        if enabling != 0 {
+            if !self.is_valid_domain(self.domain_of(node)) {
+                return Err(EOPNOTSUPP);
+            }
+            if node != ROOT {
+                let threaded = self.is_threaded(node);
+                let exempt = if enabling & !THREADED != 0 {
+                    if threaded || self.is_thread_root(node) {
+                        return Err(EOPNOTSUPP);
+                    }
+                    false
+                } else {
+                    threaded || self.can_be_thread_root(node)
+                };
+                if !exempt && self.has_own_tasks(node) {
+                    return Err(EBUSY);
+                }
             }
         }
         // A child still hands a controller on to its own children.
@@ -1326,7 +1456,7 @@ impl CgroupTree {
                 u8::from(n.live > 0),
                 u8::from(self.frozen(node))
             ),
-            "cgroup.type" => "domain\n".to_string(),
+            "cgroup.type" => format!("{}\n", self.type_name(node)),
             "cgroup.max.depth" => limit(n.max_depth),
             "cgroup.max.descendants" => limit(n.max_descendants),
             // Linux's layout: the controller counts are how many cgroups from
@@ -1569,6 +1699,10 @@ impl MountFs for CgroupFs {
         let Some(file) = file else {
             return Err(errno(21)); // EISDIR
         };
+        // All of a threaded subtree's processes belong to its thread root.
+        if file == "cgroup.procs" && tree.is_threaded(node) {
+            return Err(errno(EOPNOTSUPP));
+        }
         let text = tree.render(node, &file);
         let bytes = text.as_bytes();
         let start = (off as usize).min(bytes.len());
@@ -1844,6 +1978,50 @@ mod tests {
     }
 
     #[test]
+    fn threaded_subtrees_follow_linux() {
+        let tree = CgroupTree::shared();
+        let mut t = tree.lock().unwrap();
+        t.write_file(ROOT, "cgroup.subtree_control", "+cpu +pids +memory")
+            .unwrap();
+        let d = t.mkdir(ROOT, "d", 0, 0).unwrap();
+        t.write_file(d, "cgroup.subtree_control", "+memory")
+            .unwrap();
+        let a = t.mkdir(d, "a", 0, 0).unwrap();
+        assert_eq!(
+            t.write_file(a, "cgroup.type", "threaded"),
+            Err(EOPNOTSUPP),
+            "d has a domain controller enabled"
+        );
+        t.write_file(d, "cgroup.subtree_control", "-memory")
+            .unwrap();
+        let b = t.mkdir(d, "b", 0, 0).unwrap();
+        t.write_file(a, "cgroup.type", "threaded").unwrap();
+        assert_eq!(t.type_name(a), "threaded");
+        assert_eq!(t.type_name(d), "domain threaded");
+        assert_eq!(t.type_name(b), "domain invalid");
+        assert_eq!(t.check_attach(b), Err(EOPNOTSUPP));
+        assert_eq!(t.domain_of(a), d);
+        assert_eq!(
+            t.write_file(d, "cgroup.subtree_control", "+memory"),
+            Err(EOPNOTSUPP)
+        );
+        t.write_file(d, "cgroup.subtree_control", "+cpu").unwrap();
+        assert_eq!(t.controllers(a), "cpu");
+        // Threads move within the domain, not out of it.
+        t.migrate(&[(7, true), (8, true)], d);
+        assert_eq!(t.check_thread_attach(8, a), Ok(()));
+        t.migrate(&[(8, true)], a);
+        assert_eq!(t.check_thread_attach(8, ROOT), Err(EOPNOTSUPP));
+        assert_eq!(t.check_attach(d), Ok(()), "a thread root takes tasks");
+        // Populated, it can't become threaded itself.
+        assert_eq!(t.write_file(d, "cgroup.type", "threaded"), Err(EOPNOTSUPP));
+        t.migrate(&[(7, true), (8, true)], ROOT);
+        t.rmdir(a).unwrap();
+        assert_eq!(t.type_name(d), "domain");
+        assert_eq!(t.type_name(b), "domain");
+    }
+
+    #[test]
     fn no_internal_processes_and_limits_on_the_tree() {
         let tree = CgroupTree::shared();
         let mut t = tree.lock().unwrap();
@@ -1871,9 +2049,13 @@ mod tests {
         let kid = t.mkdir(a, "kid", 0, 0).unwrap();
         t.migrate(&[(6, true)], kid);
         assert_eq!(t.check_attach(a), Err(EBUSY));
-        assert_eq!(t.check_attach(kid), Ok(()));
+        // With tasks and a threaded controller enabled, a is a thread root,
+        // under which a domain child can't hold processes.
+        assert_eq!(t.type_name(a), "domain threaded");
+        assert_eq!(t.check_attach(kid), Err(EOPNOTSUPP));
         t.write_file(a, "cgroup.subtree_control", "-pids").unwrap();
         assert_eq!(t.check_attach(a), Ok(()));
+        assert_eq!(t.check_attach(kid), Ok(()));
         t.migrate(&[(6, true)], ROOT);
         t.rmdir(kid).unwrap();
         t.write_file(a, "cgroup.max.depth", "1").unwrap();

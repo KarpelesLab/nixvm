@@ -512,8 +512,13 @@ must get the isolation it asks for.
     `memory.low`/`min` protect nothing. As a domain controller it follows v2's
     no-internal-process rule.
 
-  `io` isn't listed, since nothing would enforce it. Threaded subtrees aren't supported
-  (`EOPNOTSUPP`). `statfs` reports each
+  `io` isn't listed, since nothing would enforce it. Threaded subtrees work as on Linux:
+  writing "threaded" to `cgroup.type` makes a cgroup join its parent's resource domain
+  (the thread root, "domain threaded"), where a process's threads can be spread with
+  `cgroup.threads` and only the threaded controllers (`cpu`, `pids`) can be enabled; a
+  domain cgroup under a thread root is "domain invalid" and takes no processes, a thread
+  moves only within its domain, and `cgroup.procs` of a threaded cgroup can't be read
+  and its `cgroup.kill` isn't there to use (`EOPNOTSUPP`). `statfs` reports each
   filesystem's own magic, which is how tools find cgroup v2.
 - **Signals:** a signal sent to a task that ignores it (and doesn't block it) is discarded
   as it's sent, and making a signal ignored drops it if pending, as on Linux.

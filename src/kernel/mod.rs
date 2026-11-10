@@ -4892,7 +4892,7 @@ impl Kernel {
         if !self.pids.lock().unwrap().accepts_tasks(child_ns.pid) {
             return err(Errno::ENOMEM);
         }
-        if let Err(e) = self.cgroup_can_fork(cx, ca.cgroup) {
+        if let Err(e) = self.cgroup_can_fork(cx, ca.cgroup, ca.flags & CLONE_THREAD != 0) {
             return e;
         }
         let Ok(mut child_vcpu) = vcpu.fork() else {

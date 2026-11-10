@@ -2,13 +2,14 @@
  * pids.max, the cpu controller (weights, cpu.max bandwidth), the memory
  * controller (memory.max and its out-of-memory kills, also on lowering it;
  * memory.high's throttling), cgroup.events,
- * cgroup.kill, cgroup.freeze, the limits on the
+ * cgroup.kill, cgroup.freeze, threaded subtrees, the limits on the
  * tree, CLONE_INTO_CGROUP, cgroup namespaces and /proc/<pid>/cgroup.
  *
  * Needs root and cgroup2 at /sys/fs/cgroup: run it as root on a real system
  * (it cleans up after itself). */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <linux/sched.h>
 #include <sched.h>
@@ -69,13 +70,29 @@ static void path(char *out, const char *name) { snprintf(out, 256, "%.200s/%.50s
 static void cleanup(void) {
   if (!*base) return;
   put(home, "cgroup.procs", "0");
-  const char *kids[] = {"self", "lim", "kd", "fz", "cq", "mm/kid", "mm", "nest/a", "nest", "into", "ns", "zz", 0};
+  const char *kids[] = {"self", "lim", "kd", "fz", "cq", "mm/kid", "mm", "td/t1/t3", "td/t1", "td/t2", "td", "nest/a", "nest", "into", "ns", "zz", 0};
   for (int i = 0; kids[i]; i++) {
     char p[256];
     path(p, kids[i]);
     rmdir(p);
   }
   rmdir(base);
+}
+
+/* A thread that tells its tid down a pipe, then waits to be killed. */
+static int tid_pipe[2];
+static void *idle_thread(void *arg) {
+  (void)arg;
+  pid_t t = syscall(SYS_gettid);
+  if (write(tid_pipe[1], &t, sizeof t) != sizeof t) _exit(9);
+  for (;;) pause();
+}
+
+/* Whether a newline-separated list of ids has `id`. */
+static int listed(const char *list, int id) {
+  for (const char *l = list; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : 0)
+    if (atoi(l) == id) return 1;
+  return 0;
 }
 
 /* The calling process's cgroup, from /proc/self/cgroup. */
@@ -401,6 +418,81 @@ int main(void) {
   CHECK(field(get(mm, "memory.events"), "high") > highs);
   CHECK(rmdir(mm) == 0);
   puts("memory.max, memory.current, memory.events, memory.oom.group: ok");
+
+  /* Threaded subtrees: a cgroup made "threaded" joins its parent's resource
+   * domain, and a process's threads can then be spread across it. */
+  char td[256], t1[256], t2[256], t3[256];
+  path(td, "td");
+  CHECK(mkdir(td, 0755) == 0);
+  snprintf(t1, sizeof t1, "%.240s/t1", td);
+  snprintf(t2, sizeof t2, "%.240s/t2", td);
+  snprintf(t3, sizeof t3, "%.240s/t3", t1);
+  CHECK(mkdir(t1, 0755) == 0 && mkdir(t2, 0755) == 0);
+  CHECK(!strcmp(get(t1, "cgroup.type"), "domain\n"));
+  CHECK(put(t1, "cgroup.type", "domain") == -1 && errno == EINVAL);
+  CHECK(put(t1, "cgroup.type", "threaded") == 0);
+  CHECK(put(t1, "cgroup.type", "threaded") == 0); /* already */
+  CHECK(!strcmp(get(t1, "cgroup.type"), "threaded\n"));
+  CHECK(!strcmp(get(td, "cgroup.type"), "domain threaded\n"));
+  CHECK(!strcmp(get(t2, "cgroup.type"), "domain invalid\n")); /* a domain can't sit in a thread root */
+  CHECK(put(t2, "cgroup.procs", "0") == -1 && errno == EOPNOTSUPP);
+  CHECK(mkdir(t3, 0755) == 0 && !strcmp(get(t3, "cgroup.type"), "domain invalid\n"));
+  CHECK(put(t3, "cgroup.type", "threaded") == 0);
+  CHECK(rmdir(t3) == 0 && rmdir(t2) == 0);
+  /* Only threaded controllers inside it; no domain one in the thread root. */
+  CHECK(put(td, "cgroup.subtree_control", "+memory") == -1 && errno == EOPNOTSUPP);
+  CHECK(put(td, "cgroup.subtree_control", "+cpu +pids") == 0);
+  CHECK(!strcmp(get(t1, "cgroup.controllers"), "cpu pids\n"));
+  CHECK(put(t1, "cgroup.subtree_control", "+pids") == 0 && put(t1, "cgroup.subtree_control", "-pids") == 0);
+  /* A process in the thread root, with a second thread moved to t1. */
+  CHECK(pipe(tid_pipe) == 0 && pipe(go) == 0);
+  c = fork();
+  if (!c) {
+    pthread_t th;
+    if (pthread_create(&th, 0, idle_thread, 0)) _exit(1);
+    char x;
+    if (read(go[0], &x, 1) != 1) _exit(2);
+    _exit(0);
+  }
+  pid_t tid = 0;
+  CHECK(read(tid_pipe[0], &tid, sizeof tid) == sizeof tid);
+  snprintf(num, sizeof num, "%d", c);
+  CHECK(put(td, "cgroup.procs", num) == 0); /* "domain threaded" takes processes */
+  snprintf(num, sizeof num, "%d", tid);
+  CHECK(put(t1, "cgroup.threads", num) == 0);
+  CHECK(listed(get(t1, "cgroup.threads"), tid) && !listed(get(t1, "cgroup.threads"), c));
+  CHECK(listed(get(td, "cgroup.threads"), c) && !listed(get(td, "cgroup.threads"), tid));
+  CHECK(listed(get(td, "cgroup.procs"), c)); /* the process is the thread root's */
+  CHECK(!strcmp(get(td, "cgroup.events"), "populated 1\nfrozen 0\n"));
+  {
+    char pp[512];
+    snprintf(pp, sizeof pp, "%s/cgroup.procs", t1);
+    int fd = open(pp, O_RDONLY);
+    char b[64];
+    CHECK(fd >= 0 && read(fd, b, sizeof b) == -1 && errno == EOPNOTSUPP);
+    close(fd);
+  }
+  CHECK(put(t1, "cgroup.kill", "1") == -1 && errno == EOPNOTSUPP); /* killing is per process */
+  CHECK(put(self, "cgroup.threads", num) == -1 && errno == EOPNOTSUPP); /* out of its domain */
+  CHECK(put(t1, "cgroup.type", "threaded") == 0);
+  /* A populated domain can't become threaded; no domain controller now. */
+  CHECK(put(td, "cgroup.type", "threaded") == -1 && errno == EOPNOTSUPP);
+  /* Writing cgroup.procs anywhere in the subtree moves every thread. */
+  snprintf(num, sizeof num, "%d", c);
+  CHECK(put(t1, "cgroup.procs", num) == 0);
+  CHECK(listed(get(t1, "cgroup.threads"), c) && listed(get(t1, "cgroup.threads"), tid));
+  CHECK(listed(get(td, "cgroup.procs"), c) && !strcmp(get(td, "cgroup.threads"), ""));
+  CHECK(write(go[1], "g", 1) == 1);
+  CHECK(waitpid(c, &st, 0) == c && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+  for (int i = 0; i < 100 && strcmp(get(td, "cgroup.events"), "populated 0\nfrozen 0\n"); i++) usleep(10000);
+  CHECK(!strcmp(get(td, "cgroup.events"), "populated 0\nfrozen 0\n"));
+  CHECK(!strcmp(get(td, "cgroup.type"), "domain threaded\n")); /* t1 is still threaded */
+  CHECK(rmdir(t1) == 0);
+  CHECK(!strcmp(get(td, "cgroup.type"), "domain\n")); /* back to a plain domain */
+  CHECK(rmdir(td) == 0);
+  close(tid_pipe[0]);
+  close(tid_pipe[1]);
+  puts("threaded subtrees, cgroup.type, cgroup.threads: ok");
 
   /* Limits on the tree. */
   char nest[256], a[256];

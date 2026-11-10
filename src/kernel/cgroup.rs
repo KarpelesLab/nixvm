@@ -90,9 +90,21 @@ fn sync_exits(tree: &mut CgroupTree, tasks: &[TaskState]) {
 
 impl Kernel {
     /// Whether a new task forked by the caller may go into `into` (or the
-    /// caller's own cgroup): `EAGAIN` past a `pids.max` on the way up.
-    pub(super) fn cgroup_can_fork(&self, cx: &ServiceCtx, into: Option<u32>) -> Result<(), i64> {
+    /// caller's own cgroup): `EAGAIN` past a `pids.max` on the way up. A new
+    /// thread goes elsewhere only within the caller's resource domain.
+    pub(super) fn cgroup_can_fork(
+        &self,
+        cx: &ServiceCtx,
+        into: Option<u32>,
+        thread: bool,
+    ) -> Result<(), i64> {
         let mut tree = self.cgroups.lock().unwrap();
+        if let Some(node) = into
+            && thread
+        {
+            tree.check_thread_attach(cx.cur.pid, node)
+                .map_err(|e| err(Errno(e)))?;
+        }
         let node = into.unwrap_or_else(|| tree.node_of(cx.cur.pid));
         tree.can_fork(node, into.is_some())
             .map_err(|e| err(Errno(e)))
@@ -272,7 +284,8 @@ impl Kernel {
             let tid = self.visible_pid(cx, t.pid);
             let tgid = self.visible_pid(cx, t.tgid);
             view.threads.entry(node).or_default().push(tid);
-            let procs = view.procs.entry(node).or_default();
+            // A process in a threaded subtree is listed in its thread root.
+            let procs = view.procs.entry(tree.domain_of(node)).or_default();
             if !procs.contains(&tgid) {
                 procs.push(tgid);
             }
@@ -391,15 +404,12 @@ impl Kernel {
             return Err(err(Errno::ENOENT));
         }
         if thread {
-            // Threads all live in their process's cgroup: there are no threaded
-            // subtrees to move one into on its own.
-            return if from == node {
-                Ok(())
-            } else {
-                Err(err(Errno::EOPNOTSUPP))
-            };
+            // A thread moves on its own only within its resource domain.
+            tree.check_thread_attach(target, node)
+                .map_err(|e| err(Errno(e)))?;
+        } else {
+            tree.check_attach(node).map_err(|e| err(Errno(e)))?;
         }
-        tree.check_attach(node).map_err(|e| err(Errno(e)))?;
         // The writer needs the right to move tasks out of where they are too:
         // write access to the common ancestor's `cgroup.procs` (cgroup v2's
         // delegation rule), which a delegated cgroup's owner has below it.
@@ -409,14 +419,20 @@ impl Kernel {
         }
         let moving: Vec<(i32, bool)> = tasks
             .iter()
-            .filter(|t| t.tgid == tgid)
+            .filter(|t| {
+                if thread {
+                    t.pid == target
+                } else {
+                    t.tgid == tgid
+                }
+            })
             .map(|t| (t.pid, !t.zombie))
             .collect();
         tree.migrate(&moving, node);
         let st = tree.sched_state(node, poll::now_ns());
         drop(tree);
         let apply = |p: &mut ProcInfo| {
-            if p.tgid == tgid {
+            if moving.iter().any(|&(t, _)| t == p.pid) {
                 p.frozen = st.frozen;
                 p.cg_scale = st.scale;
                 p.throttled_until = st.throttled_until;
@@ -437,6 +453,10 @@ impl Kernel {
         }
         let mut sh = self.shared.lock().unwrap();
         let tree = self.cgroups.lock().unwrap();
+        // Killing is per process, so not something a threaded cgroup does.
+        if tree.is_threaded(node) {
+            return Err(err(Errno::EOPNOTSUPP));
+        }
         let doomed = tree.subtree(node);
         let hit = |tid: i32| doomed.contains(&tree.node_of(tid));
         for p in sh.procs.iter_mut().flatten() {
