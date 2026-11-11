@@ -52,7 +52,8 @@ use super::phys::{FrameAllocator, PhysMem};
 /// bits, so one walker serves both; only what the bits *in* an entry mean
 /// differs. Each tree is in its guest architecture's format so that
 /// architecture's hardware walker can use it (KVM/x86-64, HVF/arm64); the
-/// software walker reads either. A pool's format lives on its [`PhysMem`].
+/// software walker reads either. All the address spaces of one physical pool
+/// share its format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PtFormat {
