@@ -487,8 +487,7 @@ impl Kernel {
             };
             sched_change_allowed(caller, p, new_policy, new_prio, new_nice)?;
             set_sched(p, new_policy, new_prio);
-            if sflags & SCHED_FLAG_KEEP_PARAMS == 0 && matches!(policy, SCHED_OTHER | SCHED_BATCH)
-            {
+            if sflags & SCHED_FLAG_KEEP_PARAMS == 0 && matches!(policy, SCHED_OTHER | SCHED_BATCH) {
                 p.nice = nice.clamp(-20, 19);
             }
             Ok(())

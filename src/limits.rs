@@ -37,11 +37,13 @@ pub struct Limits {
 impl Limits {
     /// Sensible defaults for the machine this runs on: a quarter of its RAM for
     /// kernel memory, at most 8 GiB and at least 256 MiB, 4096 tasks and 262144 open
-    /// files. Each can be overridden with `NIXVM_LIMIT_KERNEL_MEMORY` (bytes),
-    /// `NIXVM_LIMIT_TASKS` or `NIXVM_LIMIT_OPEN_FILES`. Disk, CPU time and run time
-    /// have no default limit, since a host can't guess what a job needs, and can be
-    /// set with `NIXVM_LIMIT_DISK_BYTES`, `NIXVM_LIMIT_CPU_SECONDS` and
-    /// `NIXVM_LIMIT_WALL_SECONDS`.
+    /// files, and for growth on the host's disk a quarter of what's free on the
+    /// filesystem the VM starts in, at least 1 GiB. Each can be overridden with
+    /// `NIXVM_LIMIT_KERNEL_MEMORY` (bytes), `NIXVM_LIMIT_TASKS`,
+    /// `NIXVM_LIMIT_OPEN_FILES` or `NIXVM_LIMIT_DISK_BYTES`. CPU time and run time
+    /// have no default limit: a guest can't use more CPUs than it was given, and
+    /// how long a job may run is the embedder's call (a shell session runs for
+    /// hours); `NIXVM_LIMIT_CPU_SECONDS` and `NIXVM_LIMIT_WALL_SECONDS` set them.
     #[must_use]
     pub fn for_this_host() -> Self {
         const MIB: u64 = 1024 * 1024;
@@ -51,7 +53,7 @@ impl Limits {
             tasks: env_u64("NIXVM_LIMIT_TASKS").map_or(4096, |n| n.min(1 << 22) as u32),
             open_files: env_u64("NIXVM_LIMIT_OPEN_FILES")
                 .map_or(1 << 18, |n| n.min(u64::from(u32::MAX)) as u32),
-            disk_bytes: env_u64("NIXVM_LIMIT_DISK_BYTES").unwrap_or(u64::MAX),
+            disk_bytes: env_u64("NIXVM_LIMIT_DISK_BYTES").unwrap_or_else(default_disk_bytes),
             cpu_time: env_u64("NIXVM_LIMIT_CPU_SECONDS").map(Duration::from_secs),
             wall_time: env_u64("NIXVM_LIMIT_WALL_SECONDS").map(Duration::from_secs),
         }
@@ -70,6 +72,23 @@ impl Default for Limits {
 #[must_use]
 pub fn guest_memory_ceiling() -> u64 {
     env_u64("NIXVM_LIMIT_GUEST_MEMORY").unwrap_or_else(|| host_memory_bytes() / 4 * 3)
+}
+
+/// The default ceiling on growth on the host's disk: a quarter of what's free
+/// on the filesystem of the working directory, at least 1 GiB (no ceiling if
+/// that can't be told).
+fn default_disk_bytes() -> u64 {
+    #[cfg(unix)]
+    {
+        let free = std::env::current_dir()
+            .ok()
+            .and_then(|d| crate::fs::passthrough::host_space(&d))
+            .map(|s| s.avail);
+        if let Some(free) = free {
+            return (free / 4).max(1 << 30);
+        }
+    }
+    u64::MAX
 }
 
 /// A positive integer from environment variable `name`.

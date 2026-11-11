@@ -208,6 +208,19 @@ impl MountFs for Overlay {
         self.upper.attach_disk_quota(quota);
     }
 
+    fn attach_disks(&mut self, disks: &super::blockdev::SharedDisks) {
+        self.lower.attach_disks(disks);
+        self.upper.attach_disks(disks);
+    }
+
+    fn data_dev(&mut self, rel: &str) -> Option<u64> {
+        if self.upper.stat(rel).is_some() {
+            self.upper.data_dev(rel)
+        } else {
+            self.lower.data_dev(rel)
+        }
+    }
+
     fn read_only(&self) -> bool {
         false
     }

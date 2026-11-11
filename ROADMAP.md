@@ -119,6 +119,13 @@ its first unimplemented frontier; `nixvm` CLI (`run`/`shell`/`version`).
 
 ### Phase 1 — HVF backend + first syscall  ✅ static program runs on hardware
 
+> **Broken since `474bde5` (2026-07-20):** guest memory moved to the shared frame pool
+> with per-process page tables, and the HVF vcpu still maps the old flat region
+> (`backing_generation`, `host_base`), so `--features hvf` no longer compiles; CI
+> doesn't build it. Porting it (arm64 stage-1 tables over the pool, as KVM/x86-64 does
+> with its own) comes before a preemption kick and async signals at EL0, which also
+> need it. None of it can be checked without an Apple Silicon Mac.
+
 Bring up Hypervisor.framework on macOS/arm64. Create a VM, map a flat
 `GuestMemory`, create a vcpu at EL0, and trap `svc #0` into `Exit::Syscall`.
 
@@ -465,10 +472,12 @@ must get the isolation it asks for.
   - Guest RAM: capped at three quarters of host RAM (`NIXVM_LIMIT_GUEST_MEMORY`).
   - Tasks: 4096, `EAGAIN` past it (`NIXVM_LIMIT_TASKS`).
   - Open files across the VM: 262144, `ENFILE` past it (`NIXVM_LIMIT_OPEN_FILES`).
-  - Disk growth in host directories: no default ceiling (`NIXVM_LIMIT_DISK_BYTES`), but
-    a guest can never take a host filesystem below its last 5% of space or inodes.
-  - CPU and run time: no default, kills the guest when reached
-    (`NIXVM_LIMIT_CPU_SECONDS`, `NIXVM_LIMIT_WALL_SECONDS`).
+  - Disk growth in host directories: a quarter of what's free on the filesystem the
+    VM starts in, at least 1 GiB, `ENOSPC` past it (`NIXVM_LIMIT_DISK_BYTES`), and a
+    guest can never take a host filesystem below its last 5% of space or inodes.
+  - CPU and run time: kill the guest when reached (`NIXVM_LIMIT_CPU_SECONDS`,
+    `NIXVM_LIMIT_WALL_SECONDS`). Neither has a default: a guest can't use more CPUs
+    than it's given, and how long a job may run is the embedder's to say.
   - Pipes, socket queues, ptys and queued signals hold fixed amounts, as on Linux.
 - **Per-process `rlimit`s:** `NOFILE`, `AS`, `DATA`, `STACK`, `FSIZE`, `CPU`, `NPROC`,
   `MEMLOCK` (`mlock`, `mlockall`, `MAP_LOCKED`), `NICE` and `RTPRIO` (`setpriority`,
@@ -512,18 +521,37 @@ must get the isolation it asks for.
     task's virtual-runtime rate in the one flat run queue (no per-group queues).
   - `memory`: each page a process allocates (its own memory and page tables) is
     charged to its cgroup in the frame allocator, as Linux charges a page to the cgroup
-    that faulted it in; `memory.current`, `memory.peak` and `memory.stat` show it. Past
-    `memory.max` a page is refused and a task of the cgroup is killed, counted in
-    `memory.events` (the whole cgroup with `memory.oom.group`). Lowering `memory.max`
-    under what's in use kills the cgroup's biggest task, one at a time, until it fits,
-    and the write returns once it does. Past `memory.high`, a task that allocates sleeps
-    on its way back to user space, as Linux's `calculate_high_delay` reckons (quadratic
-    in the overage, at most 2 s per 64 pages). There is no reclaim or swap, so those
-    kills and sleeps come at once, where Linux would first try to reclaim, and
-    `memory.low`/`min` protect nothing. As a domain controller it follows v2's
+    that faulted it in, and so is the page cache: each page of a file on a disk that a
+    task reads or writes counts as `file`, charged to its cgroup (the data stays in the
+    host's cache; what's kept is which pages are "in memory"). `memory.current`,
+    `memory.peak` and `memory.stat` show it. Past `memory.max` the page cache is
+    reclaimed first, then a page is refused and a task of the cgroup is killed, counted
+    in `memory.events` (the whole cgroup with `memory.oom.group`). Lowering `memory.max`
+    under what's in use reclaims, then kills the cgroup's biggest task, one at a time,
+    until it fits, and the write returns once it does. Past `memory.high`, the overage is
+    reclaimed, and what's left a task that allocates sleeps off on its way back to user
+    space, as Linux's `calculate_high_delay` reckons (quadratic in the overage, at most
+    2 s per 64 pages). Reclaim goes oldest first, as Linux's `shrink_node_memcgs` does:
+    each cgroup scanned in proportion to what it holds beyond its effective
+    `memory.min`/`memory.low` (worked out down the tree as Linux does), one under
+    `memory.low` only when nothing else is left (a `low` event), one under `memory.min`
+    never; the pool's size bounds the cache the same way. `memory.reclaim` reclaims on
+    request (`EAGAIN` if there wasn't that much). There's no swap, so a process's own
+    memory is never reclaimed. As a domain controller it follows v2's
     no-internal-process rule.
+  - `io`: `io.max` (`rbps`, `wbps`, `riops`, `wiops`) holds a cgroup's I/O to a disk to
+    those rates as Linux's `blk-throttle` does (an allowance reaching back 100 ms), the
+    task waiting it out once the I/O is done; `io.stat` counts what was read from and
+    written to each disk, here and below. A read the page cache answers isn't I/O, and a
+    write is counted as it's made (Linux counts it at writeback). `io.weight` is kept and
+    shown but, as on Linux without `io.cost.qos` set up, changes nothing.
+- **Disks:** each host directory and filesystem image mounted is one of the VM's disks
+  (`vda`, `vdb`, …, major 254) the size of what holds it, listed in `/proc/partitions`,
+  `/proc/diskstats` (with its I/O), `/sys/block` and `/sys/dev/block`, and its files'
+  `st_dev`; every other filesystem has an anonymous `0:N` device of its own, as on Linux,
+  which `mountinfo` shows.
 
-  `io` isn't listed, since nothing would enforce it. Threaded subtrees work as on Linux:
+  Threaded subtrees work as on Linux:
   writing "threaded" to `cgroup.type` makes a cgroup join its parent's resource domain
   (the thread root, "domain threaded"), where a process's threads can be spread with
   `cgroup.threads` and only the threaded controllers (`cpu`, `pids`) can be enabled; a

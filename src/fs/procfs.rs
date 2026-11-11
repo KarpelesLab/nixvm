@@ -369,7 +369,7 @@ fn mounts_body(mounts: &[super::MountEntry]) -> String {
     let mut out = String::new();
     for m in mounts {
         let rw = if m.read_only { "ro" } else { "rw" };
-        let _ = writeln!(out, "{0} {1} {0} {rw} 0 0", m.fs_type, m.point);
+        let _ = writeln!(out, "{} {} {} {rw} 0 0", m.source, m.point, m.fs_type);
     }
     out
 }
@@ -377,8 +377,14 @@ fn mounts_body(mounts: &[super::MountEntry]) -> String {
 /// `/proc/self/mountinfo`, in the format documented in `proc(5)`.
 fn mountinfo_body(mounts: &[super::MountEntry]) -> String {
     let mut out = String::new();
+    let under = |p: &str, q: &str| q == "/" || p == q || p.starts_with(&format!("{q}/"));
     for (i, m) in mounts.iter().enumerate() {
-        let (id, parent) = (i + 1, i);
+        // Its parent: the latest mount before it that it's below.
+        let id = i + 1;
+        let parent = (0..i)
+            .rev()
+            .find(|&j| under(&m.point, &mounts[j].point))
+            .map_or(0, |j| j + 1);
         let rw = if m.read_only { "ro" } else { "rw" };
         // The optional fields: peer group, master, unbindable.
         let mut opt = String::new();
@@ -391,10 +397,11 @@ fn mountinfo_body(mounts: &[super::MountEntry]) -> String {
         if m.unbindable {
             opt.push_str(" unbindable");
         }
+        let (major, minor) = (super::blockdev::major(m.dev), super::blockdev::minor(m.dev));
         let _ = writeln!(
             out,
-            "{id} {parent} 0:{id} /{0} {1} {rw},relatime{opt} - {2} {2} {rw}",
-            m.subdir, m.point, m.fs_type,
+            "{id} {parent} {major}:{minor} /{0} {1} {rw},relatime{opt} - {2} {3} {rw}",
+            m.subdir, m.point, m.fs_type, m.source,
         );
     }
     out
@@ -472,8 +479,9 @@ const NR_OPEN: &str = "1048576\n";
 
 // ---- misc top-level files ----
 
-const DISKSTATS: &str = "   8       0 vda 0 0 0 0 0 0 0 0 0 0 0\n";
-const PARTITIONS: &str = "major minor  #blocks  name\n\n   8        0     102400 vda\n";
+/// `diskstats` and `partitions` before the VM's disks are known: none.
+const DISKSTATS: &str = "";
+const PARTITIONS: &str = "major minor  #blocks  name\n\n";
 const SWAPS: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
 /// No modules are ever loaded in a synthetic kernel; an empty file is the
 /// valid, real-world rendering of that state.
@@ -487,8 +495,8 @@ const DEVICES: &str = "Character devices:\n\
 136 pts\n\
 \n\
 Block devices:\n\
-  8 sd\n\
-  9 md\n\
+  7 loop\n\
+254 virtblk\n\
 259 blkext\n";
 
 /// No kernel modules ever register symbols in a synthetic kernel; a couple of
@@ -726,6 +734,8 @@ pub struct ProcSelf {
 #[derive(Debug)]
 pub struct ProcFs {
     data: ProcData,
+    /// The VM's disks, for `partitions` and `diskstats`.
+    disks: Option<super::blockdev::SharedDisks>,
 }
 
 impl Default for ProcFs {
@@ -744,6 +754,7 @@ impl ProcFs {
                 nproc: ncpu.max(1),
                 ..ProcData::default()
             },
+            disks: None,
         }
     }
 
@@ -838,6 +849,7 @@ impl ProcFs {
             inode: task_inode(task.pid, slot),
             nlink: 1,
             rdev: 0,
+            dev: 0,
         })
     }
 
@@ -894,6 +906,15 @@ impl ProcFs {
             }
             "cpuinfo" => {
                 return Some(cpuinfo_body(self.data.nproc, self.data.arch).into_bytes());
+            }
+            "partitions" | "diskstats" if self.disks.is_some() => {
+                let disks = self.disks.as_ref()?.lock().unwrap();
+                let body = if rel == "partitions" {
+                    disks.partitions()
+                } else {
+                    disks.diskstats()
+                };
+                return Some(body.into_bytes());
             }
             "stat" => return Some(stat_body(self.data.nproc).into_bytes()),
             _ => {}
@@ -1471,6 +1492,10 @@ impl MountFs for ProcFs {
         "proc"
     }
 
+    fn attach_disks(&mut self, disks: &super::blockdev::SharedDisks) {
+        self.disks = Some(disks.clone());
+    }
+
     fn as_procfs_mut(&mut self) -> Option<&mut ProcFs> {
         Some(self)
     }
@@ -1499,6 +1524,7 @@ impl MountFs for ProcFs {
                 inode: fd_inode(n),
                 nlink: 1,
                 rdev: 0,
+                dev: 0,
             });
         }
 
@@ -1541,6 +1567,7 @@ impl MountFs for ProcFs {
             inode,
             nlink: 1,
             rdev: 0,
+            dev: 0,
         })
     }
 
@@ -2214,14 +2241,22 @@ mod tests {
     fn top_level_misc_files_present() {
         let mut fs = ProcFs::new(1);
         assert!(
-            String::from_utf8(read_all(&mut fs, "diskstats"))
-                .unwrap()
-                .contains("vda")
-        );
-        assert!(
             String::from_utf8(read_all(&mut fs, "partitions"))
                 .unwrap()
                 .contains("#blocks")
+        );
+        let disks = super::super::blockdev::SharedDisks::default();
+        let dev = disks.lock().unwrap().add(1 << 30, false);
+        disks.lock().unwrap().account(dev, false, 4096);
+        fs.attach_disks(&disks);
+        assert_eq!(
+            String::from_utf8(read_all(&mut fs, "partitions")).unwrap(),
+            "major minor  #blocks  name\n\n 254       0    1048576 vda\n"
+        );
+        assert!(
+            String::from_utf8(read_all(&mut fs, "diskstats"))
+                .unwrap()
+                .starts_with(" 254       0 vda 1 0 8 0 0 0 0 0 ")
         );
         assert!(
             String::from_utf8(read_all(&mut fs, "swaps"))

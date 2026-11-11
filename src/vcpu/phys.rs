@@ -35,6 +35,7 @@
 
 use super::mem::PAGE_SIZE;
 use super::region::Region;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -260,7 +261,42 @@ pub struct FrameAllocator {
     /// past `memory.high` waiting for [`Self::take_over_high`]; shared outside
     /// the lock so an interpreter can notice and hand the task to the kernel.
     pub due: Arc<AtomicU64>,
+    /// The page cache, as far as memory cgroups see it (see [`FileCache`]).
+    cache: FileCache,
 }
+
+/// The file pages the guest has read or written on its disks, as Linux's page
+/// cache would hold them: each charged to the memory cgroup that brought it in
+/// (it counts in `memory.current`, as `file` in `memory.stat`), and reclaimed —
+/// oldest first, as memory cgroup limits, protections and the pool's size have
+/// it (see [`FrameAllocator::reclaim`]). The data itself stays on the host,
+/// which caches it; what's kept here is which pages are "in memory", which is
+/// also what tells a read that has to go to the disk (and count as I/O for the
+/// `io` controller) from one served from memory.
+#[derive(Debug, Default)]
+struct FileCache {
+    /// Each file's cached pages (file: its disk and inode), and for each the
+    /// memory cgroup it's charged to and when it was last used.
+    files: HashMap<FileId, BTreeMap<u64, (u16, u64)>>,
+    /// Per memory cgroup, its own cached pages, least recently used first.
+    lru: Vec<BTreeMap<u64, (FileId, u64)>>,
+    /// The last use handed out.
+    clock: u64,
+    /// Pages cached in all.
+    pages: u64,
+    /// Where the next reclaim starts among the memory cgroups, so none is
+    /// always the first to give pages up (Linux's reclaim cookie).
+    cursor: usize,
+}
+
+/// A cached file: its disk's device number and its inode there.
+pub type FileId = (u64, u64);
+
+/// Linux's `DEF_PRIORITY`: reclaim scans `1 >> priority` of each list, from
+/// this down to all of it.
+const DEF_PRIORITY: u32 = 12;
+/// Linux's `SWAP_CLUSTER_MAX`: the batch reclaim works in.
+const RECLAIM_BATCH: u64 = 32;
 
 /// Pages Linux charges a memory cgroup at a time (`MEMCG_CHARGE_BATCH`): the
 /// unit a `memory.high` penalty is reckoned in.
@@ -283,6 +319,14 @@ pub struct Memcg {
     pub max_events: u64,
     /// How often an allocation went past `high`.
     pub high_events: u64,
+    /// File pages cached here and below (also in [`Self::frames`]).
+    pub file: u64,
+    /// `memory.min` and `memory.low` in pages: what reclaim leaves alone.
+    pub min: u64,
+    pub low: u64,
+    /// How often its use below `memory.low` was reclaimed anyway, since
+    /// nothing else could be (`memory.events` `low`).
+    pub low_events: u64,
     /// Frames charged here while this or a memory cgroup above was over its
     /// `high`, not yet paid for (see [`FrameAllocator::take_over_high`]).
     pub over_high: u64,
@@ -299,6 +343,10 @@ impl Memcg {
         high: u64::MAX,
         max_events: 0,
         high_events: 0,
+        file: 0,
+        min: 0,
+        low: 0,
+        low_events: 0,
         over_high: 0,
         live: true,
     };
@@ -330,6 +378,7 @@ impl FrameAllocator {
             charge_to: 0,
             oom: None,
             due: Arc::new(AtomicU64::new(0)),
+            cache: FileCache::default(),
         }
     }
 
@@ -352,15 +401,31 @@ impl FrameAllocator {
     /// Allocations made from the reserve, to tear an address space down, are
     /// never refused.
     fn charge(&mut self, slot: u16) -> bool {
+        self.charge_page(slot, true)
+    }
+
+    /// [`Self::charge`], for a frame (`oom`: a refusal is an out-of-memory
+    /// event) or a file page (not cached instead). A memory cgroup at its
+    /// `memory.max` first reclaims what it can, as Linux's `try_charge` does.
+    fn charge_page(&mut self, slot: u16, oom: bool) -> bool {
         let chain: Vec<usize> = self.memcg_chain(slot).collect();
-        if !self.use_reserve
-            && let Some(&full) = chain
+        if !self.use_reserve {
+            for &m in &chain {
+                if self.memcgs[m].frames >= self.memcgs[m].max {
+                    let over = self.memcgs[m].frames + 1 - self.memcgs[m].max;
+                    self.reclaim(m as u16, over.max(RECLAIM_BATCH));
+                }
+            }
+            if let Some(&full) = chain
                 .iter()
                 .find(|&&m| self.memcgs[m].frames >= self.memcgs[m].max)
-        {
-            self.memcgs[full].max_events += 1;
-            self.oom = Some(full as u16);
-            return false;
+            {
+                self.memcgs[full].max_events += 1;
+                if oom {
+                    self.oom = Some(full as u16);
+                }
+                return false;
+            }
         }
         let mut over = false;
         for m in chain {
@@ -393,6 +458,15 @@ impl FrameAllocator {
         }
         self.memcgs[slot as usize].over_high = 0;
         self.due.fetch_and(!(1 << (slot % 64)), Ordering::Relaxed);
+        // Linux's `reclaim_high`: what's over each `memory.high` up the chain is
+        // reclaimed first, and only what's left over is slept off.
+        let chain: Vec<usize> = self.memcg_chain(slot).collect();
+        for m in chain {
+            let g = self.memcgs[m];
+            if g.frames > g.high {
+                self.reclaim(m as u16, g.frames - g.high);
+            }
+        }
         let overage = self
             .memcg_chain(slot)
             .map(|m| &self.memcgs[m])
@@ -429,6 +503,266 @@ impl FrameAllocator {
         Some(i)
     }
 
+    /// Reclaim file pages until `n` more pages fit in the pool beside those
+    /// cached, as the guest's memory filling up makes Linux reclaim from every
+    /// memory cgroup (respecting their protections).
+    fn make_room(&mut self, n: u64) {
+        let room = (self.free_list.len() as u64).saturating_sub(self.reserve as u64);
+        if self.cache.pages + n > room {
+            self.reclaim(0, (self.cache.pages + n - room).max(RECLAIM_BATCH));
+        }
+    }
+
+    /// Note that pages `[first, first + n)` of file `file` were just read
+    /// (`write`: written) by a task of memory cgroup `slot`, and say how many
+    /// of them weren't in memory — what a read had to fetch from the disk. A
+    /// page already cached is used again; one that isn't is cached and charged
+    /// to `slot`, after reclaiming what its limits need, or left uncached if
+    /// they can't be met.
+    pub fn cache_access(&mut self, file: FileId, first: u64, n: u64, slot: u16) -> u64 {
+        let mut missed = 0;
+        for page in first..first.saturating_add(n) {
+            self.cache.clock += 1;
+            let now = self.cache.clock;
+            if let Some((owner, used)) = self
+                .cache
+                .files
+                .get_mut(&file)
+                .and_then(|pages| pages.get_mut(&page))
+            {
+                let lru = &mut self.cache.lru[*owner as usize];
+                lru.remove(used);
+                lru.insert(now, (file, page));
+                *used = now;
+                continue;
+            }
+            missed += 1;
+            self.make_room(1);
+            if self.cache.pages as usize + self.allocated + self.reserve >= self.refcount.len()
+                || !self.charge_page(slot, false)
+            {
+                continue;
+            }
+            let chain: Vec<usize> = self.memcg_chain(slot).collect();
+            for m in chain {
+                self.memcgs[m].file += 1;
+            }
+            let slot = slot as usize;
+            if self.cache.lru.len() <= slot {
+                self.cache.lru.resize_with(slot + 1, BTreeMap::new);
+            }
+            self.cache.lru[slot].insert(now, (file, page));
+            self.cache
+                .files
+                .entry(file)
+                .or_default()
+                .insert(page, (slot as u16, now));
+            self.cache.pages += 1;
+        }
+        missed
+    }
+
+    /// Drop file `file`'s cached pages from `first` on (all of them for 0): it
+    /// was truncated, deleted, or `POSIX_FADV_DONTNEED` was asked for.
+    pub fn cache_drop(&mut self, file: FileId, first: u64, end: u64) {
+        let Some(pages) = self.cache.files.get_mut(&file) else {
+            return;
+        };
+        let gone: Vec<(u64, (u16, u64))> = pages.range(first..end).map(|(&p, &v)| (p, v)).collect();
+        for &(page, _) in &gone {
+            pages.remove(&page);
+        }
+        if pages.is_empty() {
+            self.cache.files.remove(&file);
+        }
+        for (_, (owner, used)) in gone {
+            self.cache.lru[owner as usize].remove(&used);
+            self.cache.pages -= 1;
+            self.uncharge_file(owner);
+        }
+    }
+
+    /// Pages the page cache holds in all.
+    #[must_use]
+    pub fn cached_pages(&self) -> u64 {
+        self.cache.pages
+    }
+
+    fn uncharge_file(&mut self, slot: u16) {
+        self.uncharge(slot);
+        let chain: Vec<usize> = self.memcg_chain(slot).collect();
+        for m in chain {
+            self.memcgs[m].file = self.memcgs[m].file.saturating_sub(1);
+        }
+    }
+
+    /// Evict memory cgroup `slot`'s `n` least recently used cached pages (or
+    /// all it has); how many went.
+    fn evict(&mut self, slot: u16, n: u64) -> u64 {
+        let mut done = 0;
+        while done < n {
+            let Some((used, (file, page))) = self
+                .cache
+                .lru
+                .get_mut(slot as usize)
+                .and_then(BTreeMap::pop_first)
+            else {
+                break;
+            };
+            let _ = used;
+            if let Some(pages) = self.cache.files.get_mut(&file) {
+                pages.remove(&page);
+                if pages.is_empty() {
+                    self.cache.files.remove(&file);
+                }
+            }
+            self.cache.pages -= 1;
+            self.uncharge_file(slot);
+            done += 1;
+        }
+        done
+    }
+
+    /// Reclaim at least `target` cached pages from memory cgroup `root` and
+    /// below (0: the whole pool), as Linux's `shrink_node_memcgs` does: each
+    /// memory cgroup is scanned in proportion to what it holds unprotected —
+    /// one at or under its effective `memory.min` not at all, one under its
+    /// `memory.low` only if nothing else would do (counted as a `low` event)
+    /// — `1 >> priority` of it a pass, the priority falling until enough is
+    /// found. Only the page cache can be reclaimed: there's no swap. Returns
+    /// how many pages went.
+    pub fn reclaim(&mut self, root: u16, target: u64) -> u64 {
+        let order = self.subtree_of(root);
+        let prot = self.protection(root, &order);
+        let mut reclaimed = 0;
+        for low_reclaim in [false, true] {
+            let mut skipped = false;
+            for priority in (0..=DEF_PRIORITY).rev() {
+                let start = self.cache.cursor % order.len();
+                for k in 0..order.len() {
+                    let m = order[(start + k) % order.len()];
+                    let (emin, elow) = prot[(start + k) % order.len()];
+                    let usage = self.memcgs[m as usize].frames;
+                    if m != root && usage <= emin {
+                        continue;
+                    }
+                    if m != root && usage <= elow {
+                        if !low_reclaim {
+                            skipped = true;
+                            continue;
+                        }
+                        self.memcgs[m as usize].low_events += 1;
+                    }
+                    let lru = self.cache.lru.get(m as usize).map_or(0, |l| l.len() as u64);
+                    if lru == 0 {
+                        continue;
+                    }
+                    // Linux's `apply_proportional_protection`.
+                    let protection = if low_reclaim { emin } else { emin.max(elow) };
+                    let mut scan = lru;
+                    if protection > 0 {
+                        scan = lru - lru * protection.min(usage) / (usage + 1);
+                        scan = scan.max(RECLAIM_BATCH.min(lru));
+                    }
+                    // Never below what still protects it.
+                    let floor = if m == root { 0 } else { protection };
+                    let scan = (scan >> priority)
+                        .min(target.saturating_sub(reclaimed).max(1))
+                        .min(usage.saturating_sub(floor));
+                    reclaimed += self.evict(m, scan);
+                    if reclaimed >= target {
+                        self.cache.cursor = self.cache.cursor.wrapping_add(1);
+                        return reclaimed;
+                    }
+                }
+            }
+            self.cache.cursor = self.cache.cursor.wrapping_add(1);
+            if !skipped {
+                break;
+            }
+        }
+        reclaimed
+    }
+
+    /// Memory cgroup `root` and those below it, parents first.
+    fn subtree_of(&self, root: u16) -> Vec<u16> {
+        let mut out = vec![root];
+        let mut i = 0;
+        while i < out.len() {
+            let p = out[i];
+            out.extend(
+                (1..self.memcgs.len())
+                    .filter(|&c| self.memcgs[c].live || self.memcgs[c].frames > 0)
+                    .filter(|&c| self.memcgs[c].parent == p && c as u16 != p)
+                    .map(|c| c as u16),
+            );
+            i += 1;
+        }
+        out
+    }
+
+    /// Each of `order`'s (a subtree, parents first) effective `memory.min`
+    /// and `memory.low` for a reclaim from `root`, as Linux's
+    /// `mem_cgroup_calculate_protection` works them out: the reclaim's root
+    /// has none, those right below it what they're set to, and those further
+    /// down what they're set to (no more than they use) — scaled down
+    /// together when they claim more than their parent's own is.
+    fn protection(&self, root: u16, order: &[u16]) -> Vec<(u64, u64)> {
+        let mut eff: HashMap<u16, (u64, u64)> = HashMap::new();
+        let used = |m: u16| self.memcgs[m as usize].frames;
+        // What each parent's children claim (their use up to their setting).
+        let mut claimed: HashMap<u16, (u64, u64)> = HashMap::new();
+        for &m in &order[1..] {
+            let g = &self.memcgs[m as usize];
+            let c = claimed.entry(g.parent).or_default();
+            c.0 += used(m).min(g.min);
+            c.1 += used(m).min(g.low);
+        }
+        for &m in order {
+            let g = &self.memcgs[m as usize];
+            let e = if m == root {
+                (0, 0)
+            } else if g.parent == root {
+                (g.min, g.low)
+            } else {
+                let parent = eff.get(&g.parent).copied().unwrap_or((0, 0));
+                let siblings = claimed.get(&g.parent).copied().unwrap_or((0, 0));
+                let scaled = |setting: u64, parent_eff: u64, siblings: u64| {
+                    let protected = used(m).min(setting);
+                    if siblings > parent_eff && siblings > 0 {
+                        protected * parent_eff / siblings
+                    } else {
+                        protected
+                    }
+                };
+                (
+                    scaled(g.min, parent.0, siblings.0),
+                    scaled(g.low, parent.1, siblings.1),
+                )
+            };
+            eff.insert(m, e);
+        }
+        order.iter().map(|m| eff[m]).collect()
+    }
+
+    /// Reclaim memory cgroup `slot` down to its `memory.max` if it can (after
+    /// the limit was lowered), and say whether it's still over.
+    pub fn shrink_to_max(&mut self, slot: u16) -> bool {
+        let Some(g) = self.memcgs.get(slot as usize).copied() else {
+            return false;
+        };
+        if g.frames > g.max {
+            self.reclaim(slot, g.frames - g.max);
+        }
+        self.memcgs[slot as usize].frames > self.memcgs[slot as usize].max
+    }
+
+    /// Reclaim up to `pages` from memory cgroup `slot` and below (a write to
+    /// `memory.reclaim`); how many went.
+    pub fn reclaim_pages(&mut self, slot: u16, pages: u64) -> u64 {
+        self.reclaim(slot, pages)
+    }
+
     /// Memory cgroup `slot` is gone. What's still charged to it stays counted
     /// above it until freed (Linux moves it to the parent; the totals are the
     /// same).
@@ -445,6 +779,14 @@ impl FrameAllocator {
         if let Some(m) = self.memcgs.get_mut(slot as usize).filter(|_| slot != 0) {
             m.max = max;
             m.high = high;
+        }
+    }
+
+    /// Set memory cgroup `slot`'s `memory.low` and `memory.min`, in pages.
+    pub fn memcg_set_protection(&mut self, slot: u16, low: u64, min: u64) {
+        if let Some(m) = self.memcgs.get_mut(slot as usize).filter(|_| slot != 0) {
+            m.low = low;
+            m.min = min;
         }
     }
 
@@ -489,6 +831,7 @@ impl FrameAllocator {
     /// is taken by shared reference — the allocator is the sole authority on which
     /// frame is free, so zeroing it races with no other owner.
     pub fn alloc(&mut self, phys: &PhysMem) -> Option<u64> {
+        self.make_room(1);
         if !self.use_reserve && self.free_list.len() <= self.reserve {
             return None;
         }
@@ -630,16 +973,19 @@ impl crate::fs::cgroupfs::MemcgHost for FrameAllocator {
     fn memcg_drop(&mut self, slot: u16) {
         self.memcg_remove(slot);
     }
-    fn memcg_limits(&mut self, slot: u16, max: u64, high: u64) {
+    fn memcg_limits(&mut self, slot: u16, max: u64, high: u64, low: u64, min: u64) {
         self.memcg_set_limits(slot, max, high);
+        self.memcg_set_protection(slot, low, min);
     }
     fn memcg_use(&self, slot: u16) -> crate::fs::cgroupfs::MemUse {
         self.memcg(slot)
             .map(|m| crate::fs::cgroupfs::MemUse {
                 current: m.frames * FRAME,
                 peak: m.peak * FRAME,
+                file: m.file * FRAME,
                 high_events: m.high_events,
                 max_events: m.max_events,
+                low_events: m.low_events,
             })
             .unwrap_or_default()
     }
@@ -836,6 +1182,40 @@ mod tests {
         assert_eq!(fa.take_over_high(b), Some((64, (64 << 20) / 100)));
         assert_eq!(fa.due.load(Ordering::Relaxed) & bit, 0);
         assert_eq!(fa.take_over_high(b), None);
+    }
+
+    #[test]
+    fn the_page_cache_is_charged_and_reclaimed_as_protections_say() {
+        let (phys, mut fa) = pool(4096);
+        let parent = fa.memcg_new(0).unwrap();
+        let a = fa.memcg_new(parent).unwrap();
+        let b = fa.memcg_new(parent).unwrap();
+        fa.memcg_set_limits(parent, 1000, u64::MAX);
+        fa.memcg_set_protection(a, 600, 0);
+        // A cached page is charged once, and a read of it again is a hit.
+        assert_eq!(fa.cache_access((1, 7), 0, 500, a), 500);
+        assert_eq!(fa.cache_access((1, 7), 0, 500, a), 0, "all cached");
+        assert_eq!(fa.memcg(a).unwrap().file, 500);
+        assert_eq!(fa.memcg(parent).unwrap().frames, 500);
+        // The sibling reading past the parent's max reclaims its own pages,
+        // not the protected ones.
+        assert_eq!(fa.cache_access((1, 8), 0, 2000, b), 2000);
+        assert_eq!(fa.memcg(a).unwrap().frames, 500, "memory.low kept them");
+        assert!(fa.memcg(parent).unwrap().frames <= 1000);
+        assert_eq!(fa.memcg(a).unwrap().low_events, 0);
+        // An anonymous frame past the max takes cache rather than fail.
+        fa.charge_to = b;
+        assert!(fa.alloc(&phys).is_some());
+        // With nothing unprotected left, protection below memory.low gives
+        // (counted), but memory.min never does.
+        fa.memcg_set_protection(a, 600, 300);
+        assert!(fa.reclaim(parent, 10_000) > 0);
+        assert_eq!(fa.memcg(a).unwrap().frames, 300, "down to memory.min");
+        assert!(fa.memcg(a).unwrap().low_events > 0);
+        // Dropping a file's pages uncharges them.
+        fa.cache_drop((1, 7), 0, u64::MAX);
+        assert_eq!(fa.memcg(a).unwrap().file, 0);
+        assert_eq!(fa.memcg(a).unwrap().frames, 0);
     }
 
     #[test]

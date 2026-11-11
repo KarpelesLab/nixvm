@@ -37,6 +37,8 @@ pub struct FsToolMount {
     fs: Box<dyn Filesystem + Send>,
     dev: Box<dyn BlockDevice + Send>,
     read_only: bool,
+    /// The VM's disk the image is (see [`super::blockdev`]), once mounted.
+    disk: Option<u64>,
 }
 
 impl std::fmt::Debug for FsToolMount {
@@ -154,6 +156,7 @@ impl FsToolMount {
             fs: Box::new(fs),
             dev: Box::new(dev),
             read_only: true,
+            disk: None,
         })
     }
 
@@ -172,6 +175,7 @@ impl FsToolMount {
             fs: Box::new(fs),
             dev,
             read_only: true,
+            disk: None,
         })
     }
 
@@ -202,6 +206,7 @@ impl FsToolMount {
             fs: Box::new(fs),
             dev,
             read_only: true,
+            disk: None,
         })
     }
 
@@ -227,6 +232,7 @@ impl FsToolMount {
             fs: Box::new(fs),
             dev: Box::new(dev),
             read_only: false,
+            disk: None,
         })
     }
 
@@ -279,6 +285,17 @@ impl MountFs for FsToolMount {
         "squashfs"
     }
 
+    fn attach_disks(&mut self, disks: &super::blockdev::SharedDisks) {
+        if self.disk.is_none() {
+            let bytes = self.dev.total_size();
+            self.disk = Some(disks.lock().unwrap().add(bytes, self.read_only));
+        }
+    }
+
+    fn own_dev(&self) -> Option<u64> {
+        self.disk
+    }
+
     fn read_only(&self) -> bool {
         self.read_only
     }
@@ -323,6 +340,7 @@ impl MountFs for FsToolMount {
             inode: u64::from(a.inode),
             nlink: a.nlink,
             rdev: u64::from(a.rdev),
+            dev: 0,
         })
     }
 

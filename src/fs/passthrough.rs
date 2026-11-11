@@ -545,6 +545,8 @@ pub struct Passthrough {
     /// Bytes charged since the host's free space was last checked; `None` before
     /// the first check.
     since_host_check: Option<u64>,
+    /// The VM's disk this is (see [`super::blockdev`]), once mounted.
+    dev: Option<u64>,
 }
 
 /// What a new directory entry is charged, since it takes host disk too.
@@ -561,6 +563,7 @@ impl Passthrough {
             read_only: false,
             disk: Quota::unlimited(),
             since_host_check: None,
+            dev: None,
         }
     }
 
@@ -572,6 +575,7 @@ impl Passthrough {
             read_only: true,
             disk: Quota::unlimited(),
             since_host_check: None,
+            dev: None,
         }
     }
 
@@ -879,6 +883,7 @@ fn attrs_of(m: &fs::Metadata) -> Attrs {
         inode: m.ino(),
         nlink: m.nlink() as u32,
         rdev: m.rdev(),
+        dev: 0,
     }
 }
 
@@ -889,6 +894,17 @@ impl MountFs for Passthrough {
 
     fn attach_disk_quota(&mut self, quota: &Arc<Quota>) {
         self.disk = quota.clone();
+    }
+
+    fn attach_disks(&mut self, disks: &super::blockdev::SharedDisks) {
+        if self.dev.is_none() {
+            let bytes = host_space(&self.root).map_or(0, |s| s.total);
+            self.dev = Some(disks.lock().unwrap().add(bytes, self.read_only));
+        }
+    }
+
+    fn own_dev(&self) -> Option<u64> {
+        self.dev
     }
 
     fn read_only(&self) -> bool {
@@ -1152,9 +1168,34 @@ fn enospc() -> io::Error {
 /// (at most 1 GiB of that) or inodes. If it can't be told, it's assumed fine: the
 /// host will still report a truly full disk itself.
 fn host_is_low_on_space(path: &Path) -> bool {
-    let Ok(cpath) = CString::new(path.as_os_str().as_encoded_bytes()) else {
+    let Some(HostSpace {
+        total,
+        avail,
+        files,
+        favail,
+    }) = host_space(path)
+    else {
         return false;
     };
+    let reserve = (total / 20).min(1 << 30);
+    avail < reserve || (files > 0 && favail < files / 20)
+}
+
+/// What `statvfs` says of the host filesystem holding a path.
+#[derive(Debug, Clone, Copy)]
+pub struct HostSpace {
+    /// Its size and what an unprivileged user may still use of it, in bytes.
+    pub total: u64,
+    pub avail: u64,
+    /// Its inodes, and those still free to such a user.
+    pub files: u64,
+    pub favail: u64,
+}
+
+/// [`HostSpace`] for the host filesystem holding `path`, if it can be told.
+#[must_use]
+pub fn host_space(path: &Path) -> Option<HostSpace> {
+    let cpath = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
     // `struct statvfs`, whose start is all we read: f_bsize, f_frsize, then
     // f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_favail. Those last six are
     // 64-bit on Linux and 32-bit on macOS. Oversized for either's whole struct.
@@ -1162,7 +1203,7 @@ fn host_is_low_on_space(path: &Path) -> bool {
     // SAFETY: `cpath` is NUL-terminated, and `buf` is larger than `struct statvfs`
     // on every target here; the callee only writes within that struct.
     if unsafe { statvfs(cpath.as_ptr(), buf.as_mut_ptr().cast()) } != 0 {
-        return false;
+        return None;
     }
     let frsize = buf[1];
     #[cfg(target_os = "linux")]
@@ -1179,8 +1220,12 @@ fn host_is_low_on_space(path: &Path) -> bool {
         };
         (field(0), field(2), field(3), field(5))
     };
-    let reserve = (blocks.saturating_mul(frsize) / 20).min(1 << 30);
-    bavail.saturating_mul(frsize) < reserve || (files > 0 && favail < files / 20)
+    Some(HostSpace {
+        total: blocks.saturating_mul(frsize),
+        avail: bavail.saturating_mul(frsize),
+        files,
+        favail,
+    })
 }
 
 #[cfg(test)]

@@ -32,10 +32,11 @@ pub const ROOT: u32 = 0;
 
 /// The controllers there are, as `cgroup.controllers` lists them, with the
 /// bit each has in a cgroup's set of enabled controllers.
-const CONTROLLERS: &[(&str, u8)] = &[("cpu", CPU), ("memory", MEMORY), ("pids", PIDS)];
+const CONTROLLERS: &[(&str, u8)] = &[("cpu", CPU), ("io", IO), ("memory", MEMORY), ("pids", PIDS)];
 const CPU: u8 = 1;
 const PIDS: u8 = 2;
 const MEMORY: u8 = 4;
+const IO: u8 = 8;
 /// The threaded controllers, which may share a cgroup with tasks; the others
 /// (`memory`) are domain controllers, held to the no-internal-process rule.
 const THREADED: u8 = CPU | PIDS;
@@ -81,6 +82,13 @@ const CPU_FILES: &[(&str, bool)] = &[
     ("cpu.weight.nice", true),
 ];
 
+/// The `io` controller's files, in a cgroup whose parent enables it.
+const IO_FILES: &[(&str, bool)] = &[("io.max", true), ("io.stat", false), ("io.weight", true)];
+
+/// How far back `io.max` lets a cgroup's unused allowance reach, so a burst
+/// after a quiet spell gets through at once: Linux's `throtl_slice`.
+const IO_SLICE_NS: u128 = 100_000_000;
+
 /// The `memory` controller's files, in a cgroup whose parent enables it.
 const MEMORY_FILES: &[(&str, bool)] = &[
     ("memory.current", false),
@@ -92,6 +100,7 @@ const MEMORY_FILES: &[(&str, bool)] = &[
     ("memory.min", true),
     ("memory.oom.group", true),
     ("memory.peak", false),
+    ("memory.reclaim", true),
     ("memory.stat", false),
 ];
 
@@ -101,7 +110,10 @@ pub const SCHED_FILES: &[&str] = &[
     "cgroup.subtree_control",
     "cgroup.type",
     "memory.high",
+    "memory.low",
     "memory.max",
+    "memory.min",
+    "io.max",
     "cpu.idle",
     "cpu.max",
     "cpu.max.burst",
@@ -111,6 +123,7 @@ pub const SCHED_FILES: &[&str] = &[
 
 /// Writes the kernel handles, since they act on tasks.
 pub const KERNEL_FILES: &[&str] = &[
+    "memory.reclaim",
     "cgroup.procs",
     "cgroup.threads",
     "cgroup.kill",
@@ -250,8 +263,9 @@ pub trait MemcgHost {
     /// A new memory cgroup below `parent`; `None` if there's no room.
     fn memcg_create(&mut self, parent: u16) -> Option<u16>;
     fn memcg_drop(&mut self, slot: u16);
-    /// `memory.max` and `memory.high`, in pages (`u64::MAX` for none).
-    fn memcg_limits(&mut self, slot: u16, max: u64, high: u64);
+    /// `memory.max` and `memory.high`, in pages (`u64::MAX` for none), and
+    /// `memory.low` and `memory.min` (0 for none).
+    fn memcg_limits(&mut self, slot: u16, max: u64, high: u64, low: u64, min: u64);
     /// What's charged to `slot` and below.
     fn memcg_use(&self, slot: u16) -> MemUse;
 }
@@ -262,6 +276,14 @@ const PAGE: u64 = 4096;
 /// A memory size as Linux's `memparse` takes one: a number (decimal, `0x`
 /// hex, `0` octal) with an optional `K`, `M`, `G`, `T`, `P` or `E` suffix, or
 /// "max". Rounded down to whole pages, as `page_counter_memparse` does.
+/// A memory size as `memory.max` takes one, for the kernel: in pages, `None` for "max".
+///
+/// # Errors
+/// `EINVAL` (as an errno) when `text` isn't a size.
+pub fn parse_mem_pages(text: &str) -> Result<Option<u64>, i32> {
+    mem_limit(text)
+}
+
 fn mem_limit(text: &str) -> Result<Option<u64>, i32> {
     if text == "max" {
         return Ok(None);
@@ -379,14 +401,27 @@ struct Node {
     idle: bool,
     bandwidth: Bandwidth,
     /// `memory.max`, `memory.high` in bytes (`None` is "max"), and
-    /// `memory.low`, `memory.min` (protections, which mean nothing without
-    /// reclaim, but are kept).
+    /// `memory.low`, `memory.min`: what reclaim leaves to it (see
+    /// `FrameAllocator::reclaim`).
     mem_max: Option<u64>,
     mem_high: Option<u64>,
     mem_low: Option<u64>,
     mem_min: Option<u64>,
     /// `memory.oom.group`: an out-of-memory kill takes every task in it.
     oom_group: bool,
+    /// `io.max`: per disk, `rbps`, `wbps`, `riops`, `wiops` (`None`: max).
+    io_max: BTreeMap<u64, [Option<u64>; 4]>,
+    /// For each of those, when the I/O allowed so far is used up (see
+    /// [`CgroupTree::io_account`]).
+    io_next: BTreeMap<(u64, usize), u128>,
+    /// `io.weight`: the default and per disk. Linux's `io.cost` model, which
+    /// weights would share disk time by, is off unless `io.cost.qos` is set
+    /// up (there's none here), so they're kept but don't change anything.
+    io_weight: u64,
+    io_weight_dev: BTreeMap<u64, u64>,
+    /// `io.stat`: per disk, the bytes and I/Os read and written here and
+    /// below.
+    io_stat: BTreeMap<u64, [u64; 4]>,
     /// The memory cgroup the frame allocator charges for this one, once
     /// the kernel has made one (see [`CgroupTree::memcg_of`]).
     memcg: Option<u16>,
@@ -428,6 +463,12 @@ impl Node {
             self.oom_group = false;
             self.oom_events = [0; 3];
         }
+        if controllers & IO != 0 {
+            self.io_max.clear();
+            self.io_next.clear();
+            self.io_weight = 100;
+            self.io_weight_dev.clear();
+        }
     }
 
     fn new(name: &str, parent: Option<u32>, uid: u32, gid: u32) -> Self {
@@ -447,6 +488,11 @@ impl Node {
             mem_low: Some(0),
             mem_min: Some(0),
             oom_group: false,
+            io_max: BTreeMap::new(),
+            io_next: BTreeMap::new(),
+            io_weight: 100,
+            io_weight_dev: BTreeMap::new(),
+            io_stat: BTreeMap::new(),
             memcg: None,
             oom_events: [0; 3],
             max_depth: None,
@@ -503,6 +549,10 @@ pub struct MemUse {
     /// `memory.max`.
     pub high_events: u64,
     pub max_events: u64,
+    /// Bytes of it that are file pages (the page cache).
+    pub file: u64,
+    /// Times reclaim took from it below its `memory.low`.
+    pub low_events: u64,
 }
 
 /// The VM's cgroup hierarchy.
@@ -521,6 +571,10 @@ pub struct CgroupTree {
     quotas: Arc<AtomicUsize>,
     /// Memory cgroups of cgroups that went away, for the kernel to drop.
     dead_memcgs: Vec<u16>,
+    /// The VM's disks, which `io.max` and `io.weight` name.
+    disks: Option<super::blockdev::SharedDisks>,
+    /// Whether any cgroup has an `io.max` limit.
+    io_limited: bool,
 }
 
 /// How a cgroup's tasks are to be scheduled, from its own settings and its
@@ -553,6 +607,8 @@ impl Default for CgroupTree {
             view: View::default(),
             quotas: Arc::new(AtomicUsize::new(0)),
             dead_memcgs: Vec::new(),
+            disks: None,
+            io_limited: false,
         }
     }
 }
@@ -743,6 +799,8 @@ impl CgroupTree {
                     slot,
                     n.mem_max.unwrap_or(u64::MAX),
                     n.mem_high.unwrap_or(u64::MAX),
+                    n.mem_low.unwrap_or(u64::MAX),
+                    n.mem_min.unwrap_or(u64::MAX),
                 );
             }
         }
@@ -1191,6 +1249,11 @@ impl CgroupTree {
         if node != ROOT && self.has(node, MEMORY) {
             out.extend_from_slice(MEMORY_FILES);
         }
+        if node == ROOT {
+            out.push(("io.stat", false));
+        } else if self.has(node, IO) {
+            out.extend_from_slice(IO_FILES);
+        }
         out.sort_unstable();
         out
     }
@@ -1381,6 +1444,8 @@ impl CgroupTree {
                 set_bandwidth(&mut n.bandwidth, quota, period, burst)?;
                 self.update_quota_gate();
             }
+            "io.max" => return self.write_io_max(node, text),
+            "io.weight" => return self.write_io_weight(node, text),
             "memory.max" => n.mem_max = mem_limit(text)?,
             "memory.high" => n.mem_high = mem_limit(text)?,
             "memory.low" => n.mem_low = mem_limit(text)?,
@@ -1404,6 +1469,180 @@ impl CgroupTree {
             _ => return Err(EACCES),
         }
         Ok(())
+    }
+
+    /// The disk `text` (`MAJ:MIN`) names: `EINVAL` if it isn't a device
+    /// number, `ENODEV` if there's no such disk (a partition isn't one).
+    fn disk_named(&self, text: &str) -> Result<u64, i32> {
+        const ENODEV: i32 = 19;
+        let (ma, mi) = text.split_once(':').ok_or(EINVAL)?;
+        let ma: u32 = ma.parse().map_err(|_| EINVAL)?;
+        let mi: u32 = mi.parse().map_err(|_| EINVAL)?;
+        let disks = self.disks.as_ref().ok_or(ENODEV)?.lock().unwrap();
+        disks.find(ma, mi).map(|d| d.dev).ok_or(ENODEV)
+    }
+
+    /// `io.max`: `MAJ:MIN` and `key=value` words (`rbps`, `wbps`, `riops`,
+    /// `wiops`; a number or "max"), as Linux's `tg_set_limit` takes them.
+    fn write_io_max(&mut self, node: u32, text: &str) -> Result<(), i32> {
+        let mut words = text.split_whitespace();
+        let dev = self.disk_named(words.next().ok_or(EINVAL)?)?;
+        let n = self.nodes.get_mut(&node).ok_or(ENOENT)?;
+        let mut v = n.io_max.get(&dev).copied().unwrap_or([None; 4]);
+        for w in words {
+            let (key, val) = w.split_once('=').ok_or(EINVAL)?;
+            let val = match val {
+                "max" => None,
+                x => Some(x.parse::<u64>().map_err(|_| EINVAL)?),
+            };
+            if val == Some(0) {
+                return Err(ERANGE);
+            }
+            let i = ["rbps", "wbps", "riops", "wiops"]
+                .iter()
+                .position(|k| *k == key)
+                .ok_or(EINVAL)?;
+            v[i] = if i >= 2 {
+                val.map(|x| x.min(u64::from(u32::MAX)))
+            } else {
+                val
+            };
+        }
+        if v.iter().all(Option::is_none) {
+            n.io_max.remove(&dev);
+        } else {
+            n.io_max.insert(dev, v);
+        }
+        n.io_next.retain(|(d, _), _| *d != dev);
+        self.io_limited = self.nodes.values().any(|n| !n.io_max.is_empty());
+        Ok(())
+    }
+
+    /// `io.weight`: `[default] N` for the default, `MAJ:MIN N|default` for a
+    /// disk, as Linux's `ioc_weight_write` takes it.
+    fn write_io_weight(&mut self, node: u32, text: &str) -> Result<(), i32> {
+        let weight = |t: &str| -> Result<u64, i32> {
+            let w: u64 = t.parse().map_err(|_| EINVAL)?;
+            if (1..=10_000).contains(&w) {
+                Ok(w)
+            } else {
+                Err(EINVAL)
+            }
+        };
+        let mut words = text.split_whitespace();
+        let first = words.next().ok_or(EINVAL)?;
+        if !first.contains(':') {
+            let w = if first == "default" {
+                weight(words.next().ok_or(EINVAL)?)?
+            } else {
+                weight(first)?
+            };
+            self.nodes.get_mut(&node).ok_or(ENOENT)?.io_weight = w;
+            return Ok(());
+        }
+        let dev = self.disk_named(first)?;
+        let w = match words.next().ok_or(EINVAL)? {
+            "default" => None,
+            t => Some(weight(t)?),
+        };
+        let n = self.nodes.get_mut(&node).ok_or(ENOENT)?;
+        match w {
+            Some(w) => n.io_weight_dev.insert(dev, w),
+            None => n.io_weight_dev.remove(&dev),
+        };
+        Ok(())
+    }
+
+    /// Count an I/O of `bytes` by a task of cgroup `node` to disk `dev` (a
+    /// read, or with `write` a write) in `io.stat` there and above, and hold
+    /// it to the `io.max` limits on the way up, as Linux's `blk-throttle`
+    /// does: each limit lets through what its rate allows since its I/O last
+    /// caught up (reaching back at most Linux's `throtl_slice`, 100 ms). Returns until when
+    /// the task is to wait for it, if at all.
+    pub fn io_account(&mut self, node: u32, dev: u64, write: bool, bytes: u64) -> Option<u128> {
+        let now = crate::clock::now_monotonic().as_nanos();
+        let mut until: Option<u128> = None;
+        let (bps, iops) = if write { (1, 3) } else { (0, 2) };
+        for id in self.chain(node) {
+            let Some(n) = self.nodes.get_mut(&id) else {
+                continue;
+            };
+            let st = n.io_stat.entry(dev).or_default();
+            st[usize::from(write)] += bytes;
+            st[2 + usize::from(write)] += 1;
+            if id == ROOT || !self.io_limited {
+                continue;
+            }
+            let Some(limits) = n.io_max.get(&dev).copied() else {
+                continue;
+            };
+            for (k, amount) in [(bps, u128::from(bytes)), (iops, 1)] {
+                let Some(rate) = limits[k] else {
+                    continue;
+                };
+                let next = n.io_next.entry((dev, k)).or_insert(0);
+                let start = (*next).max(now.saturating_sub(IO_SLICE_NS));
+                *next = start + amount * 1_000_000_000 / u128::from(rate);
+                if *next > now {
+                    until = until.max(Some(*next));
+                }
+            }
+        }
+        until.map(|t| t - now + crate::clock::now_unix().as_nanos())
+    }
+
+    /// Whether any cgroup has an `io.max` limit.
+    #[must_use]
+    pub fn io_limited(&self) -> bool {
+        self.io_limited
+    }
+
+    /// Give the tree the VM's disks, which `io.max` names.
+    pub fn attach_disks(&mut self, disks: &super::blockdev::SharedDisks) {
+        self.disks = Some(disks.clone());
+    }
+
+    /// `io.stat`, `io.max` or `io.weight` of `n`.
+    fn render_io(n: &Node, file: &str) -> String {
+        use super::blockdev::{major, minor};
+        let mut out = String::new();
+        let mm = |d: u64| format!("{}:{}", major(d), minor(d));
+        match file {
+            "io.stat" => {
+                for (&d, st) in &n.io_stat {
+                    let _ = writeln!(
+                        out,
+                        "{} rbytes={} wbytes={} rios={} wios={} dbytes=0 dios=0",
+                        mm(d),
+                        st[0],
+                        st[1],
+                        st[2],
+                        st[3]
+                    );
+                }
+            }
+            "io.max" => {
+                for (&d, v) in &n.io_max {
+                    let f = |x: Option<u64>| x.map_or_else(|| "max".to_string(), |x| x.to_string());
+                    let _ = writeln!(
+                        out,
+                        "{} rbps={} wbps={} riops={} wiops={}",
+                        mm(d),
+                        f(v[0]),
+                        f(v[1]),
+                        f(v[2]),
+                        f(v[3])
+                    );
+                }
+            }
+            _ => {
+                let _ = writeln!(out, "default {}", n.io_weight);
+                for (&d, w) in &n.io_weight_dev {
+                    let _ = writeln!(out, "{} {w}", mm(d));
+                }
+            }
+        }
+        out
     }
 
     /// `+name`/`-name` words, space separated, all or nothing.
@@ -1579,6 +1818,7 @@ impl CgroupTree {
                 }
             }
             "cpu.max.burst" => format!("{}\n", n.bandwidth.burst_us),
+            "io.stat" | "io.max" | "io.weight" => Self::render_io(n, file),
             "memory.current" => format!("{}\n", self.mem_use(node).current),
             "memory.peak" => format!("{}\n", self.mem_use(node).peak),
             "memory.max" => mem_bytes(n.mem_max),
@@ -1589,12 +1829,12 @@ impl CgroupTree {
             "memory.events" => self.mem_events(&self.subtree(node)),
             "memory.events.local" => self.mem_events(&[node]),
             "memory.stat" => {
-                // Everything charged here is a process's own memory (or the
-                // page tables for it): nixvm's file data lives apart.
-                let anon = self.mem_use(node).current;
-                let mut out = format!("anon {anon}\n");
+                // What's charged here is the page cache's file pages and a
+                // process's own memory (and its page tables).
+                let u = self.mem_use(node);
+                let anon = u.current - u.file;
+                let mut out = format!("anon {anon}\nfile {}\n", u.file);
                 for key in [
-                    "file",
                     "kernel",
                     "kernel_stack",
                     "pagetables",
@@ -1615,6 +1855,8 @@ impl CgroupTree {
                     let _ = writeln!(out, "{key} 0");
                 }
                 let _ = writeln!(out, "active_anon {anon}");
+                let _ = writeln!(out, "inactive_file {}", u.file);
+                let _ = writeln!(out, "active_file 0");
                 out
             }
             "pids.max" => limit(n.pids_max),
@@ -1631,9 +1873,10 @@ impl CgroupTree {
     /// `memory.events` for `nodes` together: one cgroup's own events, or a
     /// subtree's.
     fn mem_events(&self, nodes: &[u32]) -> String {
-        let (mut high, mut max, mut oom) = (0, 0, [0u64; 3]);
+        let (mut low, mut high, mut max, mut oom) = (0, 0, 0, [0u64; 3]);
         for n in nodes {
             let u = self.mem_use(*n);
+            low += u.low_events;
             high += u.high_events;
             max += u.max_events;
             if let Some(x) = self.nodes.get(n) {
@@ -1643,7 +1886,7 @@ impl CgroupTree {
             }
         }
         format!(
-            "low 0\nhigh {high}\nmax {max}\noom {}\noom_kill {}\noom_group_kill {}\n",
+            "low {low}\nhigh {high}\nmax {max}\noom {}\noom_kill {}\noom_group_kill {}\n",
             oom[0], oom[1], oom[2]
         )
     }
@@ -1656,6 +1899,7 @@ impl CgroupTree {
                 .chain(PIDS_FILES)
                 .chain(CPU_FILES)
                 .chain(MEMORY_FILES)
+                .chain(IO_FILES)
                 .position(|(n, _)| *n == f)
                 .map_or(0, |i| i as u64 + 1)
         });
@@ -1697,6 +1941,10 @@ fn split_last(rel: &str) -> (&str, &str) {
 }
 
 impl MountFs for CgroupFs {
+    fn attach_disks(&mut self, disks: &super::blockdev::SharedDisks) {
+        self.tree.lock().unwrap().attach_disks(disks);
+    }
+
     fn stat(&mut self, rel: &str) -> Option<Attrs> {
         let tree = self.tree.lock().unwrap();
         let (node, file) = tree.lookup(self.root, rel)?;
@@ -1713,6 +1961,7 @@ impl MountFs for CgroupFs {
                 inode: CgroupTree::inode(node, None),
                 nlink: 2 + n.children.len() as u32,
                 rdev: 0,
+                dev: 0,
             },
             Some(f) => {
                 let writable = tree.files(node).iter().any(|(x, w)| *x == f && *w);
@@ -1738,6 +1987,7 @@ impl MountFs for CgroupFs {
                     inode: CgroupTree::inode(node, Some(&f)),
                     nlink: 1,
                     rdev: 0,
+                    dev: 0,
                 }
             }
         })
@@ -1894,7 +2144,7 @@ mod tests {
     fn a_hierarchy_with_the_pids_controller() {
         let tree = CgroupTree::shared();
         let mut fs = CgroupFs::new(tree.clone(), ROOT);
-        assert_eq!(read(&mut fs, "cgroup.controllers"), "cpu memory pids\n");
+        assert_eq!(read(&mut fs, "cgroup.controllers"), "cpu io memory pids\n");
         assert!(fs.stat("cgroup.events").is_none(), "the root has none");
         fs.mkdir("a", 0o755).unwrap();
         assert!(fs.stat("a/pids.max").is_none(), "not enabled yet");
@@ -2123,7 +2373,7 @@ mod tests {
         // pids is threaded: it may be enabled where there are tasks...
         t.write_file(a, "cgroup.subtree_control", "+pids").unwrap();
         assert_eq!(
-            t.write_file(a, "cgroup.subtree_control", "+io"),
+            t.write_file(a, "cgroup.subtree_control", "+rdma"),
             Err(EINVAL)
         );
         assert_eq!(

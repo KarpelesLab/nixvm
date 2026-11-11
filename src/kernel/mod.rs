@@ -445,6 +445,9 @@ struct ProcInfo {
     /// Allocating past its memory cgroup's `memory.high` has it sleep until
     /// then (see [`memcg_high_delay`]); only `SIGKILL` cuts that short.
     high_delay_until: Option<u128>,
+    /// I/O past an `io.max` of its cgroup has it wait until then, as Linux's
+    /// `blk-throttle` holds the I/O itself back.
+    io_delay_until: Option<u128>,
     /// What its CPU time counts for in fair scheduling because of its
     /// cgroup's `cpu.weight` (see [`crate::fs::cgroupfs::SchedState::scale`]).
     cg_scale: u64,
@@ -627,6 +630,7 @@ impl Default for ProcInfo {
             rt_run_ns: 0,
             throttled_until: None,
             high_delay_until: None,
+            io_delay_until: None,
             cg_scale: crate::fs::cgroupfs::UNSCALED,
             memcg: 0,
             vruntime: 0,
@@ -699,7 +703,8 @@ impl ProcInfo {
         let now = poll::now_ns();
         (self.frozen
             || self.throttled_until.is_some_and(|t| t > now)
-            || self.high_delay_until.is_some_and(|t| t > now))
+            || self.high_delay_until.is_some_and(|t| t > now)
+            || self.io_delay_until.is_some_and(|t| t > now))
             && self.pending & (1 << (9 - 1)) == 0
     }
 
@@ -722,7 +727,8 @@ impl ProcInfo {
     fn deadlines(&self) -> [Option<u128>; 2] {
         if self.held() {
             let thawed = |t: Option<u128>| t.filter(|_| !self.frozen);
-            [thawed(self.throttled_until), thawed(self.high_delay_until)]
+            let other = self.high_delay_until.max(self.io_delay_until);
+            [thawed(self.throttled_until), thawed(other)]
         } else {
             [self.wake_deadline, self.timer_deadline()]
         }
@@ -1287,7 +1293,13 @@ const FAIR_SERVER_RUNTIME_NS: u128 = 50_000_000;
 
 /// The scheduling attributes another task can change while this one runs.
 fn sched_attrs(p: &ProcInfo) -> (i32, i32, i32, u64, u8) {
-    (p.sched_policy, p.sched_priority, p.nice, p.affinity, p.rt_requeue)
+    (
+        p.sched_policy,
+        p.sched_priority,
+        p.nice,
+        p.affinity,
+        p.rt_requeue,
+    )
 }
 
 /// A task's real-time priority, 1..=99, if it's in a real-time class
@@ -2939,7 +2951,14 @@ impl Kernel {
     ) -> Serviced {
         // What this step allocates is charged to the task's memory cgroup.
         mem.set_memcg(cx.cur.memcg);
+        pagecache::IoTask::enter(cx.cur.pid, cx.cur.memcg, mem);
         let flow = self.service_exit(cx, exit, vcpu, mem);
+        // Its I/O went past an `io.max`: it waits that out before going on.
+        if let Some(until) = pagecache::IoTask::leave()
+            && !matches!(flow, Serviced::Ended)
+        {
+            cx.cur.io_delay_until = Some(until);
+        }
         // A memory cgroup refused memory the kernel needed for the task (a
         // buffer it wrote to, a page it copied): Linux's out-of-memory kill.
         if !matches!(flow, Serviced::Ended)
@@ -3665,7 +3684,8 @@ impl Kernel {
                 // `sched_setscheduler`, `setpriority` or `sched_setaffinity`).
                 if sched_attrs(&stand_in.info) != out_cpu.3 {
                     let s = &stand_in.info;
-                    (cx.cur.sched_policy, cx.cur.sched_priority) = (s.sched_policy, s.sched_priority);
+                    (cx.cur.sched_policy, cx.cur.sched_priority) =
+                        (s.sched_policy, s.sched_priority);
                     (cx.cur.nice, cx.cur.affinity) = (s.nice, s.affinity);
                     (cx.cur.rt_requeue, cx.cur.rt_slice_ns) = (s.rt_requeue, s.rt_slice_ns);
                 }
@@ -4975,6 +4995,18 @@ impl Kernel {
                 None => err(Errno::EBADF),
                 Some(Fd::PipeRead(_) | Fd::PipeWrite(_)) if sys == Sysno::Fadvise64 => {
                     err(Errno::ESPIPE)
+                }
+                // POSIX_FADV_DONTNEED drops the range from the page cache.
+                Some(Fd::File { path, .. }) if sys == Sysno::Fadvise64 && args[3] == 4 => {
+                    let path = path.clone();
+                    let (off, len) = (args[1], args[2]);
+                    let end = if len == 0 {
+                        u64::MAX
+                    } else {
+                        (off + len) / 4096
+                    };
+                    Self::cache_drop(&mut self.vfs_for(cx), &path, off.div_ceil(4096), end);
+                    0
                 }
                 Some(Fd::File { .. }) if sys == Sysno::Readahead || args[3] <= 5 => 0,
                 Some(Fd::Dir { .. }) if sys == Sysno::Fadvise64 && args[3] <= 5 => 0,
@@ -9166,6 +9198,7 @@ impl Kernel {
                 inode: 0x4d51_0000 + *q as u64,
                 nlink: 1,
                 rdev: 0,
+                dev: 0,
             },
             None => return Err(err(Errno::EBADF)),
         })
@@ -10506,7 +10539,11 @@ fn nice_weight(nice: i32) -> u128 {
 /// the 3 Linux gives it (`WEIGHT_IDLEPRIO`), so it runs only when little else
 /// wants the CPU.
 fn task_weight(p: &ProcInfo) -> u128 {
-    if p.sched_policy == 5 { 3 } else { nice_weight(p.nice) }
+    if p.sched_policy == 5 {
+        3
+    } else {
+        nice_weight(p.nice)
+    }
 }
 
 /// Add one executed step's weighted virtual runtime to a task, given the raw CPU

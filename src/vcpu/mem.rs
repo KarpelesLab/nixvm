@@ -299,6 +299,12 @@ impl GuestMemory {
         self.fa.lock().unwrap().take_over_high(slot)
     }
 
+    /// The frame allocator every address space shares.
+    #[must_use]
+    pub fn allocator(&self) -> Arc<Mutex<FrameAllocator>> {
+        Arc::clone(&self.fa)
+    }
+
     /// Run `f` on the frame allocator every address space shares, for the
     /// kernel's memory cgroup bookkeeping.
     pub fn with_allocator<T>(&self, f: impl FnOnce(&mut FrameAllocator) -> T) -> T {

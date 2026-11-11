@@ -105,6 +105,17 @@ pub struct MountTable {
     quota: Option<std::sync::Arc<crate::limits::Quota>>,
     /// What every mounted filesystem charges growth on the host's disk to.
     disk_quota: Option<std::sync::Arc<crate::limits::Quota>>,
+    /// The VM's disks (see [`super::blockdev`]).
+    disks: super::blockdev::SharedDisks,
+    /// The device each mounted filesystem is (keyed by [`fs_key`]): its disk,
+    /// or an anonymous device.
+    devs: BTreeMap<usize, u64>,
+}
+
+/// What tells one mounted filesystem from another: every mount of it (a bind
+/// mount, a copy in another namespace) shares the one instance.
+fn fs_key(m: &Mount) -> usize {
+    Arc::as_ptr(&m.fs).cast::<()>() as usize
 }
 
 impl MountTable {
@@ -285,7 +296,8 @@ impl MountTable {
             .iter()
             .filter(|m| detached_root(&m.point).is_none())
             .filter(|m| self.root.is_empty() || path_has_prefix(&m.point, &self.root))
-            .map(|m| MountEntry {
+            .map(|m| (m, m.lock().fs_type().to_string()))
+            .map(|(m, fs_type)| MountEntry {
                 point: if self.root.is_empty() {
                     m.point.clone()
                 } else {
@@ -293,7 +305,9 @@ impl MountTable {
                 },
                 subdir: m.subdir.clone(),
                 read_only: m.read_only,
-                fs_type: m.lock().fs_type().to_string(),
+                fs_type,
+                dev: self.devs.get(&fs_key(m)).copied().unwrap_or(1),
+                source: self.source_of(m),
                 peer: m.peer,
                 master: m.master,
                 unbindable: m.unbindable,
@@ -419,8 +433,55 @@ impl MountTable {
         if let Some(quota) = &self.disk_quota {
             fs.attach_disk_quota(quota);
         }
-        self.mounts
-            .push(Mount::new(normalize(&point.into()), fs, false));
+        let m = Mount::new(normalize(&point.into()), fs, false);
+        self.register(&m);
+        self.mounts.push(m);
+    }
+
+    /// Give a newly mounted filesystem its device: the disk it registers, if
+    /// it's on one, or a fresh anonymous device.
+    fn register(&mut self, m: &Mount) {
+        if self.devs.contains_key(&fs_key(m)) {
+            return;
+        }
+        let mut fs = m.lock();
+        fs.attach_disks(&self.disks);
+        let dev = fs
+            .own_dev()
+            .unwrap_or_else(|| self.disks.lock().unwrap().anon());
+        drop(fs);
+        self.devs.insert(fs_key(m), dev);
+    }
+
+    /// Where mount `m` is mounted from, as `mountinfo` says.
+    fn source_of(&self, m: &Mount) -> String {
+        let dev = self.devs.get(&fs_key(m)).copied().unwrap_or(1);
+        let disks = self.disks.lock().unwrap();
+        disks.list().iter().find(|d| d.dev == dev).map_or_else(
+            || m.lock().fs_type().to_string(),
+            |d| format!("/dev/{}", d.name),
+        )
+    }
+
+    /// The VM's disks.
+    #[must_use]
+    pub fn disks(&self) -> super::blockdev::SharedDisks {
+        self.disks.clone()
+    }
+
+    /// The device of mount `i`'s filesystem.
+    fn dev_of(&self, i: usize) -> u64 {
+        self.devs
+            .get(&fs_key(&self.mounts[i]))
+            .copied()
+            .unwrap_or(1)
+    }
+
+    /// The disk holding `abs_path`'s contents, if they're on one (see
+    /// [`MountFs::data_dev`]).
+    pub fn data_dev(&mut self, abs_path: &str) -> Option<u64> {
+        let (mut fs, rel) = self.resolve(abs_path)?;
+        fs.data_dev(&rel)
     }
 
     /// Mount `fs` at `point` on the guest's behalf (`mount(2)`); it stacks
@@ -432,7 +493,9 @@ impl MountTable {
         if let Some(quota) = &self.disk_quota {
             fs.attach_disk_quota(quota);
         }
-        self.attach(vec![Mount::new(normalize(point), fs, true)]);
+        let m = Mount::new(normalize(point), fs, true);
+        self.register(&m);
+        self.attach(vec![m]);
     }
 
     /// Add `tree` (a mount, then any below it) where its first mount says, and
@@ -875,15 +938,17 @@ impl MountTable {
     }
 
     pub fn stat(&mut self, abs_path: &str) -> Option<Attrs> {
-        let (mut fs, rel) = self.resolve(abs_path)?;
-        fs.stat(&rel)
+        let abs_path = self.canonical(abs_path);
+        self.stat_raw(&abs_path)
     }
 
     /// `stat` of an already-canonical path, without resolving symlinks.
     fn stat_raw(&mut self, abs_path: &str) -> Option<Attrs> {
         let i = self.best_mount(abs_path)?;
         let rel = self.mounts[i].fs_path(&relative_to(abs_path, &self.mounts[i].point));
-        self.mounts[i].lock().stat(&rel)
+        let mut a = self.mounts[i].lock().stat(&rel)?;
+        a.dev = self.dev_of(i);
+        Some(a)
     }
 
     /// `abs_path`, normalized, with every symlink among its directories
@@ -1188,6 +1253,11 @@ pub struct MountEntry {
     pub subdir: String,
     pub read_only: bool,
     pub fs_type: String,
+    /// The device its filesystem is (`st_dev` of its files).
+    pub dev: u64,
+    /// What `mountinfo` says it's mounted from: its disk (`/dev/vda`), or for
+    /// a filesystem not on one its type.
+    pub source: String,
     /// `shared:N`, `master:N` and `unbindable` in `mountinfo`; 0 for none.
     pub peer: u32,
     pub master: u32,
@@ -1514,6 +1584,7 @@ mod tests {
                 inode: 0,
                 nlink: 1,
                 rdev: 0,
+                dev: 0,
             })
         }
 

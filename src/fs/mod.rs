@@ -20,6 +20,7 @@
 
 use std::io;
 
+pub mod blockdev;
 pub mod cgroupfs;
 pub mod devfs;
 #[cfg(feature = "fstool")]
@@ -74,6 +75,10 @@ pub struct Attrs {
     /// Device number (major/minor, `st_rdev`) for a character or block special
     /// file; `0` for every other node kind.
     pub rdev: u64,
+    /// The device the node is on (`st_dev`, see [`blockdev`]): filled in by
+    /// the [`MountTable`] from the mount it was found through; `0` from a
+    /// backend.
+    pub dev: u64,
 }
 
 /// One field of a `utimensat`/`futimens` request (`atime` or `mtime`).
@@ -118,6 +123,22 @@ pub trait MountFs: std::fmt::Debug + Send {
     /// Charge growth on the host's disk to `quota` from now on. A backend that
     /// doesn't write to the host doesn't need this.
     fn attach_disk_quota(&mut self, _quota: &std::sync::Arc<crate::limits::Quota>) {}
+
+    /// Register the disks this filesystem's files are on with `disks` (a host
+    /// directory is one; an overlay has its layers'), or keep the list to show
+    /// it (procfs, sysfs). Called once, when the filesystem is first mounted.
+    fn attach_disks(&mut self, _disks: &blockdev::SharedDisks) {}
+
+    /// The disk this filesystem is, if it's one: its files' `st_dev`.
+    fn own_dev(&self) -> Option<u64> {
+        None
+    }
+
+    /// The disk holding `rel`'s contents, if they're on one: what reading and
+    /// writing it does I/O to (for an overlay, the disk of the layer it's in).
+    fn data_dev(&mut self, _rel: &str) -> Option<u64> {
+        self.own_dev()
+    }
 
     /// The filesystem's type name, as `/proc/self/mountinfo` shows it.
     fn fs_type(&self) -> &'static str {

@@ -212,6 +212,7 @@ impl DevFs {
             inode: PTS_INODE_BASE + n,
             nlink: 1,
             rdev: makedev(136, n),
+            dev: 0,
         }
     }
 
@@ -237,6 +238,7 @@ impl DevFs {
             inode,
             nlink: 1,
             rdev,
+            dev: 0,
         }
     }
 
@@ -254,6 +256,7 @@ impl DevFs {
             inode,
             nlink: 1,
             rdev,
+            dev: 0,
         }
     }
 
@@ -361,6 +364,7 @@ impl MountFs for DevFs {
                 inode: ROOT_INODE,
                 nlink: 1,
                 rdev: 0,
+                dev: 0,
             });
         }
         if let Some(attrs) = Self::lookup(rel).map(Self::dev_attrs) {
@@ -384,6 +388,7 @@ impl MountFs for DevFs {
                 inode,
                 nlink: 1,
                 rdev: 0,
+                dev: 0,
             });
         }
         // `/dev/pts/<N>` — a pty slave. The pty table owns which slaves are open,
@@ -404,6 +409,7 @@ impl MountFs for DevFs {
             inode,
             nlink: 1,
             rdev: 0,
+            dev: 0,
         })
     }
 

@@ -57,6 +57,21 @@ fn nproc() -> usize {
         .max(1)
 }
 
+/// A disk's `queue/` attributes: what Linux shows for a virtio disk with no
+/// I/O scheduler.
+const QUEUE_ATTRS: &[(&str, &str)] = &[
+    ("rotational", "0\n"),
+    ("logical_block_size", "512\n"),
+    ("physical_block_size", "512\n"),
+    ("hw_sector_size", "512\n"),
+    ("minimum_io_size", "512\n"),
+    ("optimal_io_size", "0\n"),
+    ("read_ahead_kb", "128\n"),
+    ("nr_requests", "256\n"),
+    ("max_sectors_kb", "1280\n"),
+    ("scheduler", "[none] mq-deadline\n"),
+];
+
 /// Render a CPU index set the way `sysfs` bitmap-list files do: `"0\n"` for a
 /// single CPU, `"0-N\n"` for a contiguous range starting at 0.
 fn cpu_range(ncpu: usize) -> String {
@@ -108,9 +123,24 @@ impl Builder {
     }
 }
 
-/// The synthesized `/sys` backend. The tree it serves is fixed at construction.
+/// The synthesized `/sys` backend. The tree it serves is fixed at construction,
+/// but for the VM's disks (`block`, `dev/block`, `devices/virtual/block`).
 #[derive(Debug)]
-pub struct SysFs;
+pub struct SysFs {
+    disks: Option<super::blockdev::SharedDisks>,
+}
+
+/// A node of the part of the tree made from the VM's disks.
+enum DiskNode {
+    Dir(Vec<(String, NodeKind)>),
+    File(Vec<u8>),
+    Link(String),
+}
+
+/// Unix mode type bit for a symlink.
+const S_IFLNK: u32 = 0o120_000;
+/// Where the disks' inodes are numbered from.
+const DISK_INODES: u64 = 0x5d00_0000;
 
 impl Default for SysFs {
     fn default() -> Self {
@@ -125,7 +155,108 @@ impl SysFs {
     #[must_use]
     pub fn new(ncpu: usize) -> Self {
         GUEST_NPROC.store(ncpu.max(1), std::sync::atomic::Ordering::Relaxed);
-        Self
+        Self { disks: None }
+    }
+
+    /// `rel` in the part of the tree made from the VM's disks, if it's there:
+    /// `devices/virtual/block/<disk>` with its attributes, and the links to it
+    /// from `block`, `class/block` and `dev/block/<major>:<minor>`.
+    fn disk_node(&self, rel: &str) -> Option<DiskNode> {
+        use super::blockdev::{major, minor};
+        let disks = self.disks.as_ref()?.lock().unwrap();
+        let list = disks.list();
+        let by_name = |n: &str| list.iter().find(|d| d.name == n);
+        let to = |up: &str, name: &str| DiskNode::Link(format!("{up}devices/virtual/block/{name}"));
+        let parts: Vec<&str> = rel.split('/').collect();
+        Some(match parts.as_slice() {
+            ["block"] | ["class", "block"] => DiskNode::Dir(
+                list.iter()
+                    .map(|d| (d.name.clone(), NodeKind::Symlink))
+                    .collect(),
+            ),
+            ["devices", "virtual", "block"] => DiskNode::Dir(
+                list.iter()
+                    .map(|d| (d.name.clone(), NodeKind::Dir))
+                    .collect(),
+            ),
+            ["dev", "block"] => DiskNode::Dir(
+                list.iter()
+                    .map(|d| {
+                        (
+                            format!("{}:{}", major(d.dev), minor(d.dev)),
+                            NodeKind::Symlink,
+                        )
+                    })
+                    .collect(),
+            ),
+            ["block", name] if by_name(name).is_some() => to("../", name),
+            ["class", "block", name] if by_name(name).is_some() => to("../../", name),
+            ["dev", "block", mm] => {
+                let d = list
+                    .iter()
+                    .find(|d| format!("{}:{}", major(d.dev), minor(d.dev)) == *mm)?;
+                to("../../", &d.name)
+            }
+            ["devices", "virtual", "block", name, rest @ ..] => {
+                let d = by_name(name)?;
+                let (ma, mi) = (major(d.dev), minor(d.dev));
+                match rest {
+                    [] => DiskNode::Dir(
+                        ["dev", "size", "ro", "removable", "uevent", "stat"]
+                            .iter()
+                            .map(|f| ((*f).to_string(), NodeKind::File))
+                            .chain([("queue".to_string(), NodeKind::Dir)])
+                            .collect(),
+                    ),
+                    ["queue"] => DiskNode::Dir(
+                        QUEUE_ATTRS
+                            .iter()
+                            .map(|(f, _)| ((*f).to_string(), NodeKind::File))
+                            .collect(),
+                    ),
+                    ["queue", attr] => DiskNode::File(
+                        QUEUE_ATTRS
+                            .iter()
+                            .find(|(f, _)| f == attr)?
+                            .1
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    [attr] => DiskNode::File(
+                        match *attr {
+                            "dev" => format!("{ma}:{mi}\n"),
+                            "size" => format!("{}\n", d.bytes / 512),
+                            "ro" => format!("{}\n", u8::from(d.read_only)),
+                            "removable" => "0\n".to_string(),
+                            "uevent" => format!(
+                                "MAJOR={ma}\nMINOR={mi}\nDEVNAME={}\nDEVTYPE=disk\n",
+                                d.name
+                            ),
+                            "stat" => format!(
+                                "{:8} 0 {:8} 0 {:8} 0 {:8} 0 0 0 0 0 0 0 0 0 0\n",
+                                d.reads,
+                                d.read_bytes / 512,
+                                d.writes,
+                                d.write_bytes / 512
+                            ),
+                            _ => return None,
+                        }
+                        .into_bytes(),
+                    ),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    /// The inode of `rel` in the disks' part of the tree.
+    fn disk_inode(rel: &str) -> u64 {
+        // FNV-1a: stable, and far from the static tree's small numbers.
+        let h = rel.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+        });
+        DISK_INODES + (h & 0xff_ffff)
     }
 
     /// The shared static tree, built once on first access. Directories carry
@@ -202,6 +333,11 @@ impl SysFs {
         }
 
         // ---- devices/system/node (single-node NUMA topology) ----
+        b.dir("devices/virtual");
+        b.dir("devices/virtual/block");
+        b.dir("dev");
+        b.dir("dev/block");
+        b.dir("dev/char");
         b.dir("devices/system/node");
         b.dir("devices/system/node/node0");
         b.file("devices/system/node/node0/cpulist", online);
@@ -272,7 +408,42 @@ impl MountFs for SysFs {
         "sysfs"
     }
 
+    fn attach_disks(&mut self, disks: &super::blockdev::SharedDisks) {
+        self.disks = Some(disks.clone());
+    }
+
+    fn readlink(&mut self, rel: &str) -> io::Result<String> {
+        match self.disk_node(rel) {
+            Some(DiskNode::Link(target)) => Ok(target),
+            Some(_) => Err(io::Error::from_raw_os_error(22)), // EINVAL
+            None if Self::tree().contains_key(rel) => Err(io::Error::from_raw_os_error(22)),
+            None => Err(enoent()),
+        }
+    }
+
     fn stat(&mut self, rel: &str) -> Option<Attrs> {
+        if !Self::tree().contains_key(rel)
+            && let Some(node) = self.disk_node(rel)
+        {
+            let (kind, mode, size) = match node {
+                DiskNode::Dir(_) => (NodeKind::Dir, S_IFDIR | 0o755, 0),
+                DiskNode::File(data) => (NodeKind::File, S_IFREG | 0o444, data.len() as u64),
+                DiskNode::Link(t) => (NodeKind::Symlink, S_IFLNK | 0o777, t.len() as u64),
+            };
+            return Some(Attrs {
+                kind,
+                size,
+                mode,
+                uid: 0,
+                gid: 0,
+                atime: 0,
+                mtime: 0,
+                inode: Self::disk_inode(rel),
+                nlink: 1,
+                rdev: 0,
+                dev: 0,
+            });
+        }
         let node = Self::tree().get(rel)?;
         let (kind, mode, size) = match node {
             Node::Dir { .. } => (NodeKind::Dir, S_IFDIR | 0o755, 0),
@@ -289,10 +460,17 @@ impl MountFs for SysFs {
             inode: node.inode(),
             nlink: 1,
             rdev: 0,
+            dev: 0,
         })
     }
 
     fn read_at(&mut self, rel: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(DiskNode::File(data)) = self.disk_node(rel) {
+            let off = (off as usize).min(data.len());
+            let n = buf.len().min(data.len() - off);
+            buf[..n].copy_from_slice(&data[off..off + n]);
+            return Ok(n);
+        }
         match Self::tree().get(rel) {
             Some(Node::File { data, .. }) => {
                 let off = off as usize;
@@ -310,12 +488,19 @@ impl MountFs for SysFs {
 
     fn readdir(&mut self, rel: &str) -> io::Result<Vec<DirEntry>> {
         let tree = Self::tree();
+        let mut out = Vec::new();
+        if let Some(DiskNode::Dir(entries)) = self.disk_node(rel) {
+            for (name, kind) in entries {
+                let inode = Self::disk_inode(&format!("{rel}/{name}"));
+                out.push(DirEntry { name, kind, inode });
+            }
+        }
         match tree.get(rel) {
             Some(Node::Dir { .. }) => {}
+            _ if !out.is_empty() => return Ok(out),
             Some(_) => return Err(enotdir()),
             None => return Err(enoent()),
         }
-        let mut out = Vec::new();
         for (path, node) in tree {
             if path.is_empty() || Self::parent_of(path) != rel {
                 continue;
@@ -351,7 +536,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "block", "bus", "class", "devices", "firmware", "fs", "kernel", "module", "power",
+                "block", "bus", "class", "dev", "devices", "firmware", "fs", "kernel", "module",
+                "power",
             ]
         );
         // Every top-level entry is a directory.

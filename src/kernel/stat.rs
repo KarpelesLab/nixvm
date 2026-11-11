@@ -43,7 +43,7 @@ pub fn encode_stat(attrs: &Attrs, arch: Arch) -> Vec<u8> {
     let put32 =
         |b: &mut [u8], off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
 
-    put64(&mut b, 0, 1); // st_dev
+    put64(&mut b, 0, st_dev(attrs)); // st_dev
     put64(&mut b, 8, attrs.inode); // st_ino
     match arch {
         Arch::Aarch64 => {
@@ -109,9 +109,16 @@ pub fn encode_statx(attrs: &Attrs) -> [u8; 256] {
     let rdev = attrs.rdev;
     put32(&mut b, 128, ((rdev >> 8) & 0xfff) as u32); // major
     put32(&mut b, 132, (rdev & 0xff | ((rdev >> 12) & !0xff)) as u32); // minor
-    put32(&mut b, 136, 0); // stx_dev_major
-    put32(&mut b, 140, 1); // stx_dev_minor
+    let dev = st_dev(attrs);
+    put32(&mut b, 136, crate::fs::blockdev::major(dev)); // stx_dev_major
+    put32(&mut b, 140, crate::fs::blockdev::minor(dev)); // stx_dev_minor
     b
+}
+
+/// The device `attrs`' node is on: the one the mount table found it on, or,
+/// for one that isn't on a filesystem (a pipe, a socket), `0:1`.
+fn st_dev(attrs: &Attrs) -> u64 {
+    if attrs.dev == 0 { 1 } else { attrs.dev }
 }
 
 /// The `f_type` `statfs` reports for a filesystem of type `fs_type` (as
@@ -164,6 +171,7 @@ pub fn char_device_attrs() -> Attrs {
         inode: 0,
         nlink: 1,
         rdev: 0,
+        dev: 0,
     }
 }
 
@@ -180,6 +188,7 @@ pub fn fifo_attrs() -> Attrs {
         inode: 0,
         nlink: 1,
         rdev: 0,
+        dev: 0,
     }
 }
 
@@ -196,6 +205,7 @@ pub fn socket_attrs() -> Attrs {
         inode: 0,
         nlink: 1,
         rdev: 0,
+        dev: 0,
     }
 }
 
@@ -299,6 +309,7 @@ mod tests {
             inode: 42,
             nlink: 1,
             rdev: 0,
+            dev: 0,
         };
         let b = encode_stat(&attrs, Arch::Aarch64);
         assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 42); // st_ino
@@ -319,6 +330,7 @@ mod tests {
             inode: 7,
             nlink: 1,
             rdev: makedev(1, 3), // /dev/null
+            dev: 0,
         };
         let b = encode_stat(&attrs, Arch::Aarch64);
         // st_rdev sits at offset 32 and must round-trip the attrs value.
@@ -342,6 +354,7 @@ mod tests {
             inode: 42,
             nlink: 2,
             rdev: 0,
+            dev: 0,
         };
         let b = encode_stat(&attrs, Arch::X86_64);
         assert_eq!(b.len(), 144, "x86-64 struct stat is 144 bytes");

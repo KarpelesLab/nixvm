@@ -411,6 +411,7 @@ impl MountFs for TmpFs {
             inode: meta.inode,
             nlink,
             rdev: 0,
+            dev: 0,
         })
     }
 

@@ -1,7 +1,8 @@
 /* cgroup v2: a hierarchy of our own under the root cgroup, moving processes,
  * pids.max, the cpu controller (weights, cpu.max bandwidth), the memory
  * controller (memory.max and its out-of-memory kills, also on lowering it;
- * memory.high's throttling), cgroup.events,
+ * memory.high's throttling, the page cache, memory.reclaim and memory.low),
+ * the io controller (io.max, io.stat, io.weight), cgroup.events,
  * cgroup.kill, cgroup.freeze, threaded subtrees, the limits on the
  * tree, CLONE_INTO_CGROUP, cgroup namespaces and /proc/<pid>/cgroup.
  *
@@ -21,6 +22,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -28,7 +30,7 @@
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL: %s (line %d, errno %d)\n", #c, __LINE__, errno); cleanup(); exit(1); } } while (0)
 
-static char base[256], home[256];
+static char base[256], home[256], scratch[256];
 
 static int put(const char *dir, const char *file, const char *text) {
   char p[512];
@@ -68,9 +70,16 @@ static long long field(const char *text, const char *key) {
 static void path(char *out, const char *name) { snprintf(out, 256, "%.200s/%.50s", base, name); }
 
 static void cleanup(void) {
+  if (*scratch) {
+    char f[300];
+    for (int i = 0; i < 3; i++) {
+      snprintf(f, sizeof f, "%s.%d", scratch, i);
+      unlink(f);
+    }
+  }
   if (!*base) return;
   put(home, "cgroup.procs", "0");
-  const char *kids[] = {"self", "lim", "kd", "fz", "cq", "ga", "gb", "mm/kid", "mm", "td/t1/t3", "td/t1", "td/t2", "td", "nest/a", "nest", "into", "ns", "zz", 0};
+  const char *kids[] = {"self", "lim", "kd", "fz", "cq", "ga", "gb", "mm/kid", "mm", "io", "pr/a", "pr/b", "pr", "td/t1/t3", "td/t1", "td/t2", "td", "nest/a", "nest", "into", "ns", "zz", 0};
   for (int i = 0; kids[i]; i++) {
     char p[256];
     path(p, kids[i]);
@@ -93,6 +102,70 @@ static int listed(const char *list, int id) {
   for (const char *l = list; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : 0)
     if (atoi(l) == id) return 1;
   return 0;
+}
+
+/* A number from the "key=value" field of a nested-keyed file's line for `dev`. */
+static long long keyed(const char *text, const char *dev, const char *key) {
+  char k[64];
+  snprintf(k, sizeof k, " %s=", key);
+  for (const char *l = text; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : 0) {
+    if (strncmp(l, dev, strlen(dev)) || l[strlen(dev)] != ' ') continue;
+    const char *end = strchr(l, '\n');
+    const char *v = strstr(l, k);
+    if (v && (!end || v < end)) return atoll(v + strlen(k));
+  }
+  return -1;
+}
+
+/* Write `mib` MiB to file `name`, flush it to the disk and drop it from the
+ * page cache, so it's read from the disk again. */
+static int make_file(const char *name, int mib) {
+  static char chunk[64 << 10];
+  memset(chunk, 'x', sizeof chunk);
+  int fd = open(name, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+  if (fd < 0) return -1;
+  for (int i = 0; i < mib * 16; i++)
+    if (write(fd, chunk, sizeof chunk) != sizeof chunk) return -1;
+  if (fsync(fd) || posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)) return -1;
+  return close(fd);
+}
+
+/* Read all of `name`; how long it took, in milliseconds. */
+static long read_file(const char *name) {
+  static char chunk[64 << 10];
+  double t0 = secs(CLOCK_MONOTONIC);
+  int fd = open(name, O_RDONLY);
+  if (fd < 0) return -1;
+  while (read(fd, chunk, sizeof chunk) > 0) {}
+  close(fd);
+  return (long)((secs(CLOCK_MONOTONIC) - t0) * 1000);
+}
+
+/* In a child moved into cgroup `cg`: read file `name` (`write_mib` 0) or write
+ * that many MiB to it and flush them; the milliseconds it took. */
+static long io_in(const char *cg, const char *name, int write_mib) {
+  int fds[2];
+  if (pipe(fds)) return -1;
+  pid_t c = fork();
+  if (!c) {
+    if (put(cg, "cgroup.procs", "0")) _exit(1);
+    long ms;
+    if (write_mib) {
+      double t0 = secs(CLOCK_MONOTONIC);
+      ms = make_file(name, write_mib) ? -1 : (long)((secs(CLOCK_MONOTONIC) - t0) * 1000);
+    } else {
+      ms = read_file(name);
+    }
+    if (write(fds[1], &ms, sizeof ms) != sizeof ms) _exit(2);
+    _exit(0);
+  }
+  long ms = -1;
+  if (read(fds[0], &ms, sizeof ms) != sizeof ms) ms = -1;
+  int st;
+  waitpid(c, &st, 0);
+  close(fds[0]);
+  close(fds[1]);
+  return ms;
 }
 
 /* The calling process's cgroup, from /proc/self/cgroup. */
@@ -456,6 +529,118 @@ int main(void) {
   CHECK(field(get(mm, "memory.events"), "high") > highs);
   CHECK(rmdir(mm) == 0);
   puts("memory.max, memory.current, memory.events, memory.oom.group: ok");
+
+  /* Files on a disk: the io controller limits and counts the I/O to it, and
+   * the page cache holding their data is charged to the memory cgroup that
+   * read them. A scratch file in the working directory (in nixvm a host
+   * directory, /work, which is a disk of its own). */
+  struct stat ws;
+  /* Unique beyond the pid: VMs running side by side all have a pid 1. */
+  struct timespec uniq;
+  clock_gettime(CLOCK_REALTIME, &uniq);
+  snprintf(scratch, sizeof scratch, "%s/.nixvm-cgroups-%d-%ld",
+           stat("/work", &ws) == 0 && access("/work", W_OK) == 0 ? "/work" : ".", getpid(),
+           (long)(uniq.tv_nsec ^ uniq.tv_sec));
+  char f0[300], f1[300], f2[300];
+  snprintf(f0, sizeof f0, "%s.0", scratch);
+  snprintf(f1, sizeof f1, "%s.1", scratch);
+  snprintf(f2, sizeof f2, "%s.2", scratch);
+  CHECK(make_file(f0, 2) == 0);
+  CHECK(stat(f0, &ws) == 0);
+  /* io.max names a whole disk: the one holding a partition, if it's on one. */
+  char sys[300], real[4096], disk[32];
+  snprintf(sys, sizeof sys, "/sys/dev/block/%u:%u", major(ws.st_dev), minor(ws.st_dev));
+  int on_disk = realpath(sys, real) != 0;
+  if (on_disk) {
+    snprintf(sys, sizeof sys, "%.4000s/partition", real);
+    if (access(sys, F_OK) == 0) *strrchr(real, '/') = 0;
+    snprintf(sys, sizeof sys, "%.4000s", real);
+    snprintf(disk, sizeof disk, "%s", get(sys, "dev"));
+    if (strchr(disk, '\n')) *strchr(disk, '\n') = 0;
+  }
+  if (!on_disk || !strstr(get("/sys/fs/cgroup", "cgroup.controllers"), "io")) {
+    puts("the working directory isn't on a disk, or no io controller: io skipped");
+  } else {
+    if (!strstr(get("/sys/fs/cgroup", "cgroup.subtree_control"), "io"))
+      CHECK(put("/sys/fs/cgroup", "cgroup.subtree_control", "+io") == 0);
+    CHECK(put(base, "cgroup.subtree_control", "+io") == 0);
+    char io[256], line[128];
+    path(io, "io");
+    CHECK(mkdir(io, 0755) == 0);
+    CHECK(!strcmp(get(io, "io.max"), ""));
+    CHECK(!strncmp(get(io, "io.weight"), "default 100\n", 12));
+    CHECK(put(io, "io.weight", "50") == 0 && !strncmp(get(io, "io.weight"), "default 50\n", 11));
+    CHECK(put(io, "io.weight", "default 0") == -1 && errno == EINVAL);
+    snprintf(line, sizeof line, "%s bogus=1", disk);
+    CHECK(put(io, "io.max", line) == -1 && errno == EINVAL);
+    snprintf(line, sizeof line, "%s rbps=0", disk);
+    CHECK(put(io, "io.max", line) == -1 && errno == ERANGE);
+    CHECK(put(io, "io.max", "4000:4000 rbps=1") == -1 && errno == ENODEV);
+    snprintf(line, sizeof line, "%s rbps=max", disk);
+    CHECK(put(io, "io.max", line) == 0 && !strcmp(get(io, "io.max"), ""));
+    /* Writes past wbps wait for it: 2 MiB at 1 MiB/s. */
+    snprintf(line, sizeof line, "%s wbps=1048576", disk);
+    CHECK(put(io, "io.max", line) == 0);
+    char want_max[128];
+    snprintf(want_max, sizeof want_max, "%s rbps=max wbps=1048576 riops=max wiops=max\n", disk);
+    CHECK(!strcmp(get(io, "io.max"), want_max));
+    long ms = io_in(io, f1, 2);
+    printf("2 MiB written at wbps 1 MiB/s: %ld ms\n", ms);
+    CHECK(ms >= 1200 && ms < 15000);
+    CHECK(keyed(get(io, "io.stat"), disk, "wbytes") >= 2 << 20);
+    CHECK(keyed(get(io, "io.stat"), disk, "wios") > 0);
+    /* And reads past rbps: the file is read from the disk, not the cache. */
+    snprintf(line, sizeof line, "%s wbps=max rbps=1048576", disk);
+    CHECK(put(io, "io.max", line) == 0);
+    ms = io_in(io, f0, 0);
+    printf("2 MiB read at rbps 1 MiB/s: %ld ms\n", ms);
+    CHECK(ms >= 1200 && ms < 15000);
+    CHECK(keyed(get(io, "io.stat"), disk, "rbytes") >= 2 << 20);
+    CHECK(keyed(get("/sys/fs/cgroup", "io.stat"), disk, "rbytes") >= 2 << 20);
+    /* What it read is in the page cache now, charged to it, and read again
+     * from there it's no longer held back. */
+    long long file = field(get(io, "memory.stat"), "file");
+    printf("page cache charged after the read: %lld KiB\n", file >> 10);
+    CHECK(file >= 1 << 20);
+    CHECK(atoll(get(io, "memory.current")) >= file);
+    ms = io_in(io, f0, 0);
+    CHECK(ms >= 0 && ms < 500);
+    /* memory.reclaim takes it back; asking for more than there is fails. */
+    CHECK(put(io, "memory.reclaim", "1G") == -1 && errno == EAGAIN);
+    CHECK(field(get(io, "memory.stat"), "file") < 512 << 10);
+    CHECK(put(io, "memory.reclaim", "nonsense") == -1 && errno == EINVAL);
+    CHECK(rmdir(io) == 0);
+    puts("io.max, io.stat, io.weight, page cache, memory.reclaim: ok");
+  }
+
+  /* memory.low: reclaim within a parent's memory.max takes from the sibling
+   * that isn't protected. */
+  {
+    char pr[256], pa[256], pb[256];
+    path(pr, "pr");
+    path(pa, "pr/a");
+    path(pb, "pr/b");
+    CHECK(mkdir(pr, 0755) == 0 && mkdir(pa, 0755) == 0 && mkdir(pb, 0755) == 0);
+    CHECK(put(pr, "cgroup.subtree_control", "+memory") == 0);
+    CHECK(put(pr, "memory.max", "16M") == 0 && put(pa, "memory.low", "12M") == 0);
+    CHECK(make_file(f1, 8) == 0 && make_file(f2, 16) == 0);
+    CHECK(io_in(pa, f1, 0) >= 0);
+    long long a0 = atoll(get(pa, "memory.current"));
+    CHECK(io_in(pb, f2, 0) >= 0 && io_in(pb, f2, 0) >= 0);
+    long long a1 = atoll(get(pa, "memory.current")), b1 = atoll(get(pb, "memory.current"));
+    printf("memory.low 12M beside a sibling reading 16M under 16M: %lld KiB kept of %lld, the sibling %lld KiB\n",
+           a1 >> 10, a0 >> 10, b1 >> 10);
+    if (a0 >= 6 << 20) { /* a page cache to protect (a disk to have read from) */
+      CHECK(a1 >= a0 - (1 << 20));
+      CHECK(b1 <= 9 << 20);
+      CHECK(field(get(pa, "memory.events"), "low") == 0);
+    }
+    CHECK(rmdir(pa) == 0 && rmdir(pb) == 0 && rmdir(pr) == 0);
+    puts("memory.low: ok");
+  }
+  unlink(f0);
+  unlink(f1);
+  unlink(f2);
 
   /* Threaded subtrees: a cgroup made "threaded" joins its parent's resource
    * domain, and a process's threads can then be spread across it. */

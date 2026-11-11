@@ -38,6 +38,41 @@ use crate::vcpu::GuestMemory;
 use crate::vcpu::mem::{PAGE_SIZE, Prot};
 use crate::vcpu::phys::PhysMem;
 
+/// The task whose syscall this host thread is servicing, as file I/O needs
+/// it: set by [`IoTask::enter`] for the length of a step.
+pub(super) struct IoTask {
+    pid: i32,
+    memcg: u16,
+    fa: Arc<std::sync::Mutex<crate::vcpu::phys::FrameAllocator>>,
+    /// Until when its I/O has it wait, by its cgroups' `io.max`.
+    delay_until: Option<u128>,
+}
+
+thread_local! {
+    static IO_TASK: std::cell::RefCell<Option<IoTask>> = const { std::cell::RefCell::new(None) };
+}
+
+impl IoTask {
+    /// File I/O on this thread is task `pid`'s (memory cgroup `memcg`, in
+    /// `mem`'s frame pool) until [`IoTask::leave`].
+    pub(super) fn enter(pid: i32, memcg: u16, mem: &GuestMemory) {
+        let fa = mem.allocator();
+        IO_TASK.with(|t| {
+            *t.borrow_mut() = Some(Self {
+                pid,
+                memcg,
+                fa,
+                delay_until: None,
+            });
+        });
+    }
+
+    /// The step is over: until when its I/O has the task wait, if it does.
+    pub(super) fn leave() -> Option<u128> {
+        IO_TASK.with(|t| t.borrow_mut().take().and_then(|t| t.delay_until))
+    }
+}
+
 /// A file's identity: the mount point serving it and its inode there.
 type FileKey = (String, u64);
 
@@ -101,7 +136,63 @@ impl Kernel {
     ) -> std::io::Result<usize> {
         let n = vfs.read_at(path, off, buf)?;
         self.pc_after_read(vfs, path, off, &mut buf[..n]);
+        self.disk_io(vfs, path, off, n as u64, false);
         Ok(n)
+    }
+
+    /// After `n` bytes at `off` of `path` were read (or with `write`
+    /// written): if they're on one of the VM's disks, run them through the
+    /// page cache's accounting (charged to the task's memory cgroup), count
+    /// what had to go to the disk — what a read didn't find in memory, all of
+    /// a write — in `/proc/diskstats` and the task's `io.stat`, and hold it to
+    /// its cgroups' `io.max` (see [`IoTask`]).
+    fn disk_io(&self, vfs: &mut MountTable, path: &str, off: u64, n: u64, write: bool) {
+        if n == 0 {
+            return;
+        }
+        let Some(dev) = vfs.data_dev(path) else {
+            return;
+        };
+        let Some(inode) = vfs.stat(path).map(|a| a.inode) else {
+            return;
+        };
+        IO_TASK.with(|t| {
+            let mut t = t.borrow_mut();
+            let Some(task) = t.as_mut() else { return };
+            let first = off / PAGE_SIZE;
+            let pages = (off + n).div_ceil(PAGE_SIZE) - first;
+            let missed =
+                task.fa
+                    .lock()
+                    .unwrap()
+                    .cache_access((dev, inode), first, pages, task.memcg);
+            let bytes = if write { n } else { missed * PAGE_SIZE };
+            if bytes == 0 {
+                return;
+            }
+            vfs.disks().lock().unwrap().account(dev, write, bytes);
+            let mut tree = self.cgroups.lock().unwrap();
+            let node = tree.node_of(task.pid);
+            if let Some(until) = tree.io_account(node, dev, write, bytes) {
+                task.delay_until = task.delay_until.max(Some(until));
+            }
+        });
+    }
+
+    /// Drop pages `[first, end)` of the file at `path` from the page cache,
+    /// if it's on a disk.
+    pub(super) fn cache_drop(vfs: &mut MountTable, path: &str, first: u64, end: u64) {
+        let (Some(dev), Some(a)) = (vfs.data_dev(path), vfs.stat(path)) else {
+            return;
+        };
+        IO_TASK.with(|t| {
+            if let Some(task) = t.borrow().as_ref() {
+                task.fa
+                    .lock()
+                    .unwrap()
+                    .cache_drop((dev, a.inode), first, end);
+            }
+        });
     }
 
     /// `vfs.write_at`, written through into any cached pages of the file.
@@ -118,6 +209,7 @@ impl Kernel {
         }
         let n = vfs.write_at(path, off, data)?;
         self.pc_after_write(vfs, path, off, &data[..n]);
+        self.disk_io(vfs, path, off, n as u64, true);
         Ok(n)
     }
 
@@ -133,6 +225,7 @@ impl Kernel {
         }
         vfs.truncate(path, len)?;
         self.pc_after_truncate(vfs, path, len);
+        Self::cache_drop(vfs, path, len.div_ceil(PAGE_SIZE), u64::MAX);
         Ok(())
     }
 

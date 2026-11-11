@@ -150,10 +150,7 @@ impl Kernel {
             return;
         }
         let runnable = |p: &ProcInfo| {
-            p.run == RunState::Running
-                && !p.parked
-                && !p.held()
-                && super::rt_priority(p).is_none()
+            p.run == RunState::Running && !p.parked && !p.held() && super::rt_priority(p).is_none()
         };
         let tasks: Vec<(i32, u128)> = sh
             .procs
@@ -224,9 +221,37 @@ impl Kernel {
         victim.is_some_and(|v| oom_kill(&mut sh, &mut tree, cx, v, slot))
     }
 
+    /// A write to `memory.reclaim` of cgroup `node`: reclaim that much from
+    /// it, `EAGAIN` if there wasn't that much to take, as Linux's
+    /// `memory_reclaim` (which takes the page cache only, with no swap).
+    fn memcg_reclaim(&self, node: u32, text: &str, mem: &GuestMemory) -> Result<(), i64> {
+        let mut words = text.split_whitespace();
+        let pages = words
+            .next()
+            .and_then(|w| crate::fs::cgroupfs::parse_mem_pages(w).ok().flatten())
+            .ok_or_else(|| err(Errno::EINVAL))?;
+        // The only key Linux takes is `swappiness=N` (0..=200, or "max").
+        for w in words {
+            let ok = w
+                .strip_prefix("swappiness=")
+                .is_some_and(|v| v == "max" || v.parse::<u32>().is_ok_and(|n| n <= 200));
+            if !ok {
+                return Err(err(Errno::EINVAL));
+            }
+        }
+        let Some(slot) = self.cgroups.lock().unwrap().memcg_slot(node) else {
+            return Err(err(Errno::EAGAIN));
+        };
+        let got = mem.with_allocator(|fa| fa.reclaim_pages(slot, pages));
+        if got < pages {
+            return Err(err(Errno::EAGAIN));
+        }
+        Ok(())
+    }
+
     /// After a write to `memory.max` of cgroup `node`: while what it's
-    /// charged is over the new limit, kill its tasks, biggest first, as
-    /// Linux's `memory_max_write` does (there's no reclaim to try first).
+    /// charged is over the new limit, reclaim its page cache and then kill
+    /// its tasks, biggest first, as Linux's `memory_max_write` does.
     /// One victim at a time: while one is dying, the writer waits for it.
     pub(super) fn memcg_shrink(&self, cx: &mut ServiceCtx, node: u32, mem: &GuestMemory) -> Shrink {
         let mut sh = self.shared.lock().unwrap();
@@ -234,7 +259,7 @@ impl Kernel {
         let Some(slot) = tree.memcg_slot(node) else {
             return Shrink::Done;
         };
-        let over = mem.with_allocator(|fa| fa.memcg(slot).is_some_and(|m| m.frames > m.max));
+        let over = mem.with_allocator(|fa| fa.shrink_to_max(slot));
         if !over {
             return Shrink::Done;
         }
@@ -404,6 +429,7 @@ impl Kernel {
                 self.cgroup_move(cx, node, &text, file == "cgroup.threads")
             }
             "cgroup.kill" => self.cgroup_kill(cx, node, &text),
+            "memory.reclaim" => self.memcg_reclaim(node, &text, mem),
             _ => self.cgroup_freeze(cx, node, &text),
         };
         Some(result.map_or_else(|e| e, |()| count as i64))
