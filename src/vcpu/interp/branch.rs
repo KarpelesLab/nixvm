@@ -248,22 +248,7 @@ impl Aarch64Interp {
                 self.cntvct = self.cntvct.wrapping_add(1);
                 self.cntvct
             }
-            // Linux emulates EL0 reads of the CPU identification space.
-            MIDR_EL1 => MIDR_EL1_VAL,
-            MPIDR_EL1 => MPIDR_EL1_VAL,
-            REVIDR_EL1 => 0,
-            ID_AA64PFR0_EL1 => ID_AA64PFR0_EL1_VAL,
-            ID_AA64ISAR0_EL1 => ID_AA64ISAR0_EL1_VAL,
-            ID_AA64DFR0_EL1 => ID_AA64DFR0_EL1_VAL,
-            ID_AA64MMFR0_EL1 => ID_AA64MMFR0_EL1_VAL,
-            ID_AA64ISAR1_EL1 => ID_AA64ISAR1_EL1_VAL,
-            ID_AA64MMFR2_EL1 => ID_AA64MMFR2_EL1_VAL,
-            // The rest of the ID space (op0=3, op1=0, CRn=0, CRm=1..7) reads
-            // as zero: AArch32 ID registers (no AArch32 at EL0), and the
-            // AArch64 ones whose every user-visible field is "not
-            // implemented" for this CPU (ISAR1/ISAR2, PFR1, MMFR*, ZFR0, …).
-            k if k & 0xff80 == 0xc000 && (1..=7).contains(&((k >> 3) & 0xf)) => 0,
-            _ => return None,
+            k => return el0_id_register(k),
         })
     }
 
@@ -282,6 +267,31 @@ impl Aarch64Interp {
         }
         true
     }
+}
+
+/// What an EL0 `MRS` of the CPU identification register `key`
+/// (`op0:op1:CRn:CRm:op2`) reads under Linux, which traps and emulates those
+/// reads (`HWCAP_CPUID`): the CPU this interpreter models, whose features are
+/// the ones the loader advertises. `None` outside the ID space. Shared with
+/// the hardware backend, so a guest sees the same CPU on both.
+pub(crate) fn el0_id_register(key: u32) -> Option<u64> {
+    Some(match key {
+        MIDR_EL1 => MIDR_EL1_VAL,
+        MPIDR_EL1 => MPIDR_EL1_VAL,
+        REVIDR_EL1 => 0,
+        ID_AA64PFR0_EL1 => ID_AA64PFR0_EL1_VAL,
+        ID_AA64ISAR0_EL1 => ID_AA64ISAR0_EL1_VAL,
+        ID_AA64DFR0_EL1 => ID_AA64DFR0_EL1_VAL,
+        ID_AA64MMFR0_EL1 => ID_AA64MMFR0_EL1_VAL,
+        ID_AA64ISAR1_EL1 => ID_AA64ISAR1_EL1_VAL,
+        ID_AA64MMFR2_EL1 => ID_AA64MMFR2_EL1_VAL,
+        // The rest of the ID space (op0=3, op1=0, CRn=0, CRm=1..7) reads
+        // as zero: AArch32 ID registers (no AArch32 at EL0), and the
+        // AArch64 ones whose every user-visible field is "not
+        // implemented" for this CPU (ISAR1/ISAR2, PFR1, MMFR*, ZFR0, …).
+        k if k & 0xff80 == 0xc000 && (1..=7).contains(&((k >> 3) & 0xf)) => 0,
+        _ => return None,
+    })
 }
 
 // System-register keys: `op0:op1:CRn:CRm:op2` (instruction bits 20:5).

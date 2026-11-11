@@ -45,6 +45,6 @@ echo "==> codesigning $bin"
 codesign --sign - --force --entitlements tests/hvf.entitlements "$bin"
 
 echo "==> running HVF tests (NIXVM_HVF=1)"
-# Single-threaded: hv_vcpu handles are thread-bound and every guest shares the
-# process's one IPA space, so HVF tests must not run concurrently.
-NIXVM_HVF=1 "$bin" --ignored --nocapture --test-threads=1 "${filter[@]}"
+# They may run in parallel: each guest pool has its own window of the process's
+# one IPA space, and each test thread its own hv_vcpu.
+NIXVM_HVF=1 "$bin" --ignored "${filter[@]}"

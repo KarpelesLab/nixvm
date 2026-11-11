@@ -27,6 +27,7 @@ pub(crate) mod region;
 pub(crate) mod vdso;
 
 pub use mem::{GuestMemory, MemError, Prot};
+pub use pagetable::PtFormat;
 
 /// The wall-clock preemption quantum shared by every backend.
 ///
@@ -350,10 +351,8 @@ pub trait Backend {
     fn new_vcpu(&self, entry: u64, stack: u64) -> Result<Box<dyn Vcpu>, VcpuError>;
 }
 
-// Behind the `hvf` feature: the backend still maps guest RAM as one flat,
-// identity-mapped region, which the paged `GuestMemory` (frame pool + page
-// tables) no longer provides. It needs guest stage-1 page tables before it can
-// run again; until then default macOS builds use the interpreter.
+// Behind the `hvf` feature: running it needs a binary codesigned with the
+// hypervisor entitlement, which `select` probes for at runtime.
 #[cfg(all(feature = "hvf", target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf;
 

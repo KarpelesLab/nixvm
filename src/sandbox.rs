@@ -356,6 +356,9 @@ impl Sandbox {
             GUEST_VSIZE,
             round_up_page(self.config.mem_bytes),
         );
+        // Page tables in the guest's own format, for its hardware MMU.
+        mem.set_guest_arch(arch)
+            .map_err(|e| Error::Config(format!("guest memory: {e:?}")))?;
         let spec = ProcessSpec {
             argv: argv.clone(),
             envp: self.env(),
@@ -472,6 +475,9 @@ impl Sandbox {
             GUEST_VSIZE,
             round_up_page(self.config.mem_bytes),
         );
+        // Page tables in the guest's own format, for its hardware MMU.
+        mem.set_guest_arch(arch)
+            .map_err(|e| Error::Config(format!("guest memory: {e:?}")))?;
 
         let argv = if self.config.command.is_empty() {
             vec!["prog".to_string()]

@@ -184,6 +184,8 @@ impl Vm {
         // only touched pages take a frame.
         let mem_bytes = round_up_page(mem_bytes);
         let mut mem = GuestMemory::new_split(GUEST_BASE, GUEST_VSIZE.max(mem_bytes), mem_bytes);
+        // Page tables in the guest's own format, for its hardware MMU.
+        mem.set_guest_arch(arch).map_err(|e| format!("{e:?}"))?;
         let spec = ProcessSpec {
             argv,
             envp: default_env(),

@@ -34,10 +34,11 @@
 #![allow(dead_code)]
 
 use super::mem::PAGE_SIZE;
+use super::pagetable::PtFormat;
 use super::region::Region;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Frame size — the guest page size, 4 KiB. A physical frame is one of these.
 const FRAME: u64 = PAGE_SIZE;
@@ -62,6 +63,19 @@ pub struct PhysMem {
     region: Region,
     /// Pool size in bytes = `region.len()` rounded to a whole number of frames.
     size: usize,
+    /// The descriptor format of every page table built in this pool (a
+    /// [`PtFormat`] as `u8`): the guest architecture's, so a hardware walker of
+    /// that architecture can walk them. Chosen once, before the pool is shared
+    /// (see [`crate::vcpu::GuestMemory::set_guest_arch`]).
+    format: AtomicU8,
+    /// Where the pool sits in guest-physical space as a *hardware* walker sees
+    /// it: the address page-table entries and the translation base hold for
+    /// physical address 0. 0 for an x86-64 pool (KVM maps each VM's pool at
+    /// guest-physical 0); an arm64 pool gets its own window of the one
+    /// process-wide Hypervisor.framework IPA space (see [`ipa_window`]), so
+    /// several pools can be mapped at once. Every `pa` this type's methods take
+    /// is still an offset from the pool's start.
+    base: AtomicU64,
 }
 
 // SAFETY: `PhysMem` is the shared guest physical RAM, held as an `Arc<PhysMem>`
@@ -88,16 +102,39 @@ impl PhysMem {
         Self {
             size: region.len(),
             region,
+            format: AtomicU8::new(PtFormat::X86_64 as u8),
+            base: AtomicU64::new(0),
         }
     }
 
-    /// Physical base of the pool — always 0, the constant a KVM memslot maps
-    /// guest-physical address 0 to. Present as a method so call sites read
-    /// intent rather than a bare literal.
+    /// Where physical address 0 of the pool sits in the guest-physical space a
+    /// hardware page-table walker uses (see the field doc): 0 for an x86-64
+    /// pool, the pool's IPA window for an arm64 one.
     #[must_use]
-    #[allow(clippy::unused_self)]
     pub fn base(&self) -> u64 {
-        0
+        self.base.load(Ordering::Relaxed)
+    }
+
+    /// The descriptor format of the page tables built in this pool.
+    #[must_use]
+    pub fn format(&self) -> PtFormat {
+        PtFormat::from_u8(self.format.load(Ordering::Relaxed))
+    }
+
+    /// Switch the pool's page-table format, giving an arm64 pool a window of
+    /// guest-physical space (and an x86-64 one base 0). The caller re-encodes
+    /// every table already built in the pool.
+    pub(crate) fn set_format(&self, format: PtFormat) {
+        let old = self.base.swap(0, Ordering::Relaxed);
+        if old != 0 {
+            release_window(old, self.size as u64);
+        }
+        let base = match format {
+            PtFormat::X86_64 => 0,
+            PtFormat::Aarch64 => ipa_window(self.size as u64),
+        };
+        self.base.store(base, Ordering::Relaxed);
+        self.format.store(format as u8, Ordering::Relaxed);
     }
 
     /// Pool size in bytes (a whole number of frames).
@@ -210,6 +247,58 @@ impl PhysMem {
         self.region.read(src as usize, &mut buf);
         self.region.write(dst as usize, &buf);
     }
+}
+
+impl Drop for PhysMem {
+    fn drop(&mut self) {
+        let base = *self.base.get_mut();
+        if base != 0 {
+            release_window(base, self.size as u64);
+        }
+    }
+}
+
+/// Where the first IPA window starts: above 0, so a base of 0 always means
+/// "no window".
+const IPA_FIRST: u64 = 1 << 30;
+/// IPA windows are aligned to 2 MiB (a hardware block size, and a multiple of
+/// the 16 KiB `hv_vm_map` wants).
+const IPA_ALIGN: u64 = 2 << 20;
+
+/// The IPA windows in use: start → length, sorted.
+static IPA_WINDOWS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+
+/// Called with `(base, len)` as an arm64 pool's IPA window is given up, before
+/// its memory goes: how the hypervisor backend learns to unmap it.
+static WINDOW_RELEASE: OnceLock<fn(u64, u64)> = OnceLock::new();
+
+/// Register the function told when an IPA window is given up (first caller
+/// wins; the hypervisor backend sets it once, when it creates its VM).
+pub(crate) fn on_window_release(hook: fn(u64, u64)) {
+    let _ = WINDOW_RELEASE.set(hook);
+}
+
+/// Take the lowest free IPA window of `len` bytes.
+fn ipa_window(len: u64) -> u64 {
+    let len = len.next_multiple_of(IPA_ALIGN);
+    let mut windows = IPA_WINDOWS.lock().unwrap();
+    let mut at = IPA_FIRST;
+    for (&start, &size) in windows.iter() {
+        if start >= at + len {
+            break;
+        }
+        at = (start + size).next_multiple_of(IPA_ALIGN);
+    }
+    windows.insert(at, len);
+    at
+}
+
+/// Give back the IPA window at `base`, telling the hypervisor backend first.
+fn release_window(base: u64, len: u64) {
+    if let Some(hook) = WINDOW_RELEASE.get() {
+        hook(base, len);
+    }
+    IPA_WINDOWS.lock().unwrap().remove(&base);
 }
 
 /// A 4 KiB physical-frame allocator over a [`PhysMem`] pool `[0, size)`.
@@ -1300,5 +1389,28 @@ mod tests {
         let (_phys, alloc) = pool(2);
         assert_eq!(alloc.refcount(1), 0, "misaligned pa");
         assert_eq!(alloc.refcount(100 * FRAME), 0, "out-of-pool frame");
+    }
+
+    #[test]
+    fn arm64_pools_get_disjoint_ipa_windows_given_back_on_drop() {
+        let a = PhysMem::new(3 << 20);
+        let b = PhysMem::new(1 << 20);
+        a.set_format(PtFormat::Aarch64);
+        b.set_format(PtFormat::Aarch64);
+        let (ab, bb) = (a.base(), b.base());
+        assert!(ab != 0 && bb != 0);
+        assert_eq!(ab % IPA_ALIGN, 0);
+        assert!(
+            ab + a.len() as u64 <= bb || bb + b.len() as u64 <= ab,
+            "windows overlap: {ab:#x}+{:#x} and {bb:#x}+{:#x}",
+            a.len(),
+            b.len()
+        );
+        drop(a);
+        assert!(!IPA_WINDOWS.lock().unwrap().contains_key(&ab), "given back");
+        assert!(IPA_WINDOWS.lock().unwrap().contains_key(&bb));
+        b.set_format(PtFormat::X86_64);
+        assert_eq!(b.base(), 0, "x86-64 tables address the pool from 0");
+        assert!(!IPA_WINDOWS.lock().unwrap().contains_key(&bb));
     }
 }

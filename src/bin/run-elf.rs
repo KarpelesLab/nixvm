@@ -12,9 +12,7 @@ use nixvm::abi::Arch;
 use nixvm::fs::{DevFs, MountTable, Overlay, Passthrough, ProcFs, SysFs, TmpFs};
 use nixvm::kernel::Kernel;
 use nixvm::loader::{ProcessSpec, interp_path, load_dynamic, load_static};
-use nixvm::vcpu::Backend;
 use nixvm::vcpu::GuestMemory;
-use nixvm::vcpu::interp::InterpBackend;
 use nixvm::vcpu::mem::PAGE_SIZE;
 
 const GUEST_BASE: u64 = 0x1_0000;
@@ -73,6 +71,9 @@ fn main() {
     }
 
     let mut mem = GuestMemory::new(GUEST_BASE, MEM_BYTES);
+    // arm64 page tables: what HVF's MMU walks (the interpreter reads either).
+    mem.set_guest_arch(Arch::Aarch64)
+        .expect("a fresh pool takes any format");
     let spec = ProcessSpec { argv, envp };
     let loaded = if let Some(interp) = interp_path(&elf) {
         eprintln!("run-elf: dynamic executable, interpreter {interp}");
@@ -98,7 +99,10 @@ fn main() {
 
     let mid = page_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
 
-    let backend = InterpBackend::new(Arch::Aarch64).unwrap();
+    // Hardware (HVF, in a codesigned build with the `hvf` feature) when there is
+    // some, the interpreter otherwise or with NIXVM_INTERP=1.
+    let backend = nixvm::vcpu::select(Arch::Aarch64).unwrap();
+    eprintln!("run-elf: backend {}", backend.name());
     let vcpu = backend.new_vcpu(img.entry, img.stack_pointer).unwrap();
 
     let mut kernel = Kernel::new(Arch::Aarch64, mounts);

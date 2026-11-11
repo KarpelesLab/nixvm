@@ -39,6 +39,12 @@ mod ldst;
 mod simd;
 mod simd_ext;
 
+#[cfg_attr(
+    not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+    allow(unused_imports)
+)]
+pub(crate) use branch::el0_id_register;
+
 use crate::abi::Arch;
 
 use super::{Backend, Exit, GuestMemory, Vcpu, VcpuError};

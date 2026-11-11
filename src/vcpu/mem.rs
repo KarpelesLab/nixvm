@@ -3,8 +3,9 @@
 //! Phase 3 of the MMU refactor replaced the flat, identity-mapped backing with a
 //! *real* MMU model. Guest RAM is one shared pool of physical frames
 //! (`super::phys::PhysMem`) registered as a single KVM memslot; each process
-//! owns a 4-level x86-64 page-table tree (`super::pagetable::AddrSpace`, its own
-//! `CR3`) over that pool. A [`GuestMemory`] bundles the two together plus the
+//! owns a 4-level page-table tree (`super::pagetable::AddrSpace`, its own
+//! `CR3`/`TTBR0`) over that pool, in its guest architecture's descriptor format
+//! ([`GuestMemory::set_guest_arch`]). A [`GuestMemory`] bundles the two together plus the
 //! per-page bookkeeping the kernel and loader need.
 //!
 //! The public surface is unchanged from the flat model — `read`/`write`/`map`/
@@ -21,7 +22,7 @@
 //! `write`/`write_init`). Only touched pages ever consume a private frame.
 
 use super::ctrl;
-use super::pagetable::AddrSpace;
+use super::pagetable::{AddrSpace, Enc, PtFormat};
 use super::pagevec::PageVec;
 use super::phys::{FrameAllocator, PhysMem};
 use super::region::HOST_PAGE;
@@ -136,6 +137,14 @@ pub struct GuestMemory {
     /// would keep serving the old (now-unmapped or reused) frame. Consumed by
     /// [`GuestMemory::take_tlb_dirty`]; irrelevant to the interpreter (no TLB).
     tlb_dirty: bool,
+    /// Set whenever the host puts bytes into a page the guest may execute, or a
+    /// frame behind an executable mapping changes (a copy-on-write copy): an
+    /// arm64 hardware vcpu must invalidate its instruction cache before running
+    /// this space again, since stores on the host's side don't reach the
+    /// instruction fetch path by themselves. Code the guest writes itself is its
+    /// own to synchronize, as on Linux. Consumed by
+    /// [`GuestMemory::take_icache_dirty`]; x86-64 and the interpreters need none.
+    icache_dirty: bool,
     /// Physical address of this address space's private kernel-stack frame (the
     /// page mapped at [`ctrl::KSTACK_PAGE_VA`]). The CPU pushes the `#PF`
     /// exception frame here at CPL0; a KVM vcpu reads it back from this frame
@@ -264,10 +273,44 @@ impl GuestMemory {
             fork_policy: std::collections::BTreeMap::new(),
             locks: super::pagelocks::PageLocks::default(),
             tlb_dirty: false,
+            icache_dirty: true,
             kstack_pa,
             shared: false,
             memcg: 0,
         }
+    }
+
+    /// Build this space's page tables for a guest of `arch` from now on (its
+    /// descriptor format: what `arch`'s hardware MMU walks), converting those
+    /// already built. A new [`GuestMemory`] starts in the x86-64 format; an
+    /// aarch64 guest that is to run on hardware switches before it runs. All the
+    /// address spaces of a pool share one format, so this must come before the
+    /// pool has a second (before a `fork`).
+    ///
+    /// # Errors
+    /// The format would change once the pool is shared with another space.
+    pub fn set_guest_arch(&mut self, arch: crate::abi::Arch) -> Result<(), MemError> {
+        let want = PtFormat::for_arch(arch);
+        if self.phys.format() == want {
+            return Ok(());
+        }
+        if Arc::strong_count(&self.phys) != 1 {
+            return Err(MemError::Host(
+                "a guest's page-table format is chosen before its memory is shared".into(),
+            ));
+        }
+        let from = Enc::of(&self.phys);
+        self.phys.set_format(want);
+        self.space.reencode(from, Enc::of(&self.phys), &self.phys);
+        ctrl::build_arm_kernel_tables(&self.phys);
+        self.tlb_dirty = true;
+        Ok(())
+    }
+
+    /// The format of this space's page tables.
+    #[must_use]
+    pub fn page_table_format(&self) -> PtFormat {
+        self.phys.format()
     }
 
     /// Charge frames this address space allocates from now on to memory cgroup
@@ -316,9 +359,12 @@ impl GuestMemory {
     /// The `CR3` value (PML4 physical address) for this address space.
     #[must_use]
     #[cfg_attr(
-        not(all(target_os = "linux", target_arch = "x86_64")),
+        not(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(feature = "hvf", target_os = "macos", target_arch = "aarch64")
+        )),
         allow(dead_code)
-    )] // KVM-only
+    )] // hardware backends only
     pub(crate) fn cr3(&self) -> u64 {
         self.space.cr3()
     }
@@ -327,9 +373,12 @@ impl GuestMemory {
     /// memslot's `userspace_addr`.
     #[must_use]
     #[cfg_attr(
-        not(all(target_os = "linux", target_arch = "x86_64")),
+        not(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(feature = "hvf", target_os = "macos", target_arch = "aarch64")
+        )),
         allow(dead_code)
-    )] // KVM-only
+    )] // hardware backends only
     pub(crate) fn phys_ptr(&self) -> *mut u8 {
         self.phys.as_ptr()
     }
@@ -337,9 +386,12 @@ impl GuestMemory {
     /// Size of the shared pool in bytes — the memslot's `memory_size`.
     #[must_use]
     #[cfg_attr(
-        not(all(target_os = "linux", target_arch = "x86_64")),
+        not(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(feature = "hvf", target_os = "macos", target_arch = "aarch64")
+        )),
         allow(dead_code)
-    )] // KVM-only
+    )] // hardware backends only
     pub(crate) fn phys_len(&self) -> u64 {
         self.phys.len() as u64
     }
@@ -382,6 +434,43 @@ impl GuestMemory {
     /// stale entry never serves an unmapped or replaced frame.
     pub(crate) fn take_tlb_dirty(&mut self) -> bool {
         std::mem::take(&mut self.tlb_dirty)
+    }
+
+    /// Take and clear the "code changed behind the guest's back" flag (see the
+    /// field): whether the host wrote into a page the guest may execute since
+    /// the last check.
+    #[cfg_attr(
+        not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn take_icache_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.icache_dirty)
+    }
+
+    /// Where physical address 0 of the pool appears to a hardware page-table
+    /// walker (see [`PhysMem::base`]).
+    #[must_use]
+    #[cfg_attr(
+        not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn phys_base(&self) -> u64 {
+        self.phys.base()
+    }
+
+    /// `TTBR1_EL1` for this (arm64) pool: its upper-half kernel tables.
+    #[must_use]
+    #[cfg_attr(
+        not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn arm_ttbr1(&self) -> u64 {
+        ctrl::arm_ttbr1(&self.phys)
+    }
+
+    /// Whether any page of `[first, last]` may be executed.
+    fn any_exec(&self, first: usize, last: usize) -> bool {
+        (first..=last).any(|p| self.prot[p].contains(Prot::EXEC))
     }
 
     /// Send guests' clock reads through the kernel from now on, by leaving the vDSO
@@ -735,6 +824,7 @@ impl GuestMemory {
             self.file_backed[p] = false;
             self.shared_anon[p] = true;
         }
+        self.icache_dirty |= prot.contains(Prot::EXEC);
         Ok(())
     }
 
@@ -1072,6 +1162,7 @@ impl GuestMemory {
             }
             self.tlb_dirty |= changed;
         }
+        self.icache_dirty |= self.any_exec(first, last);
         let mut done = 0usize;
         while done < buf.len() {
             let cur = addr + done as u64;
@@ -1120,6 +1211,7 @@ impl GuestMemory {
             return false;
         }
         let va = self.base + (p as u64) * PAGE_SIZE;
+        self.icache_dirty |= self.prot[p].contains(Prot::EXEC);
         let mut fa = lock_fa(&self.fa, self.memcg);
         // Out of frames is a real fault: reporting success here would retry the
         // store forever.
@@ -1167,6 +1259,7 @@ impl GuestMemory {
             }
             self.tlb_dirty |= changed;
         }
+        self.icache_dirty |= self.any_exec(first, last);
         let mut done = 0usize;
         while done < buf.len() {
             let cur = addr + done as u64;
@@ -1275,6 +1368,7 @@ impl GuestMemory {
             fork_policy,
             locks: super::pagelocks::PageLocks::default(),
             tlb_dirty: false,
+            icache_dirty: true,
             kstack_pa: child_kstack,
             shared: self.shared,
             memcg: self.memcg,
@@ -1717,5 +1811,31 @@ mod tests {
         assert!(m.read_vec(0x1_0000, 1).is_err(), "old mapping is gone");
         m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
         assert_eq!(m.read_vec(0x1_0000, 1).unwrap(), vec![0], "fresh zero page");
+    }
+
+    #[test]
+    fn switching_to_arm64_tables_keeps_the_contents() {
+        use crate::abi::Arch;
+        let base = 0x1_0000;
+        let mut m = GuestMemory::new(base, 64 * PAGE_SIZE);
+        m.map(base, 4 * PAGE_SIZE, Prot::rw()).unwrap();
+        m.write_init(base + 0x10, b"before").unwrap();
+        assert_eq!(m.page_table_format(), PtFormat::X86_64);
+        m.set_guest_arch(Arch::Aarch64).unwrap();
+        assert_eq!(m.page_table_format(), PtFormat::Aarch64);
+        assert_ne!(m.phys_base(), 0);
+        assert_eq!(m.read_vec(base + 0x10, 6).unwrap(), b"before");
+        m.write(base + 2 * PAGE_SIZE, b"after").unwrap();
+        assert_eq!(m.read_vec(base + 2 * PAGE_SIZE, 5).unwrap(), b"after");
+        // Copy-on-write still works in the new format.
+        let mut child = m.fork();
+        child.write(base + 0x10, b"child!").unwrap();
+        assert_eq!(m.read_vec(base + 0x10, 6).unwrap(), b"before");
+        assert_eq!(child.read_vec(base + 0x10, 6).unwrap(), b"child!");
+        assert!(
+            m.set_guest_arch(Arch::X86_64).is_err(),
+            "a shared pool keeps its format"
+        );
+        m.set_guest_arch(Arch::Aarch64).unwrap(); // no change is fine
     }
 }

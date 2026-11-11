@@ -49,6 +49,13 @@ jobs:
       - name: Clippy (fstool, warnings denied)
         run: cargo clippy --all-targets --features fstool -- -D warnings
 
+      # The HVF backend builds here, but running it needs a codesigned binary
+      # with the hypervisor entitlement (scripts/hvf-test.sh), so its hardware
+      # tests stay ignored in CI.
+      - name: Clippy (hvf, warnings denied)
+        if: runner.os == 'macOS'
+        run: cargo clippy --all-targets --features hvf -- -D warnings
+
       - name: Test (default features)
         run: cargo test
 

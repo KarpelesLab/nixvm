@@ -90,6 +90,48 @@ pub const VDSO_VA: u64 = CTRL_GPA + VDSO_OFF;
 /// code reads it.
 pub const VVAR_VA: u64 = CTRL_GPA + VVAR_OFF;
 
+/// Virtual base of the arm64 EL1 exception vectors (`VBAR_EL1`), kernel-only
+/// read/execute. An aarch64 guest runs at EL0 under Hypervisor.framework; every
+/// exception it takes to EL1 lands in one of the 16 vector slots, each of which
+/// is a lone `hvc #slot` that hands the exception straight to the host (which
+/// reads `ESR_EL1`/`ELR_EL1`/`FAR_EL1` to see what it was). See [`vectors`].
+///
+/// It sits in the upper (`TTBR1_EL1`) half of the address space, mapped by a
+/// small tree of pinned tables shared by every process
+/// ([`build_arm_kernel_tables`]) rather than in each process's own (`TTBR0`)
+/// tables: the code that flushes stale translations after the host changed a
+/// process's tables must itself never be fetched through them.
+#[cfg_attr(
+    not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub const VECTORS_VA: u64 = 0xFFFF_FF80_0000_0000;
+
+/// `TCR_EL1.T1SZ` for the upper half: 39-bit, so its walk starts at level 1
+/// and [`VECTORS_VA`] needs three tables.
+#[cfg_attr(
+    not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+pub const ARM_T1SZ: u64 = 25;
+
+/// The layout of the arm64 vector page.
+pub mod vectors {
+    #![cfg_attr(
+        not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    /// Offset of the TLB/instruction-cache flush stub: entered at EL1 with the
+    /// EL0 context to return to in `ELR_EL1`/`SPSR_EL1`, it invalidates every
+    /// cached translation and instruction of the VM and `eret`s there. How the
+    /// host makes the guest see page tables or code it changed.
+    pub const FLUSH: u64 = 0x800;
+    /// The `hvc` immediate of the slot an exception from EL0 (AArch64) lands
+    /// in: `VBAR_EL1 + 0x400`, the synchronous one; `+1..=3` are IRQ, FIQ and
+    /// SError from EL0.
+    pub const LOWER_SYNC: u16 = 8;
+}
+
 /// GDT selector of the TSS descriptor (a 16-byte descriptor at slots 5–6).
 #[cfg_attr(
     not(all(target_os = "linux", target_arch = "x86_64")),
@@ -127,13 +169,17 @@ pub const GDT_LIMIT: u16 = 7 * 8 - 1;
 /// [`reserve_and_build`].
 pub const CTRL_PHYS_BASE: u64 = PAGE_SIZE;
 /// Number of *shared* control-block pages: GDT, syscall trampoline, `#PF`
-/// trampoline, IDT, TSS, then the vDSO code page and its vvar data page. The
+/// trampoline, IDT, TSS, then the vDSO code page, its vvar data page, the
+/// arm64 vector page and the three arm64 upper-half tables that map it. The
 /// kernel stack is **not** here — it is per address space (see
 /// [`KSTACK_PAGE_VA`] / [`map_kstack`]).
-pub const CTRL_FRAMES: u64 = 7;
-/// Physical-run index of the vDSO code frame and the vvar frame.
+pub const CTRL_FRAMES: u64 = 11;
+/// Physical-run index of the vDSO code frame, the vvar frame, the arm64 vector
+/// frame and the first of its three upper-half tables (levels 1, 2, 3).
 const VDSO_FIDX: usize = 5;
 const VVAR_FIDX: usize = 6;
+const VECTORS_FIDX: usize = 7;
+const ARM_KTABLE_FIDX: usize = 8;
 /// Bytes the control block reserves in the pool.
 pub const CTRL_SIZE: u64 = CTRL_FRAMES * PAGE_SIZE;
 
@@ -232,6 +278,25 @@ pub fn reserve_and_build(fa: &mut FrameAllocator, phys: &PhysMem) {
     // frame is left zeroed — `mult == 0` makes the vDSO fall back to the syscall
     // until [`write_vvar`] fills in the TSC calibration after the vcpu exists.
     phys.write(frame_pa(VDSO_FIDX), &super::vdso::build_image(VVAR_VA));
+
+    // arm64 vectors: `hvc #slot` at each of the 16 slots, then the flush stub.
+    let vec_pa = frame_pa(VECTORS_FIDX);
+    for slot in 0..16u32 {
+        let hvc = 0xD400_0002u32 | (slot << 5);
+        phys.write(vec_pa + u64::from(slot) * 0x80, &hvc.to_le_bytes());
+    }
+    let flush: [u32; 7] = [
+        0xD503_3A9F, // dsb ishst      (the host's table stores before the flush)
+        0xD508_831F, // tlbi vmalle1is (every cached translation, every core)
+        0xD508_711F, // ic ialluis     (every instruction cache, every core)
+        0xD503_3B9F, // dsb ish
+        0xD503_3FDF, // isb
+        0xD69F_03E0, // eret           (to ELR_EL1/SPSR_EL1: back to EL0)
+        0xD41F_FFE2, // hvc #0xffff:   never reached
+    ];
+    for (i, w) in flush.iter().enumerate() {
+        phys.write(vec_pa + vectors::FLUSH + i as u64 * 4, &w.to_le_bytes());
+    }
 }
 
 /// Write the vDSO's vvar calibration (TSC → nanoseconds) into the shared vvar
@@ -270,6 +335,38 @@ pub fn map_into(space: &mut AddrSpace, fa: &mut FrameAllocator, phys: &PhysMem) 
     // These are the only user-accessible control-block pages.
     let _ = space.map(VDSO_VA, frame_pa(VDSO_FIDX), Prot::rx(), false, fa, phys);
     let _ = space.map(VVAR_VA, frame_pa(VVAR_FIDX), Prot::READ, false, fa, phys);
+}
+
+/// Build the arm64 upper-half tables mapping [`VECTORS_VA`] (kernel
+/// read/execute) in `phys`'s format and at its guest-physical base. Call when
+/// the pool's page tables become arm64; a no-op for x86-64.
+pub fn build_arm_kernel_tables(phys: &PhysMem) {
+    use super::pagetable::{Enc, PtFormat};
+    if phys.format() != PtFormat::Aarch64 {
+        return;
+    }
+    let enc = Enc::of(phys);
+    let l1 = frame_pa(ARM_KTABLE_FIDX);
+    let l2 = frame_pa(ARM_KTABLE_FIDX + 1);
+    let l3 = frame_pa(ARM_KTABLE_FIDX + 2);
+    for t in [l1, l2, l3] {
+        phys.zero_frame(t);
+    }
+    // VECTORS_VA's index is 0 at every level.
+    phys.write_u64_atomic(l1, enc.interior(l2));
+    phys.write_u64_atomic(l2, enc.interior(l3));
+    phys.write_u64_atomic(l3, enc.leaf(frame_pa(VECTORS_FIDX), Prot::rx(), true));
+}
+
+/// `TTBR1_EL1` for an arm64 pool: the guest-physical address of its upper-half
+/// level-1 table (see [`build_arm_kernel_tables`]).
+#[cfg_attr(
+    not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)]
+#[must_use]
+pub fn arm_ttbr1(phys: &PhysMem) -> u64 {
+    phys.base() + frame_pa(ARM_KTABLE_FIDX)
 }
 
 /// Map a private kernel-stack `frame` at [`KSTACK_PAGE_VA`] into `space`,

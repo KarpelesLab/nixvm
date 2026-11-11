@@ -66,7 +66,7 @@ background compilation on. Floating point is a dependency-free **soft-float**
 **true 80-bit x87** extended precision and SSE **`MXCSR` directed rounding** +
 IEEE exception flags — validated bit-for-bit against the host's native
 arithmetic and against real x87/SSE hardware via KVM. Hardware acceleration is live on both target hosts: the **HVF
-backend (macOS/arm64) runs a static program end-to-end**, and the **KVM backend
+backend (macOS/arm64) runs a real Alpine userland**, and the **KVM backend
 (Linux/x86-64) runs a real statically-linked glibc binary end-to-end on real
 hardware** (long mode at ring 3, `syscall` trapped via an `LSTAR` trampoline,
 TLS via `arch_prctl`). `vcpu::select` prefers hardware and falls back to the
@@ -78,7 +78,7 @@ See [ROADMAP.md](ROADMAP.md) for the phased plan and what's next.
 | Area | Status |
 | --- | --- |
 | **Guest architectures** | aarch64 (interpreter, primary target); x86-64 (interpreter, growing) |
-| **Execution backends** | software interpreter — **working** (portable, CI-tested). HVF (macOS/arm64) — **runs a static program end-to-end on hardware** (guest MMU-off at EL0, `svc` trapped via an EL1 stub); needs a codesigned binary (`scripts/hvf-test.sh`). KVM (Linux/x86-64) — **runs a real static glibc binary end-to-end on hardware** (guest at CPL3 in long mode over fixed identity page tables, `syscall` → `LSTAR` trampoline → `KVM_EXIT_HLT`); no entitlement needed, its tests run under plain `cargo test` wherever `/dev/kvm` is accessible and skip elsewhere. `vcpu::select` prefers hardware and falls back to the interpreter (`NIXVM_INTERP=1` forces it); dynamic linking + multi-process on the hardware backends are the follow-up. KVM/arm64 — not started. |
+| **Execution backends** | software interpreter — **working** (portable, CI-tested). HVF (macOS/arm64) — **runs a real Alpine userland on hardware** (guest at EL0 with the MMU on over its own arm64 page tables, every exception handed to the host through an EL1 vector page of `hvc`s, SMP, preemption and signals into syscall-free loops); needs a codesigned binary (`scripts/hvf-test.sh`). KVM (Linux/x86-64) — **runs a real static glibc binary end-to-end on hardware** (guest at CPL3 in long mode over fixed identity page tables, `syscall` → `LSTAR` trampoline → `KVM_EXIT_HLT`); no entitlement needed, its tests run under plain `cargo test` wherever `/dev/kvm` is accessible and skip elsewhere. `vcpu::select` prefers hardware and falls back to the interpreter (`NIXVM_INTERP=1` forces it); dynamic linking + multi-process on the hardware backends are the follow-up. KVM/arm64 — not started. |
 | **ELF loading** | static (`ET_EXEC`), static-PIE (`ET_DYN` with `R_*_RELATIVE`/`R_*_IRELATIVE` fixups), and **dynamic linking** (`PT_INTERP` → `ld-musl`, file-backed `mmap` of `.so`s) — working; real Alpine boots on the interpreter. |
 | **Processes & threads** | `clone`/`fork`/`execve`/`wait4`/`exit(_group)`; `CLONE_VM`+`CLONE_THREAD` shared-address-space threads; real `futex` WAIT/WAKE parking |
 | **SMP scheduler** | a pool of `ncpus` host worker threads run guest compute in parallel; syscalls are serviced serially on the main thread (a big-kernel-lock model, `Kernel::set_ncpus`/`NIXVM_CPUS`) |

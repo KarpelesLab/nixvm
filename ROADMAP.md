@@ -100,7 +100,7 @@ contracts.
 > any machine and in CI (and is exactly what the wasm demo needs), whereas HVF
 > needs a macOS entitlement + codesign to run. So Phases 1-8 and Phase 10's
 > aarch64/x86-64 ISA all work end-to-end on the interpreter (~505 tests). Both
-> hardware backends are now real: **HVF** runs a static program end-to-end on
+> hardware backends are now real: **HVF** runs a real Alpine userland on
 > Apple Silicon (Phase 1), and **KVM (Linux/x86-64)** runs a real static glibc
 > binary end-to-end on the same `Vcpu`/`Backend` seam — `vcpu::select` prefers
 > hardware and falls back to the interpreter (unentitled HVF, missing
@@ -117,45 +117,49 @@ its first unimplemented frontier; `nixvm` CLI (`run`/`shell`/`version`).
 - **Exit criteria:** `cargo build`, `cargo test`, `cargo clippy` all clean;
   `nixvm run -- <cmd>` walks the pipeline and reports the current frontier.
 
-### Phase 1 — HVF backend + first syscall  ✅ static program runs on hardware
+### Phase 1 — HVF backend  ✅ real Alpine userland runs on hardware
 
-> **Broken since `474bde5` (2026-07-20):** guest memory moved to the shared frame pool
-> with per-process page tables, and the HVF vcpu still maps the old flat region
-> (`backing_generation`, `host_base`), so `--features hvf` no longer compiles; CI
-> doesn't build it. Porting it (arm64 stage-1 tables over the pool, as KVM/x86-64 does
-> with its own) comes before a preemption kick and async signals at EL0, which also
-> need it. None of it can be checked without an Apple Silicon Mac.
+Bring up Hypervisor.framework on macOS/arm64: run aarch64 guest code at EL0 on a
+real core and hand every exception to the kernel.
 
-Bring up Hypervisor.framework on macOS/arm64. Create a VM, map a flat
-`GuestMemory`, create a vcpu at EL0, and trap `svc #0` into `Exit::Syscall`.
-
-- **New:** `vcpu::hvf` (`hvf/{sys,vm,stub,vcpu,mod}.rs`) — hand-rolled
+- **New:** `vcpu::hvf` (`hvf/{sys,vm,vcpu,mod}.rs`) — hand-rolled
   `hv_vm_*`/`hv_vcpu_*` FFI (the register constants are the ARM `MRS`/`MSR`
   encodings), one process-global VM (`OnceLock`; Apple Silicon's small VM
-  quota), ESR decode, register get/set. The crate's hardware-virtualization
-  `unsafe`.
-- **Trap model:** the guest runs **MMU-off at EL0**, so its virtual addresses
-  are the IPAs of the contiguous `GuestMemory` region `hv_vm_map`'d into the VM
-  (guest VA == IPA — the same flat model the interpreter uses). A guest `svc`
-  traps to a process-global EL1 stub page (`hvc #0` in every vector slot) that
-  `hvc`s out to the host → `Exit::Syscall`; `set_syscall_ret` emulates the
-  `eret` back to EL0 from the captured `ELR_EL1`/`SPSR_EL1`. A guest access
-  outside the mapped region is a stage-2 abort → `Exit::MemFault`.
-- **Status: DONE for a single static program.** A guest doing
-  `write(1,"hi\n",3); exit(0)` runs entirely through HVF, driven by the real
-  `Kernel` run/serve loop, with syscalls dispatched off the hardware vcpu's
-  registers. `vcpu::select` probes `hv_vm_create` and **falls back to the
-  interpreter** when the process isn't entitled, so default `cargo test`/CI stay
-  green. Running HVF needs a codesigned binary — `scripts/hvf-test.sh` builds,
-  ad-hoc signs with `tests/hvf.entitlements` (`com.apple.security.hypervisor`),
-  and runs the `#[ignore]`d, `NIXVM_HVF=1`-gated tests; 3 pass on Apple Silicon,
-  incl. `program_write_exit_through_kernel`.
-- **Deferred to follow-up:** dynamic linking through HVF; multi-process (the one
-  IPA space holds a single process today — remap-on-context-switch via
-  `backing_generation` is the seam); SMP vcpu thread-affinity (`hv_vcpu` is
-  thread-bound, so M1 forces `ncpus=1` / the serial scheduler); and lazy/shared
-  copy-on-write via stage-2 `hv_vm_protect` (fork is eager-copy for now — see
-  the memory-model note in Phase 10).
+  quota) created with the host's largest IPA size. The crate's
+  hardware-virtualization `unsafe`.
+- **Memory:** the guest runs **MMU-on at EL0** over the same per-process page
+  tables the kernel and interpreter use: an aarch64 guest's tables are built in
+  the arm64 VMSAv8-64 descriptor format (`GuestMemory::set_guest_arch`; the
+  tree geometry is shared with x86-64, only the entry bits differ, and the
+  software walker reads both). Each physical pool owns a window of the one IPA
+  space, mapped once (stage 2 RWX; stage 1 carries every protection), so
+  several guests share the VM. `TTBR0_EL1` is the process's root: a context
+  switch is a register write, `fork` is copy-on-write in the guest tables.
+- **Trap model:** `VBAR_EL1` points at a vector page of `hvc #slot`s in the
+  upper (`TTBR1`) half, mapped by pinned tables every process shares; the host
+  decodes `ESR_EL1`/`FAR_EL1` into `Exit::Syscall`, `MemFault`, `Misaligned`,
+  `Breakpoint`, … and emulates the `eret`. EL0 `mrs` of the ID registers is
+  emulated as Linux does (`HWCAP_CPUID`). After the host edits a process's tables
+  or writes code into its memory, the vcpu re-enters through a flush stub
+  (`tlbi vmalle1is; ic ialluis; eret`).
+- **Threads:** `hv_vcpu`s are thread-bound, so an `HvfVcpu` is a register cache
+  and each host thread keeps one `hv_vcpu` that runs whichever task it is handed
+  — the SMP scheduler and `fork` work unchanged.
+- **Preemption and signals:** the guest's virtual timer, armed for the quantum
+  before each entry, ends a compute-bound run with `Exit::Interrupted` at an EL0
+  instruction boundary, where pending signals are delivered — so `SIGALRM`
+  reaches a loop that makes no syscalls, and `kill -9` stops one.
+- **Status:** Alpine's dynamically linked busybox runs (fork/exec-heavy shell
+  loops, pipes, signals), and `tests/guest` programs built for aarch64 pass as on
+  the interpreter, on 1 and several vcpus. Running HVF needs a codesigned binary:
+  `scripts/hvf-test.sh` builds, ad-hoc signs with `tests/hvf.entitlements`
+  (`com.apple.security.hypervisor`) and runs the `#[ignore]`d, `NIXVM_HVF=1`-gated
+  tests. `vcpu::select` falls back to the interpreter when the process isn't
+  entitled, so default `cargo test`/CI stay green; CI builds and lints the
+  backend on macOS but can't run it.
+- **Not yet:** a vDSO for aarch64 (clock reads are syscalls), per-process ASIDs
+  (every address-space switch flushes the TLB), and a kick for a task signalled
+  while it runs on another vcpu (it waits for the next quantum, as on KVM).
 
 ### Phase 2 — Memory manager + static ELF loader  ✅ (interpreter path)
 
@@ -579,7 +583,7 @@ must get the isolation it asks for.
   contains the attacks; `tests/namespace_tools.rs` runs the
   real tools.
 
-### Phase 10 — Portability backends (KVM + interpreter) & x86-64 guests  🟡 interpreters live; HVF + KVM/x86-64 run static programs; KVM/arm64 not started
+### Phase 10 — Portability backends (KVM + interpreter) & x86-64 guests  🟡 interpreters live; KVM/x86-64 runs real programs; KVM/arm64 not started
 
 Second and third backends, and the second guest arch.
 
