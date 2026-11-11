@@ -149,13 +149,18 @@ impl Kernel {
         if !tree.weights_active() {
             return;
         }
-        let runnable = |p: &ProcInfo| p.run == RunState::Running && !p.parked && !p.held();
+        let runnable = |p: &ProcInfo| {
+            p.run == RunState::Running
+                && !p.parked
+                && !p.held()
+                && super::rt_priority(p).is_none()
+        };
         let tasks: Vec<(i32, u128)> = sh
             .procs
             .iter()
             .flatten()
             .filter(|p| runnable(&p.info))
-            .map(|p| (p.info.pid, super::nice_weight(p.info.nice)))
+            .map(|p| (p.info.pid, super::task_weight(&p.info)))
             .collect();
         let scales = tree.group_scales(&tasks);
         drop(tree);

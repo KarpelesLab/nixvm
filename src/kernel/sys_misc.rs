@@ -445,8 +445,8 @@ pub(super) fn sys_sysinfo(buf: u64, mem: &mut GuestMemory) -> i64 {
 }
 
 /// `getcpu(cpu, node, tcache)` — always CPU 0 / NUMA node 0.
-pub(super) fn sys_getcpu(cpu: u64, node: u64, mem: &mut GuestMemory) -> i64 {
-    if cpu != 0 && mem.write(cpu, &0u32.to_le_bytes()).is_err() {
+pub(super) fn sys_getcpu(on: u16, cpu: u64, node: u64, mem: &mut GuestMemory) -> i64 {
+    if cpu != 0 && mem.write(cpu, &u32::from(on).to_le_bytes()).is_err() {
         return err(Errno::EFAULT);
     }
     if node != 0 && mem.write(node, &0u32.to_le_bytes()).is_err() {

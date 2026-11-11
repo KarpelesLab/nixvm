@@ -477,8 +477,16 @@ must get the isolation it asks for.
   enforced, with Linux's defaults, and `/proc/<pid>/limits` shows them. `CORE` is moot,
   since no core files are written; `RSS` and `LOCKS` do nothing on Linux either. `RTTIME`
   is enforced as Linux's real-time watchdog does it (CPU time a `SCHED_FIFO`/`SCHED_RR`
-  task runs without blocking), though real-time priorities don't otherwise change how
-  tasks are scheduled here.
+  task runs without blocking).
+- **Scheduling classes:** `SCHED_FIFO` and `SCHED_RR` tasks run ahead of fair ones and
+  of lower priorities, on both schedulers: among one priority a FIFO task keeps the CPU
+  until it blocks or yields and then goes to the back, an RR one also after each 100 ms
+  slice, a raised priority takes the CPU at once (a lowered one goes to the front of its
+  new queue), and a woken real-time task preempts a fair one at its next syscall or
+  10 ms quantum. Fair tasks a real-time hog starves get the last 50 ms of each second,
+  as Linux's fair server gives them. `SCHED_IDLE` weighs 3, as on Linux; a
+  `SCHED_DEADLINE` task runs ahead of the real-time ones, with no bandwidth of its own
+  enforced. `getcpu` reports the CPU a task runs on.
 - **Namespaces (`kernel/ns.rs`, `pidns.rs`, `userns.rs`):** UTS, IPC, network, mount, PID,
   user and time, with `setns` and `/proc/<pid>/ns`, plus real `chroot`, `pivot_root` and
   bind mounts. Bubblewrap and util-linux's `unshare` run inside the VM.

@@ -163,6 +163,27 @@ fn sched_change_allowed(
     Ok(())
 }
 
+/// Give `p` a new scheduling policy and priority, queued as Linux's
+/// `__sched_setscheduler` queues it: a real-time task whose settings changed
+/// goes to the back of its priority's queue, or to the front when its
+/// priority was lowered.
+fn set_sched(p: &mut ProcInfo, policy: u32, prio: u32) {
+    let old = (p.sched_policy, p.sched_priority, super::rt_priority(p));
+    p.sched_policy = policy as i32;
+    p.sched_priority = prio as i32;
+    if (p.sched_policy, p.sched_priority) == (old.0, old.1) {
+        return;
+    }
+    if let Some(new) = super::rt_priority(p) {
+        p.rt_requeue = if old.2.is_some_and(|o| new < o) {
+            super::RT_HEAD
+        } else {
+            super::RT_TAIL
+        };
+        p.rt_slice_ns = 0;
+    }
+}
+
 /// The valid `sched_priority` range for a policy: 1..=99 for the real-time
 /// ones, exactly 0 otherwise.
 fn priority_ok(policy: u32, prio: u32) -> bool {
@@ -259,7 +280,7 @@ impl Kernel {
             if let Err(e) = sched_change_allowed(caller, p, policy, prio, None) {
                 return e;
             }
-            p.sched_priority = prio as i32;
+            set_sched(p, policy, prio);
             0
         }) {
             Ok(r) | Err(r) => r,
@@ -299,8 +320,7 @@ impl Kernel {
         let caller = SchedCaller::of(cx);
         match with_task(sh, cx, pid, |p| {
             sched_change_allowed(caller, p, policy, prio, None)?;
-            p.sched_policy = policy as i32;
-            p.sched_priority = prio as i32;
+            set_sched(p, policy, prio);
             Ok(0)
         }) {
             Ok(Ok(r)) => r,
@@ -466,14 +486,10 @@ impl Kernel {
                 (p.sched_priority as u32, None)
             };
             sched_change_allowed(caller, p, new_policy, new_prio, new_nice)?;
-            if sflags & SCHED_FLAG_KEEP_POLICY == 0 {
-                p.sched_policy = policy as i32;
-            }
-            if sflags & SCHED_FLAG_KEEP_PARAMS == 0 {
-                p.sched_priority = prio as i32;
-                if matches!(policy, SCHED_OTHER | SCHED_BATCH) {
-                    p.nice = nice.clamp(-20, 19);
-                }
+            set_sched(p, new_policy, new_prio);
+            if sflags & SCHED_FLAG_KEEP_PARAMS == 0 && matches!(policy, SCHED_OTHER | SCHED_BATCH)
+            {
+                p.nice = nice.clamp(-20, 19);
             }
             Ok(())
         }) {

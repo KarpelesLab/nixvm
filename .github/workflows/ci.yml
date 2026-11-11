@@ -155,13 +155,13 @@ jobs:
             exit 1
           fi
 
-      # The cgroups and rlimits programs need root (and cgroups a real cgroup v2
+      # The cgroups, rlimits and sched programs need root (and cgroups a real cgroup v2
       # tree), which this runner has: run them on the host too, so their
       # expectations are Linux's.
       - name: Check the root-only programs against Linux
         if: matrix.backend == 'kvm'
         run: |
-          for p in cgroups rlimits; do
+          for p in cgroups rlimits sched; do
             gcc -static -O2 -pthread -o "$RUNNER_TEMP/$p" "tests/guest/$p.c"
             echo "== $p"
             sudo "$RUNNER_TEMP/$p"

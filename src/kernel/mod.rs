@@ -381,14 +381,27 @@ struct ProcInfo {
     /// behaves correctly instead of silently staying root.
     creds: Creds,
     /// Scheduling attributes: policy (`SCHED_OTHER`=0/`FIFO`=1/`RR`=2/…) and
-    /// real-time priority (recorded and reported back, but not preempting:
-    /// there are no real-time run queues), `nice` (−20..19, which weights fair
-    /// scheduling), and the CPU-affinity mask (0 for all CPUs; the SMP
-    /// scheduler runs the task only on those, see [`ProcInfo::home_cpu`]).
+    /// real-time priority (a `SCHED_FIFO`/`SCHED_RR` task runs ahead of every
+    /// fair one and of lower real-time priorities, see [`Shared::sched_key`]),
+    /// `nice` (−20..19, which weights fair scheduling), and the CPU-affinity
+    /// mask (0 for all CPUs; the SMP scheduler runs the task only on those,
+    /// see [`ProcInfo::home_cpu`]).
     sched_policy: i32,
     sched_priority: i32,
     nice: i32,
     affinity: u64,
+    /// A real-time task's place among those of its priority: the least runs
+    /// first (Linux's per-priority FIFO list). Reassigned when it is queued
+    /// anew, as [`Self::rt_requeue`] asks.
+    rt_seq: i64,
+    /// Where the task is to go in its real-time queue when next looked at:
+    /// [`RT_TAIL`] (it blocked, yielded, used up its `SCHED_RR` slice, is new
+    /// or was given a priority) or [`RT_HEAD`] (its priority was lowered).
+    rt_requeue: u8,
+    /// CPU time (ns) of the current `SCHED_RR` time slice used so far.
+    rt_slice_ns: u64,
+    /// The CPU the task last ran on (what `getcpu` reports).
+    cpu: u16,
     /// Parked: the task blocked on its last slice (futex/poll/wait4/stdin) and
     /// should not be re-run until something might wake it. Distinct from
     /// `RunState::Running` so the scheduler doesn't busy-spin re-running a
@@ -648,6 +661,10 @@ impl Default for ProcInfo {
             sched_priority: 0,
             nice: 0,
             affinity: 0, // 0 = "all CPUs" (default; never a real mask)
+            rt_seq: 0,
+            rt_requeue: RT_TAIL,
+            rt_slice_ns: 0,
+            cpu: 0,
         }
     }
 }
@@ -1256,6 +1273,33 @@ enum SliceOutcome {
 /// others keep running: the scheduling quantum's default.
 const RECHECK_NS: u128 = 10_000_000;
 
+/// [`ProcInfo::rt_requeue`]: to the back of its real-time priority's queue.
+const RT_TAIL: u8 = 1;
+/// [`ProcInfo::rt_requeue`]: to the front of it.
+const RT_HEAD: u8 = 2;
+/// `SCHED_RR`'s time slice, Linux's `RR_TIMESLICE`.
+const RR_SLICE_NS: u64 = 100_000_000;
+/// Linux's fair server: of each second a CPU spends running real-time tasks,
+/// the last 50 ms go to the fair tasks that are waiting, so a real-time task
+/// that never sleeps can't starve them for good (`dl_server_init`'s defaults).
+const FAIR_SERVER_PERIOD_NS: u128 = 1_000_000_000;
+const FAIR_SERVER_RUNTIME_NS: u128 = 50_000_000;
+
+/// The scheduling attributes another task can change while this one runs.
+fn sched_attrs(p: &ProcInfo) -> (i32, i32, i32, u64, u8) {
+    (p.sched_policy, p.sched_priority, p.nice, p.affinity, p.rt_requeue)
+}
+
+/// A task's real-time priority, 1..=99, if it's in a real-time class
+/// (`SCHED_FIFO`, `SCHED_RR`); `SCHED_DEADLINE` counts as above them all.
+fn rt_priority(p: &ProcInfo) -> Option<u32> {
+    match p.sched_policy {
+        1 | 2 => Some(p.sched_priority.clamp(1, 99) as u32),
+        6 => Some(100),
+        _ => None,
+    }
+}
+
 /// Poll interval while every task is parked but a host connection is live: the
 /// scheduler sleeps this long, then retries a round that re-checks host-socket
 /// readiness. Short enough that an arriving HTTP response is picked up promptly,
@@ -1510,6 +1554,9 @@ pub struct Kernel {
     /// How many cgroups have a `cpu.max` quota, so CPU time is only charged
     /// to cgroups while one does.
     cpu_quotas: Arc<std::sync::atomic::AtomicUsize>,
+    /// Whether a task may have been put in a real-time class (see
+    /// [`Kernel::note_sched_change`]).
+    rt_seen: std::sync::atomic::AtomicBool,
     /// The offsets of each time namespace that has any.
     time_offsets: Mutex<BTreeMap<u32, userns::TimeNs>>,
     /// Growth on the host's disk (see [`crate::limits::Limits::disk_bytes`]).
@@ -1709,6 +1756,13 @@ pub(super) struct Shared {
     /// When the serial scheduler last had every parked task re-check its
     /// wait (see [`Shared::pick_serial_runnable`]).
     rechecked_at: u128,
+    /// The last places handed out at the back and the front of the real-time
+    /// queues (see [`ProcInfo::rt_seq`]).
+    rt_tail: i64,
+    rt_head: i64,
+    /// Per CPU, the fair server's window: when it began and how much of it
+    /// real-time tasks have run (see [`Shared::fair_server_active`]).
+    rt_windows: Vec<(u128, u128)>,
     /// `NIXVM_WATCHCODE` debug watch: address whose 8 bytes are checked after
     /// every syscall, and the last value seen there.
     watch_addr: Option<u64>,
@@ -2020,14 +2074,107 @@ impl Shared {
             self.rechecked_at = now;
             self.unpark_all();
         }
+        self.requeue_rt();
         let floor = self.min_vruntime;
         let best = (0..self.procs.len())
             .filter(|&i| {
                 matches!(self.procs.get(i),
                     Some(Some(p)) if p.info.run == RunState::Running && !p.info.parked && !p.info.held() && p.vcpu.is_some())
             })
-            .min_by_key(|&i| self.procs[i].as_ref().unwrap().info.vruntime.max(floor));
-        best.map(|i| self.admit_fair(i))
+            .min_by_key(|&i| self.sched_key(&self.procs[i].as_ref().unwrap().info, 0, floor));
+        best.map(|i| self.admit(i))
+    }
+
+    /// Give each task that asked for one its new place in the real-time
+    /// queues (see [`ProcInfo::rt_requeue`]).
+    fn requeue_rt(&mut self) {
+        let (tail, head) = (&mut self.rt_tail, &mut self.rt_head);
+        for p in self.procs.iter_mut().flatten() {
+            match std::mem::take(&mut p.info.rt_requeue) {
+                RT_TAIL => {
+                    *tail += 1;
+                    p.info.rt_seq = *tail;
+                }
+                RT_HEAD => {
+                    *head -= 1;
+                    p.info.rt_seq = *head;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Where task `p` (to run on `cpu`) stands in the run queue; the least
+    /// runs next. Real-time tasks come first, by priority and then their
+    /// place in its queue, as Linux's real-time class runs ahead of the fair
+    /// one; then fair tasks, by virtual runtime (at least `floor`). While
+    /// the fair server has `cpu`, its real-time tasks go after the fair ones.
+    fn sched_key(&self, p: &ProcInfo, cpu: usize, floor: u128) -> (u8, u32, i128) {
+        match rt_priority(p) {
+            Some(prio) => {
+                let class = if self.fair_server_active(cpu) { 2 } else { 0 };
+                (class, 100 - prio, i128::from(p.rt_seq))
+            }
+            None => (1, 0, p.vruntime.max(floor) as i128),
+        }
+    }
+
+    /// Admit task `i`, picked to run: a fair one as [`Shared::admit_fair`]
+    /// does; a real-time one has no virtual runtime to speak of.
+    fn admit(&mut self, i: usize) -> usize {
+        if rt_priority(&self.procs[i].as_ref().unwrap().info).is_some() {
+            i
+        } else {
+            self.admit_fair(i)
+        }
+    }
+
+    /// Count `ns` a real-time task just ran on `cpu` toward the fair server's
+    /// window there, starting a new window once the last one is over.
+    fn charge_rt_window(&mut self, cpu: usize, ns: u128) {
+        let now = poll::now_ns();
+        if self.rt_windows.len() <= cpu {
+            self.rt_windows.resize(cpu + 1, (0, 0));
+        }
+        let w = &mut self.rt_windows[cpu];
+        if now.saturating_sub(w.0) >= FAIR_SERVER_PERIOD_NS {
+            *w = (now, 0);
+        }
+        w.1 = w.1.saturating_add(ns);
+    }
+
+    /// Whether the fair server has `cpu` now: in the last part of the
+    /// window, its runtime, after real-time tasks had the CPU for most of the
+    /// rest — Linux's deferred server, which steps in once the fair tasks
+    /// have waited all but its runtime of its period.
+    fn fair_server_active(&self, cpu: usize) -> bool {
+        self.rt_windows.get(cpu).is_some_and(|&(start, used)| {
+            let into = poll::now_ns().saturating_sub(start);
+            (FAIR_SERVER_PERIOD_NS - FAIR_SERVER_RUNTIME_NS..FAIR_SERVER_PERIOD_NS).contains(&into)
+                && used >= into / 4 * 3
+        })
+    }
+
+    /// Whether `cur`, running on its CPU, should give it up now: a task
+    /// there that's ready to run would be picked ahead of it (a higher
+    /// real-time priority than its own, or any real-time one when it's
+    /// fair), as Linux preempts on wake-up. `ncpus` places each task.
+    fn preempts(&self, cur: &ProcInfo, ncpus: usize) -> bool {
+        let cpu = usize::from(cur.cpu);
+        let mine = self.sched_key(cur, cpu, 0);
+        self.procs.iter().enumerate().any(|(i, p)| {
+            p.as_ref().is_some_and(|p| {
+                p.info.run == RunState::Running
+                    && !p.info.parked
+                    && !p.info.held()
+                    && p.vcpu.is_some()
+                    && p.info.home_cpu(i, ncpus) == cpu
+                    && {
+                        let theirs = self.sched_key(&p.info, cpu, 0);
+                        (theirs.0, theirs.1) < (mine.0, mine.1)
+                    }
+            })
+        })
     }
 
     /// Pick a runnable task for an SMP worker: `Running`, holding its vcpu (not
@@ -2040,8 +2187,10 @@ impl Shared {
         &mut self,
         blocked_at: &BTreeMap<usize, u64>,
         epoch: u64,
+        ncpus: usize,
         idle: &dyn Fn(usize, &ProcInfo) -> bool,
     ) -> Option<usize> {
+        self.requeue_rt();
         let floor = self.min_vruntime;
         let best = (0..self.procs.len())
             .filter(|&i| {
@@ -2054,8 +2203,11 @@ impl Shared {
                     && blocked_at.get(&i).copied() != Some(epoch)
                     && idle(i, &p.info)
             })
-            .min_by_key(|&i| self.procs[i].as_ref().unwrap().info.vruntime.max(floor));
-        best.map(|i| self.admit_fair(i))
+            .min_by_key(|&i| {
+                let p = &self.procs[i].as_ref().unwrap().info;
+                self.sched_key(p, p.home_cpu(i, ncpus), floor)
+            });
+        best.map(|i| self.admit(i))
     }
 
     /// Check the running task's shared fd table out of [`Shared::file_tables`]
@@ -2115,6 +2267,7 @@ impl Kernel {
             users: users.clone(),
             cgroups: cgroups.clone(),
             cpu_quotas: cpu_quotas.clone(),
+            rt_seen: std::sync::atomic::AtomicBool::new(false),
             time_offsets: Mutex::new(BTreeMap::new()),
             memory_quota,
             disk_quota,
@@ -2173,6 +2326,9 @@ impl Kernel {
                 free_cwd_slots: Vec::new(),
                 min_vruntime: 0,
                 rechecked_at: 0,
+                rt_tail: 0,
+                rt_head: 0,
+                rt_windows: Vec::new(),
                 spaces: Vec::new(),
                 file_tables: Vec::new(),
                 cwd_tables: Vec::new(),
@@ -2471,6 +2627,8 @@ impl Kernel {
                 return Ok(progressed);
             };
             let mut guard = space_arc.lock().unwrap();
+            cx.cur.cpu = 0;
+            let cpu_before = cx.cur.cpu_ns;
             let made = self.run_slice(&mut cx, &mut vcpu, &mut guard)?;
             if self.schedtrace {
                 let end = if matches!(cx.cur.run, RunState::Zombie(_)) {
@@ -2492,6 +2650,9 @@ impl Kernel {
             {
                 let mut sh = self.shared.lock().unwrap();
                 sh.check_in_files(&mut cx);
+                if rt_priority(&cx.cur).is_some() {
+                    sh.charge_rt_window(0, cx.cur.cpu_ns.saturating_sub(cpu_before));
+                }
                 proc.info = cx.cur;
                 proc.info.parked = blocked && proc.info.run == RunState::Running;
                 proc.vcpu = Some(vcpu);
@@ -2728,6 +2889,13 @@ impl Kernel {
                     // siblings run. The task is *not* parked — `cx.block` stays clear.
                     if cx.yield_now {
                         cx.yield_now = false;
+                        return Ok(true);
+                    }
+                    // A task ahead of it in the run queue is ready (a
+                    // real-time one it woke, say): it gets the CPU now.
+                    if self.rt_seen.load(std::sync::atomic::Ordering::Relaxed)
+                        && self.shared.lock().unwrap().preempts(&cx.cur, 1)
+                    {
                         return Ok(true);
                     }
                 }
@@ -3213,13 +3381,15 @@ impl Kernel {
                         let idle = |i: usize, p: &ProcInfo| {
                             !busy[p.home_cpu(i, nworkers)] && !dispatched.contains_key(&i)
                         };
-                        let Some(i) = sh.pick_smp_runnable(&blocked_at, epoch, &idle) else {
+                        let Some(i) = sh.pick_smp_runnable(&blocked_at, epoch, nworkers, &idle)
+                        else {
                             break;
                         };
                         let mm = sh.procs[i].as_ref().unwrap().info.mm;
                         let space = Arc::clone(&sh.spaces[mm]);
                         let p = sh.procs[i].as_mut().unwrap();
                         let w = p.info.home_cpu(i, nworkers);
+                        p.info.cpu = w as u16;
                         busy[w] = true;
                         dispatched.insert(i, (p.info.pid, w));
                         let vcpu = p.vcpu.take().unwrap();
@@ -3427,7 +3597,12 @@ impl Kernel {
             });
             sh.check_out_files(&mut cx);
             let (pending, ppid, frozen) = (cx.cur.pending, cx.cur.ppid, cx.cur.frozen);
-            let cpu = (cx.cur.cg_scale, cx.cur.throttled_until, cx.cur.memcg);
+            let cpu = (
+                cx.cur.cg_scale,
+                cx.cur.throttled_until,
+                cx.cur.memcg,
+                sched_attrs(&cx.cur),
+            );
             let rt_lens: BTreeMap<u32, usize> =
                 cx.cur.rt_queue.iter().map(|(&s, q)| (s, q.len())).collect();
             (proc, cx, pending, ppid, frozen, cpu, rt_lens)
@@ -3480,12 +3655,23 @@ impl Kernel {
                     stand_in.info.cg_scale,
                     stand_in.info.throttled_until,
                     stand_in.info.memcg,
-                ) != out_cpu
+                ) != (out_cpu.0, out_cpu.1, out_cpu.2)
                 {
                     cx.cur.cg_scale = stand_in.info.cg_scale;
                     cx.cur.throttled_until = stand_in.info.throttled_until;
                     cx.cur.memcg = stand_in.info.memcg;
                 }
+                // So did its scheduling attributes (another task's
+                // `sched_setscheduler`, `setpriority` or `sched_setaffinity`).
+                if sched_attrs(&stand_in.info) != out_cpu.3 {
+                    let s = &stand_in.info;
+                    (cx.cur.sched_policy, cx.cur.sched_priority) = (s.sched_policy, s.sched_priority);
+                    (cx.cur.nice, cx.cur.affinity) = (s.nice, s.affinity);
+                    (cx.cur.rt_requeue, cx.cur.rt_slice_ns) = (s.rt_requeue, s.rt_slice_ns);
+                }
+            }
+            if rt_priority(&cx.cur).is_some() {
+                sh.charge_rt_window(usize::from(cx.cur.cpu), delta);
             }
             sh.check_in_files(&mut cx);
             // A task that just exited: wake its parent again now that the
@@ -3493,7 +3679,10 @@ impl Kernel {
             // stand-in still read "running", so a parent whose `wait4` ran in
             // between parked on it and would otherwise wait for a stall retry.
             let ppid = matches!(cx.cur.run, RunState::Zombie(_)).then_some(cx.cur.ppid);
-            stopped = matches!(cx.cur.run, RunState::Stopped(_)) || cx.cur.held();
+            stopped = matches!(cx.cur.run, RunState::Stopped(_))
+                || cx.cur.held()
+                || (self.rt_seen.load(std::sync::atomic::Ordering::Relaxed)
+                    && sh.preempts(&cx.cur, self.ncpus));
             proc.info = cx.cur;
             sh.procs[i] = Some(proc);
             if let Some(ppid) = ppid {
@@ -4652,24 +4841,34 @@ impl Kernel {
             }
             Sysno::SchedGetscheduler => i64::from(cx.cur.sched_policy),
             Sysno::SchedSetscheduler => {
-                self.sys_sched_setscheduler(sh, cx, args[0], args[1], args[2], mem)
+                let r = self.sys_sched_setscheduler(sh, cx, args[0], args[1], args[2], mem);
+                self.note_sched_change(r);
+                r
             }
             Sysno::SchedGetPriorityMax => self.sys_sched_priority_bound(args[0], true),
             Sysno::SchedGetPriorityMin => self.sys_sched_priority_bound(args[0], false),
             Sysno::Getrusage => self.sys_getrusage(sh, cx, args[0], args[1], mem),
             Sysno::Sysinfo => sys_misc::sys_sysinfo(args[0], mem),
             Sysno::Times => self.sys_times(sh, cx, args[0], mem),
-            Sysno::Getcpu => sys_misc::sys_getcpu(args[0], args[1], mem),
+            Sysno::Getcpu => sys_misc::sys_getcpu(cx.cur.cpu, args[0], args[1], mem),
             Sysno::Capget => self.sys_capget(sh, cx, args[0], args[1], mem),
             Sysno::Capset => self.sys_capset(cx, args[0], args[1], mem),
             // Scheduling / I/O priority / NUMA / pkeys / sealing / rseq /
             // membarrier / clock discipline / names / robust list / namespaces
             // (see `attrs.rs`).
-            Sysno::SchedSetparam => self.sys_sched_setparam(sh, cx, args[0], args[1], mem),
+            Sysno::SchedSetparam => {
+                let r = self.sys_sched_setparam(sh, cx, args[0], args[1], mem);
+                self.note_sched_change(r);
+                r
+            }
             Sysno::SchedRrGetInterval => {
                 self.sys_sched_rr_get_interval(sh, cx, args[0], args[1], mem)
             }
-            Sysno::SchedSetattr => self.sys_sched_setattr(sh, cx, args[0], args[1], args[2], mem),
+            Sysno::SchedSetattr => {
+                let r = self.sys_sched_setattr(sh, cx, args[0], args[1], args[2], mem);
+                self.note_sched_change(r);
+                r
+            }
             Sysno::SchedGetattr => {
                 self.sys_sched_getattr(sh, cx, args[0], args[1], args[2], args[3], mem)
             }
@@ -5005,6 +5204,9 @@ impl Kernel {
         // with no reaped children's time (a thread shares its group's).
         info.cpu_ns = 0;
         info.rt_run_ns = 0;
+        // A new real-time task joins the back of its priority's queue.
+        info.rt_requeue = RT_TAIL;
+        info.rt_slice_ns = 0;
         if flags & CLONE_THREAD == 0 {
             info.child_cpu_ns = 0;
         }
@@ -8079,6 +8281,16 @@ impl Kernel {
 
     /// Charge `ns` of CPU time to the VM and to the current thread group, raising
     /// whatever `RLIMIT_CPU` and `RLIMIT_RTTIME` call for.
+    /// After a call that may have put a task in a real-time class: from now
+    /// on the schedulers look for tasks to preempt others (see
+    /// [`Shared::preempts`]), which there's no need to do until then.
+    fn note_sched_change(&self, r: i64) {
+        if r == 0 {
+            self.rt_seen
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn charge_cpu_time(&self, cx: &mut ServiceCtx, ns: u128) {
         let ns = u64::try_from(ns).unwrap_or(u64::MAX);
         self.total_cpu_ns
@@ -8088,6 +8300,22 @@ impl Kernel {
         }
         if let Some(sig) = charge_rt_time(&mut cx.cur, ns, cx.block) {
             cx.cur.raise(sig);
+        }
+        // A real-time task that blocked or yielded goes to the back of its
+        // queue, and so does a `SCHED_RR` one whose time slice is used up,
+        // giving the CPU to the next of its priority.
+        if rt_priority(&cx.cur).is_some() {
+            if cx.block || cx.yield_now {
+                cx.cur.rt_requeue = RT_TAIL;
+                cx.cur.rt_slice_ns = 0;
+            } else if cx.cur.sched_policy == 2 {
+                cx.cur.rt_slice_ns = cx.cur.rt_slice_ns.saturating_add(ns);
+                if cx.cur.rt_slice_ns >= RR_SLICE_NS {
+                    cx.cur.rt_slice_ns = 0;
+                    cx.cur.rt_requeue = RT_TAIL;
+                    cx.yield_now = true;
+                }
+            }
         }
         if self.cpu_quotas.load(std::sync::atomic::Ordering::Relaxed) > 0 {
             self.cgroup_charge_cpu(cx, ns);
@@ -10084,15 +10312,17 @@ impl Kernel {
 
 /// CPU time (ns) of `cx`'s whole thread group — this task plus its checked-in
 /// siblings sharing its `tgid`. `cx.cur` is out of `sh.procs` during its slice,
-/// so it is added explicitly. Shared by `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`,
-/// `getrusage`, and `times` so all three agree.
+/// so it is added explicitly (and the stand-in the SMP scheduler leaves in its
+/// place skipped, or it would count twice). Shared by
+/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`, `getrusage`, and `times` so all
+/// three agree.
 fn process_cpu_ns(sh: &Shared, cx: &ServiceCtx) -> u128 {
     let tgid = cx.cur.tgid;
     cx.cur.cpu_ns
         + sh.procs
             .iter()
             .flatten()
-            .filter(|p| p.info.tgid == tgid)
+            .filter(|p| p.info.tgid == tgid && p.info.pid != cx.cur.pid)
             .map(|p| p.info.cpu_ns)
             .sum::<u128>()
 }
@@ -10272,11 +10502,21 @@ fn nice_weight(nice: i32) -> u128 {
     table[(nice.clamp(-20, 19) + 20) as usize]
 }
 
+/// A fair task's scheduling weight: its nice value's, or for `SCHED_IDLE`
+/// the 3 Linux gives it (`WEIGHT_IDLEPRIO`), so it runs only when little else
+/// wants the CPU.
+fn task_weight(p: &ProcInfo) -> u128 {
+    if p.sched_policy == 5 { 3 } else { nice_weight(p.nice) }
+}
+
 /// Add one executed step's weighted virtual runtime to a task, given the raw CPU
 /// nanoseconds it consumed. Shared by the serial and SMP accounting sites so the
 /// two paths order their run queues identically.
 fn charge_vruntime(p: &mut ProcInfo, cpu_delta_ns: u128) {
-    let weighted = cpu_delta_ns.saturating_mul(NICE0_WEIGHT) / nice_weight(p.nice);
+    if rt_priority(p).is_some() {
+        return;
+    }
+    let weighted = cpu_delta_ns.saturating_mul(NICE0_WEIGHT) / task_weight(p);
     let scaled = weighted.saturating_mul(u128::from(p.cg_scale)) >> 16;
     p.vruntime = p.vruntime.saturating_add(scaled);
 }
@@ -13588,6 +13828,54 @@ mod tests {
             "clamped up to the floor"
         );
         assert_eq!(sh.min_vruntime, 250, "floor stays monotonic");
+    }
+
+    #[test]
+    fn real_time_tasks_run_first_by_priority_then_in_turn() {
+        fn task(pid: i32, policy: i32, prio: i32) -> Process {
+            Process {
+                vcpu: Some(Box::new(DummyVcpu)),
+                info: ProcInfo {
+                    pid,
+                    sched_policy: policy,
+                    sched_priority: prio,
+                    run: RunState::Running,
+                    ..ProcInfo::default()
+                },
+            }
+        }
+        let (k, _mem, _v, _cx) = setup();
+        let mut sh = k.shared.lock().unwrap();
+        sh.procs = vec![
+            Some(task(10, 0, 0)),  // fair
+            Some(task(11, 1, 10)), // FIFO 10, queued first
+            Some(task(12, 2, 10)), // RR 10, queued after it
+            Some(task(13, 1, 5)),  // FIFO 5
+        ];
+        assert_eq!(sh.pick_serial_runnable(), Some(1), "FIFO 10 first in line");
+        // It blocks (or yields): to the back, behind the RR task of its
+        // priority, which runs next.
+        sh.procs[1].as_mut().unwrap().info.rt_requeue = RT_TAIL;
+        assert_eq!(sh.pick_serial_runnable(), Some(2));
+        // A lowered priority puts it at the front of its new queue.
+        sh.procs[2].as_mut().unwrap().info.sched_priority = 5;
+        sh.procs[2].as_mut().unwrap().info.rt_requeue = RT_HEAD;
+        sh.procs[1].as_mut().unwrap().info.sched_policy = 0;
+        assert_eq!(sh.pick_serial_runnable(), Some(2), "ahead of the FIFO 5");
+        // A fair task waiting on a CPU real-time tasks have had for most of a
+        // second gets the rest of it, and a fair task there that's ready
+        // preempts them meanwhile.
+        let start = poll::now_ns() - 960_000_000;
+        sh.rt_windows = vec![(start, 950_000_000)];
+        let picked = sh.pick_serial_runnable().unwrap();
+        assert_eq!(rt_priority(&sh.procs[picked].as_ref().unwrap().info), None);
+        let rt = sh.procs[3].take().unwrap();
+        assert!(sh.preempts(&rt.info, 1));
+        sh.rt_windows = vec![(start, 100_000_000)];
+        assert!(!sh.preempts(&rt.info, 1), "they didn't have it");
+        let fair = sh.procs[0].take().unwrap();
+        sh.procs[3] = Some(rt);
+        assert!(sh.preempts(&fair.info, 1), "a real-time task is ready");
     }
 
     #[test]

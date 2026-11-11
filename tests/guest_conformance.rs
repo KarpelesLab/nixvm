@@ -25,6 +25,7 @@ const PROGRAMS: &[&str] = &[
     "ns_mount",
     "ns_user",
     "cgroups",
+    "sched",
 ];
 
 /// A directory of binaries, also used as the guest's root, so that a program can
