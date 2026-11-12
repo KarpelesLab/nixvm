@@ -84,19 +84,17 @@ impl Kernel {
             return err(Errno::EBADF);
         };
         // The wrong end of a pipe is simply not open for that direction.
-        if matches!(fin, Fd::PipeWrite(_)) || matches!(fout, Fd::PipeRead(_)) {
+        // (A FIFO opened O_RDWR is both.)
+        if matches!(fin, Fd::PipeWrite(..))
+            || (matches!(fout, Fd::PipeRead(..)) && fout.pipe_out().is_none())
+        {
             return err(Errno::EBADF);
         }
-        let in_pipe = if let Fd::PipeRead(i) = fin {
-            Some(i)
-        } else {
-            None
-        };
-        let out_pipe = if let Fd::PipeWrite(j) = fout {
-            Some(j)
-        } else {
-            None
-        };
+        let in_pipe = fin.pipe_in();
+        let out_pipe = fout.pipe_out();
+        // A FIFO's O_NONBLOCK is its open's own.
+        let nb_in = nonblock || fin.fifo_open().is_some_and(super::FifoOpen::nonblock);
+        let nb_out = nonblock || fout.fifo_open().is_some_and(super::FifoOpen::nonblock);
         if in_pipe.is_none() && out_pipe.is_none() {
             return err(Errno::EINVAL);
         }
@@ -123,7 +121,7 @@ impl Kernel {
                     return err(Errno::EINVAL);
                 }
                 let mut pipes = self.pipes.lock().unwrap();
-                if let PipeState::Done(r) = Self::pipe_src_state(&pipes, cx, i, nonblock) {
+                if let PipeState::Done(r) = Self::pipe_src_state(&pipes, cx, i, nb_in) {
                     return r;
                 }
                 if pipes[j].readers == 0 {
@@ -132,7 +130,7 @@ impl Kernel {
                 }
                 let room = pipes[j].capacity.saturating_sub(pipes[j].buf.len());
                 if room == 0 {
-                    return Self::pipe_full(cx, pipes[j].write_nonblock || nonblock);
+                    return Self::pipe_full(cx, pipes[j].write_nonblock || nb_out);
                 }
                 let n = (len as usize).min(pipes[i].buf.len()).min(room);
                 let data: Vec<u8> = pipes[i].buf.drain(..n).collect();
@@ -160,7 +158,7 @@ impl Kernel {
                     };
                     let mut vfs = self.vfs_for(cx);
                     let mut pipes = self.pipes.lock().unwrap();
-                    if let PipeState::Done(r) = Self::pipe_src_state(&pipes, cx, i, nonblock) {
+                    if let PipeState::Done(r) = Self::pipe_src_state(&pipes, cx, i, nb_in) {
                         return r;
                     }
                     let n = (len as usize).min(pipes[i].buf.len());
@@ -178,7 +176,7 @@ impl Kernel {
                 Fd::Socket { sock, end } => {
                     let mut net = self.net.lock().unwrap();
                     let mut pipes = self.pipes.lock().unwrap();
-                    if let PipeState::Done(r) = Self::pipe_src_state(&pipes, cx, i, nonblock) {
+                    if let PipeState::Done(r) = Self::pipe_src_state(&pipes, cx, i, nb_in) {
                         return r;
                     }
                     let n = (len as usize).min(pipes[i].buf.len());
@@ -192,7 +190,7 @@ impl Kernel {
                 Fd::Stdout | Fd::Stderr | Fd::Tty => {
                     let mut sh = self.shared.lock().unwrap();
                     let mut pipes = self.pipes.lock().unwrap();
-                    if let PipeState::Done(r) = Self::pipe_src_state(&pipes, cx, i, nonblock) {
+                    if let PipeState::Done(r) = Self::pipe_src_state(&pipes, cx, i, nb_in) {
                         return r;
                     }
                     let n = (len as usize).min(pipes[i].buf.len());
@@ -215,7 +213,7 @@ impl Kernel {
                 let room = {
                     let pipes = self.pipes.lock().unwrap();
                     if pipes[j].readers > 0 && pipes[j].buf.len() >= pipes[j].capacity {
-                        return Self::pipe_full(cx, pipes[j].write_nonblock || nonblock);
+                        return Self::pipe_full(cx, pipes[j].write_nonblock || nb_out);
                     }
                     pipes[j].capacity.saturating_sub(pipes[j].buf.len())
                 };
@@ -313,9 +311,13 @@ impl Kernel {
         ) else {
             return err(Errno::EBADF);
         };
-        let (Fd::PipeRead(i), Fd::PipeWrite(j)) = (fin, fout) else {
+        let (Some(i), Some(j)) = (fin.pipe_in(), fout.pipe_out()) else {
             return err(Errno::EINVAL);
         };
+        let nb_in = flags & SPLICE_F_NONBLOCK != 0
+            || fin.fifo_open().is_some_and(super::FifoOpen::nonblock);
+        let nb_out = flags & SPLICE_F_NONBLOCK != 0
+            || fout.fifo_open().is_some_and(super::FifoOpen::nonblock);
         if i == j {
             return err(Errno::EINVAL);
         }
@@ -323,9 +325,7 @@ impl Kernel {
             return 0;
         }
         let mut pipes = self.pipes.lock().unwrap();
-        if let PipeState::Done(r) =
-            Self::pipe_src_state(&pipes, cx, i, flags & SPLICE_F_NONBLOCK != 0)
-        {
+        if let PipeState::Done(r) = Self::pipe_src_state(&pipes, cx, i, nb_in) {
             return r;
         }
         if pipes[j].readers == 0 {
@@ -334,8 +334,7 @@ impl Kernel {
         }
         let room = pipes[j].capacity.saturating_sub(pipes[j].buf.len());
         if room == 0 {
-            let nonblock = flags & SPLICE_F_NONBLOCK != 0;
-            return Self::pipe_full(cx, pipes[j].write_nonblock || nonblock);
+            return Self::pipe_full(cx, pipes[j].write_nonblock || nb_out);
         }
         let n = (len as usize).min(pipes[i].buf.len()).min(room);
         let data: Vec<u8> = pipes[i].buf.iter().take(n).copied().collect();
@@ -369,8 +368,8 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         match cx.cur.fds.get(fd as i32).cloned() {
-            Some(Fd::PipeWrite(_)) => self.sys_writev(cx, fd, iov, nr_segs, mem),
-            Some(Fd::PipeRead(i)) => {
+            Some(Fd::PipeWrite(..)) => self.sys_writev(cx, fd, iov, nr_segs, mem),
+            Some(Fd::PipeRead(i, ..)) => {
                 if flags & SPLICE_F_NONBLOCK != 0 {
                     let pipes = self.pipes.lock().unwrap();
                     if pipes[i].buf.is_empty() && pipes[i].writers > 0 {
@@ -429,8 +428,10 @@ impl Kernel {
             return n;
         }
         if off == -1 {
-            if !write && flags & RWF_NOWAIT != 0 && matches!(f, Fd::PipeRead(_)) {
-                let Fd::PipeRead(i) = f else { unreachable!() };
+            if !write && flags & RWF_NOWAIT != 0 && matches!(f, Fd::PipeRead(..)) {
+                let Fd::PipeRead(i, ..) = f else {
+                    unreachable!()
+                };
                 let pipes = self.pipes.lock().unwrap();
                 if pipes[i].buf.is_empty() && pipes[i].writers > 0 {
                     return err(Errno::EAGAIN);
@@ -533,7 +534,9 @@ impl Kernel {
             | RESOLVE_NO_SYMLINKS
             | RESOLVE_BENEATH
             | RESOLVE_IN_ROOT;
-        if resolve & restrict == 0 {
+        // (A FIFO open resuming after a wait skips the walk: its path was
+        // resolved the first time.)
+        if resolve & restrict == 0 || cx.cur.fifo_wait.is_some() {
             return self.open_path(vfs, cx, dirfd, &rel, flags, mode);
         }
         let base = if dirfd == AT_FDCWD {

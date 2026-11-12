@@ -314,7 +314,17 @@ impl Kernel {
             // in-VM loopback sockets stay best-effort always-ready, since
             // their queues aren't observable from here.
             Fd::Socket { sock, end } => self.sock_readiness(net, sock, end),
-            Fd::PipeRead(i) => {
+            // A FIFO opened O_RDWR is its own writer: never at EOF, and
+            // writable while there's room.
+            Fd::PipeRead(i, Some(o)) if o.rdwr() => {
+                let p = &pipes[i];
+                let mut m = if p.buf.is_empty() { 0 } else { POLLIN };
+                if p.buf.len() < p.capacity {
+                    m |= POLLOUT;
+                }
+                m
+            }
+            Fd::PipeRead(i, ..) => {
                 let p = &pipes[i];
                 if !p.buf.is_empty() {
                     POLLIN
@@ -329,7 +339,7 @@ impl Kernel {
                     0
                 }
             }
-            Fd::PipeWrite(i) => {
+            Fd::PipeWrite(i, ..) => {
                 // Writable while there's room; a vanished read end adds POLLERR
                 // on top (POLLOUT | POLLERR, not POLLERR alone), the readiness a
                 // real host reports here.

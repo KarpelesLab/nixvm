@@ -128,10 +128,12 @@ pub enum Fd {
         path: String,
         pos: usize,
     },
-    /// Read end of pipe `index` in the kernel's pipe table.
-    PipeRead(usize),
-    /// Write end of pipe `index` in the kernel's pipe table.
-    PipeWrite(usize),
+    /// Read end of pipe `index` in the kernel's pipe table; for a named FIFO,
+    /// its open (see [`FifoOpen`]), which may write too.
+    PipeRead(usize, Option<FifoOpen>),
+    /// Write end of pipe `index` in the kernel's pipe table; for a named FIFO,
+    /// its open.
+    PipeWrite(usize, Option<FifoOpen>),
     /// An endpoint of socket `sock` in the kernel's socket table. `end` is 0 or
     /// 1, selecting which side of a connected pair (and thus which direction is
     /// read vs. written). Unconnected/listening sockets always use `end == 0`.
@@ -169,6 +171,86 @@ pub enum Fd {
         flags: u64,
         hold: std::sync::Arc<()>,
     },
+}
+
+/// One `open` of a named FIFO: an open file description of its own, shared by
+/// the descriptors `dup` and `fork` make of it. Its `O_NONBLOCK` is its own —
+/// another process opening the same FIFO blocking doesn't make this one block
+/// — and an `O_RDWR` open both reads and writes. (An anonymous pipe's ends
+/// are one description each, so their flags live with the pipe.)
+#[derive(Debug, Clone)]
+pub struct FifoOpen(Arc<FifoOpenState>);
+
+#[derive(Debug)]
+struct FifoOpenState {
+    nonblock: AtomicBool,
+    rdwr: bool,
+    /// The FIFO's device and inode.
+    node: (u64, u64),
+}
+
+impl FifoOpen {
+    #[must_use]
+    pub fn new(node: (u64, u64), nonblock: bool, rdwr: bool) -> Self {
+        Self(Arc::new(FifoOpenState {
+            nonblock: AtomicBool::new(nonblock),
+            rdwr,
+            node,
+        }))
+    }
+
+    /// The FIFO's device and inode: what `fstat` on the descriptor reports,
+    /// wherever the node has been renamed to since.
+    #[must_use]
+    pub fn node(&self) -> (u64, u64) {
+        self.0.node
+    }
+
+    #[must_use]
+    pub fn nonblock(&self) -> bool {
+        self.0.nonblock.load(Ordering::Relaxed)
+    }
+
+    pub fn set_nonblock(&self, on: bool) {
+        self.0.nonblock.store(on, Ordering::Relaxed);
+    }
+
+    /// Opened `O_RDWR`: a reader and a writer of the FIFO at once.
+    #[must_use]
+    pub fn rdwr(&self) -> bool {
+        self.0.rdwr
+    }
+}
+
+impl Fd {
+    /// The pipe this descriptor reads, if it reads one.
+    #[must_use]
+    pub fn pipe_in(&self) -> Option<usize> {
+        match self {
+            Self::PipeRead(i, _) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// The pipe this descriptor writes, if it writes one: a write end, or a
+    /// FIFO opened `O_RDWR`.
+    #[must_use]
+    pub fn pipe_out(&self) -> Option<usize> {
+        match self {
+            Self::PipeWrite(i, _) => Some(*i),
+            Self::PipeRead(i, Some(o)) if o.rdwr() => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// The FIFO open behind a pipe descriptor, if it's a named FIFO's.
+    #[must_use]
+    pub fn fifo_open(&self) -> Option<&FifoOpen> {
+        match self {
+            Self::PipeRead(_, o) | Self::PipeWrite(_, o) => o.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 /// Maps small integer descriptors to [`Fd`]s, allocating the lowest free number.

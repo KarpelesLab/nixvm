@@ -62,7 +62,7 @@ mod unavailable;
 mod userns;
 mod xattr;
 
-pub use fd::{Fd, FdTable, FileOffset};
+pub use fd::{Fd, FdTable, FifoOpen, FileOffset};
 use net::Net;
 use poll::{EventFdInst, PidfdInst, PollFds};
 
@@ -440,6 +440,10 @@ struct ProcInfo {
     /// Bytes a blocked pipe or socket write has already queued, so the re-run of
     /// the syscall continues rather than starting over. 0 outside such a write.
     io_progress: u64,
+    /// A blocking `open` of a named FIFO waiting for the other end. The waiter
+    /// already counts as a reader (or writer), so the other side's open can
+    /// go; abandoning the wait takes that back.
+    fifo_wait: Option<FifoWait>,
     /// CPU time consumed by this task, in nanoseconds: the wall time it has spent
     /// actually executing (each dispatched step's run + service), accumulated by
     /// the schedulers. A parked/blocked task doesn't advance it — which is what
@@ -641,6 +645,7 @@ impl Default for ProcInfo {
             shared_maps: Vec::new(),
             wake_deadline: None,
             io_progress: 0,
+            fifo_wait: None,
             cpu_ns: 0,
             rt_run_ns: 0,
             throttled_until: None,
@@ -1485,6 +1490,44 @@ struct Pipe {
     write_nonblock: bool,
     /// How many bytes this pipe holds before a writer blocks (`F_SETPIPE_SZ`).
     capacity: usize,
+    /// The named FIFO this pipe is, by device and inode; `None` for `pipe2`'s.
+    fifo: Option<(u64, u64)>,
+    /// How many times its read and write ends have been opened: a FIFO opener
+    /// waiting for the other end goes once that count has moved, even if the
+    /// other end has closed again since (Linux's `r_counter`/`w_counter`).
+    read_opens: u64,
+    write_opens: u64,
+}
+
+impl Pipe {
+    fn new(capacity: usize, nonblock: bool, fifo: Option<(u64, u64)>) -> Self {
+        Self {
+            buf: VecDeque::new(),
+            readers: 0,
+            writers: 0,
+            read_nonblock: nonblock,
+            write_nonblock: nonblock,
+            capacity,
+            fifo,
+            read_opens: 0,
+            write_opens: 0,
+        }
+    }
+}
+
+/// A named-FIFO `open` waiting for the other end ([`ProcInfo::fifo_wait`]).
+/// The call is re-run when it may go on, and resumes from here: the path was
+/// resolved once, as on Linux, so a FIFO renamed meanwhile is still the one.
+#[derive(Debug, Clone, Copy)]
+struct FifoWait {
+    /// The pipe, in the kernel's table.
+    pipe: usize,
+    /// The FIFO's device and inode.
+    node: (u64, u64),
+    /// Whether this opens the write end.
+    write: bool,
+    /// The other end's open count when the wait began.
+    seen: u64,
 }
 
 /// A new pipe's capacity, as on Linux.
@@ -3081,6 +3124,7 @@ impl Kernel {
                         cx.cur.futex_waitv.clear();
                         cx.cur.futex_pi = false;
                         cx.cur.futex_woken = false;
+                        self.abandon_fifo_wait(cx);
                     }
                 }
                 // Land the syscall's result in the vcpu *before* delivering any
@@ -5029,7 +5073,7 @@ impl Kernel {
             // hints with nothing to act on in memory, after Linux's checks.
             Sysno::Readahead | Sysno::Fadvise64 => match cx.cur.fds.get(args[0] as i32) {
                 None => err(Errno::EBADF),
-                Some(Fd::PipeRead(_) | Fd::PipeWrite(_)) if sys == Sysno::Fadvise64 => {
+                Some(Fd::PipeRead(..) | Fd::PipeWrite(..)) if sys == Sysno::Fadvise64 => {
                     err(Errno::ESPIPE)
                 }
                 // POSIX_FADV_DONTNEED drops the range from the page cache.
@@ -5429,11 +5473,10 @@ impl Kernel {
             let copy = cx.cur.fds.clone();
             let (mut r, mut w, mut socks) = (Vec::new(), Vec::new(), Vec::new());
             for fd in copy.values() {
-                match fd {
-                    Fd::PipeRead(i) => r.push(*i),
-                    Fd::PipeWrite(i) => w.push(*i),
-                    Fd::Socket { .. } => socks.push(fd.clone()),
-                    _ => {}
+                r.extend(fd.pipe_in());
+                w.extend(fd.pipe_out());
+                if let Fd::Socket { .. } = fd {
+                    socks.push(fd.clone());
                 }
             }
             // Socket refcounts live in `net`, pipe refcounts in `pipes`: bump
@@ -6410,6 +6453,8 @@ impl Kernel {
         cause: ExitCause,
         mem: &mut GuestMemory,
     ) -> i64 {
+        // Killed while a FIFO open waited for the other end: it's no end now.
+        self.abandon_fifo_wait(cx);
         // Flush any un-munmap'd writable shared file mappings first. `sh` is
         // held; scope `vfs` to just the flush (sh→vfs order), dropping it before
         // the rest of teardown.
@@ -6723,7 +6768,7 @@ impl Kernel {
                 let ret = self.write_socket_fd(&mut net, cx, fd, buf, count, mem);
                 self.apply_sock_timeout(&net, cx, fd, net::SockDirection::Send, ret)
             }
-            Some(Fd::PipeWrite(..)) => {
+            Some(f) if f.pipe_out().is_some() => {
                 let mut pipes = self.pipes.lock().unwrap();
                 self.write_pipe_fd(&mut pipes, cx, fd, buf, count, mem)
             }
@@ -6871,10 +6916,14 @@ impl Kernel {
         mem: &GuestMemory,
     ) -> i64 {
         let count = count.min(MAX_RW_COUNT);
-        let Some(Fd::PipeWrite(i)) = cx.cur.fds.get(fd as i32).cloned() else {
+        let Some(f) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
-        self.pipe_write_from(pipes, cx, i, count, false, |off, n| {
+        let Some(i) = f.pipe_out() else {
+            return err(Errno::EBADF);
+        };
+        let nonblock = f.fifo_open().map(FifoOpen::nonblock);
+        self.pipe_write_from(pipes, cx, i, nonblock, count, false, |off, n| {
             mem.read_vec(buf + off, n).ok()
         })
     }
@@ -7188,10 +7237,11 @@ impl Kernel {
         count: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        let Some(Fd::PipeRead(i)) = cx.cur.fds.get(fd as i32).cloned() else {
+        let Some(f @ Fd::PipeRead(i, _)) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
-        self.read_pipe(pipes, cx, i, buf, count, mem)
+        let nonblock = f.fifo_open().map(FifoOpen::nonblock);
+        self.read_pipe(pipes, cx, i, nonblock, buf, count, mem)
     }
 
     /// The `Fd::File` arm of [`Self::sys_read`]: read at the fd's offset and
@@ -7318,11 +7368,13 @@ impl Kernel {
     /// Read from pipe `i`. Empty with writers still open -> block; empty with no
     /// writers -> EOF (0).
     #[allow(clippy::unused_self)]
+    #[allow(clippy::too_many_arguments)]
     fn read_pipe(
         &self,
         pipes: &mut [Pipe],
         cx: &mut ServiceCtx,
         i: usize,
+        nonblock: Option<bool>,
         buf: u64,
         count: u64,
         mem: &mut GuestMemory,
@@ -7331,7 +7383,7 @@ impl Kernel {
             if pipes[i].writers > 0 {
                 // Empty but still open: a non-blocking reader gets EAGAIN; a
                 // blocking one parks (re-trap) until a writer feeds the pipe.
-                if pipes[i].read_nonblock {
+                if nonblock.unwrap_or(pipes[i].read_nonblock) {
                     return err(Errno::EAGAIN);
                 }
                 cx.block = true;
@@ -7355,12 +7407,19 @@ impl Kernel {
         pipes: &mut [Pipe],
         cx: &mut ServiceCtx,
         i: usize,
+        nonblock: Option<bool>,
         data: &[u8],
         nosignal: bool,
     ) -> i64 {
-        self.pipe_write_from(pipes, cx, i, data.len() as u64, nosignal, |off, n| {
-            Some(data[off as usize..off as usize + n].to_vec())
-        })
+        self.pipe_write_from(
+            pipes,
+            cx,
+            i,
+            nonblock,
+            data.len() as u64,
+            nosignal,
+            |off, n| Some(data[off as usize..off as usize + n].to_vec()),
+        )
     }
 
     /// Write `total` bytes to pipe `i`, as much as fits. `read(off, n)` supplies
@@ -7370,11 +7429,13 @@ impl Kernel {
     /// A blocking write that doesn't fit parks the task, remembering how far it
     /// got in [`ProcInfo::io_progress`]; the re-run after a reader makes room
     /// carries on from there, so the guest sees one complete write, as on Linux.
+    #[allow(clippy::too_many_arguments)]
     fn pipe_write_from(
         &self,
         pipes: &mut [Pipe],
         cx: &mut ServiceCtx,
         i: usize,
+        nonblock: Option<bool>,
         total: u64,
         nosignal: bool,
         read: impl FnOnce(u64, usize) -> Option<Vec<u8>>,
@@ -7411,7 +7472,7 @@ impl Kernel {
             cx.cur.io_progress = 0;
             return total as i64;
         }
-        if pipes[i].write_nonblock {
+        if nonblock.unwrap_or(pipes[i].write_nonblock) {
             cx.cur.io_progress = 0;
             return if done > 0 {
                 done as i64
@@ -7718,8 +7779,17 @@ impl Kernel {
                 .map_or(err(Errno::EIO), |()| buf.len() as i64),
             // Destination is a pipe: its buffer lives in `pipes`, taken *after*
             // sh, vfs (and it never coexists with `net` here) — pipes is last.
-            Some(Fd::PipeWrite(i)) => {
-                self.write_pipe(&mut self.pipes.lock().unwrap(), cx, i, &buf, false)
+            Some(f) if f.pipe_out().is_some() => {
+                let i = f.pipe_out().unwrap_or_default();
+                let nonblock = f.fifo_open().map(FifoOpen::nonblock);
+                self.write_pipe(
+                    &mut self.pipes.lock().unwrap(),
+                    cx,
+                    i,
+                    nonblock,
+                    &buf,
+                    false,
+                )
             }
             // Destination is a socket: its state lives in `net`, taken *after*
             // sh and vfs (sh → vfs → net order) and released with the arm.
@@ -8109,7 +8179,10 @@ impl Kernel {
             }
             return total;
         }
-        if let Some(Fd::PipeWrite(i)) = cx.cur.fds.get(fd as i32).cloned() {
+        if let Some(f) = cx.cur.fds.get(fd as i32).cloned()
+            && let Some(i) = f.pipe_out()
+        {
+            let nonblock = f.fifo_open().map(FifoOpen::nonblock);
             // One atomic, resumable write of the whole vector, as on Linux.
             if iovcnt > 1024 {
                 return err(Errno::EINVAL);
@@ -8134,7 +8207,7 @@ impl Kernel {
                 data.append(&mut chunk);
             }
             let mut pipes = self.pipes.lock().unwrap();
-            return self.write_pipe(&mut pipes, cx, i, &data, false);
+            return self.write_pipe(&mut pipes, cx, i, nonblock, &data, false);
         }
         if let Some(Fd::Eventfd(..)) = cx.cur.fds.get(fd as i32) {
             let mut pf = self.pollfds.lock().unwrap();
@@ -8554,7 +8627,7 @@ impl Kernel {
             // Bytes available to read, written as an `int` at `arg`.
             FIONREAD => {
                 let bytes = match &f {
-                    Fd::PipeRead(i) => self
+                    Fd::PipeRead(i, ..) => self
                         .pipes
                         .lock()
                         .unwrap()
@@ -8808,8 +8881,9 @@ impl Kernel {
             }
             Fd::PtyMaster(n) => self.ptys.lock().unwrap().set_nonblock(*n, true, nb),
             Fd::PtySlave(n) => self.ptys.lock().unwrap().set_nonblock(*n, false, nb),
-            Fd::PipeRead(i) => self.pipes.lock().unwrap()[*i].read_nonblock = nb,
-            Fd::PipeWrite(i) => self.pipes.lock().unwrap()[*i].write_nonblock = nb,
+            Fd::PipeRead(_, Some(o)) | Fd::PipeWrite(_, Some(o)) => o.set_nonblock(nb),
+            Fd::PipeRead(i, None) => self.pipes.lock().unwrap()[*i].read_nonblock = nb,
+            Fd::PipeWrite(i, None) => self.pipes.lock().unwrap()[*i].write_nonblock = nb,
             _ => {}
         }
     }
@@ -8823,8 +8897,9 @@ impl Kernel {
             }
             Fd::PtyMaster(n) => self.ptys.lock().unwrap().is_nonblock(*n, true),
             Fd::PtySlave(n) => self.ptys.lock().unwrap().is_nonblock(*n, false),
-            Fd::PipeRead(i) => self.pipes.lock().unwrap()[*i].read_nonblock,
-            Fd::PipeWrite(i) => self.pipes.lock().unwrap()[*i].write_nonblock,
+            Fd::PipeRead(_, Some(o)) | Fd::PipeWrite(_, Some(o)) => o.nonblock(),
+            Fd::PipeRead(i, None) => self.pipes.lock().unwrap()[*i].read_nonblock,
+            Fd::PipeWrite(i, None) => self.pipes.lock().unwrap()[*i].write_nonblock,
             _ => false,
         }
     }
@@ -8875,6 +8950,11 @@ impl Kernel {
             Arch::Aarch64 => (0o40000, 0o100000),
         };
         const O_ACCMODE: u64 = 0o3;
+        // The re-run of a FIFO open that waited for the other end: the path
+        // was resolved the first time, and the FIFO may be elsewhere by now.
+        if let Some(w) = cx.cur.fifo_wait {
+            return self.open_fifo(cx, w.node, flags);
+        }
         // A trailing slash on the guest path demands a directory target.
         let had_slash = rel.len() > 1 && rel.ends_with('/');
         let resolved = self.resolve_path(cx, dirfd, rel);
@@ -8975,7 +9055,8 @@ impl Kernel {
             Some(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => {
                 return err(Errno::EEXIST);
             }
-            Some(_) if flags & O_TRUNC != 0 => {
+            // (O_TRUNC means nothing to a FIFO.)
+            Some(a) if flags & O_TRUNC != 0 && a.kind != NodeKind::Fifo => {
                 let _ = self.vfs_truncate(vfs, &abs, 0);
             }
             Some(_) => {}
@@ -8993,6 +9074,9 @@ impl Kernel {
         if is_dir && flags & O_ACCMODE != 0 {
             return err(Errno::EISDIR);
         }
+        if attrs.kind == NodeKind::Fifo {
+            return self.open_fifo(cx, (attrs.dev, attrs.inode), flags);
+        }
         let fd = if attrs.kind == NodeKind::Dir {
             cx.cur.fds.alloc(Fd::Dir { path: abs, pos: 0 })
         } else {
@@ -9008,6 +9092,133 @@ impl Kernel {
         cx.cur.fds.set_cloexec(fd, flags & O_CLOEXEC != 0);
         cx.cur.fds.set_append(fd, flags & O_APPEND != 0);
         i64::from(fd)
+    }
+
+    /// Open a named FIFO, as Linux's `fifo_open`: every open of the same node
+    /// shares one pipe, live while any end is open. A read-only open waits for
+    /// a writer and a write-only one for a reader, unless `O_NONBLOCK` — then a
+    /// reader goes at once and a writer with no reader is `ENXIO`. `O_RDWR`
+    /// never waits. A wait re-runs this call; [`ProcInfo::fifo_wait`] carries
+    /// it over.
+    fn open_fifo(&self, cx: &mut ServiceCtx, key: (u64, u64), flags: u64) -> i64 {
+        const O_ACCMODE: u64 = 0o3;
+        const O_NONBLOCK: u64 = 0o4000;
+        const O_CLOEXEC: u64 = 0o2000000;
+        let nonblock = flags & O_NONBLOCK != 0;
+        let mut pipes = self.pipes.lock().unwrap();
+        let (i, write) = if let Some(FifoWait {
+            pipe: i,
+            write,
+            seen,
+            ..
+        }) = cx.cur.fifo_wait
+        {
+            // The re-run of a waiting open: it's counted already.
+            let moved = if write {
+                pipes[i].read_opens != seen
+            } else {
+                pipes[i].write_opens != seen
+            };
+            if !moved {
+                cx.block = true;
+                return 0;
+            }
+            cx.cur.fifo_wait = None;
+            (i, write)
+        } else {
+            let acc = flags & O_ACCMODE;
+            if acc == 3 {
+                return err(Errno::EINVAL);
+            }
+            // The live pipe of this FIFO; else a new one, in the slot of a
+            // finished one where there is one (its contents went with its last
+            // close, as on Linux).
+            let live = pipes
+                .iter()
+                .position(|p| p.fifo == Some(key) && p.readers + p.writers > 0);
+            let i = if let Some(i) = live {
+                i
+            } else {
+                let fresh = Pipe::new(PIPE_DEFAULT_CAPACITY, false, Some(key));
+                if let Some(i) = pipes.iter().position(|p| p.fifo == Some(key)) {
+                    pipes[i] = fresh;
+                    i
+                } else {
+                    pipes.push(fresh);
+                    pipes.len() - 1
+                }
+            };
+            let p = &mut pipes[i];
+            match acc {
+                0 => {
+                    p.readers += 1;
+                    p.read_opens += 1;
+                    if p.writers == 0 && !nonblock {
+                        cx.cur.fifo_wait = Some(FifoWait {
+                            pipe: i,
+                            node: key,
+                            write: false,
+                            seen: p.write_opens,
+                        });
+                        cx.block = true;
+                        return 0;
+                    }
+                    (i, false)
+                }
+                1 => {
+                    if p.readers == 0 && nonblock {
+                        return err(Errno::ENXIO);
+                    }
+                    p.writers += 1;
+                    p.write_opens += 1;
+                    if p.readers == 0 {
+                        cx.cur.fifo_wait = Some(FifoWait {
+                            pipe: i,
+                            node: key,
+                            write: true,
+                            seen: p.read_opens,
+                        });
+                        cx.block = true;
+                        return 0;
+                    }
+                    (i, true)
+                }
+                _ => {
+                    p.readers += 1;
+                    p.writers += 1;
+                    p.read_opens += 1;
+                    p.write_opens += 1;
+                    let open = FifoOpen::new(key, nonblock, true);
+                    drop(pipes);
+                    let fd = cx.cur.fds.alloc(Fd::PipeRead(i, Some(open)));
+                    cx.cur.fds.set_cloexec(fd, flags & O_CLOEXEC != 0);
+                    return i64::from(fd);
+                }
+            }
+        };
+        drop(pipes);
+        let open = Some(FifoOpen::new(key, nonblock, false));
+        let fd = cx.cur.fds.alloc(if write {
+            Fd::PipeWrite(i, open)
+        } else {
+            Fd::PipeRead(i, open)
+        });
+        cx.cur.fds.set_cloexec(fd, flags & O_CLOEXEC != 0);
+        i64::from(fd)
+    }
+
+    /// Give up a FIFO open that was waiting for the other end (interrupted by
+    /// a signal, or the task is going away): it no longer counts as an end.
+    pub(super) fn abandon_fifo_wait(&self, cx: &mut ServiceCtx) {
+        if let Some(w) = cx.cur.fifo_wait.take() {
+            let mut pipes = self.pipes.lock().unwrap();
+            let p = &mut pipes[w.pipe];
+            if w.write {
+                p.writers = p.writers.saturating_sub(1);
+            } else {
+                p.readers = p.readers.saturating_sub(1);
+            }
+        }
     }
 
     /// `close(fd)`.
@@ -9041,16 +9252,12 @@ impl Kernel {
         const O_NONBLOCK: u64 = 0o4000;
         let nonblock = flags & O_NONBLOCK != 0;
         let idx = pipes.len();
-        pipes.push(Pipe {
-            buf: VecDeque::new(),
-            capacity: PIPE_DEFAULT_CAPACITY,
-            readers: 1,
-            writers: 1,
-            read_nonblock: nonblock,
-            write_nonblock: nonblock,
-        });
-        let rfd = cx.cur.fds.alloc(Fd::PipeRead(idx));
-        let wfd = cx.cur.fds.alloc(Fd::PipeWrite(idx));
+        let mut pipe = Pipe::new(PIPE_DEFAULT_CAPACITY, nonblock, None);
+        pipe.readers = 1;
+        pipe.writers = 1;
+        pipes.push(pipe);
+        let rfd = cx.cur.fds.alloc(Fd::PipeRead(idx, None));
+        let wfd = cx.cur.fds.alloc(Fd::PipeWrite(idx, None));
         let cloexec = flags & O_CLOEXEC != 0;
         cx.cur.fds.set_cloexec(rfd, cloexec);
         cx.cur.fds.set_cloexec(wfd, cloexec);
@@ -9120,8 +9327,15 @@ impl Kernel {
             }
         };
         match fd {
-            Fd::PipeRead(i) => apply(&mut self.pipes.lock().unwrap()[*i].readers),
-            Fd::PipeWrite(i) => apply(&mut self.pipes.lock().unwrap()[*i].writers),
+            Fd::PipeRead(..) | Fd::PipeWrite(..) => {
+                let mut pipes = self.pipes.lock().unwrap();
+                if let Some(i) = fd.pipe_in() {
+                    apply(&mut pipes[i].readers);
+                }
+                if let Some(i) = fd.pipe_out() {
+                    apply(&mut pipes[i].writers);
+                }
+            }
             Fd::Socket { .. } => self.net.lock().unwrap().bump(fd, inc),
             // Non-refcounted fds (files, stdio, eventfds, …): nothing to adjust.
             _ => {}
@@ -9252,7 +9466,16 @@ impl Kernel {
                 inode: kind.inode(*id),
                 ..stat::char_device_attrs()
             },
-            Some(Fd::PipeRead(_) | Fd::PipeWrite(_)) => stat::fifo_attrs(),
+            // A named FIFO's descriptor is its node, wherever that's been
+            // renamed to since: its device and inode (pipe2's have neither).
+            Some(f @ (Fd::PipeRead(..) | Fd::PipeWrite(..))) => {
+                let (dev, inode) = f.fifo_open().map(FifoOpen::node).unwrap_or_default();
+                Attrs {
+                    inode,
+                    dev,
+                    ..stat::fifo_attrs()
+                }
+            }
             Some(Fd::Socket { .. }) => stat::socket_attrs(),
             // A message queue is a regular file on the mqueue filesystem.
             Some(Fd::Mqueue { q, .. }) => Attrs {

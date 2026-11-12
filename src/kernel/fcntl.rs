@@ -386,7 +386,7 @@ impl Kernel {
             }
             // Pipe capacity. Only pipes have one.
             F_GETPIPE_SZ | F_SETPIPE_SZ => {
-                let (Fd::PipeRead(i) | Fd::PipeWrite(i)) = f else {
+                let (Fd::PipeRead(i, ..) | Fd::PipeWrite(i, ..)) = f else {
                     return err(Errno::EBADF);
                 };
                 let mut pipes = self.pipes.lock().unwrap();
@@ -438,8 +438,9 @@ impl Kernel {
                         acc | o_largefile
                     }
                     Fd::Dir { .. } => o_directory | o_largefile,
-                    Fd::PipeRead(_) => 0,
-                    Fd::PipeWrite(_) => O_WRONLY,
+                    Fd::PipeRead(_, Some(o)) if o.rdwr() => O_RDWR,
+                    Fd::PipeRead(..) => 0,
+                    Fd::PipeWrite(..) => O_WRONLY,
                     Fd::Mqueue { flags, .. } => (*flags & 3) as i64,
                     _ => O_RDWR,
                 };

@@ -409,6 +409,14 @@ Synthesized pseudo-filesystems and the fd machinery real programs assume.
 - **Syscalls:** `pipe2`, `dup`/`dup2`/`dup3`, `poll`/`ppoll`, `pselect6`,
   `epoll_create1`/`epoll_ctl`/`epoll_pwait`, `eventfd2`, `signalfd4`,
   `timerfd_*`, `inotify_*` (stub), `memfd_create`, `close_range`.
+- **Named FIFOs:** a `mkfifo` node opens as a pipe shared by every open of it,
+  found by device and inode (so a FIFO renamed or moved while open, even while
+  an `open` waits on it, is the same pipe), with Linux's `fifo_open` rules: a
+  reader waits for a writer and a writer for a reader, `O_NONBLOCK` lets a
+  reader go and makes a lone writer `ENXIO`, `O_RDWR` never waits, each open
+  has its own `O_NONBLOCK`, and the contents go with the last close. GNU make's
+  `-j` jobserver runs on one. Only guest processes meet there: a host process
+  opening the same host FIFO doesn't. (`tests/guest/fifo.c`)
 - **Exit criteria:** programs using epoll and ptys work (`bash -i`, a
   select/poll-based server loop locally).
 - **Status:** `fs::ProcFs` serves a real, rendered `/proc/self/*` (`maps`,

@@ -1049,7 +1049,7 @@ fn fd_link_target(fd: &Fd) -> String {
         },
         Fd::Stdin | Fd::Stdout | Fd::Stderr => "/dev/null".to_string(),
         Fd::Tty => "/dev/tty".to_string(),
-        Fd::PipeRead(i) | Fd::PipeWrite(i) => format!("pipe:[{i}]"),
+        Fd::PipeRead(i, ..) | Fd::PipeWrite(i, ..) => format!("pipe:[{i}]"),
         Fd::Socket { sock, .. } => format!("socket:[{sock}]"),
         Fd::Eventfd(_) => "anon_inode:[eventfd]".to_string(),
         Fd::Signalfd(_) => "anon_inode:[signalfd]".to_string(),
