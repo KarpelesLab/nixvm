@@ -494,7 +494,11 @@ int main(void) {
   CHECK(atoll(get(mm, "memory.current")) <= 4 << 20);
   CHECK(waitpid(c, &st, 0) == c && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
   long long now_kills = field(get(mm, "memory.events"), "oom_kill");
-  int small_gone = waitpid(small, &st, WNOHANG) == small;
+  /* A second kill is counted as it's sent, before the small one can be
+   * reaped: then wait for it. */
+  int small_gone = now_kills == kills + 2
+                       ? waitpid(small, &st, 0) == small && WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL
+                       : waitpid(small, &st, WNOHANG) == small;
   printf("memory.max lowered: %lld kill(s), the small one %s\n", now_kills - kills,
          small_gone ? "killed too" : "kept");
   /* The big one goes first. Linux may take the small one too, if it looks
