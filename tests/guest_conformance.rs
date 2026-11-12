@@ -153,7 +153,14 @@ fn conformance_of(runner: &str, root: &Path, env: &[(&str, &str)], seconds: &str
         let passed = text.lines().any(|l| l == "PASS");
         let failures: Vec<&str> = text.lines().filter(|l| l.starts_with("FAIL")).collect();
         if !passed || !failures.is_empty() {
-            let tail: Vec<&str> = text.lines().rev().take(6).collect();
+            // The program's own output, which says what it measured; the
+            // runner's lines (`run-elf: …`) say little.
+            let tail: Vec<&str> = text
+                .lines()
+                .filter(|l| !l.starts_with("run-elf:") && !l.is_empty())
+                .rev()
+                .take(12)
+                .collect();
             failed.push(format!("{name}: {failures:?} (last lines: {tail:?})"));
         }
     }
