@@ -1661,9 +1661,7 @@ mod tests {
                 continue; // data in .text, or a deliberate trap
             }
             let mut c = cpu();
-            for r in 0..31 {
-                c.x[r] = base + 0x100;
-            }
+            c.x[..31].fill(base + 0x100);
             c.sp = base + 0x1000;
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 matches!(c.exec(word, &mut m), Step::Illegal)

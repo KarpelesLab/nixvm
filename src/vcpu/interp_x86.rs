@@ -5643,9 +5643,9 @@ mod tests {
             total += 1;
             m.write_init(code, &bytes).unwrap();
             let mut c = X86Interp::new(code, base + 16 * page);
-            for r in 0..16 {
+            for (r, g) in c.gpr.iter_mut().enumerate().take(16) {
                 if r != RSP {
-                    c.gpr[r] = base + 8 * page;
+                    *g = base + 8 * page;
                 }
             }
             c.gpr[RCX] = 4;
