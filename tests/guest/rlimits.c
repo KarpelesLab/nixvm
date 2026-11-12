@@ -18,7 +18,13 @@ static int fails;
 #define CHECK(c, ...) do { int ok_ = (c); printf("%s: ", ok_ ? "ok  " : "FAIL"); printf(__VA_ARGS__); puts(""); fflush(stdout); if (!ok_) fails++; } while (0)
 static volatile sig_atomic_t got;
 static void h(int s) { got = s; }
-static int child_status(void (*f)(void)) { fflush(stdout); pid_t p = fork(); if (!p) { f(); _exit(0); } int st; waitpid(p, &st, 0); return st; }
+static int child_status(void (*f)(void)) {
+  fflush(stdout); pid_t p = fork(); if (!p) { f(); _exit(0); }
+  int st = -1; pid_t w = waitpid(p, &st, 0);
+  /* Seen once on CI with 3 CPUs: a status no child path gives. Say what came back. */
+  if (w != p) printf("waitpid(%d) returned %d, errno %d\n", p, w, errno);
+  return st;
+}
 static void *set_in_thread(void *a) { struct rlimit r = {123, 456}; setrlimit(RLIMIT_CORE, &r); return a; }
 static void as_child(void) { struct rlimit r = {256 << 20, 256 << 20}; setrlimit(RLIMIT_AS, &r); void *p = mmap(0, 512UL << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); _exit(p == MAP_FAILED && errno == ENOMEM ? 7 : 1); }
 static volatile char sink;
