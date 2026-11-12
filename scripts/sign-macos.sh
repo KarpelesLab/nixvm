@@ -6,6 +6,8 @@
 #
 # Without the entitlement `hv_vm_create` is denied and nixvm quietly falls back
 # to the software interpreter; check with `NIXVM_INTERP=1` for comparison.
+# Any rebuild — including the one `cargo test --release` does of these same
+# binaries — replaces them unsigned, so sign again after building.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [[ "$(uname -s)" != "Darwin" ]]; then

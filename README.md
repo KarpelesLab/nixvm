@@ -115,7 +115,7 @@ macOS binaries are); an unsigned one quietly uses the interpreter:
 
 ```sh
 cargo build --release
-scripts/sign-macos.sh        # ad-hoc signs target/release/{nixvm,run-elf}
+scripts/sign-macos.sh        # ad-hoc signs target/release/{nixvm,run-elf} (again after any rebuild)
 target/release/nixvm run --root ./alpine-rootfs -- /bin/sh
 ```
 
