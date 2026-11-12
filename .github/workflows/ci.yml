@@ -56,6 +56,12 @@ jobs:
       - name: Test (fstool)
         run: cargo test --features fstool
 
+      - name: Clippy (Docker/OCI images, warnings denied)
+        run: cargo clippy --all-targets --features oci,fetch -- -D warnings
+
+      - name: Test (Docker/OCI images, offline parts)
+        run: cargo test --features oci --lib oci
+
       - name: Clippy (tunnel networking, warnings denied)
         run: cargo clippy --all-targets --features tunnel -- -D warnings
 
@@ -162,11 +168,22 @@ jobs:
       - name: Check the root-only programs against Linux
         if: matrix.backend == 'kvm'
         run: |
-          for p in cgroups rlimits sched exec; do
+          for p in cgroups rlimits sched exec fifo devfd; do
             gcc -static -O2 -pthread -o "$RUNNER_TEMP/$p" "tests/guest/$p.c"
             echo "== $p"
             sudo "$RUNNER_TEMP/$p"
           done
+
+      # Pull real images from Docker Hub and run them as `docker run` would.
+      - name: Pull and run Docker images
+        if: matrix.backend == 'kvm'
+        run: |
+          set -o pipefail
+          NIXVM_OCI_TESTS=1 cargo test --features oci,fetch --test oci_images -- --nocapture 2>&1 | tee oci.log
+          if grep -q 'skipping' oci.log; then
+            echo '::error::the image pull tests skipped themselves'
+            exit 1
+          fi
 
       # Real tools using every namespace at once find what targeted tests don't.
       - name: Run bubblewrap and util-linux in the VM
@@ -226,6 +243,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # `--all-features` is avoided (wasm/hvf/kvm don't build on a host doc run);
-      # `fstool` covers the one optional module with public docs.
-      - name: cargo doc --no-deps --features fstool
-        run: cargo doc --no-deps --features fstool
+      # `fstool` and `oci,fetch` cover the optional modules with public docs.
+      - name: cargo doc --no-deps --features fstool,oci,fetch
+        run: cargo doc --no-deps --features fstool,oci,fetch

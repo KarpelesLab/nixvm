@@ -54,11 +54,18 @@ fstool = ["dep:fstool"]
 # `DecompressionStream` — so it works in any wasm-capable browser and keeps the
 # decompression path in Rust. Pure computation; builds for wasm32.
 targz = ["dep:compcol"]
+# Docker/OCI images (src/oci): read an image from a registry or a `docker save`
+# / OCI layout archive, flatten its layers and run it — docker without dockerd.
+# Pulling over the network natively also needs `fetch`; in the browser the
+# embedder does the fetching (src/wasm.rs `ImagePull`). Layers are gzip or
+# zstd, so this adds compcol's zstd decoder; running needs `fstool` to hold the
+# flattened root as an in-memory squashfs.
+oci = ["targz", "fstool", "compcol/zstd"]
 # Browser demo entry point (src/wasm.rs): exposes an interactive `Terminal` and
 # `run_elf` via wasm-bindgen. Pulls in wasm-bindgen + console_error_panic_hook,
 # `targz` to unpack a `.tar.gz` root image in-process, and `fstool` to repack it
 # into an in-memory squashfs (read-only lower of a copy-on-write overlay).
-wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "targz", "fstool", "tunnel"]
+wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "targz", "fstool", "tunnel", "oci"]
 # HTTP(S) fetching of guest root images (src/image.rs). Off by default so the
 # core stays dependency-free and wasm-buildable; sha256 verification is
 # hand-rolled in image.rs so it needs no extra dep either way.
@@ -77,7 +84,7 @@ tunnel = ["dep:pktkit"]
 # Since 0.4.28 each filesystem is its own feature (a `default-features = false`
 # build gets none and doesn't compile); enable the ones nixvm reads/builds:
 # ext2/3/4 root images, squashfs (the repacked overlay lower), tar.
-fstool = { version = "0.5.2", optional = true, default-features = false, features = [
+fstool = { version = "0.5.3", optional = true, default-features = false, features = [
     "gzip",
     "ext",
     "squashfs",
@@ -88,7 +95,7 @@ fstool = { version = "0.5.2", optional = true, default-features = false, feature
 ureq = { version = "3", optional = true }
 # Compression collection (gzip decoder), gated behind `targz`. `std` + `gzip`
 # only — a pure-Rust inflate that builds for wasm32. Same crate `fstool` uses.
-compcol = { version = "0.7.8", optional = true, default-features = false, features = [
+compcol = { version = "0.7.9", optional = true, default-features = false, features = [
     "std",
     "gzip",
 ] }
@@ -143,3 +150,4 @@ too_many_lines = "allow"
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+

@@ -26,6 +26,31 @@ type Tunnel = crate::tunnel::Tunnel;
 #[cfg(not(feature = "tunnel"))]
 type Tunnel = std::convert::Infallible;
 
+/// How pid 1 starts: its argv (`argv[0]` an absolute path in the root),
+/// environment, working directory and ids.
+struct Start {
+    argv: Vec<String>,
+    env: Vec<String>,
+    cwd: String,
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+}
+
+impl Start {
+    /// The interactive shell's: root, at `/`, with the default environment.
+    fn shell(argv: Vec<String>) -> Self {
+        Self {
+            argv,
+            env: default_env(),
+            cwd: "/".into(),
+            uid: 0,
+            gid: 0,
+            groups: Vec::new(),
+        }
+    }
+}
+
 /// A [`std::io::Write`] that appends into a shared byte buffer — used to
 /// capture guest fd 1/2 for the terminal.
 struct CaptureSink(Arc<Mutex<Vec<u8>>>);
@@ -87,7 +112,7 @@ impl Vm {
         let mut mounts = MountTable::new();
         mounts.mount("/", Box::new(TmpFs::new()));
         tar::extract_into(&mut mounts, tar_bytes);
-        Self::finish(mounts, argv, mem_bytes, None)
+        Self::finish(mounts, Start::shell(argv), mem_bytes, None)
     }
 
     /// Boot from a `.tar` root image mounted as a **read-only squashfs lower**
@@ -138,20 +163,81 @@ impl Vm {
             "/",
             Box::new(Overlay::new(Box::new(lower), Box::new(TmpFs::new()))),
         );
-        Self::finish(mounts, argv, mem_bytes, tunnel)
+        Self::finish(mounts, Start::shell(argv), mem_bytes, tunnel)
+    }
+
+    /// Boot a Docker/OCI image: its layers flattened into a read-only root
+    /// (an in-memory squashfs) under a writable tmpfs, and its entrypoint run
+    /// as `docker run` would — command, environment, working directory and
+    /// user from the image, overridden by `opts`. Drive it like any [`Vm`].
+    ///
+    /// # Errors
+    /// A message if the layers don't make a root, the image names nothing to
+    /// run or a program or user it lacks, or as [`Vm::boot`].
+    #[cfg(feature = "oci")]
+    pub fn boot_image(
+        image: &crate::oci::Image,
+        opts: &crate::oci::RunOptions,
+        mem_bytes: u64,
+    ) -> Result<Self, String> {
+        Self::boot_image_with(image, opts, mem_bytes, None)
+    }
+
+    /// [`Vm::boot_image`] with the guest's network carried over `tunnel`, as
+    /// [`Vm::boot_squashfs_net`].
+    ///
+    /// # Errors
+    /// As [`Vm::boot_image`].
+    #[cfg(all(feature = "oci", feature = "tunnel"))]
+    pub fn boot_image_net(
+        image: &crate::oci::Image,
+        opts: &crate::oci::RunOptions,
+        mem_bytes: u64,
+        tunnel: crate::tunnel::Tunnel,
+    ) -> Result<Self, String> {
+        Self::boot_image_with(image, opts, mem_bytes, Some(tunnel))
+    }
+
+    #[cfg(feature = "oci")]
+    fn boot_image_with(
+        image: &crate::oci::Image,
+        opts: &crate::oci::RunOptions,
+        mem_bytes: u64,
+        tunnel: Option<Tunnel>,
+    ) -> Result<Self, String> {
+        let mut mounts = image_root(image)?;
+        let l = image.launch(opts, &mut mounts).map_err(|e| e.to_string())?;
+        let start = Start {
+            argv: l.argv,
+            env: l.env,
+            cwd: l.cwd,
+            uid: l.uid,
+            gid: l.gid,
+            groups: l.groups,
+        };
+        Self::finish(mounts, start, mem_bytes, tunnel)
     }
 
     /// Mount the synthetic filesystems onto `mounts`, load `argv[0]` (following
     /// its `PT_INTERP` linker for dynamic executables), and boot it interactively.
     fn finish(
         mut mounts: MountTable,
-        argv: Vec<String>,
+        start: Start,
         mem_bytes: u64,
         tunnel: Option<Tunnel>,
     ) -> Result<Self, String> {
+        let Start {
+            argv,
+            env,
+            cwd,
+            uid,
+            gid,
+            groups,
+        } = start;
         if argv.is_empty() {
             return Err("empty argv".into());
         }
+        let argv = resolve_script(&mut mounts, argv)?;
         let path = argv[0].clone();
 
         mounts.mount("/tmp", Box::new(TmpFs::new()));
@@ -187,8 +273,8 @@ impl Vm {
         // Page tables in the guest's own format, for its hardware MMU.
         mem.set_guest_arch(arch).map_err(|e| format!("{e:?}"))?;
         let spec = ProcessSpec {
-            argv,
-            envp: default_env(),
+            argv: argv.clone(),
+            envp: env,
         };
         let loaded = if let Some(interp) = interp_path(&elf) {
             let interp_elf = mounts
@@ -215,10 +301,14 @@ impl Vm {
         kernel.set_interactive(true);
         kernel.set_stdout(Box::new(CaptureSink(stdout.clone())));
         kernel.set_stderr(Box::new(CaptureSink(stderr.clone())));
-        // Start at `/` so the demo's hard-coded `/ $` prompt is accurate and a
-        // bare `ls` lists the populated root (Alpine's /root home is empty, which
-        // made `ls` look like it did nothing).
-        kernel.set_cwd("/");
+        // The shell starts at `/` so the demo's hard-coded `/ $` prompt is
+        // accurate and a bare `ls` lists the populated root (Alpine's /root
+        // home is empty, which made `ls` look like it did nothing); an image
+        // starts in its working directory.
+        kernel.set_cwd(cwd);
+        kernel.set_creds(uid, gid, &groups);
+        kernel.set_exe(&path);
+        kernel.set_cmdline(argv);
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
         install_egress(&mut kernel);
@@ -385,6 +475,80 @@ pub(crate) fn install_egress(kernel: &mut Kernel) {
     }
     #[cfg(target_arch = "wasm32")]
     let _ = kernel;
+}
+
+/// An image's root: its layers flattened into an in-memory squashfs, read-only
+/// under a writable tmpfs, with the `/etc/hostname` and `/etc/hosts` a
+/// container runtime puts in where the image has none.
+#[cfg(feature = "oci")]
+pub(crate) fn image_root(image: &crate::oci::Image) -> Result<MountTable, String> {
+    use crate::fs::{FsToolMount, Overlay};
+    let tar = image.rootfs_tar().map_err(|e| e.to_string())?;
+    let lower = FsToolMount::from_tar(&tar).map_err(|e| format!("build the image's root: {e}"))?;
+    drop(tar);
+    let mut mounts = MountTable::new();
+    mounts.mount(
+        "/",
+        Box::new(Overlay::new(Box::new(lower), Box::new(TmpFs::new()))),
+    );
+    if mounts.stat("/etc").is_none() {
+        let _ = mounts.mkdir("/etc", 0o755);
+    }
+    for (path, content) in [
+        ("/etc/hostname", "nixvm\n"),
+        (
+            "/etc/hosts",
+            "127.0.0.1\tlocalhost nixvm\n::1\tlocalhost ip6-localhost ip6-loopback\n",
+        ),
+    ] {
+        if mounts.stat(path).is_none() && mounts.create(path, 0o644).is_ok() {
+            let _ = mounts.write_at(path, 0, content.as_bytes());
+        }
+    }
+    Ok(mounts)
+}
+
+/// PID 1's argv once a `#!` script is replaced by its interpreter, as
+/// `execve` does it (Linux's binfmt_script): `[interpreter, its optional
+/// argument, script, args…]`, up to 4 levels deep. A container image's
+/// entrypoint is often a shell script.
+///
+/// # Errors
+/// A message for a script whose interpreter line is empty, or too deep.
+pub(crate) fn resolve_script(
+    mounts: &mut MountTable,
+    mut argv: Vec<String>,
+) -> Result<Vec<String>, String> {
+    for _ in 0..5 {
+        let Some(path) = argv.first().cloned() else {
+            return Err("empty argv".into());
+        };
+        let Some(target) = mounts.follow(&path) else {
+            return Ok(argv);
+        };
+        let mut head = [0u8; 256];
+        let n = mounts.read_at(&target, 0, &mut head).unwrap_or(0);
+        let head = &head[..n];
+        if !head.starts_with(b"#!") {
+            return Ok(argv);
+        }
+        let line = head[2..].split(|&b| b == b'\n').next().unwrap_or_default();
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim();
+        let (interp, arg) = match line.split_once([' ', '\t']) {
+            Some((i, a)) => (i, Some(a.trim()).filter(|a| !a.is_empty())),
+            None => (line, None),
+        };
+        if interp.is_empty() {
+            return Err(format!("{path}: a #! line with no interpreter"));
+        }
+        let mut next = vec![interp.to_string()];
+        next.extend(arg.map(str::to_string));
+        next.push(path);
+        next.extend(argv.into_iter().skip(1));
+        argv = next;
+    }
+    Err("#! interpreters nest too deep".into())
 }
 
 /// Write a minimal `/etc/resolv.conf` (public resolvers) into the guest root,

@@ -57,6 +57,12 @@ pub enum RootSource {
     /// A named image resolved through the [`ImageStore`] (squashfs; needs
     /// `fstool` and a cached image).
     Image(ImageRef),
+    /// A Docker/OCI image (needs the `oci` feature): a registry name
+    /// (`alpine:3.20`, `ghcr.io/o/i@sha256:…`, pulled with the `fetch`
+    /// feature, blobs cached), or the path of a `docker save` archive or an
+    /// OCI image layout (a tar or a directory). It's run as `docker run`
+    /// would: [`Config::command`], when given, replaces its `Cmd`.
+    Oci(String),
 }
 
 /// Default guest RAM ceiling: 8 GiB, reduced on a host without that much to spare
@@ -114,6 +120,10 @@ pub struct Config {
     /// Syscalls refused to every guest task; `None` leaves the kernel's own
     /// default (`NIXVM_DENY_SYSCALLS`).
     pub syscall_policy: Option<crate::policy::SyscallPolicy>,
+    /// For an image root ([`RootSource::Oci`]): replaces its entrypoint.
+    pub entrypoint: Option<Vec<String>>,
+    /// For an image root: replaces its user (`user`, `uid`, `user:group`).
+    pub user: Option<String>,
 }
 
 /// A host directory shared into the sandbox at a guest mount point.
@@ -162,6 +172,8 @@ impl Default for SandboxBuilder {
                 binds: Vec::new(),
                 env: Vec::new(),
                 syscall_policy: None,
+                entrypoint: None,
+                user: None,
             },
         }
     }
@@ -298,6 +310,32 @@ impl SandboxBuilder {
         self
     }
 
+    /// Run a Docker/OCI image: a registry name or an archive path (see
+    /// [`RootSource::Oci`]).
+    #[must_use]
+    pub fn image(mut self, name: impl Into<String>) -> Self {
+        self.config.root = RootSource::Oci(name.into());
+        self
+    }
+
+    /// Replace the image's entrypoint (`docker run --entrypoint`).
+    #[must_use]
+    pub fn entrypoint<I, S>(mut self, argv: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.entrypoint = Some(argv.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Run the image as `user` (`docker run --user`).
+    #[must_use]
+    pub fn user(mut self, user: impl Into<String>) -> Self {
+        self.config.user = Some(user.into());
+        self
+    }
+
     /// Finish building.
     #[must_use]
     pub fn build(self) -> Sandbox {
@@ -340,10 +378,69 @@ impl Sandbox {
     /// `root_squashfs`). The binary must be a static ELF today — dynamic linking
     /// is not yet wired.
     pub fn run(&self) -> Result<i32, Error> {
-        let mut mounts = self.build_mounts()?;
+        #[cfg(feature = "oci")]
+        let image = match &self.config.root {
+            RootSource::Oci(name) => Some(self.load_image(name)?),
+            _ => None,
+        };
+        #[cfg(feature = "oci")]
+        let lower = match &image {
+            Some(img) => {
+                let tar = img.rootfs_tar()?;
+                let fs = crate::fs::FsToolMount::from_tar(&tar)
+                    .map_err(|e| Error::Config(format!("build the image's root: {e}")))?;
+                Some(Box::new(fs) as Box<dyn MountFs>)
+            }
+            None => self.resolve_lower()?,
+        };
+        #[cfg(not(feature = "oci"))]
+        let lower = self.resolve_lower()?;
+        let mut mounts = self.build_mounts(lower);
         preconfigure(&mut mounts);
 
-        let (path, argv) = self.pid1_program(&mut mounts);
+        let (_, argv) = self.pid1_program(&mut mounts);
+        #[cfg_attr(not(feature = "oci"), allow(unused_mut))]
+        let mut start = Pid1 {
+            env: self.env(),
+            cwd: if self.config.mode == RunMode::Booted {
+                "/".into()
+            } else {
+                "/root".into()
+            },
+            argv,
+            uid: 0,
+            gid: 0,
+            groups: Vec::new(),
+        };
+        #[cfg(feature = "oci")]
+        if let Some(img) = &image {
+            let opts = crate::oci::RunOptions {
+                entrypoint: self.config.entrypoint.clone(),
+                cmd: self.config.command.clone(),
+                env: self.config.env.clone(),
+                user: self.config.user.clone(),
+                working_dir: None,
+            };
+            let l = img.launch(&opts, &mut mounts)?;
+            start = Pid1 {
+                argv: l.argv,
+                env: l.env,
+                cwd: l.cwd,
+                uid: l.uid,
+                gid: l.gid,
+                groups: l.groups,
+            };
+        }
+        let Pid1 {
+            argv,
+            env,
+            cwd,
+            uid,
+            gid,
+            groups,
+        } = start;
+        let argv = crate::vm::resolve_script(&mut mounts, argv).map_err(Error::Config)?;
+        let path = argv[0].clone();
         let elf = mounts.read_file(&path).ok_or_else(|| {
             Error::Config(format!(
                 "cannot read PID 1 `{path}` from the guest root (is the root populated?)"
@@ -361,7 +458,7 @@ impl Sandbox {
             .map_err(|e| Error::Config(format!("guest memory: {e:?}")))?;
         let spec = ProcessSpec {
             argv: argv.clone(),
-            envp: self.env(),
+            envp: env,
         };
         // Dynamic executables name their linker in PT_INTERP; load it alongside.
         let img = if let Some(interp) = interp_path(&elf) {
@@ -388,11 +485,8 @@ impl Sandbox {
         }
         kernel.set_ncpus(self.config.ncpus);
         kernel.set_host_tty(true);
-        kernel.set_cwd(if self.config.mode == RunMode::Booted {
-            "/"
-        } else {
-            "/root"
-        });
+        kernel.set_cwd(cwd);
+        kernel.set_creds(uid, gid, &groups);
         kernel.set_exe(&path); // /proc/self/exe for pid 1
         kernel.set_cmdline(argv); // /proc/self/cmdline + comm for pid 1
         kernel.set_heap(img.program_break, mid);
@@ -403,6 +497,43 @@ impl Sandbox {
         crate::vm::install_egress(&mut kernel);
         calibrate_vdso(vcpu.as_ref(), &mem);
         Ok(kernel.run(vcpu, mem)?)
+    }
+
+    /// Load the image a [`RootSource::Oci`] names: an archive or layout on
+    /// disk, else a pull from its registry. Unless the guest architecture was
+    /// set explicitly, an image without one for this host's runs as the other
+    /// (on the interpreter).
+    #[cfg(feature = "oci")]
+    fn load_image(&self, name: &str) -> Result<crate::oci::Image, Error> {
+        use crate::oci::{Image, OciError};
+        let arch = self.config.arch;
+        let other = match arch {
+            Arch::X86_64 => Arch::Aarch64,
+            Arch::Aarch64 => Arch::X86_64,
+        };
+        let local = Path::new(name);
+        let load = |a: Arch| -> Result<Image, OciError> {
+            if local.is_dir() {
+                return Image::from_dir(local, a);
+            }
+            if local.is_file() {
+                return Image::from_archive(&std::fs::read(local)?, a);
+            }
+            #[cfg(feature = "fetch")]
+            {
+                crate::oci::pull(name, a)
+            }
+            #[cfg(not(feature = "fetch"))]
+            {
+                Err(OciError::Fetch(format!(
+                    "{name} isn't a file, and pulling it from a registry needs the `fetch` feature"
+                )))
+            }
+        };
+        match load(arch) {
+            Err(OciError::Platform(_)) if !self.config.arch_explicit => Ok(load(other)?),
+            r => Ok(r?),
+        }
     }
 
     /// PID 1's path and argv. Booted mode runs init (config override, else
@@ -498,7 +629,7 @@ impl Sandbox {
         let backend = self.backend(arch)?;
         let vcpu = backend.new_vcpu(img.entry, img.stack_pointer)?;
 
-        let mut kernel = Kernel::new(arch, self.build_mounts()?);
+        let mut kernel = Kernel::new(arch, self.build_mounts(self.resolve_lower()?));
         kernel.set_ncpus(self.config.ncpus);
         kernel.set_host_tty(true);
         kernel.set_cwd("/work");
@@ -545,9 +676,9 @@ impl Sandbox {
     /// instances share one read-only lower — or a bare tmpfs when the root is
     /// [`RootSource::Empty`]. `/tmp` is its own tmpfs; `/dev`, `/proc`, `/sys`
     /// are synthetic; `/work` and any binds are host passthroughs ("holes").
-    fn build_mounts(&self) -> Result<MountTable, Error> {
+    fn build_mounts(&self, lower: Option<Box<dyn MountFs>>) -> MountTable {
         let mut mounts = MountTable::new();
-        match self.resolve_lower()? {
+        match lower {
             Some(lower) => {
                 mounts.mount("/", Box::new(Overlay::new(lower, Box::new(TmpFs::new()))));
             }
@@ -580,7 +711,7 @@ impl Sandbox {
                 mounts.mount(b.guest.clone(), Box::new(pt));
             }
         }
-        Ok(mounts)
+        mounts
     }
 
     /// Resolve the overlay's read-only lower layer from the configured
@@ -600,6 +731,10 @@ impl Sandbox {
                 }
             }
             RootSource::Squashfs(path) => open_squashfs(path),
+            // Loaded by `run`, which needs the image's config too.
+            RootSource::Oci(name) => Err(Error::Config(format!(
+                "running the image {name} needs the `oci` feature"
+            ))),
             RootSource::Image(image) => {
                 let store = ImageStore::default_location();
                 let path = store
@@ -609,6 +744,17 @@ impl Sandbox {
             }
         }
     }
+}
+
+/// How PID 1 starts.
+struct Pid1 {
+    /// `argv[0]` is the program's path in the root.
+    argv: Vec<String>,
+    env: Vec<String>,
+    cwd: String,
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
 }
 
 /// Open a squashfs image as an overlay lower layer (needs the `fstool` feature).
@@ -919,7 +1065,7 @@ mod tests {
     #[test]
     fn preconfigure_seeds_etc_and_defaults_to_shell() {
         let sb = Sandbox::builder().build();
-        let mut mounts = sb.build_mounts().unwrap();
+        let mut mounts = sb.build_mounts(sb.resolve_lower().unwrap());
         preconfigure(&mut mounts);
         assert!(
             mounts.stat("/etc/hostname").is_some(),

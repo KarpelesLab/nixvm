@@ -144,6 +144,12 @@ pub struct ImageStore {
 }
 
 impl ImageStore {
+    /// The cache directory.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
         Self { root }
@@ -320,14 +326,15 @@ fn hash_file(path: &Path) -> Result<[u8; 32], ImageError> {
     Ok(hasher.finalize())
 }
 
-#[cfg(test)]
-fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+/// The SHA-256 of `data` (also what OCI blob digests are).
+#[cfg(any(test, feature = "oci"))]
+pub(crate) fn sha256_bytes(data: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(data);
     h.finalize()
 }
 
-fn hex(bytes: &[u8; 32]) -> String {
+pub(crate) fn hex(bytes: &[u8; 32]) -> String {
     use core::fmt::Write as _;
     let mut s = String::with_capacity(64);
     for b in bytes {

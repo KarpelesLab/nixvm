@@ -898,6 +898,17 @@ impl MountTable {
     /// resolves against the guest root, never the host's. `None` for a loop
     /// (more than 40 hops) or a dangling intermediate link.
     pub fn follow(&mut self, abs_path: &str) -> Option<String> {
+        self.follow_until(abs_path, &mut |_| false)
+    }
+
+    /// [`Self::follow`], stopping at the first hop `stop` says to — where the
+    /// kernel finds a "magic" link (`/proc/self/fd/N`) that names an open
+    /// descriptor rather than a path.
+    pub fn follow_until(
+        &mut self,
+        abs_path: &str,
+        stop: &mut dyn FnMut(&str) -> bool,
+    ) -> Option<String> {
         let mut p = normalize(abs_path);
         for _ in 0..SYMLINK_MAX {
             // The link's directories resolved first: a relative target is read
@@ -905,6 +916,9 @@ impl MountTable {
             // holds `ld-linux-x86-64.so.2 -> ../lib/x86_64-linux-gnu/…`, whose
             // `..` is `/usr`, not `/`.
             p = self.canonical(&p);
+            if stop(&p) {
+                return Some(p);
+            }
             match self.stat_raw(&p) {
                 Some(a) if a.kind == NodeKind::Symlink => {
                     let target = self.readlink(&p).ok()?;

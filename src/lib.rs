@@ -14,6 +14,7 @@
 //! * [`fs`]     — the VFS mount table (squashfs, overlay, passthrough, …).
 //! * [`kernel`] — the arch-agnostic syscall engine + process state.
 //! * [`image`]  — guest root-image resolve/download/cache.
+//! * `oci`      — Docker/OCI images: pull, flatten, run (`oci` feature).
 //! * [`sandbox`]— the public [`Sandbox`] builder that wires it all together.
 //!
 //! `unsafe` is confined to the hardware backends (`vcpu::hvf`, `vcpu::kvm`);
@@ -37,6 +38,8 @@ pub mod image;
 pub mod kernel;
 pub mod limits;
 pub mod loader;
+#[cfg(feature = "oci")]
+pub mod oci;
 pub mod policy;
 pub mod sandbox;
 #[cfg(feature = "tunnel")]
@@ -55,6 +58,8 @@ pub enum Error {
     Vcpu(vcpu::VcpuError),
     Load(loader::LoadError),
     Image(image::ImageError),
+    #[cfg(feature = "oci")]
+    Oci(oci::OciError),
     Config(String),
 }
 
@@ -64,6 +69,8 @@ impl core::fmt::Display for Error {
             Self::Vcpu(e) => write!(f, "{e}"),
             Self::Load(e) => write!(f, "{e}"),
             Self::Image(e) => write!(f, "{e}"),
+            #[cfg(feature = "oci")]
+            Self::Oci(e) => write!(f, "{e}"),
             Self::Config(m) => write!(f, "configuration error: {m}"),
         }
     }
@@ -84,5 +91,11 @@ impl From<loader::LoadError> for Error {
 impl From<image::ImageError> for Error {
     fn from(e: image::ImageError) -> Self {
         Self::Image(e)
+    }
+}
+#[cfg(feature = "oci")]
+impl From<oci::OciError> for Error {
+    fn from(e: oci::OciError) -> Self {
+        Self::Oci(e)
     }
 }

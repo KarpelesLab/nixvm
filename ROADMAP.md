@@ -687,6 +687,28 @@ Second and third backends, and the second guest arch.
   `prefer_interp`, `bind`/`bind_ro`) and `Sandbox::exec_elf` are the stable,
   working embeddable surface today; `Sandbox::run()` (the image-based path) is
   blocked on the fetch stub above.
+- **Docker/OCI images (`oci` feature):** done. `oci::Pull` speaks the OCI
+  distribution API (Bearer token and Basic auth, manifest lists picked by
+  platform, attestation entries skipped, every blob and digest-named manifest
+  verified) as a state machine that does no I/O, so the same code pulls
+  natively (`oci::pull`, over `ureq` with the `fetch` feature, blobs cached by
+  digest under the image cache) and in the browser (`wasm::ImagePull`, the page
+  fetching). `docker save` output and OCI layouts load too. Layers (gzip, zstd
+  or plain) are flattened by the OCI rules — whiteouts, opaque directories, a
+  directory re-declared by a later layer keeping its place — into one tar that
+  becomes an in-memory squashfs under a writable tmpfs. `Image::launch` works
+  out `docker run`'s first process: entrypoint and Cmd with overrides, `argv[0]`
+  on the image's `PATH`, environment, working directory, and the user from the
+  image's `/etc/passwd`/`/etc/group` (`Kernel::set_creds`). PID 1 may be a `#!`
+  script. Wired into `Vm::boot_image`, `Sandbox` (`RootSource::Oci`), the CLI
+  (`run --image`, `--entrypoint`, `--user`, `pull`) and `wasm::Terminal`.
+  Checked with alpine, debian, python, node, nginx (serving), bitnami
+  (non-root), distroless and GHCR images, natively and on the wasm build.
+  Ubuntu's root needs fstool's squashfs fixpoint fix (fstool a9c4dfc, in the
+  release after 0.5.3): until then its squashfs fails to build.
+  Left: hard links are written as copies (fstool's squashfs writer can't take
+  one from a stream), `docker run` niceties with no place here yet (volumes,
+  published ports, healthchecks), and a CORS proxy for the browser demo.
 
 ### Phase 12 — Hardening, performance, 1.0
 

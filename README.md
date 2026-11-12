@@ -86,6 +86,7 @@ See [ROADMAP.md](ROADMAP.md) for the phased plan and what's next.
 | **Filesystem** | `tmpfs` (rw in-memory), `overlay` (COW upper/lower), `passthrough` (host dir, **symlink/TOCTOU-safe** — see below), `devfs`, `procfs`, `sysfs`; a real on-disk squashfs/ext reader (`fstoolfs`, via the optional `fstool` crate) exists but isn't wired into the default mount table yet |
 | **Networking** | in-VM AF_UNIX + AF_INET/AF_INET6 loopback (TCP stream + UDP datagram), plus **host-passthrough egress** (opt-in `NIXVM_NET=host`, native only): guest TCP/UDP to routable addresses is bridged to real host sockets, so **`apk update && apk add` work over the real internet on x86-64**. DNS via a host UDP socket + injected `/etc/resolv.conf`. A browser (WebSocket/pktkit) transport and a `smoltcp` NAT stack are the follow-ups. |
 | **I/O multiplexing** | `poll`/`ppoll`/`select`/`pselect6`, `epoll_create1`/`ctl`/`wait`/`pwait2`, `eventfd2`, `timerfd_*` |
+| **Docker/OCI images** | pull from any registry (Docker Hub, GHCR, Quay, GCR, a mirror; anonymous or with credentials) or load a `docker save` / OCI layout archive, flatten the layers (whiteouts, opaque dirs) and run the entrypoint as `docker run` would — no daemon. CLI, library and wasm ([details](#run-docker-images)) |
 | **Browser demo (wasm)** | working — [**live demo**](https://karpeleslab.github.io/nixvm/): `wasm32-unknown-unknown` + interpreter, built and deployed to GitHub Pages by CI on every push to `main` ([details](#try-it-in-your-browser)) |
 
 The syscall dispatch table in `src/kernel/mod.rs` is broad: process/thread
@@ -158,6 +159,41 @@ Useful environment variables (both harnesses):
   routable addresses reach the real internet via host sockets (native only;
   off by default = loopback-only). Lets `apk`/`wget`/`curl` fetch from the
   network.
+
+## Run Docker images
+
+Docker without dockerd: nixvm pulls an image (or reads a `docker save` /
+OCI layout archive), flattens its layers into a read-only root under a
+writable layer, and runs its entrypoint with its environment, working
+directory and user, as `docker run` would. Build with the `oci` feature (and
+`fetch` to pull natively); blobs are cached by digest, so a second pull
+fetches only the manifests.
+
+```sh
+cargo build --release --features oci,fetch
+target/release/nixvm run --image hello-world
+NIXVM_NET=host target/release/nixvm run --image python:3.12-slim -- python3 -c 'print(1)'
+target/release/nixvm run --image nginx:alpine --entrypoint sh -- -c 'nginx -t'
+target/release/nixvm run --image ./saved.tar --user 1000:1000 -- id   # docker save output
+target/release/nixvm pull ghcr.io/owner/image:tag
+```
+
+Arguments after `--` replace the image's `Cmd`; `--entrypoint`, `--user` and
+`--env` work as in `docker run`. An image without a build for the host's
+architecture runs as the other one on the interpreter (`--arch` picks).
+`NIXVM_REGISTRY_USER`/`NIXVM_REGISTRY_PASSWORD` log in.
+
+As a library, `nixvm::oci::pull` (or `oci::Image::from_archive`) gives an
+image and `vm::Vm::boot_image` boots it as a guest you drive — write its stdin,
+pump its output, interrupt it, read its exit code — or
+`Sandbox::builder().image("alpine:3.20")` runs it like the CLI does.
+
+In the browser, `ImagePull` does no networking of its own: the page fetches
+each request it names and feeds the response back, then
+`Terminal.from_image(pull, args, env)` boots it. Registries send no CORS
+headers, so a page sends those requests through a proxy (one that passes
+`WWW-Authenticate` back); `Terminal.from_image_archive` takes a `docker save`
+file the user picked instead.
 
 ## Default sandbox layout
 

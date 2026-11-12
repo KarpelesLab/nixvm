@@ -277,6 +277,62 @@ mod browser {
             })
         }
 
+        /// Boot a Docker/OCI image a finished [`ImagePull`] fetched, as
+        /// `docker run` would: `args`, when given, replace its `Cmd`;
+        /// `env` (`KEY=VALUE`) adds to its environment. Throws if the image
+        /// names nothing to run or lacks the program or user it names.
+        pub fn from_image(
+            pull: ImagePull,
+            args: Vec<String>,
+            env: Vec<String>,
+        ) -> Result<Terminal, JsError> {
+            console_error_panic_hook::set_once();
+            let image = pull
+                .inner
+                .finish()
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            Self::boot_image(&image, args, env)
+        }
+
+        /// Boot an image from an archive: `docker save` output (gzipped or
+        /// not) or an OCI image layout tar, taking `arch`'s image
+        /// (`amd64`/`arm64`) where it holds several. Otherwise as
+        /// [`Terminal::from_image`].
+        pub fn from_image_archive(
+            archive: &[u8],
+            arch: &str,
+            args: Vec<String>,
+            env: Vec<String>,
+        ) -> Result<Terminal, JsError> {
+            console_error_panic_hook::set_once();
+            let arch = Arch::from_name(arch)
+                .ok_or_else(|| JsError::new(&format!("unknown architecture {arch:?}")))?;
+            let image = crate::oci::Image::from_archive(archive, arch)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            Self::boot_image(&image, args, env)
+        }
+
+        fn boot_image(
+            image: &crate::oci::Image,
+            args: Vec<String>,
+            env: Vec<String>,
+        ) -> Result<Terminal, JsError> {
+            let opts = crate::oci::RunOptions {
+                cmd: args,
+                env,
+                ..crate::oci::RunOptions::default()
+            };
+            let net = crate::tunnel::Tunnel::new();
+            let vm = crate::vm::Vm::boot_image_net(image, &opts, MEM_BYTES, net.clone())
+                .map_err(|e| JsError::new(&e))?;
+            Ok(Self {
+                vm,
+                net,
+                out: std::collections::VecDeque::new(),
+                busy: false,
+            })
+        }
+
         /// Bring the network link up with the addresses from the tunnel's
         /// hello: `ipv4` (dotted quad) with its `ipv4_prefix` length, and/or
         /// `ipv6`, the leased range (`"2001:db8:1:2::/64"`, of which the guest
@@ -413,6 +469,117 @@ mod browser {
         #[must_use]
         pub fn exit_code(&self) -> i32 {
             self.vm.exit_code().unwrap_or(-1)
+        }
+    }
+
+    /// Pulling a Docker/OCI image from a registry, with the page doing the
+    /// fetching: `next_request()` says what to `fetch()` (a JSON
+    /// `{url, headers, digest}`, or `undefined` once done), and `feed()`
+    /// takes the response. Registries send no CORS headers, so a page sends
+    /// these requests through a proxy it trusts, and that proxy must pass
+    /// the `WWW-Authenticate` header back. A request whose `digest` is set
+    /// can be answered from a cache keyed by it; every blob is checked
+    /// against its digest either way.
+    ///
+    /// ```js
+    /// const pull = new ImagePull("alpine:3.20", "amd64");
+    /// let req;
+    /// while ((req = pull.next_request()) !== undefined) {
+    ///   const { url, headers } = JSON.parse(req);
+    ///   const r = await fetch(PROXY + encodeURIComponent(url), { headers });
+    ///   pull.feed(r.status, r.headers.get("www-authenticate"),
+    ///             r.headers.get("content-type"),
+    ///             new Uint8Array(await r.arrayBuffer()));
+    /// }
+    /// const term = Terminal.from_image(pull, ["sh"], []);
+    /// ```
+    #[wasm_bindgen]
+    #[derive(Debug)]
+    pub struct ImagePull {
+        inner: crate::oci::Pull,
+    }
+
+    #[wasm_bindgen]
+    impl ImagePull {
+        /// Start pulling `name` (`alpine:3.20`, `ghcr.io/o/i:tag`) for a
+        /// guest of `arch` (`amd64` or `arm64`).
+        #[wasm_bindgen(constructor)]
+        pub fn new(name: &str, arch: &str) -> Result<ImagePull, JsError> {
+            console_error_panic_hook::set_once();
+            let arch = Arch::from_name(arch)
+                .ok_or_else(|| JsError::new(&format!("unknown architecture {arch:?}")))?;
+            let inner =
+                crate::oci::Pull::new(name, arch).map_err(|e| JsError::new(&e.to_string()))?;
+            Ok(Self { inner })
+        }
+
+        /// Log in to the registry (a token can go as the password).
+        pub fn set_credentials(&mut self, user: &str, password: &str) {
+            self.inner.set_credentials(user, password);
+        }
+
+        /// Talk to `base` (a mirror) instead of the registry the name says.
+        pub fn set_registry_base(&mut self, base: &str) {
+            self.inner.set_registry_base(base);
+        }
+
+        /// The next request, as JSON `{"url", "headers": {name: value},
+        /// "digest": string|null}`; `undefined` once everything is fetched.
+        #[must_use]
+        pub fn next_request(&self) -> Option<String> {
+            use crate::oci::json::quote;
+            let r = self.inner.next_request()?;
+            let headers: Vec<String> = r
+                .headers
+                .iter()
+                .map(|(k, v)| format!("{}:{}", quote(k), quote(v)))
+                .collect();
+            Some(format!(
+                r#"{{"url":{},"headers":{{{}}},"digest":{}}}"#,
+                quote(&r.url),
+                headers.join(","),
+                r.digest.as_deref().map_or("null".to_string(), quote)
+            ))
+        }
+
+        /// Hand over the response to the last request (after redirects):
+        /// its status, `WWW-Authenticate` and `Content-Type` headers, and
+        /// body. Throws on a registry error or bad content.
+        pub fn feed(
+            &mut self,
+            status: u16,
+            www_authenticate: Option<String>,
+            content_type: Option<String>,
+            body: Vec<u8>,
+        ) -> Result<(), JsError> {
+            let mut headers = Vec::new();
+            if let Some(v) = www_authenticate {
+                headers.push(("www-authenticate".to_string(), v));
+            }
+            if let Some(v) = content_type {
+                headers.push(("content-type".to_string(), v));
+            }
+            self.inner
+                .feed(crate::oci::Response {
+                    status,
+                    headers,
+                    body,
+                })
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// `[layers fetched, layers in all, bytes fetched, bytes in all]`;
+        /// the totals are known once the manifest is in.
+        #[must_use]
+        pub fn progress(&self) -> Vec<f64> {
+            let (l, lt, b, bt) = self.inner.progress();
+            vec![l as f64, lt as f64, b as f64, bt as f64]
+        }
+
+        /// Whether everything has been fetched.
+        #[must_use]
+        pub fn is_done(&self) -> bool {
+            self.inner.is_done()
         }
     }
 

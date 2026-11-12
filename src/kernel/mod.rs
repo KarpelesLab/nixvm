@@ -42,7 +42,7 @@ mod net;
 mod ns;
 mod orphan;
 mod pagecache;
-mod path;
+pub(crate) mod path;
 mod pidns;
 mod poll;
 mod prctl;
@@ -2529,6 +2529,23 @@ impl Kernel {
     /// Set the first process's current working directory.
     pub fn set_cwd(&mut self, dir: impl Into<String>) {
         self.seed.cwd = path::normalize(&dir.into());
+    }
+
+    /// Start the first process as `uid`/`gid` (every one of its real,
+    /// effective, saved and filesystem ids) with supplementary `groups` — a
+    /// container image's `USER`.
+    pub fn set_creds(&mut self, uid: u32, gid: u32, groups: &[u32]) {
+        self.seed.creds = Creds {
+            ruid: uid,
+            euid: uid,
+            suid: uid,
+            fsuid: uid,
+            rgid: gid,
+            egid: gid,
+            sgid: gid,
+            fsgid: gid,
+        };
+        self.seed.groups = groups.to_vec();
     }
 
     /// Set the first process's program path (for `/proc/self/exe`); later
@@ -8985,10 +9002,20 @@ impl Kernel {
         {
             return err(Errno::ELOOP);
         }
-        let abs = match self.follow_or_eloop(vfs, &resolved) {
-            Ok(p) => p,
-            Err(e) => return e,
+        // The final link chain, hop by hop: one landing on this process's
+        // `/proc/self/fd/N` (`/dev/stdout`, `/dev/fd/N`, a log file linked to
+        // `/dev/stderr`) is a magic link that reopens descriptor N itself.
+        let mut magic = None;
+        let followed = vfs.follow_until(&resolved, &mut |p| {
+            magic = self.own_fd_link(cx, p);
+            magic.is_some()
+        });
+        let Some(abs) = followed else {
+            return err(Errno::ELOOP);
         };
+        if let Some(n) = magic {
+            return self.reopen_fd(vfs, cx, n, flags, mode);
+        }
         if self.trace {
             eprintln!("[open] pid={} {abs:?}", cx.cur.pid);
         }
@@ -9098,6 +9125,68 @@ impl Kernel {
         const O_APPEND: u64 = 0o2000;
         cx.cur.fds.set_cloexec(fd, flags & O_CLOEXEC != 0);
         cx.cur.fds.set_append(fd, flags & O_APPEND != 0);
+        i64::from(fd)
+    }
+
+    /// The descriptor `abs` names when it's this process's
+    /// `/proc/{self,thread-self,<pid>}/fd/N`.
+    fn own_fd_link(&self, cx: &ServiceCtx, abs: &str) -> Option<i32> {
+        let rest = abs.strip_prefix("/proc/")?;
+        let (who, tail) = rest.split_once('/')?;
+        if who != "self"
+            && who != "thread-self"
+            && who != self.visible_pid(cx, cx.cur.tgid).to_string()
+        {
+            return None;
+        }
+        tail.strip_prefix("fd/")?.parse().ok()
+    }
+
+    /// Open descriptor `n` again through its `/proc/self/fd/N` link, as Linux
+    /// does: a file or directory is opened again by its path (a new open file
+    /// description, `flags` applying); a pipe gives the end the access mode
+    /// asks for, a FIFO opens as FIFOs do; a terminal or the console is shared.
+    /// A socket can't be opened this way (`ENXIO`).
+    fn reopen_fd(
+        &self,
+        vfs: &mut MountTable,
+        cx: &mut ServiceCtx,
+        n: i32,
+        flags: u64,
+        mode: u64,
+    ) -> i64 {
+        const O_ACCMODE: u64 = 0o3;
+        const O_NONBLOCK: u64 = 0o4000;
+        const O_CLOEXEC: u64 = 0o2000000;
+        let Some(fd) = cx.cur.fds.get(n).cloned() else {
+            return err(Errno::ENOENT);
+        };
+        let new = match &fd {
+            Fd::File { path, .. } | Fd::Dir { path, .. } => {
+                let path = Self::as_seen_from_root(cx, path);
+                return self.open_path(vfs, cx, AT_FDCWD, &path, flags, mode);
+            }
+            Fd::PipeRead(i, open) | Fd::PipeWrite(i, open) => {
+                if let Some(node) = open.as_ref().map(FifoOpen::node).filter(|n| *n != (0, 0)) {
+                    return self.open_fifo(cx, node, flags);
+                }
+                let nonblock = flags & O_NONBLOCK != 0;
+                match flags & O_ACCMODE {
+                    0 => Fd::PipeRead(*i, Some(FifoOpen::new((0, 0), nonblock, false))),
+                    1 => Fd::PipeWrite(*i, Some(FifoOpen::new((0, 0), nonblock, false))),
+                    _ => Fd::PipeRead(*i, Some(FifoOpen::new((0, 0), nonblock, true))),
+                }
+            }
+            Fd::Stdin | Fd::Stdout | Fd::Stderr | Fd::Tty => fd.clone(),
+            Fd::PtySlave(p) => {
+                self.ptys.lock().unwrap().open_slave(*p, pgid_of(&cx.cur));
+                fd.clone()
+            }
+            _ => return err(Errno::ENXIO),
+        };
+        self.bump_pipe(&new, true);
+        let fd = cx.cur.fds.alloc(new);
+        cx.cur.fds.set_cloexec(fd, flags & O_CLOEXEC != 0);
         i64::from(fd)
     }
 
