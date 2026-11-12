@@ -102,7 +102,7 @@ pub const VVAR_VA: u64 = CTRL_GPA + VVAR_OFF;
 /// tables: the code that flushes stale translations after the host changed a
 /// process's tables must itself never be fetched through them.
 #[cfg_attr(
-    not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+    not(all(target_os = "macos", target_arch = "aarch64")),
     allow(dead_code)
 )]
 pub const VECTORS_VA: u64 = 0xFFFF_FF80_0000_0000;
@@ -110,7 +110,7 @@ pub const VECTORS_VA: u64 = 0xFFFF_FF80_0000_0000;
 /// `TCR_EL1.T1SZ` for the upper half: 39-bit, so its walk starts at level 1
 /// and [`VECTORS_VA`] needs three tables.
 #[cfg_attr(
-    not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+    not(all(target_os = "macos", target_arch = "aarch64")),
     allow(dead_code)
 )]
 pub const ARM_T1SZ: u64 = 25;
@@ -118,7 +118,7 @@ pub const ARM_T1SZ: u64 = 25;
 /// The layout of the arm64 vector page.
 pub mod vectors {
     #![cfg_attr(
-        not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+        not(all(target_os = "macos", target_arch = "aarch64")),
         allow(dead_code)
     )]
     /// Offset of the TLB/instruction-cache flush stub: entered at EL1 with the
@@ -361,7 +361,7 @@ pub fn build_arm_kernel_tables(phys: &PhysMem) {
 /// `TTBR1_EL1` for an arm64 pool: the guest-physical address of its upper-half
 /// level-1 table (see [`build_arm_kernel_tables`]).
 #[cfg_attr(
-    not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+    not(all(target_os = "macos", target_arch = "aarch64")),
     allow(dead_code)
 )]
 #[must_use]

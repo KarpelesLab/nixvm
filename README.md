@@ -109,9 +109,18 @@ cargo build --release
 cargo test
 ```
 
-On macOS/arm64 the HVF backend is exercised by a separate, `#[ignore]`d test
-suite (it needs a binary codesigned with the `com.apple.security.hypervisor`
-entitlement, which `cargo test` can't do for itself):
+On macOS/arm64, aarch64 guests run on Hypervisor.framework once the binary is
+codesigned with the `com.apple.security.hypervisor` entitlement (the released
+macOS binaries are); an unsigned one quietly uses the interpreter:
+
+```sh
+cargo build --release
+scripts/sign-macos.sh        # ad-hoc signs target/release/{nixvm,run-elf}
+target/release/nixvm run --root ./alpine-rootfs -- /bin/sh
+```
+
+The HVF backend's own tests are `#[ignore]`d for the same reason
+(`cargo test` can't sign its test binary):
 
 ```sh
 scripts/hvf-test.sh          # builds, ad-hoc codesigns, runs the HVF tests

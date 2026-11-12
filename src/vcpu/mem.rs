@@ -361,7 +361,7 @@ impl GuestMemory {
     #[cfg_attr(
         not(any(
             all(target_os = "linux", target_arch = "x86_64"),
-            all(feature = "hvf", target_os = "macos", target_arch = "aarch64")
+            all(target_os = "macos", target_arch = "aarch64")
         )),
         allow(dead_code)
     )] // hardware backends only
@@ -375,7 +375,7 @@ impl GuestMemory {
     #[cfg_attr(
         not(any(
             all(target_os = "linux", target_arch = "x86_64"),
-            all(feature = "hvf", target_os = "macos", target_arch = "aarch64")
+            all(target_os = "macos", target_arch = "aarch64")
         )),
         allow(dead_code)
     )] // hardware backends only
@@ -388,7 +388,7 @@ impl GuestMemory {
     #[cfg_attr(
         not(any(
             all(target_os = "linux", target_arch = "x86_64"),
-            all(feature = "hvf", target_os = "macos", target_arch = "aarch64")
+            all(target_os = "macos", target_arch = "aarch64")
         )),
         allow(dead_code)
     )] // hardware backends only
@@ -440,7 +440,7 @@ impl GuestMemory {
     /// field): whether the host wrote into a page the guest may execute since
     /// the last check.
     #[cfg_attr(
-        not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+        not(all(target_os = "macos", target_arch = "aarch64")),
         allow(dead_code)
     )]
     pub(crate) fn take_icache_dirty(&mut self) -> bool {
@@ -451,7 +451,7 @@ impl GuestMemory {
     /// walker (see [`PhysMem::base`]).
     #[must_use]
     #[cfg_attr(
-        not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+        not(all(target_os = "macos", target_arch = "aarch64")),
         allow(dead_code)
     )]
     pub(crate) fn phys_base(&self) -> u64 {
@@ -461,7 +461,7 @@ impl GuestMemory {
     /// `TTBR1_EL1` for this (arm64) pool: its upper-half kernel tables.
     #[must_use]
     #[cfg_attr(
-        not(all(feature = "hvf", target_os = "macos", target_arch = "aarch64")),
+        not(all(target_os = "macos", target_arch = "aarch64")),
         allow(dead_code)
     )]
     pub(crate) fn arm_ttbr1(&self) -> u64 {

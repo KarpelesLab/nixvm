@@ -127,6 +127,14 @@ jobs:
           cp README.md LICENSE staging/
           file staging/bin/*
 
+      # Ad-hoc sign with the hypervisor entitlement: on Apple Silicon the
+      # binaries then run guests on Hypervisor.framework (without it they fall
+      # back to the interpreter). The x86_64 slice has no HVF and ignores it.
+      - name: Codesign with the hypervisor entitlement
+        run: |
+          scripts/sign-macos.sh staging/bin/nixvm staging/bin/run-elf staging/bin/run-elf-x86
+          codesign -d --entitlements - staging/bin/nixvm
+
       - name: Pack archive
         id: pack
         run: |

@@ -351,9 +351,9 @@ pub trait Backend {
     fn new_vcpu(&self, entry: u64, stack: u64) -> Result<Box<dyn Vcpu>, VcpuError>;
 }
 
-// Behind the `hvf` feature: running it needs a binary codesigned with the
+// Always built on macOS/arm64; running it needs a binary codesigned with the
 // hypervisor entitlement, which `select` probes for at runtime.
-#[cfg(all(feature = "hvf", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -374,7 +374,7 @@ pub(crate) mod softfloat;
 /// `SandboxBuilder::prefer_interp`).
 pub fn select(guest: Arch) -> Result<Box<dyn Backend>, VcpuError> {
     let force_interp = std::env::var_os("NIXVM_INTERP").is_some_and(|v| v == "1");
-    #[cfg(all(feature = "hvf", target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         // When the hypervisor is unavailable/unentitled, `new` fails and we fall
         // through to the interpreter.
