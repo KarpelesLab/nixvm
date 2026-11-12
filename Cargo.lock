@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "nixvm"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "compcol",
  "console_error_panic_hook",
