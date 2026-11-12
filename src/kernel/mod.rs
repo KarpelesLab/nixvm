@@ -3743,6 +3743,7 @@ impl Kernel {
         charge_vruntime(&mut cx.cur, delta);
         self.charge_cpu_time(&mut cx, delta);
         let stopped;
+        let mut killed = false;
         {
             let mut sh = self.shared.lock().unwrap();
             // Fold in what other workers did to the stand-in meanwhile: signals
@@ -3793,6 +3794,21 @@ impl Kernel {
                     (cx.cur.nice, cx.cur.affinity) = (s.nice, s.affinity);
                     (cx.cur.rt_requeue, cx.cur.rt_slice_ns) = (s.rt_requeue, s.rt_slice_ns);
                 }
+                // Another thread's `exit_group` killed it meanwhile: it dies
+                // with the group rather than coming back to life. Its fd table
+                // was checked out here, out of that `exit_group`'s reach, so
+                // it's closed now.
+                if let RunState::Zombie(cause) = stand_in.info.run
+                    && !matches!(cx.cur.run, RunState::Zombie(_))
+                {
+                    cx.cur.run = RunState::Zombie(cause);
+                    killed = true;
+                }
+            }
+            if killed {
+                for fd in cx.cur.fds.drain() {
+                    self.bump_pipe(&fd, false);
+                }
             }
             if rt_priority(&cx.cur).is_some() {
                 sh.charge_rt_window(usize::from(cx.cur.cpu), delta);
@@ -3816,6 +3832,9 @@ impl Kernel {
                     }
                 }
             }
+        }
+        if killed {
+            return SliceStep::Ended;
         }
         match flow {
             Serviced::SetRet => {
@@ -5912,7 +5931,11 @@ impl Kernel {
             if wanted(&p.info) {
                 has_child = true;
                 match p.info.run {
-                    RunState::Zombie(code) if zombie.is_none() => {
+                    // A task still finishing its exit on another CPU (its
+                    // stand-in marked by `exit_group`) isn't reapable yet:
+                    // reaping it frees its slot, which its check-in would then
+                    // take back from whatever was forked into it.
+                    RunState::Zombie(code) if zombie.is_none() && !p.info.in_flight => {
                         zombie = Some((p.info.pid, code, p.info.cpu_ns));
                     }
                     RunState::Stopped(sig) if !p.info.stop_reported && stopped.is_none() => {
@@ -6045,7 +6068,10 @@ impl Kernel {
             if p.info.ppid == cur && !p.info.is_thread && matches_id(&p.info) {
                 has_child = true;
                 match p.info.run {
-                    RunState::Zombie(code) if zombie.is_none() && options & WEXITED != 0 => {
+                    // (Not one still finishing its exit on another CPU: see wait4.)
+                    RunState::Zombie(code)
+                        if zombie.is_none() && options & WEXITED != 0 && !p.info.in_flight =>
+                    {
                         zombie = Some((p.info.pid, code, p.info.cpu_ns));
                     }
                     RunState::Stopped(sig) if !p.info.stop_reported && stopped.is_none() => {
@@ -11977,6 +12003,64 @@ mod tests {
             0,
             "no WIFEXITED exit code for a signal death"
         );
+    }
+
+    /// A child still finishing its exit on another CPU — its slot holds the
+    /// SMP stand-in, which `exit_group` marked a zombie — isn't reapable until
+    /// it checks back in. Reaping it freed the slot for the next `fork`, and
+    /// the check-in then overwrote that new child with the old one's zombie:
+    /// the parent's next `waitpid` got ECHILD (rlimits on CI, 3 CPUs).
+    #[test]
+    fn a_child_still_exiting_on_another_cpu_is_not_reaped_yet() {
+        const WNOHANG: u64 = 1;
+        let (k, mut mem, mut v, mut cx) = setup();
+        let child = call(&k, &mut cx, &mut mem, &mut v, Sysno::Clone, [0; 6]);
+        assert_eq!(child, 2);
+        let mark = |in_flight: bool| {
+            for p in k.shared.lock().unwrap().procs.iter_mut().flatten() {
+                if p.info.pid == 2 {
+                    p.info.run = RunState::Zombie(ExitCause::Exited(3));
+                    p.info.in_flight = in_flight;
+                }
+            }
+        };
+        mark(true);
+        let ws = 0x1_0000;
+        let wait = |cx: &mut ServiceCtx, mem: &mut GuestMemory, v: &mut _, opts: u64| {
+            call(
+                &k,
+                cx,
+                mem,
+                v,
+                Sysno::Wait4,
+                [child as u64, ws, opts, 0, 0, 0],
+            )
+        };
+        assert_eq!(
+            wait(&mut cx, &mut mem, &mut v, WNOHANG),
+            0,
+            "still there, not reaped"
+        );
+        let mut info = [0u8; 128];
+        let r = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Waitid,
+            [1, child as u64, 0x1_0100, 4 | WNOHANG, 0, 0],
+        );
+        assert_eq!(r, 0);
+        mem.read(0x1_0100, &mut info).unwrap();
+        assert_eq!(
+            &info[16..20],
+            &[0; 4],
+            "waitid reports no child yet (si_pid 0)"
+        );
+        // Checked back in: now it's reaped, with its status.
+        mark(false);
+        assert_eq!(wait(&mut cx, &mut mem, &mut v, 0), 2);
+        assert_eq!(mem.read_u32(ws).unwrap(), 3 << 8);
     }
 
     /// Helper: set a table process's `run` state, by pid.
