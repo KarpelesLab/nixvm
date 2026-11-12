@@ -106,6 +106,50 @@ const SYMS: &[Sym] = &[
     },
 ];
 
+/// The aarch64 vDSO's code (assembled from `vdso_aarch64.s`): Linux's arm64
+/// vDSO symbols, reading `cntvct_el0` against the same vvar calibration. The
+/// vvar VA is one shared literal, at [`VVAR_PATCH_AARCH64`].
+const CODE_AARCH64: &[u8] = &[
+    0x1f, 0x18, 0x00, 0xf1, 0x08, 0x04, 0x00, 0x54, 0x1f, 0x08, 0x00, 0xf1, 0xc0, 0x03, 0x00, 0x54,
+    0x1f, 0x0c, 0x00, 0xf1, 0x80, 0x03, 0x00, 0x54, 0x49, 0x08, 0x00, 0x58, 0x2a, 0x05, 0x40, 0xf9,
+    0x2a, 0x03, 0x00, 0xb4, 0xdf, 0x3f, 0x03, 0xd5, 0x4b, 0xe0, 0x3b, 0xd5, 0x2c, 0x0d, 0x40, 0xf9,
+    0x6b, 0x01, 0x0c, 0xcb, 0x6d, 0x7d, 0x0a, 0x9b, 0x6e, 0x7d, 0xca, 0x9b, 0x2f, 0x09, 0x40, 0xf9,
+    0xad, 0x25, 0xcf, 0x9a, 0xef, 0x03, 0x0f, 0xcb, 0xce, 0x21, 0xcf, 0x9a, 0xad, 0x01, 0x0e, 0xaa,
+    0x1f, 0x00, 0x00, 0xf1, 0x04, 0x18, 0x45, 0xfa, 0x2c, 0x11, 0x40, 0xf9, 0x2e, 0x15, 0x40, 0xf9,
+    0xcc, 0x01, 0x8c, 0x9a, 0xad, 0x01, 0x0c, 0x8b, 0x0f, 0x40, 0x99, 0xd2, 0x4f, 0x73, 0xa7, 0xf2,
+    0xb0, 0x09, 0xcf, 0x9a, 0x11, 0xb6, 0x0f, 0x9b, 0x30, 0x44, 0x00, 0xa9, 0x00, 0x00, 0x80, 0xd2,
+    0xc0, 0x03, 0x5f, 0xd6, 0x28, 0x0e, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6,
+    0x41, 0x00, 0x00, 0xb4, 0x3f, 0x00, 0x00, 0xf9, 0x00, 0x03, 0x00, 0xb4, 0x29, 0x04, 0x00, 0x58,
+    0x2a, 0x05, 0x40, 0xf9, 0xea, 0x02, 0x00, 0xb4, 0xdf, 0x3f, 0x03, 0xd5, 0x4b, 0xe0, 0x3b, 0xd5,
+    0x2c, 0x0d, 0x40, 0xf9, 0x6b, 0x01, 0x0c, 0xcb, 0x6d, 0x7d, 0x0a, 0x9b, 0x6e, 0x7d, 0xca, 0x9b,
+    0x2f, 0x09, 0x40, 0xf9, 0xad, 0x25, 0xcf, 0x9a, 0xef, 0x03, 0x0f, 0xcb, 0xce, 0x21, 0xcf, 0x9a,
+    0xad, 0x01, 0x0e, 0xaa, 0x2c, 0x15, 0x40, 0xf9, 0xad, 0x01, 0x0c, 0x8b, 0x0f, 0x40, 0x99, 0xd2,
+    0x4f, 0x73, 0xa7, 0xf2, 0xb0, 0x09, 0xcf, 0x9a, 0x11, 0xb6, 0x0f, 0x9b, 0x0f, 0x7d, 0x80, 0xd2,
+    0x31, 0x0a, 0xcf, 0x9a, 0x10, 0x44, 0x00, 0xa9, 0x00, 0x00, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6,
+    0x28, 0x15, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6, 0x48, 0x0e, 0x80, 0xd2,
+    0x01, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6, 0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4,
+    0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+];
+const VVAR_PATCH_AARCH64: [usize; 1] = [0x120];
+const SYMS_AARCH64: &[Sym] = &[
+    Sym {
+        name: "__kernel_clock_gettime",
+        off: 0x0,
+    },
+    Sym {
+        name: "__kernel_gettimeofday",
+        off: 0x90,
+    },
+    Sym {
+        name: "__kernel_clock_getres",
+        off: 0x10c,
+    },
+    Sym {
+        name: "__kernel_rt_sigreturn",
+        off: 0x118,
+    },
+];
+
 // ---- ELF-image layout (all within one 4 KiB page, ET_DYN, load base = 0) ----
 // The ELF header sits at offset 0. Everything below is a fixed offset into the
 // one-page image; `build_image` writes each region there. Sized for the 5-symbol
@@ -130,19 +174,38 @@ fn w16(buf: &mut [u8], off: u64, v: u16) {
     buf[off as usize..off as usize + 2].copy_from_slice(&v.to_le_bytes());
 }
 
-/// Build the 4 KiB vDSO ELF image, with the `movabs` clock-page immediates
-/// patched to `vvar_va` (the absolute guest VA the vvar page is mapped at).
+/// Build the 4 KiB x86-64 vDSO ELF image, with the `movabs` clock-page
+/// immediates patched to `vvar_va` (the absolute guest VA the vvar page is
+/// mapped at).
 #[must_use]
 pub fn build_image(vvar_va: u64) -> [u8; PAGE] {
+    build(62, CODE, SYMS, &VVAR_PATCH, vvar_va)
+}
+
+/// [`build_image`] for an aarch64 guest.
+#[must_use]
+pub fn build_image_aarch64(vvar_va: u64) -> [u8; PAGE] {
+    build(
+        183,
+        CODE_AARCH64,
+        SYMS_AARCH64,
+        &VVAR_PATCH_AARCH64,
+        vvar_va,
+    )
+}
+
+/// Lay out the one-page vDSO for `machine` (`e_machine`) around `code`,
+/// exporting `syms` and patching the vvar VA in at `patches`.
+fn build(machine: u16, code: &[u8], syms: &[Sym], patches: &[usize], vvar_va: u64) -> [u8; PAGE] {
     let mut b = [0u8; PAGE];
 
-    // ELF header: ET_DYN, EM_X86_64.
+    // ELF header: ET_DYN.
     b[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
     b[4] = 2; // ELFCLASS64
     b[5] = 1; // ELFDATA2LSB
     b[6] = 1; // EV_CURRENT
     w16(&mut b, 16, 3); // e_type = ET_DYN
-    w16(&mut b, 18, 62); // e_machine = EM_X86_64
+    w16(&mut b, 18, machine); // e_machine
     w32(&mut b, 20, 1); // e_version
     w64(&mut b, 32, PHDR); // e_phoff
     w16(&mut b, 52, 64); // e_ehsize
@@ -169,7 +232,7 @@ pub fn build_image(vvar_va: u64) -> [u8; PAGE] {
     w64(&mut b, PHDR + 56 + 40, 6 * 16); // p_memsz
     w64(&mut b, PHDR + 56 + 48, 8); // p_align
 
-    let nsym = SYMS.len() as u64; // exported symbols (index 1..=nsym)
+    let nsym = syms.len() as u64; // exported symbols (index 1..=nsym)
     let nchain = nsym + 1; // + the reserved null symbol at index 0
 
     // SysV hash: a single bucket whose chain threads every symbol (1→2→…→N→end),
@@ -188,7 +251,7 @@ pub fn build_image(vvar_va: u64) -> [u8; PAGE] {
     // each name's offset for the matching .dynsym entry.
     let mut str_off = 1u64; // byte 0 is the empty string
     let mut name_offs = [0u64; 8];
-    for (i, s) in SYMS.iter().enumerate() {
+    for (i, s) in syms.iter().enumerate() {
         name_offs[i] = str_off;
         let at = (DYNSTR + str_off) as usize;
         b[at..at + s.name.len()].copy_from_slice(s.name.as_bytes());
@@ -199,13 +262,13 @@ pub fn build_image(vvar_va: u64) -> [u8; PAGE] {
     // Dynamic symbols. sym[0] is the reserved null entry (already zero); each
     // exported function follows. st_info = (STB_GLOBAL<<4)|STT_FUNC = 0x12;
     // st_shndx = 1 (defined in the single load segment).
-    for (i, s) in SYMS.iter().enumerate() {
+    for (i, s) in syms.iter().enumerate() {
         let sym = DYNSYM + (i as u64 + 1) * 24;
         w32(&mut b, sym, name_offs[i] as u32); // st_name
         b[sym as usize + 4] = 0x12; // st_info
         w16(&mut b, sym + 6, 1); // st_shndx
         w64(&mut b, sym + 8, TEXT + s.off); // st_value
-        let end = SYMS.get(i + 1).map_or(CODE.len() as u64, |n| n.off);
+        let end = syms.get(i + 1).map_or(code.len() as u64, |n| n.off);
         w64(&mut b, sym + 16, end - s.off); // st_size
     }
 
@@ -231,11 +294,11 @@ pub fn build_image(vvar_va: u64) -> [u8; PAGE] {
     );
     debug_assert!(DYNSYM + nchain * 24 <= DYNSTR, "dynsym overlaps dynstr");
     debug_assert!(DYNSTR + strsz <= DYNAMIC, "dynstr overlaps dynamic");
-    debug_assert!(TEXT as usize + CODE.len() <= PAGE, "code overruns the page");
+    debug_assert!(TEXT as usize + code.len() <= PAGE, "code overruns the page");
 
     // Code, with the vvar VA patched into each `movabs` immediate.
-    b[TEXT as usize..TEXT as usize + CODE.len()].copy_from_slice(CODE);
-    for &p in &VVAR_PATCH {
+    b[TEXT as usize..TEXT as usize + code.len()].copy_from_slice(code);
+    for &p in patches {
         assert_eq!(
             &b[TEXT as usize + p..TEXT as usize + p + 8],
             &0x1122_3344_5566_7788u64.to_le_bytes(),
@@ -255,8 +318,20 @@ mod tests {
     /// regression guard on the ELF.
     #[test]
     fn image_exports_all_clock_symbols() {
+        check_image(&build_image(0xF_FFE4_9000), 62, SYMS, &VVAR_PATCH);
+    }
+
+    #[test]
+    fn aarch64_image_exports_the_arm64_symbols() {
+        let img = build_image_aarch64(0xF_FFE4_9000);
+        check_image(&img, 183, SYMS_AARCH64, &VVAR_PATCH_AARCH64);
+        // The vvar literal is 8-aligned, as `ldr x9, <literal>` needs.
+        assert_eq!((TEXT as usize + VVAR_PATCH_AARCH64[0]) % 8, 0);
+    }
+
+    fn check_image(img: &[u8; PAGE], machine: u16, syms: &[Sym], patches: &[usize]) {
         let vvar = 0xF_FFE4_9000u64;
-        let img = build_image(vvar);
+        assert_eq!(u16::from_le_bytes([img[18], img[19]]), machine);
         // ELF magic + ET_DYN.
         assert_eq!(&img[0..4], &[0x7f, b'E', b'L', b'F']);
         assert_eq!(u16::from_le_bytes([img[16], img[17]]), 3);
@@ -320,7 +395,7 @@ mod tests {
             ));
         }
         // Every exported symbol resolves to the right code offset.
-        for s in SYMS {
+        for s in syms {
             assert_eq!(
                 resolved.get(s.name),
                 Some(&(TEXT + s.off)),
@@ -330,12 +405,12 @@ mod tests {
         }
         assert_eq!(
             resolved.len(),
-            SYMS.len(),
+            syms.len(),
             "chain reaches exactly the exports"
         );
 
-        // The vvar VA was patched into every movabs immediate.
-        for &p in &VVAR_PATCH {
+        // The vvar VA was patched into every immediate/literal.
+        for &p in patches {
             let got = u64::from_le_bytes(
                 img[(TEXT + p as u64) as usize..(TEXT + p as u64) as usize + 8]
                     .try_into()

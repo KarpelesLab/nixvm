@@ -824,13 +824,19 @@ fn build_stack(
     let platform_addr = str_base + platform_off;
     let random_bytes = deterministic_random16(&blob);
 
-    // Advertise the vDSO (x86-64 only — it is part of that arch's control block)
-    // via AT_SYSINFO_EHDR so musl uses `__vdso_clock_gettime` instead of the
-    // syscall. AT_IGNORE elsewhere. The vDSO self-disables (falls back to the
-    // syscall) until the host writes its TSC calibration, so this is always safe.
+    // Advertise the vDSO in the control block via AT_SYSINFO_EHDR so libc reads
+    // the clock without a syscall: the x86-64 one, or the aarch64 one once the
+    // memory's page tables are arm64 (that's when it is written). AT_IGNORE
+    // otherwise. The vDSO falls back to the syscall until the host writes its
+    // counter calibration, so this is always safe.
     const AT_SYSINFO_EHDR: u64 = 33;
     const AT_IGNORE: u64 = 1;
-    let (sysinfo_tag, sysinfo_val) = if ehdr.machine == EM_X86_64 {
+    let vdso_matches = match ehdr.machine {
+        EM_X86_64 => mem.page_table_format() == crate::vcpu::PtFormat::X86_64,
+        EM_AARCH64 => mem.page_table_format() == crate::vcpu::PtFormat::Aarch64,
+        _ => false,
+    };
+    let (sysinfo_tag, sysinfo_val) = if vdso_matches {
         (AT_SYSINFO_EHDR, crate::vcpu::ctrl::VDSO_VA)
     } else {
         (AT_IGNORE, 0)

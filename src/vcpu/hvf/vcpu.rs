@@ -339,8 +339,15 @@ fn now_ticks() -> u64 {
 
 /// `d` in `mach_absolute_time` ticks (at least one).
 fn ns_to_ticks(d: Duration) -> u64 {
+    let (numer, denom) = timebase();
+    let ticks = d.as_nanos() * u128::from(denom) / u128::from(numer);
+    (ticks as u64).max(1)
+}
+
+/// The host timebase: `mach_absolute_time` ticks × `numer / denom` = ns.
+fn timebase() -> (u64, u64) {
     static TB: OnceLock<(u64, u64)> = OnceLock::new();
-    let &(numer, denom) = TB.get_or_init(|| {
+    *TB.get_or_init(|| {
         let mut tb = sys::mach_timebase_info_data_t::default();
         // SAFETY: a valid out-pointer.
         unsafe { sys::mach_timebase_info(&raw mut tb) };
@@ -349,9 +356,7 @@ fn ns_to_ticks(d: Duration) -> u64 {
         } else {
             (u64::from(tb.numer), u64::from(tb.denom))
         }
-    });
-    let ticks = d.as_nanos() * u128::from(denom) / u128::from(numer);
-    (ticks as u64).max(1)
+    })
 }
 
 /// Distinguishes [`HvfVcpu`]s for [`Slot::owner`].
@@ -801,5 +806,22 @@ impl Vcpu for HvfVcpu {
     fn flush_tlb(&mut self) {
         self.flush = true;
         request_flush();
+    }
+
+    /// The guest's virtual counter is the host's `mach_absolute_time` (the
+    /// vtimer offset is 0), so the vDSO turns `cntvct_el0` into nanoseconds
+    /// with the host timebase: `ns = ticks * numer / denom`, as a 32-bit
+    /// fixed-point multiplier.
+    fn vdso_calibration(&self) -> Option<crate::vcpu::VdsoCal> {
+        let (numer, denom) = timebase();
+        let shift = 32;
+        let mult = ((u128::from(numer) << shift) / u128::from(denom)) as u64;
+        Some(crate::vcpu::VdsoCal {
+            mult,
+            shift,
+            base_tsc: now_ticks(),
+            base_mono_ns: crate::clock::now_monotonic().as_nanos() as u64,
+            base_wall_ns: crate::clock::now_unix().as_nanos() as u64,
+        })
     }
 }

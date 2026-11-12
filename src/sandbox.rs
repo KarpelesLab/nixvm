@@ -636,7 +636,7 @@ fn open_squashfs(path: &Path) -> Result<Option<Box<dyn MountFs>>, Error> {
 /// runs, and write it to the shared vvar page. A no-op for backends that can't
 /// calibrate (the interpreter) or when the TSC is unavailable — the vDSO then
 /// stays disabled and the guest uses the `clock_gettime` syscall.
-fn calibrate_vdso(vcpu: &dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
+pub(crate) fn calibrate_vdso(vcpu: &dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
     if let Some(c) = vcpu.vdso_calibration() {
         crate::vcpu::ctrl::write_vvar(
             &mem.phys_arc(),

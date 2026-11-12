@@ -337,14 +337,20 @@ pub fn map_into(space: &mut AddrSpace, fa: &mut FrameAllocator, phys: &PhysMem) 
     let _ = space.map(VVAR_VA, frame_pa(VVAR_FIDX), Prot::READ, false, fa, phys);
 }
 
-/// Build the arm64 upper-half tables mapping [`VECTORS_VA`] (kernel
-/// read/execute) in `phys`'s format and at its guest-physical base. Call when
-/// the pool's page tables become arm64; a no-op for x86-64.
+/// Make the control block match `phys`'s page-table format: the vDSO for that
+/// architecture and, for arm64, the upper-half tables mapping [`VECTORS_VA`]
+/// (kernel read/execute) at the pool's guest-physical base. Call when the
+/// pool's format changes.
 pub fn build_arm_kernel_tables(phys: &PhysMem) {
     use super::pagetable::{Enc, PtFormat};
     if phys.format() != PtFormat::Aarch64 {
+        phys.write(frame_pa(VDSO_FIDX), &super::vdso::build_image(VVAR_VA));
         return;
     }
+    phys.write(
+        frame_pa(VDSO_FIDX),
+        &super::vdso::build_image_aarch64(VVAR_VA),
+    );
     let enc = Enc::of(phys);
     let l1 = frame_pa(ARM_KTABLE_FIDX);
     let l2 = frame_pa(ARM_KTABLE_FIDX + 1);

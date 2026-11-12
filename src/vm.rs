@@ -205,6 +205,9 @@ impl Vm {
         let vcpu = backend
             .new_vcpu(img.entry, img.stack_pointer)
             .map_err(|e| e.to_string())?;
+        // Let the guest's vDSO read the clock without a syscall where the
+        // backend can calibrate it (hardware; a no-op on the interpreter).
+        crate::sandbox::calibrate_vdso(vcpu.as_ref(), &mem);
 
         let stdout = Arc::new(Mutex::new(Vec::new()));
         let stderr = Arc::new(Mutex::new(Vec::new()));

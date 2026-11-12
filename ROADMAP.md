@@ -157,9 +157,17 @@ real core and hand every exception to the kernel.
   tests. `vcpu::select` falls back to the interpreter when the process isn't
   entitled, so default `cargo test`/CI stay green; CI builds and lints the
   backend on macOS but can't run it.
-- **Not yet:** a vDSO for aarch64 (clock reads are syscalls), per-process ASIDs
-  (every address-space switch flushes the TLB), and a kick for a task signalled
-  while it runs on another vcpu (it waits for the next quantum, as on KVM).
+- **vDSO:** aarch64 guests get Linux's arm64 vDSO symbols
+  (`__kernel_clock_gettime`, …) reading `cntvct_el0` — the host's
+  `mach_absolute_time` — against the vvar calibration: ~20 ns per
+  `clock_gettime` instead of a ~1.3 µs exit. Uncalibrated (the interpreter) it
+  takes the syscall.
+- **Distribution:** the backend is built on every macOS/arm64 target (the `hvf`
+  feature is a no-op); `scripts/sign-macos.sh` signs a local build, and the
+  released macOS binaries are signed with the entitlement.
+- **Not yet:** per-process ASIDs (every address-space switch flushes the TLB),
+  and a kick for a task signalled while it runs on another vcpu (it waits for
+  the next quantum, as on KVM).
 
 ### Phase 2 — Memory manager + static ELF loader  ✅ (interpreter path)
 
