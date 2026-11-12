@@ -39,25 +39,15 @@ const DNS_TRIES: u32 = 6;
 const STALL_MS: u64 = 60_000;
 const MAX_REDIRECTS: u32 = 8;
 
-/// Where TLS gets its randomness: the OS natively; in the browser
-/// `crypto.getRandomValues`, through wasm-bindgen (purecrypto's own browser
-/// source is a raw import that would need the page to reach into wasm memory).
-#[cfg(target_arch = "wasm32")]
-#[derive(Debug)]
-struct BrowserEntropy;
+/// TLS's randomness: purecrypto's `OsRng`, the same as the guest's
+/// ([`crate::entropy`]) — the OS, or the page's `crypto.getRandomValues`.
+/// (purecrypto's own `os_rng()` shortcut needs its `std`, which the wasm build
+/// leaves out.)
+struct Entropy;
 
-#[cfg(target_arch = "wasm32")]
-impl purecrypto::tls::EntropySource for BrowserEntropy {
+impl purecrypto::tls::EntropySource for Entropy {
     fn fill(&self, dest: &mut [u8]) {
-        #[wasm_bindgen::prelude::wasm_bindgen]
-        extern "C" {
-            #[wasm_bindgen(js_namespace = crypto, js_name = getRandomValues)]
-            fn get_random_values(buf: &mut [u8]);
-        }
-        // `getRandomValues` fills at most 64 KiB a call.
-        for chunk in dest.chunks_mut(65536) {
-            get_random_values(chunk);
-        }
+        crate::entropy::fill(dest);
     }
 }
 
@@ -573,12 +563,8 @@ impl NetPull {
                     f.active_at = now;
                     let tls = if f.url.tls {
                         let time = Time::from_unix(crate::clock::now_unix().as_secs());
-                        let builder = Config::builder();
-                        #[cfg(target_arch = "wasm32")]
-                        let builder = builder.rng(std::sync::Arc::new(BrowserEntropy));
-                        #[cfg(not(target_arch = "wasm32"))]
-                        let builder = builder.os_rng();
-                        let cfg = builder
+                        let cfg = Config::builder()
+                            .rng(std::sync::Arc::new(Entropy))
                             .roots(RootCertStore::with_embedded_roots())
                             .server_name(f.url.host.clone())
                             .alpn(vec![b"http/1.1".to_vec()])

@@ -709,13 +709,19 @@ Second and third backends, and the second guest arch.
   In the browser (`oci-net` feature) the pull goes over the guest's network
   link instead of `fetch()`: `oci::net::NetPull` drives the same `Pull` over
   any `Egress` (the packet tunnel), doing DNS over its UDP, TLS with
-  purecrypto (no `std` on wasm, so it never reads `SystemTime`; entropy from
-  `crypto.getRandomValues`, time from `crate::clock`) and HTTP/1.1 with
-  redirects, never blocking — so no CORS and no proxy. The live demo pulls
-  `?image=<name>` that way and boots it on the same link (checked in Chrome:
-  alpine on arm64, python:3.12-alpine on x86-64). purecrypto's own browser
-  entropy hook stays linked though unused, so pages map `purecrypto` to a
-  shim that throws if it's ever called (`web/public/purecrypto.js`).
+  purecrypto (no `std` on wasm, so it never reads `SystemTime`; time from
+  `crate::clock`) and HTTP/1.1 with redirects, never blocking — so no CORS
+  and no proxy. The live demo pulls `?image=<name>` that way and boots it on
+  the same link (checked in Chrome: alpine on arm64, python:3.12-alpine on
+  x86-64).
+- **Guest randomness:** `getrandom`, `/dev/random`/`/dev/urandom`,
+  `AT_RANDOM` and the interpreter's `RDRAND` (and TLS) all come from
+  purecrypto's `OsRng` (`crate::entropy`): the host OS natively, and in the
+  browser its `purecrypto.random_get` import, which the page's shim
+  (`web/public/purecrypto.js`) fills from `crypto.getRandomValues` into the
+  memory nixvm hands it at start-up. Before, they were xorshift/LCG streams
+  seeded from the clock (and `AT_RANDOM` was derived from argv), so guest
+  keys and stack canaries were predictable.
   Left: hard links are written as copies (fstool's squashfs writer can't take
   one from a stream), and `docker run` niceties with no place here yet
   (volumes, published ports, healthchecks).

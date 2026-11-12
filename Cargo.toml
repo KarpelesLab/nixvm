@@ -65,7 +65,7 @@ oci = ["targz", "fstool", "compcol/zstd"]
 # with nixvm doing DNS, TLS and HTTP itself — no `fetch()`, so no CORS. TLS is
 # purecrypto's (pure Rust; in the browser its entropy comes from a
 # `purecrypto.random_get` import the page supplies).
-oci-net = ["oci", "tunnel", "dep:purecrypto"]
+oci-net = ["oci", "tunnel", "purecrypto/tls", "purecrypto/embedded-roots"]
 # Browser demo entry point (src/wasm.rs): exposes an interactive `Terminal` and
 # `run_elf` via wasm-bindgen. Pulls in wasm-bindgen + console_error_panic_hook,
 # `targz` to unpack a `.tar.gz` root image in-process, and `fstool` to repack it
@@ -98,13 +98,11 @@ fstool = { version = "0.5.3", optional = true, default-features = false, feature
 # Blocking HTTP(S) client for downloading guest root images, gated behind the
 # `fetch` feature (see src/image.rs). Not linked into the default build.
 ureq = { version = "3", optional = true }
-# TLS for `oci-net`: our pure-Rust crypto toolkit, with only what a TLS client
-# needs (its embedded CA roots included).
-purecrypto = { version = "0.10.6", optional = true, default-features = false, features = [
-    "tls",
-    "rng",
-    "embedded-roots",
-] }
+# Our pure-Rust crypto toolkit. Always: its `OsRng` is where guest randomness
+# comes from (`getrandom`, `/dev/urandom`, `AT_RANDOM`, `RDRAND`; src/entropy.rs)
+# — the OS natively, `crypto.getRandomValues` in the browser through its
+# `purecrypto.random_get` import. `oci-net` adds its TLS client and CA roots.
+purecrypto = { version = "0.10.6", default-features = false, features = ["rng"] }
 # Compression collection (gzip decoder), gated behind `targz`. `std` + `gzip`
 # only — a pure-Rust inflate that builds for wasm32. Same crate `fstool` uses.
 compcol = { version = "0.7.9", optional = true, default-features = false, features = [
@@ -119,11 +117,11 @@ pktkit = { version = "0.1.11", optional = true, default-features = false, featur
     "vclient",
 ] }
 
-# purecrypto's `std` natively: OS entropy and clock. Not on wasm32, where it
-# would read `SystemTime::now()` (which panics there) — the TLS client there
-# takes its time and entropy from nixvm (src/oci/net.rs).
+# purecrypto's `std` natively: its `OsRng` (`getrandom(2)` on Linux) and clock.
+# Not on wasm32, where `std` would make its TLS client read `SystemTime::now()`
+# (which panics there); its `OsRng` there needs no `std`.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-purecrypto = { version = "0.10.6", optional = true, default-features = false, features = ["std"] }
+purecrypto = { version = "0.10.6", default-features = false, features = ["std", "linux-getrandom"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Only pulled in on wasm32, and only linked when the `wasm` feature is on

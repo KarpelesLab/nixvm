@@ -33,6 +33,7 @@
 
 pub mod abi;
 pub mod clock;
+pub mod entropy;
 pub mod fs;
 pub mod image;
 pub mod kernel;

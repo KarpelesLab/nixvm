@@ -50,8 +50,10 @@ doesn't apply — and boots it instead of the bundled Alpine.
 On wasm32 the pktkit crate reads its clock from `pktkit.now_ms` /
 `pktkit.unix_ms` imports, which the wasm-bindgen glue imports from the bare
 specifier `pktkit`. `index.html` maps that to `public/pktkit.js` with an
-import map, and maps `purecrypto` (an entropy hook the TLS crate links but
-nixvm never calls) to `public/purecrypto.js`.
+import map, and maps `purecrypto` to `public/purecrypto.js`: the purecrypto
+crate's browser entropy source, `random_get`, filled from
+`crypto.getRandomValues` — where the guest's `getrandom(2)`, `/dev/urandom`,
+stack-canary seed and `RDRAND` come from, and the TLS that pulls images.
 
 ## Local dev
 

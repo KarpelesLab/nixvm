@@ -801,31 +801,6 @@ fn arch_hints(machine: u16) -> (u64, u64, &'static str) {
     }
 }
 
-/// Deterministic stand-in for the 16 bytes of kernel-supplied randomness
-/// glibc/musl read via `AT_RANDOM` to seed the stack-protector canary (and,
-/// on musl, `__stack_chk_guard`/`arc4random`'s initial state). Startup code
-/// only requires *some* 16 bytes here, never checking their entropy, so a
-/// host RNG or wall-clock timestamp isn't needed — and would make loading
-/// (and tests) non-reproducible. Instead this mixes a fixed seed with the
-/// process's own argv/envp bytes via a Knuth/PCG-style LCG, so the value is
-/// stable across runs of the same `ProcessSpec` but still varies with it.
-fn deterministic_random16(seed_material: &[u8]) -> [u8; 16] {
-    const MUL: u64 = 6_364_136_223_846_793_005;
-    const INC: u64 = 1_442_695_040_888_963_407;
-    let mut state: u64 = 0x2545_F491_4F6C_DD1D ^ seed_material.len() as u64;
-    for &b in seed_material {
-        state = (state ^ u64::from(b)).wrapping_mul(MUL).wrapping_add(INC);
-    }
-    state = state.wrapping_mul(MUL).wrapping_add(INC);
-    let lo = state.to_le_bytes();
-    state = state.wrapping_mul(MUL).wrapping_add(INC);
-    let hi = state.to_le_bytes();
-    let mut out = [0u8; 16];
-    out[..8].copy_from_slice(&lo);
-    out[8..].copy_from_slice(&hi);
-    out
-}
-
 fn build_stack(
     mem: &mut GuestMemory,
     spec: &ProcessSpec,
@@ -870,7 +845,10 @@ fn build_stack(
     let random_addr = (str_base - 16) & !0xf;
     let execfn = str_base + arg_off.first().copied().unwrap_or(0);
     let platform_addr = str_base + platform_off;
-    let random_bytes = deterministic_random16(&blob);
+    // The 16 bytes libc seeds its stack canary (and musl's `arc4random`)
+    // from: they must be unpredictable, as on Linux.
+    let mut random_bytes = [0u8; 16];
+    crate::entropy::fill(&mut random_bytes);
 
     // Advertise the vDSO in the control block via AT_SYSINFO_EHDR so libc reads
     // the clock without a syscall: the x86-64 one, or the aarch64 one once the

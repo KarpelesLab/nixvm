@@ -1763,7 +1763,6 @@ pub(super) struct Shared {
     /// The last interactive-stdin read found the buffer empty and parked: the
     /// guest is waiting for the user (see [`Kernel::awaiting_input`]).
     stdin_waiting: bool,
-    rng_state: u64,
     /// The tracked `RLIMIT_NOFILE` `(soft, hard)`. Programs (node/V8) binary-
     /// search `setrlimit` to raise it to the maximum, then loop over `[0,
     /// soft)` marking fds cloexec — so the hard cap must be *bounded* or that
@@ -2383,7 +2382,6 @@ impl Kernel {
                 stdin: Box::new(std::io::stdin()),
                 stdout: Box::new(std::io::stdout()),
                 stderr: Box::new(std::io::stderr()),
-                rng_state: 0,
                 memfd_seq: 0,
                 umask: 0o022,
                 unsupported: BTreeMap::new(),
@@ -4848,7 +4846,7 @@ impl Kernel {
                     err(Errno::EBADF)
                 }
             }
-            Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], args[2], mem),
+            Sysno::Getrandom => self.sys_getrandom(args[0], args[1], args[2], mem),
             // mlock/munlock/mlock2(addr, len[, flags]) and mlockall: nothing is
             // ever paged out, so a lock only matters to RLIMIT_MEMLOCK, which is
             // charged and enforced as on Linux.
@@ -10336,18 +10334,9 @@ impl Kernel {
     ///
     /// The flags are validated (`GRND_NONBLOCK`, `GRND_RANDOM`,
     /// `GRND_INSECURE`; `RANDOM` with `INSECURE` is `EINVAL`); the pool is
-    /// always "initialized", so none of them changes the output. The
-    /// generator is reseeded from the host's entropy (`/dev/urandom`) when one
-    /// is available, so guest keys and nonces aren't predictable from the
-    /// boot time.
-    fn sys_getrandom(
-        &self,
-        sh: &mut Shared,
-        buf: u64,
-        len: u64,
-        flags: u64,
-        mem: &mut GuestMemory,
-    ) -> i64 {
+    /// always "initialized", so none of them changes the output. The bytes
+    /// are the host's ([`crate::entropy`]): guests make keys with them.
+    fn sys_getrandom(&self, buf: u64, len: u64, flags: u64, mem: &mut GuestMemory) -> i64 {
         const GRND_NONBLOCK: u64 = 1;
         const GRND_RANDOM: u64 = 2;
         const GRND_INSECURE: u64 = 4;
@@ -10358,23 +10347,8 @@ impl Kernel {
         }
         // Linux returns at most 32 MiB - 1 per call.
         let len = len.min((1 << 25) - 1);
-        if sh.rng_state == 0 {
-            let now = match crate::clock::now_unix().as_nanos() as u64 {
-                0 => 0x9E37_79B9_7F4A_7C15,
-                n => n,
-            };
-            sh.rng_state = (now ^ host_entropy()) | 1;
-        }
         let mut out = vec![0u8; len as usize];
-        for chunk in out.chunks_mut(8) {
-            let mut s = sh.rng_state;
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            sh.rng_state = s;
-            let bytes = s.to_le_bytes();
-            chunk.copy_from_slice(&bytes[..chunk.len()]);
-        }
+        crate::entropy::fill(&mut out);
         if mem.write(buf, &out).is_err() {
             return err(Errno::EFAULT);
         }
@@ -10790,21 +10764,6 @@ fn rusage_bytes(cpu_ns: u128) -> [u8; 144] {
     ru[0..8].copy_from_slice(&((cpu_ns / 1_000_000_000) as i64).to_le_bytes());
     ru[8..16].copy_from_slice(&((cpu_ns % 1_000_000_000 / 1_000) as i64).to_le_bytes());
     ru
-}
-
-/// 64 bits from the host's entropy pool, or 0 where there is none (wasm).
-fn host_entropy() -> u64 {
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
-    {
-        let mut b = [0u8; 8];
-        if std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut b))
-            .is_ok()
-        {
-            return u64::from_le_bytes(b);
-        }
-    }
-    0
 }
 
 /// Encode an errno as a negative syscall return.

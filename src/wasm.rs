@@ -58,6 +58,23 @@ mod browser {
 
     use wasm_bindgen::prelude::*;
 
+    #[wasm_bindgen(module = "purecrypto")]
+    extern "C" {
+        /// Hand the page's `purecrypto` shim this module's memory: its
+        /// `random_get(ptr, len)` — purecrypto's `OsRng`, the source of all
+        /// guest randomness ([`crate::entropy`]) — fills `len` bytes at `ptr`
+        /// there from `crypto.getRandomValues`.
+        #[wasm_bindgen(js_name = nixvm_memory)]
+        fn give_entropy_memory(memory: JsValue);
+    }
+
+    /// Runs when the module is instantiated, before anything can ask for
+    /// randomness.
+    #[wasm_bindgen(start)]
+    pub fn start() {
+        give_entropy_memory(wasm_bindgen::memory());
+    }
+
     use crate::abi::Arch;
     use crate::fs::{DevFs, MountTable, ProcFs, SysFs, TmpFs};
     use crate::kernel::Kernel;

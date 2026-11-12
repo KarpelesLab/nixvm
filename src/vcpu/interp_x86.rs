@@ -590,8 +590,6 @@ struct X86Interp {
     /// Free-running counter behind `RDTSC`/`RDTSCP` — see
     /// [`X86Interp::rdtsc_tick`].
     tsc: u64,
-    /// PRNG state behind `RDRAND` — see [`X86Interp::rdrand`].
-    prng: u64,
     /// The SSE control/status register (`LDMXCSR`/`STMXCSR`): rounding control,
     /// `FTZ`/`DAZ`, exception masks and sticky exception flags.
     mxcsr: u32,
@@ -636,8 +634,7 @@ impl X86Interp {
             fpu_fip: 0,
             fpu_fdp: 0,
             tsc: 0,
-            prng: 0x9E37_79B9_7F4A_7C15, // arbitrary nonzero seed (golden-ratio constant)
-            mxcsr: 0x1f80,               // the power-on default (all exceptions masked)
+            mxcsr: 0x1f80, // the power-on default (all exceptions masked)
             quantum: super::preempt_quantum(),
         }
     }
@@ -1847,14 +1844,13 @@ impl X86Interp {
         }
     }
 
-    /// The `RDRAND` value source: a splitmix64 step over a private state —
-    /// deterministic, never "not ready" (`CF` is always set).
+    /// The `RDRAND` value: the host's randomness ([`crate::entropy`]), never
+    /// "not ready" (`CF` is always set).
+    #[allow(clippy::unused_self)]
     fn rdrand(&mut self) -> u64 {
-        self.prng = self.prng.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.prng;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+        // The host's randomness, as the instruction promises (guests seed
+        // their generators with it).
+        crate::entropy::u64()
     }
 
     /// `ENTER imm16, imm8`: push `rBP`, copy `level - 1` outer frame pointers,
