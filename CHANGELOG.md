@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/KarpelesLab/nixvm/compare/v0.0.4...v0.0.5) - 2026-11-12
+
+### Other
+
+- an aarch64 vDSO, calibrated from the host timebase on HVF
+- build the backend on every macOS/arm64 target; sign the macOS release
+- no link to a private item from PtFormat
+- run on the shared pool with arm64 page tables; preempt and signal spinning guests
+- disks, the page cache, reclaim with memory.min/low, the io controller
+- real-time tasks run ahead of fair ones, FIFO/RR in turn, with the fair server
+- cpu.weight is shared by the group; sched_setaffinity is honored
+- threaded subtrees
+- Linux may also kill the small task when memory.max is lowered
+- say what lowering memory.max killed
+- lowering memory.max kills until the cgroup fits; memory.high throttles
+- no link to a private item
+- the memory controller (memory.max, out-of-memory kills)
+- the cpu controller (cpu.max bandwidth, cpu.weight)
+- a nonzero SO_LINGER makes close wait for the host peer's ack
+
 ## [0.0.4](https://github.com/KarpelesLab/nixvm/compare/v0.0.3...v0.0.4) - 2026-11-07
 
 ### Other
