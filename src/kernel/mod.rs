@@ -2951,6 +2951,23 @@ impl Kernel {
     ) -> Serviced {
         // What this step allocates is charged to the task's memory cgroup.
         mem.set_memcg(cx.cur.memcg);
+        // Past `memory.high` with what it allocated in user mode (the pages its
+        // own stores faulted in): Linux has the task sleep that off on the way
+        // back from the fault, before it runs anything else — so before this
+        // syscall. Pay it now and leave the syscall unanswered; it is issued
+        // again once the task runs (the interpreter re-executes the `svc`, the
+        // hardware backends re-deliver it). Otherwise a syscall that reads the
+        // clock would read it before the penalty it owes.
+        if matches!(exit, Exit::Syscall)
+            && cx.cur.pending & (1 << (9 - 1)) == 0
+            && mem.kernel_due()
+            && let Some((pages, overage)) = mem.take_memcg_over_high(cx.cur.memcg)
+            && let Some(delay) = memcg_high_delay(pages, overage)
+        {
+            cx.cur.high_delay_until = Some(poll::now_ns() + delay);
+            cx.block = false;
+            return Serviced::Resume;
+        }
         pagecache::IoTask::enter(cx.cur.pid, cx.cur.memcg, mem);
         let flow = self.service_exit(cx, exit, vcpu, mem);
         // Its I/O went past an `io.max`: it waits that out before going on.
