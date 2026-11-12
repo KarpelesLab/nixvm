@@ -150,3 +150,25 @@ fn a_pull_over_a_network_link_with_nixvm_doing_dns_tls_and_http() {
     assert_eq!(code, 0, "{out}");
     assert!(out.starts_with("3.20."), "{out}");
 }
+
+/// Ubuntu's root (thousands of small /usr/share/doc directories) needs the
+/// squashfs writer to settle its metadata offsets (fstool 0.5.4).
+#[test]
+fn an_ubuntu_root_builds_and_runs() {
+    if !enabled() {
+        return;
+    }
+    let img = oci::pull("ubuntu:24.04", arch()).expect("pull ubuntu");
+    let opts = RunOptions {
+        cmd: vec![
+            "bash".into(),
+            "-c".into(),
+            "head -1 /etc/lsb-release; apt --version | cut -c1-3".into(),
+        ],
+        ..RunOptions::default()
+    };
+    let mut vm = Vm::boot_image(&img, &opts, 512 << 20).expect("boot");
+    let (code, out) = run(&mut vm);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.starts_with("DISTRIB_ID=Ubuntu\napt"), "{out}");
+}

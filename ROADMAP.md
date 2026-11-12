@@ -702,10 +702,10 @@ Second and third backends, and the second guest arch.
   image's `/etc/passwd`/`/etc/group` (`Kernel::set_creds`). PID 1 may be a `#!`
   script. Wired into `Vm::boot_image`, `Sandbox` (`RootSource::Oci`), the CLI
   (`run --image`, `--entrypoint`, `--user`, `pull`) and `wasm::Terminal`.
-  Checked with alpine, debian, python, node, nginx (serving), bitnami
+  Checked with alpine, debian, ubuntu, python, node, nginx (serving), bitnami
   (non-root), distroless and GHCR images, natively and on the wasm build.
-  Ubuntu's root needs fstool's squashfs fixpoint fix (fstool a9c4dfc, in the
-  release after 0.5.3): until then its squashfs fails to build.
+  Ubuntu's root needed fstool's squashfs fixpoint fix (fstool 0.5.4); it runs,
+  apt included, and CI pulls and runs it.
   In the browser (`oci-net` feature) the pull goes over the guest's network
   link instead of `fetch()`: `oci::net::NetPull` drives the same `Pull` over
   any `Egress` (the packet tunnel), doing DNS over its UDP, TLS with

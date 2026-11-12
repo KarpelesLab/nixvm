@@ -89,7 +89,7 @@ tunnel = ["dep:pktkit"]
 # Since 0.4.28 each filesystem is its own feature (a `default-features = false`
 # build gets none and doesn't compile); enable the ones nixvm reads/builds:
 # ext2/3/4 root images, squashfs (the repacked overlay lower), tar.
-fstool = { version = "0.5.3", optional = true, default-features = false, features = [
+fstool = { version = "0.5.4", optional = true, default-features = false, features = [
     "gzip",
     "ext",
     "squashfs",
