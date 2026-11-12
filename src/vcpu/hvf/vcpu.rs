@@ -48,8 +48,8 @@ use super::vm::{ensure_pool, vm};
 use crate::vcpu::ctrl::{VECTORS_VA, vectors};
 use crate::vcpu::{Exit, GuestMemory, PtFormat, Vcpu, VcpuError};
 use std::cell::RefCell;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// `SCTLR_EL1`: the `RES1` bits plus `M` (MMU on), `C`/`I` (caches), `SA`/`SA0`
@@ -392,6 +392,9 @@ pub struct HvfVcpu {
     ttbr1: u64,
     /// The preemption quantum ([`crate::vcpu::preempt_quantum`]).
     quantum: Option<Duration>,
+    /// While inside `hv_vcpu_run`, the `hv_vcpu` it runs on, plus one (0:
+    /// not running): what [`Vcpu::kicker`]'s handle stops from another thread.
+    running: Arc<AtomicU64>,
 }
 
 impl HvfVcpu {
@@ -401,6 +404,14 @@ impl HvfVcpu {
     pub fn new(entry: u64, stack: u64) -> Result<Box<dyn Vcpu>, VcpuError> {
         vm()?;
         Ok(Box::new(Self::with_regs(Regs::new(entry, stack))))
+    }
+
+    /// A vcpu with no preemption quantum: only an exit or a kick stops it.
+    #[cfg(test)]
+    pub(super) fn unpreempted(entry: u64, stack: u64) -> Box<dyn Vcpu> {
+        let mut v = Self::with_regs(Regs::new(entry, stack));
+        v.quantum = None;
+        Box::new(v)
     }
 
     fn with_regs(regs: Regs) -> Self {
@@ -413,6 +424,7 @@ impl HvfVcpu {
             ttbr0: 0,
             ttbr1: 0,
             quantum: crate::vcpu::preempt_quantum(),
+            running: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -456,8 +468,10 @@ impl HvfVcpu {
             if let Some(q) = self.quantum {
                 slot.arm_timer(q);
             }
+            self.running.store(slot.vcpu + 1, Ordering::Release);
             // SAFETY: the slot's vcpu belongs to this thread.
             let ret = unsafe { sys::hv_vcpu_run(slot.vcpu) };
+            self.running.store(0, Ordering::Release);
             check(ret, "hv_vcpu_run")?;
             // SAFETY: framework-owned storage, written by the run that returned.
             let ex = unsafe { *slot.exit };
@@ -806,6 +820,23 @@ impl Vcpu for HvfVcpu {
     fn flush_tlb(&mut self) {
         self.flush = true;
         request_flush();
+    }
+
+    /// `hv_vcpus_exit` on whichever thread's `hv_vcpu` runs this task right
+    /// now: the run ends with `HV_EXIT_REASON_CANCELED` → [`Exit::Interrupted`],
+    /// at an EL0 boundary where the kernel delivers the signal.
+    fn kicker(&self) -> Option<crate::vcpu::Kick> {
+        let running = Arc::clone(&self.running);
+        Some(Arc::new(move || {
+            let id = running.load(Ordering::Acquire);
+            if id != 0 {
+                let vcpu = id - 1;
+                // SAFETY: `hv_vcpus_exit` may be called from any thread; a
+                // vcpu that has since finished its run (or been destroyed) just
+                // gets a harmless early exit or an error status, ignored.
+                unsafe { sys::hv_vcpus_exit(&raw const vcpu, 1) };
+            }
+        }))
     }
 
     /// The guest's virtual counter is the host's `mach_absolute_time` (the

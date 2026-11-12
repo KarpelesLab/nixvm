@@ -433,4 +433,35 @@ mod tests {
         assert_eq!(m.read_u64(data).unwrap(), 0x1111);
         assert_eq!(m.read_u64(data + 8).unwrap(), 0x2222);
     }
+
+    /// A vcpu spinning on another thread with no quantum to end its run stops
+    /// when kicked — how a signal reaches a task running on another worker.
+    #[test]
+    #[ignore = "requires the hypervisor entitlement + codesign; run scripts/hvf-test.sh"]
+    fn a_kick_stops_a_vcpu_running_on_another_thread() {
+        let Some(_backend) = backend() else { return };
+        let mut mem = guest(&[SPIN], Prot::rx());
+        let mut v = super::vcpu::HvfVcpu::unpreempted(BASE, BASE + 0x8000);
+        let kick = v.kicker().expect("HVF can kick");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let exit = v.run(&mut mem).unwrap();
+            tx.send(()).unwrap();
+            (exit, v.pc())
+        });
+        // Kick until it stops (a kick before it is inside the run may be lost).
+        let mut stopped = false;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            kick();
+            if rx.try_recv().is_ok() {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(stopped, "the kick stopped the run");
+        let (exit, pc) = runner.join().unwrap();
+        assert_eq!(exit, Exit::Interrupted);
+        assert_eq!(pc, BASE, "at a user instruction boundary");
+    }
 }

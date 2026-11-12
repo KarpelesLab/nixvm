@@ -181,6 +181,12 @@ pub struct VdsoCal {
     pub base_wall_ns: u64,
 }
 
+/// Something that interrupts a vcpu running on another host thread, so it
+/// returns [`Exit::Interrupted`] promptly (see [`Vcpu::kicker`]). Calling it
+/// when the vcpu isn't running is harmless: at worst its next run returns at
+/// once.
+pub type Kick = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// A single virtual CPU executing one guest thread.
 ///
 /// The kernel owns one `Vcpu` per running guest thread and drives it with a
@@ -338,6 +344,15 @@ pub trait Vcpu: Send {
     /// A no-op for the interpreter, which re-walks the page tables on every access
     /// and so has no TLB to invalidate.
     fn flush_tlb(&mut self) {}
+
+    /// A handle another thread can use to cut this vcpu's current run short
+    /// (a signal was posted to its task, which runs on another SMP worker), so
+    /// the signal is delivered now rather than at the end of the quantum.
+    /// `None` when the backend can't: its runs end on their own soon enough
+    /// (the interpreter) or at the next quantum.
+    fn kicker(&self) -> Option<Kick> {
+        None
+    }
 }
 
 /// Constructs [`Vcpu`]s that share one guest address space.

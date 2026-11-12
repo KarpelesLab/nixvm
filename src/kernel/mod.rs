@@ -257,6 +257,19 @@ fn is_thread_flags_conflict(flags: u64, ns: &ns::NsProxy) -> bool {
         && (flags & (ns::CLONE_NEWPID | ns::CLONE_NEWUSER) != 0 || ns.pid_for_children != ns.pid)
 }
 
+/// [`ProcInfo::kick`]: the dispatched vcpu's [`crate::vcpu::Kick`], if any.
+#[derive(Clone, Default)]
+struct Kicker(Option<crate::vcpu::Kick>);
+
+impl Kicker {
+    /// Interrupt the vcpu, if the task is out running and its backend can.
+    fn kick(&self) {
+        if let Some(k) = &self.0 {
+            k();
+        }
+    }
+}
+
 /// Per-process kernel-side state (swapped into `Kernel::cur` while running).
 #[derive(Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -519,6 +532,10 @@ struct ProcInfo {
     /// its handlers and mask may be stale, so a signal posted to it is never
     /// discarded here, only when the running task acts on it.
     in_flight: bool,
+    /// While the task is dispatched to an SMP worker, a way to interrupt its
+    /// vcpu there ([`crate::vcpu::Vcpu::kicker`]): a signal posted to it uses it,
+    /// so a task computing without syscalls takes it now, not at the quantum.
+    kick: Kicker,
     /// POSIX timers (`timer_create`) whose expirations are delivered to this
     /// task — see [`ptimer`]. Like `ITIMER_REAL` they wake the task at their
     /// deadline ([`ProcInfo::timer_deadline`]); unlike it, neither `fork`
@@ -648,6 +665,7 @@ impl Default for ProcInfo {
             queued_siginfo: [None; NSIG_SLOTS],
             rt_queue: BTreeMap::new(),
             in_flight: false,
+            kick: Kicker::default(),
             ptimers: Vec::new(),
             ioprio: 0,
             mempolicy: (0, 0),
@@ -3429,6 +3447,7 @@ impl Kernel {
                         busy[w] = true;
                         dispatched.insert(i, (p.info.pid, w));
                         let vcpu = p.vcpu.take().unwrap();
+                        p.info.kick = Kicker(vcpu.kicker());
                         batch.push((w, i, vcpu, space));
                     }
                     batch
@@ -3530,6 +3549,7 @@ impl Kernel {
                 let reattach = |sh: &mut Shared, vcpu| {
                     if let Some(p) = sh.procs[i].as_mut() {
                         p.vcpu = Some(vcpu);
+                        p.info.kick = Kicker::default();
                     }
                 };
                 match out {
@@ -3575,6 +3595,7 @@ impl Kernel {
                         && p.vcpu.is_none()
                     {
                         p.vcpu = Some(vcpu);
+                        p.info.kick = Kicker::default();
                     }
                 }
                 inflight -= 1;
@@ -5227,6 +5248,7 @@ impl Kernel {
         }
         let mut info = cx.cur.clone();
         info.pid = pid;
+        info.kick = Kicker::default(); // not dispatched yet
         info.frozen = sched.frozen;
         info.cg_scale = sched.scale;
         info.throttled_until = sched.throttled_until;

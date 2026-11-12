@@ -165,9 +165,10 @@ real core and hand every exception to the kernel.
 - **Distribution:** the backend is built on every macOS/arm64 target (the `hvf`
   feature is a no-op); `scripts/sign-macos.sh` signs a local build, and the
   released macOS binaries are signed with the entitlement.
-- **Not yet:** per-process ASIDs (every address-space switch flushes the TLB),
-  and a kick for a task signalled while it runs on another vcpu (it waits for
-  the next quantum, as on KVM).
+- **Kick:** a signal posted to a task running on another SMP worker stops its
+  vcpu at once (`Vcpu::kicker` → `hv_vcpus_exit`), so it is delivered in ~0.1 ms
+  rather than at the end of the quantum (KVM still waits for the quantum).
+- **Not yet:** per-process ASIDs (every address-space switch flushes the TLB).
 
 ### Phase 2 — Memory manager + static ELF loader  ✅ (interpreter path)
 

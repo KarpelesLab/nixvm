@@ -262,6 +262,8 @@ impl super::ProcInfo {
             return false;
         }
         self.pending |= 1u64 << (sig - 1);
+        // Out running on another worker: stop it, so it takes the signal now.
+        self.kick.kick();
         true
     }
 
