@@ -369,6 +369,54 @@ fn map_image(
     })
 }
 
+/// Check, without touching guest memory, that `elf` is an image
+/// [`load_static`]/[`load_dynamic`] can load for a guest of `arch`: its
+/// headers parse, every segment's bytes are in the file, and something is
+/// loaded. `execve` calls this before it tears down the caller's image, so a
+/// bad file fails with `ENOEXEC` and leaves the caller running, as Linux's
+/// checks before `begin_new_exec` do.
+///
+/// # Errors
+/// What loading `elf` would fail with, short of running out of memory.
+pub fn check(elf: &[u8], arch: crate::abi::Arch) -> Result<(), LoadError> {
+    let ehdr = Ehdr::parse(elf)?;
+    let want = match arch {
+        crate::abi::Arch::Aarch64 => EM_AARCH64,
+        crate::abi::Arch::X86_64 => EM_X86_64,
+    };
+    if ehdr.machine != want {
+        return Err(LoadError::UnsupportedArch);
+    }
+    let mut loads = false;
+    for i in 0..ehdr.phnum {
+        let off = (ehdr.phoff as usize)
+            .checked_add(i as usize * PHDR_LEN)
+            .ok_or(LoadError::Truncated)?;
+        let ph = Phdr::parse(elf, off)?;
+        if ph.p_type != PT_LOAD || ph.memsz == 0 {
+            continue;
+        }
+        let end = ph
+            .offset
+            .checked_add(ph.filesz)
+            .ok_or(LoadError::Malformed("segment offset overflow"))?;
+        if end > elf.len() as u64 {
+            return Err(LoadError::Truncated);
+        }
+        if ph.filesz > ph.memsz {
+            return Err(LoadError::Malformed(
+                "segment file size over its memory size",
+            ));
+        }
+        loads = true;
+    }
+    if loads {
+        Ok(())
+    } else {
+        Err(LoadError::Malformed("no loadable segments"))
+    }
+}
+
 /// The dynamic-linker path (`PT_INTERP`) named by a dynamic executable, if any.
 /// The caller reads that file and hands its bytes to [`load_dynamic`].
 #[must_use]

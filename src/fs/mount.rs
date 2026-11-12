@@ -900,7 +900,12 @@ impl MountTable {
     pub fn follow(&mut self, abs_path: &str) -> Option<String> {
         let mut p = normalize(abs_path);
         for _ in 0..SYMLINK_MAX {
-            match self.stat(&p) {
+            // The link's directories resolved first: a relative target is read
+            // from where the link really is. Debian's `/lib64 -> usr/lib64`
+            // holds `ld-linux-x86-64.so.2 -> ../lib/x86_64-linux-gnu/…`, whose
+            // `..` is `/usr`, not `/`.
+            p = self.canonical(&p);
+            match self.stat_raw(&p) {
                 Some(a) if a.kind == NodeKind::Symlink => {
                     let target = self.readlink(&p).ok()?;
                     p = if target.starts_with('/') {
@@ -1480,6 +1485,35 @@ mod tests {
         assert!(t.stat("/old/b").is_some());
         t.unmount("/old", true).unwrap();
         assert!(t.stat("/old/b").is_none());
+    }
+
+    #[test]
+    fn a_relative_link_is_read_from_where_it_really_is() {
+        // Debian's merged /usr: the loader's path goes through a linked
+        // directory, then ends in a link whose `..` is /usr, not /.
+        let mut t = table_with_tmpfs_root();
+        for d in [
+            "/usr",
+            "/usr/lib",
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+        ] {
+            t.mkdir(d, 0o755).unwrap();
+        }
+        t.symlink("usr/lib64", "/lib64").unwrap();
+        t.symlink(
+            "../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+            "/usr/lib64/ld-linux-x86-64.so.2",
+        )
+        .unwrap();
+        let real = "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2";
+        t.create(real, 0o755).unwrap();
+        t.write_at(real, 0, b"\x7fELF").unwrap();
+        assert_eq!(t.follow("/lib64/ld-linux-x86-64.so.2").unwrap(), real);
+        assert_eq!(
+            t.read_file("/lib64/ld-linux-x86-64.so.2").unwrap(),
+            b"\x7fELF"
+        );
     }
 
     #[test]

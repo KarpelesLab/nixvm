@@ -18,7 +18,8 @@ unshare -Urm /tmp/ns_pid                  # the ns_* programs want root in a use
 `unshare -Urn sh -c 'ip link set lo up && ./ns_net'` (a new namespace's `lo` starts down). `cgroups` wants root and cgroup v2 (`sudo ./cgroups`; it makes a subtree of its own under
 the root cgroup and removes it again). `rlimits` wants root too (`sudo ./rlimits`: it
 raises hard limits and runs `SCHED_FIFO` tasks), and so does `sched` (`sudo ./sched`:
-it runs real-time tasks on CPU 0 for a few seconds). CI runs all three on the runner as
-well as in the VM.
+it runs real-time tasks on CPU 0 for a few seconds). `exec` needs nothing: it writes
+tiny ELF images of its own to exec. CI runs those four on the runner as well as in
+the VM.
 `attacks.c` isn't a pass/fail
 program: the Rust test checks that each thing it tries is contained.

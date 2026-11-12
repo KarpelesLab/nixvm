@@ -72,8 +72,6 @@ const MAX_RW_COUNT: u64 = 0x7fff_f000;
 
 /// `dirfd` value meaning "resolve relative to the current working directory".
 const AT_FDCWD: i64 = -100;
-/// Max symlink hops before `ELOOP` (matches Linux's `MAXSYMLINKS`).
-const SYMLINK_MAX: u32 = 40;
 
 /// A task's table of signal dispositions, indexed by signal number (1..=64;
 /// index 0 is unused). Cloning this handle *shares* the table, so a change made
@@ -5582,7 +5580,9 @@ impl Kernel {
         };
         let argv = read_string_array(mem, argv_ptr);
         let envp = read_string_array(mem, envp_ptr);
-        self.exec_image(sh, &mut vfs, cx, &abs, argv, envp, vcpu, mem)
+        let r = self.exec_image(sh, &mut vfs, cx, &abs, argv, envp, vcpu, mem);
+        drop(vfs);
+        self.exec_result(sh, cx, r, mem)
     }
 
     /// `execveat(dirfd, path, argv, envp, flags)` — like `execve` but resolves
@@ -5617,7 +5617,25 @@ impl Kernel {
         let envp = read_string_array(mem, envp_ptr);
         // sh held (dispatch_shared) → acquire vfs in the mandated order.
         let mut vfs = self.vfs_for(cx);
-        self.exec_image(sh, &mut vfs, cx, &abs, argv, envp, vcpu, mem)
+        let r = self.exec_image(sh, &mut vfs, cx, &abs, argv, envp, vcpu, mem);
+        drop(vfs);
+        self.exec_result(sh, cx, r, mem)
+    }
+
+    /// What `execve` returns for `exec_image`'s result: its own, or — for a
+    /// load that failed past the point of no return, with no image left to
+    /// return to — a SIGSEGV death, as Linux's `force_fatal_sig` gives.
+    fn exec_result(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        r: Option<i64>,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        match r {
+            Some(r) => r,
+            None => self.exit_group_with(sh, cx, ExitCause::Signaled(SIGSEGV as i32), mem),
+        }
     }
 
     /// Load `abs` (following `PT_INTERP` for dynamic executables) into a fresh
@@ -5635,7 +5653,7 @@ impl Kernel {
         envp: Vec<String>,
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
-    ) -> i64 {
+    ) -> Option<i64> {
         // A `#!` script runs its interpreter instead (Linux's binfmt_script):
         // argv becomes [interpreter, (its optional argument), script path,
         // argv[1..]]. The interpreter may itself be a script, up to 4 levels
@@ -5646,14 +5664,14 @@ impl Kernel {
         let mut depth = 0;
         let elf = loop {
             let Some(data) = self.read_file(vfs, &abs) else {
-                return err(Errno::ENOENT);
+                return Some(err(Errno::ENOENT));
             };
             if !data.starts_with(b"#!") {
                 break data;
             }
             depth += 1;
             if depth > 4 {
-                return err(Errno::ELOOP);
+                return Some(err(Errno::ELOOP));
             }
             // Only the first line counts, and only its first 256 bytes.
             let head = &data[2..data.len().min(256)];
@@ -5668,10 +5686,10 @@ impl Kernel {
                 None => (line, None),
             };
             if interp.is_empty() {
-                return err(Errno::ENOEXEC);
+                return Some(err(Errno::ENOEXEC));
             }
             let Some(interp_abs) = self.resolve_exec(vfs, cx, interp) else {
-                return err(Errno::ENOENT);
+                return Some(err(Errno::ENOENT));
             };
             let mut next = vec![interp.to_string()];
             next.extend(arg.map(str::to_string));
@@ -5681,12 +5699,28 @@ impl Kernel {
             abs = interp_abs;
         };
         let abs = abs.as_str();
-        // Reject an obviously non-ELF64 image *before* tearing down the current
-        // one, so a bad `execve` leaves the process intact (real semantics) rather
-        // than stranded on an empty address space.
-        if elf.len() < 64 || elf[0..4] != [0x7f, b'E', b'L', b'F'] || elf[4] != 2 {
-            return err(Errno::ENOEXEC);
+        // Everything that can fail is checked *before* the current image is torn
+        // down, as Linux does before `begin_new_exec`: a bad file or a missing
+        // dynamic linker fails the call and the caller carries on — a shell
+        // prints "not found" rather than dying with its address space.
+        if crate::loader::check(&elf, self.arch).is_err() {
+            return Some(err(Errno::ENOEXEC));
         }
+        let interp_elf = match interp_path(&elf) {
+            Some(interp) => {
+                // The dynamic linker is named by the program, so it's found from
+                // the task's root like any other path the program names.
+                let interp = Self::under_root(&cx.cur.root, &interp);
+                let Some(interp_elf) = self.read_file(vfs, &interp) else {
+                    return Some(err(Errno::ENOENT)); // what Linux says for a missing one
+                };
+                if crate::loader::check(&interp_elf, self.arch).is_err() {
+                    return Some(err(Errno::ELIBBAD));
+                }
+                Some(interp_elf)
+            }
+            None => None,
+        };
         // Capture the launch identity for /proc/self/{cmdline,comm} before argv
         // is moved into the spec: cmdline is argv NUL-joined; comm is the new
         // program's basename (truncated to 15), which execve resets (a prior
@@ -5743,19 +5777,14 @@ impl Kernel {
         // the one KVM memslot stays valid and the process just gets a new cr3.
         mem.exec_reset();
         self.pc_gc(mem);
-        let loaded = if let Some(interp) = interp_path(&elf) {
-            // The dynamic linker is named by the program, so it's found from the
-            // task's root like any other path the program names.
-            let interp = Self::under_root(&cx.cur.root, &interp);
-            let Some(interp_elf) = self.read_file(vfs, &interp) else {
-                return err(Errno::ENOENT); // interpreter missing
-            };
-            load_dynamic(mem, &elf, &interp_elf, &spec)
-        } else {
-            load_static(mem, &elf, &spec)
+        let loaded = match &interp_elf {
+            Some(interp_elf) => load_dynamic(mem, &elf, interp_elf, &spec),
+            None => load_static(mem, &elf, &spec),
         };
         let Ok(img) = loaded else {
-            return err(Errno::ENOEXEC);
+            // Past the point of no return there's no image left to return to:
+            // Linux kills the task with SIGSEGV here, and so do we.
+            return None;
         };
         vcpu.reset(img.entry, img.stack_pointer);
         cx.cur.auxv = crate::loader::read_auxv(mem, img.stack_pointer);
@@ -5773,7 +5802,7 @@ impl Kernel {
         let mm = cx.cur.mm;
         sh.mmap_areas[mm] = Arena::new(top, mid);
         cx.exec_ok = true;
-        0
+        Some(0)
     }
 
     /// `wait4(pid, wstatus, options, rusage)` — reap a zombie child, honoring the
@@ -9559,26 +9588,11 @@ impl Kernel {
     }
 
     /// Follow the final-component symlink chain (bounded), returning the target.
-    /// `None` means the chain exceeded [`SYMLINK_MAX`] hops (a loop) — callers
+    /// `None` means the chain exceeded 40 hops (Linux's `MAXSYMLINKS`: a loop) — callers
     /// that must report `ELOOP` should go through [`Self::follow_or_eloop`].
     #[allow(clippy::unused_self)]
     fn follow_symlinks(&self, vfs: &mut MountTable, path: &str) -> Option<String> {
-        let mut p = path.to_string();
-        for _ in 0..SYMLINK_MAX {
-            match vfs.stat(&p) {
-                Some(a) if a.kind == NodeKind::Symlink => {
-                    let target = vfs.readlink(&p).ok()?;
-                    p = if target.starts_with('/') {
-                        vfs.join_root(&target)
-                    } else {
-                        let dir = parent_of(&p);
-                        vfs.join_relative(dir, &target)
-                    };
-                }
-                _ => return Some(p),
-            }
-        }
-        None
+        vfs.follow(path)
     }
 
     /// Resolve an `execve` target: absolute-ize, then follow symlinks.
@@ -9593,24 +9607,11 @@ impl Kernel {
         self.follow_symlinks(vfs, &abs)
     }
 
-    /// Read an entire file from the mount table.
+    /// Read an entire file from the mount table, following symlinks — the last
+    /// component's too, as a dynamic linker's path often ends in one.
     #[allow(clippy::unused_self)]
     fn read_file(&self, vfs: &mut MountTable, path: &str) -> Option<Vec<u8>> {
-        let size = vfs.stat(path)?.size as usize;
-        // A sparse file can claim any size at all.
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(size).ok()?;
-        buf.resize(size, 0);
-        let mut off = 0;
-        while off < size {
-            match vfs.read_at(path, off as u64, &mut buf[off..]) {
-                Ok(0) => break,
-                Ok(n) => off += n,
-                Err(_) => return None,
-            }
-        }
-        buf.truncate(off);
-        Some(buf)
+        vfs.read_file(path)
     }
 
     // ---- memory -----------------------------------------------------------

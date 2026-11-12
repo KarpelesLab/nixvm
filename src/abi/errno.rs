@@ -81,6 +81,7 @@ errnos! {
     ETIME = 62,
     EOVERFLOW = 75,
     EBADFD = 77,
+    ELIBBAD = 80,
     ENOTSOCK = 88,
     EMSGSIZE = 90,
     ENOPROTOOPT = 92,
