@@ -234,6 +234,13 @@ pub struct KvmVcpu {
     /// because the host edited this address space's page tables in place (a fork's
     /// copy-on-write downgrade of the parent) without the guest reloading cr3.
     tlb_flush_pending: bool,
+    /// The address space's [`GuestMemory::tlb_generation`] at this vcpu's last
+    /// flush. Another thread of the process editing the page tables moves it,
+    /// and this vcpu then flushes before its next run: its TLB survives across
+    /// runs, and a stale entry would read or write a page that was unmapped or
+    /// replaced (V8's background compiler wrote finished code into the old copy
+    /// of a page, and the main thread ran stale code).
+    tlb_gen_seen: u64,
     /// The shared physical pool, cached from the running `GuestMemory` so the
     /// fault path can read the pushed `#PF` exception frame lock-free (no
     /// `GuestMemory` borrow — the SMP path holds none). Set on the first run.
@@ -417,6 +424,7 @@ impl KvmVcpu {
             // and a page table freed by that task can come back at the same
             // physical address: KVM wouldn't flush on a cr3 it thinks unchanged.
             tlb_flush_pending: !is_new,
+            tlb_gen_seen: u64::MAX,
             phys: None,
             kstack_pa: 0,
         })
@@ -426,6 +434,11 @@ impl KvmVcpu {
     /// the per-process page-table switch. One `KVM_SET_SREGS` (deferred via the
     /// dirty flag) on a change, nothing on the common same-process run.
     fn sync_cr3(&mut self, mem: &GuestMemory) {
+        let generation = mem.tlb_generation();
+        if self.tlb_gen_seen != generation {
+            self.tlb_gen_seen = generation;
+            self.tlb_flush_pending = true;
+        }
         let cr3 = mem.cr3();
         if self.cur_cr3 != Some(cr3) {
             self.sregs.cr3 = cr3;

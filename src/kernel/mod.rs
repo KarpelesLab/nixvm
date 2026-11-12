@@ -278,9 +278,6 @@ struct ProcInfo {
     /// field while the task runs, checked back in between slices so siblings see a
     /// `chdir`. A plain `fork` gets a private copy.
     cwd: String,
-    brk: u64,
-    heap_start: u64,
-    heap_limit: u64,
     mmap_cursor: u64,
     mmap_floor: u64,
     /// Lowest address the initial thread's stack may grow to. A fault in
@@ -605,9 +602,6 @@ impl Default for ProcInfo {
         Self {
             fds: FdTable::with_standard_streams(),
             cwd: "/".to_string(),
-            brk: 0,
-            heap_start: 0,
-            heap_limit: 0,
             mmap_cursor: 0,
             mmap_floor: 0,
             stack_limit: 0,
@@ -1681,6 +1675,9 @@ pub struct Kernel {
     /// the kernel, so several tasks can be serviced re-entrantly once the kernel
     /// lock is split (a later phase).
     seed: ProcInfo,
+    /// The first process's heap window ([`Kernel::set_heap`]), put in its
+    /// memory when it boots.
+    seed_heap: crate::vcpu::mem::Heap,
     /// Number of virtual CPUs: how many host worker threads run guest compute
     /// in parallel. `1` uses the single-threaded cooperative scheduler.
     ncpus: usize,
@@ -2365,6 +2362,7 @@ impl Kernel {
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(1024),
             seed: ProcInfo::default(),
+            seed_heap: crate::vcpu::mem::Heap::default(),
             ncpus: 1,
             interactive: false,
             host_tty: false,
@@ -2509,9 +2507,7 @@ impl Kernel {
     /// Set the initial heap window for the first process: `start` is the program
     /// break, `limit` the highest address the heap may reach.
     pub fn set_heap(&mut self, start: u64, limit: u64) {
-        self.seed.heap_start = start;
-        self.seed.brk = start;
-        self.seed.heap_limit = limit;
+        self.seed_heap = crate::vcpu::mem::Heap::new(start, limit);
     }
 
     /// Set the initial anonymous-`mmap` arena for the first process. `top` is
@@ -2579,7 +2575,8 @@ impl Kernel {
     /// Run the machine: `vcpu`/`mem` become the initial process (pid 1), then
     /// the scheduler drives all processes until pid 1 exits. Returns pid 1's
     /// exit code.
-    pub fn run(&mut self, vcpu: Box<dyn Vcpu>, mem: GuestMemory) -> Result<i32, VcpuError> {
+    pub fn run(&mut self, vcpu: Box<dyn Vcpu>, mut mem: GuestMemory) -> Result<i32, VcpuError> {
+        mem.heap = self.seed_heap;
         let ncpus = self.ncpus;
         let mut info = std::mem::take(&mut self.seed);
         {
@@ -2835,7 +2832,8 @@ impl Kernel {
     /// Seed the initial process (pid 1) without running it, for the incremental
     /// [`Kernel::pump`] driver. Use instead of [`Kernel::run`] when the embedder
     /// wants to interleave guest execution with feeding input (e.g. a terminal).
-    pub fn boot(&mut self, vcpu: Box<dyn Vcpu>, mem: GuestMemory) {
+    pub fn boot(&mut self, vcpu: Box<dyn Vcpu>, mut mem: GuestMemory) {
+        mem.heap = self.seed_heap;
         let mut info = std::mem::take(&mut self.seed);
         let sh = self.shared.get_mut().unwrap();
         info.pid = 1;
@@ -5874,9 +5872,7 @@ impl Kernel {
         cx.cur.auxv = crate::loader::read_auxv(mem, img.stack_pointer);
         cx.cur.sigtramp = 0;
         let mid = page_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
-        cx.cur.brk = img.program_break;
-        cx.cur.heap_start = img.program_break;
-        cx.cur.heap_limit = mid;
+        mem.heap = crate::vcpu::mem::Heap::new(img.program_break, mid);
         cx.cur.stack_limit = img.stack_bottom; // stack grows down to here on demand
         // Arena top sits a guard gap below the stack (see STACK_GUARD_GAP).
         let top = arena_top(img.stack_bottom, mid);
@@ -9961,36 +9957,42 @@ impl Kernel {
 
     /// `brk(addr)`.
     #[allow(clippy::unused_self)]
+    ///
+    /// The break is the address space's ([`GuestMemory::heap`]), shared by the
+    /// process's threads: a per-task copy let a thread grow the heap from a
+    /// stale break, over memory another thread's allocator had handed out
+    /// (musl's malloc then found its own metadata wrecked).
     fn sys_brk(&self, cx: &mut ServiceCtx, addr: u64, mem: &mut GuestMemory) -> i64 {
-        if addr == 0 || addr < cx.cur.heap_start {
-            return cx.cur.brk as i64;
+        let heap = mem.heap;
+        if addr == 0 || addr < heap.start {
+            return heap.brk as i64;
         }
-        if addr > cx.cur.brk {
+        if addr > heap.brk {
             // Map from the first page NOT already backing the heap: the page a
             // mid-page `brk` sits on is live (`map` zero-fills, and glibc puts
             // its TCB — the TLS block and the stack-protector canary — in
             // early brk memory; rounding down here wiped it and every later
             // canary check "detected" smashing). A page-aligned `brk` is
             // exclusive, so its page is not yet part of the heap.
-            let from = cx.cur.brk.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+            let from = heap.brk.div_ceil(PAGE_SIZE) * PAGE_SIZE;
             let to = addr.div_ceil(PAGE_SIZE) * PAGE_SIZE;
             let data_limit = cx.cur.rlimits.soft(sys_misc::RLIMIT_DATA);
-            if to > cx.cur.heap_limit
-                || to - cx.cur.heap_start > data_limit
+            if to > heap.limit
+                || to - heap.start > data_limit
                 || Self::address_space_exceeded(cx, mem, to.saturating_sub(from))
                 || (to > from && mem.map(from, to - from, Prot::rw()).is_err())
             {
-                return cx.cur.brk as i64;
+                return heap.brk as i64;
             }
-        } else if addr < cx.cur.brk {
+        } else if addr < heap.brk {
             let from = addr.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-            let to = cx.cur.brk.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+            let to = heap.brk.div_ceil(PAGE_SIZE) * PAGE_SIZE;
             if to > from {
                 let _ = mem.unmap(from, to - from);
             }
         }
-        cx.cur.brk = addr;
-        cx.cur.brk as i64
+        mem.heap.brk = addr;
+        addr as i64
     }
 
     /// `mmap(addr, len, prot, flags, fd, off)`.

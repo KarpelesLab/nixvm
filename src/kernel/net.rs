@@ -445,9 +445,8 @@ struct SockOpts {
     /// `TCP_NODELAY` — stored only; every write is already delivered
     /// immediately, so Nagle's algorithm was never modeled to begin with.
     nodelay: bool,
-    /// `IPV6_V6ONLY` — stored only; this module never models a dual-stack
-    /// socket (an `AF_INET6` bind/connect always requires a v6 peer/local
-    /// address), so there is no dual-stack behavior to gate.
+    /// `IPV6_V6ONLY`: off (the default), an `AF_INET6` stream socket listening
+    /// on `::` takes IPv4 connections too (see [`Net::pick_dual_listener`]).
     v6only: bool,
     linger_on: bool,
     linger_secs: i32,
@@ -581,6 +580,10 @@ struct Pair {
     shut_rd: [bool; 2],
     nonblock: [bool; 2],
     addrs: [Option<InetAddr>; 2],
+    /// Which ends are `AF_INET6` sockets on an IPv4 connection (a dual-stack
+    /// listener's, or one that connected to a `::ffff:` address): they see
+    /// its IPv4 addresses as IPv4-mapped ones ([`Pair::addr_seen_by`]).
+    v6_view: [bool; 2],
     /// In-flight `SCM_RIGHTS` ancillary file descriptors, parallel to `to`:
     /// `scm[e]` rides the byte stream the reader on end `e` consumes. Each entry
     /// is `(pos, fds)` where `pos` is the number of stream bytes still queued
@@ -625,9 +628,21 @@ impl Pair {
             shut_rd: [false, false],
             nonblock: [false, false],
             addrs: [None, None],
+            v6_view: [false, false],
             scm: [VecDeque::new(), VecDeque::new()],
             cred: [Ucred::default(); 2],
         }
+    }
+
+    /// End `which`'s address as end `viewer` sees it: an IPv4 address shown to
+    /// an `AF_INET6` end is IPv4-mapped (`::ffff:a.b.c.d`), as on Linux.
+    fn addr_seen_by(&self, which: usize, viewer: usize) -> Option<InetAddr> {
+        let a = self.addrs[which]?;
+        Some(if self.v6_view[viewer] && !a.v6 {
+            a.mapped()
+        } else {
+            a
+        })
     }
 
     /// Bytes readable from `to[e]` in one `recvmsg` without merging past an
@@ -774,6 +789,33 @@ struct InetAddr {
 }
 
 impl InetAddr {
+    /// The IPv4 address an IPv4-mapped IPv6 one (`::ffff:a.b.c.d`) stands for.
+    fn unmapped(&self) -> Option<InetAddr> {
+        if !self.v6 || self.ip[..10] != [0; 10] || self.ip[10..12] != [0xff, 0xff] {
+            return None;
+        }
+        let mut ip = [0u8; 16];
+        ip[..4].copy_from_slice(&self.ip[12..16]);
+        Some(InetAddr {
+            v6: false,
+            port: self.port,
+            ip,
+        })
+    }
+
+    /// This IPv4 address as an IPv4-mapped IPv6 one.
+    fn mapped(&self) -> InetAddr {
+        let mut ip = [0u8; 16];
+        ip[10] = 0xff;
+        ip[11] = 0xff;
+        ip[12..16].copy_from_slice(&self.ip[..4]);
+        InetAddr {
+            v6: true,
+            port: self.port,
+            ip,
+        }
+    }
+
     /// `INADDR_ANY`/`in6addr_any` (`0.0.0.0`/`::`).
     fn is_any(&self) -> bool {
         self.ip == [0u8; 16]
@@ -1040,6 +1082,26 @@ impl Net {
     fn pick_listener(&mut self, key: &str) -> Option<usize> {
         let group = self.listeners.get(key)?;
         let chosen = *group.get(self.next_listener % group.len())?;
+        self.next_listener = self.next_listener.wrapping_add(1);
+        Some(chosen)
+    }
+
+    /// The dual-stack listener an IPv4 connection to `a` (in `netns`) goes to
+    /// when no IPv4 socket listens on its port: an `AF_INET6` one bound to
+    /// `::` without `IPV6_V6ONLY` takes IPv4 connections too, as on Linux.
+    fn pick_dual_listener(&mut self, netns: u32, a: InetAddr) -> Option<usize> {
+        let key6 = route_key(netns, "tcp", InetAddr { v6: true, ..a });
+        let group: Vec<usize> = self
+            .listeners
+            .get(&key6)?
+            .iter()
+            .copied()
+            .filter(|&i| {
+                !self.socks[i].opts.v6only
+                    && matches!(&self.socks[i].kind, Kind::Listener { addr: Some(Addr::Inet(b)), .. } if b.is_any())
+            })
+            .collect();
+        let chosen = *group.get(self.next_listener % group.len().max(1))?;
         self.next_listener = self.next_listener.wrapping_add(1);
         Some(chosen)
     }
@@ -1659,6 +1721,14 @@ impl Kernel {
         if mismatched {
             return err(Errno::EINVAL);
         }
+        // A stream `AF_INET6` socket connecting to an IPv4-mapped address
+        // (`::ffff:127.0.0.1`) makes an IPv4 connection, as on Linux.
+        let target = match target {
+            Addr::Inet(a) if !matches!(net.socks[sock].kind, Kind::Dgram(_)) => {
+                Addr::Inet(a.unmapped().unwrap_or(a))
+            }
+            other => other,
+        };
         if let Addr::Inet(a) = &target
             && let Some(e) = net.loopback_unreachable(sock, a)
         {
@@ -1719,7 +1789,12 @@ impl Kernel {
             Addr::Unix(p) => unix_key(net.socks[sock].netns, p, cx.unix_identity.as_ref()),
             Addr::Inet(a) => route_key(net.socks[sock].netns, "tcp", *a),
         };
-        let Some(lidx) = net.pick_listener(&key) else {
+        let netns = net.socks[sock].netns;
+        let picked = net.pick_listener(&key).or_else(|| match &target {
+            Addr::Inet(a) if !a.v6 => net.pick_dual_listener(netns, *a),
+            _ => None,
+        });
+        let Some(lidx) = picked else {
             return err(Errno::ECONNREFUSED);
         };
         // A full accept queue: nobody is taking connections (Linux's SOMAXCONN).
@@ -1738,9 +1813,17 @@ impl Kernel {
         pair.cred = [Ucred::of(cx), listener_cred];
         pair.nonblock[0] = net.socks[sock].nonblock;
         if domain != AF_UNIX {
-            let v6 = domain == AF_INET6;
+            // The connection's family is the target's (an IPv4-mapped one was
+            // made plain IPv4 above); an `AF_INET6` end of an IPv4 connection
+            // sees its addresses IPv4-mapped.
+            let v6 = matches!(&target, Addr::Inet(a) if a.v6);
             let mut peer_addr = match listener_addr {
-                Some(Addr::Inet(a)) => a,
+                Some(Addr::Inet(a)) if a.v6 == v6 => a,
+                Some(Addr::Inet(a)) => InetAddr {
+                    v6,
+                    port: a.port,
+                    ip: loopback_ip(v6),
+                },
                 _ => InetAddr {
                     v6,
                     port: 0,
@@ -1753,6 +1836,10 @@ impl Kernel {
             }
             pair.addrs[0] = Some(net.fresh_local(net.socks[sock].netns, v6));
             pair.addrs[1] = Some(peer_addr);
+            pair.v6_view = [
+                !v6 && domain == AF_INET6,
+                !v6 && net.socks[lidx].domain == AF_INET6,
+            ];
         }
         // The client end is held by every fd the idle socket had.
         pair.refs[0] = net.socks[sock].refs;
@@ -1861,7 +1948,7 @@ impl Kernel {
         };
         let domain = net.socks[sock].domain;
         let peer = match &net.socks[pidx].kind {
-            Kind::Pair(p) => p.addrs[0].map(Addr::Inet),
+            Kind::Pair(p) => p.addr_seen_by(0, 1).map(Addr::Inet),
             _ => None,
         };
         write_sockaddr(mem, addr, addrlen, domain, peer.as_ref());
@@ -1936,7 +2023,7 @@ impl Kernel {
         let resolved = match &net.socks[sock].kind {
             Kind::Idle { bound } => bound.clone(),
             Kind::Listener { addr, .. } => addr.clone(),
-            Kind::Pair(p) => p.addrs[end].map(Addr::Inet),
+            Kind::Pair(p) => p.addr_seen_by(end, end).map(Addr::Inet),
             Kind::Dgram(d) => d.local.map(Addr::Inet),
             // A host-bridged socket has an ephemeral local address the guest
             // never bound and doesn't inspect; report the wildcard.
@@ -1965,7 +2052,7 @@ impl Kernel {
                 addr,
                 addrlen,
                 domain,
-                p.addrs[1 - end].map(Addr::Inet).as_ref(),
+                p.addr_seen_by(1 - end, end).map(Addr::Inet).as_ref(),
             ),
             Kind::Dgram(d) if d.peer.is_some() => {
                 write_sockaddr(mem, addr, addrlen, domain, d.peer.map(Addr::Inet).as_ref())
@@ -2800,7 +2887,7 @@ impl Kernel {
             if n > 0 {
                 let domain = net.socks[sock].domain;
                 let peer = match &net.socks[sock].kind {
-                    Kind::Pair(p) => p.addrs[1 - end].map(Addr::Inet),
+                    Kind::Pair(p) => p.addr_seen_by(1 - end, end).map(Addr::Inet),
                     _ => None,
                 };
                 write_sockaddr(mem, src_addr, src_addrlen, domain, peer.as_ref());
@@ -3193,7 +3280,7 @@ impl Kernel {
                 // SCM_RIGHTS fds that ride the consumed bytes.
                 let (bytes, fds) = self.recv_stream_bytes(net, cx, sock, end, cap, flags)?;
                 let peer = match &net.socks[sock].kind {
-                    Kind::Pair(p) => p.addrs[1 - end].map(Addr::Inet),
+                    Kind::Pair(p) => p.addr_seen_by(1 - end, end).map(Addr::Inet),
                     _ => None,
                 };
                 Ok((peer, bytes, 0, fds))

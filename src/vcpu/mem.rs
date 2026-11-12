@@ -21,6 +21,15 @@
 //! privatizes the frame ([`GuestMemory::cow_fault`], or transparently inside
 //! `write`/`write_init`). Only touched pages ever consume a private frame.
 
+/// Note a page-table edit that can leave a stale TLB entry (fields only, so
+/// it works while a lock guard borrows another part of the memory).
+macro_rules! mark_tlb_dirty {
+    ($m:expr) => {{
+        $m.tlb_dirty = true;
+        $m.tlb_gen = $m.tlb_gen.wrapping_add(1);
+    }};
+}
+
 use super::ctrl;
 use super::pagetable::{AddrSpace, Enc, PtFormat};
 use super::pagevec::PageVec;
@@ -94,6 +103,27 @@ impl MemError {
 }
 
 /// The guest address space for one process. Not `Clone` — use [`GuestMemory::fork`].
+/// A process's heap: where it starts, the current program break (`brk`), and
+/// the highest address the break may reach.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Heap {
+    pub start: u64,
+    pub brk: u64,
+    pub limit: u64,
+}
+
+impl Heap {
+    /// A heap starting (empty) at `start`, growing up to `limit`.
+    #[must_use]
+    pub fn new(start: u64, limit: u64) -> Self {
+        Self {
+            start,
+            brk: start,
+            limit,
+        }
+    }
+}
+
 pub struct GuestMemory {
     base: u64,
     size: u64,
@@ -137,6 +167,14 @@ pub struct GuestMemory {
     /// would keep serving the old (now-unmapped or reused) frame. Consumed by
     /// [`GuestMemory::take_tlb_dirty`]; irrelevant to the interpreter (no TLB).
     tlb_dirty: bool,
+    /// Bumped with every such page-table edit ([`GuestMemory::tlb_generation`]):
+    /// each vcpu of this address space — every thread's — flushes its TLB
+    /// before running once this has moved since its last flush, not only the
+    /// vcpu whose syscall made the edit.
+    tlb_gen: u64,
+    /// The program break and the window it may move in: the address space's,
+    /// so a process's threads share it (as on Linux) and a fork copies it.
+    pub heap: Heap,
     /// Set whenever the host puts bytes into a page the guest may execute, or a
     /// frame behind an executable mapping changes (a copy-on-write copy): an
     /// arm64 hardware vcpu must invalidate its instruction cache before running
@@ -295,6 +333,8 @@ impl GuestMemory {
             fork_policy: std::collections::BTreeMap::new(),
             locks: super::pagelocks::PageLocks::default(),
             tlb_dirty: false,
+            tlb_gen: 0,
+            heap: Heap::default(),
             icache_dirty: true,
             kstack_pa,
             shared: false,
@@ -329,7 +369,7 @@ impl GuestMemory {
         self.phys.set_format(want);
         self.space.reencode(from, Enc::of(&self.phys), &self.phys);
         ctrl::build_arm_kernel_tables(&self.phys);
-        self.tlb_dirty = true;
+        mark_tlb_dirty!(self);
         Ok(())
     }
 
@@ -460,6 +500,15 @@ impl GuestMemory {
     /// stale entry never serves an unmapped or replaced frame.
     pub(crate) fn take_tlb_dirty(&mut self) -> bool {
         std::mem::take(&mut self.tlb_dirty)
+    }
+
+    /// How many TLB-staling page-table edits this address space has had. A
+    /// vcpu that last flushed at another value holds entries that may be
+    /// stale — one of a process's other threads unmapped, re-protected or
+    /// replaced a page since — and must flush before it runs.
+    #[must_use]
+    pub fn tlb_generation(&self) -> u64 {
+        self.tlb_gen
     }
 
     /// Take and clear the "code changed behind the guest's back" flag (see the
@@ -842,7 +891,7 @@ impl GuestMemory {
                 && let Some(old) = self.space.unmap(va, &mut fa, &self.phys)
             {
                 fa.free(old);
-                self.tlb_dirty = true;
+                mark_tlb_dirty!(self);
             }
             let frame = frames[i];
             fa.incref(frame);
@@ -1040,7 +1089,7 @@ impl GuestMemory {
                 let frame = t.paddr & !(PAGE_SIZE - 1);
                 let lp = self.leaf_prot(p, frame, &fa);
                 if self.space.protect(va, lp, false, &self.phys) {
-                    self.tlb_dirty = true; // a present leaf's permissions changed
+                    mark_tlb_dirty!(self); // a present leaf's permissions changed
                 }
             }
         }
@@ -1062,7 +1111,7 @@ impl GuestMemory {
                 && let Some(frame) = self.space.unmap(self.page_base(p), &mut fa, &self.phys)
             {
                 fa.free(frame);
-                self.tlb_dirty = true; // a present leaf was cleared
+                mark_tlb_dirty!(self); // a present leaf was cleared
             }
             self.mapped_count -= usize::from(self.mapped[p]);
             self.mapped[p] = false;
@@ -1262,7 +1311,9 @@ impl GuestMemory {
                     self.shared_anon[p],
                 )?;
             }
-            self.tlb_dirty |= changed;
+            if changed {
+                mark_tlb_dirty!(self);
+            }
         }
         self.icache_dirty |= self.any_exec(first, last);
         let mut done = 0usize;
@@ -1359,7 +1410,9 @@ impl GuestMemory {
                     self.shared_anon[p],
                 )?;
             }
-            self.tlb_dirty |= changed;
+            if changed {
+                mark_tlb_dirty!(self);
+            }
         }
         self.icache_dirty |= self.any_exec(first, last);
         let mut done = 0usize;
@@ -1470,6 +1523,8 @@ impl GuestMemory {
             fork_policy,
             locks: super::pagelocks::PageLocks::default(),
             tlb_dirty: false,
+            tlb_gen: 0,
+            heap: self.heap,
             icache_dirty: true,
             kstack_pa: child_kstack,
             shared: self.shared,
@@ -1505,7 +1560,7 @@ impl GuestMemory {
         self.file_backed.clear();
         self.shared_anon.clear();
         self.fork_policy.clear();
-        self.tlb_dirty = true;
+        mark_tlb_dirty!(self);
     }
 
     fn reset_space(&mut self) {

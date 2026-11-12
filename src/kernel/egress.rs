@@ -184,13 +184,24 @@ mod native {
 
     impl Egress for HostEgress {
         fn connect_tcp(&self, ip: [u8; 16], v6: bool, port: u16) -> io::Result<Box<dyn HostConn>> {
-            // A bounded blocking connect (the guest is mid-`connect()`), then
-            // switch to non-blocking for all subsequent I/O.
-            let stream =
-                TcpStream::connect_timeout(&sockaddr(ip, v6, port), Duration::from_secs(10))?;
-            stream.set_nonblocking(true)?;
-            let _ = stream.set_nodelay(true);
-            Ok(Box::new(TcpConn(stream)))
+            // The handshake happens on a thread of its own and the connection
+            // reports it through `poll_connect`: a blocking connect here froze
+            // the whole VM — every guest task, timers included — for as long
+            // as an address took to answer (up to the timeout, for one that
+            // never does), which a client trying several addresses (bun) turned
+            // into a hang.
+            let addr = sockaddr(ip, v6, port);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("nixvm-connect".into())
+                .spawn(move || {
+                    let _ = tx.send(TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT));
+                })?;
+            Ok(Box::new(TcpConn {
+                state: ConnState::Connecting(rx),
+                options: Vec::new(),
+                shut_write: false,
+            }))
         }
 
         fn open_udp(&self) -> io::Result<Box<dyn HostDgram>> {
@@ -200,43 +211,134 @@ mod native {
         }
     }
 
+    /// How long a host connect may take before it fails: about what Linux's
+    /// SYN retries add up to.
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(75);
+
+    /// A host TCP connection: its handshake, on a helper thread, then the
+    /// non-blocking stream.
     #[derive(Debug)]
-    struct TcpConn(TcpStream);
+    struct TcpConn {
+        state: ConnState,
+        /// Options set while still connecting, applied once it's up.
+        options: Vec<ConnOption>,
+        /// `shutdown(SHUT_WR)` while still connecting.
+        shut_write: bool,
+    }
+
+    #[derive(Debug)]
+    enum ConnState {
+        Connecting(std::sync::mpsc::Receiver<io::Result<TcpStream>>),
+        Up(TcpStream),
+        /// The handshake failed; its error, until reported.
+        Failed(Option<io::Error>),
+    }
+
+    fn apply_option(stream: &TcpStream, opt: ConnOption) {
+        match opt {
+            ConnOption::NoDelay(on) => {
+                let _ = stream.set_nodelay(on);
+            }
+            #[cfg(unix)]
+            other => super::sockopt::apply(stream, other),
+            #[cfg(not(unix))]
+            _ => {}
+        }
+    }
+
+    impl TcpConn {
+        /// The stream, once the handshake is done.
+        fn stream(&mut self) -> Option<&mut TcpStream> {
+            if let ConnState::Connecting(rx) = &self.state {
+                match rx.try_recv() {
+                    Ok(Ok(stream)) => {
+                        let _ = stream.set_nonblocking(true);
+                        let _ = stream.set_nodelay(true);
+                        for opt in self.options.drain(..) {
+                            apply_option(&stream, opt);
+                        }
+                        if self.shut_write {
+                            let _ = stream.shutdown(std::net::Shutdown::Write);
+                        }
+                        self.state = ConnState::Up(stream);
+                    }
+                    Ok(Err(e)) => self.state = ConnState::Failed(Some(e)),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.state =
+                            ConnState::Failed(Some(io::Error::other("connect thread died")));
+                    }
+                }
+            }
+            match &mut self.state {
+                ConnState::Up(stream) => Some(stream),
+                _ => None,
+            }
+        }
+
+        fn not_up(&mut self) -> io::Error {
+            match &mut self.state {
+                ConnState::Failed(e) => e
+                    .take()
+                    .unwrap_or_else(|| io::Error::from(io::ErrorKind::NotConnected)),
+                _ => io::Error::from(io::ErrorKind::WouldBlock),
+            }
+        }
+    }
 
     impl HostConn for TcpConn {
         fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.read(buf)
+            match self.stream() {
+                Some(s) => s.read(buf),
+                None => Err(self.not_up()),
+            }
         }
         fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.write(buf)
+            match self.stream() {
+                Some(s) => s.write(buf),
+                None => Err(self.not_up()),
+            }
         }
         fn shutdown_write(&mut self) {
-            let _ = self.0.shutdown(std::net::Shutdown::Write);
+            match self.stream() {
+                Some(s) => {
+                    let _ = s.shutdown(std::net::Shutdown::Write);
+                }
+                None => self.shut_write = true,
+            }
+        }
+        fn poll_connect(&mut self) -> io::Result<bool> {
+            if self.stream().is_some() {
+                return Ok(true);
+            }
+            match &mut self.state {
+                ConnState::Connecting(_) => Ok(false),
+                _ => Err(self.not_up()),
+            }
         }
         fn set_option(&mut self, opt: ConnOption) {
-            match opt {
-                ConnOption::NoDelay(on) => {
-                    let _ = self.0.set_nodelay(on);
-                }
-                #[cfg(unix)]
-                other => super::sockopt::apply(&self.0, other),
-                #[cfg(not(unix))]
-                _ => {}
+            match self.stream() {
+                Some(s) => apply_option(s, opt),
+                None => self.options.push(opt),
             }
         }
         #[cfg(unix)]
         fn unsent(&mut self) -> Option<usize> {
-            super::sockopt::unsent(&self.0)
+            super::sockopt::unsent(self.stream()?)
         }
         fn poll_readable(&mut self) -> bool {
             // A non-blocking peek: any bytes (or a clean EOF, reported as
             // `Ok(0)`) means a subsequent recv won't block. `WouldBlock` means
             // nothing yet. Any other error also counts as "ready" so the guest
-            // observes the error via recv rather than spinning.
+            // observes the error via recv rather than spinning — a failed
+            // handshake too; one still in progress has nothing to read.
             let mut b = [0u8; 1];
-            match self.0.peek(&mut b) {
-                Ok(_) => true,
-                Err(e) => e.kind() != io::ErrorKind::WouldBlock,
+            match self.stream() {
+                Some(s) => match s.peek(&mut b) {
+                    Ok(_) => true,
+                    Err(e) => e.kind() != io::ErrorKind::WouldBlock,
+                },
+                None => matches!(self.state, ConnState::Failed(_)),
             }
         }
         fn readable_len(&mut self) -> usize {
@@ -244,7 +346,7 @@ mod native {
             // the buffer — enough to size a read; a client re-checks after
             // draining. `WouldBlock`/errors report 0 (nothing to read now).
             let mut b = [0u8; 4096];
-            self.0.peek(&mut b).unwrap_or(0)
+            self.stream().map_or(0, |s| s.peek(&mut b).unwrap_or(0))
         }
     }
 
@@ -452,5 +554,49 @@ mod sockopt {
                 let _ = std::io::Read::read(&mut peer, &mut buf);
             }
         }
+    }
+}
+
+#[cfg(all(test, unix, not(target_arch = "wasm32")))]
+mod connect_tests {
+    use super::{Egress, HostEgress};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    /// A host connect returns at once and finishes in the background: a
+    /// blocking one froze the whole VM, every guest task's timers included,
+    /// for as long as the address took to answer.
+    #[test]
+    fn a_host_connect_never_blocks_the_vm() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut ip = [0u8; 16];
+        ip[..4].copy_from_slice(&[127, 0, 0, 1]);
+        let port = l.local_addr().unwrap().port();
+        let mut c = HostEgress.connect_tcp(ip, false, port).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !c.poll_connect().unwrap() {
+            assert!(Instant::now() < deadline, "the connect never completed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (mut peer, _) = l.accept().unwrap();
+        assert_eq!(c.send(b"hi").unwrap(), 2);
+        let mut b = [0u8; 2];
+        std::io::Read::read_exact(&mut peer, &mut b).unwrap();
+        assert_eq!(&b, b"hi");
+
+        // An address that never answers (TEST-NET-1, RFC 5737): the call
+        // still comes straight back, the handshake pending (or refused by the
+        // host's routing at once).
+        let started = Instant::now();
+        let mut ip = [0u8; 16];
+        ip[..4].copy_from_slice(&[192, 0, 2, 1]);
+        if let Ok(mut c) = HostEgress.connect_tcp(ip, false, 9) {
+            let pending = c.poll_connect();
+            assert!(!matches!(pending, Ok(true)), "connected to a black hole?");
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "connect blocked"
+        );
     }
 }
