@@ -937,6 +937,40 @@ impl FrameAllocator {
         Some(pa)
     }
 
+    /// A frame taken on speculation — backing a page a fault didn't ask for yet
+    /// (fault-around): only from plainly free frames, never by reclaiming,
+    /// never from the reserve or what the page cache may need, and never taking
+    /// a memory cgroup to its `memory.high` or `memory.max`. So it records no
+    /// event, causes no throttling or out-of-memory kill, and costs nothing but
+    /// a frame nobody needed; `None` whenever any of that would happen.
+    pub fn alloc_spare(&mut self, phys: &PhysMem) -> Option<u64> {
+        const SLACK: usize = 256;
+        if self.free_list.len() <= self.reserve + self.cache.pages as usize + SLACK {
+            return None;
+        }
+        let slot = self.charge_to;
+        let fits = self
+            .memcg_chain(slot)
+            .all(|m| self.memcgs[m].frames + 1 < self.memcgs[m].high.min(self.memcgs[m].max));
+        if !fits {
+            return None;
+        }
+        let chain: Vec<usize> = self.memcg_chain(slot).collect();
+        for m in chain {
+            let g = &mut self.memcgs[m];
+            g.frames += 1;
+            g.peak = g.peak.max(g.frames);
+        }
+        let f = self.free_list.pop()?;
+        debug_assert_eq!(self.refcount[f as usize], 0, "free-list frame was not free");
+        self.refcount[f as usize] = 1;
+        self.owner[f as usize] = slot;
+        self.allocated += 1;
+        let pa = u64::from(f) * FRAME;
+        phys.zero_frame(pa);
+        Some(pa)
+    }
+
     /// Keep `frames` free for allocations made under [`Self::set_use_reserve`].
     pub fn set_reserve(&mut self, frames: usize) {
         self.reserve = frames;

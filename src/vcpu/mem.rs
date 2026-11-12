@@ -164,7 +164,17 @@ pub struct GuestMemory {
     /// The memory cgroup (allocator slot) frames this address space allocates
     /// are charged to: its tasks' cgroup's, set by the kernel as they run.
     memcg: u16,
+    /// Fault-around state (see [`GuestMemory::demand_fault`]): the page the
+    /// last demand fault backed last, the direction the faults are walking
+    /// (+1 up, -1 down — a stack), and how many pages the next fault in that
+    /// direction backs.
+    fault_last: u64,
+    fault_dir: i64,
+    fault_window: u64,
 }
+
+/// The most pages one demand fault backs: 64 KiB, Linux's `fault_around_bytes`.
+const FAULT_AROUND_MAX: u64 = 16;
 
 impl std::fmt::Debug for GuestMemory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -277,6 +287,9 @@ impl GuestMemory {
             kstack_pa,
             shared: false,
             memcg: 0,
+            fault_last: 0,
+            fault_dir: 1,
+            fault_window: 1,
         }
     }
 
@@ -853,11 +866,22 @@ impl GuestMemory {
         }
     }
 
-    /// Back a demand-paged page on a fault (the KVM `#PF` / not-present path).
-    /// Returns `true` if `addr` was a mapped-but-unbacked page and is now backed,
-    /// so the faulting access retries and succeeds; `false` if the fault is
-    /// something else (unmapped, or an already-backed page — e.g. a copy-on-write
-    /// or protection fault the caller must handle).
+    /// Back a demand-paged page on a fault (the hardware `#PF` / translation
+    /// fault path). Returns `true` if `addr` was a mapped-but-unbacked page and
+    /// is now backed, so the faulting access retries and succeeds; `false` if
+    /// the fault is something else (unmapped, or an already-backed page — e.g. a
+    /// copy-on-write or protection fault the caller must handle).
+    ///
+    /// Fault-around: a guest touching fresh memory in order (a `memset`, a
+    /// growing heap or stack) would take one exit per page, and on hardware the
+    /// exit, not the work, is the cost. So when faults walk the space page after
+    /// page, each backs a growing run of the pages ahead of it (up to
+    /// [`FAULT_AROUND_MAX`]) — pages already mapped there, unbacked, private
+    /// anonymous with the same protection, within the same page table — taken
+    /// only from frames nobody needs ([`FrameAllocator::alloc_spare`]: never
+    /// past a memory cgroup's `high` or `max`, never by reclaiming). A fault
+    /// anywhere else starts over at one page, so sparse touches of a huge
+    /// reservation still cost one frame each.
     pub fn demand_fault(&mut self, addr: u64) -> bool {
         let page = addr - addr % PAGE_SIZE;
         let Some(p) = self.page_index(page) else {
@@ -875,7 +899,58 @@ impl GuestMemory {
             return false;
         }
         let mut fa = lock_fa(&self.fa, self.memcg);
-        Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, page)
+        if !Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, page) {
+            return false;
+        }
+        // Walking on from the last run (up, or down for a stack)? Back more.
+        let dir = if page.wrapping_add(PAGE_SIZE) == self.fault_last {
+            -1
+        } else {
+            1
+        };
+        let walking = page == self.fault_last.wrapping_add_signed(dir * PAGE_SIZE as i64);
+        let window = match (walking, dir == self.fault_dir) {
+            (false, _) => 1,
+            (true, true) => (self.fault_window * 2).min(FAULT_AROUND_MAX),
+            (true, false) => 2,
+        };
+        let mut last = page;
+        if !self.shared_anon[p] && !self.file_backed[p] {
+            let prot = self.prot[p];
+            for k in 1..window {
+                let Some(va) = page.checked_add_signed(dir * (k * PAGE_SIZE) as i64) else {
+                    break;
+                };
+                let same_table = va >> 21 == page >> 21;
+                let Some(q) = self.page_index(va).filter(|_| same_table) else {
+                    break;
+                };
+                if !self.mapped[q]
+                    || self.prot[q] != prot
+                    || self.shared_anon[q]
+                    || self.file_backed[q]
+                    || self.space.translate(va, &self.phys).is_some()
+                {
+                    break;
+                }
+                let Some(frame) = fa.alloc_spare(&self.phys) else {
+                    break;
+                };
+                if self
+                    .space
+                    .map(va, frame, prot, false, &mut fa, &self.phys)
+                    .is_err()
+                {
+                    fa.free(frame);
+                    break;
+                }
+                last = va;
+            }
+        }
+        self.fault_last = last;
+        self.fault_dir = dir;
+        self.fault_window = window;
+        true
     }
 
     /// Mark `[addr, addr + len)` as file-backed (an ELF segment): `MADV_DONTNEED`
@@ -1372,6 +1447,9 @@ impl GuestMemory {
             kstack_pa: child_kstack,
             shared: self.shared,
             memcg: self.memcg,
+            fault_last: 0,
+            fault_dir: 1,
+            fault_window: 1,
         })
     }
 
@@ -1427,6 +1505,8 @@ impl GuestMemory {
         self.shared_anon.clear();
         self.fork_policy.clear();
         self.locks.clear();
+        self.fault_last = 0;
+        self.fault_window = 1;
     }
 
     // ---- fixed-width helpers --------------------------------------------
