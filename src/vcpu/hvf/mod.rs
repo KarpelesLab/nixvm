@@ -1,15 +1,15 @@
 //! Hypervisor.framework backend (macOS / arm64) — the primary target.
 //!
 //! Runs aarch64 guest code on a real CPU core via Apple's Hypervisor.framework:
-//! one process-global VM ([`vm`]) whose guest-physical (IPA) space holds each
+//! one process-global VM (`vm`) whose guest-physical (IPA) space holds each
 //! guest's physical RAM pool at that pool's own window, and guest threads at
 //! EL0 with the MMU on, translated by the guest's real arm64 page tables (one
 //! tree per process, in the pool — the same tables the kernel and interpreter
 //! use, see [`crate::vcpu::GuestMemory::set_guest_arch`]). Every exception the
 //! guest takes to EL1 lands in a vector page of `hvc`s and comes straight out to
-//! the host, which turns it into an [`crate::vcpu::Exit`]. See [`vcpu`] for the
+//! the host, which turns it into an [`crate::vcpu::Exit`]. See `vcpu.rs` for the
 //! execution model, and how thread-bound `hv_vcpu`s meet a scheduler that moves
-//! tasks between threads. All `unsafe` FFI lives in [`sys`].
+//! tasks between threads. All `unsafe` FFI lives in `sys.rs`.
 //!
 //! Entitlement: creating the VM needs `com.apple.security.hypervisor`, so an
 //! un-codesigned binary (CI, `cargo test`) gets a graceful error from

@@ -47,7 +47,7 @@ use super::sys::{
 use super::vm::{ensure_pool, vm};
 use crate::vcpu::ctrl::{VECTORS_VA, vectors};
 use crate::vcpu::{Exit, GuestMemory, PtFormat, Vcpu, VcpuError};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -80,7 +80,8 @@ const TCR_EL1: u64 = 16 // T0SZ
     | 0b01 << 26 // ORGN1
     | 0b11 << 28 // SH1
     | 0b10 << 30 // TG1: 4 KiB
-    | 0b101 << 32; // IPS
+    | 0b101 << 32 // IPS
+    | 1 << 36; // AS: 16-bit ASIDs
 /// `MAIR_EL1`: attribute 0 (every descriptor's `AttrIndx`) is normal memory,
 /// inner and outer write-back non-transient, read- and write-allocate.
 const MAIR_EL1: u64 = 0xFF;
@@ -147,6 +148,63 @@ impl Dirty {
         sys: false,
         simd: false,
     };
+}
+
+/// Which parts of [`Regs`] are older than the `hv_vcpu` that last ran the
+/// guest: after an exit only `PC`/`PSTATE` are read back; the rest are fetched
+/// when the kernel asks for them, and all of it at [`Vcpu::detach`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Stale {
+    /// Bit `n`: `Xn`.
+    x: u32,
+    /// `SP_EL0` and `TPIDR_EL0`.
+    sys: bool,
+    /// `FPCR`, `FPSR` and the vector registers.
+    simd: bool,
+}
+
+impl Stale {
+    const ALL: Self = Self {
+        x: (1 << 31) - 1,
+        sys: true,
+        simd: true,
+    };
+    const NONE: Self = Self {
+        x: 0,
+        sys: false,
+        simd: false,
+    };
+    const fn x(mask: u32) -> Self {
+        Self {
+            x: mask,
+            sys: false,
+            simd: false,
+        }
+    }
+    const SYS: Self = Self {
+        x: 0,
+        sys: true,
+        simd: false,
+    };
+    const SIMD: Self = Self {
+        x: 0,
+        sys: false,
+        simd: true,
+    };
+    fn and(self, o: Self) -> Self {
+        Self {
+            x: self.x & o.x,
+            sys: self.sys && o.sys,
+            simd: self.simd && o.simd,
+        }
+    }
+    fn minus(self, o: Self) -> Self {
+        Self {
+            x: self.x & !o.x,
+            sys: self.sys && !o.sys,
+            simd: self.simd && !o.simd,
+        }
+    }
 }
 
 /// The `hv_vcpu` a host thread runs guest threads on.
@@ -275,13 +333,11 @@ impl Slot {
         }
     }
 
-    /// Read the guest's user state back after an exit. `el1` says the exit
-    /// came from a vector slot at EL1, where `ELR_EL1`/`SPSR_EL1` hold the user
-    /// `PC`/`PSTATE` (the vector code touches nothing else).
-    fn pull(&self, r: &mut Regs, el1: bool) {
-        for n in 0..31u32 {
-            r.x[n as usize] = self.get(HV_REG_X0 + n);
-        }
+    /// Read the user `PC`/`PSTATE` after an exit. `el1` says the exit came
+    /// from a vector slot at EL1, where `ELR_EL1`/`SPSR_EL1` hold them (the
+    /// vector code touches nothing else). The rest of the registers stay in the
+    /// `hv_vcpu` until asked for ([`Slot::fetch`]).
+    fn pull_pc(&self, r: &mut Regs, el1: bool) {
         if el1 {
             r.pc = self.get_sys(HV_SYS_REG_ELR_EL1);
             r.pstate = self.get_sys(HV_SYS_REG_SPSR_EL1);
@@ -289,12 +345,25 @@ impl Slot {
             r.pc = self.get(HV_REG_PC);
             r.pstate = self.get(HV_REG_CPSR);
         }
-        r.sp = self.get_sys(HV_SYS_REG_SP_EL0);
-        r.tpidr = self.get_sys(HV_SYS_REG_TPIDR_EL0);
-        r.fpcr = self.get(HV_REG_FPCR);
-        r.fpsr = self.get(HV_REG_FPSR);
-        for n in 0..32u32 {
-            r.v[n as usize] = self.get_q(n);
+    }
+
+    /// Read the parts of the user state `want` names out of the `hv_vcpu`.
+    fn fetch(&self, r: &mut Regs, want: Stale) {
+        for n in 0..31u32 {
+            if want.x & (1 << n) != 0 {
+                r.x[n as usize] = self.get(HV_REG_X0 + n);
+            }
+        }
+        if want.sys {
+            r.sp = self.get_sys(HV_SYS_REG_SP_EL0);
+            r.tpidr = self.get_sys(HV_SYS_REG_TPIDR_EL0);
+        }
+        if want.simd {
+            r.fpcr = self.get(HV_REG_FPCR);
+            r.fpsr = self.get(HV_REG_FPSR);
+            for n in 0..32u32 {
+                r.v[n as usize] = self.get_q(n);
+            }
         }
     }
 
@@ -373,12 +442,41 @@ fn request_flush() {
     FLUSH_GEN.fetch_add(1, Ordering::Release);
 }
 
+/// The ASID of the address space [`GuestMemory::space_id`] `space`: each tree
+/// gets its own, so the TLB keeps every process's translations apart and a
+/// switch between them is a `TTBR0_EL1` write with no flush (the tables mark
+/// their leaves not-global). ASIDs are handed out in order and never reused
+/// while any translation tagged with one may linger: when all 65535 are spent,
+/// every thread flushes before it next enters ([`request_flush`]) and the
+/// numbering starts over.
+fn asid(space: u64) -> u64 {
+    static ASIDS: std::sync::Mutex<(u64, std::collections::BTreeMap<u64, u64>)> =
+        std::sync::Mutex::new((0, std::collections::BTreeMap::new()));
+    let mut guard = ASIDS.lock().unwrap();
+    let (next, map) = &mut *guard;
+    if let Some(&a) = map.get(&space) {
+        return a;
+    }
+    if *next >= 0xFFFF {
+        map.clear();
+        *next = 0;
+        request_flush();
+    }
+    *next += 1;
+    map.insert(space, *next);
+    *next
+}
+
 pub struct HvfVcpu {
     /// Unique among this process's vcpus; never 0.
     id: u64,
-    regs: Regs,
+    /// The registers, as far as they've been read back (see `stale`).
+    regs: RefCell<Regs>,
     /// What changed since the registers were loaded into a slot.
     dirty: Dirty,
+    /// What of `regs` the slot that last ran the vcpu still holds newer
+    /// values of. Never set once the vcpu could have moved threads.
+    stale: Cell<Stale>,
     /// Trapped in a syscall whose return value has not been written yet. While
     /// set, [`Vcpu::run`] re-delivers [`Exit::Syscall`] without entering the
     /// guest (a blocked syscall is retried by running again), and `pc` sits on
@@ -417,8 +515,9 @@ impl HvfVcpu {
     fn with_regs(regs: Regs) -> Self {
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-            regs,
+            regs: RefCell::new(regs),
             dirty: Dirty::ALL,
+            stale: Cell::new(Stale::NONE),
             in_syscall: false,
             flush: true,
             ttbr0: 0,
@@ -431,6 +530,11 @@ impl HvfVcpu {
     /// Run on this thread's slot until an [`Exit`].
     fn run_slot(&mut self, slot: &mut Slot) -> Result<Exit, VcpuError> {
         if slot.owner != self.id {
+            if self.stale.get() != Stale::NONE {
+                return Err(VcpuError::Backend(
+                    "an HVF vcpu moved threads without Vcpu::detach".into(),
+                ));
+            }
             slot.owner = self.id;
             self.dirty = Dirty::ALL;
         }
@@ -440,10 +544,10 @@ impl HvfVcpu {
             self.flush = true;
         }
         if slot.ttbr0 != self.ttbr0 {
+            // Another address space (another ASID): its translations and this
+            // one's are told apart in the TLB, so no flush.
             slot.set_sys(HV_SYS_REG_TTBR0_EL1, self.ttbr0)?;
             slot.ttbr0 = self.ttbr0;
-            // Another address space's translations may be cached.
-            self.flush = true;
         }
         loop {
             // Load what the host changed (all of it for a vcpu new to this
@@ -458,13 +562,14 @@ impl HvfVcpu {
                 slot.flushed = generation;
                 // Enter through the flush stub, which `eret`s to the user context.
                 dirty.pc = false;
-                slot.set_sys(HV_SYS_REG_ELR_EL1, self.regs.pc)?;
-                slot.set_sys(HV_SYS_REG_SPSR_EL1, self.regs.pstate)?;
+                let r = self.regs.get_mut();
+                slot.set_sys(HV_SYS_REG_ELR_EL1, r.pc)?;
+                slot.set_sys(HV_SYS_REG_SPSR_EL1, r.pstate)?;
                 slot.set(HV_REG_PC, VECTORS_VA + vectors::FLUSH);
                 slot.set(HV_REG_CPSR, CPSR_EL1H);
                 self.flush = false;
             }
-            slot.push(&self.regs, dirty);
+            slot.push(self.regs.get_mut(), dirty);
             if let Some(q) = self.quantum {
                 slot.arm_timer(q);
             }
@@ -488,7 +593,7 @@ impl HvfVcpu {
                     if slot.get(HV_REG_CPSR) & 0xF != 0 {
                         continue;
                     }
-                    slot.pull(&mut self.regs, false);
+                    self.exited(slot, false);
                     return Ok(Exit::Interrupted);
                 }
                 other => {
@@ -522,22 +627,19 @@ impl HvfVcpu {
             // An `hvc` from the vector page: the guest took an exception to EL1.
             0x16 => {
                 let slot_no = (ex.syndrome & 0xffff) as u16;
-                slot.pull(&mut self.regs, true);
-                // The vcpu sits at EL1 in the vector page; the next entry
-                // returns to the user context instead.
-                self.dirty.pc = true;
+                self.exited(slot, true);
                 match slot_no {
                     vectors::LOWER_SYNC => {
                         let esr = slot.get_sys(HV_SYS_REG_ESR_EL1);
                         let far = slot.get_sys(HV_SYS_REG_FAR_EL1);
-                        Ok(self.user_exception(esr, far))
+                        Ok(self.user_exception(slot, esr, far))
                     }
                     // IRQ/FIQ from EL0: nothing is ever injected; resume.
                     9 | 10 => Ok(None),
                     _ => Err(VcpuError::Backend(format!(
                         "guest exception in vector slot {slot_no} (ESR_EL1 {:#x}, ELR_EL1 {:#x}, FAR_EL1 {:#x})",
                         slot.get_sys(HV_SYS_REG_ESR_EL1),
-                        self.regs.pc,
+                        self.regs.get_mut().pc,
                         slot.get_sys(HV_SYS_REG_FAR_EL1)
                     ))),
                 }
@@ -545,42 +647,44 @@ impl HvfVcpu {
             // `WFI`/`WFE` trapped to the host: the guest is waiting, so give
             // the CPU up.
             0x01 => {
-                slot.pull(&mut self.regs, false);
-                self.regs.pc += 4;
+                self.exited(slot, false);
+                self.regs.get_mut().pc += 4;
                 self.dirty.pc = true;
                 Ok(Some(Exit::Interrupted))
             }
             // A system-register access the hypervisor traps.
             0x18 => {
-                slot.pull(&mut self.regs, false);
-                Ok(self.sysreg_access(ex.syndrome))
+                self.exited(slot, false);
+                Ok(self.sysreg_access(slot, ex.syndrome))
             }
             // A stage-2 abort: the guest's tables point outside its pool.
             0x20 | 0x24 => {
-                slot.pull(&mut self.regs, false);
+                self.exited(slot, false);
                 Ok(Some(Exit::MemFault {
                     addr: ex.virtual_address,
                     write: ec == 0x24 && (ex.syndrome >> 6) & 1 == 1,
                 }))
             }
             _ => {
-                slot.pull(&mut self.regs, false);
-                Ok(Some(Exit::IllegalInstruction { pc: self.regs.pc }))
+                self.exited(slot, false);
+                Ok(Some(Exit::IllegalInstruction {
+                    pc: self.regs.get_mut().pc,
+                }))
             }
         }
     }
 
     /// What a synchronous exception the guest took at EL0 (`ESR_EL1`, with
     /// `FAR_EL1` = `far`) means. `self.regs.pc` holds `ELR_EL1`.
-    fn user_exception(&mut self, esr: u64, far: u64) -> Option<Exit> {
+    fn user_exception(&mut self, slot: &Slot, esr: u64, far: u64) -> Option<Exit> {
         let ec = (esr >> 26) & 0x3f;
         let iss = esr & 0x1ff_ffff;
-        let pc = self.regs.pc;
+        let pc = self.regs.get_mut().pc;
         Some(match ec {
             // `svc`: ELR is past it; the interpreter keeps pc on it until the
             // return value is written.
             0x15 => {
-                self.regs.pc = pc.wrapping_sub(4);
+                self.regs.get_mut().pc = pc.wrapping_sub(4);
                 self.in_syscall = true;
                 Exit::Syscall
             }
@@ -603,17 +707,20 @@ impl HvfVcpu {
                 addr: far,
                 write: false,
             },
-            0x26 => Exit::Misaligned {
-                addr: self.regs.sp,
-                write: false,
-            },
+            0x26 => {
+                self.fetch_from(slot, Stale::SYS);
+                Exit::Misaligned {
+                    addr: self.regs.get_mut().sp,
+                    write: false,
+                }
+            }
             // `brk #imm` (ELR is on it).
             0x3C => Exit::Breakpoint {
                 pc,
                 code: iss & 0xffff,
             },
             // `mrs`/`msr` of a register EL0 can't reach.
-            0x18 => return self.sysreg_access(esr),
+            0x18 => return self.sysreg_access(slot, esr),
             _ => Exit::IllegalInstruction { pc },
         })
     }
@@ -621,7 +728,7 @@ impl HvfVcpu {
     /// Emulate a trapped `mrs` the way Linux does for EL0 (the CPU
     /// identification registers, `HWCAP_CPUID`): write the value and step past
     /// it (`None`: resume). Anything else is undefined (`SIGILL`).
-    fn sysreg_access(&mut self, esr: u64) -> Option<Exit> {
+    fn sysreg_access(&mut self, slot: &Slot, esr: u64) -> Option<Exit> {
         let iss = esr & 0x1ff_ffff;
         let read = iss & 1 == 1;
         let rt = ((iss >> 5) & 0x1f) as usize;
@@ -632,14 +739,58 @@ impl HvfVcpu {
             | ((iss >> 17) & 7); // op2
         if read && let Some(v) = crate::vcpu::interp::el0_id_register(key as u32) {
             if rt != 31 {
-                self.regs.x[rt] = v;
+                self.fetch_from(slot, Stale::NONE); // nothing to read: Xt is replaced
+                self.stale.set(self.stale.get().minus(Stale::x(1 << rt)));
+                self.regs.get_mut().x[rt] = v;
                 self.dirty.x |= 1 << rt;
             }
-            self.regs.pc += 4;
+            self.regs.get_mut().pc += 4;
             self.dirty.pc = true;
             return None;
         }
-        Some(Exit::IllegalInstruction { pc: self.regs.pc })
+        Some(Exit::IllegalInstruction {
+            pc: self.regs.get_mut().pc,
+        })
+    }
+
+    /// After an exit: read `PC`/`PSTATE`, and leave the rest in the slot until
+    /// it is asked for. Exits from the vector page (`el1`) leave the vcpu at
+    /// EL1, so the next entry writes the user `PC`/`CPSR` back (the `eret`).
+    fn exited(&mut self, slot: &Slot, el1: bool) {
+        slot.pull_pc(self.regs.get_mut(), el1);
+        self.stale.set(Stale::ALL);
+        if el1 {
+            self.dirty.pc = true;
+        }
+    }
+
+    /// Read the stale parts of `want` from `slot` (this vcpu's, on this thread).
+    fn fetch_from(&self, slot: &Slot, want: Stale) {
+        let missing = self.stale.get().and(want);
+        if missing != Stale::NONE {
+            slot.fetch(&mut self.regs.borrow_mut(), missing);
+            self.stale.set(self.stale.get().minus(missing));
+        }
+    }
+
+    /// Make the `want` parts of `regs` current, reading them from this
+    /// thread's slot if they are still there.
+    ///
+    /// # Panics
+    /// If they are on another thread's slot — the vcpu was moved without
+    /// [`Vcpu::detach`].
+    fn ensure(&self, want: Stale) {
+        if self.stale.get().and(want) == Stale::NONE {
+            return;
+        }
+        SLOT.with(|cell| {
+            let cell = cell.borrow();
+            let slot = cell
+                .as_ref()
+                .filter(|s| s.owner == self.id)
+                .expect("HVF registers read off the thread that ran the vcpu (no Vcpu::detach)");
+            self.fetch_from(slot, want);
+        });
     }
 
     /// Point the vcpu at `mem`'s address space, mapping its pool if this is the
@@ -650,7 +801,7 @@ impl HvfVcpu {
                 .map_err(VcpuError::Mem)?;
         }
         let base = ensure_pool(mem)?;
-        self.ttbr0 = base + mem.cr3();
+        self.ttbr0 = (asid(mem.space_id()) << 48) | (base + mem.cr3());
         self.ttbr1 = mem.arm_ttbr1();
         if mem.take_tlb_dirty() | mem.take_icache_dirty() {
             self.flush = true;
@@ -696,17 +847,21 @@ impl Vcpu for HvfVcpu {
     }
 
     fn syscall_nr(&self) -> u64 {
-        self.regs.x[8]
+        self.ensure(Stale::x(1 << 8));
+        self.regs.borrow().x[8]
     }
 
     fn syscall_args(&self) -> [u64; 6] {
-        let x = &self.regs.x;
-        [x[0], x[1], x[2], x[3], x[4], x[5]]
+        self.ensure(Stale::x(0x3f));
+        let r = self.regs.borrow();
+        [r.x[0], r.x[1], r.x[2], r.x[3], r.x[4], r.x[5]]
     }
 
     fn set_syscall_ret(&mut self, value: u64) {
-        self.regs.x[0] = value;
-        self.regs.pc = self.regs.pc.wrapping_add(4);
+        self.stale.set(self.stale.get().minus(Stale::x(1)));
+        let r = self.regs.get_mut();
+        r.x[0] = value;
+        r.pc = r.pc.wrapping_add(4);
         self.dirty.x |= 1;
         self.dirty.pc = true;
         self.in_syscall = false;
@@ -714,54 +869,60 @@ impl Vcpu for HvfVcpu {
 
     fn reg(&self, idx: usize) -> u64 {
         if idx < 31 {
-            self.regs.x[idx]
+            self.ensure(Stale::x(1 << idx));
+            self.regs.borrow().x[idx]
         } else {
-            self.regs.sp
+            self.ensure(Stale::SYS);
+            self.regs.borrow().sp
         }
     }
     fn set_reg(&mut self, idx: usize, value: u64) {
         if idx < 31 {
-            self.regs.x[idx] = value;
+            self.stale.set(self.stale.get().minus(Stale::x(1 << idx)));
+            self.regs.get_mut().x[idx] = value;
             self.dirty.x |= 1 << idx;
         } else {
-            self.regs.sp = value;
-            self.dirty.sys = true;
+            self.set_sp(value);
         }
     }
 
     fn pc(&self) -> u64 {
-        self.regs.pc
+        self.regs.borrow().pc
     }
     fn set_pc(&mut self, pc: u64) {
-        self.regs.pc = pc;
+        self.regs.get_mut().pc = pc;
         self.dirty.pc = true;
         // Redirected: whatever syscall was pending is over.
         self.in_syscall = false;
     }
     fn sp(&self) -> u64 {
-        self.regs.sp
+        self.ensure(Stale::SYS);
+        self.regs.borrow().sp
     }
     fn set_sp(&mut self, sp: u64) {
-        self.regs.sp = sp;
+        self.ensure(Stale::SYS);
+        self.regs.get_mut().sp = sp;
         self.dirty.sys = true;
     }
 
     fn rflags(&self) -> u64 {
         // NZCV and DIT, as the interpreter models them.
-        self.regs.pstate & 0xF100_0000
+        self.regs.borrow().pstate & 0xF100_0000
     }
     fn set_rflags(&mut self, value: u64) {
         // Only the condition flags and DIT are the guest's to set: the mode
         // stays EL0t.
-        self.regs.pstate = value & 0xF100_0000;
+        self.regs.get_mut().pstate = value & 0xF100_0000;
         self.dirty.pc = true;
     }
 
     fn simd_state(&self) -> Vec<u8> {
+        self.ensure(Stale::SIMD);
+        let r = self.regs.borrow();
         let mut out = Vec::with_capacity(8 + 32 * 16);
-        out.extend_from_slice(&(self.regs.fpsr as u32).to_le_bytes());
-        out.extend_from_slice(&(self.regs.fpcr as u32).to_le_bytes());
-        for v in &self.regs.v {
+        out.extend_from_slice(&(r.fpsr as u32).to_le_bytes());
+        out.extend_from_slice(&(r.fpcr as u32).to_le_bytes());
+        for v in &r.v {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out
@@ -770,10 +931,12 @@ impl Vcpu for HvfVcpu {
         if bytes.len() < 8 + 32 * 16 {
             return;
         }
+        self.stale.set(self.stale.get().minus(Stale::SIMD));
+        let r = self.regs.get_mut();
         let word = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
-        self.regs.fpsr = u64::from(word(0));
-        self.regs.fpcr = u64::from(word(4));
-        for (i, v) in self.regs.v.iter_mut().enumerate() {
+        r.fpsr = u64::from(word(0));
+        r.fpcr = u64::from(word(4));
+        for (i, v) in r.v.iter_mut().enumerate() {
             let off = 8 + i * 16;
             *v = u128::from_le_bytes(bytes[off..off + 16].try_into().unwrap());
         }
@@ -781,25 +944,32 @@ impl Vcpu for HvfVcpu {
     }
 
     fn set_tls(&mut self, value: u64) {
-        self.regs.tpidr = value;
+        self.ensure(Stale::SYS);
+        self.regs.get_mut().tpidr = value;
         self.dirty.sys = true;
     }
 
     fn fork(&self) -> Result<Box<dyn Vcpu>, VcpuError> {
         // Just the registers: the child gets an `hv_vcpu` from whichever thread
         // runs it, and its own address space at its first `reconcile`.
-        let mut child = Self::with_regs(self.regs.clone());
+        self.ensure(Stale::ALL);
+        let mut child = Self::with_regs(self.regs.borrow().clone());
         child.in_syscall = self.in_syscall;
         Ok(Box::new(child))
     }
 
     fn reset(&mut self, entry: u64, sp: u64) {
-        self.regs = Regs::new(entry, sp);
+        *self.regs.get_mut() = Regs::new(entry, sp);
+        self.stale.set(Stale::NONE);
         self.dirty = Dirty::ALL;
         self.in_syscall = false;
         // execve freed the old image's tables, which may be cached anywhere.
         self.flush = true;
         request_flush();
+    }
+
+    fn detach(&mut self) {
+        self.ensure(Stale::ALL);
     }
 
     fn settle_syscall_return(&mut self) {

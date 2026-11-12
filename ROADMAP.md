@@ -168,7 +168,12 @@ real core and hand every exception to the kernel.
 - **Kick:** a signal posted to a task running on another SMP worker stops its
   vcpu at once (`Vcpu::kicker` → `hv_vcpus_exit`), so it is delivered in ~0.1 ms
   rather than at the end of the quantum (KVM still waits for the quantum).
-- **Not yet:** per-process ASIDs (every address-space switch flushes the TLB).
+- **Performance:** each address space has its own ASID (switching processes
+  is a `TTBR0` write, no TLB flush); registers are read back lazily after an
+  exit (only `PC`/`PSTATE` up front, the rest when the kernel asks, all of it
+  at `Vcpu::detach` as a slice ends); sequential first touches fault in up to
+  16 pages at a time. A syscall round trip is ~1.06 µs, ~80% of it the
+  hypervisor's own entry and exit.
 
 ### Phase 2 — Memory manager + static ELF loader  ✅ (interpreter path)
 

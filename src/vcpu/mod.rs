@@ -345,6 +345,13 @@ pub trait Vcpu: Send {
     /// and so has no TLB to invalidate.
     fn flush_tlb(&mut self) {}
 
+    /// The vcpu may next be used — run, or its registers read — on another
+    /// host thread: bring all of its state into host memory. A hardware backend
+    /// that reads registers back lazily after an exit (HVF) needs this before
+    /// the task leaves the thread it ran on; the scheduler calls it as each
+    /// slice ends. A no-op for the others.
+    fn detach(&mut self) {}
+
     /// A handle another thread can use to cut this vcpu's current run short
     /// (a signal was posted to its task, which runs on another SMP worker), so
     /// the signal is delivered now rather than at the end of the quantum.

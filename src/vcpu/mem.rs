@@ -171,6 +171,18 @@ pub struct GuestMemory {
     fault_last: u64,
     fault_dir: i64,
     fault_window: u64,
+    /// Which incarnation of an address space this is: a new value for every
+    /// page-table tree (`new`, `fork`, `execve`), never reused, so a hardware
+    /// backend can tag its translations by address space (arm64 ASIDs) without
+    /// confusing a tree with an earlier one at the same root frame.
+    space_id: u64,
+}
+
+/// The next [`GuestMemory::space_id`].
+static NEXT_SPACE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn new_space_id() -> u64 {
+    NEXT_SPACE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The most pages one demand fault backs: 64 KiB, Linux's `fault_around_bytes`.
@@ -290,6 +302,7 @@ impl GuestMemory {
             fault_last: 0,
             fault_dir: 1,
             fault_window: 1,
+            space_id: new_space_id(),
         }
     }
 
@@ -469,6 +482,16 @@ impl GuestMemory {
     )]
     pub(crate) fn phys_base(&self) -> u64 {
         self.phys.base()
+    }
+
+    /// This page-table tree's incarnation (see the field).
+    #[must_use]
+    #[cfg_attr(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn space_id(&self) -> u64 {
+        self.space_id
     }
 
     /// `TTBR1_EL1` for this (arm64) pool: its upper-half kernel tables.
@@ -876,9 +899,9 @@ impl GuestMemory {
     /// growing heap or stack) would take one exit per page, and on hardware the
     /// exit, not the work, is the cost. So when faults walk the space page after
     /// page, each backs a growing run of the pages ahead of it (up to
-    /// [`FAULT_AROUND_MAX`]) — pages already mapped there, unbacked, private
+    /// 16, `FAULT_AROUND_MAX`) — pages already mapped there, unbacked, private
     /// anonymous with the same protection, within the same page table — taken
-    /// only from frames nobody needs ([`FrameAllocator::alloc_spare`]: never
+    /// only from frames nobody needs (the allocator's `alloc_spare`: never
     /// past a memory cgroup's `high` or `max`, never by reclaiming). A fault
     /// anywhere else starts over at one page, so sparse touches of a huge
     /// reservation still cost one frame each.
@@ -1204,6 +1227,10 @@ impl GuestMemory {
                 fa.decref(of);
             }
             Ok(true)
+        } else if t.prot == prot {
+            // Private already, and the leaf says so: nothing changed (so no TLB
+            // flush is owed — every kernel copy into a user buffer comes here).
+            Ok(false)
         } else {
             // Private already: make sure the leaf carries the intended write bit
             // (a prior fork may have cleared it).
@@ -1450,6 +1477,7 @@ impl GuestMemory {
             fault_last: 0,
             fault_dir: 1,
             fault_window: 1,
+            space_id: new_space_id(),
         })
     }
 
@@ -1507,6 +1535,7 @@ impl GuestMemory {
         self.locks.clear();
         self.fault_last = 0;
         self.fault_window = 1;
+        self.space_id = new_space_id();
     }
 
     // ---- fixed-width helpers --------------------------------------------

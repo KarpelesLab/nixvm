@@ -108,6 +108,9 @@ const A_AP_RO: u64 = 1 << 7;
 const A_SH_INNER: u64 = 3 << 8;
 /// The access flag. Set from the start: nothing here wants access-flag faults.
 const A_AF: u64 = 1 << 10;
+/// Not global: the TLB tags the translation with the address space's ASID, so
+/// switching processes needs no flush (each space has its own ASID).
+const A_NG: u64 = 1 << 11;
 /// Privileged (EL1) execute-never.
 const A_PXN: u64 = 1 << 53;
 /// Unprivileged (EL0) execute-never.
@@ -180,7 +183,7 @@ impl Enc {
             }
             return pa | f;
         }
-        let mut f = P | A_TABLE_PAGE | A_ATTR_NORMAL | A_SH_INNER | A_AF;
+        let mut f = P | A_TABLE_PAGE | A_ATTR_NORMAL | A_SH_INNER | A_AF | A_NG;
         // A user page that grants nothing (PROT_NONE with a frame behind it) is
         // kept present but kernel-only, so EL0 faults on it.
         if !supervisor && prot.contains(Prot::READ) {

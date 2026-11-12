@@ -2700,7 +2700,11 @@ impl Kernel {
             let mut guard = space_arc.lock().unwrap();
             cx.cur.cpu = 0;
             let cpu_before = cx.cur.cpu_ns;
-            let made = self.run_slice(&mut cx, &mut vcpu, &mut guard)?;
+            let made = self.run_slice(&mut cx, &mut vcpu, &mut guard);
+            // The task may run on another thread next (an embedder pumping from
+            // elsewhere): its registers come home first.
+            vcpu.detach();
+            let made = made?;
             if self.schedtrace {
                 let end = if matches!(cx.cur.run, RunState::Zombie(_)) {
                     "ended"
@@ -3425,7 +3429,10 @@ impl Kernel {
                         match work {
                             Work::Stop => break,
                             Work::Run(id, vcpu, space) => {
-                                let done = run_slice_smp(kernel, slice_cap, id, vcpu, &space);
+                                let mut done = run_slice_smp(kernel, slice_cap, id, vcpu, &space);
+                                // Back to the scheduler, maybe to another worker
+                                // next: its registers come home first.
+                                done.1.detach();
                                 if out.send(done).is_err() {
                                     break;
                                 }
