@@ -277,6 +277,31 @@ mod browser {
             })
         }
 
+        /// [`Terminal::new`], on a [`Network`] the page already drives: the
+        /// guest's sockets go over it, and either object can pump its packets.
+        pub fn new_on(
+            rootfs_targz: &[u8],
+            argv: Vec<String>,
+            net: &Network,
+        ) -> Result<Terminal, JsError> {
+            console_error_panic_hook::set_once();
+            let argv = if argv.is_empty() {
+                vec!["/bin/busybox".to_string(), "sh".to_string()]
+            } else {
+                argv
+            };
+            let tar = crate::fs::tar::gunzip(rootfs_targz, MAX_ROOTFS_BYTES)
+                .map_err(|e| JsError::new(&e))?;
+            let vm = crate::vm::Vm::boot_squashfs_net(&tar, argv, MEM_BYTES, net.net.clone())
+                .map_err(|e| JsError::new(&e))?;
+            Ok(Self {
+                vm,
+                net: net.net.clone(),
+                out: std::collections::VecDeque::new(),
+                busy: false,
+            })
+        }
+
         /// Boot a Docker/OCI image a finished [`ImagePull`] fetched, as
         /// `docker run` would: `args`, when given, replace its `Cmd`;
         /// `env` (`KEY=VALUE`) adds to its environment. Throws if the image
@@ -287,10 +312,7 @@ mod browser {
             env: Vec<String>,
         ) -> Result<Terminal, JsError> {
             console_error_panic_hook::set_once();
-            let image = pull
-                .inner
-                .finish()
-                .map_err(|e| JsError::new(&e.to_string()))?;
+            let image = pull.finish()?;
             Self::boot_image(&image, args, env)
         }
 
@@ -337,6 +359,7 @@ mod browser {
         /// hello: `ipv4` (dotted quad) with its `ipv4_prefix` length, and/or
         /// `ipv6`, the leased range (`"2001:db8:1:2::/64"`, of which the guest
         /// takes `::1`). `mtu` bounds every packet the guest sends or asks for.
+        #[allow(clippy::needless_pass_by_value)] // wasm-bindgen passes strings owned
         pub fn net_up(
             &mut self,
             ipv4: Option<String>,
@@ -344,27 +367,36 @@ mod browser {
             ipv6: Option<String>,
             mtu: u16,
         ) -> Result<(), JsError> {
-            let v4 = match ipv4.as_deref() {
-                Some(a) => Some((
-                    a.parse::<std::net::Ipv4Addr>()
-                        .map_err(|e| JsError::new(&format!("bad ipv4 {a:?}: {e}")))?,
-                    ipv4_prefix,
-                )),
-                None => None,
-            };
-            let v6 = match ipv6.as_deref() {
-                Some(r) => {
-                    let (addr, bits) = r.split_once('/').unwrap_or((r, "64"));
-                    let net = addr
-                        .parse::<std::net::Ipv6Addr>()
-                        .map_err(|e| JsError::new(&format!("bad ipv6 {r:?}: {e}")))?;
-                    let bits = bits.parse::<u8>().unwrap_or(64).min(128);
-                    Some((std::net::Ipv6Addr::from(u128::from(net) | 1), bits))
-                }
-                None => None,
-            };
-            self.net.up(crate::tunnel::Lease { v4, v6, mtu });
+            self.net
+                .up(lease(ipv4.as_deref(), ipv4_prefix, ipv6.as_deref(), mtu)?);
             Ok(())
+        }
+
+        /// Boot an image an [`ImagePull`] fetched over `net`
+        /// ([`ImagePull::pull_over`]), on that same link: the guest's sockets
+        /// go over it too, and either object can pump its packets. Otherwise
+        /// as [`Terminal::from_image`].
+        pub fn from_image_on(
+            pull: ImagePull,
+            net: &Network,
+            args: Vec<String>,
+            env: Vec<String>,
+        ) -> Result<Terminal, JsError> {
+            console_error_panic_hook::set_once();
+            let image = pull.finish()?;
+            let opts = crate::oci::RunOptions {
+                cmd: args,
+                env,
+                ..crate::oci::RunOptions::default()
+            };
+            let vm = crate::vm::Vm::boot_image_net(&image, &opts, MEM_BYTES, net.net.clone())
+                .map_err(|e| JsError::new(&e))?;
+            Ok(Self {
+                vm,
+                net: net.net.clone(),
+                out: std::collections::VecDeque::new(),
+                busy: false,
+            })
         }
 
         /// The guest's public IPv6 address while the link is up (the one it
@@ -472,13 +504,134 @@ mod browser {
         }
     }
 
-    /// Pulling a Docker/OCI image from a registry, with the page doing the
-    /// fetching: `next_request()` says what to `fetch()` (a JSON
-    /// `{url, headers, digest}`, or `undefined` once done), and `feed()`
-    /// takes the response. Registries send no CORS headers, so a page sends
-    /// these requests through a proxy it trusts, and that proxy must pass
-    /// the `WWW-Authenticate` header back. A request whose `digest` is set
-    /// can be answered from a cache keyed by it; every blob is checked
+    /// The tunnel lease `net_up` describes: `ipv4` (dotted quad) with its
+    /// prefix length, and/or `ipv6`, the leased range (the guest takes `::1`).
+    fn lease(
+        ipv4: Option<&str>,
+        ipv4_prefix: u8,
+        ipv6: Option<&str>,
+        mtu: u16,
+    ) -> Result<crate::tunnel::Lease, JsError> {
+        let v4 = match ipv4 {
+            Some(a) => Some((
+                a.parse::<std::net::Ipv4Addr>()
+                    .map_err(|e| JsError::new(&format!("bad ipv4 {a:?}: {e}")))?,
+                ipv4_prefix,
+            )),
+            None => None,
+        };
+        let v6 = match ipv6 {
+            Some(r) => {
+                let (addr, bits) = r.split_once('/').unwrap_or((r, "64"));
+                let net = addr
+                    .parse::<std::net::Ipv6Addr>()
+                    .map_err(|e| JsError::new(&format!("bad ipv6 {r:?}: {e}")))?;
+                let bits = bits.parse::<u8>().unwrap_or(64).min(128);
+                Some((std::net::Ipv6Addr::from(u128::from(net) | 1), bits))
+            }
+            None => None,
+        };
+        Ok(crate::tunnel::Lease { v4, v6, mtu })
+    }
+
+    /// A network link carried over the page's packet transport (grouterd's
+    /// WebSocket), before there's a guest to own it: [`ImagePull::pull_over`]
+    /// pulls an image over it, and [`Terminal::from_image_on`] boots the image
+    /// on it. The page pumps it as it would a [`Terminal`]'s: `up` with the
+    /// hello's addresses, `input` for each packet received, send what
+    /// `next_packet` yields, `tick` about every 100 ms.
+    #[wasm_bindgen]
+    #[derive(Debug)]
+    pub struct Network {
+        net: crate::tunnel::Tunnel,
+        out: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    #[wasm_bindgen]
+    impl Network {
+        #[wasm_bindgen(constructor)]
+        #[must_use]
+        pub fn new() -> Network {
+            console_error_panic_hook::set_once();
+            Self {
+                net: crate::tunnel::Tunnel::new(),
+                out: std::collections::VecDeque::new(),
+            }
+        }
+
+        /// Bring the link up with the addresses from the transport's hello
+        /// (as [`Terminal::net_up`]).
+        #[allow(clippy::needless_pass_by_value)] // wasm-bindgen passes strings owned
+        pub fn up(
+            &mut self,
+            ipv4: Option<String>,
+            ipv4_prefix: u8,
+            ipv6: Option<String>,
+            mtu: u16,
+        ) -> Result<(), JsError> {
+            self.net
+                .up(lease(ipv4.as_deref(), ipv4_prefix, ipv6.as_deref(), mtu)?);
+            Ok(())
+        }
+
+        /// The public IPv6 address the link took from the leased range, while
+        /// it's up and IPv6 was leased.
+        #[must_use]
+        pub fn ipv6(&self) -> Option<String> {
+            self.net.lease()?.v6.map(|(addr, _)| addr.to_string())
+        }
+
+        /// Take the link down (the transport closed).
+        pub fn down(&mut self) {
+            self.net.down();
+        }
+
+        /// A packet received from the transport.
+        pub fn input(&mut self, packet: &[u8]) {
+            self.net.inject(packet);
+        }
+
+        /// The next packet to send over the transport, if any.
+        #[must_use]
+        pub fn next_packet(&mut self) -> Option<Vec<u8>> {
+            if self.out.is_empty() {
+                self.out.extend(self.net.take_outbound());
+            }
+            self.out.pop_front()
+        }
+
+        /// Run the network timers; call about every 100 ms while it's up.
+        pub fn tick(&mut self) {
+            self.net.tick();
+        }
+    }
+
+    impl Default for Network {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// Pulling a Docker/OCI image from a registry, one of two ways.
+    ///
+    /// Over a [`Network`] (the page's packet tunnel): call `pull_over(net)`
+    /// between pumping the network until it returns `true`. nixvm does the
+    /// DNS, TLS and HTTP itself, so CORS doesn't apply and no proxy is
+    /// needed; then [`Terminal::from_image_on`] boots it on the same link.
+    ///
+    /// ```js
+    /// const net = new Network();   // up() with the tunnel's hello, then pump
+    /// const pull = new ImagePull("alpine:3.20", "amd64");
+    /// while (!pull.pull_over(net)) await pumpPackets(net);
+    /// const term = Terminal.from_image_on(pull, net, ["sh"], []);
+    /// ```
+    ///
+    /// Or with the page doing the fetching: `next_request()` says what to
+    /// `fetch()` (a JSON `{url, headers, digest}`, or `undefined` once done),
+    /// and `feed()` takes the response. Registries send no CORS headers, so a
+    /// page sends these requests through a proxy it trusts, and that proxy
+    /// must pass the `WWW-Authenticate` header back. A request whose `digest`
+    /// is set can be answered from a cache keyed by it; every blob is checked
     /// against its digest either way.
     ///
     /// ```js
@@ -496,7 +649,43 @@ mod browser {
     #[wasm_bindgen]
     #[derive(Debug)]
     pub struct ImagePull {
-        inner: crate::oci::Pull,
+        mode: PullMode,
+    }
+
+    /// Who's fetching: the page, or nixvm over a [`Network`]. `Done` only
+    /// while [`ImagePull::pull_over`] switches between them.
+    #[derive(Debug)]
+    #[allow(clippy::large_enum_variant)] // one per pull
+    enum PullMode {
+        Page(crate::oci::Pull),
+        Net(crate::oci::net::NetPull),
+        Done,
+    }
+
+    impl ImagePull {
+        fn pull(&self) -> Option<&crate::oci::Pull> {
+            match &self.mode {
+                PullMode::Page(p) => Some(p),
+                PullMode::Net(n) => Some(n.pull()),
+                PullMode::Done => None,
+            }
+        }
+
+        fn page(&mut self) -> Result<&mut crate::oci::Pull, JsError> {
+            match &mut self.mode {
+                PullMode::Page(p) => Ok(p),
+                _ => Err(JsError::new("this pull is going over a Network")),
+            }
+        }
+
+        fn finish(self) -> Result<crate::oci::Image, JsError> {
+            match self.mode {
+                PullMode::Page(p) => p.finish(),
+                PullMode::Net(n) => n.finish(),
+                PullMode::Done => Err(crate::oci::OciError::Fetch("the pull failed".into())),
+            }
+            .map_err(|e| JsError::new(&e.to_string()))
+        }
     }
 
     #[wasm_bindgen]
@@ -510,17 +699,39 @@ mod browser {
                 .ok_or_else(|| JsError::new(&format!("unknown architecture {arch:?}")))?;
             let inner =
                 crate::oci::Pull::new(name, arch).map_err(|e| JsError::new(&e.to_string()))?;
-            Ok(Self { inner })
+            Ok(Self {
+                mode: PullMode::Page(inner),
+            })
         }
 
-        /// Log in to the registry (a token can go as the password).
-        pub fn set_credentials(&mut self, user: &str, password: &str) {
-            self.inner.set_credentials(user, password);
+        /// Log in to the registry (a token can go as the password). Before
+        /// the pull starts.
+        pub fn set_credentials(&mut self, user: &str, password: &str) -> Result<(), JsError> {
+            self.page()?.set_credentials(user, password);
+            Ok(())
         }
 
         /// Talk to `base` (a mirror) instead of the registry the name says.
-        pub fn set_registry_base(&mut self, base: &str) {
-            self.inner.set_registry_base(base);
+        /// Before the pull starts.
+        pub fn set_registry_base(&mut self, base: &str) -> Result<(), JsError> {
+            self.page()?.set_registry_base(base);
+            Ok(())
+        }
+
+        /// Pull over `net`, as far as it can go right now without waiting;
+        /// `true` once everything is fetched. Call it again after pumping the
+        /// network. Throws on a network, TLS or registry error.
+        pub fn pull_over(&mut self, net: &Network) -> Result<bool, JsError> {
+            if let PullMode::Page(_) = self.mode {
+                let PullMode::Page(p) = std::mem::replace(&mut self.mode, PullMode::Done) else {
+                    unreachable!()
+                };
+                self.mode = PullMode::Net(crate::oci::net::NetPull::new(p, net.net.egress()));
+            }
+            let PullMode::Net(n) = &mut self.mode else {
+                return Err(JsError::new("the pull failed"));
+            };
+            n.poll().map_err(|e| JsError::new(&e.to_string()))
         }
 
         /// The next request, as JSON `{"url", "headers": {name: value},
@@ -528,7 +739,10 @@ mod browser {
         #[must_use]
         pub fn next_request(&self) -> Option<String> {
             use crate::oci::json::quote;
-            let r = self.inner.next_request()?;
+            let PullMode::Page(p) = &self.mode else {
+                return None;
+            };
+            let r = p.next_request()?;
             let headers: Vec<String> = r
                 .headers
                 .iter()
@@ -559,7 +773,7 @@ mod browser {
             if let Some(v) = content_type {
                 headers.push(("content-type".to_string(), v));
             }
-            self.inner
+            self.page()?
                 .feed(crate::oci::Response {
                     status,
                     headers,
@@ -571,15 +785,16 @@ mod browser {
         /// `[layers fetched, layers in all, bytes fetched, bytes in all]`;
         /// the totals are known once the manifest is in.
         #[must_use]
+        #[allow(clippy::cast_precision_loss)] // counts and sizes far below 2^53
         pub fn progress(&self) -> Vec<f64> {
-            let (l, lt, b, bt) = self.inner.progress();
+            let (l, lt, b, bt) = self.pull().map_or((0, 0, 0, 0), crate::oci::Pull::progress);
             vec![l as f64, lt as f64, b as f64, bt as f64]
         }
 
         /// Whether everything has been fetched.
         #[must_use]
         pub fn is_done(&self) -> bool {
-            self.inner.is_done()
+            self.pull().is_some_and(crate::oci::Pull::is_done)
         }
     }
 

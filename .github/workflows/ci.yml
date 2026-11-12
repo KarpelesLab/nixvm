@@ -57,10 +57,10 @@ jobs:
         run: cargo test --features fstool
 
       - name: Clippy (Docker/OCI images, warnings denied)
-        run: cargo clippy --all-targets --features oci,fetch -- -D warnings
+        run: cargo clippy --all-targets --features oci,fetch,oci-net -- -D warnings
 
       - name: Test (Docker/OCI images, offline parts)
-        run: cargo test --features oci --lib oci
+        run: cargo test --features oci,oci-net --lib oci
 
       - name: Clippy (tunnel networking, warnings denied)
         run: cargo clippy --all-targets --features tunnel -- -D warnings
@@ -179,7 +179,7 @@ jobs:
         if: matrix.backend == 'kvm'
         run: |
           set -o pipefail
-          NIXVM_OCI_TESTS=1 cargo test --features oci,fetch --test oci_images -- --nocapture 2>&1 | tee oci.log
+          NIXVM_OCI_TESTS=1 cargo test --features oci,fetch,oci-net --test oci_images -- --nocapture 2>&1 | tee oci.log
           if grep -q 'skipping' oci.log; then
             echo '::error::the image pull tests skipped themselves'
             exit 1
@@ -244,5 +244,5 @@ jobs:
 
       # `--all-features` is avoided (wasm/hvf/kvm don't build on a host doc run);
       # `fstool` and `oci,fetch` cover the optional modules with public docs.
-      - name: cargo doc --no-deps --features fstool,oci,fetch
-        run: cargo doc --no-deps --features fstool,oci,fetch
+      - name: cargo doc --no-deps --features fstool,oci,fetch,oci-net
+        run: cargo doc --no-deps --features fstool,oci,fetch,oci-net

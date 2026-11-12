@@ -41,10 +41,17 @@ first text message is a JSON hello with the leased addresses and MTU, and
 every binary message after that (either way) is one IP packet. The toolbar's
 `net:` button shows the link state and turns it off/on.
 
+The page owns the link (a wasm `Network`) and the guest boots on it. With
+`?image=<name>` (say `?image=python:3.12-alpine`, plus `&cmd=sh` to replace
+the image's command) the page first brings the link up, pulls that
+Docker/OCI image over it — nixvm doing DNS, TLS and HTTP itself, so CORS
+doesn't apply — and boots it instead of the bundled Alpine.
+
 On wasm32 the pktkit crate reads its clock from `pktkit.now_ms` /
 `pktkit.unix_ms` imports, which the wasm-bindgen glue imports from the bare
 specifier `pktkit`. `index.html` maps that to `public/pktkit.js` with an
-import map.
+import map, and maps `purecrypto` (an entropy hook the TLS crate links but
+nixvm never calls) to `public/purecrypto.js`.
 
 ## Local dev
 

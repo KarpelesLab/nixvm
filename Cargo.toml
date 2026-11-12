@@ -61,11 +61,16 @@ targz = ["dep:compcol"]
 # zstd, so this adds compcol's zstd decoder; running needs `fstool` to hold the
 # flattened root as an in-memory squashfs.
 oci = ["targz", "fstool", "compcol/zstd"]
+# Pull images over a guest-style network link (the browser's packet tunnel)
+# with nixvm doing DNS, TLS and HTTP itself — no `fetch()`, so no CORS. TLS is
+# purecrypto's (pure Rust; in the browser its entropy comes from a
+# `purecrypto.random_get` import the page supplies).
+oci-net = ["oci", "tunnel", "dep:purecrypto"]
 # Browser demo entry point (src/wasm.rs): exposes an interactive `Terminal` and
 # `run_elf` via wasm-bindgen. Pulls in wasm-bindgen + console_error_panic_hook,
 # `targz` to unpack a `.tar.gz` root image in-process, and `fstool` to repack it
 # into an in-memory squashfs (read-only lower of a copy-on-write overlay).
-wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "targz", "fstool", "tunnel", "oci"]
+wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "targz", "fstool", "tunnel", "oci", "oci-net"]
 # HTTP(S) fetching of guest root images (src/image.rs). Off by default so the
 # core stays dependency-free and wasm-buildable; sha256 verification is
 # hand-rolled in image.rs so it needs no extra dep either way.
@@ -93,6 +98,13 @@ fstool = { version = "0.5.3", optional = true, default-features = false, feature
 # Blocking HTTP(S) client for downloading guest root images, gated behind the
 # `fetch` feature (see src/image.rs). Not linked into the default build.
 ureq = { version = "3", optional = true }
+# TLS for `oci-net`: our pure-Rust crypto toolkit, with only what a TLS client
+# needs (its embedded CA roots included).
+purecrypto = { version = "0.10.6", optional = true, default-features = false, features = [
+    "tls",
+    "rng",
+    "embedded-roots",
+] }
 # Compression collection (gzip decoder), gated behind `targz`. `std` + `gzip`
 # only — a pure-Rust inflate that builds for wasm32. Same crate `fstool` uses.
 compcol = { version = "0.7.9", optional = true, default-features = false, features = [
@@ -106,6 +118,12 @@ compcol = { version = "0.7.9", optional = true, default-features = false, featur
 pktkit = { version = "0.1.11", optional = true, default-features = false, features = [
     "vclient",
 ] }
+
+# purecrypto's `std` natively: OS entropy and clock. Not on wasm32, where it
+# would read `SystemTime::now()` (which panics there) — the TLS client there
+# takes its time and entropy from nixvm (src/oci/net.rs).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+purecrypto = { version = "0.10.6", optional = true, default-features = false, features = ["std"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Only pulled in on wasm32, and only linked when the `wasm` feature is on

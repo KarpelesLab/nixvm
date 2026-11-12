@@ -73,8 +73,19 @@ const termEl = ref(null);
 const status = ref("idle");
 const arch = ref("aarch64");
 const hasBooted = ref(false);
+// `?image=<name>` boots that Docker/OCI image (from Docker Hub or any
+// registry) instead of the bundled Alpine: pulled over the network link — nixvm
+// does the DNS, TLS and HTTP itself, so no CORS proxy is involved — then run
+// on that same link. `&cmd=` replaces the image's command (space-separated).
+const pageParams = new URLSearchParams(location.search);
+const imageName = pageParams.get("image");
+const imageCmd = (pageParams.get("cmd") ?? "").split(" ").filter(Boolean);
+const pullProgress = ref("");
 const statusMessages = {
-  idle: "pick an architecture and press Start",
+  idle: imageName
+    ? `pick an architecture and press Start to pull ${imageName}`
+    : "pick an architecture and press Start",
+  connecting: "connecting the network…",
   downloading: "downloading Alpine rootfs…",
   decompressing: "decompressing rootfs…",
   loading: "loading WebAssembly module…",
@@ -83,7 +94,11 @@ const statusMessages = {
   exited: "shell exited",
   error: "boot failed",
 };
-const statusText = computed(() => statusMessages[status.value] ?? status.value);
+const statusText = computed(() =>
+  status.value === "pulling"
+    ? `pulling ${imageName}… ${pullProgress.value}`
+    : (statusMessages[status.value] ?? status.value),
+);
 
 // Network link state, shown in the toolbar:
 // off | connecting | online | error | unavailable.
@@ -139,7 +154,14 @@ const netTitle = computed(() => {
 const netCanCopy = computed(
   () => netEnabled.value && netState.value === "online" && netAddr.value.includes(":"),
 );
-const bootingPhases = new Set(["downloading", "decompressing", "loading", "booting"]);
+const bootingPhases = new Set([
+  "downloading",
+  "decompressing",
+  "loading",
+  "connecting",
+  "pulling",
+  "booting",
+]);
 const rebootDisabled = computed(() => bootingPhases.has(status.value));
 const bootLabel = computed(() => (hasBooted.value ? "Reboot" : "Start"));
 
@@ -147,6 +169,9 @@ let xterm = null;
 let fitAddon = null;
 let resizeObserver = null;
 let guestTerm = null;
+// The network link (a wasm `Network`): the tunnel is pumped through it, and
+// the guest boots on it — after an image was pulled over it, in image mode.
+let netLink = null;
 
 // Cached across reboots so hitting "Reboot" doesn't re-download a rootfs
 // (one entry per arch) or re-instantiate the wasm module — only a fresh
@@ -508,9 +533,9 @@ async function netGetToken() {
 
 // Send every packet the guest's stack has queued.
 function flushNet() {
-  if (!guestTerm || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!netLink || !ws || ws.readyState !== WebSocket.OPEN) return;
   for (;;) {
-    const p = guestTerm.net_next_packet();
+    const p = netLink.next_packet();
     if (p === undefined || p === null) break;
     notePacket("out", p);
     ws.send(p);
@@ -541,7 +566,7 @@ function netDisconnect() {
     }
   }
   try {
-    if (!guestDead) guestTerm?.net_down();
+    if (!guestDead) netLink?.down();
   } catch (err) {
     surfaceGuestCrash(err);
   }
@@ -551,7 +576,7 @@ function netDisconnect() {
 
 function netRetryLater() {
   netStopTimers();
-  if (!netEnabled.value || !guestTerm || guestDead) return;
+  if (!netEnabled.value || !netLink || guestDead) return;
   netState.value = "error";
   const delay = netRetryDelay;
   netRetryDelay = Math.min(netRetryDelay * 2, 30_000);
@@ -560,7 +585,7 @@ function netRetryLater() {
 
 async function netConnect() {
   netDisconnect();
-  if (!netEnabled.value || !guestTerm || guestDead) return;
+  if (!netEnabled.value || !netLink || guestDead) return;
   const gen = netGen;
   netState.value = "connecting";
   let token;
@@ -580,7 +605,7 @@ async function netConnect() {
     netRetryLater(); // couldn't reach the API (offline): back off, retry
     return;
   }
-  if (gen !== netGen || !guestTerm) return;
+  if (gen !== netGen || !netLink) return;
   netUnavailable.value = false;
 
   const sock = new WebSocket(NET_TUNNEL_URL + encodeURIComponent(token));
@@ -588,17 +613,17 @@ async function netConnect() {
   ws = sock;
   let hello = false;
   sock.onmessage = (ev) => {
-    if (gen !== netGen || !guestTerm || guestDead) return;
+    if (gen !== netGen || !netLink || guestDead) return;
     try {
       if (typeof ev.data === "string") {
         // The first text message is the hello: what we were leased.
         if (hello) return;
         hello = true;
         const h = JSON.parse(ev.data);
-        guestTerm.net_up(h.ipv4 ?? undefined, h.ipv4_prefix ?? 32, h.ipv6 ?? undefined, h.mtu ?? 1400);
+        netLink.up(h.ipv4 ?? undefined, h.ipv4_prefix ?? 32, h.ipv6 ?? undefined, h.mtu ?? 1400);
         // Show the guest's public IPv6 address. The IPv4 one is a NATed
         // inside address (the same for every client), so not shown.
-        netAddr.value = guestTerm.net_ipv6() ?? "online";
+        netAddr.value = netLink.ipv6() ?? "online";
         // The address lasts as long as the tunnel: until `expires` (Unix s).
         netExpires.value = Number.isFinite(h.expires) ? h.expires * 1000 : 0;
         netNow.value = Date.now();
@@ -610,7 +635,7 @@ async function netConnect() {
         netTokenFails = 0;
         netTickTimer = setInterval(() => {
           try {
-            guestTerm?.net_tick();
+            netLink?.tick();
             flushNet();
           } catch (err) {
             surfaceGuestCrash(err);
@@ -623,7 +648,7 @@ async function netConnect() {
       }
       const pkt = new Uint8Array(ev.data);
       notePacket("in", pkt);
-      guestTerm.net_input(pkt);
+      netLink.input(pkt);
       schedulePump(0);
     } catch (err) {
       surfaceGuestCrash(err);
@@ -633,7 +658,7 @@ async function netConnect() {
     if (gen !== netGen) return;
     ws = null;
     try {
-      if (!guestDead) guestTerm?.net_down();
+      if (!guestDead) netLink?.down();
     } catch (err) {
       surfaceGuestCrash(err);
     }
@@ -741,28 +766,72 @@ async function loadWasmModule() {
   return cachedWasmModule;
 }
 
+/// Resolve once the network link is up; reject if it's refused, or not up
+/// within a minute (it retries on its own meanwhile).
+function netReady() {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const check = () => {
+      if (netState.value === "online") return resolve();
+      if (netState.value === "unavailable" || !netEnabled.value) {
+        return reject(new Error("the network is not available right now, so the image can't be pulled"));
+      }
+      if (Date.now() - started > 60_000) return reject(new Error("the network didn't come up"));
+      setTimeout(check, 50);
+    };
+    check();
+  });
+}
+
+/// Pull `imageName` over the network link, showing progress.
+async function pullImage(mod, archId) {
+  status.value = "connecting";
+  netEnabled.value = true;
+  netConnect();
+  await netReady();
+  status.value = "pulling";
+  pullProgress.value = "";
+  const pull = new mod.ImagePull(imageName, archId);
+  const mb = (n) => (n / 1048576).toFixed(1);
+  while (!pull.pull_over(netLink)) {
+    flushNet();
+    const [l, lt, b, bt] = pull.progress();
+    pullProgress.value = lt ? `${l}/${lt} layers, ${mb(b)}/${mb(bt)} MB` : "";
+    await new Promise((r) => setTimeout(r, 4));
+  }
+  return pull;
+}
+
 async function boot() {
   const archId = arch.value;
   guestDead = false;
   try {
-    const targz = await fetchRootfsTarGz(archId);
+    const targz = imageName ? null : await fetchRootfsTarGz(archId);
     const mod = await loadWasmModule();
+    netLink = new mod.Network();
+    const pull = imageName ? await pullImage(mod, archId) : null;
     status.value = "booting";
     lineBuffer = "";
     atLineStart = true;
     await tick();
-    // The wasm Terminal takes the raw .tar.gz and gunzips it in-process; the
-    // guest arch is auto-detected from the ELFs inside it. Construction or the
-    // first pump can trap (panic=abort) — the catch below surfaces it.
-    guestTerm = new mod.Terminal(targz, ["/bin/busybox", "sh"]);
+    // Construction or the first pump can trap (panic=abort) — the catch below
+    // surfaces it. The bundled rootfs's guest arch is auto-detected from the
+    // ELFs inside it; an image's is the one it was pulled for.
+    guestTerm = pull
+      ? mod.Terminal.from_image_on(pull, netLink, imageCmd, [])
+      : mod.Terminal.new_on(targz, ["/bin/busybox", "sh"], netLink);
     const out = guestTerm.pump();
-    writeBanner(`nixvm — Alpine Linux (${archId}), running entirely in your browser.`);
-    writeBanner('Type commands and press Enter. Try: uname -m; ls /; cat /etc/os-release');
+    if (imageName) {
+      writeBanner(`nixvm — ${imageName} (${archId}), pulled over the network and running in your browser.`);
+    } else {
+      writeBanner(`nixvm — Alpine Linux (${archId}), running entirely in your browser.`);
+      writeBanner('Type commands and press Enter. Try: uname -m; ls /; cat /etc/os-release');
+    }
     writeBytes(out);
     hasBooted.value = true;
     status.value = "ready";
     writePrompt();
-    netConnect();
+    if (!imageName) netConnect();
   } catch (err) {
     status.value = "error";
     writeErrorBanner(`boot failed: ${err?.message ?? err}`);
@@ -780,6 +849,12 @@ async function reboot() {
     // already freed / never constructed — fine.
   }
   guestTerm = null;
+  try {
+    netLink?.free?.();
+  } catch {
+    // already freed
+  }
+  netLink = null;
   lineBuffer = "";
   atLineStart = true;
   busy = false;

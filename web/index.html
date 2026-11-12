@@ -10,9 +10,10 @@
     />
     <link rel="icon" href="data:," />
     <!-- pkg/nixvm.js (wasm-bindgen glue) imports the pktkit crate's clock from
-         the bare specifier "pktkit"; resolve it to our shim in public/. -->
+         the bare specifier "pktkit", and purecrypto's entropy hook from
+         "purecrypto"; resolve them to our shims in public/. -->
     <script type="importmap">
-      { "imports": { "pktkit": "./pktkit.js" } }
+      { "imports": { "pktkit": "./pktkit.js", "purecrypto": "./purecrypto.js" } }
     </script>
   </head>
   <body>

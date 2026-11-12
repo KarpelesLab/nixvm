@@ -20,6 +20,8 @@ mod reference;
 
 #[cfg(all(feature = "fetch", not(target_arch = "wasm32")))]
 mod fetch;
+#[cfg(feature = "oci-net")]
+pub mod net;
 
 #[cfg(all(feature = "fetch", not(target_arch = "wasm32")))]
 pub use fetch::{pull, pull_with};

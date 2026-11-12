@@ -118,3 +118,35 @@ fn a_script_entrypoint_and_layers_with_whiteouts_run() {
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("py 3.") && out.contains("pip"), "{out}");
 }
+
+/// The pull nixvm does over a guest-style link (the browser's tunnel) — its own
+/// DNS, purecrypto TLS and HTTP, redirects to the CDN included — here over the
+/// host's sockets.
+#[cfg(feature = "oci-net")]
+#[test]
+fn a_pull_over_a_network_link_with_nixvm_doing_dns_tls_and_http() {
+    if !enabled() {
+        return;
+    }
+    let pull = oci::Pull::new("alpine:3.20", arch()).unwrap();
+    let mut net = oci::net::NetPull::new(pull, Box::new(nixvm::kernel::egress::HostEgress));
+    let start = std::time::Instant::now();
+    while !net.poll().expect("pull") {
+        assert!(start.elapsed().as_secs() < 120, "pull took too long");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let img = net.finish().expect("image");
+    assert_eq!(img.config.arch(), Some(arch()));
+    let mut vm = Vm::boot_image(
+        &img,
+        &RunOptions {
+            cmd: vec!["cat".into(), "/etc/alpine-release".into()],
+            ..RunOptions::default()
+        },
+        256 << 20,
+    )
+    .expect("boot");
+    let (code, out) = run(&mut vm);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.starts_with("3.20."), "{out}");
+}

@@ -27,6 +27,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "cacrt"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de50c589220a5516d733d43e585df9489cd93f373e6f8deead9d16c50d3fa30d"
+
+[[package]]
 name = "cc"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -47,6 +53,12 @@ name = "compcol"
 version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fbe9a1760292869e621e78fe025e3588acfbf29b2947758aacd2eb31cc179dd3"
+
+[[package]]
+name = "compcol"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4be160df80e77bdf4902bb026c6a0f6c700ec7793379c26305d45e293e17b8c"
 
 [[package]]
 name = "console_error_panic_hook"
@@ -90,7 +102,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7a0ca781fb95b482d2645fbd50787012965778d99d2f405579664a87eba74dd"
 dependencies = [
- "compcol",
+ "compcol 0.7.9",
  "uuid",
 ]
 
@@ -199,10 +211,11 @@ dependencies = [
 name = "nixvm"
 version = "0.0.5"
 dependencies = [
- "compcol",
+ "compcol 0.7.9",
  "console_error_panic_hook",
  "fstool",
  "pktkit",
+ "purecrypto",
  "ureq",
  "wasm-bindgen",
 ]
@@ -238,6 +251,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "purecrypto"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36f943243cf00add6222fc0decfc3a17f37942bd82e8465a9d354eeb13822263"
+dependencies = [
+ "cacrt",
+ "compcol 0.8.0",
 ]
 
 [[package]]

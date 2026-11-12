@@ -188,12 +188,17 @@ image and `vm::Vm::boot_image` boots it as a guest you drive — write its stdin
 pump its output, interrupt it, read its exit code — or
 `Sandbox::builder().image("alpine:3.20")` runs it like the CLI does.
 
-In the browser, `ImagePull` does no networking of its own: the page fetches
-each request it names and feeds the response back, then
-`Terminal.from_image(pull, args, env)` boots it. Registries send no CORS
-headers, so a page sends those requests through a proxy (one that passes
-`WWW-Authenticate` back); `Terminal.from_image_archive` takes a `docker save`
-file the user picked instead.
+In the browser the pull goes over the guest's own network link: the page
+brings up a `Network` on its packet tunnel (the live demo's grouterd
+WebSocket), `ImagePull.pull_over(net)` fetches the image over it with nixvm
+doing the DNS, TLS (purecrypto, pure Rust) and HTTP itself — so CORS never
+applies and no proxy is needed — and `Terminal.from_image_on(pull, net, args,
+env)` boots it on that same link. The live demo does this with
+[`?image=<name>`](https://karpeleslab.github.io/nixvm/?image=alpine:3.20)
+(and `&cmd=` to replace the image's command). A page without a tunnel can
+instead fetch each request `ImagePull` names itself (through a CORS proxy)
+and feed the responses back, or hand `Terminal.from_image_archive` a
+`docker save` file the user picked.
 
 ## Default sandbox layout
 

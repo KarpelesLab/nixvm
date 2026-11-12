@@ -706,9 +706,19 @@ Second and third backends, and the second guest arch.
   (non-root), distroless and GHCR images, natively and on the wasm build.
   Ubuntu's root needs fstool's squashfs fixpoint fix (fstool a9c4dfc, in the
   release after 0.5.3): until then its squashfs fails to build.
+  In the browser (`oci-net` feature) the pull goes over the guest's network
+  link instead of `fetch()`: `oci::net::NetPull` drives the same `Pull` over
+  any `Egress` (the packet tunnel), doing DNS over its UDP, TLS with
+  purecrypto (no `std` on wasm, so it never reads `SystemTime`; entropy from
+  `crypto.getRandomValues`, time from `crate::clock`) and HTTP/1.1 with
+  redirects, never blocking — so no CORS and no proxy. The live demo pulls
+  `?image=<name>` that way and boots it on the same link (checked in Chrome:
+  alpine on arm64, python:3.12-alpine on x86-64). purecrypto's own browser
+  entropy hook stays linked though unused, so pages map `purecrypto` to a
+  shim that throws if it's ever called (`web/public/purecrypto.js`).
   Left: hard links are written as copies (fstool's squashfs writer can't take
-  one from a stream), `docker run` niceties with no place here yet (volumes,
-  published ports, healthchecks), and a CORS proxy for the browser demo.
+  one from a stream), and `docker run` niceties with no place here yet
+  (volumes, published ports, healthchecks).
 
 ### Phase 12 — Hardening, performance, 1.0
 
