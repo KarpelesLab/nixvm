@@ -500,7 +500,13 @@ impl Kernel {
 
     /// Everything visible from this task, with the numbers it knows them by. Threads
     /// don't get an entry of their own at the top level, on Linux or here.
-    pub(super) fn visible_tasks(&self, cx: &ServiceCtx) -> Vec<crate::fs::ProcTask> {
+    /// `maps_of` is the task (as this one numbers it) whose `maps` is being
+    /// read, if any: only its address space is rendered, a walk of all of it.
+    pub(super) fn visible_tasks(
+        &self,
+        cx: &ServiceCtx,
+        maps_of: Option<u32>,
+    ) -> Vec<crate::fs::ProcTask> {
         use super::RunState;
         let sh = self.shared.lock().unwrap();
         let describe = |info: &super::ProcInfo| {
@@ -543,8 +549,14 @@ impl Kernel {
                     Vec::new()
                 },
                 // Its mappings, read from its address space when that is free
-                // (a stopped tracee's is; a running one's may be busy).
-                maps: if info.mm != cx.cur.mm && self.may_ptrace(cx, info) {
+                // (a stopped tracee's is; a running one's may be busy). Only
+                // when they are what's being read: rendering every traceable
+                // task's on each /proc access made all of them take seconds
+                // among Chromium's processes, whose reservations are huge.
+                maps: if maps_of == Some(pid as u32)
+                    && info.mm != cx.cur.mm
+                    && self.may_ptrace(cx, info)
+                {
                     sh.spaces
                         .get(info.mm)
                         .and_then(|space| space.try_lock().ok().map(|m| Self::render_maps(cx, &m)))

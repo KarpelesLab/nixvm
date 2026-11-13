@@ -371,29 +371,29 @@ impl Kernel {
         ) {
             return;
         }
-        let (under_proc, maps) = match cx.cur.fds.get(args[0] as i32) {
-            Some(Fd::File { path, .. } | Fd::Dir { path, .. }) => (
-                path.contains("/proc"),
-                path.ends_with("/maps") || path.ends_with("/smaps"),
-            ),
-            _ => (false, false),
+        let path = match cx.cur.fds.get(args[0] as i32) {
+            Some(Fd::File { path, .. } | Fd::Dir { path, .. }) => path.clone(),
+            _ => return,
         };
-        // Rendering the address space walks all of it (a .NET process has
-        // 256 GiB of reservations): only for a maps file.
-        if under_proc {
-            self.refresh_procfs(cx, maps.then_some(mem));
+        if path.contains("/proc") {
+            self.refresh_procfs(cx, &path, mem);
         }
     }
 
-    /// Bring procfs up to date for this task, ahead of a lookup in it. The other
-    /// tasks have to be read before taking `vfs`, which sorts after `shared`.
-    fn refresh_procfs(&self, cx: &ServiceCtx, mem: Option<&GuestMemory>) {
-        let tasks = self.visible_tasks(cx);
+    /// Bring procfs up to date for this task, ahead of a lookup of `path` in
+    /// it. The other tasks have to be read before taking `vfs`, which sorts
+    /// after `shared`. Rendering an address space walks all of it (a .NET
+    /// process has 256 GiB of reservations), so only a maps file's is: this
+    /// task's, or the one task's whose file it is.
+    fn refresh_procfs(&self, cx: &ServiceCtx, path: &str, mem: &GuestMemory) {
+        let maps = path.ends_with("/maps") || path.ends_with("/smaps");
+        let maps_of = maps.then(|| maps_pid(path)).flatten();
+        let tasks = self.visible_tasks(cx, maps_of);
         let tids = self.visible_thread_ids(cx);
         let mut live = self.proc_self_live(cx);
         live.tasks = tasks;
         live.tids = tids;
-        if let Some(mem) = mem {
+        if maps {
             live.maps = Self::render_maps(cx, mem);
         }
         {
@@ -438,9 +438,7 @@ impl Kernel {
         if !abs.contains("/proc") {
             return None;
         }
-        // Rendering the address space costs a walk of it: only for its files.
-        let maps = abs.ends_with("/maps") || abs.ends_with("/smaps");
-        self.refresh_procfs(cx, maps.then_some(&*mem));
+        self.refresh_procfs(cx, &abs, mem);
         let inside = Self::as_seen_from_root(cx, &abs);
         let (target, kind) = parse_ns_path(&inside)?;
         let id = match self.ns_of_target(cx, target, kind) {
@@ -658,8 +656,25 @@ impl Kernel {
     }
 }
 
+/// The task a `/proc/<pid>/maps` (or `/proc/<pid>/task/<tid>/maps`) path
+/// names, by the number the reader knows it by; `None` for `self` and
+/// `thread-self`, or a path of another shape.
+fn maps_pid(path: &str) -> Option<u32> {
+    let rest = &path[path.rfind("/proc/")? + "/proc/".len()..];
+    rest.split('/').next()?.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_maps_path_names_its_task() {
+        assert_eq!(super::maps_pid("/proc/42/maps"), Some(42));
+        assert_eq!(super::maps_pid("/proc/42/task/43/smaps"), Some(42));
+        assert_eq!(super::maps_pid("/chroot/proc/7/maps"), Some(7));
+        assert_eq!(super::maps_pid("/proc/self/maps"), None);
+        assert_eq!(super::maps_pid("/proc/thread-self/maps"), None);
+    }
+
     use super::*;
 
     #[test]
