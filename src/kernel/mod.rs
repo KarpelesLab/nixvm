@@ -3510,7 +3510,7 @@ impl Kernel {
                         mem.page_prot(addr).is_some(),
                         addr == vcpu.pc(),
                     );
-                    self.ptrace_fault(cx, &fault, vcpu)
+                    self.ptrace_fault(cx, &fault, vcpu, mem)
                 } {
                     s
                 } else if self.deliver_fault_signal(
@@ -3544,7 +3544,7 @@ impl Kernel {
                 // load bias for PIEs/`ld-musl`, so it can't be looked up in
                 // the on-disk ELF directly).
                 let fault = signal::Fault::ill(self.arch, pc);
-                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu) {
+                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu, mem) {
                     return s;
                 }
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
@@ -3563,7 +3563,7 @@ impl Kernel {
             }
             Exit::ArithmeticFault { pc, code, vector } => {
                 let fault = signal::Fault::fpe(pc, code, vector);
-                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu) {
+                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu, mem) {
                     return s;
                 }
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
@@ -3579,7 +3579,7 @@ impl Kernel {
             }
             Exit::ProtectionFault { pc } => {
                 let fault = signal::Fault::gp();
-                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu) {
+                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu, mem) {
                     return s;
                 }
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
@@ -3597,7 +3597,7 @@ impl Kernel {
                 // `BRK`/`int3`: SIGTRAP (a debugger-less process dies of it with
                 // a core, like Linux; a guest handler — Go, sanitizers — runs).
                 let fault = signal::Fault::brk(self.arch, pc, code);
-                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu) {
+                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu, mem) {
                     return s;
                 }
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
@@ -3611,7 +3611,7 @@ impl Kernel {
             Exit::DebugTrap { pc, dr6 } => {
                 // A single step or a debug-register hit: SIGTRAP, as above.
                 let fault = signal::Fault::debug_trap(pc, dr6);
-                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu) {
+                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu, mem) {
                     return s;
                 }
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
@@ -3624,7 +3624,7 @@ impl Kernel {
             }
             Exit::Misaligned { addr, write } => {
                 let fault = signal::Fault::misaligned(self.arch, addr, write, vcpu.pc(), vcpu.sp());
-                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu) {
+                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu, mem) {
                     return s;
                 }
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {

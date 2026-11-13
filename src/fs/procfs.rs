@@ -207,6 +207,12 @@ pub struct ProcTask {
     pub sandbox: Sandbox,
     /// Body of its `syscall` file: the syscall it waits in, or `running`.
     pub syscall: String,
+    /// Its auxiliary vector (`auxv`, which debuggers read to find where the
+    /// program and its interpreter were loaded); empty unless the reader may
+    /// trace it, as Linux's `PTRACE_MODE_READ` check.
+    pub auxv: Vec<u8>,
+    /// Its `maps`, for a reader that may trace it; empty otherwise.
+    pub maps: String,
 }
 
 /// What `/proc/<pid>/status` says of a task's sandboxing: its `no_new_privs`
@@ -242,6 +248,8 @@ impl ProcTask {
             "gid_map" => self.id_files[1].clone().into_bytes(),
             "setgroups" => self.id_files[2].clone().into_bytes(),
             "syscall" => self.syscall.clone().into_bytes(),
+            "auxv" => self.auxv.clone(),
+            "maps" => self.maps.clone().into_bytes(),
             "stat" => {
                 // Only the leading fields `ps` and friends read carry anything.
                 let rest = "0 ".repeat(45);
@@ -284,10 +292,12 @@ impl ProcTask {
 
 /// Files under `/proc/<pid>` for a task other than the reader.
 const TASK_FILES: &[&str] = &[
+    "auxv",
     "cgroup",
     "cmdline",
     "comm",
     "gid_map",
+    "maps",
     "setgroups",
     "stat",
     "status",
@@ -940,6 +950,13 @@ impl ProcFs {
         let (first, tail) = rel.split_once('/').unwrap_or((rel, ""));
         let pid: u32 = first.parse().ok()?;
         let task = self.data.tasks.iter().find(|t| t.pid == pid)?;
+        // Its main thread's directory (`task/<pid>/...`) holds the same files.
+        let main = format!("task/{pid}");
+        let tail = match tail.strip_prefix(main.as_str()) {
+            Some("") => "",
+            Some(rest) if rest.starts_with('/') => &rest[1..],
+            _ => tail,
+        };
         Some((task, tail))
     }
 
@@ -2017,6 +2034,8 @@ mod tests {
             cgroup: "0::/a\n".to_string(),
             sandbox: Sandbox::default(),
             syscall: String::new(),
+            auxv: Vec::new(),
+            maps: String::new(),
         }];
         fs
     }
@@ -2037,6 +2056,25 @@ mod tests {
         assert_eq!(stat.split_whitespace().count(), 52);
         let status = String::from_utf8(read_all(&mut fs, "7/status")).unwrap();
         assert!(status.contains("Uid:\t5\t5\t5\t5"), "{status}");
+    }
+
+    #[test]
+    fn a_debugger_reads_another_tasks_auxv_and_maps() {
+        let mut fs = with_tasks();
+        fs.data.tasks[0].auxv = vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0, 0, 0, 0];
+        fs.data.tasks[0].maps = "00010000-00011000 r-xp 00000000 00:00 0 /t\n".to_string();
+        assert_eq!(read_all(&mut fs, "7/auxv"), fs.data.tasks[0].auxv);
+        assert_eq!(
+            read_all(&mut fs, "7/maps"),
+            fs.data.tasks[0].maps.as_bytes()
+        );
+        // Its main thread's directory shows the same files.
+        assert_eq!(
+            read_all(&mut fs, "7/task/7/maps"),
+            fs.data.tasks[0].maps.as_bytes()
+        );
+        assert_eq!(read_all(&mut fs, "7/task/7/comm"), b"worker\n");
+        assert!(fs.stat("7/task/8/comm").is_none());
     }
 
     #[test]

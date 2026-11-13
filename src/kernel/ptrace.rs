@@ -944,7 +944,7 @@ impl Kernel {
     /// Linux's `__ptrace_may_access` for an attach: the same user (real ids
     /// against the target's real, effective and saved ones) and a dumpable
     /// target, or `CAP_SYS_PTRACE` over the target's user namespace.
-    fn may_ptrace(&self, cx: &ServiceCtx, target: &ProcInfo) -> bool {
+    pub(super) fn may_ptrace(&self, cx: &ServiceCtx, target: &ProcInfo) -> bool {
         const CAP_SYS_PTRACE: u32 = 19;
         let (c, t) = (&cx.cur.creds, &target.creds);
         let same_user = [t.euid, t.suid, t.ruid].iter().all(|&u| u == c.ruid)
@@ -1216,11 +1216,19 @@ impl Kernel {
         cx: &mut ServiceCtx,
         fault: &super::signal::Fault,
         vcpu: &mut dyn Vcpu,
+        mem: &mut GuestMemory,
     ) -> Option<Serviced> {
-        let t = cx.cur.ptrace.as_mut()?;
+        let t = cx.cur.ptrace.as_ref()?;
         if t.tracer == 0 {
             return None;
         }
+        // Killed while stopped (`PTRACE_KILL`, `kill -9`): the instruction
+        // faults again on the way out, but the kill comes first.
+        if cx.cur.pending & (1 << (SIGKILL - 1)) != 0 {
+            self.die_of_signal(cx, SIGKILL as u32, mem);
+            return Some(Serviced::Ended);
+        }
+        let t = cx.cur.ptrace.as_mut()?;
         if let Some((sig, _)) = t.inject
             && sig == fault.sig
         {

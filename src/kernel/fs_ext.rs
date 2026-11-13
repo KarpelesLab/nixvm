@@ -417,7 +417,23 @@ impl Kernel {
         let (who, tail) = rest.split_once('/')?;
         let me = self.visible_pid(cx, cx.cur.tgid).to_string();
         if who != "self" && who != "thread-self" && who != me {
-            return None;
+            // Another process's program, for a reader that may trace it (a
+            // debugger attaching by pid finds the binary there).
+            if tail != "exe" {
+                return None;
+            }
+            let pid: i32 = who.parse().ok()?;
+            let sh = self.shared.lock().unwrap();
+            let info = sh
+                .procs
+                .iter()
+                .flatten()
+                .map(|p| &p.info)
+                .find(|i| !i.is_thread && self.visible_pid(cx, i.tgid) == pid)?;
+            if info.exe.is_empty() || !self.may_ptrace(cx, info) {
+                return None;
+            }
+            return Some(Self::as_seen_from_root(cx, &info.exe));
         }
         // `/proc/self/{exe,cwd,root}` resolve to *live* per-task state, not
         // procfs's static snapshot — programs read these to locate themselves.
@@ -474,6 +490,21 @@ impl Kernel {
                     syscall_line(info)
                 } else {
                     "running\n".to_string()
+                },
+                auxv: if self.may_ptrace(cx, info) {
+                    info.auxv.clone()
+                } else {
+                    Vec::new()
+                },
+                // Its mappings, read from its address space when that is free
+                // (a stopped tracee's is; a running one's may be busy).
+                maps: if info.mm != cx.cur.mm && self.may_ptrace(cx, info) {
+                    sh.spaces
+                        .get(info.mm)
+                        .and_then(|space| space.try_lock().ok().map(|m| Self::render_maps(cx, &m)))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
                 },
             })
         };
