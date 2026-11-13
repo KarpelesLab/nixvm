@@ -280,6 +280,9 @@ struct ProcInfo {
     /// field while the task runs, checked back in between slices so siblings see a
     /// `chdir`. A plain `fork` gets a private copy.
     cwd: String,
+    /// The file-creation mask (`umask`): the other half of the filesystem
+    /// context, shared and checked out with [`Self::cwd`].
+    umask: u32,
     mmap_cursor: u64,
     mmap_floor: u64,
     /// Lowest address the initial thread's stack may grow to. A fault in
@@ -320,9 +323,7 @@ struct ProcInfo {
     /// share one entry, so a `chdir` in one is seen by all; a plain `fork` gets a
     /// private copy. Like [`ProcInfo::files`] the entry is *checked out* into
     /// [`ProcInfo::cwd`] while the task runs, and lives in `cwd_tables[fs]`
-    /// between slices. (The `umask` half of a filesystem context is already a
-    /// single global in [`Shared::umask`], and there is no per-task chroot root,
-    /// so `cwd` is the only per-task fs state a `CLONE_FS` share must unify.)
+    /// between slices, with the `umask`, the other half of a filesystem context.
     fs: usize,
     /// `set_tid_address` / `CLONE_CHILD_CLEARTID`: on exit, zero this guest
     /// word and futex-wake it (lets `pthread_join` return). 0 = unset.
@@ -597,6 +598,14 @@ struct QueuedSig {
 /// Signal-table size: signals `1..=64` plus the unused index 0.
 const NSIG_SLOTS: usize = 65;
 
+/// A filesystem context between its tasks' slices: the working directory and
+/// the `umask`, which `CLONE_FS` shares.
+#[derive(Clone, Debug)]
+struct FsCtx {
+    cwd: String,
+    umask: u32,
+}
+
 /// A writable file-backed `MAP_SHARED` region awaiting flush-back.
 #[derive(Clone, Debug)]
 struct SharedMap {
@@ -611,6 +620,7 @@ impl Default for ProcInfo {
         Self {
             fds: FdTable::with_standard_streams(),
             cwd: "/".to_string(),
+            umask: 0o022,
             mmap_cursor: 0,
             mmap_floor: 0,
             stack_limit: 0,
@@ -1819,8 +1829,6 @@ pub(super) struct Shared {
     /// conclude it could raise the limit to a million fds and spin there.
     /// Monotonic counter for `memfd_create` backing-file names.
     memfd_seq: u64,
-    /// The process file-creation mask (`umask`); global for our single session.
-    umask: u32,
     unsupported: BTreeMap<u64, u64>,
     /// All tasks; the running one is `take`n out during its slice, so its
     /// slot is temporarily `None` (making `fork`/`wait4` on the table clean).
@@ -1857,7 +1865,7 @@ pub(super) struct Shared {
     /// gets its own. Checked out into [`ProcInfo::cwd`] while the owning task runs
     /// (slot `None` meanwhile), alongside the fd table — see
     /// [`Shared::check_out_files`].
-    cwd_tables: Vec<Option<String>>,
+    cwd_tables: Vec<Option<FsCtx>>,
     /// Anonymous-`mmap` arenas indexed by [`ProcInfo::mm`] — one per address
     /// space, so every `CLONE_VM` thread allocates from the same arena and two
     /// threads can never be handed overlapping ranges.
@@ -2354,7 +2362,9 @@ impl Shared {
             .take()
             .expect("fd table already checked out");
         let s = cx.cur.fs;
-        cx.cur.cwd = self.cwd_tables[s].take().expect("cwd already checked out");
+        let fs = self.cwd_tables[s].take().expect("cwd already checked out");
+        cx.cur.cwd = fs.cwd;
+        cx.cur.umask = fs.umask;
     }
 
     /// Check the running task's fd table back into [`Shared::file_tables`] and its
@@ -2367,7 +2377,10 @@ impl Shared {
         let f = cx.cur.files;
         self.file_tables[f] = Some(std::mem::take(&mut cx.cur.fds));
         let s = cx.cur.fs;
-        self.cwd_tables[s] = Some(std::mem::take(&mut cx.cur.cwd));
+        self.cwd_tables[s] = Some(FsCtx {
+            cwd: std::mem::take(&mut cx.cur.cwd),
+            umask: cx.cur.umask,
+        });
     }
 
     /// The running task's `mmap` arena — the one shared by every task in its
@@ -2447,7 +2460,6 @@ impl Kernel {
                 stdout: Box::new(std::io::stdout()),
                 stderr: Box::new(std::io::stderr()),
                 memfd_seq: 0,
-                umask: 0o022,
                 unsupported: BTreeMap::new(),
                 procs: Vec::new(),
                 free_proc_slots: Vec::new(),
@@ -2657,7 +2669,10 @@ impl Kernel {
             info.files = sh.file_tables.len();
             sh.file_tables.push(Some(std::mem::take(&mut info.fds)));
             info.fs = sh.cwd_tables.len();
-            sh.cwd_tables.push(Some(std::mem::take(&mut info.cwd)));
+            sh.cwd_tables.push(Some(FsCtx {
+                cwd: std::mem::take(&mut info.cwd),
+                umask: info.umask,
+            }));
             sh.mmap_areas
                 .push(Arena::new(info.mmap_cursor, info.mmap_floor));
             sh.spaces.push(Arc::new(Mutex::new(mem)));
@@ -2934,7 +2949,10 @@ impl Kernel {
         info.files = sh.file_tables.len();
         sh.file_tables.push(Some(std::mem::take(&mut info.fds)));
         info.fs = sh.cwd_tables.len();
-        sh.cwd_tables.push(Some(std::mem::take(&mut info.cwd)));
+        sh.cwd_tables.push(Some(FsCtx {
+            cwd: std::mem::take(&mut info.cwd),
+            umask: info.umask,
+        }));
         sh.mmap_areas
             .push(Arena::new(info.mmap_cursor, info.mmap_floor));
         sh.spaces.push(Arc::new(Mutex::new(mem)));
@@ -4471,11 +4489,32 @@ impl Kernel {
             | Sysno::Sendmmsg
             | Sysno::Recvmmsg => {
                 cx.unix_identity = self.unix_path_identity(cx, sys, args, mem);
+                // Binding an `AF_UNIX` socket to a path makes the socket's
+                // name there first (`vfs` before `net`), and takes it back if
+                // the bind fails.
+                let name = if sys == Sysno::Bind {
+                    match self.make_socket_name(cx, args, mem) {
+                        Ok(name) => name,
+                        Err(e) => {
+                            cx.unix_identity = None;
+                            return e;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let mut net = self.net.lock().unwrap();
                 cx.dontwait = false;
                 let ret = self.dispatch_net(&mut net, cx, sys, args, mem);
                 cx.dontwait = false;
                 cx.unix_identity = None;
+                if ret < 0
+                    && let Some(name) = name
+                {
+                    drop(net);
+                    let _ = self.vfs_for(cx).unlink(&name);
+                    return ret;
+                }
                 let direction = match sys {
                     Sysno::Accept
                     | Sysno::Accept4
@@ -5085,7 +5124,7 @@ impl Kernel {
             }
             Sysno::Getcwd => self.sys_getcwd(cx, args[0], args[1], mem),
             Sysno::Fstatfs => self.sys_fstatfs(cx, args[0], args[1], mem),
-            Sysno::Umask => self.sys_umask(sh, args[0]),
+            Sysno::Umask => Self::sys_umask(cx, args[0]),
             // Sync family that takes an fd: nothing is durably backed, so there's
             // nothing to flush — but a bad fd must still report EBADF (real
             // fsync/fdatasync/syncfs/sync_file_range validate the descriptor).
@@ -5809,7 +5848,10 @@ impl Kernel {
         if share_fs {
             info.fs = cx.cur.fs;
         } else {
-            let cwd = cx.cur.cwd.clone();
+            let cwd = FsCtx {
+                cwd: cx.cur.cwd.clone(),
+                umask: cx.cur.umask,
+            };
             info.fs = if let Some(slot) = sh.free_cwd_slots.pop() {
                 sh.cwd_tables[slot] = Some(cwd);
                 slot
@@ -9527,7 +9569,7 @@ impl Kernel {
                     if had_slash {
                         return err(Errno::ENOTDIR);
                     }
-                    if let Err(e) = vfs.create(&abs, (mode & 0o777) as u32) {
+                    if let Err(e) = vfs.create(&abs, (mode & 0o7777) as u32 & !cx.cur.umask) {
                         return io_errno(&e);
                     }
                     self.own_new_node(vfs, cx, &abs);
@@ -9547,7 +9589,7 @@ impl Kernel {
                 return err(Errno::EEXIST);
             }
             // (O_TRUNC means nothing to a FIFO.)
-            Some(a) if flags & O_TRUNC != 0 && a.kind != NodeKind::Fifo => {
+            Some(a) if flags & O_TRUNC != 0 && a.kind == NodeKind::File => {
                 let _ = self.vfs_truncate(vfs, &abs, 0);
             }
             Some(_) => {}
@@ -9567,6 +9609,10 @@ impl Kernel {
         }
         if attrs.kind == NodeKind::Fifo {
             return self.open_fifo(cx, (attrs.dev, attrs.inode), flags);
+        }
+        // A socket's name is for `connect`, not `open` (an `O_PATH` handle aside).
+        if attrs.kind == NodeKind::Socket && flags & 0o10_000_000 == 0 {
+            return err(Errno::ENXIO);
         }
         let fd = if attrs.kind == NodeKind::Dir {
             cx.cur.fds.alloc(Fd::Dir { path: abs, pos: 0 })
@@ -10335,6 +10381,56 @@ impl Kernel {
         let path = read_path(mem, ptr + SUN_PATH_OFFSET)?;
         let abs = self.resolve_path(cx, AT_FDCWD, &path);
         Some(self.vfs_for(cx).identity(&abs))
+    }
+
+    /// For `bind` of an `AF_UNIX` socket to a path: create the socket's name
+    /// in the filesystem, as Linux does — `EADDRINUSE` if the name exists,
+    /// `ENOENT`/`ENOTDIR`/`EROFS`… as creating a file there would fail. Its
+    /// path, to take back if the bind itself fails; `None` for every other
+    /// `bind` (abstract names, other families, a descriptor not a socket).
+    fn make_socket_name(
+        &self,
+        cx: &ServiceCtx,
+        args: &[u64; 6],
+        mem: &GuestMemory,
+    ) -> Result<Option<String>, i64> {
+        const AF_UNIX: u16 = 1;
+        let (ptr, len) = (args[1], args[2]);
+        if ptr == 0
+            || len <= 2
+            || !matches!(cx.cur.fds.get(args[0] as i32), Some(Fd::Socket { .. }))
+        {
+            return Ok(None);
+        }
+        let Ok(head) = mem.read_vec(ptr, 3) else {
+            return Ok(None);
+        };
+        if u16::from_le_bytes([head[0], head[1]]) != AF_UNIX || head[2] == 0 {
+            return Ok(None);
+        }
+        let Ok(raw) = mem.read_vec(ptr + 2, (len - 2).min(108) as usize) else {
+            return Ok(None);
+        };
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        let Ok(path) = std::str::from_utf8(&raw[..end]) else {
+            return Ok(None);
+        };
+        let abs = self.resolve_path(cx, AT_FDCWD, path);
+        let mut vfs = self.vfs_for(cx);
+        if vfs.stat(&abs).is_some() {
+            return Err(err(Errno::EADDRINUSE));
+        }
+        let mode = 0o140_000 | (0o777 & !cx.cur.umask);
+        match vfs.mknod(&abs, mode) {
+            Ok(()) => {
+                self.own_new_node(&mut vfs, cx, &abs);
+                Ok(Some(abs))
+            }
+            // A filesystem with no socket nodes of its own (a host directory):
+            // the socket still binds, nameless there, as before.
+            Err(e) if e.raw_os_error() == Some(1) => Ok(None),
+            Err(e) => Err(io_errno(&e)),
+        }
     }
 
     /// The mount table, answering for this task's namespace and root.
@@ -13130,11 +13226,10 @@ mod tests {
     fn clone_fs_shares_the_cwd_slot_a_fork_copies_it() {
         let (k, mut mem, mut v, mut cx) = setup();
         // Seed the caller's cwd slot (index 0) so a fork's fresh slot is distinct.
-        k.shared
-            .lock()
-            .unwrap()
-            .cwd_tables
-            .push(Some("/".to_string()));
+        k.shared.lock().unwrap().cwd_tables.push(Some(FsCtx {
+            cwd: "/".to_string(),
+            umask: 0o022,
+        }));
         cx.cur.fs = 0;
         const CLONE_FS: u64 = 0x0000_0200;
         let shared = call(

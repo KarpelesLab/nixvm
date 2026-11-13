@@ -272,9 +272,10 @@ impl Kernel {
             None => return err(Errno::ENOENT),
         }
         let [root, local] = self.orphan_homes(vfs, dir);
-        let hidden = match vfs.create(&root, (mode & 0o7777) as u32) {
+        let mode = (mode & 0o7777) as u32 & !cx.cur.umask;
+        let hidden = match vfs.create(&root, mode) {
             Ok(()) => root,
-            Err(_) => match vfs.create(&local, (mode & 0o7777) as u32) {
+            Err(_) => match vfs.create(&local, mode) {
                 Ok(()) => local,
                 Err(e) => return io_errno(&e),
             },

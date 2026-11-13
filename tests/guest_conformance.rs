@@ -39,6 +39,7 @@ const PROGRAMS: &[&str] = &[
     "ptrace",
     "seccomp_notify",
     "cpu_traps",
+    "creation",
 ];
 
 /// A directory of binaries, also used as the guest's root, so that a program can

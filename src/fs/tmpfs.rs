@@ -24,6 +24,7 @@ const S_IFDIR: u32 = 0o040_000;
 const S_IFREG: u32 = 0o100_000;
 const S_IFLNK: u32 = 0o120_000;
 const S_IFIFO: u32 = 0o010_000;
+const S_IFSOCK: u32 = 0o140_000;
 
 /// Per-node metadata common to every node kind: identity, owner, the
 /// access/modification timestamps `utimensat`/`chown` mutate, and the node's
@@ -83,14 +84,18 @@ fn xattr_cost(meta: &Meta) -> u64 {
 enum Node {
     Dir {
         meta: Meta,
+        /// The permission bits (and set-group-ID / sticky).
+        mode: u32,
     },
     /// A regular file: its inode in `TmpFs::files`.
     File {
         ino: u64,
     },
+    /// A FIFO, or (`socket`) the name a bound `AF_UNIX` socket made.
     Fifo {
         meta: Meta,
         mode: u32,
+        socket: bool,
     },
     Symlink {
         meta: Meta,
@@ -129,6 +134,8 @@ impl TmpFs {
                     mtime: 0,
                     xattrs: BTreeMap::new(),
                 },
+                // A fresh tmpfs's root is world-writable and sticky, as Linux's.
+                mode: 0o1777,
             },
         );
         Self {
@@ -178,14 +185,18 @@ impl TmpFs {
     /// The metadata of the node at `rel` (a regular file's lives in its inode).
     fn meta_of(&self, rel: &str) -> Option<&Meta> {
         match self.nodes.get(rel)? {
-            Node::Dir { meta } | Node::Fifo { meta, .. } | Node::Symlink { meta, .. } => Some(meta),
+            Node::Dir { meta, .. } | Node::Fifo { meta, .. } | Node::Symlink { meta, .. } => {
+                Some(meta)
+            }
             Node::File { ino } => self.files.get(ino).map(|f| &f.meta),
         }
     }
 
     fn meta_of_mut(&mut self, rel: &str) -> Option<&mut Meta> {
         match self.nodes.get_mut(rel)? {
-            Node::Dir { meta } | Node::Fifo { meta, .. } | Node::Symlink { meta, .. } => Some(meta),
+            Node::Dir { meta, .. } | Node::Fifo { meta, .. } | Node::Symlink { meta, .. } => {
+                Some(meta)
+            }
             Node::File { ino } => self.files.get_mut(ino).map(|f| &mut f.meta),
         }
     }
@@ -203,7 +214,7 @@ impl TmpFs {
     fn node_cost(rel: &str, node: &Node) -> u64 {
         let contents = match node {
             Node::File { .. } => 0,
-            Node::Dir { meta } | Node::Fifo { meta, .. } => xattr_cost(meta),
+            Node::Dir { meta, .. } | Node::Fifo { meta, .. } => xattr_cost(meta),
             Node::Symlink { meta, target } => target.len() as u64 + xattr_cost(meta),
         };
         NODE_OVERHEAD + rel.len() as u64 + contents
@@ -368,7 +379,7 @@ impl MountFs for TmpFs {
     fn stat(&mut self, rel: &str) -> Option<Attrs> {
         let node = self.nodes.get(rel)?;
         let (kind, mode, size, nlink) = match node {
-            Node::Dir { .. } => {
+            Node::Dir { mode, .. } => {
                 // Directory hard-link count: "." plus ".." plus one ".." per
                 // immediate subdirectory (the standard Unix accounting).
                 let subdirs = self
@@ -380,7 +391,7 @@ impl MountFs for TmpFs {
                     .count();
                 (
                     NodeKind::Dir,
-                    S_IFDIR | 0o755,
+                    S_IFDIR | mode,
                     0,
                     2 + u32::try_from(subdirs).unwrap_or(u32::MAX),
                 )
@@ -394,7 +405,10 @@ impl MountFs for TmpFs {
                     f.links,
                 )
             }
-            Node::Fifo { mode, .. } => (NodeKind::Fifo, S_IFIFO | (mode & 0o777), 0, 1),
+            Node::Fifo {
+                mode, socket: true, ..
+            } => (NodeKind::Socket, S_IFSOCK | (mode & 0o7777), 0, 1),
+            Node::Fifo { mode, .. } => (NodeKind::Fifo, S_IFIFO | (mode & 0o7777), 0, 1),
             Node::Symlink { target, .. } => {
                 (NodeKind::Symlink, S_IFLNK | 0o777, target.len() as u64, 1)
             }
@@ -444,8 +458,11 @@ impl MountFs for TmpFs {
                 continue;
             }
             let (kind, inode) = match node {
-                Node::Dir { meta } => (NodeKind::Dir, meta.inode),
+                Node::Dir { meta, .. } => (NodeKind::Dir, meta.inode),
                 Node::File { ino } => (NodeKind::File, *ino),
+                Node::Fifo {
+                    meta, socket: true, ..
+                } => (NodeKind::Socket, meta.inode),
                 Node::Fifo { meta, .. } => (NodeKind::Fifo, meta.inode),
                 Node::Symlink { meta, .. } => (NodeKind::Symlink, meta.inode),
             };
@@ -493,13 +510,14 @@ impl MountFs for TmpFs {
         Ok(())
     }
 
-    fn mkdir(&mut self, rel: &str, _mode: u32) -> io::Result<()> {
+    fn mkdir(&mut self, rel: &str, mode: u32) -> io::Result<()> {
         self.require_parent(rel)?;
         if self.nodes.contains_key(rel) {
             return Err(eexist());
         }
         let meta = self.new_meta();
-        self.insert_node(rel, Node::Dir { meta })?;
+        let mode = mode & 0o7777;
+        self.insert_node(rel, Node::Dir { meta, mode })?;
         Ok(())
     }
 
@@ -508,9 +526,10 @@ impl MountFs for TmpFs {
         // backend. A type of 0 means a regular file (mknod(2) semantics);
         // device/socket nodes report EPERM, matching an unprivileged mknod.
         let typ = mode & 0o170_000;
-        let is_fifo = match typ {
-            0 | S_IFREG => false,
-            S_IFIFO => true,
+        let (is_fifo, socket) = match typ {
+            0 | S_IFREG => (false, false),
+            S_IFIFO => (true, false),
+            S_IFSOCK => (true, true),
             _ => return Err(eperm()),
         };
         self.require_parent(rel)?;
@@ -522,6 +541,7 @@ impl MountFs for TmpFs {
             Node::Fifo {
                 meta,
                 mode: mode & 0o7777,
+                socket,
             }
         } else {
             Node::File {
@@ -597,7 +617,7 @@ impl MountFs for TmpFs {
 
     fn set_mode(&mut self, rel: &str, mode: u32) -> io::Result<()> {
         match self.nodes.get_mut(rel) {
-            // Files and fifos store their mode; dirs/symlinks don't model one.
+            // Symlinks have no mode of their own.
             Some(Node::File { ino }) => {
                 let ino = *ino;
                 if let Some(f) = self.files.get_mut(&ino) {
@@ -605,7 +625,7 @@ impl MountFs for TmpFs {
                 }
                 Ok(())
             }
-            Some(Node::Fifo { mode: m, .. }) => {
+            Some(Node::Fifo { mode: m, .. } | Node::Dir { mode: m, .. }) => {
                 *m = (*m & !0o7777) | (mode & 0o7777);
                 Ok(())
             }

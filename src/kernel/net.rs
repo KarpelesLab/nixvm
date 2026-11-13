@@ -1838,8 +1838,11 @@ impl Kernel {
         }
 
         if matches!(net.socks[sock].kind, Kind::Dgram(_)) {
+            // An `AF_UNIX` datagram socket connecting to a path (syslog's
+            // `/dev/log`) isn't modeled — `sendto` with the path is — so it's
+            // what Linux says when no socket is there.
             let Addr::Inet(peer) = target else {
-                unreachable!("validated above")
+                return err(Errno::ENOENT);
             };
             self.ensure_dgram_bound(net, sock);
             if let Kind::Dgram(d) = &mut net.socks[sock].kind {

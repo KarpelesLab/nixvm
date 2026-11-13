@@ -243,8 +243,8 @@ impl Kernel {
             }
         }
         for c in cwds {
-            if let Some(Some(cwd)) = sh.cwd_tables.get_mut(c) {
-                *cwd = moved(cwd);
+            if let Some(Some(fs)) = sh.cwd_tables.get_mut(c) {
+                fs.cwd = moved(&fs.cwd);
             }
         }
         0
@@ -295,8 +295,8 @@ impl Kernel {
             }
         }
         for c in cwds {
-            if let Some(Some(cwd)) = sh.cwd_tables.get_mut(c) {
-                *cwd = moved.translate(cwd);
+            if let Some(Some(fs)) = sh.cwd_tables.get_mut(c) {
+                fs.cwd = moved.translate(&fs.cwd);
             }
         }
         Self::collect_unused_hidden_mounts(sh, cx, &mut vfs);
@@ -313,7 +313,7 @@ impl Kernel {
                 Fd::File { path, .. } | Fd::Dir { path, .. } => Some(path.as_str()),
                 _ => None,
             });
-        let dirs = sh.cwd_tables.iter().flatten().map(String::as_str);
+        let dirs = sh.cwd_tables.iter().flatten().map(|fs| fs.cwd.as_str());
         let maps = sh
             .procs
             .iter()
@@ -697,9 +697,18 @@ impl Kernel {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(cx, dirfd, &rel);
-        match vfs.mkdir(&abs, (mode & 0o777) as u32) {
+        match vfs.mkdir(&abs, (mode & 0o1777) as u32 & !cx.cur.umask) {
             Ok(()) => {
                 self.own_new_node(vfs, cx, &abs);
+                // A subdirectory of a set-group-ID directory is set-group-ID too.
+                if let Some(parent) = abs
+                    .rsplit_once('/')
+                    .map(|(d, _)| if d.is_empty() { "/" } else { d })
+                    && vfs.stat(parent).is_some_and(|a| a.mode & 0o2000 != 0)
+                    && let Some(a) = vfs.stat(&abs)
+                {
+                    let _ = vfs.set_mode(&abs, (a.mode & 0o7777) | 0o2000);
+                }
                 // A new cgroup belongs to whoever made it, so a delegate can
                 // manage what it creates.
                 if self
@@ -1064,7 +1073,9 @@ impl Kernel {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(cx, dirfd, &rel);
-        match vfs.mknod(&abs, mode as u32) {
+        // The type bits as given, the permissions less the umask.
+        let mode = mode as u32 & !(cx.cur.umask & 0o777);
+        match vfs.mknod(&abs, mode) {
             Ok(()) => {
                 self.own_new_node(vfs, cx, &abs);
                 0
@@ -1159,9 +1170,9 @@ impl Kernel {
 
     /// `umask(mask)` — set the file-creation mask, returning the previous one.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_umask(&self, sh: &mut Shared, mask: u64) -> i64 {
-        let old = sh.umask;
-        sh.umask = (mask & 0o777) as u32;
+    pub(super) fn sys_umask(cx: &mut ServiceCtx, mask: u64) -> i64 {
+        let old = cx.cur.umask;
+        cx.cur.umask = (mask & 0o777) as u32;
         i64::from(old)
     }
 }
@@ -1435,8 +1446,8 @@ mod tests {
 
     #[test]
     fn umask_returns_previous() {
-        let (k, _mem, _cx) = setup();
-        assert_eq!(k.sys_umask(&mut k.shared.lock().unwrap(), 0o077), 0o022);
-        assert_eq!(k.sys_umask(&mut k.shared.lock().unwrap(), 0o022), 0o077);
+        let (_k, _mem, mut cx) = setup();
+        assert_eq!(Kernel::sys_umask(&mut cx, 0o077), 0o022);
+        assert_eq!(Kernel::sys_umask(&mut cx, 0o022), 0o077);
     }
 }

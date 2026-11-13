@@ -39,11 +39,28 @@ impl Overlay {
     /// Build an overlay with `upper` (writable) over `lower` (read-only).
     #[must_use]
     pub fn new(lower: Box<dyn MountFs>, upper: Box<dyn MountFs>) -> Self {
-        Self {
+        let mut o = Self {
             upper,
             lower,
             whiteouts: BTreeSet::new(),
+        };
+        // The merged root is the upper's, which must look like the lower's.
+        o.copy_attrs_up("");
+        o
+    }
+
+    /// Give `rel`'s fresh upper copy the lower node's permissions, owner and
+    /// times, as overlayfs's copy-up does.
+    fn copy_attrs_up(&mut self, rel: &str) {
+        let Some(a) = self.lower.stat(rel) else {
+            return;
+        };
+        if a.kind != NodeKind::Symlink {
+            let _ = self.upper.set_mode(rel, a.mode & 0o7777);
         }
+        let _ = self.upper.set_owner(rel, Some(a.uid), Some(a.gid));
+        let t = |sec| super::SetTime::Set { sec, nsec: 0 };
+        let _ = self.upper.set_times(rel, t(a.atime), t(a.mtime));
     }
 
     /// Is `rel` (or an ancestor) hidden by a whiteout?
@@ -67,7 +84,9 @@ impl Overlay {
             return;
         }
         self.ensure_dir_in_upper(parent_of(dir));
-        let _ = self.upper.mkdir(dir, 0o755);
+        if self.upper.mkdir(dir, 0o755).is_ok() {
+            self.copy_attrs_up(dir);
+        }
     }
 
     /// Read a lower file's full contents.
@@ -116,10 +135,11 @@ impl Overlay {
             }
             _ => {
                 let data = self.read_all_lower(rel);
-                self.upper.create(rel, attrs.mode & 0o777)?;
+                self.upper.create(rel, attrs.mode & 0o7777)?;
                 self.upper.write_at(rel, 0, &data)?;
             }
         }
+        self.copy_attrs_up(rel);
         self.copy_up_xattrs(rel);
         Ok(())
     }

@@ -1294,7 +1294,10 @@ impl Kernel {
             sh.file_tables.push(None);
         }
         if flags & CLONE_FS != 0 && sh.procs.iter().flatten().any(|p| p.info.fs == fs) {
-            sh.cwd_tables[fs] = Some(cx.cur.cwd.clone());
+            sh.cwd_tables[fs] = Some(super::FsCtx {
+                cwd: cx.cur.cwd.clone(),
+                umask: cx.cur.umask,
+            });
             cx.cur.fs = sh.cwd_tables.len();
             sh.cwd_tables.push(None);
         }
