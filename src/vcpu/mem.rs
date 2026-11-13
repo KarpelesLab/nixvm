@@ -1090,9 +1090,45 @@ impl GuestMemory {
             return FileFault::NotFile;
         }
         match self.back_file_page(p) {
-            Ok(true) => FileFault::Resolved,
+            Ok(true) => {
+                self.file_fault_around(p);
+                FileFault::Resolved
+            }
             Ok(false) => FileFault::NotFile,
             Err(_) => FileFault::Bus,
+        }
+    }
+
+    /// After a file page's fault: put in the pages after it that the file
+    /// already has (up to [`FAULT_AROUND_MAX`], within the mapping, the same
+    /// page table and protection), as Linux's fault-around maps what's in the
+    /// page cache — a code page the JIT wrote through its writable view,
+    /// say, the first time its executable view runs it.
+    fn file_fault_around(&mut self, p: usize) {
+        let Some((start, vma)) = self.file_at(p) else {
+            return;
+        };
+        let Some(obj) = vma.map.obj.clone() else {
+            return;
+        };
+        let pgoff = vma.map.pgoff + (p - start) as u64;
+        let room = (start + vma.pages - p - 1).min(FAULT_AROUND_MAX as usize - 1);
+        let table_end = (self.page_base(p) | 0x1f_ffff) + 1;
+        let prot = self.prot[p];
+        for (idx, _) in obj.pages_in(pgoff + 1, pgoff + 1 + room as u64) {
+            let q = p + (idx - pgoff) as usize;
+            let va = self.page_base(q);
+            if va >= table_end
+                || !self.mapped[q]
+                || self.prot[q] != prot
+                || self.space.translate(va, &self.phys).is_some()
+            {
+                continue;
+            }
+            let Ok(frame) = obj.get(idx, self.memcg) else {
+                break;
+            };
+            self.install_file_page(q, frame);
         }
     }
 

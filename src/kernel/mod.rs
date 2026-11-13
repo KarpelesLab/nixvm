@@ -5802,10 +5802,11 @@ impl Kernel {
             info.tgid = pid;
             // CLONE_PARENT makes the child a *sibling* of the caller: its parent is
             // the caller's parent, so it is reaped by (and signals) the grandparent.
+            // (The parent is the caller's process, whichever thread forked.)
             info.ppid = if flags & CLONE_PARENT != 0 {
                 cx.cur.ppid
             } else {
-                cx.cur.pid
+                cx.cur.tgid
             };
             info.is_thread = false;
             // The termination signal is the low byte of `flags` (SIGCHLD for fork).
@@ -6403,6 +6404,25 @@ impl Kernel {
         sh.reap_unwaited_zombies(cx);
     }
 
+    /// Whose children a `wait4`/`waitid` by the caller may reap: those of
+    /// every thread of its process (a child is its creating thread's, and any
+    /// thread waits for it, as on Linux), or with `__WNOTHREAD` its own only.
+    fn waiting_group(sh: &Shared, cx: &ServiceCtx, options: u64) -> Vec<i32> {
+        const WNOTHREAD: u64 = 0x2000_0000;
+        let mut group = vec![cx.cur.pid];
+        if options & WNOTHREAD == 0 {
+            let tgid = cx.cur.tgid;
+            group.extend(
+                sh.procs
+                    .iter()
+                    .flatten()
+                    .filter(|p| p.info.tgid == tgid && p.info.pid != cx.cur.pid)
+                    .map(|p| p.info.pid),
+            );
+        }
+        group
+    }
+
     /// `wait4(pid, wstatus, options, rusage)` — reap a zombie child, honoring the
     /// `pid` filter (`>0` a specific child, `-1` any, `0` the caller's group,
     /// `<-1` group `-pid`) and filling `rusage` with the child's CPU time.
@@ -6431,8 +6451,11 @@ impl Kernel {
             }
         };
         // Threads (CLONE_THREAD) are not reaped by wait4; only child processes
-        // matching the `pid` filter.
-        let wanted = |p: &ProcInfo| -> bool { p.ppid == cur && !p.is_thread && matches_pid(p) };
+        // matching the `pid` filter — those of any thread of the caller's
+        // process, unless `__WNOTHREAD` asks for its own only.
+        let group = Self::waiting_group(sh, cx, options);
+        let wanted =
+            |p: &ProcInfo| -> bool { group.contains(&p.ppid) && !p.is_thread && matches_pid(p) };
         let mut zombie = None;
         let mut stopped = None; // (pid, stop signal) — an unreported stop
         let mut continued = None; // pid of a continued child
@@ -6596,8 +6619,9 @@ impl Kernel {
         let mut stopped = None; // (pid, stop signal)
         let mut continued = None; // pid
         let mut has_child = false;
+        let group = Self::waiting_group(sh, cx, options);
         for p in sh.procs.iter().flatten() {
-            if p.info.ppid == cur && !p.info.is_thread && matches_id(&p.info) {
+            if group.contains(&p.info.ppid) && !p.info.is_thread && matches_id(&p.info) {
                 has_child = true;
                 match p.info.run {
                     // (Not one still finishing its exit on another CPU, nor one
@@ -7190,6 +7214,17 @@ impl Kernel {
             }
             found
         };
+        // A thread's children stay in its process while another thread of it
+        // lives, as on Linux.
+        let new_parent = if sh.procs.iter().flatten().any(|p| {
+            p.info.tgid == cx.cur.tgid
+                && p.info.pid != me
+                && !matches!(p.info.run, RunState::Zombie(_))
+        }) {
+            cx.cur.tgid
+        } else {
+            new_parent
+        };
         // What the parent's handler, sigwaitinfo or signalfd reads with it:
         // si_code CLD_EXITED or CLD_KILLED, the child's pid, and si_status (the
         // `value` slot sits where si_status is).
@@ -7212,19 +7247,44 @@ impl Kernel {
         }
         // What this task traced is let go, or killed (`PTRACE_O_EXITKILL`).
         self.ptrace_tracer_exit(sh, me);
+        // Any thread of the parent's process may be the one waiting, and the
+        // signal goes to the process: to a thread of it still running if the
+        // one named has exited.
+        let parent_tgid = sh
+            .procs
+            .iter()
+            .flatten()
+            .find(|p| p.info.pid == ppid)
+            .map_or(ppid, |p| p.info.tgid);
+        let live = |p: &ProcInfo| !matches!(p.run, RunState::Zombie(_));
+        let signalled = sh
+            .procs
+            .iter()
+            .flatten()
+            .find(|p| p.info.pid == ppid && live(&p.info))
+            .or_else(|| {
+                sh.procs
+                    .iter()
+                    .flatten()
+                    .find(|p| p.info.tgid == parent_tgid && live(&p.info))
+            })
+            .map_or(ppid, |p| p.info.pid);
         for slot in sh.procs.iter_mut().flatten() {
-            if slot.info.pid == ppid {
+            if slot.info.pid == signalled {
                 if (1..=64).contains(&exit_sig) && !tracer_first {
                     let info = self.seen_by(slot.info.ns.pid, chld_info);
                     slot.info.raise_with(exit_sig, info);
                 }
                 slot.info.parked = false;
             }
+            if slot.info.tgid == parent_tgid {
+                slot.info.parked = false;
+            }
             // Reparent our children (to a subreaper or init): an orphan must
             // not keep its dead parent's pid as `getppid()`, and its eventual
             // zombie must be reaped rather than stranding forever. A child that
             // armed PR_SET_PDEATHSIG gets that signal now that its parent died.
-            if slot.info.ppid == me && slot.info.pid != me {
+            if slot.info.ppid == me && slot.info.pid != me && new_parent != me {
                 slot.info.ppid = new_parent;
                 let ds = slot.info.pdeathsig;
                 if (1..=64).contains(&ds) && slot.info.raise(ds) {

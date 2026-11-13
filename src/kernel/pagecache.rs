@@ -250,12 +250,23 @@ impl Kernel {
             return Ok(());
         }
         let end = (first + n).min(obj.size().div_ceil(PAGE_SIZE));
-        let mut buf = vec![0u8; PAGE_SIZE as usize];
-        for idx in first..end {
+        // Read runs of missing pages a chunk at a time: a read through the
+        // filesystems costs far more per call than per byte.
+        const CHUNK: u64 = 256;
+        let ps = PAGE_SIZE as usize;
+        let mut buf = Vec::new();
+        let mut idx = first;
+        while idx < end {
             if obj.has_page(idx) {
+                idx += 1;
                 continue;
             }
-            buf.fill(0);
+            let mut run = 1;
+            while run < CHUNK && idx + run < end && !obj.has_page(idx + run) {
+                run += 1;
+            }
+            buf.clear();
+            buf.resize(run as usize * ps, 0);
             let mut got = 0;
             while got < buf.len() {
                 match vfs.read_at(path, idx * PAGE_SIZE + got as u64, &mut buf[got..]) {
@@ -263,7 +274,11 @@ impl Kernel {
                     _ => break,
                 }
             }
-            obj.fill(idx, &buf, memcg).map_err(|_| err(Errno::ENOMEM))?;
+            for (k, page) in buf.chunks(ps).enumerate() {
+                obj.fill(idx + k as u64, page, memcg)
+                    .map_err(|_| err(Errno::ENOMEM))?;
+            }
+            idx += run;
         }
         Ok(())
     }

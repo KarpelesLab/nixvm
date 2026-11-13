@@ -928,7 +928,10 @@ impl ProcFs {
         d.auxv = live.auxv;
         d.syscall = live.syscall;
         d.seccomp_logged = live.seccomp_logged;
-        d.maps = live.maps;
+        // (Only rendered when a maps file is opened: kept until the next one.)
+        if !live.maps.is_empty() {
+            d.maps = live.maps;
+        }
         if live.arch.is_some() {
             d.arch = live.arch;
         }
