@@ -4030,6 +4030,11 @@ impl Kernel {
                 || (self.rt_seen.load(std::sync::atomic::Ordering::Relaxed)
                     && sh.preempts(&cx.cur, self.ncpus));
             proc.info = cx.cur;
+            // Blocked in a syscall: asleep, as the serial scheduler marks it
+            // (what `/proc/<pid>/stat` shows; the SMP scheduler itself goes
+            // by its progress epochs).
+            proc.info.parked =
+                matches!(flow, Serviced::Blocked) && proc.info.run == RunState::Running;
             sh.procs[i] = Some(proc);
             for waiter in [ppid, tracer].into_iter().flatten() {
                 for p in sh.procs.iter_mut().flatten() {
