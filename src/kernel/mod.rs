@@ -8020,8 +8020,12 @@ impl Kernel {
                 };
             }
             total += n as u64;
-            if (n as u64) < want {
-                break; // EOF
+            // A backend may answer a large read in parts (an image layer a
+            // block at a time); only nothing at all is the end of the file.
+            // A regular file's read is all of it, up to EOF — the JVM reads
+            // its CDS heap region in one call and refuses a short one.
+            if n == 0 {
+                break;
             }
         }
         total as i64

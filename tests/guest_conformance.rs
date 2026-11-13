@@ -44,6 +44,7 @@ const PROGRAMS: &[&str] = &[
     "sysv_shm",
     "ptrace_debug",
     "threadwait",
+    "connect_again",
 ];
 
 /// A directory of binaries, also used as the guest's root, so that a program can

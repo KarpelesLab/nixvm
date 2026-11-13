@@ -625,6 +625,9 @@ struct Pair {
     /// duplicated backing reference, transferred to a fresh guest fd on receipt
     /// or dropped if the bytes are consumed by a plain `read`/`recv`.
     scm: [VecDeque<(usize, Vec<Fd>)>; 2],
+    /// A nonblocking connect on this end said EINPROGRESS and hasn't been
+    /// asked again: the next connect() reports it done (0), later ones EISCONN.
+    connect_pending: [bool; 2],
     /// The process on each end, for `SO_PEERCRED`: the creator of a
     /// `socketpair`, or the connecting process (end 0) and the listener's
     /// `listen()` caller (end 1), as Linux records them.
@@ -668,6 +671,7 @@ impl Pair {
             addrs: [None, None],
             v6_view: [false, false],
             scm: [VecDeque::new(), VecDeque::new()],
+            connect_pending: [false; 2],
             cred: [Ucred::default(); 2],
             sender: [Ucred::default(); 2],
             msgs: None,
@@ -1856,10 +1860,20 @@ impl Kernel {
             return 0;
         }
 
-        // An idle client end 0; anything else (already connected, a listener,
-        // or the wrong end) is invalid.
-        if !matches!(&net.socks[sock].kind, Kind::Idle { .. } if end == 0) {
-            return err(Errno::EINVAL);
+        // An idle client end 0. A connected stream socket, or a listening one,
+        // is EISCONN, as Linux says — what a nonblocking connect's caller
+        // (hiredis, after EINPROGRESS) asks again to learn it has finished.
+        match &mut net.socks[sock].kind {
+            Kind::Idle { .. } if end == 0 => {}
+            Kind::Pair(p) => {
+                return if std::mem::take(&mut p.connect_pending[end]) {
+                    0
+                } else {
+                    err(Errno::EISCONN)
+                };
+            }
+            Kind::Listener { .. } => return err(Errno::EISCONN),
+            _ => return err(Errno::EINVAL),
         }
         let key = match &target {
             Addr::Unix(p) => unix_key(net.socks[sock].netns, p, cx.unix_identity.as_ref()),
@@ -1919,6 +1933,8 @@ impl Kernel {
         }
         // The client end is held by every fd the idle socket had.
         pair.refs[0] = net.socks[sock].refs;
+        let einprogress = domain != AF_UNIX && net.socks[sock].nonblock;
+        pair.connect_pending[0] = einprogress;
         net.socks[sock].kind = Kind::Pair(pair);
         if let Kind::Listener { backlog, .. } = &mut net.socks[lidx].kind {
             backlog.push_back(sock);
@@ -1930,7 +1946,7 @@ impl Kernel {
         // so returning EINPROGRESS here alone reproduces the observable
         // sequence. AF_UNIX stream connects complete synchronously even when
         // nonblocking (Linux returns 0), so this only applies to AF_INET(6).
-        if domain != AF_UNIX && net.socks[sock].nonblock {
+        if einprogress {
             return err(Errno::EINPROGRESS);
         }
         0
