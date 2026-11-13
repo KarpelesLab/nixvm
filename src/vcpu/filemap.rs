@@ -29,7 +29,7 @@ use super::phys::{FrameAllocator, PhysMem};
 
 /// Bumped whenever a mapped file loses pages (a shrinking `ftruncate`, a hole
 /// punched): every address space compares it with what it saw last.
-pub(crate) static SHRINK_EPOCH: AtomicU64 = AtomicU64::new(0);
+pub static SHRINK_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Why a page of a file can't be had.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,8 +392,8 @@ impl FileObj {
         self.writable_maps.load(Ordering::Acquire)
     }
 
-    /// Whether a mapping could have stored into the pages (see [`Self::dirty`]
-    /// field docs), clearing the mark when `clear`.
+    /// Whether a mapping could have stored into the pages since they were
+    /// filled (they may differ from the file's), clearing the mark when `clear`.
     pub fn take_dirty(&self, clear: bool) -> bool {
         if clear {
             self.dirty.swap(false, Ordering::AcqRel)
