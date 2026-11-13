@@ -36,6 +36,7 @@ const PTRACE_POKEDATA: u64 = 5;
 const PTRACE_POKEUSER: u64 = 6;
 const PTRACE_CONT: u64 = 7;
 const PTRACE_KILL: u64 = 8;
+const PTRACE_SINGLESTEP: u64 = 9;
 const PTRACE_GETREGS: u64 = 12;
 const PTRACE_SETREGS: u64 = 13;
 const PTRACE_GETFPREGS: u64 = 14;
@@ -192,6 +193,18 @@ pub(super) struct PtraceState {
     event_msg: u64,
     /// The signal of a signal-delivery stop, as `PTRACE_GETSIGINFO` shows it.
     siginfo: [u8; 128],
+    /// The FP/SIMD registers at the stop, in the vcpu's own layout (see
+    /// [`Vcpu::fp_state`]); empty at a syscall-entry/exit stop, which
+    /// doesn't capture them.
+    fp: Vec<u8>,
+    /// The tracer changed them: put them back before user code runs again.
+    apply_fp: bool,
+    /// Resumed by `PTRACE_SINGLESTEP` from a user-mode stop: arm a step
+    /// before user code runs again.
+    step: bool,
+    /// Resumed by `PTRACE_SINGLESTEP` from a signal or event stop inside a
+    /// syscall: arm the step once the syscall has returned.
+    step_at_return: bool,
     /// `PTRACE_INTERRUPT` asked for a stop.
     interrupt: bool,
     /// A signal the tracer passed on, delivered without stopping again.
@@ -237,6 +250,10 @@ impl PtraceState {
             apply_user: false,
             event_msg: 0,
             siginfo: [0; 128],
+            fp: Vec::new(),
+            apply_fp: false,
+            step: false,
+            step_at_return: false,
             interrupt: false,
             inject: None,
             sc_entered: false,
@@ -269,6 +286,22 @@ impl PtraceState {
         std::mem::take(&mut self.apply_user).then_some(self.regs)
     }
 
+    /// The FP registers to put back before user code runs again, if the
+    /// tracer changed them.
+    pub(super) fn take_fp_state(&mut self) -> Option<Vec<u8>> {
+        std::mem::take(&mut self.apply_fp).then(|| self.fp.clone())
+    }
+
+    /// Whether to arm a single step before user code runs again.
+    pub(super) fn take_step(&mut self) -> bool {
+        std::mem::take(&mut self.step)
+    }
+
+    /// Whether to arm a single step now that the syscall has returned.
+    pub(super) fn take_step_at_return(&mut self) -> bool {
+        std::mem::take(&mut self.step_at_return)
+    }
+
     /// The current syscall is over: forget how far it got.
     fn end_syscall(&mut self) {
         self.sc_entered = false;
@@ -288,6 +321,9 @@ impl PtraceState {
             && self.stop.is_none()
             && self.inject.is_none()
             && !self.apply_user
+            && !self.apply_fp
+            && !self.step
+            && !self.step_at_return
             && !self.apply_gprs
             && !self.sc_entered
             && self.sc_result.is_none()
@@ -431,6 +467,62 @@ pub(super) fn apply_user(arch: Arch, vcpu: &mut dyn Vcpu, r: &[u64; NREGS]) {
     }
 }
 
+/// FP state (the vcpu's layout) as the ptrace user layout: x86-64's
+/// `user_fpregs_struct` (the 512-byte `FXSAVE` image that opens the `XSAVE`
+/// area); arm64's `user_fpsimd_state` (`V0..V31`, then `FPSR`, `FPCR`, and
+/// padding: 528 bytes) from the vcpu's `FPSR`, `FPCR`, `V0..V31`.
+fn fp_user(arch: Arch, fp: &[u8]) -> Vec<u8> {
+    match arch {
+        Arch::X86_64 => {
+            let mut out = vec![0u8; 512];
+            let n = fp.len().min(512);
+            out[..n].copy_from_slice(&fp[..n]);
+            if n < 512 {
+                // Nothing captured: the state a fresh process has.
+                out[0..2].copy_from_slice(&0x37fu16.to_le_bytes()); // fcw
+                out[24..28].copy_from_slice(&0x1f80u32.to_le_bytes()); // mxcsr
+            }
+            out
+        }
+        Arch::Aarch64 => {
+            let mut out = vec![0u8; 528];
+            if fp.len() >= 8 + 512 {
+                out[..512].copy_from_slice(&fp[8..520]);
+                out[512..520].copy_from_slice(&fp[..8]);
+            }
+            out
+        }
+    }
+}
+
+impl PtraceState {
+    /// Take the tracer's FP registers (ptrace user layout, possibly short)
+    /// into the captured state, to be put back before user code runs.
+    fn set_fp_user(&mut self, arch: Arch, user: &[u8]) {
+        let mut cur = fp_user(arch, &self.fp);
+        let n = user.len().min(cur.len());
+        cur[..n].copy_from_slice(&user[..n]);
+        match arch {
+            Arch::X86_64 => {
+                // Keep the extended state the stop captured; replace the
+                // legacy region.
+                if self.fp.len() >= 512 {
+                    self.fp[..512].copy_from_slice(&cur);
+                } else {
+                    self.fp = cur;
+                }
+            }
+            Arch::Aarch64 => {
+                let mut fp = Vec::with_capacity(520);
+                fp.extend_from_slice(&cur[512..520]);
+                fp.extend_from_slice(&cur[..512]);
+                self.fp = fp;
+            }
+        }
+        self.apply_fp = true;
+    }
+}
+
 /// A signal's `siginfo_t` as `PTRACE_GETSIGINFO` returns it.
 fn siginfo_bytes(sig: u64, q: Option<QueuedSig>) -> [u8; 128] {
     let mut si = [0u8; 128];
@@ -459,6 +551,7 @@ fn siginfo_queued(si: &[u8; 128]) -> QueuedSig {
 enum Resume {
     Cont,
     Syscall,
+    Step,
     Detach,
 }
 
@@ -599,13 +692,14 @@ impl Kernel {
                 }
                 0
             }
-            PTRACE_CONT | PTRACE_SYSCALL | PTRACE_DETACH => {
+            PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP | PTRACE_DETACH => {
                 if data > 64 {
                     return err(Errno::EIO);
                 }
                 let mode = match req {
                     PTRACE_CONT => Resume::Cont,
                     PTRACE_SYSCALL => Resume::Syscall,
+                    PTRACE_SINGLESTEP => Resume::Step,
                     _ => Resume::Detach,
                 };
                 let p = &mut sh.procs[idx].as_mut().unwrap().info;
@@ -647,13 +741,20 @@ impl Kernel {
                 0
             }
             PTRACE_GETFPREGS if arch == Arch::X86_64 => {
-                // The FPU state isn't captured at a stop: report it clear.
-                if mem.write(data, &[0u8; 512]).is_err() {
+                let t = Self::tracee_state(sh, idx);
+                if mem.write(data, &fp_user(arch, &t.fp)).is_err() {
                     return err(Errno::EFAULT);
                 }
                 0
             }
-            PTRACE_SETFPREGS if arch == Arch::X86_64 => 0,
+            PTRACE_SETFPREGS if arch == Arch::X86_64 => {
+                let mut buf = [0u8; 512];
+                if mem.read(data, &mut buf).is_err() {
+                    return err(Errno::EFAULT);
+                }
+                Self::tracee_state(sh, idx).set_fp_user(arch, &buf);
+                0
+            }
             PTRACE_SETOPTIONS => {
                 let opts = data as u32;
                 if data > u64::from(u32::MAX) || opts & !O_MASK != 0 {
@@ -861,6 +962,17 @@ impl Kernel {
             return;
         };
         t.syscall_trace = mode == Resume::Syscall;
+        // A step from user mode is one instruction; from a stop inside a
+        // syscall it ends as the syscall returns (Linux reports a step over
+        // a syscall at its exit).
+        let step_in_syscall = mode == Resume::Step
+            && stop.phase != Phase::User
+            && matches!(
+                stop.kind,
+                StopKind::Entry | StopKind::Exit | StopKind::Seccomp
+            );
+        t.step = mode == Resume::Step && stop.phase == Phase::User;
+        t.step_at_return = mode == Resume::Step && stop.phase != Phase::User && !step_in_syscall;
         match stop.phase {
             Phase::Before => {
                 if matches!(stop.kind, StopKind::Entry | StopKind::Seccomp) {
@@ -918,6 +1030,9 @@ impl Kernel {
         if let Some(sig) = raise {
             p.raise(sig);
         }
+        if step_in_syscall {
+            p.raise(u64::from(SIGTRAP));
+        }
     }
 
     /// `PTRACE_GETREGSET`/`PTRACE_SETREGSET` (`addr` = the note type, `data` = an
@@ -941,8 +1056,7 @@ impl Kernel {
                 t.regs[..27].iter().flat_map(|v| v.to_le_bytes()).collect()
             }
             (NT_PRSTATUS, Arch::Aarch64) => t.regs.iter().flat_map(|v| v.to_le_bytes()).collect(),
-            (NT_PRFPREG, Arch::X86_64) => vec![0; 512],
-            (NT_PRFPREG, Arch::Aarch64) => vec![0; 528],
+            (NT_PRFPREG, _) => fp_user(arch, &t.fp),
             (NT_ARM_SYSTEM_CALL, Arch::Aarch64) => (t.a64_nr as i32).to_le_bytes().to_vec(),
             _ => return err(Errno::EINVAL),
         };
@@ -962,6 +1076,7 @@ impl Kernel {
                     }
                     t.regs_dirty = true;
                 }
+                (NT_PRFPREG, _) => t.set_fp_user(arch, &buf[..n]),
                 (NT_ARM_SYSTEM_CALL, _) if n == 4 => {
                     t.a64_nr = i64::from(i32::from_le_bytes(buf[..4].try_into().unwrap())) as u64;
                     t.regs_dirty = true;
@@ -1070,6 +1185,12 @@ impl Kernel {
         t.regs = regs;
         t.a64_nr = nr;
         t.regs_dirty = false;
+        t.apply_fp = false;
+        t.fp = if matches!(kind, StopKind::Entry | StopKind::Exit) {
+            Vec::new()
+        } else {
+            vcpu.fp_state()
+        };
         t.stop = Some(Stop {
             kind,
             sig,
@@ -1082,6 +1203,45 @@ impl Kernel {
         let tracer = t.tracer;
         let mut sh = self.shared.lock().unwrap();
         Self::notify_tracer(&mut sh, &cx.cur, tracer, CLD_TRAPPED, sig as i32);
+    }
+
+    /// A synchronous fault in a tracee (`SIGSEGV`, `SIGILL`, a breakpoint, a
+    /// finished single step…): it stops for its tracer before anything is
+    /// delivered, as Linux's signal-delivery stop. `Some` is how the exit
+    /// ends (stopped); `None` lets the fault be delivered as usual — untraced,
+    /// or the tracer passed this very signal back (the instruction ran again
+    /// and faulted again: now it is delivered, to a handler or fatally).
+    pub(super) fn ptrace_fault(
+        &self,
+        cx: &mut ServiceCtx,
+        fault: &super::signal::Fault,
+        vcpu: &mut dyn Vcpu,
+    ) -> Option<Serviced> {
+        let t = cx.cur.ptrace.as_mut()?;
+        if t.tracer == 0 {
+            return None;
+        }
+        if let Some((sig, _)) = t.inject
+            && sig == fault.sig
+        {
+            t.inject = None;
+            return None;
+        }
+        let mut si = [0u8; 128];
+        si[0..4].copy_from_slice(&(fault.sig as i32).to_le_bytes());
+        si[8..12].copy_from_slice(&(fault.code as i32).to_le_bytes());
+        si[16..24].copy_from_slice(&fault.addr.to_le_bytes());
+        t.siginfo = si;
+        self.ptrace_stop(
+            cx,
+            vcpu,
+            StopKind::Signal,
+            fault.sig as u32,
+            0,
+            Phase::User,
+            None,
+        );
+        Some(Serviced::Blocked)
     }
 
     /// Tell `tracer` that `tracee` changed state: `SIGCHLD` with the given

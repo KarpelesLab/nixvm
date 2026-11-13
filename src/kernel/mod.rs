@@ -1420,12 +1420,16 @@ fn run_slice_smp(
             return (i, vcpu, SliceOutcome::Ended);
         }
         // A tracer changed its registers while it was stopped in user mode.
-        if let Some(regs) = sh.procs[i]
-            .as_mut()
-            .and_then(|p| p.info.ptrace.as_mut())
-            .and_then(|t| t.take_user_regs())
-        {
-            ptrace::apply_user(kernel.arch, vcpu.as_mut(), &regs);
+        if let Some(t) = sh.procs[i].as_mut().and_then(|p| p.info.ptrace.as_mut()) {
+            if let Some(regs) = t.take_user_regs() {
+                ptrace::apply_user(kernel.arch, vcpu.as_mut(), &regs);
+            }
+            if let Some(fp) = t.take_fp_state() {
+                vcpu.set_fp_state(&fp);
+            }
+            if t.take_step() {
+                vcpu.set_single_step(true);
+            }
         }
     }
     // The program its address space held when this task last ran; another
@@ -2840,8 +2844,16 @@ impl Kernel {
                 return Ok(progressed);
             };
             // A tracer changed its registers while it was stopped in user mode.
-            if let Some(regs) = cx.cur.ptrace.as_mut().and_then(|t| t.take_user_regs()) {
-                ptrace::apply_user(self.arch, vcpu.as_mut(), &regs);
+            if let Some(t) = cx.cur.ptrace.as_mut() {
+                if let Some(regs) = t.take_user_regs() {
+                    ptrace::apply_user(self.arch, vcpu.as_mut(), &regs);
+                }
+                if let Some(fp) = t.take_fp_state() {
+                    vcpu.set_fp_state(&fp);
+                }
+                if t.take_step() {
+                    vcpu.set_single_step(true);
+                }
             }
             let mut guard = space_arc.lock().unwrap();
             cx.cur.cpu = 0;
@@ -3374,6 +3386,18 @@ impl Kernel {
                     cx.cur.seccomp.syscall_done();
                 }
                 self.watch_code(vcpu, mem, sys);
+                // A tracer single-stepping out of a stop inside this syscall:
+                // the step starts now that it has returned.
+                if !cx.block
+                    && cx.cur.run == RunState::Running
+                    && cx
+                        .cur
+                        .ptrace
+                        .as_mut()
+                        .is_some_and(|t| t.take_step_at_return())
+                {
+                    vcpu.set_single_step(true);
+                }
                 if let RunState::Zombie(_) = cx.cur.run {
                     Serviced::Ended
                 } else if cx.block {
@@ -3477,6 +3501,18 @@ impl Kernel {
                     // the faulting instruction. Never true for the interpreter or
                     // the serial path, which are always coherent with `mem`.
                     Serviced::Resume
+                } else if let Some(s) = {
+                    // A tracee stops for its tracer first.
+                    let fault = signal::Fault::segv(
+                        self.arch,
+                        addr,
+                        write,
+                        mem.page_prot(addr).is_some(),
+                        addr == vcpu.pc(),
+                    );
+                    self.ptrace_fault(cx, &fault, vcpu)
+                } {
+                    s
                 } else if self.deliver_fault_signal(
                     cx,
                     signal::Fault::segv(
@@ -3507,7 +3543,11 @@ impl Kernel {
                 // is identifiable from the report alone (the pc is under a
                 // load bias for PIEs/`ld-musl`, so it can't be looked up in
                 // the on-disk ELF directly).
-                if self.deliver_fault_signal(cx, signal::Fault::ill(self.arch, pc), vcpu, mem) {
+                let fault = signal::Fault::ill(self.arch, pc);
+                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu) {
+                    return s;
+                }
+                if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume; // guest's SIGILL handler (JIT trap)
                 }
                 let bytes = mem.read_vec(pc, 16).unwrap_or_default();
@@ -3522,7 +3562,11 @@ impl Kernel {
                 Serviced::Ended
             }
             Exit::ArithmeticFault { pc, code, vector } => {
-                if self.deliver_fault_signal(cx, signal::Fault::fpe(pc, code, vector), vcpu, mem) {
+                let fault = signal::Fault::fpe(pc, code, vector);
+                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu) {
+                    return s;
+                }
+                if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume;
                 }
                 eprintln!(
@@ -3534,7 +3578,11 @@ impl Kernel {
                 Serviced::Ended
             }
             Exit::ProtectionFault { pc } => {
-                if self.deliver_fault_signal(cx, signal::Fault::gp(), vcpu, mem) {
+                let fault = signal::Fault::gp();
+                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu) {
+                    return s;
+                }
+                if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume;
                 }
                 eprintln!(
@@ -3549,6 +3597,9 @@ impl Kernel {
                 // `BRK`/`int3`: SIGTRAP (a debugger-less process dies of it with
                 // a core, like Linux; a guest handler — Go, sanitizers — runs).
                 let fault = signal::Fault::brk(self.arch, pc, code);
+                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu) {
+                    return s;
+                }
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume;
                 }
@@ -3560,6 +3611,9 @@ impl Kernel {
             Exit::DebugTrap { pc, dr6 } => {
                 // A single step or a debug-register hit: SIGTRAP, as above.
                 let fault = signal::Fault::debug_trap(pc, dr6);
+                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu) {
+                    return s;
+                }
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume;
                 }
@@ -3570,6 +3624,9 @@ impl Kernel {
             }
             Exit::Misaligned { addr, write } => {
                 let fault = signal::Fault::misaligned(self.arch, addr, write, vcpu.pc(), vcpu.sp());
+                if let Some(s) = self.ptrace_fault(cx, &fault, vcpu) {
+                    return s;
+                }
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume;
                 }
