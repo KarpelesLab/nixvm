@@ -476,7 +476,9 @@ impl Kernel {
         // write access to the common ancestor's `cgroup.procs` (cgroup v2's
         // delegation rule), which a delegated cgroup's owner has below it.
         let ancestor = tree.common_ancestor(from, node);
-        if !cx.cur.privileged() && tree.owner(ancestor).0 != cx.cur.creds.euid {
+        if !Self::capable(cx, super::caps::CAP_DAC_OVERRIDE)
+            && tree.owner(ancestor).0 != cx.cur.creds.euid
+        {
             return Err(err(Errno::EACCES));
         }
         let moving: Vec<(i32, bool)> = tasks

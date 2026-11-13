@@ -1,0 +1,99 @@
+/* What sandbox setup tools (bubblewrap, the container runtimes) lean on, from
+ * inside a user and mount namespace of their own:
+ *  - creating a name that already exists on a read-only mount is EEXIST, not
+ *    EROFS, so "make sure this directory exists" walks a read-only tree;
+ *  - a mount target, chdir, or stat through /proc/self/fd/N acts on what that
+ *    descriptor has open, wherever it is now;
+ *  - a netlink peek with MSG_TRUNC says how long the next message is.
+ * Runs as anyone (as root it makes its namespaces all the same). */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mount.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+static int fails;
+#define CHECK(c, ...) do { int ok_ = (c); printf("%s: ", ok_ ? "ok  " : "FAIL"); printf(__VA_ARGS__); puts(""); fflush(stdout); if (!ok_) fails++; } while (0)
+static int child(int (*f)(void)) { fflush(stdout); pid_t c = fork(); if (!c) _exit(f()); int st; waitpid(c, &st, 0); fails += WIFEXITED(st) ? WEXITSTATUS(st) : 1; return st; }
+static int put(const char *path, const char *text) { int f = open(path, O_WRONLY); if (f < 0) return -1; int r = write(f, text, strlen(text)); int e = errno; close(f); errno = e; return r < 0 ? -1 : 0; }
+static int sandbox(void) {
+  int uid = getuid(), gid = getgid(); char l[64];
+  if (unshare(CLONE_NEWUSER | CLONE_NEWNS)) return -1;
+  put("/proc/self/setgroups", "deny"); sprintf(l, "0 %d 1\n", uid); put("/proc/self/uid_map", l); sprintf(l, "0 %d 1\n", gid); put("/proc/self/gid_map", l);
+  return mount(0, "/", 0, MS_REC | MS_PRIVATE, 0);
+}
+/* A scratch tree on a tmpfs of our own, under the first writable place there is. */
+static char base[256];
+static int scratch(void) {
+  const char *tries[] = {"/tmp", "/dev/shm", "/run", "/var/tmp", 0};
+  for (int i = 0; tries[i]; i++) { sprintf(base, "%s/sbfs.%d", tries[i], getpid()); if (!mkdir(base, 0755)) return mount("tmpfs", base, "tmpfs", 0, 0); }
+  return -1;
+}
+static int t_readonly(void) {
+  char p[512], q[512];
+  CHECK(!sandbox(), "user and mount namespace (%d)", errno); CHECK(!scratch(), "scratch tmpfs at %s (%d)", base, errno);
+  sprintf(p, "%s/ro", base); mkdir(p, 0755); sprintf(q, "%s/ro/dir", base); mkdir(q, 0755); sprintf(q, "%s/ro/file", base); close(open(q, O_CREAT | O_WRONLY, 0644)); sprintf(q, "%s/ro/link", base); symlink("file", q);
+  sprintf(q, "%s/view", base); mkdir(q, 0755);
+  CHECK(!mount(p, q, 0, MS_BIND | MS_REC, 0), "bind it"); CHECK(!mount(0, q, 0, MS_BIND | MS_REMOUNT | MS_RDONLY, 0), "read-only (%d)", errno);
+  sprintf(q, "%s/view/dir", base); CHECK(mkdir(q, 0755) < 0 && errno == EEXIST, "mkdir of an existing directory there: EEXIST (%d)", errno);
+  sprintf(q, "%s/view/file", base); CHECK(mkdir(q, 0755) < 0 && errno == EEXIST, "of an existing file: EEXIST (%d)", errno);
+  CHECK(mknod(q, S_IFREG | 0644, 0) < 0 && errno == EEXIST, "mknod too (%d)", errno);
+  CHECK(symlink("x", q) < 0 && errno == EEXIST, "symlink too (%d)", errno);
+  CHECK(open(q, O_CREAT | O_EXCL | O_WRONLY, 0644) < 0 && errno == EEXIST, "O_CREAT|O_EXCL too (%d)", errno);
+  int fd = open(q, O_CREAT | O_RDONLY, 0644); CHECK(fd >= 0, "a plain O_CREAT open of it for reading works (%d)", errno); close(fd);
+  sprintf(q, "%s/view/link", base); CHECK(mkdir(q, 0755) < 0 && errno == EEXIST, "a symlink's name: EEXIST (%d)", errno);
+  sprintf(q, "%s/view/new", base); CHECK(mkdir(q, 0755) < 0 && errno == EROFS, "a new name: EROFS (%d)", errno);
+  CHECK(symlink("x", q) < 0 && errno == EROFS, "symlink of a new name: EROFS (%d)", errno);
+  sprintf(q, "%s/view", base); int dirfd = open(q, O_PATH | O_DIRECTORY);
+  CHECK(mkdirat(dirfd, "dir", 0755) < 0 && errno == EEXIST, "mkdirat through a descriptor: EEXIST (%d)", errno);
+  CHECK(mkdirat(dirfd, "new2", 0755) < 0 && errno == EROFS, "and EROFS for a new name (%d)", errno);
+  return fails;
+}
+static int t_fd_paths(void) {
+  char p[512], q[512], via[64]; struct stat a, b;
+  CHECK(!sandbox(), "user and mount namespace (%d)", errno); CHECK(!scratch(), "scratch tmpfs (%d)", errno);
+  sprintf(p, "%s/target", base); mkdir(p, 0755); sprintf(q, "%s/target/below", base); mkdir(q, 0755);
+  int other = open(base, O_PATH | O_DIRECTORY); int fd = open(p, O_PATH | O_DIRECTORY | O_NOFOLLOW); CHECK(fd >= 0, "O_PATH descriptor of a directory");
+  close(other);
+  sprintf(via, "/proc/self/fd/%d", fd);
+  CHECK(!stat(via, &a) && !fstat(fd, &b) && a.st_ino == b.st_ino && S_ISDIR(a.st_mode), "stat through /proc/self/fd/N is the directory (%lu %lu)", (unsigned long)a.st_ino, (unsigned long)b.st_ino);
+  CHECK(!mount("tmpfs", via, "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755"), "mount on /proc/self/fd/N (%d)", errno);
+  sprintf(q, "%s/target/below", base); CHECK(access(q, F_OK) < 0 && errno == ENOENT, "the mount went on the directory: what was there is covered (%d)", errno);
+  sprintf(q, "%s/target/fresh", base); CHECK(!mkdir(q, 0755), "and the new tmpfs is there to use");
+  /* bubblewrap binds onto a fresh O_PATH descriptor of each destination. */
+  sprintf(q, "%s/bindsrc", base); mkdir(q, 0755); sprintf(p, "%s/bindsrc/marker", base); close(open(p, O_CREAT | O_WRONLY, 0644));
+  sprintf(p, "%s/target/fresh", base); int dst = open(p, O_PATH | O_DIRECTORY); sprintf(via, "/proc/self/fd/%d", dst);
+  CHECK(!mount(q, via, 0, MS_BIND | MS_REC, 0), "bind onto /proc/self/fd/N (%d)", errno);
+  sprintf(p, "%s/target/fresh/marker", base); CHECK(access(p, F_OK) == 0, "landed on the right directory (%d)", errno);
+  int d2 = open(base, O_RDONLY | O_DIRECTORY); sprintf(via, "/proc/self/fd/%d", d2); CHECK(!chdir(via), "chdir through /proc/self/fd/N (%d)", errno);
+  CHECK(access("bindsrc/marker", F_OK) == 0, "lands in that directory (%d)", errno);
+  return fails;
+}
+static int t_netlink_peek(void) {
+  int s = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE); CHECK(s >= 0, "rtnetlink socket (%d)", errno);
+  struct { struct nlmsghdr h; struct ifinfomsg i; } req = {{sizeof req, RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, 0}, {AF_UNSPEC}};
+  CHECK(send(s, &req, sizeof req, 0) == sizeof req, "dump the links");
+  struct iovec iov = {0, 0}; struct msghdr m = {0}; m.msg_iov = &iov; m.msg_iovlen = 1;
+  ssize_t n = recvmsg(s, &m, MSG_PEEK | MSG_TRUNC); CHECK(n > (ssize_t)sizeof(struct nlmsghdr), "a zero-length MSG_PEEK|MSG_TRUNC says how long the reply is (%zd)", n);
+  CHECK(m.msg_flags & MSG_TRUNC, "and that it didn't fit");
+  char *buf = malloc(n > 0 ? n : 1); iov.iov_base = buf; iov.iov_len = n > 0 ? n : 1; m.msg_flags = 0;
+  ssize_t got = recvmsg(s, &m, 0); CHECK(got == n, "the read that follows gets just that much (%zd)", got);
+  struct nlmsghdr *h = (struct nlmsghdr *)buf; CHECK(got > 0 && h->nlmsg_type == RTM_NEWLINK, "a link (%d)", got > 0 ? h->nlmsg_type : -1);
+  while (recv(s, buf, n, MSG_DONTWAIT) > 0) {}
+  CHECK(send(s, &req, sizeof req, 0) == sizeof req, "dump them again");
+  char small[8]; ssize_t t = recv(s, small, sizeof small, MSG_TRUNC); CHECK(t > (ssize_t)sizeof small, "recv with MSG_TRUNC gives the full length too (%zd)", t);
+  return fails;
+}
+int main(void) {
+  child(t_readonly); child(t_fd_paths); child(t_netlink_peek);
+  puts(fails ? "SOME FAILED" : "PASS"); return fails != 0;
+}

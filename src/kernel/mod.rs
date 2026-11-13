@@ -29,6 +29,7 @@ use crate::vcpu::mem::{PAGE_SIZE, Prot};
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 
 mod attrs;
+mod caps;
 mod cgroup;
 pub mod egress;
 mod fcntl;
@@ -361,9 +362,6 @@ struct ProcInfo {
     ns: ns::NsProxy,
     /// This task's root directory (`chroot`), in its mount namespace's terms.
     root: String,
-    /// It created or joined its user namespace, which gives it every capability
-    /// there whatever its uid, until it `exec`s a program as anyone but root.
-    ns_caps: bool,
     /// Alternate signal stack (`sigaltstack`): `(base, size, flags)`. A handler
     /// registered `SA_ONSTACK` runs here instead of the interrupted stack —
     /// which is exactly how a runtime catches its own stack-overflow fault.
@@ -557,9 +555,9 @@ struct ProcInfo {
     personality: u32,
     /// `set_robust_list` head (reported by `get_robust_list`).
     robust_list: u64,
-    /// Capability sets `[effective, permitted, inheritable]` after a
-    /// `capset`; `None` = the default for the task's uid (see `attrs.rs`).
-    caps: Option<[u64; 3]>,
+    /// Capability sets and securebits (see [`caps`]), relative to its user
+    /// namespace.
+    caps: caps::CapSets,
     /// The System V semaphore this task is parked on in `semop`:
     /// `(semid, semnum, waiting-for-zero)` — what `GETNCNT`/`GETZCNT` count.
     sem_wait: Option<(i32, u16, bool)>,
@@ -631,7 +629,6 @@ impl Default for ProcInfo {
             rlimits: RLimits::default(),
             ns: ns::NsProxy::default(),
             root: "/".to_string(),
-            ns_caps: false,
             altstack: (0, 0, SS_DISABLE),
             blocked: 0,
             pending: 0,
@@ -674,7 +671,7 @@ impl Default for ProcInfo {
             rseq: None,
             personality: 0,
             robust_list: 0,
-            caps: None,
+            caps: caps::CapSets::full(),
             sem_wait: None,
             groups: Vec::new(),
             fs_base: 0,
@@ -709,13 +706,6 @@ struct Creds {
 }
 
 impl ProcInfo {
-    /// Whether this task is privileged where it is: root, or holding the
-    /// capabilities of a user namespace. Whether that covers a given resource is
-    /// [`Kernel::may_administer`]'s question.
-    fn privileged(&self) -> bool {
-        self.creds.euid == 0 || self.ns_caps
-    }
-
     /// Held back by a frozen cgroup, or one whose `cpu.max` quota is used up
     /// for now: not to be scheduled. A task with `SIGKILL` pending runs anyway,
     /// to die, as Linux's freezer lets it.
@@ -757,8 +747,8 @@ impl ProcInfo {
     /// Whether this task holds capabilities over the whole VM, not just inside a
     /// user namespace of its own: what Linux's `capable()` asks for the
     /// resource-limit overrides (`CAP_IPC_LOCK`, `CAP_SYS_NICE`, ...).
-    fn host_capable(&self) -> bool {
-        self.privileged() && self.ns.user == 0
+    fn host_capable(&self, cap: u32) -> bool {
+        self.caps.has(cap) && self.ns.user == 0
     }
 
     /// The earliest real-time timer deadline this task holds — its
@@ -2589,6 +2579,7 @@ impl Kernel {
             fsgid: gid,
         };
         self.seed.groups = groups.to_vec();
+        self.seed.caps = caps::CapSets::for_uid(uid);
     }
 
     /// Set the first process's program path (for `/proc/self/exe`); later
@@ -4024,6 +4015,31 @@ impl Kernel {
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
     ) -> i64 {
+        if !self.trace {
+            return self.dispatch_layers(cx, sys, raw, args, vcpu, mem);
+        }
+        let (pid, pc) = (cx.cur.pid, vcpu.pc());
+        eprintln!("[trace] pid={pid} pc={pc:#x} {sys:?} raw={raw} args={args:x?}");
+        let ret = self.dispatch_layers(cx, sys, raw, args, vcpu, mem);
+        if (-4095..0).contains(&ret) {
+            eprintln!("[trace]   = {ret} (errno {})", -ret);
+        } else {
+            eprintln!("[trace]   = {ret:#x}");
+        }
+        ret
+    }
+
+    /// The checks every syscall passes, then the namespace layers it runs through.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_layers(
+        &self,
+        cx: &mut ServiceCtx,
+        sys: Sysno,
+        raw: u64,
+        args: &[u64; 6],
+        vcpu: &mut dyn Vcpu,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         if let Some(failure) = self.fd_limit_error(cx, sys, args) {
             return failure;
         }
@@ -4042,18 +4058,7 @@ impl Kernel {
         if cx.cur.ns.pid != 0 {
             return self.dispatch_in_pid_ns(cx, sys, raw, args, vcpu, mem);
         }
-        if !self.trace {
-            return self.dispatch_impl(cx, sys, raw, args, vcpu, mem);
-        }
-        let (pid, pc) = (cx.cur.pid, vcpu.pc());
-        eprintln!("[trace] pid={pid} pc={pc:#x} {sys:?} raw={raw} args={args:x?}");
-        let ret = self.dispatch_impl(cx, sys, raw, args, vcpu, mem);
-        if (-4095..0).contains(&ret) {
-            eprintln!("[trace]   = {ret} (errno {})", -ret);
-        } else {
-            eprintln!("[trace]   = {ret:#x}");
-        }
-        ret
+        self.dispatch_impl(cx, sys, raw, args, vcpu, mem)
     }
 
     /// Whether syscall `sys` would open more descriptors than allowed: the
@@ -5137,7 +5142,7 @@ impl Kernel {
             // CAP_SYS_TTY_CONFIG; for root a no-op (the session's tty is the
             // host's or an in-VM pty that the caller is about to reopen).
             Sysno::Vhangup => {
-                if cx.cur.privileged() {
+                if Self::capable(cx, caps::CAP_SYS_TTY_CONFIG) {
                     0
                 } else {
                     err(Errno::EPERM)
@@ -5335,7 +5340,10 @@ impl Kernel {
             | ns::CLONE_NEWPID
             | ns::CLONE_NEWNET;
         // A new user namespace needs no privilege, and gives what the rest need.
-        if flags & NEEDS_PRIVILEGE != 0 && !cx.cur.privileged() && flags & ns::CLONE_NEWUSER == 0 {
+        if flags & NEEDS_PRIVILEGE != 0
+            && !cx.cur.caps.has(caps::CAP_SYS_ADMIN)
+            && flags & ns::CLONE_NEWUSER == 0
+        {
             return err(Errno::EPERM);
         }
         if flags & ns::CLONE_NEWUSER != 0 && cx.cur.root != "/" {
@@ -5777,6 +5785,43 @@ impl Kernel {
         self.exec_result(sh, cx, r, mem)
     }
 
+    /// The credentials a program runs with (Linux's `bprm_fill_uid` and
+    /// `cap_bprm_creds_from_file`): a set-user-ID or set-group-ID file's owner,
+    /// if that's mapped in the caller's user namespace and `no_new_privs` isn't
+    /// set; then capabilities by the root rule.
+    fn exec_credentials(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, abs: &str) {
+        const S_ISUID: u32 = 0o4000;
+        const S_ISGID: u32 = 0o2000;
+        const S_IXGRP: u32 = 0o010;
+        let old = cx.cur.creds;
+        if let Some(file) = vfs.stat(abs).filter(|_| !cx.cur.no_new_privs) {
+            let ns = cx.cur.ns.user;
+            let users = self.users.lock().unwrap();
+            let seen = |kind, id| {
+                let inside = users.seen_from_global(ns, kind, id);
+                (inside != userns::OVERFLOW_ID || id == userns::OVERFLOW_ID).then_some(inside)
+            };
+            if file.mode & S_ISUID != 0
+                && let Some(uid) = seen(userns::IdKind::Uid, file.uid)
+            {
+                cx.cur.creds.euid = uid;
+            }
+            if file.mode & (S_ISGID | S_IXGRP) == S_ISGID | S_IXGRP
+                && let Some(gid) = seen(userns::IdKind::Gid, file.gid)
+            {
+                cx.cur.creds.egid = gid;
+            }
+        }
+        let c = &mut cx.cur.creds;
+        c.suid = c.euid;
+        c.fsuid = c.euid;
+        c.sgid = c.egid;
+        c.fsgid = c.egid;
+        let set_id = c.euid != old.euid || (c.egid != old.egid && !cx.cur.groups.contains(&c.egid));
+        let (ruid, euid) = (c.ruid, c.euid);
+        cx.cur.caps.on_exec(ruid, euid, set_id);
+    }
+
     /// What `execve` returns for `exec_image`'s result: its own, or — for a
     /// load that failed past the point of no return, with no image left to
     /// return to — a SIGSEGV death, as Linux's `force_fatal_sig` gives.
@@ -5888,11 +5933,7 @@ impl Kernel {
         // The process's other threads end here, and this one becomes the
         // process (Linux's `de_thread`).
         Self::de_thread(sh, cx);
-        // Capabilities from a user namespace last through exec only for its root.
-        if cx.cur.creds.euid != 0 {
-            cx.cur.ns_caps = false;
-            cx.cur.caps = None;
-        }
+        self.exec_credentials(vfs, cx, abs);
         // execve resets every *caught* signal handler to SIG_DFL — the handler
         // addresses point into the image being replaced, so keeping them would
         // jump the new program to garbage on the next signal. Ignored (SIG_IGN)
@@ -8077,7 +8118,7 @@ impl Kernel {
         let mut old_abs = self.resolve_path(cx, olddirfd, &orel);
         // AT_SYMLINK_FOLLOW links the symlink's target instead of the link.
         if flags & AT_SYMLINK_FOLLOW != 0 {
-            old_abs = match self.follow_or_eloop(vfs, &old_abs) {
+            old_abs = match self.follow_or_eloop(vfs, cx, &old_abs) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
@@ -8451,7 +8492,7 @@ impl Kernel {
             }
             Some(new)
         };
-        let root = cx.cur.privileged();
+        let root = Self::capable(cx, caps::CAP_SYS_RESOURCE);
         let target = if pid == 0 || pid == cx.cur.tgid || pid == cx.cur.pid {
             cx.cur.rlimits.clone()
         } else {
@@ -8515,7 +8556,9 @@ impl Kernel {
     /// `CAP_IPC_LOCK` (root of the first user namespace) has no limit.
     fn memlock_allows(cx: &ServiceCtx, total: u64) -> bool {
         let limit = cx.cur.rlimits.soft(sys_misc::RLIMIT_MEMLOCK);
-        cx.cur.host_capable() || limit == sys_misc::RLIM_INFINITY || total <= limit
+        cx.cur.host_capable(caps::CAP_IPC_LOCK)
+            || limit == sys_misc::RLIM_INFINITY
+            || total <= limit
     }
 
     /// `mlock`, `mlock2` and `munlock`.
@@ -8537,7 +8580,10 @@ impl Kernel {
         };
         let lock = sys != Sysno::Munlock;
         // Locking at all takes a nonzero limit or CAP_IPC_LOCK.
-        if lock && cx.cur.rlimits.soft(sys_misc::RLIMIT_MEMLOCK) == 0 && !cx.cur.host_capable() {
+        if lock
+            && cx.cur.rlimits.soft(sys_misc::RLIMIT_MEMLOCK) == 0
+            && !cx.cur.host_capable(caps::CAP_IPC_LOCK)
+        {
             return err(Errno::EPERM);
         }
         let mut p = page_down(addr);
@@ -8566,7 +8612,9 @@ impl Kernel {
         if flags & !7 != 0 || flags & (MCL_CURRENT | MCL_FUTURE) == 0 {
             return err(Errno::EINVAL);
         }
-        if cx.cur.rlimits.soft(sys_misc::RLIMIT_MEMLOCK) == 0 && !cx.cur.host_capable() {
+        if cx.cur.rlimits.soft(sys_misc::RLIMIT_MEMLOCK) == 0
+            && !cx.cur.host_capable(caps::CAP_IPC_LOCK)
+        {
             return err(Errno::EPERM);
         }
         let current = flags & MCL_CURRENT != 0;
@@ -8726,8 +8774,8 @@ impl Kernel {
         if net::is_iface_ioctl(req) {
             return if matches!(f, Fd::Socket { .. }) {
                 let mut net = self.net.lock().unwrap();
-                let privileged = cx.cur.privileged();
                 let ns = net.netns_of(&f).unwrap_or(cx.cur.ns.net);
+                let privileged = self.capable_over(cx, ns, caps::CAP_NET_ADMIN);
                 net::iface_ioctl(req, arg, mem, &mut net, ns, privileged)
             } else {
                 err(Errno::ENOTTY)
@@ -9124,7 +9172,7 @@ impl Kernel {
         // in the directory `rel` names (see `orphan.rs`).
         const O_TMPFILE: u64 = 0o20000000;
         if flags & O_TMPFILE != 0 {
-            let dir = match self.follow_or_eloop(vfs, &resolved) {
+            let dir = match self.follow_or_eloop(vfs, cx, &resolved) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
@@ -9269,7 +9317,8 @@ impl Kernel {
     /// The descriptor `abs` names when it's this process's
     /// `/proc/{self,thread-self,<pid>}/fd/N`.
     fn own_fd_link(&self, cx: &ServiceCtx, abs: &str) -> Option<i32> {
-        let rest = abs.strip_prefix("/proc/")?;
+        let inside = Self::as_seen_from_root(cx, abs);
+        let rest = inside.strip_prefix("/proc/")?;
         let (who, tail) = rest.split_once('/')?;
         if who != "self"
             && who != "thread-self"
@@ -9762,7 +9811,7 @@ impl Kernel {
         let had_slash = rel.len() > 1 && rel.ends_with('/');
         let mut abs = self.resolve_path(cx, dirfd, &rel);
         if flags & AT_SYMLINK_NOFOLLOW == 0 {
-            abs = self.follow_or_eloop(vfs, &abs)?;
+            abs = self.follow_or_eloop(vfs, cx, &abs)?;
         }
         let Some(attrs) = vfs.stat(&abs) else {
             if self.has_nondir_component(vfs, &abs) {
@@ -9882,7 +9931,10 @@ impl Kernel {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
-        let abs = self.resolve_path(cx, AT_FDCWD, &rel);
+        let abs = match self.follow_or_eloop(vfs, cx, &self.resolve_path(cx, AT_FDCWD, &rel)) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
         match vfs.stat(&abs) {
             Some(a) if a.kind == NodeKind::Dir => {
                 cx.cur.cwd = abs;
@@ -10039,9 +10091,41 @@ impl Kernel {
     /// `a -> b -> a` loop `stat`/`open` "succeed" on the link node. Returns the
     /// resolved path on success (including the case where the final component
     /// doesn't exist yet — that's `ENOENT` at the caller, not here).
-    fn follow_or_eloop(&self, vfs: &mut MountTable, path: &str) -> Result<String, i64> {
-        self.follow_symlinks(vfs, path)
-            .ok_or_else(|| err(Errno::ELOOP))
+    ///
+    /// A hop landing on this process's `/proc/self/fd/N` is a magic link to what
+    /// descriptor N has open, wherever that is now (the `mount`, `chdir`, `stat`
+    /// of `/proc/self/fd/N` sandbox tools use to act on a directory they opened
+    /// without a race).
+    fn follow_or_eloop(
+        &self,
+        vfs: &mut MountTable,
+        cx: &ServiceCtx,
+        path: &str,
+    ) -> Result<String, i64> {
+        let mut path = path.to_string();
+        for _ in 0..40 {
+            let mut magic = None;
+            let followed = vfs
+                .follow_until(&path, &mut |p| {
+                    magic = self.own_fd_link(cx, p);
+                    magic.is_some()
+                })
+                .ok_or_else(|| err(Errno::ELOOP))?;
+            let Some(n) = magic else {
+                return Ok(followed);
+            };
+            match cx.cur.fds.get(n) {
+                Some(Fd::File { path: open, .. } | Fd::Dir { path: open, .. }) => {
+                    if *open == path {
+                        return Ok(followed);
+                    }
+                    path.clone_from(open);
+                }
+                Some(_) => return Ok(followed),
+                None => return Err(err(Errno::ENOENT)),
+            }
+        }
+        Err(err(Errno::ELOOP))
     }
 
     /// Follow the final-component symlink chain (bounded), returning the target.
@@ -13128,6 +13212,7 @@ mod tests {
             err(Errno::EINVAL)
         );
         cx.cur.creds.euid = 1000;
+        cx.cur.caps = crate::kernel::caps::CapSets::none();
         let uts = [ns::CLONE_NEWUTS, 0, 0, 0, 0, 0];
         assert_eq!(
             call(&k, &mut cx, &mut mem, &mut v, Sysno::Unshare, uts),

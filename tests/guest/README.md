@@ -21,5 +21,8 @@ raises hard limits and runs `SCHED_FIFO` tasks), and so does `sched` (`sudo ./sc
 it runs real-time tasks on CPU 0 for a few seconds). `exec` needs nothing: it writes
 tiny ELF images of its own to exec, and neither do `fifo`, `devfd`, `threads_mm`, `dualstack`, `madvise` and `execthread`. CI runs those
 on the runner as well as in the VM.
+`userns_caps` and `sandbox_fs` run as anyone, making their own user namespaces;
+as root `userns_caps` also checks how dropping uid 0 drops capabilities, so CI
+runs both as root on the runner, and they're worth running as an ordinary user too.
 `attacks.c` isn't a pass/fail
 program: the Rust test checks that each thing it tries is contained.

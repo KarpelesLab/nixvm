@@ -5,6 +5,7 @@
 //! startup (rlimits, cpu affinity, scheduler class, process name) and mostly
 //! ignores the exact values, so a believable constant answer is enough.
 
+use super::caps::{CAP_SETGID, CAP_SETUID};
 use super::{Kernel, ServiceCtx, Shared, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
@@ -18,33 +19,34 @@ fn opt_id(v: u64) -> Option<u32> {
 }
 
 impl Kernel {
-    /// `setuid(uid)`: a privileged process (euid 0) sets the real, effective,
-    /// saved, and fs uid all to `uid`; an unprivileged one may only set the
-    /// effective (and fs) uid to its real or saved uid, else `EPERM`.
+    /// `setuid(uid)`: with `CAP_SETUID` it sets the real, effective, saved and
+    /// fs uid; without, only the effective (and fs) uid, to the real or saved
+    /// one, else `EPERM`.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_setuid(&self, cx: &mut ServiceCtx, uid: u32) -> i64 {
-        let privileged = cx.cur.privileged();
+        let privileged = cx.cur.caps.has(CAP_SETUID);
+        let old = cx.cur.creds;
         let c = &mut cx.cur.creds;
         if privileged {
             c.ruid = uid;
             c.euid = uid;
             c.suid = uid;
             c.fsuid = uid;
-            0
         } else if uid == c.ruid || uid == c.suid {
             c.euid = uid;
             c.fsuid = uid;
-            0
         } else {
-            err(Errno::EPERM)
+            return err(Errno::EPERM);
         }
+        Self::uids_changed(cx, old);
+        0
     }
 
-    /// `setgid(gid)` — the group analogue of [`Self::sys_setuid`] (privilege is
-    /// still determined by the *user* euid).
+    /// `setgid(gid)` — the group analogue of [`Self::sys_setuid`], with
+    /// `CAP_SETGID`.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_setgid(&self, cx: &mut ServiceCtx, gid: u32) -> i64 {
-        let privileged = cx.cur.privileged();
+        let privileged = cx.cur.caps.has(CAP_SETGID);
         let c = &mut cx.cur.creds;
         if privileged {
             c.rgid = gid;
@@ -62,37 +64,38 @@ impl Kernel {
     }
 
     /// `setresuid(ruid, euid, suid)` — set each id independently (`-1` leaves it
-    /// unchanged). Privileged sets any; unprivileged only among its current
+    /// unchanged). With `CAP_SETUID` any; otherwise only among its current
     /// real/effective/saved uids.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_setresuid(&self, cx: &mut ServiceCtx, r: u64, e: u64, s: u64) -> i64 {
         let c = cx.cur.creds;
-        let privileged = c.euid == 0;
+        let privileged = cx.cur.caps.has(CAP_SETUID);
         let ok = |id: u32| privileged || id == c.ruid || id == c.euid || id == c.suid;
         for id in [opt_id(r), opt_id(e), opt_id(s)].into_iter().flatten() {
             if !ok(id) {
                 return err(Errno::EPERM);
             }
         }
-        let c = &mut cx.cur.creds;
+        let nc = &mut cx.cur.creds;
         if let Some(v) = opt_id(r) {
-            c.ruid = v;
+            nc.ruid = v;
         }
         if let Some(v) = opt_id(e) {
-            c.euid = v;
-            c.fsuid = v;
+            nc.euid = v;
+            nc.fsuid = v;
         }
         if let Some(v) = opt_id(s) {
-            c.suid = v;
+            nc.suid = v;
         }
+        Self::uids_changed(cx, c);
         0
     }
 
-    /// `setresgid(rgid, egid, sgid)` — the group analogue.
+    /// `setresgid(rgid, egid, sgid)` — the group analogue, with `CAP_SETGID`.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_setresgid(&self, cx: &mut ServiceCtx, r: u64, e: u64, s: u64) -> i64 {
         let c = cx.cur.creds;
-        let privileged = c.euid == 0;
+        let privileged = cx.cur.caps.has(CAP_SETGID);
         let ok = |id: u32| privileged || id == c.rgid || id == c.egid || id == c.sgid;
         for id in [opt_id(r), opt_id(e), opt_id(s)].into_iter().flatten() {
             if !ok(id) {
@@ -118,7 +121,7 @@ impl Kernel {
     #[allow(clippy::unused_self)]
     pub(super) fn sys_setreuid(&self, cx: &mut ServiceCtx, r: u64, e: u64) -> i64 {
         let c = cx.cur.creds;
-        let privileged = c.euid == 0;
+        let privileged = cx.cur.caps.has(CAP_SETUID);
         if let Some(r) = opt_id(r)
             && !(privileged || r == c.ruid || r == c.euid)
         {
@@ -142,6 +145,7 @@ impl Kernel {
         if opt_id(r).is_some() || opt_id(e).is_some_and(|e| e != c.ruid) {
             nc.suid = nc.euid;
         }
+        Self::uids_changed(cx, c);
         0
     }
 
@@ -149,7 +153,7 @@ impl Kernel {
     #[allow(clippy::unused_self)]
     pub(super) fn sys_setregid(&self, cx: &mut ServiceCtx, r: u64, e: u64) -> i64 {
         let c = cx.cur.creds;
-        let privileged = c.euid == 0;
+        let privileged = cx.cur.caps.has(CAP_SETGID);
         if let Some(r) = opt_id(r)
             && !(privileged || r == c.rgid || r == c.egid)
         {
@@ -175,17 +179,19 @@ impl Kernel {
     }
 
     /// `setfsuid(fsuid)` / `setfsgid(fsgid)` — set the filesystem id, returning
-    /// the *previous* one. Allowed if privileged or the id matches the caller's
-    /// real/effective/saved/current-fs id; otherwise the change is silently
-    /// ignored (the syscall never fails, it just returns the old value).
+    /// the *previous* one. Allowed with `CAP_SETUID` or if the id matches the
+    /// caller's real/effective/saved/current-fs id; otherwise the change is
+    /// silently ignored (the syscall never fails, it just returns the old value).
     #[allow(clippy::unused_self)]
     pub(super) fn sys_setfsuid(&self, cx: &mut ServiceCtx, fsuid: u64) -> i64 {
+        let privileged = cx.cur.caps.has(CAP_SETUID);
         let c = &mut cx.cur.creds;
         let old = c.fsuid;
         if let Some(v) = opt_id(fsuid)
-            && (c.euid == 0 || v == c.ruid || v == c.euid || v == c.suid || v == c.fsuid)
+            && (privileged || v == c.ruid || v == c.euid || v == c.suid || v == c.fsuid)
         {
             c.fsuid = v;
+            cx.cur.caps.after_setfsuid(old, v);
         }
         i64::from(old)
     }
@@ -193,14 +199,24 @@ impl Kernel {
     /// `setfsgid(fsgid)` — the group analogue of [`Self::sys_setfsuid`].
     #[allow(clippy::unused_self)]
     pub(super) fn sys_setfsgid(&self, cx: &mut ServiceCtx, fsgid: u64) -> i64 {
+        let privileged = cx.cur.caps.has(CAP_SETGID);
         let c = &mut cx.cur.creds;
         let old = c.fsgid;
         if let Some(v) = opt_id(fsgid)
-            && (c.euid == 0 || v == c.rgid || v == c.egid || v == c.sgid || v == c.fsgid)
+            && (privileged || v == c.rgid || v == c.egid || v == c.sgid || v == c.fsgid)
         {
             c.fsgid = v;
         }
         i64::from(old)
+    }
+
+    /// The capability fixups after the uids changed from `old`'s.
+    fn uids_changed(cx: &mut ServiceCtx, old: super::Creds) {
+        let new = cx.cur.creds;
+        cx.cur.caps.after_setuid(
+            (old.ruid, old.euid, old.suid, old.fsuid),
+            (new.ruid, new.euid, new.suid, new.fsuid),
+        );
     }
 
     /// `sched_get_priority_min`/`_max(policy)` — the valid real-time priority
@@ -226,7 +242,7 @@ impl Kernel {
         list: u64,
         mem: &GuestMemory,
     ) -> i64 {
-        if !cx.cur.privileged() {
+        if !cx.cur.caps.has(super::caps::CAP_SETGID) {
             return err(Errno::EPERM);
         }
         if size > 65536 {
@@ -239,11 +255,37 @@ impl Kernel {
         let Ok(raw) = mem.read_vec(list, size as usize * 4) else {
             return err(Errno::EFAULT);
         };
-        cx.cur.groups = raw
+        // Kept as the VM sees them: each must be mapped where the caller is.
+        let ns = cx.cur.ns.user;
+        let users = self.users.lock().unwrap();
+        let groups: Option<Vec<u32>> = raw
             .chunks(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .map(|g| users.to_global(ns, super::userns::IdKind::Gid, g))
             .collect();
-        0
+        drop(users);
+        match groups {
+            Some(groups) => {
+                cx.cur.groups = groups;
+                0
+            }
+            None => err(Errno::EINVAL),
+        }
+    }
+
+    /// The supplementary groups as the caller's user namespace sees them, the
+    /// unmapped ones as the overflow gid.
+    pub(super) fn visible_groups(&self, cx: &ServiceCtx) -> Vec<u32> {
+        let ns = cx.cur.ns.user;
+        if ns == 0 {
+            return cx.cur.groups.clone();
+        }
+        let users = self.users.lock().unwrap();
+        cx.cur
+            .groups
+            .iter()
+            .map(|&g| users.seen_from_global(ns, super::userns::IdKind::Gid, g))
+            .collect()
     }
 
     /// `getgroups(size, list)`: the supplementary groups; `size == 0` asks
@@ -264,7 +306,8 @@ impl Kernel {
         if size as u32 > i32::MAX as u32 || (size as usize) < n {
             return err(Errno::EINVAL);
         }
-        let b: Vec<u8> = cx.cur.groups.iter().flat_map(|g| g.to_le_bytes()).collect();
+        let groups = self.visible_groups(cx);
+        let b: Vec<u8> = groups.iter().flat_map(|g| g.to_le_bytes()).collect();
         if mem.write(list, &b).is_err() {
             return err(Errno::EFAULT);
         }
@@ -293,7 +336,10 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         let action = action as u64;
-        if !cx.cur.privileged() && !matches!(action, READ_ALL | SIZE_BUFFER) {
+        if !Self::capable(cx, super::caps::CAP_SYSLOG)
+            && !Self::capable(cx, super::caps::CAP_SYS_ADMIN)
+            && !matches!(action, READ_ALL | SIZE_BUFFER)
+        {
             return err(Errno::EPERM);
         }
         match action {

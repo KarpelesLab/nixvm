@@ -163,7 +163,7 @@ impl Kernel {
                     let abs = if nofollow {
                         abs
                     } else {
-                        self.follow_or_eloop(vfs, &abs)?
+                        self.follow_or_eloop(vfs, cx, &abs)?
                     };
                     Node::Path(abs, NodeKind::File)
                 }
@@ -181,7 +181,7 @@ impl Kernel {
     /// Whether the caller holds `CAP_SYS_ADMIN` (the `trusted.*` gate). The VM
     /// grants root every capability, so this is "is effectively root".
     fn xattr_admin(cx: &ServiceCtx) -> bool {
-        cx.cur.privileged()
+        Self::capable(cx, super::caps::CAP_SYS_ADMIN)
     }
 
     /// `getxattr`/`lgetxattr`/`fgetxattr`/`getxattrat`: copy attribute `name`'s
@@ -749,6 +749,7 @@ mod tests {
         );
         // trusted.* is hidden from a non-root caller.
         cx.cur.creds.euid = 1000;
+        cx.cur.caps = crate::kernel::caps::CapSets::none();
         assert_eq!(
             call(
                 &k,

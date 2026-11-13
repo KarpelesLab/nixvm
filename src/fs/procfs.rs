@@ -185,8 +185,14 @@ pub struct ProcTask {
     pub cmdline: Vec<u8>,
     /// The letter `ps` shows: `R`, `S`, `T` or `Z`.
     pub state: char,
+    /// Who owns its `/proc/<pid>` entries: its effective ids, as the VM sees them.
     pub uid: u32,
     pub gid: u32,
+    /// Its `status` file's `Uid:` and `Gid:` lines, in the reader's terms. Empty
+    /// shows `uid`/`gid`.
+    pub status_ids: String,
+    /// Its user namespace's `uid_map`, `gid_map` and `setgroups`.
+    pub id_files: [String; 3],
     /// Body of its `cgroup` file (`0::/path\n`).
     pub cgroup: String,
 }
@@ -198,6 +204,9 @@ impl ProcTask {
             "comm" => format!("{}\n", self.comm).into_bytes(),
             "cmdline" => self.cmdline.clone(),
             "cgroup" => self.cgroup.clone().into_bytes(),
+            "uid_map" => self.id_files[0].clone().into_bytes(),
+            "gid_map" => self.id_files[1].clone().into_bytes(),
+            "setgroups" => self.id_files[2].clone().into_bytes(),
             "stat" => {
                 // Only the leading fields `ps` and friends read carry anything.
                 let rest = "0 ".repeat(45);
@@ -215,9 +224,13 @@ impl ProcTask {
             }
             "status" => {
                 let (uid, gid) = (self.uid, self.gid);
+                let ids = if self.status_ids.is_empty() {
+                    format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\n")
+                } else {
+                    self.status_ids.clone()
+                };
                 format!(
-                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n\
-                     Uid:\t{uid} {uid} {uid} {uid}\nGid:\t{gid} {gid} {gid} {gid}\n",
+                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n{ids}",
                     self.comm, self.state, self.pid, self.pid, self.ppid
                 )
                 .into_bytes()
@@ -228,7 +241,16 @@ impl ProcTask {
 }
 
 /// Files under `/proc/<pid>` for a task other than the reader.
-const TASK_FILES: &[&str] = &["cgroup", "cmdline", "comm", "stat", "status"];
+const TASK_FILES: &[&str] = &[
+    "cgroup",
+    "cmdline",
+    "comm",
+    "gid_map",
+    "setgroups",
+    "stat",
+    "status",
+    "uid_map",
+];
 
 /// A fixed inode range for `/proc/<pid>` entries, which have no table entry.
 fn task_inode(pid: u32, slot: u64) -> u64 {
@@ -641,6 +663,14 @@ pub struct ProcData {
     pub uid: u32,
     /// Real/effective/saved/filesystem gid.
     pub gid: u32,
+    /// Who owns `self/` and what's in it: the reader's effective ids, as the VM
+    /// sees them.
+    pub owner: (u32, u32),
+    /// `status`'s `Uid:`, `Gid:` and `Groups:` lines, and its capability,
+    /// `NoNewPrivs` and `Seccomp` lines, once the kernel has said (until then
+    /// `uid`/`gid` are shown).
+    pub status_ids: String,
+    pub status_security: String,
     /// Single-letter run state (`R`, `S`, `D`, `Z`, `T`) for `stat`/`status`.
     pub state: char,
     /// Thread count.
@@ -684,6 +714,9 @@ impl Default for ProcData {
             ppid: 0,
             uid: 0,
             gid: 0,
+            owner: (0, 0),
+            status_ids: String::new(),
+            status_security: String::new(),
             state: 'R',
             threads: 1,
             vm_size_kb: 4096,
@@ -722,6 +755,11 @@ pub struct ProcSelf {
     pub cwd: String,
     pub pid: u32,
     pub ppid: u32,
+    /// The reader's effective ids as the VM sees them, which own `self/`.
+    pub owner: (u32, u32),
+    /// `self/status`'s id lines and security lines (see [`ProcData`]).
+    pub status_ids: String,
+    pub status_security: String,
     /// Open descriptors as `(fd number, symlink target)`, backing `self/fd/`.
     pub fds: Vec<(u32, String)>,
     /// The task's saved auxiliary vector (`self/auxv`).
@@ -789,6 +827,9 @@ impl ProcFs {
         d.cwd = live.cwd;
         d.pid = live.pid;
         d.ppid = live.ppid;
+        d.owner = live.owner;
+        d.status_ids = live.status_ids;
+        d.status_security = live.status_security;
         d.fds = live.fds;
         d.auxv = live.auxv;
         if live.arch.is_some() {
@@ -952,28 +993,38 @@ impl ProcFs {
                 };
                 smaps_body(&text)
             }
-            "self/status" => format!(
-                "Name:\t{comm}\n\
-                 State:\t{state} ({state_desc})\n\
-                 Tgid:\t{pid}\n\
-                 Pid:\t{pid}\n\
-                 PPid:\t{ppid}\n\
-                 Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n\
-                 Gid:\t{gid}\t{gid}\t{gid}\t{gid}\n\
-                 Threads:\t{threads}\n\
-                 VmSize:\t{vsize} kB\n\
-                 VmRSS:\t{rss} kB\n",
-                comm = d.comm,
-                state = d.state,
-                state_desc = state_desc(d.state),
-                pid = d.pid,
-                ppid = d.ppid,
-                uid = d.uid,
-                gid = d.gid,
-                threads = d.threads,
-                vsize = d.vm_size_kb,
-                rss = d.vm_rss_kb,
-            ),
+            "self/status" => {
+                let ids = if d.status_ids.is_empty() {
+                    format!(
+                        "Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\n",
+                        uid = d.uid,
+                        gid = d.gid
+                    )
+                } else {
+                    d.status_ids.clone()
+                };
+                format!(
+                    "Name:\t{comm}\n\
+                     State:\t{state} ({state_desc})\n\
+                     Tgid:\t{pid}\n\
+                     Pid:\t{pid}\n\
+                     PPid:\t{ppid}\n\
+                     {ids}\
+                     Threads:\t{threads}\n\
+                     VmSize:\t{vsize} kB\n\
+                     VmRSS:\t{rss} kB\n\
+                     {security}",
+                    comm = d.comm,
+                    state = d.state,
+                    state_desc = state_desc(d.state),
+                    pid = d.pid,
+                    ppid = d.ppid,
+                    threads = d.threads,
+                    vsize = d.vm_size_kb,
+                    rss = d.vm_rss_kb,
+                    security = d.status_security,
+                )
+            }
             _ => return None,
         };
         Some(body.into_bytes())
@@ -1556,12 +1607,17 @@ impl MountFs for ProcFs {
             let data = self.content(rel)?;
             (NodeKind::File, S_IFREG | 0o444, data.len() as u64)
         };
+        let (uid, gid) = if rel == "self" || rel.starts_with("self/") {
+            self.data.owner
+        } else {
+            (0, 0)
+        };
         Some(Attrs {
             kind,
             size,
             mode,
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             atime: 0,
             mtime: 0,
             inode,
@@ -1765,6 +1821,9 @@ mod tests {
             ppid: 7,
             uid: 1000,
             gid: 1000,
+            owner: (1000, 1000),
+            status_ids: String::new(),
+            status_security: String::new(),
             state: 'R',
             threads: 3,
             vm_size_kb: 8192,
@@ -1791,6 +1850,8 @@ mod tests {
             state: 'S',
             uid: 5,
             gid: 6,
+            status_ids: String::new(),
+            id_files: Default::default(),
             cgroup: "0::/a\n".to_string(),
         }];
         fs
@@ -1811,7 +1872,7 @@ mod tests {
         assert!(stat.starts_with("7 (worker) S 1 "), "{stat}");
         assert_eq!(stat.split_whitespace().count(), 52);
         let status = String::from_utf8(read_all(&mut fs, "7/status")).unwrap();
-        assert!(status.contains("Uid:\t5 5 5 5"), "{status}");
+        assert!(status.contains("Uid:\t5\t5\t5\t5"), "{status}");
     }
 
     #[test]
@@ -1901,6 +1962,9 @@ mod tests {
             cwd: "/tmp".to_string(),
             pid: 7,
             ppid: 3,
+            owner: (0, 0),
+            status_ids: String::new(),
+            status_security: String::new(),
             fds: vec![(0, "/dev/null".to_string()), (3, "pipe:[9]".to_string())],
             auxv: vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0],
             arch: None,

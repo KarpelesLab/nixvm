@@ -111,7 +111,7 @@ struct SchedCaller {
 impl SchedCaller {
     fn of(cx: &ServiceCtx) -> Self {
         Self {
-            capable: cx.cur.host_capable(),
+            capable: cx.cur.host_capable(super::caps::CAP_SYS_NICE),
             euid: cx.cur.creds.euid,
         }
     }
@@ -560,7 +560,10 @@ impl Kernel {
             if class > 3 || (class != 0 && class != 3 && level > 7) || prio > 0xffff {
                 return err(Errno::EINVAL);
             }
-            if class == IOPRIO_CLASS_RT && !cx.cur.privileged() {
+            if class == IOPRIO_CLASS_RT
+                && !Self::capable(cx, super::caps::CAP_SYS_NICE)
+                && !Self::capable(cx, super::caps::CAP_SYS_ADMIN)
+            {
                 return err(Errno::EPERM);
             }
         }
@@ -1053,12 +1056,10 @@ impl Kernel {
             }
         }
         let [eff, perm, inh] = sets.map(|s| s & CAP_ALL);
-        let [_, old_perm, _] = task_caps(&cx.cur);
-        if perm & !old_perm != 0 || eff & !perm != 0 || inh & !(old_perm | inh) != 0 {
-            return err(Errno::EPERM);
+        match cx.cur.caps.capset(eff, perm, inh) {
+            Ok(()) => 0,
+            Err(e) => err(e),
         }
-        cx.cur.caps = Some([eff, perm, inh]);
-        0
     }
 
     /// `adjtimex(buf)` / `clock_adjtime(clk, buf)`: read the kernel clock
@@ -1230,7 +1231,10 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         // A new user namespace needs no privilege, and gives what the rest need.
-        if flags & NS != 0 && !cx.cur.privileged() && flags & CLONE_NEWUSER == 0 {
+        if flags & NS != 0
+            && !cx.cur.caps.has(super::caps::CAP_SYS_ADMIN)
+            && flags & CLONE_NEWUSER == 0
+        {
             return err(Errno::EPERM);
         }
         // A chroot jail isn't a way to confuse a privileged program in a new one.
@@ -1364,14 +1368,9 @@ impl Kernel {
     }
 }
 
-/// `[effective, permitted, inheritable]` for a task: what `capset` stored, or
-/// root's full set / nothing for a non-root task.
+/// `[effective, permitted, inheritable]` for a task.
 fn task_caps(p: &ProcInfo) -> [u64; 3] {
-    p.caps.unwrap_or(if p.privileged() {
-        [CAP_ALL, CAP_ALL, 0]
-    } else {
-        [0, 0, 0]
-    })
+    [p.caps.effective, p.caps.permitted, p.caps.inheritable]
 }
 
 impl Kernel {

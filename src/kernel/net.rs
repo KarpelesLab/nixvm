@@ -2901,7 +2901,7 @@ impl Kernel {
         };
         if matches!(net.socks[sock].kind, Kind::Netlink(_)) {
             let nonblock = net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
-            let Some(data) = self.drain_netlink(net, sock, len as usize) else {
+            let Some(packet) = self.drain_netlink(net, sock, len as usize, flags) else {
                 if nonblock {
                     return err(Errno::EAGAIN);
                 }
@@ -2910,11 +2910,15 @@ impl Kernel {
             };
             // Every reply's source is the kernel, whose `nl_pid` is always `0`.
             write_netlink_sockaddr(mem, src_addr, src_addrlen, 0);
-            let n = data.len();
-            if mem.write(buf, &data).is_err() {
+            let n = packet.len().min(len as usize);
+            if mem.write(buf, &packet[..n]).is_err() {
                 return err(Errno::EFAULT);
             }
-            return n as i64;
+            return if flags & MSG_TRUNC != 0 {
+                packet.len() as i64
+            } else {
+                n as i64
+            };
         }
         if !matches!(net.socks[sock].kind, Kind::Dgram(_)) {
             let n = self.recv_stream(net, cx, sock, end, buf, len, mem, flags);
@@ -3150,6 +3154,9 @@ impl Kernel {
             }
             off += take;
         }
+        // A datagram or netlink message longer than the buffer: the rest is
+        // lost, and with `MSG_TRUNC` the call says how long it was.
+        let whole = got.len();
         got.truncate(off);
         // Fill msg_name (source address); `msg_namelen` (socklen_t at msg+8)
         // doubles as write_sockaddr's in/out length word — it carries the
@@ -3165,7 +3172,11 @@ impl Kernel {
         // msg_controllen), setting msg_flags (offset 48).
         self.emit_scm_rights(net, cx, msg, &hdr, flags, scm_fds, &mut msg_flags, mem);
         let _ = mem.write(msg + 48, &(msg_flags as i32).to_le_bytes());
-        off as i64
+        if flags & MSG_TRUNC != 0 && msg_flags & MSG_TRUNC != 0 {
+            whole as i64
+        } else {
+            off as i64
+        }
     }
 
     /// Materialize `scm_fds` (in-flight SCM_RIGHTS fds delivered with this
@@ -3242,10 +3253,11 @@ impl Kernel {
         cap: u64,
         flags: u64,
     ) -> Result<Vec<u8>, i64> {
-        let (_, data, _, fds) = self.recv_message(net, cx, fd, cap, flags)?;
+        let (_, mut data, _, fds) = self.recv_message(net, cx, fd, cap, flags)?;
         for f in &fds {
             self.scm_ref(net, f, false);
         }
+        data.truncate(cap as usize);
         Ok(data)
     }
 
@@ -3267,8 +3279,15 @@ impl Kernel {
         match &net.socks[sock].kind {
             Kind::Netlink(_) => {
                 let nonblock = net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
-                match self.drain_netlink(net, sock, cap as usize) {
-                    Some(data) => Ok((None, data, 0, Vec::new())),
+                match self.drain_netlink(net, sock, cap as usize, flags) {
+                    Some(data) => {
+                        let mf = if data.len() as u64 > cap {
+                            MSG_TRUNC
+                        } else {
+                            0
+                        };
+                        Ok((None, data, mf, Vec::new()))
+                    }
                     None => {
                         if nonblock {
                             Err(err(Errno::EAGAIN))
@@ -3282,10 +3301,12 @@ impl Kernel {
             Kind::Dgram(_) => {
                 let nonblock = net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
                 match self.recv_dgram_msg(net, sock, flags) {
-                    Some((from, mut data)) => {
-                        let truncated = data.len() as u64 > cap;
-                        data.truncate(cap as usize);
-                        let mf = if truncated { MSG_TRUNC } else { 0 };
+                    Some((from, data)) => {
+                        let mf = if data.len() as u64 > cap {
+                            MSG_TRUNC
+                        } else {
+                            0
+                        };
                         Ok((Some(Addr::Inet(from)), data, mf, Vec::new()))
                     }
                     None => {
@@ -3384,13 +3405,14 @@ impl Kernel {
         }
         if matches!(net.socks[sock].kind, Kind::Netlink(_)) {
             let nonblock = net.socks[sock].nonblock;
-            let Some(data) = self.drain_netlink(net, sock, count as usize) else {
+            let Some(mut data) = self.drain_netlink(net, sock, count as usize, 0) else {
                 if nonblock {
                     return err(Errno::EAGAIN);
                 }
                 cx.block = true;
                 return 0;
             };
+            data.truncate(count as usize);
             if mem.write(buf, &data).is_err() {
                 return err(Errno::EFAULT);
             }
@@ -3446,35 +3468,47 @@ impl Kernel {
         }
     }
 
-    /// Drain up to `want` bytes' worth of complete, already-encoded messages
-    /// from netlink socket `sock`'s reply queue, in order — packing as many
-    /// whole messages as fit (never splitting one across two `recv` calls,
-    /// leaving the remainder queued for the next read, like a real netlink
-    /// socket packing a dump reply across skbs). `None` means the queue is
-    /// currently empty (the caller decides block/`EAGAIN`); `Some` is always
-    /// non-empty. If even the single next message doesn't fit `want`, it is
-    /// truncated to `want` bytes and dropped from the queue (datagram
-    /// semantics: an oversized read is truncated, not left partially queued).
+    /// The next netlink "packet" queued for socket `sock`: as many whole
+    /// messages as fit `want` bytes, or the first message alone. That's what a
+    /// receive returns, the caller cutting it to its buffer; whatever doesn't
+    /// fit is lost (datagram semantics). With `MSG_TRUNC` the packet is formed
+    /// as for a 32 KiB buffer, the size a zero-length peek reports so the
+    /// caller can size its buffer for the read that follows (iproute2 does
+    /// this); with `MSG_PEEK` it stays queued.
     #[allow(clippy::unused_self)]
-    fn drain_netlink(&self, net: &mut Net, sock: usize, want: usize) -> Option<Vec<u8>> {
+    fn drain_netlink(
+        &self,
+        net: &mut Net,
+        sock: usize,
+        want: usize,
+        flags: u64,
+    ) -> Option<Vec<u8>> {
+        const TRUNC_PACKET: usize = 32 * 1024;
         let Kind::Netlink(nl) = &mut net.socks[sock].kind else {
             unreachable!("checked by caller")
         };
-        if nl.queue.is_empty() {
+        let limit = if flags & MSG_TRUNC != 0 {
+            want.max(TRUNC_PACKET)
+        } else {
+            want
+        };
+        let mut out = Vec::new();
+        let mut taken = 0;
+        for next in &nl.queue {
+            if taken > 0 && out.len() + next.len() > limit {
+                break;
+            }
+            out.extend_from_slice(next);
+            taken += 1;
+            if out.len() >= limit {
+                break;
+            }
+        }
+        if taken == 0 {
             return None;
         }
-        let mut out = Vec::new();
-        while let Some(next) = nl.queue.front() {
-            if out.is_empty() && next.len() > want {
-                let msg = nl.queue.pop_front().expect("front just checked Some");
-                out.extend_from_slice(&msg[..want.min(msg.len())]);
-                break;
-            }
-            if out.len() + next.len() > want {
-                break;
-            }
-            let msg = nl.queue.pop_front().expect("front just checked Some");
-            out.extend_from_slice(&msg);
+        if flags & MSG_PEEK == 0 {
+            nl.queue.drain(..taken);
         }
         Some(out)
     }
@@ -3656,7 +3690,7 @@ impl Kernel {
         nosignal: bool,
     ) -> i64 {
         if matches!(net.socks[sock].kind, Kind::Netlink(_)) {
-            let privileged = cx.cur.privileged();
+            let privileged = self.capable_over(cx, cx.cur.ns.net, super::caps::CAP_NET_ADMIN);
             return self.handle_netlink_request(net, sock, data, privileged);
         }
         if matches!(net.socks[sock].kind, Kind::Dgram(_)) {

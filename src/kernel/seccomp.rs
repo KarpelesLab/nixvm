@@ -220,7 +220,7 @@ impl Kernel {
                 if st.mode == SECCOMP_MODE_STRICT {
                     return err(Errno::EINVAL);
                 }
-                if !cx.cur.no_new_privs && !cx.cur.privileged() {
+                if !cx.cur.no_new_privs && !cx.cur.caps.has(super::caps::CAP_SYS_ADMIN) {
                     return err(Errno::EACCES);
                 }
                 let prog = match Self::read_fprog(mem, args) {
@@ -431,6 +431,7 @@ mod tests {
         );
         // Without no_new_privs a non-root task may not install a filter.
         cx.cur.creds.euid = 1000;
+        cx.cur.caps = crate::kernel::caps::CapSets::none();
         assert_eq!(
             call(
                 &k,

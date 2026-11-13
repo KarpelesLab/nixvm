@@ -46,10 +46,16 @@ impl Kernel {
         let Some(rel) = read_path(mem, target) else {
             return err(Errno::EFAULT);
         };
-        let abs = match self.follow_or_eloop(vfs, &self.resolve_path(cx, AT_FDCWD, &rel)) {
+        let abs = match self.follow_or_eloop(vfs, cx, &self.resolve_path(cx, AT_FDCWD, &rel)) {
             Ok(p) => p,
             Err(e) => return e,
         };
+        if self.trace {
+            eprintln!(
+                "[mount] pid={} target {rel:?} -> {abs:?} flags={flags:#x}",
+                cx.cur.pid
+            );
+        }
         match vfs.stat(&abs) {
             Some(st) if st.kind == NodeKind::Dir => {}
             Some(_) if flags & MS_BIND != 0 => {}
@@ -69,11 +75,11 @@ impl Kernel {
             let Some(source) = read_path(mem, a[0]) else {
                 return err(Errno::EFAULT);
             };
-            let source = match self.follow_or_eloop(vfs, &self.resolve_path(cx, AT_FDCWD, &source))
-            {
-                Ok(p) => p,
-                Err(e) => return e,
-            };
+            let source =
+                match self.follow_or_eloop(vfs, cx, &self.resolve_path(cx, AT_FDCWD, &source)) {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                };
             if vfs.stat(&source).is_none() {
                 return err(Errno::ENOENT);
             }
@@ -144,13 +150,13 @@ impl Kernel {
         path: u64,
         mem: &GuestMemory,
     ) -> i64 {
-        if !cx.cur.privileged() {
+        if !cx.cur.caps.has(super::caps::CAP_SYS_CHROOT) {
             return err(Errno::EPERM);
         }
         let Some(rel) = read_path(mem, path) else {
             return err(Errno::EFAULT);
         };
-        let abs = match self.follow_or_eloop(vfs, &self.resolve_path(cx, AT_FDCWD, &rel)) {
+        let abs = match self.follow_or_eloop(vfs, cx, &self.resolve_path(cx, AT_FDCWD, &rel)) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -188,7 +194,7 @@ impl Kernel {
         };
         let mut vfs = self.vfs_for(cx);
         let follow = |this: &Self, vfs: &mut MountTable, p: &str| {
-            this.follow_or_eloop(vfs, &this.resolve_path(cx, AT_FDCWD, p))
+            this.follow_or_eloop(vfs, cx, &this.resolve_path(cx, AT_FDCWD, p))
         };
         let new_root = match follow(self, &mut vfs, &new_root) {
             Ok(p) => p,
@@ -371,7 +377,7 @@ impl Kernel {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(cx, AT_FDCWD, &rel);
-        let abs = match self.follow_or_eloop(vfs, &abs) {
+        let abs = match self.follow_or_eloop(vfs, cx, &abs) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -436,6 +442,12 @@ impl Kernel {
         use super::RunState;
         let sh = self.shared.lock().unwrap();
         let describe = |info: &super::ProcInfo| {
+            let (owner, status_ids, id_files) = {
+                let users = self.users.lock().unwrap();
+                let (owner, ids) = Self::task_ids(&users, cx.cur.ns.user, info);
+                let (u, g, s) = users.identity_files(info.ns.user);
+                (owner, ids, [u, g, s])
+            };
             let pid = self.visible_pid(cx, info.tgid);
             (pid != 0).then(|| crate::fs::ProcTask {
                 pid: pid as u32,
@@ -448,8 +460,10 @@ impl Kernel {
                     RunState::Stopped(_) => 'T',
                     RunState::Zombie(_) => 'Z',
                 },
-                uid: info.creds.ruid,
-                gid: info.creds.rgid,
+                uid: owner.0,
+                gid: owner.1,
+                status_ids,
+                id_files,
                 cgroup: self.cgroup_line(cx, info.pid),
             })
         };
@@ -490,10 +504,61 @@ impl Kernel {
             cwd: Self::as_seen_from_root(cx, &cx.cur.cwd),
             pid: self.visible_pid(cx, cx.cur.tgid) as u32,
             ppid: self.visible_pid(cx, cx.cur.ppid) as u32,
+            owner: {
+                let users = self.users.lock().unwrap();
+                Self::task_ids(&users, cx.cur.ns.user, &cx.cur).0
+            },
+            status_ids: self.status_id_lines(cx),
+            status_security: format!(
+                "{}NoNewPrivs:\t{}\nSeccomp:\t{}\n",
+                cx.cur.caps.status_lines(),
+                u8::from(cx.cur.no_new_privs),
+                cx.cur.seccomp.mode()
+            ),
             fds,
             auxv: cx.cur.auxv.clone(),
             arch: Some(self.arch),
         }
+    }
+
+    /// A task's effective ids as the VM sees them, which own its `/proc/<pid>`,
+    /// and its `status` id lines as user namespace `reader` sees them.
+    fn task_ids(
+        users: &super::userns::UserNamespaces,
+        reader: u32,
+        info: &super::ProcInfo,
+    ) -> ((u32, u32), String) {
+        use super::userns::{IdKind, OVERFLOW_ID};
+        let ns = info.ns.user;
+        let global = |kind, id| users.to_global(ns, kind, id).unwrap_or(OVERFLOW_ID);
+        let seen = |kind, id| users.seen_from_global(reader, kind, global(kind, id));
+        let c = info.creds;
+        let line = |kind, ids: [u32; 4]| ids.map(|id| seen(kind, id).to_string()).join("\t");
+        let ids = format!(
+            "Uid:\t{}\nGid:\t{}\n",
+            line(IdKind::Uid, [c.ruid, c.euid, c.suid, c.fsuid]),
+            line(IdKind::Gid, [c.rgid, c.egid, c.sgid, c.fsgid])
+        );
+        (
+            (global(IdKind::Uid, c.euid), global(IdKind::Gid, c.egid)),
+            ids,
+        )
+    }
+
+    /// `status`'s `Uid:`, `Gid:` and `Groups:` lines, in the reader's user
+    /// namespace.
+    fn status_id_lines(&self, cx: &ServiceCtx) -> String {
+        use std::fmt::Write as _;
+        let c = cx.cur.creds;
+        let mut out = format!(
+            "Uid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\nGroups:\t",
+            c.ruid, c.euid, c.suid, c.fsuid, c.rgid, c.egid, c.sgid, c.fsgid
+        );
+        for g in self.visible_groups(cx) {
+            let _ = write!(out, "{g} ");
+        }
+        out.push('\n');
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -743,7 +808,7 @@ impl Kernel {
             };
             let abs = self.resolve_path(cx, dirfd, &rel);
             if flags & AT_SYMLINK_NOFOLLOW == 0 {
-                match self.follow_or_eloop(vfs, &abs) {
+                match self.follow_or_eloop(vfs, cx, &abs) {
                     Ok(p) => p,
                     Err(e) => return e,
                 }
@@ -772,7 +837,7 @@ impl Kernel {
             return err(Errno::EFAULT);
         };
         let abs = self.resolve_path(cx, dirfd, &rel);
-        let abs = match self.follow_or_eloop(vfs, &abs) {
+        let abs = match self.follow_or_eloop(vfs, cx, &abs) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -987,7 +1052,7 @@ impl Kernel {
         };
         let had_slash = rel.len() > 1 && rel.ends_with('/');
         let abs = self.resolve_path(cx, dirfd, &rel);
-        let abs = match self.follow_or_eloop(vfs, &abs) {
+        let abs = match self.follow_or_eloop(vfs, cx, &abs) {
             Ok(p) => p,
             Err(e) => return e,
         };

@@ -14,19 +14,12 @@ use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
 /// The last capability Linux defines (`CAP_CHECKPOINT_RESTORE`).
-const CAP_LAST_CAP: u64 = 40;
-const CAP_ALL: u64 = (1u64 << (CAP_LAST_CAP + 1)) - 1;
+const CAP_LAST_CAP: u64 = super::caps::CAP_LAST_CAP as u64;
 
 /// Per-task `prctl` state without a better home.
 #[derive(Clone, Copy, Debug)]
 #[allow(clippy::struct_excessive_bools)] // independent per-option latches
 pub(super) struct PrctlState {
-    keepcaps: bool,
-    /// The capability bounding set (`PR_CAPBSET_READ`/`DROP`).
-    bset: u64,
-    /// Ambient capabilities (`PR_CAP_AMBIENT`).
-    ambient: u64,
-    securebits: u32,
     /// Timer slack in ns (default 50 µs).
     timerslack: u64,
     /// `PR_SET_CHILD_SUBREAPER`: orphaned descendants are reparented here
@@ -46,10 +39,6 @@ pub(super) struct PrctlState {
 impl Default for PrctlState {
     fn default() -> Self {
         Self {
-            keepcaps: false,
-            bset: CAP_ALL,
-            ambient: 0,
-            securebits: 0,
             timerslack: 50_000,
             child_subreaper: false,
             thp_disable: false,
@@ -118,7 +107,8 @@ impl Kernel {
         const PR_SET_VMA: u64 = 0x5356_4d41;
         const PR_SET_PTRACER: u64 = 0x5961_6d61;
         let (a2, a3) = (args[1], args[2]);
-        let root = cx.cur.privileged();
+        // CAP_SYS_ADMIN over the VM, for the options that need it.
+        let root = Self::capable(cx, super::caps::CAP_SYS_ADMIN);
         let put_i32 = |mem: &mut GuestMemory, at: u64, v: i32| -> i64 {
             if mem.write(at, &v.to_le_bytes()).is_ok() {
                 0
@@ -180,10 +170,9 @@ impl Kernel {
                 if a2 > 1 {
                     return err(Errno::EINVAL);
                 }
-                pr.keepcaps = a2 == 1;
-                0
+                cx.cur.caps.set_keep_caps(a2 == 1).map_or_else(err, |()| 0)
             }
-            PR_GET_KEEPCAPS => i64::from(pr.keepcaps),
+            PR_GET_KEEPCAPS => i64::from(cx.cur.caps.keep_caps()),
             // Only statistical process timing exists.
             PR_GET_TIMING => 0,
             PR_SET_TIMING => {
@@ -199,17 +188,17 @@ impl Kernel {
                 if a2 > CAP_LAST_CAP {
                     err(Errno::EINVAL)
                 } else {
-                    i64::from(pr.bset >> a2 & 1 == 1)
+                    i64::from(cx.cur.caps.bounding >> a2 & 1 == 1)
                 }
             }
             PR_CAPBSET_DROP => {
                 if a2 > CAP_LAST_CAP {
                     err(Errno::EINVAL)
-                } else if !root {
-                    err(Errno::EPERM)
                 } else {
-                    pr.bset &= !(1 << a2);
-                    0
+                    cx.cur
+                        .caps
+                        .drop_bounding(a2 as u32)
+                        .map_or_else(err, |()| 0)
                 }
             }
             PR_CAP_AMBIENT => {
@@ -221,44 +210,30 @@ impl Kernel {
                     if a3 != 0 {
                         return err(Errno::EINVAL);
                     }
-                    pr.ambient = 0;
+                    cx.cur.caps.ambient = 0;
                     return 0;
                 }
                 if a3 > CAP_LAST_CAP || args[3] != 0 || args[4] != 0 {
                     return err(Errno::EINVAL);
                 }
                 match a2 {
-                    IS_SET => i64::from(pr.ambient >> a3 & 1 == 1),
+                    IS_SET => i64::from(cx.cur.caps.ambient >> a3 & 1 == 1),
                     // Raising needs the capability permitted and inheritable;
                     // root's default set has nothing inheritable.
-                    RAISE => {
-                        let inh = cx.cur.caps.map_or(0, |c| c[2]);
-                        let perm = cx.cur.caps.map_or(if root { CAP_ALL } else { 0 }, |c| c[1]);
-                        if inh >> a3 & 1 == 0 || perm >> a3 & 1 == 0 {
-                            err(Errno::EPERM)
-                        } else {
-                            pr.ambient |= 1 << a3;
-                            0
-                        }
-                    }
+                    RAISE => cx
+                        .cur
+                        .caps
+                        .raise_ambient(a3 as u32)
+                        .map_or_else(err, |()| 0),
                     LOWER => {
-                        pr.ambient &= !(1 << a3);
+                        cx.cur.caps.ambient &= !(1 << a3);
                         0
                     }
                     _ => err(Errno::EINVAL),
                 }
             }
-            PR_GET_SECUREBITS => i64::from(pr.securebits),
-            PR_SET_SECUREBITS => {
-                if !root {
-                    err(Errno::EPERM)
-                } else if a2 > 0xff {
-                    err(Errno::EINVAL)
-                } else {
-                    pr.securebits = a2 as u32;
-                    0
-                }
-            }
+            PR_GET_SECUREBITS => i64::from(cx.cur.caps.securebits),
+            PR_SET_SECUREBITS => cx.cur.caps.set_securebits(a2).map_or_else(err, |()| 0),
             PR_GET_TSC if self.arch == Arch::X86_64 => put_i32(mem, a2, pr.tsc as i32),
             PR_SET_TSC if self.arch == Arch::X86_64 => {
                 if a2 == 1 || a2 == 2 {

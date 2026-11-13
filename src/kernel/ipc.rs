@@ -619,7 +619,7 @@ impl Kernel {
                     return err(Errno::EPERM);
                 }
                 let qbytes = u64::from_le_bytes(raw[88..96].try_into().unwrap());
-                if qbytes > MSGMNB && !cx.cur.privileged() {
+                if qbytes > MSGMNB && !Self::capable(cx, super::caps::CAP_SYS_RESOURCE) {
                     return err(Errno::EPERM);
                 }
                 q.perm.set_from(&raw);

@@ -199,14 +199,14 @@ impl Kernel {
                     1 => 0o2,
                     _ => 0o6,
                 };
-                if !cx.cur.privileged() && (m.mode >> 6) & want != want {
+                if !cx.cur.caps.has(super::caps::CAP_DAC_OVERRIDE) && (m.mode >> 6) & want != want {
                     return err(Errno::EACCES);
                 }
                 q
             }
             None if oflag & O_CREAT == 0 => return err(Errno::ENOENT),
             None => {
-                let root = cx.cur.privileged();
+                let root = Self::capable(cx, super::caps::CAP_SYS_RESOURCE);
                 let (maxmsg, msgsize) = if attr == 0 {
                     (DFL_MAXMSG, DFL_MSGSIZE)
                 } else {

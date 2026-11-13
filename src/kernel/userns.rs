@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 
+use super::caps::{CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN};
 use super::{Kernel, RunState, ServiceCtx, Shared, Vcpu, err};
 use crate::abi::arch::Sysno;
 use crate::abi::errno::Errno;
@@ -131,7 +132,8 @@ impl UserNamespaces {
     }
 
     /// Whether `inner` is `outer` or nested inside it.
-    pub(super) fn is_within(&self, inner: u32, outer: u32) -> bool {
+    #[cfg(test)]
+    fn is_within(&self, inner: u32, outer: u32) -> bool {
         outer == 0 || inner == outer || self.chain(inner).contains(&outer)
     }
 
@@ -149,11 +151,10 @@ impl UserNamespaces {
         self.owners.get(&ns).copied().unwrap_or(0)
     }
 
-    /// Whether `ns` is a direct child of `parent` created by `uid` there.
-    pub(super) fn created_by(&self, ns: u32, parent: u32, uid: u32) -> bool {
-        self.table
-            .get(&ns)
-            .is_some_and(|n| n.parent == parent && n.creator_uid == uid)
+    /// The parent of user namespace `ns` and its owner, the euid that created it
+    /// as the parent sees it. `None` for the initial namespace.
+    pub(super) fn parent_and_owner(&self, ns: u32) -> Option<(u32, u32)> {
+        self.table.get(&ns).map(|n| (n.parent, n.creator_uid))
     }
 
     /// Whether `id` has a mapping in `ns`, which is all that lets a task take it on.
@@ -193,6 +194,19 @@ impl UserNamespaces {
     /// The text of a `uid_map` or `gid_map` in `ns`.
     pub(super) fn render(&self, ns: u32, kind: IdKind) -> Option<String> {
         self.map(ns, kind).map(IdMap::render)
+    }
+
+    /// `uid_map`, `gid_map` and `setgroups` of a task in user namespace `ns`.
+    pub(super) fn identity_files(&self, ns: u32) -> (String, String, String) {
+        const IDENTITY: &str = "         0          0 4294967295\n";
+        if ns == 0 {
+            return (IDENTITY.into(), IDENTITY.into(), "allow\n".into());
+        }
+        (
+            self.render(ns, IdKind::Uid).unwrap_or_default(),
+            self.render(ns, IdKind::Gid).unwrap_or_default(),
+            self.setgroups_state(ns).to_string(),
+        )
     }
 
     /// The text of `setgroups` in `ns`.
@@ -382,17 +396,17 @@ fn parse_time_offsets(text: &str, offsets: &mut TimeOffsets) -> Result<(), Errno
 }
 
 impl Kernel {
-    /// Whether this task has privilege over namespace `ns`: it's privileged, and
-    /// the user namespace that owns `ns` is its own or one nested inside it.
+    /// Whether this task has `CAP_SYS_ADMIN` over namespace `ns`, in the user
+    /// namespace that owns it.
     pub(super) fn may_administer(&self, cx: &ServiceCtx, ns: u32) -> bool {
-        if !cx.cur.privileged() {
-            return false;
-        }
-        if cx.cur.ns.user == 0 {
-            return true;
-        }
-        let users = self.users.lock().unwrap();
-        users.is_within(users.owner(ns), cx.cur.ns.user)
+        self.capable_over(cx, ns, CAP_SYS_ADMIN)
+    }
+
+    /// Whether this task holds `cap` over namespace `ns` of a kind other than
+    /// user: in the user namespace that owns it.
+    pub(super) fn capable_over(&self, cx: &ServiceCtx, ns: u32, cap: u32) -> bool {
+        let owner = self.users.lock().unwrap().owner(ns);
+        self.ns_capable(cx, owner, cap)
     }
 
     /// Move `info` into new user namespace `ns`: until a map says otherwise its ids
@@ -419,8 +433,7 @@ impl Kernel {
             sgid: OVERFLOW_ID,
             fsgid: OVERFLOW_ID,
         };
-        info.caps = None;
-        info.ns_caps = true;
+        info.caps = super::caps::CapSets::full();
         Ok(())
     }
 
@@ -649,8 +662,37 @@ impl Kernel {
             };
             (entry.parent, creator)
         };
-        let privileged_in_parent = cx.cur.ns.user == parent && cx.cur.privileged();
-        if !privileged_in_parent && cx.cur.ns.user != ns {
+        // The writer is in the namespace or its parent, holding CAP_SYS_ADMIN
+        // over it; then CAP_SETUID/CAP_SETGID over the parent maps anything, and
+        // the owner can map just its own id.
+        let writer = cx.cur.ns.user;
+        if (writer != ns && writer != parent) || !self.ns_capable(cx, ns, CAP_SYS_ADMIN) {
+            return Err(Errno::EPERM);
+        }
+        let cap = match kind {
+            IdKind::Uid => CAP_SETUID,
+            IdKind::Gid => CAP_SETGID,
+        };
+        let privileged_in_parent = writer == parent && self.ns_capable(cx, parent, cap);
+        // Inside, before its ids are mapped, the writer is who created it.
+        let own_outside = if writer == parent {
+            match kind {
+                IdKind::Uid => cx.cur.creds.euid,
+                IdKind::Gid => cx.cur.creds.egid,
+            }
+        } else {
+            creator
+        };
+        let owner = self
+            .users
+            .lock()
+            .unwrap()
+            .table
+            .get(&ns)
+            .map(|n| n.creator_uid);
+        if !privileged_in_parent
+            && (own_outside != creator || writer == parent && owner != Some(cx.cur.creds.euid))
+        {
             return Err(Errno::EPERM);
         }
         let mut users = self.users.lock().unwrap();
@@ -719,17 +761,7 @@ impl Kernel {
 
     /// The maps and related files as `/proc/self` shows them to this task.
     pub(super) fn proc_identity_files(&self, cx: &ServiceCtx) -> (String, String, String) {
-        const IDENTITY: &str = "         0          0 4294967295\n";
-        if cx.cur.ns.user == 0 {
-            return (IDENTITY.into(), IDENTITY.into(), "allow\n".into());
-        }
-        let users = self.users.lock().unwrap();
-        let ns = cx.cur.ns.user;
-        (
-            users.render(ns, IdKind::Uid).unwrap_or_default(),
-            users.render(ns, IdKind::Gid).unwrap_or_default(),
-            users.setgroups_state(ns).to_string(),
-        )
+        self.users.lock().unwrap().identity_files(cx.cur.ns.user)
     }
 }
 

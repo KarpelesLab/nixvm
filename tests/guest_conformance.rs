@@ -34,6 +34,8 @@ const PROGRAMS: &[&str] = &[
     "madvise",
     "execthread",
     "epoll_et",
+    "userns_caps",
+    "sandbox_fs",
 ];
 
 /// A directory of binaries, also used as the guest's root, so that a program can

@@ -402,6 +402,22 @@ impl MountTable {
         Ok((self.mounts[i].lock(), rel))
     }
 
+    /// As [`Self::resolve_for_write`], for a call that creates `abs_path`: on a
+    /// read-only mount, a name that already exists is `EEXIST` rather than
+    /// `EROFS`, as Linux looks the name up first. `mkdir -p` and sandbox setup
+    /// tools rely on that to walk read-only trees.
+    fn resolve_for_create(
+        &mut self,
+        abs_path: &str,
+    ) -> io::Result<(MutexGuard<'_, Box<dyn MountFs>>, String)> {
+        let canonical = self.canonical(abs_path);
+        let i = self.best_mount(&canonical).ok_or_else(enoent)?;
+        if self.mounts[i].read_only && self.stat_raw(&canonical).is_some() {
+            return Err(io::Error::from_raw_os_error(17)); // EEXIST
+        }
+        self.resolve_for_write(abs_path)
+    }
+
     /// Charge every filesystem's in-memory contents to `quota`, now and for
     /// anything mounted later.
     pub fn attach_quota(&mut self, quota: &std::sync::Arc<crate::limits::Quota>) {
@@ -1084,17 +1100,17 @@ impl MountTable {
     }
 
     pub fn create(&mut self, abs_path: &str, mode: u32) -> io::Result<()> {
-        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
+        let (mut fs, rel) = self.resolve_for_create(abs_path)?;
         fs.create(&rel, mode)
     }
 
     pub fn mkdir(&mut self, abs_path: &str, mode: u32) -> io::Result<()> {
-        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
+        let (mut fs, rel) = self.resolve_for_create(abs_path)?;
         fs.mkdir(&rel, mode)
     }
 
     pub fn mknod(&mut self, abs_path: &str, mode: u32) -> io::Result<()> {
-        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
+        let (mut fs, rel) = self.resolve_for_create(abs_path)?;
         fs.mknod(&rel, mode)
     }
 
@@ -1145,7 +1161,7 @@ impl MountTable {
 
     /// Create a symlink at `abs_link` pointing at `target` (stored verbatim).
     pub fn symlink(&mut self, target: &str, abs_link: &str) -> io::Result<()> {
-        let (mut fs, rel) = self.resolve_for_write(abs_link)?;
+        let (mut fs, rel) = self.resolve_for_create(abs_link)?;
         fs.symlink(target, &rel)
     }
 
