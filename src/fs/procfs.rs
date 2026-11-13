@@ -95,6 +95,21 @@ const PATHS: &[&str] = &[
     "sys/fs",
     "sys/fs/file-max",
     "sys/fs/nr_open",
+    "sys/fs/inotify",
+    "sys/fs/inotify/max_user_watches",
+    "sys/fs/inotify/max_user_instances",
+    "sys/fs/inotify/max_queued_events",
+    "sys/user",
+    "sys/user/max_user_namespaces",
+    "sys/user/max_mnt_namespaces",
+    "sys/user/max_pid_namespaces",
+    "sys/user/max_net_namespaces",
+    "sys/user/max_ipc_namespaces",
+    "sys/user/max_uts_namespaces",
+    "sys/user/max_cgroup_namespaces",
+    "sys/user/max_time_namespaces",
+    "sys/user/max_inotify_watches",
+    "sys/user/max_inotify_instances",
     "diskstats",
     "partitions",
     "swaps",
@@ -154,6 +169,7 @@ const PATHS: &[&str] = &[
     "consoles",
     "self/task",
     "thread-self",
+    "self/fdinfo",
 ];
 
 /// Static top-level file names, in `readdir("")` order.
@@ -196,8 +212,8 @@ pub struct ProcTask {
     /// Who owns its `/proc/<pid>` entries: its effective ids, as the VM sees them.
     pub uid: u32,
     pub gid: u32,
-    /// Its `status` file's `Uid:` and `Gid:` lines, in the reader's terms. Empty
-    /// shows `uid`/`gid`.
+    /// Its `status` file's `Uid:`, `Gid:` and `Groups:` lines, in the reader's
+    /// terms, and its capability lines. Empty shows `uid`/`gid`.
     pub status_ids: String,
     /// Its user namespace's `uid_map`, `gid_map` and `setgroups`.
     pub id_files: [String; 3],
@@ -329,6 +345,7 @@ const NS_FILES: &[&str] = &[
 const SELF_FILES: &[&str] = &[
     "ns",
     "task",
+    "fdinfo",
     "timens_offsets",
     "cmdline",
     "status",
@@ -406,6 +423,24 @@ const SYS_VM_FILES: &[&str] = &["overcommit_memory", "max_map_count"];
 
 /// Tunables exposed under `sys/fs/`.
 const SYS_FS_FILES: &[&str] = &["file-max", "nr_open"];
+const SYS_FS_INOTIFY_FILES: &[&str] = &[
+    "max_user_watches",
+    "max_user_instances",
+    "max_queued_events",
+];
+/// `sys/user/`: the per-user-namespace limits.
+const SYS_USER_FILES: &[&str] = &[
+    "max_user_namespaces",
+    "max_mnt_namespaces",
+    "max_pid_namespaces",
+    "max_net_namespaces",
+    "max_ipc_namespaces",
+    "max_uts_namespaces",
+    "max_cgroup_namespaces",
+    "max_time_namespaces",
+    "max_inotify_watches",
+    "max_inotify_instances",
+];
 
 // ---- static file bodies (each ends with a newline) ----
 
@@ -1125,6 +1160,13 @@ impl ProcFs {
                 };
                 smaps_body(&text)
             }
+            _ if rel
+                .strip_prefix("self/fdinfo/")
+                .and_then(|n| n.parse::<u32>().ok())
+                .is_some_and(|n| self.fd_target(n).is_some()) =>
+            {
+                "pos:\t0\nflags:\t02000002\nmnt_id:\t1\nino:\t0\n".to_string()
+            }
             "self/status" => {
                 let ids = if d.status_ids.is_empty() {
                     format!(
@@ -1217,6 +1259,17 @@ fn static_content(rel: &str) -> Option<&'static [u8]> {
         "sys/vm/overcommit_memory" => OVERCOMMIT_MEMORY,
         "sys/vm/max_map_count" => MAX_MAP_COUNT,
         "sys/fs/file-max" => FILE_MAX,
+        "sys/fs/inotify/max_user_watches" | "sys/user/max_inotify_watches" => "524288\n",
+        "sys/fs/inotify/max_user_instances" | "sys/user/max_inotify_instances" => "128\n",
+        "sys/fs/inotify/max_queued_events" => "16384\n",
+        "sys/user/max_user_namespaces"
+        | "sys/user/max_mnt_namespaces"
+        | "sys/user/max_pid_namespaces"
+        | "sys/user/max_net_namespaces"
+        | "sys/user/max_ipc_namespaces"
+        | "sys/user/max_uts_namespaces"
+        | "sys/user/max_cgroup_namespaces"
+        | "sys/user/max_time_namespaces" => "63229\n",
         "sys/fs/nr_open" => NR_OPEN,
         "diskstats" => DISKSTATS,
         "partitions" => PARTITIONS,
@@ -1618,6 +1671,7 @@ fn is_dir(rel: &str) -> bool {
             | "self/fd"
             | "self/ns"
             | "self/task"
+            | "self/fdinfo"
             | "sys"
             | "sys/kernel"
             | "sys/kernel/random"
@@ -1628,6 +1682,8 @@ fn is_dir(rel: &str) -> bool {
             | "sys/net/ipv4"
             | "sys/vm"
             | "sys/fs"
+            | "sys/fs/inotify"
+            | "sys/user"
     )
 }
 
@@ -1712,6 +1768,27 @@ impl MountFs for ProcFs {
                 atime: 0,
                 mtime: 0,
                 inode: fd_inode(n),
+                nlink: 1,
+                rdev: 0,
+                dev: 0,
+            });
+        }
+
+        if let Some(n) = rel
+            .strip_prefix("self/fdinfo/")
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            self.fd_target(n)?;
+            let (uid, gid) = self.data.owner;
+            return Some(Attrs {
+                kind: NodeKind::File,
+                size: 0,
+                mode: S_IFREG | 0o444,
+                uid,
+                gid,
+                atime: 0,
+                mtime: 0,
+                inode: fd_inode(n) + 100_000,
                 nlink: 1,
                 rdev: 0,
                 dev: 0,
@@ -1868,7 +1945,7 @@ impl MountFs for ProcFs {
                     let path = format!("self/{n}");
                     let kind = match *n {
                         "exe" | "cwd" | "root" => NodeKind::Symlink,
-                        "fd" | "ns" | "task" => NodeKind::Dir,
+                        "fd" | "ns" | "task" | "fdinfo" => NodeKind::Dir,
                         _ => NodeKind::File,
                     };
                     entry(n, &path, kind)
@@ -1888,11 +1965,22 @@ impl MountFs for ProcFs {
                     inode: fd_inode(*fd),
                 })
                 .collect()),
+            "self/fdinfo" => Ok(self
+                .data
+                .fds
+                .iter()
+                .map(|(fd, _)| DirEntry {
+                    name: fd.to_string(),
+                    kind: NodeKind::File,
+                    inode: fd_inode(*fd) + 100_000,
+                })
+                .collect()),
             "sys" => Ok(vec![
                 entry("kernel", "sys/kernel", NodeKind::Dir),
                 entry("net", "sys/net", NodeKind::Dir),
                 entry("vm", "sys/vm", NodeKind::Dir),
                 entry("fs", "sys/fs", NodeKind::Dir),
+                entry("user", "sys/user", NodeKind::Dir),
             ]),
             "sys/kernel" => {
                 let mut out = list_files("sys/kernel", SYS_KERNEL_FILES);
@@ -1913,7 +2001,13 @@ impl MountFs for ProcFs {
             "sys/net/core" => Ok(list_files("sys/net/core", SYS_NET_CORE_FILES)),
             "sys/net/ipv4" => Ok(list_files("sys/net/ipv4", SYS_NET_IPV4_FILES)),
             "sys/vm" => Ok(list_files("sys/vm", SYS_VM_FILES)),
-            "sys/fs" => Ok(list_files("sys/fs", SYS_FS_FILES)),
+            "sys/fs" => {
+                let mut out = list_files("sys/fs", SYS_FS_FILES);
+                out.push(entry("inotify", "sys/fs/inotify", NodeKind::Dir));
+                Ok(out)
+            }
+            "sys/fs/inotify" => Ok(list_files("sys/fs/inotify", SYS_FS_INOTIFY_FILES)),
+            "sys/user" => Ok(list_files("sys/user", SYS_USER_FILES)),
             _ if rel.starts_with("self/fd/") => Err(enotdir()),
             _ if inode_of(rel).is_some() => Err(enotdir()),
             _ => Err(enoent()),

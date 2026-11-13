@@ -138,7 +138,53 @@ impl Kernel {
             _ => return err(Errno::ENODEV),
         };
         vfs.mount_guest(&abs, fs);
+        if matches!(fstype.as_str(), "tmpfs" | "ramfs") {
+            self.tmpfs_root(vfs, cx, &abs, a[4], mem);
+        }
         0
+    }
+
+    /// A new tmpfs's root belongs to who mounted it, with the `mode=`, `uid=`
+    /// and `gid=` its options give (Linux's `shmem_fill_super`).
+    fn tmpfs_root(
+        &self,
+        vfs: &mut MountTable,
+        cx: &ServiceCtx,
+        abs: &str,
+        data: u64,
+        mem: &GuestMemory,
+    ) {
+        use super::userns::IdKind;
+        let opts = if data == 0 {
+            String::new()
+        } else {
+            mem.read_cstr(data, 4096)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
+        };
+        let (mut uid, mut gid) = (cx.cur.creds.fsuid, cx.cur.creds.fsgid);
+        let mut mode = None;
+        for opt in opts.split(',') {
+            match opt.split_once('=') {
+                Some(("mode", v)) => mode = u32::from_str_radix(v, 8).ok(),
+                Some(("uid", v)) => uid = v.parse().unwrap_or(uid),
+                Some(("gid", v)) => gid = v.parse().unwrap_or(gid),
+                _ => {}
+            }
+        }
+        let (uid, gid) = {
+            let users = self.users.lock().unwrap();
+            let ns = cx.cur.ns.user;
+            (
+                users.kernel_id(ns, IdKind::Uid, uid),
+                users.kernel_id(ns, IdKind::Gid, gid),
+            )
+        };
+        if uid != 0 || gid != 0 {
+            let _ = vfs.set_owner(abs, Some(uid), Some(gid));
+        }
+        // Linux's default for a tmpfs root is 1777.
+        let _ = vfs.set_mode(abs, mode.unwrap_or(0o1777) & 0o7777);
     }
 
     /// `chroot(path)`: make `path` this task's root. Later paths resolve below it,
@@ -597,15 +643,28 @@ impl Kernel {
         info: &super::ProcInfo,
     ) -> ((u32, u32), String) {
         use super::userns::IdKind;
+        use std::fmt::Write as _;
         let ns = info.ns.user;
         let global = |kind, id| users.kernel_id(ns, kind, id);
         let seen = |kind, id| users.seen_from_global(reader, kind, global(kind, id));
         let c = info.creds;
         let line = |kind, ids: [u32; 4]| ids.map(|id| seen(kind, id).to_string()).join("\t");
+        // Supplementary groups are kept as the VM sees them.
+        let mut groups = String::new();
+        for &g in &info.groups {
+            let _ = write!(
+                groups,
+                "{} ",
+                users.seen_from_global(reader, IdKind::Gid, g)
+            );
+        }
         let ids = format!(
-            "Uid:\t{}\nGid:\t{}\n",
+            "Uid:\t{}\nGid:\t{}\nGroups:\t{groups}\n{}NoNewPrivs:\t{}\nSeccomp:\t{}\n",
             line(IdKind::Uid, [c.ruid, c.euid, c.suid, c.fsuid]),
-            line(IdKind::Gid, [c.rgid, c.egid, c.sgid, c.fsgid])
+            line(IdKind::Gid, [c.rgid, c.egid, c.sgid, c.fsgid]),
+            info.caps.status_lines(),
+            u8::from(info.no_new_privs),
+            info.seccomp.mode()
         );
         (
             (global(IdKind::Uid, c.euid), global(IdKind::Gid, c.egid)),
@@ -1266,6 +1325,9 @@ impl Kernel {
         };
         let had_slash = rel.len() > 1 && rel.ends_with('/');
         let abs = self.resolve_path(cx, dirfd, &rel);
+        if self.trace {
+            eprintln!("[access] pid={} {abs:?}", cx.cur.pid);
+        }
         let abs = match self.follow_or_eloop(vfs, cx, &abs) {
             Ok(p) => p,
             Err(e) => return e,

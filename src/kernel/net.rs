@@ -309,6 +309,8 @@ const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
 
 /// `cmsg_level`/`cmsg_type` for file-descriptor passing (SOL_SOCKET/SCM_RIGHTS).
 const SCM_RIGHTS: i32 = 1;
+const SCM_CREDENTIALS: i32 = 2;
+const SO_PASSCRED: u64 = 16;
 /// Size of a 64-bit `struct cmsghdr`: `cmsg_len`(size_t,8) + `cmsg_level`(int,4)
 /// + `cmsg_type`(int,4). `CMSG_DATA` follows immediately (already 8-aligned).
 const CMSG_HDR_LEN: usize = 16;
@@ -631,6 +633,8 @@ struct Pair {
     /// `to[e]`, oldest first. Each send is one message, delivered whole or
     /// not at all; a read takes at most one, the rest of it discarded.
     msgs: Option<[VecDeque<usize>; 2]>,
+    /// Who last sent toward each end, for `SCM_CREDENTIALS` (`SO_PASSCRED`).
+    sender: [Ucred; 2],
 }
 
 /// `struct ucred`: a process's global pid, uid and gid when it set up a
@@ -665,6 +669,7 @@ impl Pair {
             v6_view: [false, false],
             scm: [VecDeque::new(), VecDeque::new()],
             cred: [Ucred::default(); 2],
+            sender: [Ucred::default(); 2],
             msgs: None,
         }
     }
@@ -3214,7 +3219,41 @@ impl Kernel {
         }
         // Emit any SCM_RIGHTS ancillary data into msg_control (offset 40 =
         // msg_controllen), setting msg_flags (offset 48).
-        self.emit_scm_rights(net, cx, msg, &hdr, flags, scm_fds, &mut msg_flags, mem);
+        // With SO_PASSCRED, a message on a connected AF_UNIX socket says who sent it.
+        let creds = self
+            .sock_of(cx, fd)
+            .and_then(|(s, end)| match &net.socks[s].kind {
+                Kind::Pair(p)
+                    if net.socks[s]
+                        .opts
+                        .int_opt((SOL_SOCKET, SO_PASSCRED))
+                        .unwrap_or(0)
+                        != 0
+                        && (whole > 0 || !scm_fds.is_empty()) =>
+                {
+                    Some(p.sender[end])
+                }
+                _ => None,
+            });
+        let creds = creds.map(|c| {
+            let pid = if c.pid == 0 {
+                0
+            } else {
+                self.visible_pid(cx, c.pid)
+            };
+            (pid, c.uid, c.gid)
+        });
+        self.emit_scm_rights(
+            net,
+            cx,
+            msg,
+            &hdr,
+            flags,
+            scm_fds,
+            creds,
+            &mut msg_flags,
+            mem,
+        );
         let _ = mem.write(msg + 48, &(msg_flags as i32).to_le_bytes());
         if flags & MSG_TRUNC != 0 && msg_flags & MSG_TRUNC != 0 {
             whole as i64
@@ -3237,16 +3276,38 @@ impl Kernel {
         hdr: &MsgHdr,
         flags: u64,
         scm_fds: Vec<Fd>,
+        creds: Option<(i32, u32, u32)>,
         msg_flags: &mut u64,
         mem: &mut GuestMemory,
     ) {
+        // SCM_CREDENTIALS first, as Linux puts it: `struct ucred` in a
+        // CMSG_SPACE(12) = 32-byte message.
+        let mut used = 0usize;
+        if let Some((pid, uid, gid)) = creds {
+            const CRED_SPACE: usize = CMSG_HDR_LEN + 16;
+            if hdr.control != 0 && hdr.controllen >= CRED_SPACE as u64 {
+                let mut c = Vec::with_capacity(CRED_SPACE);
+                c.extend_from_slice(&((CMSG_HDR_LEN + 12) as u64).to_le_bytes());
+                c.extend_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
+                c.extend_from_slice(&SCM_CREDENTIALS.to_le_bytes());
+                c.extend_from_slice(&pid.to_le_bytes());
+                c.extend_from_slice(&uid.to_le_bytes());
+                c.extend_from_slice(&gid.to_le_bytes());
+                c.extend_from_slice(&[0; 4]);
+                let _ = mem.write(hdr.control, &c);
+                used = CRED_SPACE;
+            } else {
+                *msg_flags |= MSG_CTRUNC;
+            }
+        }
         if scm_fds.is_empty() {
-            let _ = mem.write(msg + 40, &0u64.to_le_bytes());
+            let _ = mem.write(msg + 40, &(used as u64).to_le_bytes());
             return;
         }
         // How many fds fit in the caller's control buffer.
-        let capacity = if hdr.control != 0 && hdr.controllen >= CMSG_HDR_LEN as u64 {
-            (hdr.controllen as usize - CMSG_HDR_LEN) / 4
+        let room = (hdr.controllen as usize).saturating_sub(used);
+        let capacity = if hdr.control != 0 && room >= CMSG_HDR_LEN {
+            (room - CMSG_HDR_LEN) / 4
         } else {
             0
         };
@@ -3269,7 +3330,7 @@ impl Kernel {
             guest_fds.push(g);
         }
         if deliver == 0 {
-            let _ = mem.write(msg + 40, &0u64.to_le_bytes());
+            let _ = mem.write(msg + 40, &(used as u64).to_le_bytes());
             return;
         }
         let cmsg_len = CMSG_HDR_LEN + 4 * deliver;
@@ -3280,8 +3341,8 @@ impl Kernel {
         for g in &guest_fds {
             cbuf.extend_from_slice(&g.to_le_bytes());
         }
-        let _ = mem.write(hdr.control, &cbuf);
-        let _ = mem.write(msg + 40, &(cmsg_len as u64).to_le_bytes());
+        let _ = mem.write(hdr.control + used as u64, &cbuf);
+        let _ = mem.write(msg + 40, &((used + cmsg_len) as u64).to_le_bytes());
     }
 
     /// Receive up to `cap` bytes from socket `fd` into a host `Vec` — the
@@ -3823,6 +3884,7 @@ impl Kernel {
         let capacity = net.socks[sock].opts.sndbuf.saturating_mul(2) as usize;
         match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
+                p.sender[1 - end] = Ucred::of(cx);
                 if p.shut_wr[end] || p.refs[1 - end] == 0 {
                     cx.cur.io_progress = 0;
                     if !nosignal {

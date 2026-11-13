@@ -1297,6 +1297,7 @@ impl Kernel {
             sh.cwd_tables[fs] = Some(super::FsCtx {
                 cwd: cx.cur.cwd.clone(),
                 umask: cx.cur.umask,
+                root: cx.cur.root.clone(),
             });
             cx.cur.fs = sh.cwd_tables.len();
             sh.cwd_tables.push(None);

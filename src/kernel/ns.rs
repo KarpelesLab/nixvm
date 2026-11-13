@@ -348,6 +348,38 @@ impl Kernel {
             .ok_or_else(|| err(Errno::ENOENT))
     }
 
+    /// Bring procfs up to date for this task ahead of a read or listing of a
+    /// `/proc` file it has open: what it opened shows this task, but another
+    /// task may have looked at procfs since.
+    pub(super) fn refresh_procfs_for_fd(
+        &self,
+        cx: &ServiceCtx,
+        sys: crate::abi::arch::Sysno,
+        args: &[u64; 6],
+        mem: &GuestMemory,
+    ) {
+        use crate::abi::arch::Sysno;
+        if !matches!(
+            sys,
+            Sysno::Read
+                | Sysno::Readv
+                | Sysno::Pread64
+                | Sysno::Preadv
+                | Sysno::Preadv2
+                | Sysno::Getdents
+                | Sysno::Getdents64
+        ) {
+            return;
+        }
+        let under_proc = match cx.cur.fds.get(args[0] as i32) {
+            Some(Fd::File { path, .. } | Fd::Dir { path, .. }) => path.contains("/proc"),
+            _ => false,
+        };
+        if under_proc {
+            self.refresh_procfs(cx, Some(mem));
+        }
+    }
+
     /// Bring procfs up to date for this task, ahead of a lookup in it. The other
     /// tasks have to be read before taking `vfs`, which sorts after `shared`.
     fn refresh_procfs(&self, cx: &ServiceCtx, mem: Option<&GuestMemory>) {
@@ -444,6 +476,15 @@ impl Kernel {
                     return Some(err(Errno::EFAULT));
                 }
                 0
+            }
+            // It exists; like Linux's nsfs files, it can be read but not run.
+            Sysno::Access | Sysno::Faccessat | Sysno::Faccessat2 => {
+                let mode = if sys == Sysno::Access {
+                    args[1]
+                } else {
+                    args[2]
+                };
+                if mode & 1 != 0 { err(Errno::EACCES) } else { 0 }
             }
             _ => return None,
         })

@@ -8,7 +8,10 @@
  *  - SOCK_SEQPACKET socket pairs keep message boundaries and carry fds
  *    (Chromium's sandbox IPC);
  *  - /proc/self/task links once per thread (how Chromium checks it's
- *    single-threaded before sandboxing itself).
+ *    single-threaded before sandboxing itself);
+ *  - what Chromium's namespace sandbox does next: a CLONE_FS child chroots
+ *    into /proc/self/fdinfo/, which its parent shares; a tmpfs belongs to its
+ *    mounter, with its mode= option; /proc/self/ns links can be access()ed.
  * Runs as anyone (as root it makes its namespaces all the same). */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -21,6 +24,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -115,6 +119,12 @@ static int t_seqpacket(void) {
   char rb[CMSG_SPACE(sizeof(int))]; struct msghdr rm = {0}; struct iovec riov = {b, sizeof b}; rm.msg_iov = &riov; rm.msg_iovlen = 1; rm.msg_control = rb; rm.msg_controllen = sizeof rb;
   CHECK(recvmsg(sv[1], &rm, 0) == 1, "receive it"); struct cmsghdr *rc = CMSG_FIRSTHDR(&rm); int got = -1; if (rc && rc->cmsg_type == SCM_RIGHTS) memcpy(&got, CMSG_DATA(rc), sizeof(int));
   CHECK(got >= 0 && write(got, "p", 1) == 1 && read(fds[0], b, 1) == 1, "and it works");
+  int on = 1; CHECK(!setsockopt(sv[1], SOL_SOCKET, SO_PASSCRED, &on, sizeof on), "SO_PASSCRED");
+  fflush(stdout); pid_t kid = fork(); if (!kid) { write(sv[0], "c", 1); _exit(0); } waitpid(kid, 0, 0);
+  char cb[CMSG_SPACE(sizeof(struct ucred))]; struct msghdr cm = {0}; struct iovec ciov = {b, sizeof b}; cm.msg_iov = &ciov; cm.msg_iovlen = 1; cm.msg_control = cb; cm.msg_controllen = sizeof cb;
+  CHECK(recvmsg(sv[1], &cm, 0) == 1, "a message from a child"); struct cmsghdr *cc = CMSG_FIRSTHDR(&cm); struct ucred uc = {0};
+  if (cc && cc->cmsg_type == SCM_CREDENTIALS) memcpy(&uc, CMSG_DATA(cc), sizeof uc);
+  CHECK(cc && cc->cmsg_level == SOL_SOCKET && cc->cmsg_type == SCM_CREDENTIALS && uc.pid == kid && uc.uid == getuid() && uc.gid == getgid(), "says who sent it (SCM_CREDENTIALS: %d %d %d)", uc.pid, uc.uid, uc.gid);
   close(sv[0]); CHECK(read(sv[1], b, sizeof b) == 0, "EOF once the other end closes");
   return fails;
 }
@@ -126,7 +136,26 @@ static int t_task_links(void) {
   char p[64]; sprintf(p, "/proc/self/task/%d/status", getpid()); CHECK(access(p, R_OK) == 0, "task/<tid>/status (%d)", errno);
   return fails;
 }
+static char stack[65536];
+static int chroot_fdinfo(void *a) { (void)a; return chroot("/proc/self/fdinfo/") || chdir("/") ? 1 : 0; }
+static int t_chromium_sandbox(void) {
+  char b[4096]; struct stat s;
+  CHECK(!access("/proc/self/ns/user", F_OK) && !access("/proc/self/ns/pid", R_OK), "access() of /proc/self/ns links (%d)", errno);
+  int fd = open("/dev/null", O_RDONLY); sprintf(b, "/proc/self/fdinfo/%d", fd); int f = open(b, O_RDONLY); int n = f < 0 ? -1 : read(f, b, sizeof b - 1); if (n > 0) b[n] = 0;
+  CHECK(n > 0 && strstr(b, "pos:") && strstr(b, "flags:"), "/proc/self/fdinfo/N says pos and flags (%d)", n); close(f);
+  CHECK(!stat("/proc/self/fdinfo", &s) && S_ISDIR(s.st_mode), "/proc/self/fdinfo is a directory");
+  f = open("/proc/sys/fs/inotify/max_user_watches", O_RDONLY); CHECK(f >= 0 && read(f, b, 16) > 0, "/proc/sys/fs/inotify/max_user_watches (%d)", errno); close(f);
+  CHECK(!sandbox(), "user and mount namespace (%d)", errno);
+  CHECK(!scratch(), "scratch tmpfs (%d)", errno);
+  CHECK(!stat(base, &s) && s.st_uid == 0 && (s.st_mode & 07777) == 01777, "a tmpfs root is its mounter's, mode 1777 (%d %o)", s.st_uid, s.st_mode & 07777);
+  char m[300]; sprintf(m, "%s/m", base); mkdir(m, 0755); CHECK(!mount("tmpfs", m, "tmpfs", 0, "mode=0710"), "tmpfs with mode=0710");
+  CHECK(!stat(m, &s) && (s.st_mode & 07777) == 0710, "takes it (%o)", s.st_mode & 07777);
+  fflush(stdout); pid_t c = clone(chroot_fdinfo, stack + sizeof stack, CLONE_FS | SIGCHLD, 0); int st; waitpid(c, &st, 0);
+  CHECK(c > 0 && WIFEXITED(st) && !WEXITSTATUS(st), "a CLONE_FS child chroots into /proc/self/fdinfo/ (%#x)", st);
+  CHECK(access("/proc", F_OK) < 0 && access(base, F_OK) < 0, "and its parent is in that empty root too");
+  return fails;
+}
 int main(void) {
-  child(t_readonly); child(t_fd_paths); child(t_netlink_peek); child(t_seqpacket); child(t_task_links);
+  child(t_readonly); child(t_fd_paths); child(t_netlink_peek); child(t_seqpacket); child(t_task_links); child(t_chromium_sandbox);
   puts(fails ? "SOME FAILED" : "PASS"); return fails != 0;
 }

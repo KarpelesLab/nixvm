@@ -624,6 +624,8 @@ pub(super) fn memfd_display(path: &str) -> Option<String> {
 struct FsCtx {
     cwd: String,
     umask: u32,
+    /// The root directory (`chroot`), which a `CLONE_FS` group shares too.
+    root: String,
 }
 
 /// A writable file-backed `MAP_SHARED` region awaiting flush-back.
@@ -2395,6 +2397,7 @@ impl Shared {
         let fs = self.cwd_tables[s].take().expect("cwd already checked out");
         cx.cur.cwd = fs.cwd;
         cx.cur.umask = fs.umask;
+        cx.cur.root = fs.root;
     }
 
     /// Check the running task's fd table back into [`Shared::file_tables`] and its
@@ -2410,6 +2413,7 @@ impl Shared {
         self.cwd_tables[s] = Some(FsCtx {
             cwd: std::mem::take(&mut cx.cur.cwd),
             umask: cx.cur.umask,
+            root: cx.cur.root.clone(),
         });
     }
 
@@ -2709,6 +2713,7 @@ impl Kernel {
             sh.cwd_tables.push(Some(FsCtx {
                 cwd: std::mem::take(&mut info.cwd),
                 umask: info.umask,
+                root: info.root.clone(),
             }));
             sh.mmap_areas
                 .push(Arena::new(info.mmap_cursor, info.mmap_floor));
@@ -2997,6 +3002,7 @@ impl Kernel {
         sh.cwd_tables.push(Some(FsCtx {
             cwd: std::mem::take(&mut info.cwd),
             umask: info.umask,
+            root: info.root.clone(),
         }));
         sh.mmap_areas
             .push(Arena::new(info.mmap_cursor, info.mmap_floor));
@@ -4338,6 +4344,7 @@ impl Kernel {
         if let Some(result) = self.ns_path_syscall(cx, sys, args, mem) {
             return result;
         }
+        self.refresh_procfs_for_fd(cx, sys, args, mem);
         if let Some(result) = self.proc_mem_syscall(cx, sys, args, mem) {
             return result;
         }
@@ -5960,6 +5967,7 @@ impl Kernel {
             let cwd = FsCtx {
                 cwd: cx.cur.cwd.clone(),
                 umask: cx.cur.umask,
+                root: cx.cur.root.clone(),
             };
             info.fs = if let Some(slot) = sh.free_cwd_slots.pop() {
                 sh.cwd_tables[slot] = Some(cwd);
@@ -6082,6 +6090,9 @@ impl Kernel {
         };
         let argv = read_string_array(mem, argv_ptr);
         let envp = read_string_array(mem, envp_ptr);
+        if self.trace {
+            eprintln!("[exec] pid={} {abs:?} {argv:?}", cx.cur.pid);
+        }
         let r = self.exec_image(sh, &mut vfs, cx, &abs, argv, envp, vcpu, mem);
         drop(vfs);
         self.exec_result(sh, cx, r, mem)
@@ -13513,6 +13524,7 @@ mod tests {
         k.shared.lock().unwrap().cwd_tables.push(Some(FsCtx {
             cwd: "/".to_string(),
             umask: 0o022,
+            root: "/".to_string(),
         }));
         cx.cur.fs = 0;
         const CLONE_FS: u64 = 0x0000_0200;
