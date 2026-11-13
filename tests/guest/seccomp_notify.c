@@ -102,7 +102,8 @@ static int recv_fd(int sock) {
  * a socket, and runs `body`; returns its pid and the listener. */
 static pid_t spawn(unsigned flags, int (*body)(void), int *listener) {
   int sv[2];
-  socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+  /* A SOCK_SEQPACKET pair, as the kernel's samples hand listeners over. */
+  socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv);
   pid_t pid = fork();
   if (pid == 0) {
     close(sv[0]);
@@ -338,6 +339,27 @@ static int strict_child(void) {
 
 int main(void) {
   setvbuf(stdout, 0, _IONBF, 0);
+  /* SOCK_SEQPACKET keeps message boundaries: a short read loses the rest. */
+  int sp[2];
+  CHECK(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp) == 0, "seqpacket socketpair");
+  CHECK(write(sp[0], "hello", 5) == 5 && write(sp[0], "world!", 6) == 6, "seqpacket writes");
+  char m[16] = {0};
+  CHECK(read(sp[1], m, 3) == 3 && !memcmp(m, "hel", 3), "short read of a message");
+  struct iovec mi = {m, sizeof m};
+  struct msghdr mh = {.msg_iov = &mi, .msg_iovlen = 1};
+  CHECK(recvmsg(sp[1], &mh, 0) == 6 && !memcmp(m, "world!", 6) && !(mh.msg_flags & MSG_TRUNC),
+        "next message whole");
+  CHECK(write(sp[0], "abcdef", 6) == 6, "seqpacket write");
+  mi.iov_len = 2;
+  CHECK(recvmsg(sp[1], &mh, 0) == 2 && (mh.msg_flags & MSG_TRUNC), "MSG_TRUNC");
+  int type = 0;
+  socklen_t tl = sizeof type;
+  CHECK(getsockopt(sp[0], SOL_SOCKET, SO_TYPE, &type, &tl) == 0 && type == SOCK_SEQPACKET,
+        "SO_TYPE %d", type);
+  close(sp[0]);
+  CHECK(read(sp[1], m, sizeof m) == 0, "EOF once the peer closes");
+  close(sp[1]);
+
   /* Sizes and actions. */
   struct seccomp_notif_sizes sz;
   CHECK(sc(SECCOMP_GET_NOTIF_SIZES, 0, &sz) == 0 && sz.seccomp_notif == 80 &&

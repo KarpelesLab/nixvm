@@ -212,6 +212,7 @@ const AF_NETLINK: u16 = 16;
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
 const SOCK_RAW: u64 = 3;
+const SOCK_SEQPACKET: u64 = 5;
 const SOCK_NONBLOCK: u64 = 0o4000;
 /// `SOCK_CLOEXEC` in a `socket`/`socketpair`/`accept4` type/flags argument.
 pub(super) const SOCK_CLOEXEC: u64 = 0o2000000;
@@ -626,6 +627,10 @@ struct Pair {
     /// `socketpair`, or the connecting process (end 0) and the listener's
     /// `listen()` caller (end 1), as Linux records them.
     cred: [Ucred; 2],
+    /// A `SOCK_SEQPACKET` pair: the lengths of the messages queued in each
+    /// `to[e]`, oldest first. Each send is one message, delivered whole or
+    /// not at all; a read takes at most one, the rest of it discarded.
+    msgs: Option<[VecDeque<usize>; 2]>,
 }
 
 /// `struct ucred`: a process's global pid, uid and gid when it set up a
@@ -660,7 +665,33 @@ impl Pair {
             v6_view: [false, false],
             scm: [VecDeque::new(), VecDeque::new()],
             cred: [Ucred::default(); 2],
+            msgs: None,
         }
+    }
+
+    /// How much of `to[e]` one read of up to `want` bytes takes: for a
+    /// `SOCK_SEQPACKET` pair, no more than the next message.
+    fn msg_read_len(&self, e: usize, want: usize) -> usize {
+        match &self.msgs {
+            Some(m) => want.min(m[e].front().copied().unwrap_or(0)),
+            None => want,
+        }
+    }
+
+    /// After a read drained `n` bytes from `to[e]`: a `SOCK_SEQPACKET`
+    /// message's unread rest is discarded with it. Returns the `SCM_RIGHTS`
+    /// descriptors the read carries off (see [`Self::scm_take`]) and whether
+    /// a message was cut short (`MSG_TRUNC`).
+    fn finish_read(&mut self, e: usize, n: usize) -> (Vec<Fd>, bool) {
+        let Some(m) = &mut self.msgs else {
+            return (self.scm_take(e, n), false);
+        };
+        let len = m[e].pop_front().unwrap_or(n).max(n);
+        let rest = (len - n).min(self.to[e].len());
+        self.to[e].drain(..rest);
+        // Its descriptors ride the message's first byte.
+        let fds = self.scm_take(e, n + rest);
+        (fds, rest > 0)
     }
 
     /// End `which`'s address as end `viewer` sees it: an IPv4 address shown to
@@ -1499,7 +1530,7 @@ impl Kernel {
             return err(Errno::EAFNOSUPPORT);
         }
         let base_type = sotype & 0xf;
-        if base_type != SOCK_STREAM && base_type != SOCK_DGRAM {
+        if ![SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET].contains(&base_type) {
             return err(Errno::EOPNOTSUPP);
         }
         let nonblock = sotype & SOCK_NONBLOCK != 0;
@@ -1531,6 +1562,9 @@ impl Kernel {
             let mut pair = Pair::new();
             pair.nonblock = [nonblock, nonblock];
             pair.cred = [Ucred::of(cx); 2];
+            if base_type == SOCK_SEQPACKET {
+                pair.msgs = Some([VecDeque::new(), VecDeque::new()]);
+            }
             let idx = net.socks.len();
             net.socks.push(Sock {
                 netns: cx.cur.ns.net,
@@ -2410,6 +2444,7 @@ impl Kernel {
                     }) => SOCK_RAW as u32,
                     Kind::Dgram(_) => SOCK_DGRAM as u32,
                     Kind::Netlink(nl) => nl.sotype as u32,
+                    Kind::Pair(Pair { msgs: Some(_), .. }) => SOCK_SEQPACKET as u32,
                     _ => SOCK_STREAM as u32,
                 },
                 SO_ERROR => {
@@ -3339,12 +3374,12 @@ impl Kernel {
                 // flag-aware `recv_stream` writes to guest memory, so replicate
                 // its dequeue here against a host buffer instead), carrying any
                 // SCM_RIGHTS fds that ride the consumed bytes.
-                let (bytes, fds) = self.recv_stream_bytes(net, cx, sock, end, cap, flags)?;
+                let (bytes, fds, cut) = self.recv_stream_bytes(net, cx, sock, end, cap, flags)?;
                 let peer = match &net.socks[sock].kind {
                     Kind::Pair(p) => p.addr_seen_by(1 - end, end).map(Addr::Inet),
                     _ => None,
                 };
-                Ok((peer, bytes, 0, fds))
+                Ok((peer, bytes, if cut { MSG_TRUNC } else { 0 }, fds))
             }
         }
     }
@@ -3580,7 +3615,7 @@ impl Kernel {
         let peek = flags & MSG_PEEK != 0;
         let data: Vec<u8> = match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
-                let n = (count as usize).min(p.to[end].len());
+                let n = p.msg_read_len(end, (count as usize).min(p.to[end].len()));
                 if peek {
                     p.to[end].iter().take(n).copied().collect()
                 } else {
@@ -3594,7 +3629,7 @@ impl Kernel {
         // ref released), matching Linux.
         if !peek {
             let dropped = match &mut net.socks[sock].kind {
-                Kind::Pair(p) => p.scm_take(end, data.len()),
+                Kind::Pair(p) => p.finish_read(end, data.len()).0,
                 _ => Vec::new(),
             };
             for fd in &dropped {
@@ -3619,7 +3654,7 @@ impl Kernel {
         end: usize,
         count: u64,
         flags: u64,
-    ) -> Result<(Vec<u8>, Vec<Fd>), i64> {
+    ) -> Result<(Vec<u8>, Vec<Fd>, bool), i64> {
         let (shut_rd, avail, peer_open, nonblock, scm_ready) = match &net.socks[sock].kind {
             Kind::Pair(p) => (
                 p.shut_rd[end],
@@ -3631,7 +3666,7 @@ impl Kernel {
             _ => return Err(err(Errno::EINVAL)),
         };
         if shut_rd {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), false));
         }
         // A pending zero-offset SCM group (fds sent with a zero-length message,
         // or whose preceding bytes are already drained) is deliverable even with
@@ -3643,13 +3678,13 @@ impl Kernel {
                 }
                 cx.block = true;
             }
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), false));
         }
         let peek = flags & MSG_PEEK != 0;
         match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
                 let want = (count as usize).min(p.to[end].len());
-                let n = p.scm_read_len(end, want);
+                let n = p.msg_read_len(end, p.scm_read_len(end, want));
                 let data: Vec<u8> = if peek {
                     p.to[end].iter().take(n).copied().collect()
                 } else {
@@ -3657,8 +3692,13 @@ impl Kernel {
                 };
                 // MSG_PEEK leaves the ancillary data queued too (a later real
                 // recv still gets the fds); a real read transfers them out.
-                let fds = if peek { Vec::new() } else { p.scm_take(end, n) };
-                Ok((data, fds))
+                let (fds, cut) = if peek {
+                    let whole = p.msgs.as_ref().and_then(|m| m[end].front());
+                    (Vec::new(), whole.is_some_and(|&len| len > n))
+                } else {
+                    p.finish_read(end, n)
+                };
+                Ok((data, fds, cut))
             }
             _ => Err(err(Errno::EINVAL)),
         }
@@ -3779,6 +3819,25 @@ impl Kernel {
                         self.raise_sigpipe(cx);
                     }
                     return err(Errno::EPIPE);
+                }
+                // A SOCK_SEQPACKET send is one message, queued whole or not
+                // at all.
+                if let Some(m) = &mut p.msgs {
+                    if data.len() > capacity {
+                        return err(Errno::EMSGSIZE);
+                    }
+                    if capacity.saturating_sub(p.to[1 - end].len()) < data.len() {
+                        if p.nonblock[end] || cx.dontwait {
+                            return err(Errno::EAGAIN);
+                        }
+                        cx.block = true;
+                        return 0;
+                    }
+                    if !data.is_empty() {
+                        m[1 - end].push_back(data.len());
+                        p.to[1 - end].extend(data.iter().copied());
+                    }
+                    return data.len() as i64;
                 }
                 // As with pipes: what fits goes in, and a blocking send parks to
                 // finish the rest, so the guest sees one complete send.
