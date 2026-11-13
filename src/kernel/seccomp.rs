@@ -7,7 +7,8 @@
 //! restrictive verdict winning, as Linux combines them) and applies the
 //! verdict: `ALLOW`/`LOG` run the call, `ERRNO(n)` fails it with `-n`
 //! unexecuted, `TRAP` raises a forced `SIGSYS` (`si_code` `SYS_SECCOMP`),
-//! `TRACE` finds no tracer and fails it `ENOSYS`, `KILL_THREAD` ends the
+//! `TRACE` stops for a tracer that asked (`PTRACE_O_TRACESECCOMP`, see
+//! `ptrace.rs`) or fails it `ENOSYS`, `KILL_THREAD` ends the
 //! thread (the process, if it's the last one) and `KILL_PROCESS` the whole
 //! process, with `SIGSYS`. Filters are inherited by `fork`/`clone` and kept
 //! across `execve`, and installing one requires `no_new_privs` or
