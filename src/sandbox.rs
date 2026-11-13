@@ -124,7 +124,8 @@ pub struct Config {
     pub syscall_policy: Option<crate::policy::SyscallPolicy>,
     /// For an image root ([`RootSource::Oci`]): replaces its entrypoint.
     pub entrypoint: Option<Vec<String>>,
-    /// For an image root: replaces its user (`user`, `uid`, `user:group`).
+    /// The user PID 1 runs as (`user`, `uid`, `user:group`), looked up in the
+    /// root's `/etc/passwd`; for an image root it replaces the image's user.
     pub user: Option<String>,
 }
 
@@ -331,7 +332,7 @@ impl SandboxBuilder {
         self
     }
 
-    /// Run the image as `user` (`docker run --user`).
+    /// Run PID 1 as `user` (`docker run --user`), any root, not just an image.
     #[must_use]
     pub fn user(mut self, user: impl Into<String>) -> Self {
         self.config.user = Some(user.into());
@@ -414,6 +415,17 @@ impl Sandbox {
             gid: 0,
             groups: Vec::new(),
         };
+        if let Some(user) = &self.config.user {
+            let (uid, gid, home, groups) =
+                resolve_user(user, &mut mounts).map_err(Error::Config)?;
+            if !self.config.env.iter().any(|e| e.starts_with("HOME=")) {
+                start.env.retain(|e| !e.starts_with("HOME="));
+                start.env.push(format!("HOME={home}"));
+            }
+            start.uid = uid;
+            start.gid = gid;
+            start.groups = groups;
+        }
         #[cfg(feature = "oci")]
         if let Some(img) = &image {
             let opts = crate::oci::RunOptions {
@@ -746,6 +758,71 @@ impl Sandbox {
             }
         }
     }
+}
+
+/// `user[:group]` → (uid, gid, home, supplementary groups), names looked up
+/// in the root's `/etc/passwd` and `/etc/group`. A numeric uid needn't be
+/// listed; its gid is then its passwd entry's, or 0.
+pub(crate) fn resolve_user(
+    spec: &str,
+    root: &mut MountTable,
+) -> Result<(u32, u32, String, Vec<u32>), String> {
+    let read = |root: &mut MountTable, p: &str| {
+        root.read_file(p)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    };
+    let passwd = read(root, "/etc/passwd");
+    let group = read(root, "/etc/group");
+    let (u, g) = match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+    let u = if u.is_empty() { "0" } else { u };
+    // name:x:uid:gid:gecos:home:shell
+    let entry = passwd
+        .lines()
+        .map(|l| l.split(':').collect::<Vec<_>>())
+        .find(|f| f.len() >= 4 && (f[0] == u || (u.parse::<u32>().is_ok() && f[2] == u)));
+    let uid = match (u.parse::<u32>(), &entry) {
+        (Ok(n), _) => n,
+        (Err(_), Some(f)) => f[2].parse().unwrap_or(0),
+        (Err(_), None) => {
+            return Err(format!("user {u:?} isn't in the root's /etc/passwd"));
+        }
+    };
+    let name = entry.as_ref().map(|f| f[0].to_string());
+    let home = entry
+        .as_ref()
+        .and_then(|f| f.get(5).filter(|h| !h.is_empty()).map(|h| (*h).to_string()))
+        .unwrap_or_else(|| if uid == 0 { "/root".into() } else { "/".into() });
+    let primary = entry.as_ref().and_then(|f| f[3].parse().ok()).unwrap_or(0);
+    let gid = match g {
+        None | Some("") => primary,
+        Some(g) => match g.parse::<u32>() {
+            Ok(n) => n,
+            Err(_) => group
+                .lines()
+                .map(|l| l.split(':').collect::<Vec<_>>())
+                .find(|f| f.len() >= 3 && f[0] == g)
+                .and_then(|f| f[2].parse().ok())
+                .ok_or_else(|| format!("group {g:?} isn't in the root's /etc/group"))?,
+        },
+    };
+    // name:x:gid:member,member
+    let mut groups: Vec<u32> = match &name {
+        Some(n) => group
+            .lines()
+            .map(|l| l.split(':').collect::<Vec<_>>())
+            .filter(|f| f.len() >= 4 && f[3].split(',').any(|m| m == n))
+            .filter_map(|f| f[2].parse().ok())
+            .collect(),
+        None => Vec::new(),
+    };
+    if !groups.contains(&gid) {
+        groups.insert(0, gid);
+    }
+    Ok((uid, gid, home, groups))
 }
 
 /// How PID 1 starts.

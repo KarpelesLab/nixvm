@@ -312,7 +312,8 @@ impl Image {
             env.push("HOSTNAME=nixvm".into());
         }
         let user = opts.user.clone().unwrap_or_else(|| c.user.clone());
-        let (uid, gid, home, groups) = resolve_user(&user, root)?;
+        let (uid, gid, home, groups) =
+            crate::sandbox::resolve_user(&user, root).map_err(OciError::Launch)?;
         if !has(&env, "HOME") {
             env.push(format!("HOME={home}"));
         }
@@ -360,75 +361,6 @@ impl Image {
             groups,
         })
     }
-}
-
-/// `user[:group]` → (uid, gid, home, supplementary groups), names looked up
-/// in the image's `/etc/passwd` and `/etc/group`. A numeric uid needn't be
-/// listed; its gid is then its passwd entry's, or 0.
-fn resolve_user(
-    spec: &str,
-    root: &mut MountTable,
-) -> Result<(u32, u32, String, Vec<u32>), OciError> {
-    let read = |root: &mut MountTable, p: &str| {
-        root.read_file(p)
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-            .unwrap_or_default()
-    };
-    let passwd = read(root, "/etc/passwd");
-    let group = read(root, "/etc/group");
-    let (u, g) = match spec.split_once(':') {
-        Some((u, g)) => (u, Some(g)),
-        None => (spec, None),
-    };
-    let u = if u.is_empty() { "0" } else { u };
-    // name:x:uid:gid:gecos:home:shell
-    let entry = passwd
-        .lines()
-        .map(|l| l.split(':').collect::<Vec<_>>())
-        .find(|f| f.len() >= 4 && (f[0] == u || (u.parse::<u32>().is_ok() && f[2] == u)));
-    let uid = match (u.parse::<u32>(), &entry) {
-        (Ok(n), _) => n,
-        (Err(_), Some(f)) => f[2].parse().unwrap_or(0),
-        (Err(_), None) => {
-            return Err(OciError::Launch(format!(
-                "user {u:?} isn't in the image's /etc/passwd"
-            )));
-        }
-    };
-    let name = entry.as_ref().map(|f| f[0].to_string());
-    let home = entry
-        .as_ref()
-        .and_then(|f| f.get(5).filter(|h| !h.is_empty()).map(|h| (*h).to_string()))
-        .unwrap_or_else(|| if uid == 0 { "/root".into() } else { "/".into() });
-    let primary = entry.as_ref().and_then(|f| f[3].parse().ok()).unwrap_or(0);
-    let gid = match g {
-        None | Some("") => primary,
-        Some(g) => match g.parse::<u32>() {
-            Ok(n) => n,
-            Err(_) => group
-                .lines()
-                .map(|l| l.split(':').collect::<Vec<_>>())
-                .find(|f| f.len() >= 3 && f[0] == g)
-                .and_then(|f| f[2].parse().ok())
-                .ok_or_else(|| {
-                    OciError::Launch(format!("group {g:?} isn't in the image's /etc/group"))
-                })?,
-        },
-    };
-    // name:x:gid:member,member
-    let mut groups: Vec<u32> = match &name {
-        Some(n) => group
-            .lines()
-            .map(|l| l.split(':').collect::<Vec<_>>())
-            .filter(|f| f.len() >= 4 && f[3].split(',').any(|m| m == n))
-            .filter_map(|f| f[2].parse().ok())
-            .collect(),
-        None => Vec::new(),
-    };
-    if !groups.contains(&gid) {
-        groups.insert(0, gid);
-    }
-    Ok((uid, gid, home, groups))
 }
 
 /// Read an image through `read` (a path in the archive → its bytes).

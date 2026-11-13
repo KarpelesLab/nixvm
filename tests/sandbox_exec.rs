@@ -62,3 +62,45 @@ fn sandbox_runs_static_elf_and_returns_exit_code() {
 
     assert_eq!(code, 42);
 }
+
+#[test]
+fn a_plain_root_runs_pid1_as_the_user_asked_for() {
+    // getuid ; sub x0,x0,#990 ; exit   -> exit(uid - 990)
+    let program: [u32; 5] = [
+        0xD280_15C8, // movz x8,#174 (getuid)
+        0xD400_0001, // svc
+        0xD10F_7800, // sub x0,x0,#990
+        0xD280_0BA8, // movz x8,#93 (exit)
+        0xD400_0001, // svc
+    ];
+    let mut body = Vec::new();
+    for w in program {
+        body.extend_from_slice(&w.to_le_bytes());
+    }
+    let root = std::env::temp_dir().join(format!("nixvm-user-root-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("etc")).unwrap();
+    std::fs::write(
+        root.join("etc/passwd"),
+        "root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000::/home/user:/bin/sh\n",
+    )
+    .unwrap();
+    let init = root.join("init");
+    std::fs::write(&init, build_elf(0x1_0000, &body)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&init, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let code = Sandbox::builder()
+        .arch(Arch::Aarch64)
+        .root_dir(&root)
+        .user("user")
+        .command(["/init"])
+        .prefer_interp(true)
+        .mem_bytes(16 * 1024 * 1024)
+        .run();
+    let _ = std::fs::remove_dir_all(&root);
+    // `--user` used to be honoured only for images: a plain root ran as root.
+    assert_eq!(code.expect("sandbox should run /init"), 10);
+}
