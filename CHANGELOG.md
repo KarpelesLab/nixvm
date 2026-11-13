@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/KarpelesLab/nixvm/compare/v0.0.5...v0.0.6) - 2026-11-13
+
+### Other
+
+- a PID namespace's init drops default-action signals when they're delivered, not only when sent
+- filemap's links resolve in the public docs
+- gdb runs, breaks, steps, catches faults and attaches
+- single steps, fault stops, and the FP registers
+- the module doc says what RET_TRACE does now
+- file mappings map the file's pages; shared memory lives in guest memory
+- the creator owns what it makes, less the umask; a bound socket has a name
+- CPU exceptions in user code get IDT gates of their own
+- file capabilities, newuidmap, /proc/self/task; userns_caps runs on Ubuntu's CI
+- a task blocked in a syscall shows as asleep
+- seccomp sees the syscall's return address; /proc/<pid>/syscall
+- kill() no longer finds threads that have exited
+- processes sharing an fd table without sharing memory
+- SOCK_SEQPACKET socketpairs
+- seccomp user notification; /proc/<pid>/mem; the rest of the seccomp API
+- a blocking recvmsg leaves the msghdr alone until it has data
+- ptrace between guest tasks, enough for strace -f
+- a guest ptrace program (exec trap, syscall stops, peek/poke, signals, fork events, seize, exitkill, seccomp RET_TRACE)
+- capabilities are privilege, not uid 0; setns checks every namespace; bubblewrap runs
+- every arrival is a fresh epoll edge; stalls re-check host I/O
+- execve takes the whole process; 1 TiB address spaces; a versioned vDSO; MADV_DONTNEED frees
+- threads share the program break; host connects don't freeze the VM; dual-stack sockets
+- index-free register setup in two tests, for clippy 1.100
+- fstool 0.5.4, so Ubuntu images run
+- guest randomness from purecrypto's OsRng, the browser's crypto in wasm
+- pull images in the browser over the guest's network link, not fetch()
+- don't reap a child still finishing its exit on another CPU
+- cgroups waits for the small task when Linux counts a second kill
+- rlimits says what waitpid returned when it isn't the child
+- run Docker/OCI images without a daemon
+- ASIDs per address space, lazy register reads; no flush for unchanged leaves
+- fault-around for sequential first touches
+- named FIFOs
+- a rebuild leaves the macOS binaries unsigned; sign again
+- fail before the point of no return; follow the linker's last link
+- a signal to a task running on another vcpu stops it at once (HVF)
+- a memory.high penalty owed from user mode is paid before the next syscall
+- a failing conformance program shows what it printed, not the runner's lines
+
 ## [0.0.5](https://github.com/KarpelesLab/nixvm/compare/v0.0.4...v0.0.5) - 2026-11-12
 
 ### Other
