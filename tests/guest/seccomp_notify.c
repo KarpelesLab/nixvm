@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/filter.h>
+#include <linux/sched.h>
 #include <linux/seccomp.h>
 #include <poll.h>
 #include <pthread.h>
@@ -525,6 +526,31 @@ int main(void) {
   p.events = POLLIN;
   CHECK(poll(&p, 1, 1000) == 1 && p.revents == POLLHUP, "POLLHUP only: %#x", p.revents);
   close(l);
+
+  /* A listener left only in a CLONE_FILES table, its filter's task gone:
+   * RECV has nobody to wait for. */
+  {
+    int pp2[2];
+    CHECK(pipe(pp2) == 0, "pipe");
+    struct clone_args ca = {.flags = CLONE_FILES, .exit_signal = SIGCHLD};
+    pid = syscall(__NR_clone3, &ca, sizeof ca);
+    if (pid == 0) {
+      prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+      long lf = install(__NR_mknodat, SECCOMP_RET_USER_NOTIF, SECCOMP_FILTER_FLAG_NEW_LISTENER);
+      if (lf < 0 || dup2(lf, 200) != 200) _exit(1);
+      close(lf);
+      close(pp2[1]);
+      usleep(100000);
+      _exit(0);
+    }
+    close(pp2[1]);
+    char c;
+    CHECK(read(pp2[0], &c, 1) == 0, "child closed the pipe");
+    close(pp2[0]);
+    CHECK(status_of(pid) == 0, "CLONE_FILES child");
+    CHECK(recv_notif(200, &n) == -1 && errno == ENOENT, "RECV with the filter unused");
+    close(200);
+  }
 
   /* The rest of the API, in a child of its own. */
   pid = fork();

@@ -3845,7 +3845,22 @@ impl Kernel {
             out_cpu,
             out_rt_lens,
         ) = {
-            let mut sh = self.shared.lock().unwrap();
+            // A task that shares its fd table or cwd with another process
+            // (`CLONE_FILES`/`CLONE_FS` without `CLONE_VM`) isn't serialized
+            // with it by the address-space lock: wait out the other's step
+            // if it has them checked out (a step never blocks in place).
+            let mut sh = loop {
+                let sh = self.shared.lock().unwrap();
+                let info = &sh.procs[i]
+                    .as_ref()
+                    .expect("dispatched task is in the table")
+                    .info;
+                if sh.file_tables[info.files].is_some() && sh.cwd_tables[info.fs].is_some() {
+                    break sh;
+                }
+                drop(sh);
+                std::thread::yield_now();
+            };
             let mut proc = sh.procs[i].take().expect("dispatched task is in the table");
             // Own the task's per-step servicing state. `yield_now`/`block`/
             // `exec_ok` start clear so we observe only this step's value (the
