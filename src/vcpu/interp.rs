@@ -175,6 +175,9 @@ struct Aarch64Interp {
     dit: bool,
     /// Decoded-fetch cache: copies of recently executed code pages.
     fetch: FetchCache,
+    /// A software step is armed ([`Vcpu::set_single_step`]): the next
+    /// instruction to complete ends the run with a debug trap (`PSTATE.SS`).
+    single_step: bool,
 }
 
 /// A tiny direct-mapped cache of guest code pages, so instruction fetch is an
@@ -256,6 +259,7 @@ impl Aarch64Interp {
             excl_addr: 0,
             dit: false,
             fetch: FetchCache::new(),
+            single_step: false,
         }
     }
 
@@ -402,7 +406,11 @@ impl Vcpu for Aarch64Interp {
             match self.exec(instr, mem) {
                 Step::Next => self.pc = self.pc.wrapping_add(4),
                 Step::Branched => {}
-                Step::Syscall => return Ok(Exit::Syscall),
+                Step::Syscall => {
+                    // The kernel reports a step over a syscall at its return.
+                    self.single_step = false;
+                    return Ok(Exit::Syscall);
+                }
                 Step::Illegal => return Ok(Exit::IllegalInstruction { pc: self.pc }),
                 Step::Fault { addr, write } => return Ok(Exit::MemFault { addr, write }),
                 Step::Breakpoint { imm } => {
@@ -412,6 +420,13 @@ impl Vcpu for Aarch64Interp {
                     });
                 }
                 Step::Misaligned { addr, write } => return Ok(Exit::Misaligned { addr, write }),
+            }
+            // A completed instruction ends a step: the software-step exception.
+            if std::mem::take(&mut self.single_step) {
+                return Ok(Exit::DebugTrap {
+                    pc: self.pc,
+                    dr6: 1 << 14,
+                });
             }
         }
         Ok(Exit::Interrupted)
@@ -493,8 +508,14 @@ impl Vcpu for Aarch64Interp {
         self.tpidr = value;
     }
 
+    fn set_single_step(&mut self, on: bool) {
+        self.single_step = on;
+    }
+
     fn fork(&self) -> Result<Box<dyn Vcpu>, VcpuError> {
-        Ok(Box::new(self.clone()))
+        let mut child = self.clone();
+        child.single_step = false;
+        Ok(Box::new(child))
     }
 
     fn reset(&mut self, entry: u64, sp: u64) {

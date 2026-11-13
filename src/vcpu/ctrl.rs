@@ -63,6 +63,25 @@ pub const GDT_BASE: u64 = CTRL_GPA + GDT_OFF;
 /// The `#PF` trampoline's virtual address (the host recognizes a fault exit by
 /// the vcpu `rip` landing just past it).
 pub const FAULT_TRAMP_VA: u64 = CTRL_GPA + FAULT_TRAMP_OFF;
+/// The CPU exceptions besides `#PF` that have an IDT gate of their own, so
+/// that a user-mode one exits cleanly with its frame (instead of
+/// triple-faulting, which loses the registers): `#DE`, `#DB`, `#BP`, `#OF`,
+/// `#BR`, `#UD`, `#NP`, `#SS`, `#GP`, `#MF`, `#AC`, `#XM`.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // KVM-only
+pub const EXC_VECTORS: [u64; 12] = [0, 1, 3, 4, 5, 6, 11, 12, 13, 16, 17, 19];
+/// Where in the fault-trampoline page vector `v`'s own `hlt` is (the `#PF`
+/// one is at the start): the host tells the exceptions apart by the `rip`
+/// just past it.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(dead_code)
+)] // KVM-only
+pub const fn exc_tramp_va(v: u64) -> u64 {
+    FAULT_TRAMP_VA + 0x100 + v * 0x10
+}
 /// Linear address of the IDT and of the TSS.
 #[cfg_attr(
     not(all(target_os = "linux", target_arch = "x86_64")),
@@ -263,15 +282,24 @@ pub fn reserve_and_build(fa: &mut FrameAllocator, phys: &PhysMem) {
     phys.write(tss_pa + 4, &KSTACK_TOP.to_le_bytes());
     phys.write(tss_pa + 102, &0x68u16.to_le_bytes()); // iomap base past the TSS
 
-    // IDT entry 14 (#PF) → the fault trampoline (64-bit interrupt gate, CPL0).
-    let off = FAULT_TRAMP_VA;
-    let gate_lo = (off & 0xFFFF)
-        | (u64::from(SEL_KCODE) << 16)
-        | (0x8Eu64 << 40)
-        | (((off >> 16) & 0xFFFF) << 48);
-    let gate_hi = (off >> 32) & 0xFFFF_FFFF;
-    phys.write(idt_pa + 14 * 16, &gate_lo.to_le_bytes());
-    phys.write(idt_pa + 14 * 16 + 8, &gate_hi.to_le_bytes());
+    // IDT entry 14 (#PF) → the fault trampoline (64-bit interrupt gate, CPL0),
+    // and each of the other exceptions to a `hlt` of its own. `int3`/`into`
+    // are software interrupts that check the gate's DPL, so theirs is 3 (as
+    // on Linux); a CPU-raised exception ignores it.
+    let gate = |vector: u64, off: u64, dpl: u64| {
+        let gate_lo = (off & 0xFFFF)
+            | (u64::from(SEL_KCODE) << 16)
+            | ((0x8E | (dpl << 5)) << 40)
+            | (((off >> 16) & 0xFFFF) << 48);
+        let gate_hi = (off >> 32) & 0xFFFF_FFFF;
+        phys.write(idt_pa + vector * 16, &gate_lo.to_le_bytes());
+        phys.write(idt_pa + vector * 16 + 8, &gate_hi.to_le_bytes());
+    };
+    gate(14, FAULT_TRAMP_VA, 0);
+    for v in EXC_VECTORS {
+        gate(v, exc_tramp_va(v), if matches!(v, 3 | 4) { 3 } else { 0 });
+        phys.write(fault_pa + (exc_tramp_va(v) - FAULT_TRAMP_VA), &[0xF4]); // hlt
+    }
 
     // Trampolines: the syscall one (`IA32_LSTAR`) and the #PF one.
     phys.write(tramp_pa, &[0xF4, 0x48, 0x0F, 0x07]); // hlt ; sysretq

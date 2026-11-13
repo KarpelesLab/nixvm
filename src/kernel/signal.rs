@@ -74,6 +74,10 @@ pub(super) struct Fault {
 const ILL_ILLOPC: u64 = 1;
 const ILL_ILLOPN: u64 = 2;
 const TRAP_BRKPT: u64 = 1;
+/// `si_code` for a finished single step.
+const TRAP_TRACE: u64 = 2;
+/// `si_code` for a hardware breakpoint or watchpoint hit.
+const TRAP_HWBKPT: u64 = 4;
 const BUS_ADRALN: u64 = 1;
 const SEGV_MAPERR: u64 = 1;
 const SEGV_ACCERR: u64 = 2;
@@ -161,6 +165,24 @@ impl Fault {
                 trapno: 3,
                 ..Self::default()
             },
+        }
+    }
+
+    /// A debug trap ([`Exit::DebugTrap`](crate::vcpu::Exit::DebugTrap)): a
+    /// finished single step (`DR6.BS`, `TRAP_TRACE`) or a debug-register
+    /// match (`DR6` bits 0-3, `TRAP_HWBKPT`), `si_addr` the pc, as Linux's
+    /// `exc_debug_user` reports them.
+    pub(super) fn debug_trap(pc: u64, dr6: u64) -> Self {
+        Self {
+            sig: SIGTRAP,
+            code: if dr6 & 0xf != 0 {
+                TRAP_HWBKPT
+            } else {
+                TRAP_TRACE
+            },
+            addr: pc,
+            trapno: 1,
+            ..Self::default()
         }
     }
 

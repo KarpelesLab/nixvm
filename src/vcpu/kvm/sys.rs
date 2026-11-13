@@ -151,9 +151,17 @@ pub const KVM_SET_FPU: c_ulong = 0x41A0_AE8D;
 pub const KVM_SET_CPUID2: c_ulong = 0x4008_AE90;
 pub const KVM_SET_XCRS: c_ulong = 0x4188_AEA7;
 pub const KVM_SET_GUEST_DEBUG: c_ulong = 0x4048_AE9B;
+/// `_IOR/_IOW(KVMIO, 0xa1/0xa2, struct kvm_debugregs)` (128 bytes).
+pub const KVM_GET_DEBUGREGS: c_ulong = 0x8080_AEA1;
+pub const KVM_SET_DEBUGREGS: c_ulong = 0x4080_AEA2;
+/// `_IOR(KVMIO, 0xa4, struct kvm_xsave)` (4096 bytes): the standard-format
+/// `XSAVE` area.
+pub const KVM_GET_XSAVE: c_ulong = 0x9000_AEA4;
+pub const KVM_SET_XSAVE: c_ulong = 0x5000_AEA5;
 
 // `kvm_guest_debug.control` flags.
 pub const KVM_GUESTDBG_ENABLE: u32 = 0x0000_0001;
+pub const KVM_GUESTDBG_SINGLESTEP: u32 = 0x0000_0002;
 pub const KVM_GUESTDBG_USE_HW_BP: u32 = 0x0002_0000;
 
 // `kvm_run.exit_reason` values this backend decodes.
@@ -415,6 +423,22 @@ pub struct kvm_guest_debug {
     pub debugreg: [u64; 8],
 }
 
+/// `struct kvm_debugregs`: the guest's own `DR0..DR3`, `DR6`, `DR7`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct kvm_debugregs {
+    pub db: [u64; 4],
+    pub dr6: u64,
+    pub dr7: u64,
+    pub flags: u64,
+    pub reserved: [u64; 9],
+}
+
+/// `struct kvm_xsave`: a 4 KiB `XSAVE` image.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct kvm_xsave(pub [u8; 4096]);
+
 /// The per-exit payload union at byte offset 32 of `struct kvm_run`.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -470,6 +494,7 @@ mod tests {
         assert_eq!(size_of::<kvm_dtable>(), 16);
         assert_eq!(size_of::<kvm_sregs>(), 312);
         assert_eq!(size_of::<kvm_fpu>(), 416);
+        assert_eq!(size_of::<kvm_debugregs>(), 128);
         assert_eq!(size_of::<kvm_userspace_memory_region>(), 32);
         assert_eq!(size_of::<kvm_msr_entry>(), 16);
         assert_eq!(size_of::<kvm_cpuid_entry2>(), 40);

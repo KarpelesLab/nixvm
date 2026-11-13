@@ -252,7 +252,7 @@ impl Trap {
 /// (x87 status or `MXCSR` flags, `IE` = bit 0 … `PE` = bit 5), in the
 /// priority `fpu__exception_code` applies: invalid, divide-by-zero,
 /// overflow, underflow/denormal, precision.
-fn fpe_code(err: u32) -> u64 {
+pub(crate) fn fpe_code(err: u32) -> u64 {
     if err & 0x01 != 0 {
         7 // FPE_FLTINV
     } else if err & 0x04 != 0 {
@@ -599,7 +599,23 @@ struct X86Interp {
     /// disables it. Cached from `NIXVM_QUANTUM_MS` at construction (see
     /// [`super::preempt_quantum`]); a `fork` clone inherits it.
     quantum: Option<Duration>,
+    /// A single step is armed ([`Vcpu::set_single_step`]): the next
+    /// instruction to complete ends the run with a debug trap.
+    single_step: bool,
+    /// The debug registers a debugger loaded ([`Vcpu::set_debug_regs`]):
+    /// `DR0..DR3` and `DR7`; `dr_on` is whether `DR7` enables any slot.
+    dr: [u64; 8],
+    dr_on: bool,
+    /// The data watchpoints the current instruction's stores matched
+    /// (`DR6`'s `B0..B3`), reported once it completes.
+    dr_hits: u64,
+    /// An execute breakpoint already reported at this address: the resumed
+    /// instruction runs once without trapping again (the `RF` flag).
+    bp_skip: Option<u64>,
 }
+
+/// `DR6.BS`: the debug trap is a single step.
+const DR6_BS: u64 = 1 << 14;
 
 impl X86Interp {
     fn new(entry: u64, stack: u64) -> Self {
@@ -636,7 +652,51 @@ impl X86Interp {
             tsc: 0,
             mxcsr: 0x1f80, // the power-on default (all exceptions masked)
             quantum: super::preempt_quantum(),
+            single_step: false,
+            dr: [0; 8],
+            dr_on: false,
+            dr_hits: 0,
+            bp_skip: None,
         }
+    }
+
+    /// The `DR7` slots enabled with R/W field `rw` matching `pred`, as
+    /// `(slot, address, length)`.
+    fn dr_slots<'a>(
+        &'a self,
+        rw: impl Fn(u64) -> bool + 'a,
+    ) -> impl Iterator<Item = (usize, u64, u64)> + 'a {
+        let dr7 = self.dr[7];
+        (0..4).filter_map(move |i| {
+            let enabled = dr7 & (3 << (2 * i)) != 0;
+            let field = (dr7 >> (16 + 4 * i)) & 3;
+            let len = match (dr7 >> (18 + 4 * i)) & 3 {
+                0 => 1,
+                1 => 2,
+                2 => 8,
+                _ => 4,
+            };
+            (enabled && rw(field)).then_some((i, self.dr[i], len))
+        })
+    }
+
+    /// Note the data watchpoints a store of `len` bytes at `a` matches.
+    fn watch_store(&mut self, a: u64, len: u64) {
+        let mut hits = 0;
+        for (i, addr, wlen) in self.dr_slots(|rw| rw == 1 || rw == 3) {
+            let start = addr & !(wlen - 1);
+            if a < start + wlen && start < a.wrapping_add(len.max(1)) {
+                hits |= 1 << i;
+            }
+        }
+        self.dr_hits |= hits;
+    }
+
+    /// The execute breakpoints set at `pc`, as `DR6` bits.
+    fn exec_breakpoints(&self, pc: u64) -> u64 {
+        self.dr_slots(|rw| rw == 0)
+            .filter(|&(_, addr, _)| addr == pc)
+            .fold(0, |acc, (i, _, _)| acc | (1 << i))
     }
 
     fn next(&mut self, pc: u64) -> Step {
@@ -938,7 +998,11 @@ impl X86Interp {
         if a.wrapping_sub(self.code_page) < PAGE || last.wrapping_sub(self.code_page) < PAGE {
             self.code_page = NO_PAGE;
         }
-        mem.write_trap(a, bytes).map_err(|e| wr_fault(&e))
+        mem.write_trap(a, bytes).map_err(|e| wr_fault(&e))?;
+        if self.dr_on {
+            self.watch_store(a, bytes.len() as u64);
+        }
+        Ok(())
     }
 
     fn read_operand(&self, mem: &GuestMemory, op: Operand, width: u32) -> Result<u64, Step> {
@@ -3093,9 +3157,46 @@ impl Vcpu for X86Interp {
         // The kernel may have remapped or rewritten memory since the last run.
         self.code_page = NO_PAGE;
         for i in 0..MAX_STEPS {
-            match self.step(mem) {
-                Step::Next | Step::Branched => {}
-                Step::Syscall => return Ok(Exit::Syscall),
+            // A hardware execute breakpoint fires before its instruction runs.
+            if self.dr_on && self.bp_skip != Some(self.rip) {
+                let hits = self.exec_breakpoints(self.rip);
+                if hits != 0 {
+                    self.bp_skip = Some(self.rip);
+                    return Ok(Exit::DebugTrap {
+                        pc: self.rip,
+                        dr6: hits,
+                    });
+                }
+            }
+            let step = self.step(mem);
+            if matches!(step, Step::Next | Step::Branched | Step::Syscall) {
+                self.bp_skip = None;
+            } else {
+                // It didn't complete (or trapped): its stores don't count.
+                self.dr_hits = 0;
+            }
+            match step {
+                Step::Next | Step::Branched => {
+                    // A completed instruction: a step or a data watchpoint
+                    // traps now, with `rip` on the next one.
+                    let hits = std::mem::take(&mut self.dr_hits);
+                    if hits != 0 || self.single_step {
+                        let bs = if std::mem::take(&mut self.single_step) {
+                            DR6_BS
+                        } else {
+                            0
+                        };
+                        return Ok(Exit::DebugTrap {
+                            pc: self.rip,
+                            dr6: hits | bs,
+                        });
+                    }
+                }
+                Step::Syscall => {
+                    // The kernel reports a step over a syscall at its return.
+                    self.single_step = false;
+                    return Ok(Exit::Syscall);
+                }
                 Step::Illegal => return Ok(Exit::IllegalInstruction { pc: self.rip }),
                 Step::Fault { addr, write } => return Ok(Exit::MemFault { addr, write }),
                 Step::Trap(t) => return Ok(self.trap_exit(t)),
@@ -3227,8 +3328,26 @@ impl Vcpu for X86Interp {
         self.fs_base = value;
     }
 
+    fn set_single_step(&mut self, on: bool) {
+        self.single_step = on;
+    }
+
+    fn set_debug_regs(&mut self, dr: &[u64; 8]) -> bool {
+        self.dr = *dr;
+        let on = self.dr_slots(|_| true).next().is_some();
+        self.dr_on = on;
+        self.dr_hits = 0;
+        true
+    }
+
     fn fork(&self) -> Result<Box<dyn Vcpu>, VcpuError> {
-        Ok(Box::new(self.clone()))
+        // A child starts with no step armed and no debug registers (Linux's
+        // `copy_thread` gives it none of the tracer's breakpoints).
+        let mut child = self.clone();
+        child.single_step = false;
+        child.set_debug_regs(&[0; 8]);
+        child.bp_skip = None;
+        Ok(Box::new(child))
     }
 
     fn reset(&mut self, entry: u64, sp: u64) {

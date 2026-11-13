@@ -3488,6 +3488,17 @@ impl Kernel {
                 self.die_of_signal(cx, SIGTRAP as u32, mem);
                 Serviced::Ended
             }
+            Exit::DebugTrap { pc, dr6 } => {
+                // A single step or a debug-register hit: SIGTRAP, as above.
+                let fault = signal::Fault::debug_trap(pc, dr6);
+                if self.deliver_fault_signal(cx, fault, vcpu, mem) {
+                    return Serviced::Resume;
+                }
+                eprintln!("[fault] pid {} debug trap at {pc:#x}", cx.cur.pid);
+                self.dump_fault_context(vcpu, mem);
+                self.die_of_signal(cx, SIGTRAP as u32, mem);
+                Serviced::Ended
+            }
             Exit::Misaligned { addr, write } => {
                 let fault = signal::Fault::misaligned(self.arch, addr, write, vcpu.pc(), vcpu.sp());
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {

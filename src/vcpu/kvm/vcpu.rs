@@ -27,6 +27,7 @@ use super::sys;
 use super::vm::{
     FAULT_TRAMP_VA, GDT_BASE, GDT_LIMIT, LSTAR_VA, SEL_UCODE, SEL_UDATA, STAR_VALUE, Vm, check,
 };
+use crate::vcpu::ctrl::{EXC_VECTORS, exc_tramp_va};
 use crate::vcpu::mem::PAGE_SIZE;
 use crate::vcpu::phys::PhysMem;
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
@@ -169,6 +170,21 @@ mod preempt {
     }
 }
 
+/// `RFLAGS.TF` (single-step) and `RFLAGS.RF` (resume: no instruction
+/// breakpoint on the next instruction).
+const RFLAGS_TF: u64 = 1 << 8;
+const RFLAGS_RF: u64 = 1 << 16;
+/// `DR6` with no event recorded (its reserved bits read as one).
+const DR6_CLEAR: u64 = 0xFFFF_0FF0;
+/// `DR6.BS`: a single-step trap.
+const DR6_BS: u64 = 1 << 14;
+
+/// The exception whose own trampoline `hlt` a vcpu at `rip` just ran.
+fn exception_vector(rip: u64) -> Option<u64> {
+    let at = rip.wrapping_sub(1);
+    EXC_VECTORS.into_iter().find(|&v| exc_tramp_va(v) == at)
+}
+
 /// `RFLAGS` for fresh user code: just the always-one bit and IF (interrupts
 /// are never injected, but a clear IF would make a guest `pushf` look odd).
 const RFLAGS_USER: u64 = 0x202;
@@ -250,6 +266,9 @@ pub struct KvmVcpu {
     /// the CPU pushed, so sibling vcpus faulting at once never read each other's.
     /// Refreshed from `mem` on every reconcile (it changes on execve/fork).
     kstack_pa: u64,
+    /// [`Vcpu::set_single_step`] set `TF` in the user flags; the next `#DB`
+    /// (or a `syscall`) takes it out again.
+    step_armed: bool,
 }
 
 // The register caches and run page are noise in a debug dump; the fd
@@ -332,6 +351,18 @@ impl KvmVcpu {
             return Err(VcpuError::Backend(
                 "KVM_SET_MSRS set fewer MSRs than requested".into(),
             ));
+        }
+
+        // A reused vcpu may still hold the debug registers a debugger gave
+        // its last task.
+        if !is_new {
+            let d = sys::kvm_debugregs {
+                dr6: DR6_CLEAR,
+                dr7: 0x400,
+                ..sys::kvm_debugregs::default()
+            };
+            // SAFETY: valid struct pointer; the fd is live.
+            unsafe { sys::ioctl(fd.0, sys::KVM_SET_DEBUGREGS, std::ptr::from_ref(&d)) };
         }
 
         // Start from the vcpu's current sregs (sane reset values for the
@@ -427,7 +458,123 @@ impl KvmVcpu {
             tlb_gen_seen: u64::MAX,
             phys: None,
             kstack_pa: 0,
+            step_armed: false,
         })
+    }
+
+    /// Read (and reset) the guest's `DR6`, with `DR7` beside it.
+    fn take_dr6(&self) -> (u64, u64) {
+        let mut d = sys::kvm_debugregs::default();
+        // SAFETY: valid out-pointer; the fd is live.
+        let ret = unsafe {
+            sys::ioctl(
+                self.fd.0,
+                sys::KVM_GET_DEBUGREGS,
+                std::ptr::from_mut(&mut d),
+            )
+        };
+        if ret < 0 {
+            return (0, 0);
+        }
+        let (dr6, dr7) = (d.dr6, d.dr7);
+        if dr6 & 0x400f != 0 {
+            d.dr6 = DR6_CLEAR;
+            // SAFETY: valid struct pointer; the fd is live.
+            unsafe { sys::ioctl(self.fd.0, sys::KVM_SET_DEBUGREGS, std::ptr::from_ref(&d)) };
+        }
+        (dr6, dr7)
+    }
+
+    /// The x87 control/status words and `MXCSR`, for a floating-point trap's
+    /// `si_code`.
+    fn fpu_status(&self) -> (u16, u16, u32) {
+        let mut fpu = sys::kvm_fpu::default();
+        // SAFETY: valid out-pointer; the fd is live.
+        let ret = unsafe { sys::ioctl(self.fd.0, sys::KVM_GET_FPU, std::ptr::from_mut(&mut fpu)) };
+        if ret < 0 {
+            return (0x37f, 0, 0x1f80);
+        }
+        // `struct kvm_fpu`: fpr[8][16], then fcw and fsw (u16s at 128),
+        // …, mxcsr (u32 at 408).
+        let w = fpu.0[16];
+        let mxcsr = (fpu.0[51] & 0xffff_ffff) as u32;
+        (w as u16, (w >> 16) as u16, mxcsr)
+    }
+
+    /// A user-mode exception other than `#PF` vectored to its own trampoline:
+    /// take the faulting user state back from the frame the CPU pushed, and
+    /// say what it was.
+    fn exception_exit(&mut self, vector: u64) -> Exit {
+        let has_code = matches!(vector, 11 | 12 | 13 | 17);
+        let ksp = self.regs.rsp + if has_code { 8 } else { 0 };
+        // [error code,] rip, cs, rflags, rsp, ss.
+        let frame = self.phys.as_ref().map(|ph| {
+            let at = |va: u64| ph.read_u64(self.kstack_pa + (va & (PAGE_SIZE - 1)));
+            (at(ksp), at(ksp + 16), at(ksp + 24))
+        });
+        let Some((rip, rflags, rsp)) = frame else {
+            return Exit::IllegalInstruction { pc: self.regs.rip };
+        };
+        self.regs.rip = rip;
+        self.regs.rsp = rsp;
+        self.regs.rflags = rflags;
+        self.regs_dirty = true;
+        self.sregs.cs = user_cs();
+        self.sregs.ss = user_ss();
+        self.sregs_dirty = true;
+        match vector {
+            0 => Exit::ArithmeticFault {
+                pc: rip,
+                code: 1, // FPE_INTDIV
+                vector: 0,
+            },
+            1 => {
+                let (dr6, dr7) = self.take_dr6();
+                let hits = dr6 & 0xf;
+                let bs = if self.step_armed && rflags & RFLAGS_TF != 0 && hits == 0 {
+                    DR6_BS
+                } else {
+                    dr6 & DR6_BS
+                };
+                if bs != 0 && std::mem::take(&mut self.step_armed) {
+                    self.regs.rflags &= !RFLAGS_TF;
+                }
+                // An instruction breakpoint is a fault: the resumed
+                // instruction must run once without hitting it again.
+                if (0..4).any(|i| hits & (1 << i) != 0 && (dr7 >> (16 + 4 * i)) & 3 == 0) {
+                    self.regs.rflags |= RFLAGS_RF;
+                }
+                if hits | bs == 0 {
+                    // `INT1`/`ICEBP`.
+                    Exit::Breakpoint { pc: rip, code: 1 }
+                } else {
+                    Exit::DebugTrap {
+                        pc: rip,
+                        dr6: hits | bs,
+                    }
+                }
+            }
+            3 => Exit::Breakpoint { pc: rip, code: 3 },
+            6 => Exit::IllegalInstruction { pc: rip },
+            16 | 19 => {
+                let (cw, sw, mxcsr) = self.fpu_status();
+                let err = if vector == 16 {
+                    u32::from(sw & !cw & 0x3f)
+                } else {
+                    mxcsr & !(mxcsr >> 7) & 0x3f
+                };
+                Exit::ArithmeticFault {
+                    pc: rip,
+                    code: crate::vcpu::interp_x86::fpe_code(err),
+                    vector,
+                }
+            }
+            17 => Exit::Misaligned {
+                addr: 0,
+                write: false,
+            },
+            _ => Exit::ProtectionFault { pc: rip },
+        }
     }
 
     /// Point the vcpu's `sregs.cr3` at `mem`'s address space if it isn't already —
@@ -599,6 +746,12 @@ impl KvmVcpu {
             let exit = self.decode_exit(reason)?;
             if exit == Exit::Syscall {
                 self.in_syscall = true;
+                // A step over a `syscall` is the kernel's to report (at its
+                // return); the user flags `sysretq` restores lose the `TF`.
+                if std::mem::take(&mut self.step_armed) {
+                    self.regs.r11 &= !RFLAGS_TF;
+                    self.regs_dirty = true;
+                }
             }
             return Ok(exit);
         }
@@ -646,6 +799,10 @@ impl KvmVcpu {
                         write: false,
                     })
                 }
+            }
+            // Another exception's own trampoline.
+            sys::KVM_EXIT_HLT if exception_vector(self.regs.rip).is_some() => {
+                Ok(self.exception_exit(exception_vector(self.regs.rip).unwrap_or(6)))
             }
             // The trampoline's `hlt` — a guest `syscall`. (With no in-kernel
             // irqchip, `hlt` exits straight to userspace and the next KVM_RUN
@@ -941,6 +1098,87 @@ impl Vcpu for KvmVcpu {
     fn set_tls(&mut self, value: u64) {
         self.sregs.fs.base = value;
         self.sregs_dirty = true;
+    }
+
+    /// The `XSAVE` image KVM keeps for the vcpu, cut to the components the
+    /// guest has (x87, SSE, AVX: `XCR0` = 7).
+    fn fp_state(&self) -> Vec<u8> {
+        let mut x = Box::new(sys::kvm_xsave([0; 4096]));
+        // SAFETY: valid out-pointer to a 4 KiB buffer; the fd is live.
+        let ret = unsafe {
+            sys::ioctl(
+                self.fd.0,
+                sys::KVM_GET_XSAVE,
+                std::ptr::from_mut(x.as_mut()),
+            )
+        };
+        if ret < 0 {
+            return Vec::new();
+        }
+        x.0[..crate::vcpu::X86_XSAVE_SIZE].to_vec()
+    }
+
+    fn set_fp_state(&mut self, bytes: &[u8]) {
+        let mut x = Box::new(sys::kvm_xsave([0; 4096]));
+        // SAFETY: as in `fp_state`.
+        let ret = unsafe {
+            sys::ioctl(
+                self.fd.0,
+                sys::KVM_GET_XSAVE,
+                std::ptr::from_mut(x.as_mut()),
+            )
+        };
+        if ret < 0 || bytes.len() < 512 {
+            return;
+        }
+        let n = bytes.len().min(crate::vcpu::X86_XSAVE_SIZE);
+        x.0[..n].copy_from_slice(&bytes[..n]);
+        // A legacy image: x87 and SSE are in it, whatever the header said.
+        if n < 520 {
+            x.0[512] |= 3;
+        }
+        // SAFETY: valid struct pointer; the fd is live.
+        unsafe {
+            sys::ioctl(
+                self.fd.0,
+                sys::KVM_SET_XSAVE,
+                std::ptr::from_ref(x.as_ref()),
+            )
+        };
+    }
+
+    fn set_single_step(&mut self, on: bool) {
+        if on {
+            if self.in_syscall {
+                // (Not expected: the result is written back first.)
+                self.regs.r11 |= RFLAGS_TF;
+            } else {
+                // Back to user mode first if the syscall's `sysretq` is
+                // pending, so the step is the user's next instruction.
+                self.settle_syscall_return();
+                self.regs.rflags |= RFLAGS_TF;
+            }
+            self.step_armed = true;
+            self.regs_dirty = true;
+        } else if std::mem::take(&mut self.step_armed) {
+            self.regs.rflags &= !RFLAGS_TF;
+            self.regs.r11 &= !RFLAGS_TF;
+            self.regs_dirty = true;
+        }
+    }
+
+    fn set_debug_regs(&mut self, dr: &[u64; 8]) -> bool {
+        let d = sys::kvm_debugregs {
+            db: [dr[0], dr[1], dr[2], dr[3]],
+            dr6: DR6_CLEAR,
+            // Bit 10 always reads as one; only the enables and the R/W and
+            // LEN fields are the debugger's (no GD, LE or GE).
+            dr7: (dr[7] & 0xffff_00ff) | 0x400,
+            ..sys::kvm_debugregs::default()
+        };
+        // SAFETY: valid struct pointer; the fd is live.
+        let ret = unsafe { sys::ioctl(self.fd.0, sys::KVM_SET_DEBUGREGS, std::ptr::from_ref(&d)) };
+        ret >= 0
     }
 
     fn fork(&self) -> Result<Box<dyn Vcpu>, VcpuError> {

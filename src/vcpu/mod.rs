@@ -123,6 +123,14 @@ pub enum Exit {
     /// reserved `MXCSR` bits, …) at `pc`: Linux's `SIGSEGV` with `SI_KERNEL`
     /// and no address.
     ProtectionFault { pc: u64 },
+    /// A debug trap (`#DB` on x86, a software-step or watchpoint exception
+    /// on arm64), with the task stopped at `pc`, where it resumes: a single
+    /// step armed by [`Vcpu::set_single_step`] completed (`dr6` has bit 14,
+    /// `BS`), or a hardware breakpoint/watchpoint armed by
+    /// [`Vcpu::set_debug_regs`] matched (`dr6` bits 0-3, which slots). Linux
+    /// answers with `SIGTRAP` — `TRAP_TRACE` for a step, `TRAP_HWBKPT` for a
+    /// match.
+    DebugTrap { pc: u64, dr6: u64 },
     /// The host asked the vcpu to stop (another thread wants to run, or a
     /// deadline/signal fired). The kernel decides what to do next.
     Interrupted,
@@ -290,6 +298,37 @@ pub trait Vcpu: Send {
         Vec::new()
     }
     fn set_simd_state(&mut self, _bytes: &[u8]) {}
+
+    /// The FP/SIMD state for a debugger (`PTRACE_GETFPREGS`, the FP regsets),
+    /// in the [`Vcpu::simd_state`] layout. The same thing unless a backend
+    /// leaves that empty for signal frames but can still read it on demand.
+    fn fp_state(&self) -> Vec<u8> {
+        self.simd_state()
+    }
+    fn set_fp_state(&mut self, bytes: &[u8]) {
+        self.set_simd_state(bytes);
+    }
+
+    /// Arm (or disarm) a single step: once the next user instruction
+    /// completes, [`Vcpu::run`] returns [`Exit::DebugTrap`] with `BS` set
+    /// instead of carrying on. One-shot: the trap disarms it, and so does a
+    /// syscall instruction (the kernel reports a step over a syscall itself,
+    /// at the syscall's return). A fault doesn't: the instruction hasn't
+    /// completed, and re-running it still traps after it. Called with the
+    /// vcpu in user mode, or (KVM) with a syscall's result already written
+    /// back, which then returns to user mode first. Backends without it
+    /// ignore it.
+    fn set_single_step(&mut self, _on: bool) {}
+
+    /// Load the x86 debug registers a debugger set for this task: `dr[0..4]`
+    /// the addresses, `dr[7]` the control word (local/global enables, R/W and
+    /// LEN fields); `dr[4..7]` are ignored. A matching access stops the task
+    /// with [`Exit::DebugTrap`] (an execute breakpoint before the
+    /// instruction, a data watchpoint after it). Whether the backend has
+    /// them.
+    fn set_debug_regs(&mut self, _dr: &[u64; 8]) -> bool {
+        false
+    }
 
     /// Thread pointer (arm64 `TPIDR_EL0` / x86-64 `FS.base`), set by TLS syscalls.
     fn set_tls(&mut self, value: u64);

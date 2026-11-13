@@ -38,6 +38,7 @@ const PROGRAMS: &[&str] = &[
     "sandbox_fs",
     "ptrace",
     "seccomp_notify",
+    "cpu_traps",
 ];
 
 /// A directory of binaries, also used as the guest's root, so that a program can
