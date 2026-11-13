@@ -44,6 +44,21 @@ impl<T: Copy + PartialEq> PageVec<T> {
         self.chunks = Vec::new();
     }
 
+    /// Pages per chunk: what [`Self::uniform_chunk`] answers for.
+    pub(crate) const CHUNK: usize = CHUNK;
+
+    /// The value every page of chunk `c` (pages `c * CHUNK ..`) holds, if
+    /// they all hold one: the default for a chunk never written.
+    pub(crate) fn uniform_chunk(&self, c: usize) -> Option<T> {
+        match self.chunks.get(c) {
+            Some(Some(chunk)) => {
+                let first = chunk[0];
+                chunk.iter().all(|v| *v == first).then_some(first)
+            }
+            _ => Some(self.default),
+        }
+    }
+
     /// The pages holding something other than the default, in order. Only
     /// visits chunks that exist, so it doesn't scan the whole address space.
     pub(crate) fn non_default(&self) -> impl Iterator<Item = (usize, T)> + '_ {

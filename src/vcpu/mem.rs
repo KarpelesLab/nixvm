@@ -1369,21 +1369,72 @@ impl GuestMemory {
 
     /// The `/proc/<pid>/maps` regions: runs of mapped pages with one
     /// protection, sharing and backing, in address order (the program break's
-    /// region one of its own).
+    /// region one of its own). Walks runs, a whole chunk of pages at a time
+    /// where nothing changes in it, so a runtime's hundreds of gigabytes of
+    /// reservations cost little.
     #[must_use]
     pub fn regions(&self) -> Vec<Region> {
+        const CHUNK: usize = PageVec::<bool>::CHUNK;
         let mut out: Vec<Region> = Vec::new();
         let none: Arc<str> = Arc::from("");
-        let heap = round_up(self.heap.start, PAGE_SIZE);
-        let mut last_kind = (false, false);
-        for (p, mapped) in self.mapped.non_default() {
-            if !mapped {
+        let n = self.mapped.len();
+        let heap_edges = [
+            self.page_index(round_up(self.heap.start, PAGE_SIZE)),
+            self.page_index(round_up(self.heap.brk, PAGE_SIZE)),
+        ];
+        // Where page `p`'s run must stop regardless: a heap edge.
+        let heap_edge = |p: usize| -> usize {
+            heap_edges
+                .into_iter()
+                .flatten()
+                .filter(|&e| e > p)
+                .min()
+                .unwrap_or(n)
+        };
+        let mut p = 0;
+        while p < n {
+            // Skip unmapped pages, a whole never-mapped chunk at a time.
+            if p.is_multiple_of(CHUNK) && self.mapped.uniform_chunk(p / CHUNK) == Some(false) {
+                p += CHUNK;
                 continue;
             }
-            let start = self.page_base(p);
-            let kind = (self.file_backed[p], start >= heap && start < self.heap.brk);
-            let same_kind = std::mem::replace(&mut last_kind, kind) == kind;
-            let (shared, offset, dev, ino, name) = match self.file_at(p) {
+            if !self.mapped[p] {
+                p += 1;
+                continue;
+            }
+            let (prot, sh, fb) = (self.prot[p], self.shared_anon[p], self.file_backed[p]);
+            let vma = self.file_at(p);
+            // A run stays within one file mapping (or the gap between two).
+            let limit = match vma {
+                Some((s, v)) => s + v.pages,
+                None => self.files.range(p + 1..).next().map_or(n, |(&s, _)| s),
+            }
+            .min(heap_edge(p))
+            .min(n);
+            let mut q = p + 1;
+            while q < limit {
+                if q.is_multiple_of(CHUNK) && q + CHUNK <= limit {
+                    let c = q / CHUNK;
+                    if self.mapped.uniform_chunk(c) == Some(true)
+                        && self.prot.uniform_chunk(c) == Some(prot)
+                        && self.shared_anon.uniform_chunk(c) == Some(sh)
+                        && self.file_backed.uniform_chunk(c) == Some(fb)
+                    {
+                        q += CHUNK;
+                        continue;
+                    }
+                }
+                if !self.mapped[q]
+                    || self.prot[q] != prot
+                    || self.shared_anon[q] != sh
+                    || self.file_backed[q] != fb
+                {
+                    break;
+                }
+                q += 1;
+            }
+            let (start, end) = (self.page_base(p), self.page_base(q));
+            let (shared, offset, dev, ino, name) = match vma {
                 Some((s, v)) => (
                     v.map.shared,
                     (v.map.pgoff + (p - s) as u64) * PAGE_SIZE,
@@ -1391,31 +1442,34 @@ impl GuestMemory {
                     v.map.ino,
                     Arc::clone(&v.map.name),
                 ),
-                None => (self.shared_anon[p], 0, 0, 0, Arc::clone(&none)),
+                None => (sh, 0, 0, 0, Arc::clone(&none)),
             };
-            if let Some(last) = out.last_mut()
-                && same_kind
-                && last.end == start
-                && last.prot == self.prot[p]
-                && last.shared == shared
-                && last.name == name
-                && last.dev == dev
-                && last.ino == ino
-                && (name.is_empty() || last.offset + (last.end - last.start) == offset)
-            {
-                last.end += PAGE_SIZE;
-                continue;
-            }
-            out.push(Region {
-                start,
-                end: start + PAGE_SIZE,
-                prot: self.prot[p],
-                shared,
-                offset,
-                dev,
-                ino,
-                name,
+            // Two file mappings of one file, one after the other, are one.
+            let joins = out.last().is_some_and(|last| {
+                last.end == start
+                    && last.prot == prot
+                    && last.shared == shared
+                    && last.name == name
+                    && last.dev == dev
+                    && last.ino == ino
+                    && !name.is_empty()
+                    && last.offset + (last.end - last.start) == offset
             });
+            if joins {
+                out.last_mut().expect("checked").end = end;
+            } else {
+                out.push(Region {
+                    start,
+                    end,
+                    prot,
+                    shared,
+                    offset,
+                    dev,
+                    ino,
+                    name,
+                });
+            }
+            p = q;
         }
         out
     }
