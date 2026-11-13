@@ -1,7 +1,15 @@
-//! A page cache for `MAP_SHARED` file mappings, so a shared file mapping is
-//! *shared*: every process (and every `mmap` within one) that maps the same
-//! page of the same file maps the same physical frame, a `fork` child aliases
-//! it, and `read`/`write` on the file stay coherent with the mappings.
+//! A page cache for file mappings, so a shared file mapping is *shared*:
+//! every process (and every `mmap` within one) that maps the same page of the
+//! same file maps the same physical frame, a `fork` child aliases it, and
+//! `read`/`write` on the file stay coherent with the mappings. A private
+//! mapping is copy-on-write over the same frames, so it reads the file as it
+//! is until it writes a page of its own.
+//!
+//! A file's pages are a [`FileObj`] (see [`crate::vcpu::filemap`]), which the
+//! mappings reference; the cache holds one per mapped regular file, keyed by
+//! the file's identity. Shared-memory files — memfds and `/dev/shm` — need no
+//! cache: their contents *are* such pages ([`ShmStore`]), so they are sparse,
+//! never written back, and mapped straight from there.
 //!
 //! Before this, a `MAP_SHARED` file mapping was a private copy written back on
 //! `munmap`, so two mappers never saw each other's stores — which broke every
@@ -13,16 +21,16 @@
 //! filesystems copy on `link`, so a hard link is a different file here; that
 //! remains a limitation.
 //!
-//! Frames are allocated from the shared pool, filled from the file, and owned
-//! by the cache (one reference) while also mapped (one reference per mapping,
-//! tagged shared so `fork` aliases instead of copying — see
-//! [`GuestMemory::map_frames`]). Coherency rules: file writes (`write`,
-//! `pwrite`, `splice`, …) are written through into cached pages; file reads
-//! overlay cached pages (a mapping's stores are visible to `read` before any
-//! flush); `truncate` zeroes cached bytes past the new end. The existing
-//! write-back of writable shared mappings (`munmap`/`msync`/exit) still
-//! persists the contents into the backend. When no address space maps an
-//! entry's frames any more, [`Kernel::pc_gc`] drops it.
+//! Frames are allocated from the shared pool, filled from the file before a
+//! mapping maps them, and owned by the [`FileObj`] (one reference) while also
+//! mapped (one reference per page table entry). Coherency rules: file writes
+//! (`write`, `pwrite`, `splice`, …) are written through into cached pages;
+//! file reads overlay cached pages (a mapping's stores are visible to `read`
+//! before any flush); `truncate` zeroes cached bytes past the new end and
+//! takes the pages past it from every mapping (touching them is `SIGBUS`).
+//! The write-back of writable shared mappings (`munmap`/`msync`/exit)
+//! persists the contents into the backend. When no address space maps a
+//! file any more, [`Kernel::pc_gc`] drops its pages.
 //!
 //! The cache sits behind its own leaf lock ([`Kernel::page_cache`]): it is
 //! taken after `vfs` (the file paths call it with `vfs` held) and nothing is
@@ -31,12 +39,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use std::sync::Mutex;
+
 use super::{Kernel, err};
 use crate::abi::errno::Errno;
-use crate::fs::MountTable;
+use crate::fs::{MountTable, PageStore};
 use crate::vcpu::GuestMemory;
-use crate::vcpu::mem::{PAGE_SIZE, Prot};
-use crate::vcpu::phys::PhysMem;
+use crate::vcpu::filemap::FileObj;
+use crate::vcpu::mem::PAGE_SIZE;
+use crate::vcpu::phys::{FrameAllocator, PhysMem};
 
 /// The task whose syscall this host thread is servicing, as file I/O needs
 /// it: set by [`IoTask::enter`] for the length of a step.
@@ -71,6 +82,11 @@ impl IoTask {
     pub(super) fn leave() -> Option<u128> {
         IO_TASK.with(|t| t.borrow_mut().take().and_then(|t| t.delay_until))
     }
+
+    /// The memory cgroup the task's I/O allocates in (0 outside a step).
+    pub(super) fn memcg() -> u16 {
+        IO_TASK.with(|t| t.borrow().as_ref().map_or(0, |t| t.memcg))
+    }
 }
 
 /// A file's identity: the mount point serving it and its inode there.
@@ -79,48 +95,8 @@ type FileKey = (String, u64);
 /// The shared-file page cache.
 #[derive(Debug, Default)]
 pub(super) struct PageCache {
-    /// The frame pool (captured from the first mapping), for reading and
-    /// writing cached pages without an address space.
-    phys: Option<Arc<PhysMem>>,
-    /// File → page index → frame.
-    files: BTreeMap<FileKey, BTreeMap<u64, u64>>,
-}
-
-impl PageCache {
-    /// Copy every cached page overlapping `[off, off + buf.len())` of `pages`
-    /// over `buf` (the cached bytes are the newest).
-    fn overlay(&self, pages: &BTreeMap<u64, u64>, off: u64, buf: &mut [u8]) {
-        let Some(phys) = &self.phys else { return };
-        let end = off + buf.len() as u64;
-        for (&idx, &frame) in pages.range(off / PAGE_SIZE..=end.saturating_sub(1) / PAGE_SIZE) {
-            let (pstart, pend) = (idx * PAGE_SIZE, (idx + 1) * PAGE_SIZE);
-            let (lo, hi) = (pstart.max(off), pend.min(end));
-            if lo >= hi {
-                continue;
-            }
-            phys.read(
-                frame + (lo - pstart),
-                &mut buf[(lo - off) as usize..(hi - off) as usize],
-            );
-        }
-    }
-
-    /// Write `data` at `off` into every cached page it overlaps.
-    fn write_through(&self, pages: &BTreeMap<u64, u64>, off: u64, data: &[u8]) {
-        let Some(phys) = &self.phys else { return };
-        let end = off + data.len() as u64;
-        for (&idx, &frame) in pages.range(off / PAGE_SIZE..=end.saturating_sub(1) / PAGE_SIZE) {
-            let (pstart, pend) = (idx * PAGE_SIZE, (idx + 1) * PAGE_SIZE);
-            let (lo, hi) = (pstart.max(off), pend.min(end));
-            if lo >= hi {
-                continue;
-            }
-            phys.write(
-                frame + (lo - pstart),
-                &data[(lo - off) as usize..(hi - off) as usize],
-            );
-        }
-    }
+    /// File → its pages.
+    files: BTreeMap<FileKey, Arc<FileObj>>,
 }
 
 impl Kernel {
@@ -235,143 +211,209 @@ impl Kernel {
         Some((vfs.mount_point_of(path)?, ino))
     }
 
-    /// Map `[base, base + len)` as a `MAP_SHARED` view of `path` from byte
-    /// `offset` (page-aligned) with `prot`, through the page cache: pages
-    /// already cached are shared, missing ones are read in.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn pc_map_shared(
+    /// The pages of the file at `path`, as mappings map them: a
+    /// shared-memory file's own (its contents), or the page cache's for any
+    /// other regular file (made now if the file has none).
+    pub(super) fn file_obj(
         &self,
         vfs: &mut MountTable,
-        mem: &mut GuestMemory,
+        mem: &GuestMemory,
         path: &str,
-        offset: u64,
-        base: u64,
-        len: u64,
-        prot: Prot,
-    ) -> Result<(), i64> {
-        let Some(key) = Self::pc_key(vfs, path) else {
-            return Err(err(Errno::ENOENT));
-        };
+    ) -> Result<Arc<FileObj>, i64> {
+        if let Some(id) = vfs.page_id(path) {
+            self.shm.attach_pool(mem);
+            return self.shm.obj(id).ok_or_else(|| err(Errno::ENODEV));
+        }
+        let size = vfs.stat(path).ok_or_else(|| err(Errno::ENOENT))?.size;
+        let key = Self::pc_key(vfs, path).ok_or_else(|| err(Errno::ENOENT))?;
         let mut pc = self.page_cache.lock().unwrap();
-        if pc.phys.is_none() {
-            pc.phys = Some(mem.phys_arc());
+        let obj = pc
+            .files
+            .entry(key)
+            .or_insert_with(|| FileObj::new(mem.phys_arc(), mem.allocator(), size, false));
+        obj.set_origin(path);
+        Ok(Arc::clone(obj))
+    }
+
+    /// Fill the page cache's pages `[first, first + n)` of the (non
+    /// shared-memory) file at `path` from the file, where they're inside it
+    /// and not cached yet: what a mapping of them is about to map.
+    pub(super) fn pc_populate(
+        vfs: &mut MountTable,
+        obj: &FileObj,
+        path: &str,
+        first: u64,
+        n: u64,
+        memcg: u16,
+    ) -> Result<(), i64> {
+        if obj.is_shmem() {
+            return Ok(());
         }
-        let first = offset / PAGE_SIZE;
-        let n = len / PAGE_SIZE;
-        let mut frames = Vec::with_capacity(n as usize);
-        let mut fresh = Vec::new();
-        {
-            let pages = pc.files.entry(key).or_default();
-            for idx in first..first + n {
-                if let Some(&f) = pages.get(&idx) {
-                    frames.push(f);
-                } else {
-                    let Some(f) = mem.alloc_frames(1) else {
-                        return Err(err(Errno::ENOMEM));
-                    };
-                    pages.insert(idx, f[0]);
-                    frames.push(f[0]);
-                    fresh.push((idx, f[0]));
+        let end = (first + n).min(obj.size().div_ceil(PAGE_SIZE));
+        let mut buf = vec![0u8; PAGE_SIZE as usize];
+        for idx in first..end {
+            if obj.has_page(idx) {
+                continue;
+            }
+            buf.fill(0);
+            let mut got = 0;
+            while got < buf.len() {
+                match vfs.read_at(path, idx * PAGE_SIZE + got as u64, &mut buf[got..]) {
+                    Ok(k) if k > 0 => got += k,
+                    _ => break,
                 }
             }
+            obj.fill(idx, &buf, memcg).map_err(|_| err(Errno::ENOMEM))?;
         }
-        // Fill the new pages from the file (past EOF they stay zero).
-        if let Some(phys) = pc.phys.clone() {
-            let mut buf = vec![0u8; PAGE_SIZE as usize];
-            for (idx, frame) in fresh {
-                buf.fill(0);
-                let mut got = 0;
-                while got < buf.len() {
-                    match vfs.read_at(path, idx * PAGE_SIZE + got as u64, &mut buf[got..]) {
-                        Ok(k) if k > 0 => got += k,
-                        _ => break,
-                    }
-                }
-                phys.write(frame, &buf);
-            }
+        Ok(())
+    }
+
+    /// The page cache's pages of the (non shared-memory) file at `path`, if
+    /// it has any.
+    fn cached(&self, vfs: &mut MountTable, path: &str) -> Option<Arc<FileObj>> {
+        if self.page_cache.lock().unwrap().files.is_empty() {
+            return None;
         }
-        drop(pc);
-        mem.map_frames(base, &frames, prot)
-            .map_err(|_| err(Errno::ENOMEM))
+        let key = Self::pc_key(vfs, path)?;
+        self.page_cache.lock().unwrap().files.get(&key).cloned()
     }
 
     /// After `read` of `buf.len()` bytes at `off` from `path`: lay any cached
     /// (possibly newer, mapped-and-stored) pages over the bytes read.
     pub(super) fn pc_after_read(&self, vfs: &mut MountTable, path: &str, off: u64, buf: &mut [u8]) {
-        let pc = self.page_cache.lock().unwrap();
-        if pc.files.is_empty() || buf.is_empty() {
+        if buf.is_empty() {
             return;
         }
-        drop(pc);
-        let Some(key) = Self::pc_key(vfs, path) else {
-            return;
-        };
-        let pc = self.page_cache.lock().unwrap();
-        if let Some(pages) = pc.files.get(&key) {
-            pc.overlay(pages, off, buf);
+        if let Some(obj) = self.cached(vfs, path) {
+            obj.overlay(off, buf);
         }
     }
 
     /// After writing `data` at `off` of `path`: write it through into cached
-    /// pages so every mapping sees it.
+    /// pages so every mapping sees it, growing the cached file with it and
+    /// caching the pages it wrote that weren't (a mapping past the old end of
+    /// the file maps them next).
     pub(super) fn pc_after_write(&self, vfs: &mut MountTable, path: &str, off: u64, data: &[u8]) {
-        let pc = self.page_cache.lock().unwrap();
-        if pc.files.is_empty() || data.is_empty() {
+        if data.is_empty() {
             return;
         }
-        drop(pc);
-        let Some(key) = Self::pc_key(vfs, path) else {
+        let Some(obj) = self.cached(vfs, path) else {
             return;
         };
-        let pc = self.page_cache.lock().unwrap();
-        if let Some(pages) = pc.files.get(&key) {
-            pc.write_through(pages, off, data);
+        obj.write_through(off, data);
+        let end = off + data.len() as u64;
+        if end > obj.size() {
+            obj.set_size(end);
         }
+        let first = off / PAGE_SIZE;
+        let pages = end.div_ceil(PAGE_SIZE) - first;
+        let memcg = IoTask::memcg();
+        let _ = Self::pc_populate(vfs, &obj, path, first, pages, memcg);
     }
 
     /// After `path` was truncated to `len`: cached bytes past the new end read
-    /// as zero (as the file now does).
+    /// as zero, and pages past it are gone from every mapping (`SIGBUS`).
     pub(super) fn pc_after_truncate(&self, vfs: &mut MountTable, path: &str, len: u64) {
-        let pc = self.page_cache.lock().unwrap();
-        if pc.files.is_empty() {
-            return;
-        }
-        drop(pc);
-        let Some(key) = Self::pc_key(vfs, path) else {
-            return;
-        };
-        let pc = self.page_cache.lock().unwrap();
-        let (Some(pages), Some(phys)) = (pc.files.get(&key), &pc.phys) else {
-            return;
-        };
-        for (&idx, &frame) in pages.range(len / PAGE_SIZE..) {
-            let start = idx * PAGE_SIZE;
-            let from = len.saturating_sub(start).min(PAGE_SIZE);
-            phys.write(frame + from, &vec![0u8; (PAGE_SIZE - from) as usize]);
+        if let Some(obj) = self.cached(vfs, path) {
+            obj.set_size(len);
         }
     }
 
-    /// Drop every cached page no address space maps any more (only the
-    /// cache's own reference is left), and every file left with no pages.
+    /// Drop the cached files no address space maps any more.
     /// Called after mappings go away (`munmap`, `execve`, exit).
-    pub(super) fn pc_gc(&self, mem: &GuestMemory) {
+    pub(super) fn pc_gc(&self, _mem: &GuestMemory) {
         let mut pc = self.page_cache.lock().unwrap();
         if pc.files.is_empty() {
             return;
         }
-        let mut dead = Vec::new();
-        for pages in pc.files.values_mut() {
-            pages.retain(|_, &mut f| {
-                let live = mem.frame_refcount(f) > 1;
+        let dead: Vec<Arc<FileObj>> = {
+            let mut dead = Vec::new();
+            pc.files.retain(|_, obj| {
+                let live = Arc::strong_count(obj) > 1;
                 if !live {
-                    dead.push(f);
+                    dead.push(Arc::clone(obj));
                 }
                 live
             });
-        }
-        pc.files.retain(|_, pages| !pages.is_empty());
+            dead
+        };
         drop(pc);
-        mem.release_frames(&dead);
+        // Their frames go back to the pool as the last references drop.
+        drop(dead);
+    }
+}
+
+/// Where shared-memory files (memfds, `/dev/shm`) keep their contents: one
+/// [`FileObj`] per file, in guest memory. See [`crate::fs::PageStore`].
+#[derive(Default)]
+pub(super) struct ShmStore {
+    /// The frame pool (the first address space's, which every other shares).
+    pool: std::sync::OnceLock<(Arc<PhysMem>, Arc<Mutex<FrameAllocator>>)>,
+    objs: Mutex<BTreeMap<u64, Arc<FileObj>>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl std::fmt::Debug for ShmStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShmStore")
+            .field("files", &self.objs.lock().unwrap().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ShmStore {
+    /// Learn the frame pool from an address space in it, once.
+    pub(super) fn attach_pool(&self, mem: &GuestMemory) {
+        if self.pool.get().is_none() {
+            let _ = self.pool.set((mem.phys_arc(), mem.allocator()));
+        }
+    }
+
+    /// The pages of shared-memory file `id`.
+    pub(super) fn obj(&self, id: u64) -> Option<Arc<FileObj>> {
+        self.objs.lock().unwrap().get(&id).cloned()
+    }
+
+    fn with<T>(&self, id: u64, f: impl FnOnce(&FileObj) -> T) -> Option<T> {
+        let obj = self.obj(id)?;
+        Some(f(&obj))
+    }
+}
+
+impl PageStore for ShmStore {
+    fn create(&self) -> Option<u64> {
+        let (phys, fa) = self.pool.get()?;
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let obj = FileObj::new(Arc::clone(phys), Arc::clone(fa), 0, true);
+        self.objs.lock().unwrap().insert(id, obj);
+        Some(id)
+    }
+
+    fn release(&self, id: u64) {
+        let obj = self.objs.lock().unwrap().remove(&id);
+        drop(obj);
+    }
+
+    fn len(&self, id: u64) -> u64 {
+        self.with(id, FileObj::size).unwrap_or(0)
+    }
+
+    fn read(&self, id: u64, off: u64, buf: &mut [u8]) -> usize {
+        self.with(id, |o| o.read(off, buf)).unwrap_or(0)
+    }
+
+    fn write(&self, id: u64, off: u64, data: &[u8]) -> std::io::Result<()> {
+        let memcg = IoTask::memcg();
+        match self.with(id, |o| o.write(off, data, memcg)) {
+            Some(Ok(())) => Ok(()),
+            Some(Err(_)) => Err(std::io::Error::from_raw_os_error(28)), // ENOSPC
+            None => Err(std::io::Error::from_raw_os_error(2)),
+        }
+    }
+
+    fn set_len(&self, id: u64, len: u64) -> std::io::Result<()> {
+        self.with(id, |o| o.set_size(len))
+            .ok_or_else(|| std::io::Error::from_raw_os_error(2))
     }
 }
 

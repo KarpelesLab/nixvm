@@ -350,12 +350,13 @@ impl Kernel {
 
     /// Bring procfs up to date for this task, ahead of a lookup in it. The other
     /// tasks have to be read before taking `vfs`, which sorts after `shared`.
-    fn refresh_procfs(&self, cx: &ServiceCtx) {
+    fn refresh_procfs(&self, cx: &ServiceCtx, mem: &GuestMemory) {
         let tasks = self.visible_tasks(cx);
         let tids = self.visible_thread_ids(cx);
         let mut live = self.proc_self_live(cx);
         live.tasks = tasks;
         live.tids = tids;
+        live.maps = Self::render_maps(cx, mem);
         {
             let mut sh = self.shared.lock().unwrap();
             let uts = sh.uts(cx.cur.ns.uts);
@@ -398,7 +399,7 @@ impl Kernel {
         if !abs.contains("/proc") {
             return None;
         }
-        self.refresh_procfs(cx);
+        self.refresh_procfs(cx, mem);
         let inside = Self::as_seen_from_root(cx, &abs);
         let (target, kind) = parse_ns_path(&inside)?;
         let id = match self.ns_of_target(cx, target, kind) {

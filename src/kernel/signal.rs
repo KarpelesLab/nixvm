@@ -79,6 +79,7 @@ const TRAP_TRACE: u64 = 2;
 /// `si_code` for a hardware breakpoint or watchpoint hit.
 const TRAP_HWBKPT: u64 = 4;
 const BUS_ADRALN: u64 = 1;
+const BUS_ADRERR: u64 = 2;
 const SEGV_MAPERR: u64 = 1;
 const SEGV_ACCERR: u64 = 2;
 const SI_KERNEL: u64 = 0x80;
@@ -115,6 +116,16 @@ impl Fault {
                 err: u64::from(mapped) | (u64::from(write) << 1) | 4 | (u64::from(ifetch) << 4),
                 ..Self::default()
             },
+        }
+    }
+
+    /// A touch of a file mapping past the end of its file: `SIGBUS` with
+    /// `BUS_ADRERR` at `addr`, from the same page fault a `SIGSEGV` would be.
+    pub(super) fn bus(arch: Arch, addr: u64, write: bool, ifetch: bool) -> Self {
+        Self {
+            sig: SIGBUS,
+            code: BUS_ADRERR,
+            ..Self::segv(arch, addr, write, false, ifetch)
         }
     }
 

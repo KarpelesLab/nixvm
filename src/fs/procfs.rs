@@ -842,6 +842,8 @@ pub struct ProcSelf {
     pub syscall: String,
     /// `sys/kernel/seccomp/actions_logged`.
     pub seccomp_logged: Option<String>,
+    /// Body of `self/maps`; empty for the fixed text.
+    pub maps: String,
 }
 
 /// The synthesized `/proc` backend.
@@ -916,6 +918,7 @@ impl ProcFs {
         d.auxv = live.auxv;
         d.syscall = live.syscall;
         d.seccomp_logged = live.seccomp_logged;
+        d.maps = live.maps;
         if live.arch.is_some() {
             d.arch = live.arch;
         }
@@ -2134,6 +2137,7 @@ mod tests {
             arch: None,
             syscall: String::new(),
             seccomp_logged: None,
+            maps: String::new(),
         });
         assert_eq!(read_all(&mut fs, "self/auxv").len(), 16);
         assert_eq!(read_all(&mut fs, "self/comm"), b"myprog\n");

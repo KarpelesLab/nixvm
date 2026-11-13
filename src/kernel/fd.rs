@@ -23,15 +23,26 @@ pub struct FileOffset(Arc<OfdState>);
 struct OfdState {
     pos: AtomicU64,
     append: AtomicBool,
+    /// Keeps the file counted as open for as long as the description lives
+    /// — in any task's table, checked out or not, or in flight in a socket
+    /// (see [`super::orphan`]).
+    _pin: Option<Arc<super::orphan::OpenPin>>,
 }
 
 impl FileOffset {
     /// A new open file description positioned at `pos`.
     #[must_use]
     pub fn new(pos: u64) -> Self {
+        Self::pinned(pos, None)
+    }
+
+    /// [`Self::new`], holding `pin` while it lives.
+    #[must_use]
+    pub(super) fn pinned(pos: u64, pin: Option<Arc<super::orphan::OpenPin>>) -> Self {
         Self(Arc::new(OfdState {
             pos: AtomicU64::new(pos),
             append: AtomicBool::new(false),
+            _pin: pin,
         }))
     }
     #[must_use]

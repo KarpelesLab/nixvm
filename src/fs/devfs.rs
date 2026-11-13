@@ -140,7 +140,9 @@ impl Default for DevFs {
 impl DevFs {
     #[must_use]
     pub fn new() -> Self {
-        Self { shm: TmpFs::new() }
+        Self {
+            shm: TmpFs::shmem(),
+        }
     }
 
     /// The path inside the `/dev/shm` tmpfs for a mount-relative `rel`
@@ -302,6 +304,14 @@ fn eagain() -> io::Error {
 impl MountFs for DevFs {
     fn fs_type(&self) -> &'static str {
         "devtmpfs"
+    }
+
+    fn attach_pages(&mut self, store: &std::sync::Arc<dyn super::PageStore>) {
+        self.shm.attach_pages(store);
+    }
+
+    fn page_id(&mut self, rel: &str) -> Option<u64> {
+        self.shm.page_id(Self::shm_rel(rel)?)
     }
 
     fn read_only(&self) -> bool {
@@ -529,6 +539,16 @@ impl MountFs for DevFs {
     fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
         match (Self::shm_rel(from), Self::shm_rel(to)) {
             (Some(f), Some(t)) if !f.is_empty() && !t.is_empty() => self.shm.rename(f, t),
+            (Some(_), _) | (_, Some(_)) => Err(io::Error::from_raw_os_error(18)), // EXDEV
+            _ => Err(io::Error::from_raw_os_error(30)),                           // EROFS
+        }
+    }
+    /// A real hard link within `/dev/shm`: musl's `sem_open` makes a
+    /// semaphore under a temporary name, maps it, and links it to its real
+    /// name — a copy there would be a different semaphore.
+    fn link(&mut self, old: &str, new: &str) -> io::Result<()> {
+        match (Self::shm_rel(old), Self::shm_rel(new)) {
+            (Some(o), Some(n)) if !o.is_empty() && !n.is_empty() => self.shm.link(o, n),
             (Some(_), _) | (_, Some(_)) => Err(io::Error::from_raw_os_error(18)), // EXDEV
             _ => Err(io::Error::from_raw_os_error(30)),                           // EROFS
         }

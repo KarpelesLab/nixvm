@@ -10,6 +10,14 @@ use super::{Attrs, DirEntry, MountFs, NodeKind};
 /// `MAXSYMLINKS`).
 const SYMLINK_MAX: usize = 40;
 
+/// Where the filesystem every namespace shares lives ([`MountTable::mount_global`]):
+/// memfds, which are in no directory. No guest path can name it — a path
+/// can't hold a NUL — and every namespace and root sees it at the same place.
+pub const GLOBAL_DIR: &str = "/\0memfd";
+
+/// [`MountTable::best_mount`]'s index for the global mount.
+const GLOBAL: usize = usize::MAX;
+
 #[derive(Clone)]
 // The flags are independent properties of a mount, as Linux's are.
 #[allow(clippy::struct_excessive_bools)]
@@ -107,6 +115,10 @@ pub struct MountTable {
     disk_quota: Option<std::sync::Arc<crate::limits::Quota>>,
     /// The VM's disks (see [`super::blockdev`]).
     disks: super::blockdev::SharedDisks,
+    /// What shared-memory filesystems keep their files' contents in.
+    pages: Option<Arc<dyn super::PageStore>>,
+    /// The filesystem at [`GLOBAL_DIR`], the same in every namespace.
+    global: Option<Mount>,
     /// The device each mounted filesystem is (keyed by [`fs_key`]): its disk,
     /// or an anonymous device.
     devs: BTreeMap<usize, u64>,
@@ -184,17 +196,19 @@ impl MountTable {
         let source = self.canonical(source);
         let target = normalize(target);
         let i = self.best_mount(&source).ok_or_else(enoent)?;
-        if self.mounts[i].unbindable {
+        if self.mount_ref(i).unbindable {
             return Err(einval());
         }
         // A bind mount of a shared mount is its peer, and of a slave a slave of
         // the same master (Linux's clone_mnt), so it keeps getting what they get.
         let mut new = vec![Mount {
             point: target.clone(),
-            subdir: self.mounts[i].fs_path(&relative_to(&source, &self.mounts[i].point)),
+            subdir: self
+                .mount_ref(i)
+                .fs_path(&relative_to(&source, &self.mount_ref(i).point)),
             guest: true,
             locked: false,
-            ..self.mounts[i].clone()
+            ..self.mount_ref(i).clone()
         }];
         if recursive {
             for m in &self.mounts {
@@ -322,7 +336,7 @@ impl MountTable {
         let abs_path = self.canonical(abs_path);
         match self.best_mount(&abs_path) {
             Some(i) => {
-                let m = &self.mounts[i];
+                let m = &self.mount_ref(i);
                 let fs = Arc::as_ptr(&m.fs).cast::<()>() as usize;
                 format!("{fs:x}:{}", m.fs_path(&relative_to(&abs_path, &m.point)))
             }
@@ -338,7 +352,7 @@ impl MountTable {
     ) -> Option<(super::cgroupfs::SharedTree, u32, Option<String>)> {
         let abs_path = self.canonical(abs_path);
         let i = self.best_mount(&abs_path)?;
-        let m = &self.mounts[i];
+        let m = &self.mount_ref(i);
         let rel = m.fs_path(&relative_to(&abs_path, &m.point));
         let mut fs = m.lock();
         let cg = fs.as_cgroupfs_mut()?;
@@ -350,7 +364,7 @@ impl MountTable {
     pub fn fs_type_at(&mut self, abs_path: &str) -> Option<&'static str> {
         let abs_path = self.canonical(abs_path);
         let i = self.best_mount(&abs_path)?;
-        Some(self.mounts[i].lock().fs_type())
+        Some(self.mount_ref(i).lock().fs_type())
     }
 
     /// The hierarchy a `cgroup2` mount shows, if there is one.
@@ -395,11 +409,13 @@ impl MountTable {
     ) -> io::Result<(MutexGuard<'_, Box<dyn MountFs>>, String)> {
         let abs_path = self.canonical(abs_path);
         let i = self.best_mount(&abs_path).ok_or_else(enoent)?;
-        if self.mounts[i].read_only {
+        if self.mount_ref(i).read_only {
             return Err(io::Error::from_raw_os_error(30)); // EROFS
         }
-        let rel = self.mounts[i].fs_path(&relative_to(&abs_path, &self.mounts[i].point));
-        Ok((self.mounts[i].lock(), rel))
+        let rel = self
+            .mount_ref(i)
+            .fs_path(&relative_to(&abs_path, &self.mount_ref(i).point));
+        Ok((self.mount_ref(i).lock(), rel))
     }
 
     /// As [`Self::resolve_for_write`], for a call that creates `abs_path`: on a
@@ -412,7 +428,7 @@ impl MountTable {
     ) -> io::Result<(MutexGuard<'_, Box<dyn MountFs>>, String)> {
         let canonical = self.canonical(abs_path);
         let i = self.best_mount(&canonical).ok_or_else(enoent)?;
-        if self.mounts[i].read_only && self.stat_raw(&canonical).is_some() {
+        if self.mount_ref(i).read_only && self.stat_raw(&canonical).is_some() {
             return Err(io::Error::from_raw_os_error(17)); // EEXIST
         }
         self.resolve_for_write(abs_path)
@@ -425,6 +441,36 @@ impl MountTable {
             mount.lock().attach_quota(quota);
         }
         self.quota = Some(quota.clone());
+    }
+
+    /// Keep shared-memory filesystems' file contents in `store`, now and for
+    /// anything mounted later.
+    pub fn attach_pages(&mut self, store: &Arc<dyn super::PageStore>) {
+        let parked = self.parked.values().flatten();
+        for mount in self.mounts.iter().chain(parked).chain(self.global.as_ref()) {
+            mount.lock().attach_pages(store);
+        }
+        self.pages = Some(Arc::clone(store));
+    }
+
+    /// Mount `fs` at [`GLOBAL_DIR`], in every namespace at once.
+    pub fn mount_global(&mut self, mut fs: Box<dyn MountFs>) {
+        if let Some(quota) = &self.quota {
+            fs.attach_quota(quota);
+        }
+        if let Some(store) = &self.pages {
+            fs.attach_pages(store);
+        }
+        let m = Mount::new(GLOBAL_DIR.to_string(), fs, false);
+        self.register(&m);
+        self.global = Some(m);
+    }
+
+    /// The id in the page store of `abs_path`'s contents, if a shared-memory
+    /// filesystem keeps them there.
+    pub fn page_id(&mut self, abs_path: &str) -> Option<u64> {
+        let (mut fs, rel) = self.resolve(abs_path)?;
+        fs.page_id(&rel)
     }
 
     /// Charge every filesystem's growth on the host's disk to `quota`, now and for
@@ -448,6 +494,9 @@ impl MountTable {
         }
         if let Some(quota) = &self.disk_quota {
             fs.attach_disk_quota(quota);
+        }
+        if let Some(store) = &self.pages {
+            fs.attach_pages(store);
         }
         let m = Mount::new(normalize(&point.into()), fs, false);
         self.register(&m);
@@ -485,10 +534,19 @@ impl MountTable {
         self.disks.clone()
     }
 
+    /// Mount `i` of [`Self::best_mount`]'s answers.
+    fn mount_ref(&self, i: usize) -> &Mount {
+        if i == GLOBAL {
+            self.global.as_ref().expect("the global mount")
+        } else {
+            &self.mounts[i]
+        }
+    }
+
     /// The device of mount `i`'s filesystem.
     fn dev_of(&self, i: usize) -> u64 {
         self.devs
-            .get(&fs_key(&self.mounts[i]))
+            .get(&fs_key(self.mount_ref(i)))
             .copied()
             .unwrap_or(1)
     }
@@ -509,6 +567,9 @@ impl MountTable {
         if let Some(quota) = &self.disk_quota {
             fs.attach_disk_quota(quota);
         }
+        if let Some(store) = &self.pages {
+            fs.attach_pages(store);
+        }
         let m = Mount::new(normalize(point), fs, true);
         self.register(&m);
         self.attach(vec![m]);
@@ -522,7 +583,9 @@ impl MountTable {
         let Some(top_point) = tree.first().map(|m| m.point.clone()) else {
             return;
         };
-        let parent = self.best_mount(&top_point).map(|i| self.mounts[i].clone());
+        let parent = self
+            .best_mount(&top_point)
+            .map(|i| self.mount_ref(i).clone());
         let Some(parent) = parent.filter(|p| p.peer != 0) else {
             self.mounts.extend(tree);
             return;
@@ -880,6 +943,9 @@ impl MountTable {
     /// [`resolve`]: Self::resolve
     /// [`rename`]: Self::rename
     fn best_mount(&self, abs_path: &str) -> Option<usize> {
+        if self.global.is_some() && path_has_prefix(abs_path, GLOBAL_DIR) {
+            return Some(GLOBAL);
+        }
         let mut best: Option<usize> = None;
         let mut best_len = 0usize;
         for (i, m) in self.mounts.iter().enumerate() {
@@ -905,8 +971,10 @@ impl MountTable {
     fn resolve(&mut self, abs_path: &str) -> Option<(MutexGuard<'_, Box<dyn MountFs>>, String)> {
         let abs_path = self.canonical(abs_path);
         let i = self.best_mount(&abs_path)?;
-        let rel = self.mounts[i].fs_path(&relative_to(&abs_path, &self.mounts[i].point));
-        Some((self.mounts[i].lock(), rel))
+        let rel = self
+            .mount_ref(i)
+            .fs_path(&relative_to(&abs_path, &self.mount_ref(i).point));
+        Some((self.mount_ref(i).lock(), rel))
     }
 
     /// `abs_path` with its final component's symlink chain followed — inside
@@ -980,8 +1048,10 @@ impl MountTable {
     /// `stat` of an already-canonical path, without resolving symlinks.
     fn stat_raw(&mut self, abs_path: &str) -> Option<Attrs> {
         let i = self.best_mount(abs_path)?;
-        let rel = self.mounts[i].fs_path(&relative_to(abs_path, &self.mounts[i].point));
-        let mut a = self.mounts[i].lock().stat(&rel)?;
+        let rel = self
+            .mount_ref(i)
+            .fs_path(&relative_to(abs_path, &self.mount_ref(i).point));
+        let mut a = self.mount_ref(i).lock().stat(&rel)?;
         a.dev = self.dev_of(i);
         Some(a)
     }
@@ -1035,7 +1105,7 @@ impl MountTable {
                     let Some(target) = (hops <= SYMLINK_MAX)
                         .then(|| {
                             let i = self.best_mount(&cand)?;
-                            let m = &self.mounts[i];
+                            let m = &self.mount_ref(i);
                             let rel = m.fs_path(&relative_to(&cand, &m.point));
                             m.lock().readlink(&rel).ok()
                         })
@@ -1171,7 +1241,7 @@ impl MountTable {
     pub fn mount_point_of(&mut self, abs_path: &str) -> Option<String> {
         let abs = self.canonical(abs_path);
         let i = self.best_mount(&abs)?;
-        Some(self.mounts[i].point.clone())
+        Some(self.mount_ref(i).point.clone())
     }
 
     /// Extended attribute `name` of the node at `abs_path` (see
@@ -1209,7 +1279,7 @@ impl MountTable {
         if from_idx != to_idx {
             return Err(io::Error::from_raw_os_error(18)); // EXDEV
         }
-        let m = &self.mounts[from_idx];
+        let m = &self.mount_ref(from_idx);
         if m.read_only {
             return Err(io::Error::from_raw_os_error(30)); // EROFS
         }
@@ -1231,7 +1301,7 @@ impl MountTable {
         if old_idx != new_idx {
             return Err(io::Error::from_raw_os_error(18)); // EXDEV, as Linux
         }
-        let m = &self.mounts[old_idx];
+        let m = &self.mount_ref(old_idx);
         if m.read_only {
             return Err(io::Error::from_raw_os_error(30)); // EROFS
         }
@@ -1339,6 +1409,8 @@ impl PivotMap {
 /// registration and every path-taking method normalize defensively so
 /// prefix matching is always done on a canonical path.
 fn normalize(p: &str) -> String {
+    // The global mount is the same whatever the root a path was joined to.
+    let p = p.find(GLOBAL_DIR).map_or(p, |i| &p[i..]);
     let mut stack: Vec<&str> = Vec::new();
     for comp in p.split('/') {
         match comp {

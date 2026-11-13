@@ -554,6 +554,7 @@ impl Kernel {
                 self.seccomp_logged
                     .load(std::sync::atomic::Ordering::Relaxed),
             )),
+            maps: String::new(),
         }
     }
 
@@ -594,6 +595,87 @@ impl Kernel {
             let _ = write!(out, "{g} ");
         }
         out.push('\n');
+        out
+    }
+
+    /// `/proc/self/maps` for the running task, laid out as Linux does: one
+    /// line per run of pages with one protection and backing, the file it
+    /// maps (`/memfd:NAME (deleted)`, `/SYSV00000000 (deleted)`, a path) or
+    /// what it is (`[heap]`, `[stack]`, `[vvar]`, `[vdso]`).
+    pub(super) fn render_maps(cx: &ServiceCtx, mem: &GuestMemory) -> String {
+        use std::fmt::Write as _;
+        let stack_top = mem.base() + mem.size();
+        let heap = mem.heap;
+        let mut lines: Vec<(u64, String)> = Vec::new();
+        let vdso = crate::vcpu::ctrl::VDSO_VA;
+        let vvar = crate::vcpu::ctrl::VVAR_VA;
+        let page = crate::vcpu::mem::PAGE_SIZE;
+        let fixed = [
+            (vvar, vvar + page, "r--p", "[vvar]"),
+            (vdso, vdso + page, "r-xp", "[vdso]"),
+        ];
+        for (start, end, perms, name) in fixed {
+            let mut l = format!("{start:08x}-{end:08x} {perms} 00000000 00:00 0");
+            pad_maps_line(&mut l);
+            l.push_str(name);
+            lines.push((start, l));
+        }
+        let _ = cx;
+        for r in mem.regions() {
+            let p = r.prot;
+            let perms = format!(
+                "{}{}{}{}",
+                if p.contains(crate::vcpu::Prot::READ) {
+                    'r'
+                } else {
+                    '-'
+                },
+                if p.contains(crate::vcpu::Prot::WRITE) {
+                    'w'
+                } else {
+                    '-'
+                },
+                if p.contains(crate::vcpu::Prot::EXEC) {
+                    'x'
+                } else {
+                    '-'
+                },
+                if r.shared { 's' } else { 'p' },
+            );
+            let (major, minor) = (
+                ((r.dev >> 8) & 0xfff) | ((r.dev >> 32) & !0xfff),
+                (r.dev & 0xff) | ((r.dev >> 12) & !0xff),
+            );
+            let mut l = String::new();
+            let _ = write!(
+                l,
+                "{:08x}-{:08x} {perms} {:08x} {major:02x}:{minor:02x} {}",
+                r.start, r.end, r.offset, r.ino
+            );
+            let name: &str = if !r.name.is_empty() {
+                &r.name
+            } else if heap.start < heap.brk
+                && r.start >= heap.start
+                && r.end <= heap.brk.next_multiple_of(page)
+            {
+                "[heap]"
+            } else if r.end == stack_top {
+                "[stack]"
+            } else {
+                ""
+            };
+            if !name.is_empty() {
+                pad_maps_line(&mut l);
+                l.push_str(name);
+            }
+            lines.push((r.start, l));
+        }
+        lines.sort_by_key(|(start, _)| *start);
+        let mut out = String::new();
+        for (_, l) in lines {
+            out.push_str(&l);
+            out.push('\n');
+        }
         out
     }
 
@@ -918,6 +1000,9 @@ impl Kernel {
             Ok(p) => p,
             Err(e) => return e,
         };
+        if self.seal_blocks_chmod(vfs, &abs, mode as u32) {
+            return err(Errno::EPERM);
+        }
         match vfs.set_mode(&abs, mode as u32) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
@@ -984,6 +1069,9 @@ impl Kernel {
             Some(_) => return 0, // non-file fds: accept (nothing to chmod)
             None => return err(Errno::EBADF),
         };
+        if self.seal_blocks_chmod(vfs, &path, mode as u32) {
+            return err(Errno::EPERM);
+        }
         match vfs.set_mode(&path, mode as u32) {
             Ok(()) => 0,
             Err(e) => io_errno(&e),
@@ -1218,6 +1306,9 @@ fn sandbox_of(info: &super::ProcInfo) -> crate::fs::Sandbox {
 /// kernel's spellings).
 fn fd_link_target(fd: &Fd) -> String {
     match fd {
+        Fd::File { path, .. } if super::memfd_display(path).is_some() => {
+            super::memfd_display(path).unwrap_or_default()
+        }
         // A file on a hidden mount (detached, or kept from another mount
         // namespace) reads as its path within that mount, as Linux shows it.
         Fd::File { path, .. } | Fd::Dir { path, .. } => match path.strip_prefix("/\0") {
@@ -1241,6 +1332,14 @@ fn fd_link_target(fd: &Fd) -> String {
         Fd::Mqueue { q, .. } => format!("mqueue:[{q}]"),
         Fd::SeccompNotify(_) => "anon_inode:seccomp notify".to_string(),
         Fd::ProcMem { pid, .. } => format!("/proc/{pid}/mem"),
+    }
+}
+
+/// Pad a `maps` line to where Linux starts the name column.
+fn pad_maps_line(l: &mut String) {
+    const NAME_COLUMN: usize = 73;
+    while l.len() < NAME_COLUMN {
+        l.push(' ');
     }
 }
 

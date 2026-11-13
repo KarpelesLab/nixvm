@@ -598,6 +598,26 @@ struct QueuedSig {
 /// Signal-table size: signals `1..=64` plus the unused index 0.
 const NSIG_SLOTS: usize = 65;
 
+/// A memfd's path in the filesystem every namespace shares: its number and
+/// its name (a `/` in it kept as `\u{1}`, a path component having none).
+fn memfd_path(seq: u64, name: &str) -> String {
+    format!(
+        "{}/{seq}:{}",
+        crate::fs::mount::GLOBAL_DIR,
+        name.replace('/', "\u{1}")
+    )
+}
+
+/// What Linux calls a memfd at `path` in `/proc/<pid>/fd` and
+/// `/proc/<pid>/maps`: `/memfd:NAME (deleted)`. `None` if it's no memfd.
+pub(super) fn memfd_display(path: &str) -> Option<String> {
+    let rest = path
+        .strip_prefix(crate::fs::mount::GLOBAL_DIR)?
+        .strip_prefix('/')?;
+    let (_, name) = rest.split_once(':')?;
+    Some(format!("/memfd:{} (deleted)", name.replace('\u{1}', "/")))
+}
+
 /// A filesystem context between its tasks' slices: the working directory and
 /// the `umask`, which `CLONE_FS` shares.
 #[derive(Clone, Debug)]
@@ -1799,10 +1819,16 @@ pub struct Kernel {
     /// The page cache behind `MAP_SHARED` file mappings (see [`pagecache`]).
     /// A leaf lock taken after `vfs`; nothing is acquired while it is held.
     page_cache: Mutex<pagecache::PageCache>,
+    /// The contents of shared-memory files: memfds and `/dev/shm` (see
+    /// [`pagecache::ShmStore`]). Its locks are leaves too.
+    shm: Arc<pagecache::ShmStore>,
     /// Open-but-unlinked files, by their hidden path (see [`orphan`]). A leaf
     /// lock; the counter mints the hidden names.
     orphans: Mutex<BTreeSet<String>>,
     orphan_seq: AtomicU64,
+    /// Which files some open file description is of (see
+    /// [`orphan::OpenPin`]), by identity. A leaf lock.
+    open_pins: Mutex<BTreeMap<(String, u64), std::sync::Weak<orphan::OpenPin>>>,
     /// Record/OFD/`flock` locks and memfd seals (see [`fcntl`]). A leaf lock.
     locks: Mutex<fcntl::FileLocks>,
 }
@@ -2399,6 +2425,11 @@ impl Kernel {
         mounts.attach_quota(&memory_quota);
         let disk_quota = crate::limits::Quota::new(limits.disk_bytes);
         mounts.attach_disk_quota(&disk_quota);
+        // Shared memory (`/dev/shm`, memfds) lives in guest memory.
+        let shm = Arc::new(pagecache::ShmStore::default());
+        let store: Arc<dyn crate::fs::PageStore> = shm.clone();
+        mounts.attach_pages(&store);
+        mounts.mount_global(Box::new(crate::fs::TmpFs::shmem()));
         let pids = Arc::new(Mutex::new(pidns::PidNamespaces::default()));
         let users = Arc::new(Mutex::new(userns::UserNamespaces::default()));
         // The hierarchy a `cgroup2` mount made before the kernel shows, if any.
@@ -2452,8 +2483,10 @@ impl Kernel {
             ptys: Mutex::new(pty::Ptys::default()),
             unsupported_sub: Mutex::new(BTreeMap::new()),
             page_cache: Mutex::new(pagecache::PageCache::default()),
+            shm,
             orphans: Mutex::new(BTreeSet::new()),
             orphan_seq: AtomicU64::new(0),
+            open_pins: Mutex::new(BTreeMap::new()),
             locks: Mutex::new(fcntl::FileLocks::default()),
             shared: Mutex::new(Shared {
                 stdin: Box::new(std::io::stdin()),
@@ -3161,7 +3194,12 @@ impl Kernel {
             return Serviced::Resume;
         }
         pagecache::IoTask::enter(cx.cur.pid, cx.cur.memcg, mem);
+        self.shm.attach_pool(mem);
+        // Pages a mapped file lost (to a truncation, say) go before the space
+        // runs on: from other processes' doing, and from this step's.
+        mem.revalidate_files();
         let flow = self.service_exit(cx, exit, vcpu, mem);
+        mem.revalidate_files();
         // Its I/O went past an `io.max`: it waits that out before going on.
         if let Some(until) = pagecache::IoTask::leave()
             && !matches!(flow, Serviced::Ended)
@@ -3398,7 +3436,20 @@ impl Kernel {
                 // write to read-only/unmapped memory, or an already-private page
                 // — is a genuine segfault. This is the software mirror of a
                 // hardware MMU's page-fault-driven COW.
-                if mem.demand_fault(addr) || mem.cow_fault(addr, write) {
+                let file = mem.file_fault(addr);
+                if file == crate::vcpu::FileFault::Bus {
+                    // Past the end of a mapped file.
+                    let fault = signal::Fault::bus(self.arch, addr, write, addr == vcpu.pc());
+                    if self.deliver_fault_signal(cx, fault, vcpu, mem) {
+                        return Serviced::Resume;
+                    }
+                    self.die_of_signal(cx, 7, mem); // SIGBUS
+                    return Serviced::Ended;
+                }
+                if file == crate::vcpu::FileFault::Resolved
+                    || mem.demand_fault(addr)
+                    || mem.cow_fault(addr, write)
+                {
                     vcpu.flush_tlb();
                     Serviced::Resume
                 } else if self.grow_stack(cx, addr, mem) {
@@ -6102,6 +6153,13 @@ impl Kernel {
         let (mut abs, mut argv) = (abs.to_string(), argv);
         let mut depth = 0;
         let elf = loop {
+            // Only a regular file with an execute bit runs (root needs one
+            // too): a memfd made with MFD_NOEXEC_SEAL doesn't.
+            match vfs.follow(&abs).and_then(|p| vfs.stat(&p)) {
+                Some(a) if a.kind == NodeKind::File && a.mode & 0o111 != 0 => {}
+                Some(_) => return Some(err(Errno::EACCES)),
+                None => return Some(err(Errno::ENOENT)),
+            }
             let Some(data) = self.read_file(vfs, &abs) else {
                 return Some(err(Errno::ENOENT));
             };
@@ -6880,16 +6938,28 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         sh.memfd_seq += 1;
-        let path = format!("/{}memfd.{}", orphan::ORPHAN_PREFIX, sh.memfd_seq);
-        if vfs.create(&path, 0o777).is_err() {
+        let path = memfd_path(sh.memfd_seq, &name);
+        // Executable unless asked not to be (and then sealed so it can't become so).
+        let mode = if flags & MFD_NOEXEC_SEAL != 0 {
+            0o666
+        } else {
+            0o777
+        };
+        if vfs.create(&path, mode).is_err() {
             return err(Errno::ENOSPC);
         }
+        self.own_new_node(vfs, cx, &path);
         self.orphans.lock().unwrap().insert(path.clone());
         // MFD_NOEXEC_SEAL implies a sealable memfd with F_SEAL_EXEC set.
-        self.memfd_register(&path, flags & (MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL) != 0);
+        self.memfd_register(
+            &path,
+            flags & MFD_ALLOW_SEALING != 0,
+            flags & MFD_NOEXEC_SEAL != 0,
+        );
+        let pin = self.pin_open(vfs, &path);
         let fd = cx.cur.fds.alloc(Fd::File {
             path,
-            offset: FileOffset::new(0),
+            offset: FileOffset::pinned(0, pin),
             readable: true,
             writable: true,
         });
@@ -8191,38 +8261,55 @@ impl Kernel {
     ) -> i64 {
         const FALLOC_FL_KEEP_SIZE: u64 = 0x01;
         const FALLOC_FL_PUNCH_HOLE: u64 = 0x02;
+        const FALLOC_FL_ZERO_RANGE: u64 = 0x10;
         let Some(Fd::File { path, writable, .. }) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
         if !writable {
             return err(Errno::EBADF); // fallocate needs a writable fd
         }
+        if (offset as i64) < 0 || (len as i64) <= 0 || offset.checked_add(len).is_none() {
+            return err(Errno::EINVAL);
+        }
+        // Collapsing and inserting ranges (and unsharing) are for block
+        // filesystems; tmpfs answers EOPNOTSUPP, as here.
+        if mode & !(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE) != 0 {
+            return err(Errno::EOPNOTSUPP);
+        }
         let cur = vfs.stat(&path).map_or(0, |a| a.size);
-        if mode & FALLOC_FL_PUNCH_HOLE != 0 {
-            // PUNCH_HOLE requires KEEP_SIZE and must not extend the file: zero
-            // only the portion of [offset, offset+len) that lies within EOF.
-            if mode & FALLOC_FL_KEEP_SIZE == 0 {
+        let end = offset + len;
+        if mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE) != 0 {
+            // PUNCH_HOLE requires KEEP_SIZE and never extends the file; it
+            // zeroes the part of the range inside the file (freeing a
+            // shared-memory file's pages there). It's a write, as far as seals go.
+            if mode & FALLOC_FL_PUNCH_HOLE != 0 && mode & FALLOC_FL_KEEP_SIZE == 0 {
                 return err(Errno::EINVAL);
             }
-            let end = offset.saturating_add(len).min(cur);
-            if end <= offset {
+            if self.seal_blocks_write(vfs, &path, offset, 0) {
+                return err(Errno::EPERM);
+            }
+            let zero_end = end.min(cur);
+            if zero_end > offset {
+                if let Some(obj) = vfs.page_id(&path).and_then(|id| self.shm.obj(id)) {
+                    obj.punch(offset, zero_end - offset);
+                } else {
+                    let zeros = vec![0u8; (zero_end - offset) as usize];
+                    if let Err(e) = self.vfs_write(vfs, &path, offset, &zeros) {
+                        return io_errno(&e);
+                    }
+                }
+            }
+            if mode & FALLOC_FL_PUNCH_HOLE != 0 || mode & FALLOC_FL_KEEP_SIZE != 0 || end <= cur {
                 return 0;
             }
-            let zeros = vec![0u8; (end - offset) as usize];
-            return match self.vfs_write(vfs, &path, offset, &zeros) {
-                Ok(_) => 0,
-                Err(e) => io_errno(&e),
-            };
+        } else if mode & FALLOC_FL_KEEP_SIZE != 0 || end <= cur {
+            // Space past the end, or within it, is already "allocated".
+            return 0;
         }
-        // Default allocate/extend: grow the file if the range runs past EOF.
-        let want = offset.saturating_add(len);
-        if want > cur {
-            match vfs.truncate(&path, want) {
-                Ok(()) => 0,
-                Err(e) => io_errno(&e),
-            }
-        } else {
-            0
+        // Grow the file to cover the range.
+        match self.vfs_truncate(vfs, &path, end) {
+            Ok(()) => 0,
+            Err(e) => io_errno(&e),
         }
     }
 
@@ -9617,9 +9704,10 @@ impl Kernel {
         let fd = if attrs.kind == NodeKind::Dir {
             cx.cur.fds.alloc(Fd::Dir { path: abs, pos: 0 })
         } else {
+            let pin = self.pin_open(vfs, &abs);
             cx.cur.fds.alloc(Fd::File {
                 path: abs,
-                offset: FileOffset::new(0),
+                offset: FileOffset::pinned(0, pin),
                 readable: flags & O_ACCMODE != 1, // not O_WRONLY
                 writable: flags & O_ACCMODE != 0, // O_WRONLY or O_RDWR
             })
@@ -10691,7 +10779,12 @@ impl Kernel {
                 Some(Fd::File { path, .. }) if path == "/dev/zero" && flags & MAP_SHARED != 0 => {
                     None
                 }
-                Some(Fd::File { path, .. }) => Some(path.clone()),
+                Some(Fd::File {
+                    path,
+                    readable,
+                    writable,
+                    ..
+                }) => Some((path.clone(), *readable, *writable)),
                 Some(_) => return err(Errno::EACCES), // mmap of pipe/socket/dir
                 None => return err(Errno::EBADF),
             }
@@ -10700,6 +10793,27 @@ impl Kernel {
         };
         if file_src.is_some() && !offset.is_multiple_of(PAGE_SIZE) {
             return err(Errno::EINVAL);
+        }
+        // What a shared mapping of the file may do: a descriptor not open for
+        // writing (or a file sealed against writes) gives one that can never
+        // be made writable — mapping it writable is EACCES (EPERM for the
+        // seal), and so is a later mprotect to add PROT_WRITE.
+        let shared = flags & MAP_SHARED != 0;
+        let mut maywrite = true;
+        if let Some((path, readable, writable)) = &file_src {
+            if !readable {
+                return err(Errno::EACCES);
+            }
+            if shared {
+                if !writable && prot.contains(Prot::WRITE) {
+                    return err(Errno::EACCES);
+                }
+                let sealed = self.seals_against_mapping(path);
+                if sealed && prot.contains(Prot::WRITE) {
+                    return err(Errno::EPERM);
+                }
+                maywrite = *writable && !sealed;
+            }
         }
 
         let noreplace = flags & MAP_FIXED_NOREPLACE != 0 && addr != 0;
@@ -10727,39 +10841,74 @@ impl Kernel {
             };
             base
         };
-        // A writable MAP_SHARED|MAP_ANONYMOUS region must be shared across fork
-        // (the standard shared-memory IPC primitive) — map it eagerly-backed and
-        // shared so a forked child aliases the same frames rather than getting a
-        // copy-on-write copy. Everything else is an ordinary (demand-paged) map.
-        let shared_anon =
-            file_src.is_none() && flags & MAP_SHARED != 0 && prot.contains(Prot::WRITE);
-        // A shared file mapping maps the page cache's frames for the file.
-        if flags & MAP_SHARED != 0
-            && let Some(path) = file_src
+        // MAP_SHARED|MAP_ANONYMOUS (or of /dev/zero) is shared memory, as on
+        // Linux a file of its own of the mapping's size: a fork child shares
+        // it, its pages come in as they're first touched, and past its end
+        // (a mapping mremap grew) is SIGBUS.
+        if file_src.is_none() && shared {
+            let obj =
+                crate::vcpu::filemap::FileObj::new(mem.phys_arc(), mem.allocator(), len, true);
+            let ino = self
+                .orphan_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let map = crate::vcpu::filemap::FileMap {
+                obj: Some(obj),
+                pgoff: 0,
+                shared: true,
+                maywrite: true,
+                name: "/dev/zero (deleted)".into(),
+                dev: 1,
+                ino,
+            };
+            if mem.map_file(base, len, prot, map).is_err() {
+                return err(Errno::ENOMEM);
+            }
+            return base as i64;
+        }
+        // A regular file's mapping maps the file's pages: its page cache's,
+        // or a shared-memory file's own.
+        if let Some((path, ..)) = &file_src
+            && let Some(attrs) = vfs.stat(path).filter(|a| a.kind == NodeKind::File)
         {
-            if let Err(e) = self.pc_map_shared(vfs, mem, &path, offset, base, len, prot) {
+            let obj = match self.file_obj(vfs, mem, path) {
+                Ok(obj) => obj,
+                Err(e) => return e,
+            };
+            let pgoff = offset / PAGE_SIZE;
+            if let Err(e) = Self::pc_populate(vfs, &obj, path, pgoff, len / PAGE_SIZE, cx.cur.memcg)
+            {
                 return e;
             }
-            if prot.contains(Prot::WRITE) {
+            let shmem = obj.is_shmem();
+            let map = crate::vcpu::filemap::FileMap {
+                obj: Some(obj),
+                pgoff,
+                shared,
+                maywrite,
+                name: Self::map_name(cx, path).into(),
+                dev: attrs.dev,
+                ino: attrs.inode,
+            };
+            if mem.map_file(base, len, prot, map).is_err() {
+                return err(Errno::ENOMEM);
+            }
+            // A shared mapping that can store into a file kept elsewhere is
+            // written back to it (a shared-memory file's pages are the file).
+            if shared && maywrite && !shmem {
                 cx.cur.shared_maps.push(SharedMap {
                     base,
                     len,
-                    path,
+                    path: path.clone(),
                     offset,
                 });
             }
             return base as i64;
         }
-        let mapped = if shared_anon {
-            mem.map_shared_anon(base, len, prot)
-        } else {
-            mem.map(base, len, prot)
-        };
-        if mapped.is_err() {
+        if mem.map(base, len, prot).is_err() {
             return err(Errno::ENOMEM);
         }
 
-        if let Some(path) = file_src {
+        if let Some((path, ..)) = file_src {
             // Fill the mapping from the file: a zero-initialized page-sized
             // buffer, with the file's bytes (from `offset`, up to EOF) copied
             // over the front; the tail past EOF stays zero, as mmap requires.
@@ -10783,6 +10932,21 @@ impl Kernel {
             }
         }
         base as i64
+    }
+
+    /// What `/proc/<pid>/maps` calls a mapping of the file at `path`: its path
+    /// as the task sees it, `/memfd:NAME (deleted)` for a memfd, with
+    /// ` (deleted)` after a file that has no name any more.
+    fn map_name(cx: &ServiceCtx, path: &str) -> String {
+        if let Some(memfd) = memfd_display(path) {
+            return memfd;
+        }
+        let shown = Self::as_seen_from_root(cx, path);
+        if path.contains(orphan::ORPHAN_PREFIX) {
+            format!("{shown} (deleted)")
+        } else {
+            shown
+        }
     }
 
     /// Flush any writable `MAP_SHARED` file mappings overlapping `[addr, addr +
@@ -10907,6 +11071,9 @@ impl Kernel {
             return 0;
         }
         let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        if prot & 2 != 0 && mem.write_forbidden(addr - addr % PAGE_SIZE, len) {
+            return err(Errno::EACCES);
+        }
         match mem.protect(addr - addr % PAGE_SIZE, len, Prot((prot as u8) & 0x7)) {
             Ok(()) => 0,
             Err(_) => err(Errno::ENOMEM),

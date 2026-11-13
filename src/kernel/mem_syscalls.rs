@@ -10,7 +10,7 @@
 use super::{Kernel, ServiceCtx, Shared, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
-use crate::vcpu::mem::{MemError, PAGE_SIZE, Prot};
+use crate::vcpu::mem::{PAGE_SIZE, Prot};
 
 /// `MREMAP_MAYMOVE`: the kernel may relocate the mapping to satisfy a grow.
 const MREMAP_MAYMOVE: u64 = 1;
@@ -30,14 +30,12 @@ fn page_down(v: u64) -> u64 {
     v - v % PAGE_SIZE
 }
 
-/// Whether every page in `[start, end)` is unmapped (and thus in-bounds room we
-/// could grow a mapping into). A mapped, protected, or out-of-bounds page all
-/// count as "not free".
-/// Whether every page in `[start, end)` is currently mapped.
+/// Whether every page in `[start, end)` is currently mapped (an
+/// out-of-bounds page isn't).
 fn range_is_mapped(mem: &GuestMemory, start: u64, end: u64) -> bool {
     let mut p = start;
     while p < end {
-        if matches!(mem.read_vec(p, 1), Err(MemError::Unmapped(_))) {
+        if mem.page_prot(p).is_none() {
             return false;
         }
         p += PAGE_SIZE;
@@ -45,10 +43,14 @@ fn range_is_mapped(mem: &GuestMemory, start: u64, end: u64) -> bool {
     true
 }
 
+/// Whether every page in `[start, end)` is unmapped (and thus in-bounds room we
+/// could grow a mapping into). A mapped or out-of-bounds page counts as "not
+/// free".
 fn range_is_free(mem: &GuestMemory, start: u64, end: u64) -> bool {
+    let (lo, hi) = (mem.base(), mem.base() + mem.size());
     let mut p = start;
     while p < end {
-        if !matches!(mem.read_vec(p, 1), Err(MemError::Unmapped(_))) {
+        if p < lo || p >= hi || mem.page_prot(p).is_some() {
             return false;
         }
         p += PAGE_SIZE;
@@ -152,8 +154,10 @@ impl Kernel {
         if !dontunmap
             && sh.arena(cx).is_free(extra_start, extra_len)
             && range_is_free(mem, extra_start, extra_start + extra_len)
-            && mem.map(extra_start, extra_len, prot).is_ok()
         {
+            if let Err(e) = self.mremap_extend(cx, old_addr + old_size, extra_len, prot, mem) {
+                return e;
+            }
             sh.arena(cx).claim(extra_start, extra_len);
             return old_addr as i64;
         }
@@ -180,11 +184,52 @@ impl Kernel {
         base as i64
     }
 
+    /// Grow the mapping that ends at `at` by `len` bytes there, as `mremap`
+    /// grows it: a file mapping over the file's next pages, shared anonymous
+    /// memory with more of it, anything else with fresh private memory.
+    fn mremap_extend(
+        &self,
+        cx: &ServiceCtx,
+        at: u64,
+        len: u64,
+        prot: Prot,
+        mem: &mut GuestMemory,
+    ) -> Result<(), i64> {
+        let below = at - PAGE_SIZE;
+        if let Some((mut map, idx)) = mem.file_map_at(below)
+            && let Some(obj) = map.obj.clone()
+        {
+            map.pgoff = idx + 1;
+            if !obj.is_shmem() {
+                let mut vfs = self.vfs_for(cx);
+                Self::pc_populate(
+                    &mut vfs,
+                    &obj,
+                    &obj.origin(),
+                    map.pgoff,
+                    len / PAGE_SIZE,
+                    cx.cur.memcg,
+                )?;
+            }
+            return mem
+                .map_file(at, len, prot, map)
+                .map_err(|_| err(Errno::ENOMEM));
+        }
+        let grown = if mem.shared_phys(below).is_some() {
+            mem.map_shared_anon(at, len, prot)
+        } else {
+            mem.map(at, len, prot)
+        };
+        grown.map_err(|_| err(Errno::ENOMEM))
+    }
+
     /// Move `[old, old + old_size)` to `[new, new + new_size)` with `prot`:
-    /// shared pages by remapping their frames, private ones by copying; then
-    /// unmap the source (or, `dontunmap`, leave it mapped and empty). Keeps a
-    /// writable shared file mapping's write-back pointed at its new home.
-    #[allow(clippy::too_many_arguments, clippy::unused_self)]
+    /// the pages keep their frames (shared ones keep sharing, private ones
+    /// move without a copy) and file mappings their files, growing as
+    /// [`Self::mremap_extend`] does; then the source is unmapped (or,
+    /// `dontunmap`, left mapped and empty). Keeps a writable shared file
+    /// mapping's write-back pointed at its new home.
+    #[allow(clippy::too_many_arguments)]
     fn mremap_move(
         &self,
         cx: &mut ServiceCtx,
@@ -197,26 +242,14 @@ impl Kernel {
         mem: &mut GuestMemory,
     ) -> Result<(), i64> {
         let keep = old_size.min(new_size);
-        if let Some(frames) = mem.shared_frames(old, keep) {
-            mem.map_frames(new, &frames, prot)
-                .map_err(|_| err(Errno::ENOMEM))?;
-            if new_size > keep {
-                mem.map_shared_anon(new + keep, new_size - keep, prot)
-                    .map_err(|_| err(Errno::ENOMEM))?;
-            }
-        } else {
-            mem.map(new, new_size, prot)
-                .map_err(|_| err(Errno::ENOMEM))?;
-            // Copy the contents forward (a write-only source can't be read
-            // through the guest view; init writes ignore protection).
-            if let Ok(data) = mem.read_vec(old, keep as usize) {
-                let _ = mem.write_init(new, &data);
-            }
+        if old_size > keep {
+            // A shrinking move leaves the tail behind, unmapped.
+            let _ = mem.unmap(old + keep, old_size - keep);
         }
-        if dontunmap {
-            let _ = mem.map(old, old_size, prot);
-        } else {
-            let _ = mem.unmap(old, old_size);
+        mem.move_range(old, new, keep, dontunmap)
+            .map_err(|_| err(Errno::ENOMEM))?;
+        if new_size > keep {
+            self.mremap_extend(cx, new + keep, new_size - keep, prot, mem)?;
         }
         for m in &mut cx.cur.shared_maps {
             if m.base == old {
@@ -286,16 +319,28 @@ impl Kernel {
                 // refaulted from the shared object, so they keep theirs too.
                 let _ = mem.discard(start, end - start);
                 // MADV_REMOVE frees a shared object's backing: its pages read
-                // zeros for every process sharing them.
+                // zeros for every process sharing them (a hole is punched in
+                // shared memory's file).
                 if advice == MADV_REMOVE {
                     let zero = [0u8; PAGE_SIZE as usize];
                     let mut p = start;
                     while p < end {
-                        if mem.shared_phys(p).is_some() && !mem.is_file_backed(p) {
-                            let _ = mem.write(p, &zero);
+                        match mem.file_map_at(p) {
+                            Some((map, idx)) if map.shared => {
+                                if let Some(obj) = map.obj.filter(|o| o.is_shmem()) {
+                                    obj.punch(idx * PAGE_SIZE, PAGE_SIZE);
+                                } else {
+                                    let _ = mem.write(p, &zero);
+                                }
+                            }
+                            _ if mem.shared_phys(p).is_some() && !mem.is_file_backed(p) => {
+                                let _ = mem.write(p, &zero);
+                            }
+                            _ => {}
                         }
                         p += PAGE_SIZE;
                     }
+                    mem.revalidate_files();
                 }
                 0
             }
@@ -355,6 +400,7 @@ mod tests {
     use crate::abi::Arch;
     use crate::abi::arch::Sysno;
     use crate::fs::{MountTable, TmpFs};
+    use crate::vcpu::mem::MemError;
     use crate::vcpu::{Exit, Vcpu, VcpuError};
 
     const PAGE: u64 = PAGE_SIZE;

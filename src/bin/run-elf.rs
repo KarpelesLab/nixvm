@@ -106,6 +106,13 @@ fn main() {
     let vcpu = backend.new_vcpu(img.entry, img.stack_pointer).unwrap();
 
     let mut kernel = Kernel::new(Arch::Aarch64, mounts);
+    // `/proc/self/exe`: the program as the guest sees it, when it's in the
+    // guest's root (as the conformance programs are).
+    if let Ok(root) = std::env::var("NIXVM_ROOT")
+        && let Ok(rel) = std::path::Path::new(host).strip_prefix(&root)
+    {
+        kernel.set_exe(format!("/{}", rel.display()));
+    }
     // NIXVM_CPUS=N runs guest compute on N host worker threads (SMP); default 1.
     if let Some(n) = std::env::var("NIXVM_CPUS")
         .ok()

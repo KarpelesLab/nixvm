@@ -104,6 +104,31 @@ pub struct DirEntry {
     pub inode: u64,
 }
 
+/// Where a shared-memory filesystem keeps its files' contents: pages of
+/// guest memory, which the kernel maps straight into the address spaces that
+/// map the files. Ids are the store's; a file's is made with it and released
+/// when the file goes.
+pub trait PageStore: Send + Sync + std::fmt::Debug {
+    /// A new, empty file's id; `None` if the store can't hold one yet.
+    fn create(&self) -> Option<u64>;
+    /// The file is gone (its pages live on in mappings that still map them).
+    fn release(&self, id: u64);
+    /// The file's size.
+    fn len(&self, id: u64) -> u64;
+    /// Read from `off` into `buf`: how many bytes, up to the end of the file.
+    fn read(&self, id: u64, off: u64, buf: &mut [u8]) -> usize;
+    /// Write `data` at `off`, growing the file if it ends past it.
+    ///
+    /// # Errors
+    /// `ENOSPC` with no memory for it.
+    fn write(&self, id: u64, off: u64, data: &[u8]) -> io::Result<()>;
+    /// Make the file `len` bytes long.
+    ///
+    /// # Errors
+    /// None so far: growing is sparse.
+    fn set_len(&self, id: u64, len: u64) -> io::Result<()>;
+}
+
 /// A filesystem backend mounted at some point in the [`MountTable`].
 ///
 /// Only `stat`, `read_at`, and `readdir` are required; every mutating method
@@ -116,6 +141,15 @@ pub trait MountFs: std::fmt::Debug + Send {
     fn readdir(&mut self, rel: &str) -> io::Result<Vec<DirEntry>>;
 
     // ---- optional (write side); default read-only ----
+    /// Keep regular files' contents in `store` from now on, if this is a
+    /// shared-memory filesystem ([`TmpFs::shmem`]); others ignore it.
+    fn attach_pages(&mut self, _store: &std::sync::Arc<dyn PageStore>) {}
+
+    /// The id in the page store of `rel`'s contents, if they live there.
+    fn page_id(&mut self, _rel: &str) -> Option<u64> {
+        None
+    }
+
     /// Charge this filesystem's in-memory contents to `quota` from now on. A
     /// backend holding no host memory for the guest doesn't need this.
     fn attach_quota(&mut self, _quota: &std::sync::Arc<crate::limits::Quota>) {}

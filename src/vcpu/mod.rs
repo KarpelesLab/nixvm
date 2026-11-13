@@ -18,6 +18,7 @@
 use crate::abi::Arch;
 
 pub(crate) mod ctrl;
+pub mod filemap;
 pub mod mem;
 mod pagelocks;
 pub(crate) mod pagetable;
@@ -26,7 +27,7 @@ pub(crate) mod phys;
 pub(crate) mod region;
 pub(crate) mod vdso;
 
-pub use mem::{GuestMemory, MemError, Prot};
+pub use mem::{FileFault, GuestMemory, MemError, Prot};
 pub use pagetable::PtFormat;
 
 /// The wall-clock preemption quantum shared by every backend.

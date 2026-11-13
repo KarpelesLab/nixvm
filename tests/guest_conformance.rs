@@ -40,6 +40,8 @@ const PROGRAMS: &[&str] = &[
     "seccomp_notify",
     "cpu_traps",
     "creation",
+    "memfd",
+    "sysv_shm",
 ];
 
 /// A directory of binaries, also used as the guest's root, so that a program can

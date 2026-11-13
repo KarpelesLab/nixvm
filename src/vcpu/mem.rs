@@ -31,6 +31,7 @@ macro_rules! mark_tlb_dirty {
 }
 
 use super::ctrl;
+use super::filemap::{FileMap, FileVma, PageError, Region, SHRINK_EPOCH};
 use super::pagetable::{AddrSpace, Enc, PtFormat};
 use super::pagevec::PageVec;
 use super::phys::{FrameAllocator, PhysMem};
@@ -87,6 +88,9 @@ pub enum MemError {
     Protection { addr: u64, needed: Prot },
     /// Host-side allocation/mapping failure (e.g. the frame pool is exhausted).
     Host(String),
+    /// The page maps a part of a file past its end: `SIGBUS` for the guest,
+    /// `EFAULT` for a syscall.
+    Bus(u64),
 }
 
 impl MemError {
@@ -95,7 +99,7 @@ impl MemError {
     #[must_use]
     pub fn fault_addr(&self) -> u64 {
         match self {
-            MemError::OutOfBounds(a) | MemError::Unmapped(a) => *a,
+            MemError::OutOfBounds(a) | MemError::Unmapped(a) | MemError::Bus(a) => *a,
             MemError::Protection { addr, .. } => *addr,
             MemError::Host(_) => 0,
         }
@@ -218,6 +222,24 @@ pub struct GuestMemory {
     /// backend can tag its translations by address space (arm64 ASIDs) without
     /// confusing a tree with an earlier one at the same root frame.
     space_id: u64,
+    /// File mappings (`mmap` of a file, a memfd, `/dev/shm`; a named SysV
+    /// attachment), by first page: where a page's frame comes from when
+    /// it's first touched, and what `/proc/<pid>/maps` calls it. See
+    /// [`super::filemap`].
+    files: std::collections::BTreeMap<usize, FileVma>,
+    /// The [`SHRINK_EPOCH`] this space last dropped lost file pages at.
+    shrink_seen: u64,
+}
+
+/// What [`GuestMemory::file_fault`] made of a fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileFault {
+    /// Not a fault on a file mapping's missing page.
+    NotFile,
+    /// The page is mapped now: run the access again.
+    Resolved,
+    /// The page is past the end of the file: `SIGBUS`.
+    Bus,
 }
 
 /// The next [`GuestMemory::space_id`].
@@ -348,6 +370,8 @@ impl GuestMemory {
             fault_dir: 1,
             fault_window: 1,
             space_id: new_space_id(),
+            files: std::collections::BTreeMap::new(),
+            shrink_seen: SHRINK_EPOCH.load(std::sync::atomic::Ordering::Acquire),
         }
     }
 
@@ -739,6 +763,9 @@ impl GuestMemory {
         let start = addr - addr % PAGE_SIZE;
         let end = round_up(addr + len, PAGE_SIZE);
         let (first, last) = self.page_range(start, (end - start) as usize)?;
+        // (Dropped once the allocator is let go: a file's last reference
+        // frees its frames.)
+        let _gone = self.cut_files(first, last + 1);
         let mut fa = lock_fa(&self.fa, self.memcg);
         for p in first..=last {
             // Fresh mapping: drop any existing backing so the page reads as zero.
@@ -757,6 +784,7 @@ impl GuestMemory {
         }
         // A mapping replaced by a new one is no longer locked.
         self.locks.remove(first, last + 1);
+        drop(fa);
         Ok(())
     }
 
@@ -872,7 +900,16 @@ impl GuestMemory {
         if !self.mapped[p] || !self.shared_anon[p] {
             return None;
         }
-        self.space.translate(addr, &self.phys).map(|t| t.paddr)
+        if let Some(t) = self.space.translate(addr, &self.phys) {
+            return Some(t.paddr);
+        }
+        // A shared file mapping's page not touched here yet: the file's page.
+        let (start, vma) = self.file_at(p)?;
+        let obj = vma.map.obj.as_ref().filter(|_| vma.map.shared)?;
+        let frame = obj
+            .frame(vma.map.pgoff + (p - start) as u64, self.memcg)
+            .ok()?;
+        Some(frame + addr % PAGE_SIZE)
     }
 
     /// Map `frames` (one per page) at `addr` with `prot`, *sharing* them: each
@@ -889,6 +926,7 @@ impl GuestMemory {
         }
         let len = frames.len() as u64 * PAGE_SIZE;
         let (first, last) = self.page_range(addr, len as usize)?;
+        let _gone = self.cut_files(first, last + 1);
         let mut fa = lock_fa(&self.fa, self.memcg);
         for (i, p) in (first..=last).enumerate() {
             let va = self.page_base(p);
@@ -914,8 +952,436 @@ impl GuestMemory {
             self.file_backed[p] = false;
             self.shared_anon[p] = true;
         }
+        drop(fa);
         self.icache_dirty |= prot.contains(Prot::EXEC);
         Ok(())
+    }
+
+    // ---- file mappings ----------------------------------------------------
+
+    /// The file mapping covering page `p`, with the page its first page is.
+    fn file_at(&self, p: usize) -> Option<(usize, &FileVma)> {
+        if self.files.is_empty() {
+            return None;
+        }
+        let (&start, vma) = self.files.range(..=p).next_back()?;
+        (p < start + vma.pages).then_some((start, vma))
+    }
+
+    /// Take the file mappings' pages `[first, end)` out of them, splitting a
+    /// mapping that reaches past either end. What was taken is returned, for
+    /// the caller to drop once it holds no allocator lock (a file's last
+    /// reference frees its frames).
+    fn cut_files(&mut self, first: usize, end: usize) -> Vec<FileVma> {
+        if self.files.is_empty() {
+            return Vec::new();
+        }
+        let mut gone = Vec::new();
+        let keys: Vec<usize> = self
+            .files
+            .range(..end)
+            .rev()
+            .take_while(|(s, v)| *s + v.pages > first)
+            .map(|(s, _)| *s)
+            .collect();
+        for start in keys {
+            let vma = self.files.remove(&start).expect("listed");
+            let vend = start + vma.pages;
+            if start < first {
+                self.files.insert(start, vma.slice(0, first - start));
+            }
+            if vend > end {
+                self.files.insert(end, vma.slice(end - start, vend - end));
+            }
+            gone.push(vma);
+        }
+        gone
+    }
+
+    /// Map `[addr, addr + len)` (page-aligned) as `map` describes, with
+    /// `prot`: the file's pages come in as they're first touched (and those
+    /// it has already are put in now), past the end of the file is `SIGBUS`,
+    /// and a shared mapping's stores are the file's — seen by every other
+    /// mapper, kept across `fork`. A private one is copy-on-write over the
+    /// file's pages: until a page is written, it reads what the file holds.
+    /// Whatever was mapped in the range is replaced.
+    pub fn map_file(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: Prot,
+        map: FileMap,
+    ) -> Result<(), MemError> {
+        if len == 0 {
+            return Ok(());
+        }
+        self.map(addr, len, prot)?;
+        let (first, last) = self.page_range(addr, len as usize)?;
+        for p in first..=last {
+            self.shared_anon[p] = map.shared;
+            // (Keeps fault-around off the pages: they come from the file.)
+            self.file_backed[p] = !map.shared;
+        }
+        let pages = last + 1 - first;
+        let obj = map.obj.clone();
+        let pgoff = map.pgoff;
+        self.files.insert(first, FileVma::new(pages, map));
+        let Some(obj) = obj else {
+            return Ok(());
+        };
+        if prot == Prot::NONE {
+            return Ok(());
+        }
+        // The pages the file has already: put them in now rather than take a
+        // fault for each.
+        for (idx, _) in obj.pages_in(pgoff, pgoff + pages as u64) {
+            let p = first + (idx - pgoff) as usize;
+            let Ok(frame) = obj.get(idx, self.memcg) else {
+                continue;
+            };
+            self.install_file_page(p, frame);
+        }
+        self.icache_dirty |= prot.contains(Prot::EXEC);
+        Ok(())
+    }
+
+    /// Put `frame` (a reference the caller took for this mapping) at page `p`.
+    fn install_file_page(&mut self, p: usize, frame: u64) -> bool {
+        let va = self.page_base(p);
+        let mut fa = lock_fa(&self.fa, self.memcg);
+        let lp = self.leaf_prot(p, frame, &fa);
+        let Ok(old) = self.space.map(va, frame, lp, false, &mut fa, &self.phys) else {
+            fa.free(frame);
+            return false;
+        };
+        if let Some(old) = old {
+            fa.free(old);
+            mark_tlb_dirty!(self);
+        }
+        true
+    }
+
+    /// Name `[addr, addr + len)` in `/proc/<pid>/maps` as `map` says, its
+    /// frames being already in place (a SysV attachment, shared anonymous
+    /// memory). `map.obj` should be `None`.
+    pub fn name_range(&mut self, addr: u64, len: u64, map: FileMap) -> Result<(), MemError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let (first, last) = self.page_range(addr, len as usize)?;
+        let _gone = self.cut_files(first, last + 1);
+        self.files
+            .insert(first, FileVma::new(last + 1 - first, map));
+        Ok(())
+    }
+
+    /// Resolve a fault at `addr` on a file mapping's page that isn't in the
+    /// page tables: put the file's page there ([`FileFault::Resolved`]), or
+    /// find it past the end of the file ([`FileFault::Bus`]).
+    pub fn file_fault(&mut self, addr: u64) -> FileFault {
+        let page = addr - addr % PAGE_SIZE;
+        let Some(p) = self.page_index(page) else {
+            return FileFault::NotFile;
+        };
+        if !self.mapped[p] || self.prot[p] == Prot::NONE {
+            return FileFault::NotFile;
+        }
+        if self.space.translate(page, &self.phys).is_some() {
+            return FileFault::NotFile;
+        }
+        match self.back_file_page(p) {
+            Ok(true) => FileFault::Resolved,
+            Ok(false) => FileFault::NotFile,
+            Err(_) => FileFault::Bus,
+        }
+    }
+
+    /// Give page `p` its file page if it's a file mapping's and has none:
+    /// `Ok(true)` if it did, `Ok(false)` if there was nothing to do (or no
+    /// frame to be had), `Bus` past the end of the file.
+    fn back_file_page(&mut self, p: usize) -> Result<bool, MemError> {
+        let Some((start, vma)) = self.file_at(p) else {
+            return Ok(false);
+        };
+        let Some(obj) = vma.map.obj.clone() else {
+            return Ok(false);
+        };
+        let idx = vma.map.pgoff + (p - start) as u64;
+        let exec = self.prot[p].contains(Prot::EXEC);
+        match obj.get(idx, self.memcg) {
+            Ok(frame) => {
+                let done = self.install_file_page(p, frame);
+                self.icache_dirty |= exec;
+                Ok(done)
+            }
+            Err(PageError::Beyond) => Err(MemError::Bus(self.page_base(p))),
+            Err(PageError::NoMemory) => Ok(false),
+        }
+    }
+
+    /// [`Self::back_file_page`] for each of pages `[first, last]` not in the
+    /// page tables: what a kernel copy into a file mapping needs first.
+    fn back_file_pages(&mut self, first: usize, last: usize) -> Result<(), MemError> {
+        if self.files.is_empty() {
+            return Ok(());
+        }
+        for p in first..=last {
+            if self.mapped[p]
+                && self.file_at(p).is_some()
+                && self
+                    .space
+                    .translate(self.page_base(p), &self.phys)
+                    .is_none()
+            {
+                self.back_file_page(p)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop the pages mapped files have lost since this space last looked
+    /// (a file shrank under its mappings, or had a hole punched): touching
+    /// one again finds the file as it is now — `SIGBUS` past its end, zeros
+    /// in a hole. Cheap when nothing shrank. Called before the space runs.
+    pub fn revalidate_files(&mut self) {
+        let epoch = SHRINK_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        if epoch == self.shrink_seen {
+            return;
+        }
+        let seen = std::mem::replace(&mut self.shrink_seen, epoch);
+        let mut lost = Vec::new();
+        for (&start, vma) in &self.files {
+            let Some(obj) = &vma.map.obj else { continue };
+            if obj.shrunk_at() <= seen {
+                continue;
+            }
+            for k in 0..vma.pages {
+                let p = start + k;
+                let va = self.page_base(p);
+                let Some(t) = self.space.translate(va, &self.phys) else {
+                    continue;
+                };
+                let frame = t.paddr & !(PAGE_SIZE - 1);
+                let stale = match obj.peek(vma.map.pgoff + k as u64) {
+                    Err(_) => true,
+                    // A shared page must be the file's own; a private one may
+                    // be its own copy.
+                    Ok(f) => vma.map.shared && f != Some(frame),
+                };
+                if stale {
+                    lost.push(va);
+                }
+            }
+        }
+        if lost.is_empty() {
+            return;
+        }
+        let mut fa = lock_fa(&self.fa, self.memcg);
+        for va in lost {
+            if let Some(frame) = self.space.unmap(va, &mut fa, &self.phys) {
+                fa.free(frame);
+            }
+        }
+        mark_tlb_dirty!(self);
+    }
+
+    /// The file mapping at `addr`: what it maps, and the file page `addr` is.
+    #[must_use]
+    pub fn file_map_at(&self, addr: u64) -> Option<(FileMap, u64)> {
+        let p = self.page_index(addr)?;
+        let (start, vma) = self.file_at(p)?;
+        Some((vma.map.clone(), vma.map.pgoff + (p - start) as u64))
+    }
+
+    /// Whether a shared file mapping in `[addr, addr + len)` can never be made
+    /// writable (`VM_MAYWRITE` clear: the file wasn't opened for writing, or
+    /// is sealed against it) — `mprotect`'s `EACCES`.
+    #[must_use]
+    pub fn write_forbidden(&self, addr: u64, len: u64) -> bool {
+        let (Some(first), Some(last)) = (
+            self.page_index(addr),
+            self.page_index(addr + len.max(1) - 1),
+        ) else {
+            return false;
+        };
+        self.files
+            .range(..=last)
+            .rev()
+            .take_while(|(s, v)| *s + v.pages > first)
+            .any(|(_, v)| v.map.shared && !v.map.maywrite)
+    }
+
+    /// Every file mapping, as `(start, end, what it maps)`.
+    #[must_use]
+    pub fn file_maps(&self) -> Vec<(u64, u64, FileMap)> {
+        self.files
+            .iter()
+            .map(|(&s, v)| {
+                let start = self.page_base(s);
+                (start, start + v.pages as u64 * PAGE_SIZE, v.map.clone())
+            })
+            .collect()
+    }
+
+    /// Move `[old, old + len)` to `[new, new + len)` (page-aligned, not
+    /// overlapping) — `mremap`'s move: the pages keep their frames (a shared
+    /// page keeps sharing, a private one moves without a copy), protection
+    /// and file mappings. The old range is then unmapped, or with
+    /// `dontunmap` stays mapped with nothing in it: a private anonymous page
+    /// reads zero, a file mapping's page comes from the file again.
+    pub fn move_range(
+        &mut self,
+        old: u64,
+        new: u64,
+        len: u64,
+        dontunmap: bool,
+    ) -> Result<(), MemError> {
+        struct Page {
+            mapped: bool,
+            prot: Prot,
+            shared: bool,
+            file_backed: bool,
+            frame: Option<u64>,
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let (of, ol) = self.page_range(old, len as usize)?;
+        let (nf, _) = self.page_range(new, len as usize)?;
+        // What the old range holds, page by page, and its file mappings.
+        let pages: Vec<Page> = (of..=ol)
+            .map(|p| Page {
+                mapped: self.mapped[p],
+                prot: self.prot[p],
+                shared: self.shared_anon[p],
+                file_backed: self.file_backed[p],
+                frame: self
+                    .space
+                    .translate(self.page_base(p), &self.phys)
+                    .map(|t| t.paddr & !(PAGE_SIZE - 1)),
+            })
+            .collect();
+        let vmas: Vec<(usize, FileVma)> = self
+            .files
+            .range(..=ol)
+            .rev()
+            .take_while(|(s, v)| *s + v.pages > of)
+            .map(|(&s, v)| {
+                let lo = s.max(of);
+                let hi = (s + v.pages).min(ol + 1);
+                (lo - of, v.slice(lo - s, hi - lo))
+            })
+            .collect();
+        // The new range: mapped, tagged and named like the old.
+        self.map(new, len, Prot::NONE)?;
+        for (k, pg) in pages.iter().enumerate() {
+            let p = nf + k;
+            if !pg.mapped {
+                self.mapped_count -= usize::from(self.mapped[p]);
+                self.mapped[p] = false;
+                continue;
+            }
+            self.prot[p] = pg.prot;
+            self.shared_anon[p] = pg.shared;
+            self.file_backed[p] = pg.file_backed;
+        }
+        for (off, vma) in &vmas {
+            self.files.insert(nf + off, vma.clone());
+        }
+        {
+            let mut fa = lock_fa(&self.fa, self.memcg);
+            for (k, pg) in pages.iter().enumerate() {
+                let Some(frame) = pg.frame.filter(|_| pg.mapped) else {
+                    continue;
+                };
+                let p = nf + k;
+                fa.incref(frame);
+                let lp = self.leaf_prot(p, frame, &fa);
+                if self
+                    .space
+                    .map(self.page_base(p), frame, lp, false, &mut fa, &self.phys)
+                    .is_err()
+                {
+                    fa.free(frame);
+                    return Err(MemError::Host("frame pool exhausted".into()));
+                }
+            }
+        }
+        self.icache_dirty = true;
+        if !dontunmap {
+            return self.unmap(old, len);
+        }
+        // The old range stays, empty: its frames go, and the private copies'
+        // leaves with them; it keeps its protection and file mappings.
+        let mut fa = lock_fa(&self.fa, self.memcg);
+        for p in of..=ol {
+            if let Some(frame) = self.space.unmap(self.page_base(p), &mut fa, &self.phys) {
+                fa.free(frame);
+            }
+            // Shared anonymous memory has no file to come back from: what
+            // stays is fresh private memory (Linux's anonymous DONTUNMAP).
+            if self.file_at(p).is_none() {
+                self.shared_anon[p] = false;
+                self.file_backed[p] = false;
+            }
+        }
+        mark_tlb_dirty!(self);
+        drop(fa);
+        self.locks.remove(of, ol + 1);
+        Ok(())
+    }
+
+    /// The `/proc/<pid>/maps` regions: runs of mapped pages with one
+    /// protection, sharing and backing, in address order (the program break's
+    /// region one of its own).
+    #[must_use]
+    pub fn regions(&self) -> Vec<Region> {
+        let mut out: Vec<Region> = Vec::new();
+        let none: Arc<str> = Arc::from("");
+        let heap = round_up(self.heap.start, PAGE_SIZE);
+        let mut last_kind = (false, false);
+        for (p, mapped) in self.mapped.non_default() {
+            if !mapped {
+                continue;
+            }
+            let start = self.page_base(p);
+            let kind = (self.file_backed[p], start >= heap && start < self.heap.brk);
+            let same_kind = std::mem::replace(&mut last_kind, kind) == kind;
+            let (shared, offset, dev, ino, name) = match self.file_at(p) {
+                Some((s, v)) => (
+                    v.map.shared,
+                    (v.map.pgoff + (p - s) as u64) * PAGE_SIZE,
+                    v.map.dev,
+                    v.map.ino,
+                    Arc::clone(&v.map.name),
+                ),
+                None => (self.shared_anon[p], 0, 0, 0, Arc::clone(&none)),
+            };
+            if let Some(last) = out.last_mut()
+                && same_kind
+                && last.end == start
+                && last.prot == self.prot[p]
+                && last.shared == shared
+                && last.name == name
+                && last.dev == dev
+                && last.ino == ino
+                && (name.is_empty() || last.offset + (last.end - last.start) == offset)
+            {
+                last.end += PAGE_SIZE;
+                continue;
+            }
+            out.push(Region {
+                start,
+                end: start + PAGE_SIZE,
+                prot: self.prot[p],
+                shared,
+                offset,
+                dev,
+                ino,
+                name,
+            });
+        }
+        out
     }
 
     /// Ensure the page at `va` has a backing frame installed (demand paging): a
@@ -965,6 +1431,10 @@ impl GuestMemory {
             return false;
         };
         if !self.mapped[p] || self.space.translate(page, &self.phys).is_some() {
+            return false;
+        }
+        // A file mapping's page comes from the file (`file_fault`).
+        if self.file_at(p).is_some_and(|(_, v)| v.map.obj.is_some()) {
             return false;
         }
         // A PROT_NONE page grants no access — never install a backing frame for
@@ -1113,11 +1583,16 @@ impl GuestMemory {
         let start = addr - addr % PAGE_SIZE;
         let end = round_up(addr + len, PAGE_SIZE);
         let (first, last) = self.page_range(start, (end - start) as usize)?;
+        let in_file: Vec<bool> = (first..=last)
+            .map(|p| self.file_at(p).is_some_and(|(_, v)| v.map.obj.is_some()))
+            .collect();
         let mut fa = lock_fa(&self.fa, self.memcg);
         for p in first..=last {
+            // A file mapping's page is read from the file again on the next
+            // touch: a private copy is gone, a shared page is the file's.
+            let file = in_file[p - first];
             if self.mapped[p]
-                && !self.file_backed[p]
-                && !self.shared_anon[p]
+                && (file || (!self.file_backed[p] && !self.shared_anon[p]))
                 && let Some(frame) = self.space.unmap(self.page_base(p), &mut fa, &self.phys)
             {
                 fa.free(frame);
@@ -1136,6 +1611,7 @@ impl GuestMemory {
         let start = addr - addr % PAGE_SIZE;
         let end = round_up(addr + len, PAGE_SIZE);
         let (first, last) = self.page_range(start, (end - start) as usize)?;
+        let _gone = self.cut_files(first, last + 1);
         let mut fa = lock_fa(&self.fa, self.memcg);
         for p in first..=last {
             if self.mapped[p]
@@ -1152,6 +1628,7 @@ impl GuestMemory {
             self.fork_policy.remove(&p);
         }
         self.locks.remove(first, last + 1);
+        drop(fa);
         Ok(())
     }
 
@@ -1225,7 +1702,9 @@ impl GuestMemory {
     /// Copy from the pool at guest `addr` into `buf`, translating per page. The
     /// caller must have verified access. A mapped-but-unbacked page (demand-paged,
     /// never touched) reads as zero without allocating a frame.
-    fn copy_out(&self, addr: u64, buf: &mut [u8]) {
+    /// A file mapping's page not yet in the page tables reads the file's page
+    /// (`Bus` past the end of the file).
+    fn copy_out(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemError> {
         let mut done = 0usize;
         while done < buf.len() {
             let cur = addr + done as u64;
@@ -1234,10 +1713,30 @@ impl GuestMemory {
             let n = (buf.len() - done).min(PS - off);
             match self.space.translate(cur, &self.phys) {
                 Some(t) => self.phys.read(t.paddr, &mut buf[done..done + n]),
-                None => buf[done..done + n].fill(0),
+                None => match self.file_page(page)? {
+                    Some(frame) => self.phys.read(frame + off as u64, &mut buf[done..done + n]),
+                    None => buf[done..done + n].fill(0),
+                },
             }
             done += n;
         }
+        Ok(())
+    }
+
+    /// The frame a file mapping's page at `page` (not in the page tables)
+    /// would map, `None` for a hole or for no file mapping there.
+    fn file_page(&self, page: u64) -> Result<Option<u64>, MemError> {
+        let Some(p) = self.page_index(page) else {
+            return Ok(None);
+        };
+        let Some((start, vma)) = self.file_at(p) else {
+            return Ok(None);
+        };
+        let Some(obj) = &vma.map.obj else {
+            return Ok(None);
+        };
+        obj.peek(vma.map.pgoff + (p - start) as u64)
+            .map_err(|_| MemError::Bus(page))
     }
 
     /// Read `buf.len()` bytes from guest `addr` (requires `READ`).
@@ -1248,8 +1747,7 @@ impl GuestMemory {
             return Ok(());
         }
         self.check(addr, buf.len(), Prot::READ)?;
-        self.copy_out(addr, buf);
-        Ok(())
+        self.copy_out(addr, buf)
     }
 
     /// Read `len` bytes into a fresh `Vec` (requires `READ`).
@@ -1323,6 +1821,7 @@ impl GuestMemory {
     /// store, writable).
     fn copy_in(&mut self, addr: u64, buf: &[u8]) -> Result<(), MemError> {
         let (first, last) = self.page_range(addr, buf.len())?;
+        self.back_file_pages(first, last)?;
         {
             let mut fa = lock_fa(&self.fa, self.memcg);
             let mut changed = false;
@@ -1399,15 +1898,25 @@ impl GuestMemory {
         let mut fa = lock_fa(&self.fa, self.memcg);
         // Out of frames is a real fault: reporting success here would retry the
         // store forever.
-        Self::make_writable(
+        match Self::make_writable(
             &mut self.space,
             &self.phys,
             self.prot[p],
             &mut fa,
             va,
             self.shared_anon[p],
-        )
-        .is_ok()
+        ) {
+            Ok(changed) => {
+                // The page has a new frame: a sibling thread's vcpu may still
+                // translate it to the old one (now another process's copy),
+                // and would read that.
+                if changed {
+                    mark_tlb_dirty!(self);
+                }
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Write `buf` to guest `addr`, bypassing protection but requiring the pages
@@ -1424,6 +1933,7 @@ impl GuestMemory {
         // Demand-back each page and privatize any copy-on-write share, then write
         // straight to the frames (bypassing the leaf's protection — the host write
         // goes to the pool, not through the guest MMU).
+        self.back_file_pages(first, last)?;
         {
             let mut fa = lock_fa(&self.fa, self.memcg);
             let mut changed = false;
@@ -1525,6 +2035,11 @@ impl GuestMemory {
             }
             (child, parent_kstack, child_kstack)
         };
+        // Every page is copy-on-write now, read-only in this space too: each
+        // vcpu running it — every thread's, not only the forking one — must
+        // drop the writable translations it holds, or a sibling thread's next
+        // store goes straight into the frame the child now shares.
+        mark_tlb_dirty!(self);
         self.kstack_pa = parent_kstack;
         let mut mapped = self.mapped.clone();
         let mut mapped_count = self.mapped_count;
@@ -1565,6 +2080,8 @@ impl GuestMemory {
             fault_dir: 1,
             fault_window: 1,
             space_id: new_space_id(),
+            files: self.files.clone(),
+            shrink_seen: self.shrink_seen,
         })
     }
 
@@ -1586,6 +2103,7 @@ impl GuestMemory {
         let old = std::mem::replace(&mut self.space, AddrSpace::retired());
         old.destroy(&mut fa, &self.phys);
         drop(fa);
+        self.files.clear();
         self.kstack_pa = 0;
         self.prot.clear();
         self.mapped.clear();
@@ -1614,6 +2132,7 @@ impl GuestMemory {
         fa.set_use_reserve(false);
         self.kstack_pa = kstack_pa;
         drop(fa);
+        self.files.clear();
         self.prot.clear();
         self.mapped.clear();
         self.mapped_count = 0;

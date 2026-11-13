@@ -19,7 +19,7 @@ unshare -Urm /tmp/ns_pid                  # the ns_* programs want root in a use
 the root cgroup and removes it again). `rlimits` wants root too (`sudo ./rlimits`: it
 raises hard limits and runs `SCHED_FIFO` tasks), and so does `sched` (`sudo ./sched`:
 it runs real-time tasks on CPU 0 for a few seconds). `exec` needs nothing: it writes
-tiny ELF images of its own to exec, and neither do `fifo`, `devfd`, `threads_mm`, `dualstack`, `madvise` and `execthread`. CI runs those
+tiny ELF images of its own to exec, and neither do `fifo`, `devfd`, `threads_mm`, `dualstack`, `madvise`, `execthread`, `memfd` and `sysv_shm`; `creation` checks who owns what it makes only as root (`sudo ./creation`). CI runs those
 on the runner as well as in the VM.
 `userns_caps` and `sandbox_fs` run as anyone, making their own user namespaces;
 as root `userns_caps` also checks how dropping uid 0 drops capabilities, so CI

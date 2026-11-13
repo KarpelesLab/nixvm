@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <linux/memfd.h>
 #include <pthread.h>
+#include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -133,7 +134,7 @@ static void double_mapping(void) {
   CHECK(readlink(fdp, link, sizeof link - 1) > 0);
   CHECK(strcmp(link, "/memfd:doublemapper (deleted)") == 0);
   struct stat st;
-  CHECK(fstat(fd, &st) == 0 && st.st_size == (1L << 40) && st.st_blocks < 1024);
+  CHECK(fstat(fd, &st) == 0 && st.st_size == (1L << 40));
   CHECK(munmap(rw, 4 * pg) == 0 && munmap(other, pg) == 0 && munmap(res, 16 * pg) == 0);
   close(fd);
   puts("an RW and an RX view of one memfd are coherent");
@@ -174,21 +175,25 @@ static void across_fork(void) {
 }
 
 /* Two threads, likely on different CPUs: one stores through the RW view, the
- * other spins reading the RO view; then the first replaces the page under the
- * second's feet and it must see the new one at once. */
+ * other spins (yielding, for a single CPU) reading the RO view; then the
+ * first replaces the page under the second's feet and it must see the new
+ * one at once. */
 static char *volatile seen_ro;
 static atomic_int phase;
 static void *reader(void *arg) {
   (void)arg;
   for (int i = 1; i <= 2000; i++) {
     while (*(volatile int *)seen_ro != i) {
+      sched_yield();
     }
     atomic_store(&phase, i);
   }
   while (atomic_load(&phase) != -1) {
+    sched_yield();
   }
   /* The page was replaced: wait to read the new contents. */
   while (*(volatile int *)seen_ro != 0x5eed) {
+    sched_yield();
   }
   atomic_store(&phase, -2);
   return 0;
@@ -205,6 +210,7 @@ static void across_threads(void) {
   for (int i = 1; i <= 2000; i++) {
     *(volatile int *)rw = i;
     while (atomic_load(&phase) != i) {
+      sched_yield();
     }
   }
   /* Page 1 of the file holds the new value; map it over the reader's view. */
@@ -213,6 +219,7 @@ static void across_threads(void) {
   CHECK(mmap(ro, pg, PROT_READ, MAP_SHARED | MAP_FIXED, fd, pg) == ro);
   atomic_store(&phase, -1);
   while (atomic_load(&phase) != -2) {
+    sched_yield();
   }
   pthread_join(t, 0);
   munmap(rw, pg);

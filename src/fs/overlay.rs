@@ -44,8 +44,14 @@ impl Overlay {
             lower,
             whiteouts: BTreeSet::new(),
         };
-        // The merged root is the upper's, which must look like the lower's.
-        o.copy_attrs_up("");
+        // The merged root is the upper's, which must look like the lower's —
+        // its mode and times (it stays root's: a host directory's owner isn't
+        // the guest's business).
+        if let Some(a) = o.lower.stat("") {
+            let _ = o.upper.set_mode("", a.mode & 0o7777);
+            let t = |sec| super::SetTime::Set { sec, nsec: 0 };
+            let _ = o.upper.set_times("", t(a.atime), t(a.mtime));
+        }
         o
     }
 

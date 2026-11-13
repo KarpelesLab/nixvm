@@ -38,7 +38,40 @@ fn names(fd_path: &str, path: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// What an open file description of a file holds (see [`Kernel::pin_open`]):
+/// while one lives, the file counts as open, wherever the description is —
+/// in a table checked out by a task running on another CPU, or in flight in
+/// a socket's `SCM_RIGHTS` — which a scan of the tables can't see.
+#[derive(Debug)]
+pub(super) struct OpenPin;
+
 impl Kernel {
+    /// The pin an open file description of the file at `path` holds.
+    pub(super) fn pin_open(
+        &self,
+        vfs: &mut MountTable,
+        path: &str,
+    ) -> Option<std::sync::Arc<OpenPin>> {
+        let key = Self::pc_key(vfs, path)?;
+        let mut pins = self.open_pins.lock().unwrap();
+        if let Some(pin) = pins.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Some(pin);
+        }
+        let pin = std::sync::Arc::new(OpenPin);
+        pins.insert(key, std::sync::Arc::downgrade(&pin));
+        Some(pin)
+    }
+
+    /// Whether some open file description, anywhere, is of the file at `path`.
+    fn pinned(&self, vfs: &mut MountTable, path: &str) -> bool {
+        let Some(key) = Self::pc_key(vfs, path) else {
+            return false;
+        };
+        let mut pins = self.open_pins.lock().unwrap();
+        pins.retain(|_, p| p.strong_count() > 0);
+        pins.contains_key(&key)
+    }
+
     /// A fresh hidden name in directory `dir`.
     fn orphan_in(&self, dir: &str) -> String {
         let n = self
@@ -69,9 +102,11 @@ impl Kernel {
 
     /// Does any descriptor — the caller's or a checked-in table's — name
     /// `path` (or a path under it)?
-    fn path_is_open(sh: &Shared, cx: &ServiceCtx, path: &str) -> bool {
+    fn path_is_open(&self, sh: &Shared, cx: &ServiceCtx, vfs: &mut MountTable, path: &str) -> bool {
         let hit = |f: &Fd| matches!(f, Fd::File { path: p, .. } | Fd::Dir { path: p, .. } if names(p, path));
-        cx.cur.fds.values().any(hit) || sh.file_tables.iter().flatten().any(|t| t.values().any(hit))
+        cx.cur.fds.values().any(hit)
+            || sh.file_tables.iter().flatten().any(|t| t.values().any(hit))
+            || self.pinned(vfs, path)
     }
 
     /// Repoint every descriptor naming `from` (or a path under it) at `to`.
@@ -102,7 +137,7 @@ impl Kernel {
             return;
         }
         orphans.retain(|o| {
-            if Self::path_is_open(sh, cx, o) {
+            if self.path_is_open(sh, cx, vfs, o) {
                 true
             } else {
                 let _ = vfs.unlink(o);
@@ -143,7 +178,7 @@ impl Kernel {
         };
         let abs = self.resolve_path(cx, dirfd, &rel);
         let is_file = vfs.stat(&abs).is_some_and(|a| a.kind != NodeKind::Dir);
-        if is_file && Self::path_is_open(sh, cx, &abs) {
+        if is_file && self.path_is_open(sh, cx, vfs, &abs) {
             return match self.orphan_move(vfs, &abs) {
                 Ok(hidden) => {
                     Self::repoint(sh, cx, &abs, &hidden);
@@ -200,7 +235,7 @@ impl Kernel {
         if flags & RENAME_NOREPLACE == 0
             && vfs.stat(&to).is_some_and(|a| a.kind != NodeKind::Dir)
             && vfs.stat(&from).is_some_and(|a| a.kind != NodeKind::Dir)
-            && Self::path_is_open(sh, cx, &to)
+            && self.path_is_open(sh, cx, vfs, &to)
             && let Ok(hidden) = self.orphan_move(vfs, &to)
         {
             Self::repoint(sh, cx, &to, &hidden);
@@ -282,9 +317,10 @@ impl Kernel {
         };
         self.own_new_node(vfs, cx, &hidden);
         self.orphans.lock().unwrap().insert(hidden.clone());
+        let pin = self.pin_open(vfs, &hidden);
         let fd = cx.cur.fds.alloc(Fd::File {
             path: hidden,
-            offset: super::FileOffset::new(0),
+            offset: super::FileOffset::pinned(0, pin),
             readable: flags & O_ACCMODE == 2,
             writable: true,
         });

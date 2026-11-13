@@ -170,6 +170,8 @@ struct ShmSeg {
     attaches: Vec<(usize, u64)>,
     /// `IPC_RMID` was requested: destroy once the last attachment goes.
     removed: bool,
+    /// `SHM_LOCK`ed: reported as `SHM_LOCKED` in its mode.
+    locked: bool,
     atime: i64,
     dtime: i64,
     ctime: i64,
@@ -1050,6 +1052,7 @@ impl Kernel {
                     frames,
                     attaches: Vec::new(),
                     removed: false,
+                    locked: false,
                     atime: 0,
                     dtime: 0,
                     ctime: now_s(),
@@ -1088,6 +1091,9 @@ impl Kernel {
         }
         let len = seg.frames.len() as u64 * PAGE_SIZE;
         let frames = seg.frames.clone();
+        // What `/proc/<pid>/maps` calls it: the segment's (deleted) file on
+        // the shm mount, named by its key, its inode the id.
+        let name = format!("/SYSV{:08x} (deleted)", seg.perm.key as u32);
         let base = if addr == 0 {
             if flags & SHM_REMAP != 0 {
                 return err(Errno::EINVAL);
@@ -1127,6 +1133,19 @@ impl Kernel {
         if mem.map_frames(base, &frames, prot).is_err() {
             return err(Errno::ENOMEM);
         }
+        let _ = mem.name_range(
+            base,
+            len,
+            crate::vcpu::filemap::FileMap {
+                obj: None,
+                pgoff: 0,
+                shared: true,
+                maywrite: flags & SHM_RDONLY == 0,
+                name: name.into(),
+                dev: 1,
+                ino: id as u64,
+            },
+        );
         let mm = cx.cur.mm;
         let tgid = cx.cur.tgid;
         if let Some(seg) = sh.ipc.shm.get_mut(&id) {
@@ -1189,6 +1208,7 @@ impl Kernel {
         const SHM_INFO: u64 = 14;
         const SHM_STAT_ANY: u64 = 15;
         const SHM_DEST: u32 = 0o1000;
+        const SHM_LOCKED: u32 = 0o2000;
         let cmd = cmd & !IPC_64;
         let ipc = &mut sh.ipc;
         match cmd {
@@ -1259,6 +1279,9 @@ impl Kernel {
                 if s.removed {
                     perm.mode |= SHM_DEST;
                 }
+                if s.locked {
+                    perm.mode |= SHM_LOCKED;
+                }
                 let mut b = [0u8; 112];
                 perm.encode(&mut b);
                 let put = |b: &mut [u8; 112], o: usize, v: i64| {
@@ -1309,11 +1332,25 @@ impl Kernel {
                 0
             }
             SHM_LOCK | SHM_UNLOCK => {
-                if ipc.shm.contains_key(&(id as i32)) {
-                    0
-                } else {
-                    err(Errno::EINVAL)
+                // The owner or creator may, with some RLIMIT_MEMLOCK to lock;
+                // a privileged task always (CAP_IPC_LOCK). Memory is never
+                // paged out here, so locking only marks it.
+                let Some(s) = ipc.shm.get_mut(&(id as i32)) else {
+                    return err(Errno::EINVAL);
+                };
+                if !Self::capable(cx, 14) {
+                    // (CAP_IPC_LOCK)
+                    let creds = cx.cur.creds;
+                    if creds.euid != s.perm.uid && creds.euid != s.perm.cuid {
+                        return err(Errno::EPERM);
+                    }
+                    if cmd == SHM_LOCK && cx.cur.rlimits.soft(super::sys_misc::RLIMIT_MEMLOCK) == 0
+                    {
+                        return err(Errno::EPERM);
+                    }
                 }
+                s.locked = cmd == SHM_LOCK;
+                0
             }
             _ => {
                 self.note_unsupported("shmctl", cmd);

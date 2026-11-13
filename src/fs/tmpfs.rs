@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::Arc;
 
-use super::{Attrs, DirEntry, MountFs, NodeKind, SetTime};
+use super::{Attrs, DirEntry, MountFs, NodeKind, PageStore, SetTime};
 use crate::limits::Quota;
 
 /// Unix mode type bits.
@@ -46,6 +46,9 @@ struct Meta {
 struct FileData {
     meta: Meta,
     data: Vec<u8>,
+    /// Where the contents are instead, for a shared-memory filesystem's file:
+    /// its id in the page store, which holds them in guest memory.
+    paged: Option<(u64, Arc<dyn PageStore>)>,
     mode: u32,
     /// How many path entries name this inode (`st_nlink`).
     links: u32,
@@ -63,6 +66,9 @@ impl FileData {
 impl Drop for FileData {
     fn drop(&mut self) {
         self.quota.release(self.cost());
+        if let Some((id, store)) = &self.paged {
+            store.release(*id);
+        }
     }
 }
 
@@ -105,6 +111,10 @@ enum Node {
 
 #[derive(Debug)]
 pub struct TmpFs {
+    /// Shared memory (`/dev/shm`, memfds): regular files keep their contents
+    /// in [`Self::pages`], once the kernel has given it one.
+    shmem: bool,
+    pages: Option<Arc<dyn PageStore>>,
     nodes: BTreeMap<String, Node>,
     /// Regular-file inodes by inode number.
     files: BTreeMap<u64, FileData>,
@@ -139,10 +149,23 @@ impl TmpFs {
             },
         );
         Self {
+            shmem: false,
+            pages: None,
             nodes,
             files: BTreeMap::new(),
             next_inode: 2,
             quota: Quota::unlimited(),
+        }
+    }
+
+    /// A shared-memory tmpfs: its files' contents live in the page store the
+    /// kernel attaches ([`MountFs::attach_pages`]) — guest memory, sparse,
+    /// and what mappings of them map.
+    #[must_use]
+    pub fn shmem() -> Self {
+        Self {
+            shmem: true,
+            ..Self::new()
         }
     }
 
@@ -169,11 +192,16 @@ impl TmpFs {
     fn new_file(&mut self, mode: u32) -> u64 {
         let meta = self.new_meta();
         let ino = meta.inode;
+        let paged = self
+            .pages
+            .as_ref()
+            .and_then(|store| Some((store.create()?, Arc::clone(store))));
         self.files.insert(
             ino,
             FileData {
                 meta,
                 data: Vec::new(),
+                paged,
                 mode,
                 links: 1,
                 quota: self.quota.clone(),
@@ -360,6 +388,19 @@ fn now_ts() -> i64 {
 }
 
 impl MountFs for TmpFs {
+    fn attach_pages(&mut self, store: &Arc<dyn PageStore>) {
+        if self.shmem && self.pages.is_none() {
+            self.pages = Some(Arc::clone(store));
+        }
+    }
+
+    fn page_id(&mut self, rel: &str) -> Option<u64> {
+        match self.nodes.get(rel)? {
+            Node::File { ino } => self.files.get(ino)?.paged.as_ref().map(|(id, _)| *id),
+            _ => None,
+        }
+    }
+
     fn attach_quota(&mut self, quota: &Arc<Quota>) {
         let nodes: u64 = self.nodes.iter().map(|(k, n)| Self::node_cost(k, n)).sum();
         self.quota.release(nodes);
@@ -398,12 +439,11 @@ impl MountFs for TmpFs {
             }
             Node::File { ino } => {
                 let f = self.files.get(ino)?;
-                (
-                    NodeKind::File,
-                    S_IFREG | (f.mode & 0o7777),
-                    f.data.len() as u64,
-                    f.links,
-                )
+                let size = match &f.paged {
+                    Some((id, store)) => store.len(*id),
+                    None => f.data.len() as u64,
+                };
+                (NodeKind::File, S_IFREG | (f.mode & 0o7777), size, f.links)
             }
             Node::Fifo {
                 mode, socket: true, ..
@@ -432,7 +472,11 @@ impl MountFs for TmpFs {
     fn read_at(&mut self, rel: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {
         match self.nodes.get(rel) {
             Some(Node::File { ino }) => {
-                let data = &self.files.get(ino).ok_or_else(enoent)?.data;
+                let f = self.files.get(ino).ok_or_else(enoent)?;
+                if let Some((id, store)) = &f.paged {
+                    return Ok(store.read(*id, off, buf));
+                }
+                let data = &f.data;
                 let off = off as usize;
                 if off >= data.len() {
                     return Ok(0);
@@ -479,6 +523,14 @@ impl MountFs for TmpFs {
         match self.nodes.get(rel) {
             Some(Node::File { .. }) => {
                 let f = self.file_mut(rel).ok_or_else(enoent)?;
+                if let Some((id, store)) = &f.paged {
+                    off.checked_add(buf.len() as u64)
+                        .filter(|&end| end <= MAX_FILE_SIZE)
+                        .ok_or_else(efbig)?;
+                    store.write(*id, off, buf)?;
+                    f.meta.mtime = now_ts();
+                    return Ok(buf.len());
+                }
                 let end = off
                     .checked_add(buf.len() as u64)
                     .filter(|&end| end <= MAX_FILE_SIZE)
@@ -593,6 +645,14 @@ impl MountFs for TmpFs {
         match self.nodes.get(rel) {
             Some(Node::File { .. }) => {
                 let f = self.file_mut(rel).ok_or_else(enoent)?;
+                if let Some((id, store)) = &f.paged {
+                    if len > MAX_FILE_SIZE {
+                        return Err(efbig());
+                    }
+                    store.set_len(*id, len)?;
+                    f.meta.mtime = now_ts();
+                    return Ok(());
+                }
                 let len = usize::try_from(len)
                     .ok()
                     .filter(|&len| len as u64 <= MAX_FILE_SIZE)

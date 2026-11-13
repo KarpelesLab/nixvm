@@ -280,13 +280,35 @@ impl Kernel {
         l.seals.get(path).copied()
     }
 
-    /// Register a new memfd's seal state: sealable ones start with none, the
-    /// rest start sealed against further sealing (`F_SEAL_SEAL`), as Linux.
-    pub(super) fn memfd_register(&self, path: &str, allow_sealing: bool) {
-        self.locks.lock().unwrap().seals.insert(
-            path.to_string(),
-            if allow_sealing { 0 } else { F_SEAL_SEAL },
-        );
+    /// Register a new memfd's seal state: a sealable one starts with none, or
+    /// (`MFD_NOEXEC_SEAL`) with `F_SEAL_EXEC`; the rest start sealed against
+    /// further sealing (`F_SEAL_SEAL`), as Linux.
+    pub(super) fn memfd_register(&self, path: &str, allow_sealing: bool, noexec: bool) {
+        let seals = match (allow_sealing, noexec) {
+            (_, true) => F_SEAL_EXEC,
+            (true, false) => 0,
+            (false, false) => F_SEAL_SEAL,
+        };
+        self.locks
+            .lock()
+            .unwrap()
+            .seals
+            .insert(path.to_string(), seals);
+    }
+
+    /// The seals on the file at `path` that keep a shared mapping from writing
+    /// to it: `F_SEAL_WRITE` and `F_SEAL_FUTURE_WRITE`.
+    pub(super) fn seals_against_mapping(&self, path: &str) -> bool {
+        self.seals_of(path)
+            .is_some_and(|s| s & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE) != 0)
+    }
+
+    /// Whether the seals on `path` forbid `chmod` to `mode`: `F_SEAL_EXEC`
+    /// freezes the execute bits.
+    pub(super) fn seal_blocks_chmod(&self, vfs: &mut MountTable, path: &str, mode: u32) -> bool {
+        self.seals_of(path).is_some_and(|s| {
+            s & F_SEAL_EXEC != 0 && vfs.stat(path).is_some_and(|a| (a.mode ^ mode) & 0o111 != 0)
+        })
     }
 
     /// Whether the seals on `path` forbid writing `[off, off + len)` (`EPERM`).
@@ -552,7 +574,7 @@ impl Kernel {
             },
             // Whether this open created the file — not tracked: "no".
             F_CREATED_QUERY => 0,
-            F_ADD_SEALS | F_GET_SEALS => self.fcntl_seals(&f, cmd == F_ADD_SEALS, arg),
+            F_ADD_SEALS | F_GET_SEALS => self.fcntl_seals(cx, &f, cmd == F_ADD_SEALS, arg),
             F_GET_RW_HINT | F_GET_FILE_RW_HINT => {
                 let h = cx.cur.fds.meta(n).rw_hint;
                 if mem.write_u64(arg, h).is_err() {
@@ -576,10 +598,19 @@ impl Kernel {
     }
 
     /// `F_ADD_SEALS`/`F_GET_SEALS` on a memfd (`EINVAL` on anything else).
-    fn fcntl_seals(&self, f: &Fd, add: bool, arg: u64) -> i64 {
+    fn fcntl_seals(&self, cx: &ServiceCtx, f: &Fd, add: bool, arg: u64) -> i64 {
         let Fd::File { path, writable, .. } = f else {
             return err(Errno::EINVAL);
         };
+        // F_SEAL_WRITE can't go on while a shared mapping could still write
+        // (`EBUSY`), as Linux's `mapping_deny_writable`.
+        let mapped_writable =
+            add && arg as u32 & F_SEAL_WRITE != 0 && self.seals_of(path).is_some() && {
+                let mut vfs = self.vfs_for(cx);
+                vfs.page_id(path)
+                    .and_then(|id| self.shm.obj(id))
+                    .is_some_and(|o| o.writable_maps() > 0)
+            };
         let mut l = self.locks.lock().unwrap();
         let Some(cur) = l.seals.get(path).copied() else {
             return err(Errno::EINVAL);
@@ -604,6 +635,9 @@ impl Kernel {
         }
         if cur & F_SEAL_SEAL != 0 {
             return err(Errno::EPERM);
+        }
+        if mapped_writable && cur & F_SEAL_WRITE == 0 {
+            return err(Errno::EBUSY);
         }
         l.seals.insert(path.clone(), cur | new);
         0
