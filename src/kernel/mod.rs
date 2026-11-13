@@ -436,6 +436,9 @@ struct ProcInfo {
     /// Bytes a blocked pipe or socket write has already queued, so the re-run of
     /// the syscall continues rather than starting over. 0 outside such a write.
     io_progress: u64,
+    /// The syscall last entered — number, arguments, and the user stack and
+    /// return addresses — for `/proc/<pid>/syscall` while the task waits in it.
+    last_syscall: (u64, [u64; 6], u64, u64),
     /// A blocking `open` of a named FIFO waiting for the other end. The waiter
     /// already counts as a reader (or writer), so the other side's open can
     /// go; abandoning the wait takes that back.
@@ -644,6 +647,7 @@ impl Default for ProcInfo {
             shared_maps: Vec::new(),
             wake_deadline: None,
             io_progress: 0,
+            last_syscall: (0, [0; 6], 0, 0),
             fifo_wait: None,
             cpu_ns: 0,
             rt_run_ns: 0,
@@ -3195,6 +3199,7 @@ impl Kernel {
                 }
                 let sys = arch::decode(self.arch, raw);
                 let args = vcpu.syscall_args();
+                cx.cur.last_syscall = (raw, args, vcpu.sp(), vcpu.syscall_ip());
                 cx.slice_syscalls = cx.slice_syscalls.saturating_add(1);
                 // No lock is held here: `dispatch` acquires exactly the lock(s)
                 // each handler needs (sh before vfs). This is what lets other
@@ -3209,7 +3214,7 @@ impl Kernel {
                 {
                     Some(r)
                 } else if cx.cur.seccomp.active() && Self::ptrace_seccomp_pending(cx) {
-                    let v = self.seccomp_check(cx, sys, raw, &args, vcpu.pc(), mem);
+                    let v = self.seccomp_check(cx, sys, raw, &args, vcpu.syscall_ip(), mem);
                     // `SECCOMP_RET_TRACE`: the tracer gets the call first.
                     if self.ptrace_seccomp_stop(cx, vcpu) {
                         return Serviced::Blocked;

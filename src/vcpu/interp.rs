@@ -442,6 +442,9 @@ impl Vcpu for Aarch64Interp {
     fn pc(&self) -> u64 {
         self.pc
     }
+    fn syscall_ip(&self) -> u64 {
+        self.pc.wrapping_add(4) // past the `svc`
+    }
     fn set_pc(&mut self, pc: u64) {
         self.pc = pc;
     }

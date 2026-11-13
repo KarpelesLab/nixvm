@@ -456,6 +456,8 @@ impl Kernel {
                 comm: info.comm.clone(),
                 cmdline: info.cmdline.clone(),
                 state: match info.run {
+                    // A killable wait (TASK_KILLABLE) reads as D, as Linux shows it.
+                    RunState::Running if info.parked && info.seccomp.killable_wait() => 'D',
                     RunState::Running if info.parked => 'S',
                     RunState::Running => 'R',
                     RunState::Stopped(_) => 'T',
@@ -468,6 +470,11 @@ impl Kernel {
                 id_files,
                 cgroup: self.cgroup_line(cx, info.pid),
                 sandbox: sandbox_of(info),
+                syscall: if info.parked || info.run != RunState::Running {
+                    syscall_line(info)
+                } else {
+                    "running\n".to_string()
+                },
             })
         };
         let others = sh.procs.iter().flatten().map(|p| &p.info);
@@ -521,6 +528,7 @@ impl Kernel {
             fds,
             auxv: cx.cur.auxv.clone(),
             arch: Some(self.arch),
+            syscall: syscall_line(&cx.cur),
             seccomp_logged: Some(super::seccomp::logged_names(
                 self.seccomp_logged
                     .load(std::sync::atomic::Ordering::Relaxed),
@@ -1104,6 +1112,16 @@ fn write_statfs_or_fault(mem: &mut GuestMemory, addr: u64, magic: u64) -> i64 {
     } else {
         0
     }
+}
+
+/// `/proc/<pid>/syscall` for a task in a syscall: its number, arguments, and
+/// stack and return addresses.
+fn syscall_line(info: &super::ProcInfo) -> String {
+    let (nr, a, sp, pc) = info.last_syscall;
+    format!(
+        "{} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {sp:#x} {pc:#x}\n",
+        nr as i64, a[0], a[1], a[2], a[3], a[4], a[5]
+    )
 }
 
 /// A task's `NoNewPrivs:`/`Seccomp:`/`Seccomp_filters:` status lines.

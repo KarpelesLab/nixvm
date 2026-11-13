@@ -114,6 +114,7 @@ const PATHS: &[&str] = &[
     "self/root",
     "self/sched",
     "self/schedstat",
+    "self/syscall",
     "self/personality",
     "self/setgroups",
     "self/gid_map",
@@ -202,6 +203,8 @@ pub struct ProcTask {
     pub cgroup: String,
     /// Its `NoNewPrivs:`, `Seccomp:` and `Seccomp_filters:` status lines.
     pub sandbox: Sandbox,
+    /// Body of its `syscall` file: the syscall it waits in, or `running`.
+    pub syscall: String,
 }
 
 /// What `/proc/<pid>/status` says of a task's sandboxing: its `no_new_privs`
@@ -236,6 +239,7 @@ impl ProcTask {
             "uid_map" => self.id_files[0].clone().into_bytes(),
             "gid_map" => self.id_files[1].clone().into_bytes(),
             "setgroups" => self.id_files[2].clone().into_bytes(),
+            "syscall" => self.syscall.clone().into_bytes(),
             "stat" => {
                 // Only the leading fields `ps` and friends read carry anything.
                 let rest = "0 ".repeat(45);
@@ -285,6 +289,7 @@ const TASK_FILES: &[&str] = &[
     "setgroups",
     "stat",
     "status",
+    "syscall",
     "uid_map",
 ];
 
@@ -335,6 +340,7 @@ const SELF_FILES: &[&str] = &[
     "root",
     "sched",
     "schedstat",
+    "syscall",
     "personality",
     "setgroups",
     "gid_map",
@@ -733,6 +739,8 @@ pub struct ProcData {
     /// The guest architecture `cpuinfo` describes; `None` until the kernel
     /// says (then the build's own architecture is assumed).
     pub arch: Option<crate::abi::Arch>,
+    /// `self/syscall`: the read it is making.
+    pub syscall: String,
     /// `sys/kernel/seccomp/actions_logged`'s body; `None` until the kernel
     /// has said (Linux's default is shown then).
     pub seccomp_logged: Option<String>,
@@ -774,6 +782,7 @@ impl Default for ProcData {
             auxv: Vec::new(),
             arch: None,
             seccomp_logged: None,
+            syscall: String::new(),
         }
     }
 }
@@ -817,6 +826,8 @@ pub struct ProcSelf {
     pub auxv: Vec<u8>,
     /// The guest architecture (selects the `cpuinfo` shape and features).
     pub arch: Option<crate::abi::Arch>,
+    /// `self/syscall`.
+    pub syscall: String,
     /// `sys/kernel/seccomp/actions_logged`.
     pub seccomp_logged: Option<String>,
 }
@@ -886,6 +897,7 @@ impl ProcFs {
         d.tracer = live.tracer;
         d.fds = live.fds;
         d.auxv = live.auxv;
+        d.syscall = live.syscall;
         d.seccomp_logged = live.seccomp_logged;
         if live.arch.is_some() {
             d.arch = live.arch;
@@ -1040,6 +1052,7 @@ impl ProcFs {
                 return Some(text.into_bytes());
             }
             "self/auxv" => return Some(d.auxv.clone()),
+            "self/syscall" => d.syscall.clone(),
             "self/comm" => format!("{}\n", d.comm),
             "self/stat" => self_stat_body(d),
             "self/statm" => statm_body(d),
@@ -1907,6 +1920,7 @@ mod tests {
             nproc: 4,
             auxv: Vec::new(),
             arch: None,
+            syscall: String::new(),
             seccomp_logged: None,
         }
     }
@@ -1927,6 +1941,7 @@ mod tests {
             id_files: Default::default(),
             cgroup: "0::/a\n".to_string(),
             sandbox: Sandbox::default(),
+            syscall: String::new(),
         }];
         fs
     }
@@ -2043,6 +2058,7 @@ mod tests {
             fds: vec![(0, "/dev/null".to_string()), (3, "pipe:[9]".to_string())],
             auxv: vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0],
             arch: None,
+            syscall: String::new(),
             seccomp_logged: None,
         });
         assert_eq!(read_all(&mut fs, "self/auxv").len(), 16);

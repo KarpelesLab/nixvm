@@ -3150,6 +3150,10 @@ impl Vcpu for X86Interp {
         self.rip
     }
 
+    fn syscall_ip(&self) -> u64 {
+        self.rip.wrapping_add(2) // past the 2-byte `syscall`
+    }
+
     fn set_pc(&mut self, pc: u64) {
         self.rip = pc;
     }

@@ -913,6 +913,10 @@ impl Vcpu for KvmVcpu {
     fn pc(&self) -> u64 {
         self.regs.rip
     }
+    fn syscall_ip(&self) -> u64 {
+        // Parked on the trampoline: `syscall` left the user return in rcx.
+        self.regs.rcx
+    }
     fn set_pc(&mut self, pc: u64) {
         self.regs.rip = pc;
         self.regs_dirty = true;

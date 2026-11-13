@@ -889,6 +889,9 @@ impl Vcpu for HvfVcpu {
     fn pc(&self) -> u64 {
         self.regs.borrow().pc
     }
+    fn syscall_ip(&self) -> u64 {
+        self.pc().wrapping_add(4) // past the `svc`
+    }
     fn set_pc(&mut self, pc: u64) {
         self.regs.get_mut().pc = pc;
         self.dirty.pc = true;

@@ -258,6 +258,14 @@ pub trait Vcpu: Send {
 
     fn pc(&self) -> u64;
     fn set_pc(&mut self, pc: u64);
+
+    /// At a syscall exit: the user address the syscall returns to — the
+    /// instruction after `syscall`/`svc`, Linux's `instruction_pointer()`
+    /// there (what seccomp's `seccomp_data.instruction_pointer` and a
+    /// `SIGSYS`'s `si_call_addr` report).
+    fn syscall_ip(&self) -> u64 {
+        self.pc()
+    }
     fn sp(&self) -> u64;
     fn set_sp(&mut self, sp: u64);
 
