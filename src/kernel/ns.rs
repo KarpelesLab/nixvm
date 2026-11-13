@@ -371,12 +371,17 @@ impl Kernel {
         ) {
             return;
         }
-        let under_proc = match cx.cur.fds.get(args[0] as i32) {
-            Some(Fd::File { path, .. } | Fd::Dir { path, .. }) => path.contains("/proc"),
-            _ => false,
+        let (under_proc, maps) = match cx.cur.fds.get(args[0] as i32) {
+            Some(Fd::File { path, .. } | Fd::Dir { path, .. }) => (
+                path.contains("/proc"),
+                path.ends_with("/maps") || path.ends_with("/smaps"),
+            ),
+            _ => (false, false),
         };
+        // Rendering the address space walks all of it (a .NET process has
+        // 256 GiB of reservations): only for a maps file.
         if under_proc {
-            self.refresh_procfs(cx, Some(mem));
+            self.refresh_procfs(cx, maps.then_some(mem));
         }
     }
 
