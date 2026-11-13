@@ -835,6 +835,14 @@ impl Kernel {
             let level = match cx.cur.fds.get(fd) {
                 Some(Fd::Eventfd(i)) => pf.eventfds.get(*i).map_or(0, |e| e.count),
                 Some(Fd::Timerfd(i)) => pf.timerfds.get(*i).map_or(0, |t| t.expirations),
+                // A socket: its mask plus a count of data moved through it, so
+                // an arrival after a read is a new edge even when the mask
+                // didn't change (see `Sock::edge_seq`).
+                Some(Fd::Socket { sock, .. }) => (net.edge_seq(*sock) << 32) | u64::from(ready),
+                // A pipe's read end, likewise with its count of writes.
+                Some(Fd::PipeRead(i, ..)) => {
+                    (pipes.get(*i).map_or(0, |p| p.writes) << 32) | u64::from(ready)
+                }
                 _ => u64::from(ready),
             };
             computed.push((fd, w, ready, level));

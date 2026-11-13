@@ -1513,9 +1513,23 @@ struct Pipe {
     /// other end has closed again since (Linux's `r_counter`/`w_counter`).
     read_opens: u64,
     write_opens: u64,
+    /// Writes delivered into the buffer: part of the read end's
+    /// edge-triggered epoll level, since Linux raises a fresh `EPOLLET` edge
+    /// on every write, even to a pipe that is still readable.
+    writes: u64,
 }
 
 impl Pipe {
+    /// Append `data` to the buffer, as a write into the pipe.
+    fn push<I>(&mut self, data: I)
+    where
+        I: IntoIterator,
+        VecDeque<u8>: Extend<I::Item>,
+    {
+        self.buf.extend(data);
+        self.writes += 1;
+    }
+
     fn new(capacity: usize, nonblock: bool, fifo: Option<(u64, u64)>) -> Self {
         Self {
             buf: VecDeque::new(),
@@ -1527,6 +1541,7 @@ impl Pipe {
             fifo,
             read_opens: 0,
             write_opens: 0,
+            writes: 0,
         }
     }
 }
@@ -2056,7 +2071,12 @@ impl Shared {
     /// returns "timed out". Returns `false` when nothing is timed — a genuine
     /// deadlock. This is what lets a fully-parked machine make `setTimeout`
     /// progress instead of being declared deadlocked.
-    fn wait_for_timer(&self) -> bool {
+    ///
+    /// `cap_ns` bounds the sleep: while a host connection is live its I/O
+    /// lands asynchronously with no wakeup into the scheduler, so the caller
+    /// passes [`HOST_IO_POLL_NS`] to re-check it promptly instead of sleeping
+    /// out a long guest timeout.
+    fn wait_for_timer(&self, cap_ns: u128) -> bool {
         let now = poll::now_ns();
         let Some(dl) = self
             .procs
@@ -2072,7 +2092,7 @@ impl Shared {
         if dl > now {
             // Wake at least this often: a VM-wide time limit must also catch a
             // guest that does nothing but sleep.
-            let ns = (dl - now).min(250_000_000) as u64;
+            let ns = (dl - now).min(cap_ns) as u64;
             std::thread::sleep(std::time::Duration::from_nanos(ns));
         }
         true
@@ -2658,7 +2678,8 @@ impl Kernel {
                 // Held, not parked (a `cpu.max` or `memory.high` penalty):
                 // sleep until it's over.
                 drop(sh);
-                if self.shared.lock().unwrap().wait_for_timer() {
+                let cap = self.stall_sleep_cap();
+                if self.shared.lock().unwrap().wait_for_timer(cap) {
                     continue;
                 }
                 let sh = self.shared.lock().unwrap();
@@ -2674,7 +2695,8 @@ impl Kernel {
             // the re-run of that task's wait sees its deadline passed and
             // returns) or it's a genuine deadlock.
             if !self.serial_sweep()? && self.shared.lock().unwrap().everything_parked() {
-                if self.shared.lock().unwrap().wait_for_timer() {
+                let cap = self.stall_sleep_cap();
+                if self.shared.lock().unwrap().wait_for_timer(cap) {
                     continue;
                 }
                 // A live host connection may still deliver data asynchronously;
@@ -2710,6 +2732,18 @@ impl Kernel {
     /// check-out/check-in bookkeeping; the slice itself runs holding just the
     /// per-address-space memory lock (outermost), so a syscall's own per-handler
     /// locks nest correctly under it.
+    /// How long a stalled scheduler may sleep toward a guest timer before
+    /// re-checking: [`HOST_IO_POLL_NS`] while any host connection is live (its
+    /// I/O, and an off-thread connect, complete with no wakeup to us), else a
+    /// quarter second so a VM-wide time limit still fires.
+    fn stall_sleep_cap(&self) -> u128 {
+        if self.net.lock().unwrap().has_pending_host_io() {
+            HOST_IO_POLL_NS
+        } else {
+            250_000_000
+        }
+    }
+
     fn serial_sweep(&self) -> Result<bool, VcpuError> {
         let mut progressed = false;
         loop {
@@ -3585,8 +3619,9 @@ impl Kernel {
                         StallAction::SleepUntil(dl) => {
                             let now = poll::now_ns();
                             if dl > now {
-                                // Short enough that a VM-wide time limit still fires.
-                                let ns = (dl - now).min(250_000_000) as u64;
+                                // Short enough that a VM-wide time limit still
+                                // fires, and that live host I/O is re-checked.
+                                let ns = (dl - now).min(self.stall_sleep_cap()) as u64;
                                 std::thread::sleep(std::time::Duration::from_nanos(ns));
                             }
                             stalled = false;
@@ -7593,7 +7628,7 @@ impl Kernel {
                 err(Errno::EFAULT)
             };
         };
-        pipes[i].buf.extend(data);
+        pipes[i].push(data);
         let done = done + n;
         if done >= total {
             cx.cur.io_progress = 0;

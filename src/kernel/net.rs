@@ -77,6 +77,27 @@ impl Net {
     /// parked machine is not a deadlock — the scheduler polls for host readiness
     /// rather than erroring out (there is no host-side wakeup into the
     /// cooperative loop, so it must look for itself).
+    /// Note data moving through `sock` (and, for a connected datagram
+    /// socketpair end, into its peer's queue) — see [`Sock::edge_seq`].
+    pub(super) fn bump_edge(&mut self, sock: usize) {
+        let Some(s) = self.socks.get_mut(sock) else {
+            return;
+        };
+        s.edge_seq += 1;
+        if let Kind::Dgram(Dgram {
+            pair_peer: Some(p), ..
+        }) = s.kind
+            && let Some(t) = self.socks.get_mut(p)
+        {
+            t.edge_seq += 1;
+        }
+    }
+
+    /// The socket's edge-trigger sequence ([`Sock::edge_seq`]), 0 if gone.
+    pub(super) fn edge_seq(&self, sock: usize) -> u64 {
+        self.socks.get(sock).map_or(0, |s| s.edge_seq)
+    }
+
     pub(super) fn has_pending_host_io(&self) -> bool {
         self.socks.iter().any(|s| {
             matches!(
@@ -426,6 +447,14 @@ struct Sock {
     /// counts per end): when the last one closes, the socket is released —
     /// a listener frees its port, a host connection is shut down.
     refs: usize,
+    /// Bumped whenever data moves through this socket (a host read, a
+    /// delivered write). It is part of the socket's edge-triggered epoll
+    /// level: Linux raises a fresh `EPOLLET` edge on every arrival, even on an
+    /// already-readable socket, and tokio relies on it — after a short read it
+    /// assumes the socket is drained and waits for the next edge. A readiness
+    /// mask alone stays `POLLIN|POLLOUT` across a read and a new arrival, so
+    /// that edge would be lost and the waiter would sleep forever.
+    edge_seq: u64,
 }
 
 /// The mutable `setsockopt`-controlled state of a socket, plus `SO_ERROR`.
@@ -1370,6 +1399,7 @@ impl Kernel {
                 nonblock,
                 opts: SockOpts::default(),
                 refs: 1,
+                edge_seq: 0,
             });
             let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
             cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
@@ -1420,6 +1450,7 @@ impl Kernel {
                 nonblock,
                 opts: SockOpts::default(),
                 refs: 1,
+                edge_seq: 0,
             });
             let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
             cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
@@ -1444,6 +1475,7 @@ impl Kernel {
             nonblock,
             opts: SockOpts::default(),
             refs: 1,
+            edge_seq: 0,
         });
         let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
         cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
@@ -1491,6 +1523,7 @@ impl Kernel {
                     nonblock,
                     opts: SockOpts::default(),
                     refs: 1,
+                    edge_seq: 0,
                 });
             }
             (a, b, 0, 0)
@@ -1507,6 +1540,7 @@ impl Kernel {
                 nonblock,
                 opts: SockOpts::default(),
                 refs: 1,
+                edge_seq: 0,
             });
             (idx, idx, 0, 1)
         };
@@ -3397,6 +3431,7 @@ impl Kernel {
         match h.conn.recv(&mut buf) {
             Ok(n) => {
                 buf.truncate(n);
+                net.socks[sock].edge_seq += 1;
                 Ok(buf) // n == 0 is a genuine EOF
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -3596,6 +3631,22 @@ impl Kernel {
     /// fire-and-forget, like real UDP: no error if nothing is bound at the
     /// peer's port. Mirrors `write_pipe`.
     pub(super) fn write_socket(
+        &self,
+        net: &mut Net,
+        cx: &mut ServiceCtx,
+        sock: usize,
+        end: usize,
+        data: &[u8],
+        nosignal: bool,
+    ) -> i64 {
+        let r = self.write_socket_inner(net, cx, sock, end, data, nosignal);
+        if r > 0 {
+            net.bump_edge(sock);
+        }
+        r
+    }
+
+    fn write_socket_inner(
         &self,
         net: &mut Net,
         cx: &mut ServiceCtx,

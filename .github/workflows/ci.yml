@@ -168,7 +168,7 @@ jobs:
       - name: Check the root-only programs against Linux
         if: matrix.backend == 'kvm'
         run: |
-          for p in cgroups rlimits sched exec fifo devfd threads_mm dualstack madvise execthread; do
+          for p in cgroups rlimits sched exec fifo devfd threads_mm dualstack madvise execthread epoll_et; do
             gcc -static -O2 -pthread -o "$RUNNER_TEMP/$p" "tests/guest/$p.c"
             echo "== $p"
             sudo "$RUNNER_TEMP/$p"

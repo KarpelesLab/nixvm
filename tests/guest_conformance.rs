@@ -33,6 +33,7 @@ const PROGRAMS: &[&str] = &[
     "dualstack",
     "madvise",
     "execthread",
+    "epoll_et",
 ];
 
 /// A directory of binaries, also used as the guest's root, so that a program can

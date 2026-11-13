@@ -134,7 +134,7 @@ impl Kernel {
                 }
                 let n = (len as usize).min(pipes[i].buf.len()).min(room);
                 let data: Vec<u8> = pipes[i].buf.drain(..n).collect();
-                pipes[j].buf.extend(data);
+                pipes[j].push(data);
                 n as i64
             }
             // pipe -> file / socket / stdio.
@@ -243,7 +243,7 @@ impl Kernel {
                             Ok(n) => n,
                             Err(e) => return io_errno(&e),
                         };
-                        pipes[j].buf.extend(&buf[..n]);
+                        pipes[j].push(&buf[..n]);
                         drop(pipes);
                         drop(vfs);
                         self.advance_off(cx, fd_in, off_in, pos, n as u64, mem);
@@ -259,7 +259,7 @@ impl Kernel {
                         let rflags = if nonblock { 0x40 } else { 0 }; // MSG_DONTWAIT
                         match self.recv_fd_bytes(&mut net, cx, fd_in, cap as u64, rflags) {
                             Ok(data) => {
-                                pipes[j].buf.extend(&data);
+                                pipes[j].push(&data);
                                 data.len() as i64
                             }
                             Err(e) => e,
@@ -338,7 +338,7 @@ impl Kernel {
         }
         let n = (len as usize).min(pipes[i].buf.len()).min(room);
         let data: Vec<u8> = pipes[i].buf.iter().take(n).copied().collect();
-        pipes[j].buf.extend(data);
+        pipes[j].push(data);
         n as i64
     }
 
