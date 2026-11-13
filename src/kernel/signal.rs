@@ -873,6 +873,33 @@ impl Kernel {
         None
     }
 
+    /// [`Self::deliver_pending_signals`] for a task in a killable wait
+    /// (`TASK_KILLABLE`): only the signals that would kill it act now; the
+    /// rest stay pending until the wait ends.
+    pub(super) fn deliver_fatal_signals(
+        &self,
+        cx: &mut ServiceCtx,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &mut GuestMemory,
+    ) -> bool {
+        let mut held = 0u64;
+        for sig in 1..=NSIG {
+            let fatal = sig == SIGKILL
+                || (cx.cur.handlers.get(sig as usize).handler == SIG_DFL
+                    && !is_default_ignored(sig)
+                    && !is_stop_signal(sig)
+                    && sig != SIGCONT);
+            if !fatal {
+                held |= 1u64 << (sig - 1);
+            }
+        }
+        let blocked = cx.cur.blocked;
+        cx.cur.blocked |= held;
+        let delivered = self.deliver_pending_signals(cx, vcpu, mem);
+        cx.cur.blocked = blocked;
+        delivered
+    }
+
     /// Notify a parent that a child changed job-control state (stopped or
     /// continued): post SIGCHLD and unpark it, so a `wait4`/`waitid` blocked for
     /// the event wakes and reports it. Called from

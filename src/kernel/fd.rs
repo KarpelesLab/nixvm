@@ -171,6 +171,17 @@ pub enum Fd {
         flags: u64,
         hold: std::sync::Arc<()>,
     },
+    /// A seccomp user-notification listener (`SECCOMP_FILTER_FLAG_NEW_LISTENER`).
+    SeccompNotify(super::seccomp::NotifFile),
+    /// `/proc/<pid>/mem`: process `pid`'s address space `mm` as it was when
+    /// opened, at the (shared) position `offset`.
+    ProcMem {
+        pid: i32,
+        mm: usize,
+        offset: FileOffset,
+        readable: bool,
+        writable: bool,
+    },
 }
 
 /// One `open` of a named FIFO: an open file description of its own, shared by

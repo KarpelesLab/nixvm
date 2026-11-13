@@ -563,6 +563,9 @@ impl Kernel {
         if let Some(name @ ("hostname" | "domainname")) = rest.strip_prefix("sys/kernel/") {
             return Some(self.write_uts_file(cx, name == "domainname", buf, count, mem));
         }
+        if rest == "sys/kernel/seccomp/actions_logged" {
+            return Some(self.write_seccomp_logged(cx, buf, count, mem));
+        }
         let (who, file) = rest.split_once('/')?;
         if !matches!(file, "uid_map" | "gid_map" | "setgroups" | "timens_offsets") {
             return None;

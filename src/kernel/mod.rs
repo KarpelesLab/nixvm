@@ -1693,6 +1693,8 @@ pub struct Kernel {
     /// Descriptors that may be open at once across the VM
     /// (see [`crate::limits::Limits::open_files`]).
     max_open_files: AtomicUsize,
+    /// `/proc/sys/kernel/seccomp/actions_logged`, as `SECCOMP_LOG_*` bits.
+    seccomp_logged: std::sync::atomic::AtomicU32,
     arch: Arch,
     /// Interactive mode (the browser terminal): guest reads of fd 0 draw from
     /// `Shared::stdin_buf` and *block* (re-trap) when it is empty rather than
@@ -2413,6 +2415,7 @@ impl Kernel {
             max_tasks: AtomicUsize::new(limits.tasks as usize),
             cgroup_mounted: std::sync::atomic::AtomicBool::new(cgroup_mounted),
             max_open_files: AtomicUsize::new(limits.open_files as usize),
+            seccomp_logged: std::sync::atomic::AtomicU32::new(seccomp::DEFAULT_LOGGED),
             arch,
             trace: std::env::var_os("NIXVM_TRACE").is_some(),
             schedtrace: std::env::var_os("NIXVM_SCHEDTRACE").is_some(),
@@ -3225,10 +3228,17 @@ impl Kernel {
                 // and the handler must run now. (A default-*terminate* signal is
                 // handled by the `Zombie` check below, which wins over `block`;
                 // `SIG_IGN`/default-ignored signals correctly leave it blocked.)
+                // (A seccomp notification its supervisor has received, under a
+                // `WAIT_KILLABLE_RECV` filter, waits on through all but a fatal
+                // signal.)
                 if cx.block
+                    && !cx.cur.seccomp.killable_wait()
                     && let Some(sig) = self.first_handled_signal(cx)
                 {
                     cx.block = false;
+                    // A seccomp notification (or ADDFD) being waited on is
+                    // dropped either way: a restart makes a fresh one.
+                    seccomp::abandon(&mut cx.cur.seccomp);
                     if cx.cur.handlers.get(sig).flags & SA_RESTART != 0 && cx.restartable {
                         // Re-run the `syscall` once the handler returns; the
                         // re-run re-establishes any wait bookkeeping (e.g. a
@@ -3275,7 +3285,11 @@ impl Kernel {
                 if !cx.block && !cx.exec_ok && !cx.restart_syscall {
                     vcpu.set_syscall_ret(ret as u64);
                 }
-                let delivered = self.deliver_pending_signals(cx, vcpu, mem);
+                let delivered = if cx.block && cx.cur.seccomp.killable_wait() {
+                    self.deliver_fatal_signals(cx, vcpu, mem)
+                } else {
+                    self.deliver_pending_signals(cx, vcpu, mem)
+                };
                 // Flush the running vcpu's TLB if the page tables were edited in
                 // place — so it can't keep serving a stale entry for a now-
                 // unmapped, re-protected, or CoW-replaced page. This MUST run
@@ -3296,6 +3310,7 @@ impl Kernel {
                 // a fresh one.
                 if !cx.block {
                     cx.cur.wake_deadline = None;
+                    cx.cur.seccomp.syscall_done();
                 }
                 self.watch_code(vcpu, mem, sys);
                 if let RunState::Zombie(_) = cx.cur.run {
@@ -3821,7 +3836,15 @@ impl Kernel {
         step_start: u128,
     ) -> SliceStep {
         // Checkout under `sh`, then release it before servicing.
-        let (mut proc, mut cx, out_pending, out_ppid, out_frozen, out_cpu, out_rt_lens) = {
+        let (
+            mut proc,
+            mut cx,
+            (out_pending, out_synced),
+            out_ppid,
+            out_frozen,
+            out_cpu,
+            out_rt_lens,
+        ) = {
             let mut sh = self.shared.lock().unwrap();
             let mut proc = sh.procs[i].take().expect("dispatched task is in the table");
             // Own the task's per-step servicing state. `yield_now`/`block`/
@@ -3844,6 +3867,7 @@ impl Kernel {
             });
             sh.check_out_files(&mut cx);
             let (pending, ppid, frozen) = (cx.cur.pending, cx.cur.ppid, cx.cur.frozen);
+            let synced = cx.cur.seccomp.synced();
             let cpu = (
                 cx.cur.cg_scale,
                 cx.cur.throttled_until,
@@ -3853,7 +3877,15 @@ impl Kernel {
             let rt_lens: BTreeMap<u32, usize> =
                 cx.cur.rt_queue.iter().map(|(&s, q)| (s, q.len())).collect();
             let link = cx.cur.ptrace.as_ref().map(|t| t.link());
-            (proc, cx, pending, ppid, frozen, (cpu, link), rt_lens)
+            (
+                proc,
+                cx,
+                (pending, synced),
+                ppid,
+                frozen,
+                (cpu, link),
+                rt_lens,
+            )
         };
         let (out_cpu, out_link) = out_cpu;
         if cx.cur.alarm_deadline.is_some() || !cx.cur.ptimers.is_empty() {
@@ -3911,6 +3943,11 @@ impl Kernel {
                         .get_or_insert_with(|| stand_in.info.ptrace.clone().unwrap())
                         .set_link(link);
                 }
+                // Another thread's seccomp `TSYNC` put it under its filters.
+                if stand_in.info.seccomp.synced() != out_synced {
+                    cx.cur.seccomp.adopt_synced(&stand_in.info.seccomp);
+                    cx.cur.no_new_privs |= stand_in.info.no_new_privs;
+                }
                 // Its cgroup's `cpu` settings changed meanwhile.
                 if (
                     stand_in.info.cg_scale,
@@ -3949,6 +3986,7 @@ impl Kernel {
                 }
             }
             if killed {
+                seccomp::release(&mut cx.cur);
                 for fd in cx.cur.fds.drain() {
                     self.bump_pipe(&fd, false);
                 }
@@ -4137,6 +4175,15 @@ impl Kernel {
         }
         if let Some(result) = self.ns_path_syscall(cx, sys, args, mem) {
             return result;
+        }
+        if let Some(result) = self.proc_mem_syscall(cx, sys, args, mem) {
+            return result;
+        }
+        // A seccomp listener's ioctls run with no lock held (they wake tasks).
+        if sys == Sysno::Ioctl
+            && let Some(Fd::SeccompNotify(file)) = cx.cur.fds.get(args[0] as i32).cloned()
+        {
+            return self.seccomp_notify_ioctl(cx, &file, args[1] as u32, args[2], mem);
         }
         if self
             .cgroup_mounted
@@ -6128,6 +6175,7 @@ impl Kernel {
                 continue;
             }
             p.run = RunState::Zombie(ExitCause::Signaled(9)); // SIGKILL
+            seccomp::release(p);
             p.parked = false;
             if p.pid == tgid {
                 leader = Some((p.ppid, p.exit_signal));
@@ -6811,6 +6859,8 @@ impl Kernel {
     ) -> i64 {
         // Killed while a FIFO open waited for the other end: it's no end now.
         self.abandon_fifo_wait(cx);
+        // It stops using its seccomp filters (and waiting on a supervisor).
+        seccomp::release(&mut cx.cur);
         // Flush any un-munmap'd writable shared file mappings first. `sh` is
         // held; scope `vfs` to just the flush (sh→vfs order), dropping it before
         // the rest of teardown.
@@ -7043,6 +7093,7 @@ impl Kernel {
                 files_ids.push(p.info.files);
             }
             p.info.run = RunState::Zombie(cause);
+            seccomp::release(&mut p.info);
             if p.info.tracer() != 0 {
                 tracers.push(p.info.tracer());
             }
@@ -9917,6 +9968,7 @@ impl Kernel {
                 | Fd::Timerfd(_)
                 | Fd::Pidfd(_)
                 | Fd::Epoll(_)
+                | Fd::SeccompNotify(_)
                 | Fd::PtyMaster(_),
             ) => stat::char_device_attrs(),
             Some(Fd::Namespace { kind, id }) => Attrs {
@@ -9934,6 +9986,20 @@ impl Kernel {
                 }
             }
             Some(Fd::Socket { .. }) => stat::socket_attrs(),
+            // `/proc/<pid>/mem`: a regular file only its owner may open.
+            Some(Fd::ProcMem { pid, .. }) => Attrs {
+                kind: NodeKind::File,
+                size: 0,
+                mode: 0o100_600,
+                uid: 0,
+                gid: 0,
+                atime: 0,
+                mtime: 0,
+                inode: (1 << 40) + (u64::from(pid.unsigned_abs()) << 8) + 7,
+                nlink: 1,
+                rdev: 0,
+                dev: 0,
+            },
             // A message queue is a regular file on the mqueue filesystem.
             Some(Fd::Mqueue { q, .. }) => Attrs {
                 kind: NodeKind::File,

@@ -379,6 +379,227 @@ impl Kernel {
             Some(_) => err(Errno::EINVAL),
         }
     }
+
+    /// Answer a syscall on `/proc/<pid>/mem`, if this is one: its open, and
+    /// reads, writes and seeks on the descriptor. The file is the task's
+    /// address space, each offset an address: a debugger's or a seccomp
+    /// supervisor's way into another process's memory. Opening it takes
+    /// `PTRACE_MODE_ATTACH` rights (the caller's own process, the same user
+    /// with the target dumpable, or privilege; `EACCES` otherwise) and binds
+    /// the descriptor to the address space the task has then — after the
+    /// task exits or `execve`s, it reads as empty. Reads and writes go a page
+    /// at a time and stop at the first one that can't be accessed (`EIO` if
+    /// that's the first); writes reach read-only pages too, as Linux's
+    /// `FOLL_FORCE` does.
+    pub(super) fn proc_mem_syscall(
+        &self,
+        cx: &mut ServiceCtx,
+        sys: crate::abi::arch::Sysno,
+        args: &[u64; 6],
+        mem: &mut GuestMemory,
+    ) -> Option<i64> {
+        use crate::abi::arch::Sysno;
+        let on_mem_fd = || matches!(cx.cur.fds.get(args[0] as i32), Some(Fd::ProcMem { .. }));
+        match sys {
+            Sysno::Open | Sysno::Openat | Sysno::Openat2 => {
+                const AT_FDCWD: i64 = -100;
+                let (dirfd, ptr) = if sys == Sysno::Open {
+                    (AT_FDCWD, args[0])
+                } else {
+                    (args[0] as i64, args[1])
+                };
+                let raw = super::read_path(mem, ptr)?;
+                if !raw.ends_with("/mem") {
+                    return None;
+                }
+                let flags = match sys {
+                    Sysno::Open => args[1],
+                    Sysno::Openat => args[2],
+                    _ => mem.read_u64(args[2]).ok()?,
+                };
+                let abs = self.resolve_path(cx, dirfd, &raw);
+                let inside = Self::as_seen_from_root(cx, &abs);
+                let rest = &inside[inside.rfind("/proc/")? + "/proc/".len()..];
+                let who = rest.strip_suffix("/mem")?;
+                Some(self.open_proc_mem(cx, who, flags))
+            }
+            Sysno::Read | Sysno::Pread64 | Sysno::Write | Sysno::Pwrite64 if on_mem_fd() => {
+                let Some(Fd::ProcMem {
+                    pid,
+                    mm,
+                    offset,
+                    readable,
+                    writable,
+                }) = cx.cur.fds.get(args[0] as i32).cloned()
+                else {
+                    return None;
+                };
+                let write = matches!(sys, Sysno::Write | Sysno::Pwrite64);
+                if (write && !writable) || (!write && !readable) {
+                    return Some(err(Errno::EBADF));
+                }
+                let positional = matches!(sys, Sysno::Pread64 | Sysno::Pwrite64);
+                let at = if positional { args[3] } else { offset.get() };
+                let n = self.proc_mem_rw(cx, pid, mm, at, args[1], args[2], write, mem);
+                if n > 0 && !positional {
+                    offset.set(at.wrapping_add(n as u64));
+                }
+                Some(n)
+            }
+            // `mem_lseek`: SEEK_SET and SEEK_CUR only, any address.
+            Sysno::Lseek if on_mem_fd() => {
+                let Some(Fd::ProcMem { offset, .. }) = cx.cur.fds.get(args[0] as i32) else {
+                    return None;
+                };
+                let pos = match args[2] {
+                    0 => args[1],
+                    1 => offset.get().wrapping_add(args[1]),
+                    _ => return Some(err(Errno::EINVAL)),
+                };
+                offset.set(pos);
+                Some(pos as i64)
+            }
+            _ => None,
+        }
+    }
+
+    /// Open `/proc/<who>/mem`.
+    fn open_proc_mem(&self, cx: &mut ServiceCtx, who: &str, flags: u64) -> i64 {
+        const O_ACCMODE: u64 = 3;
+        const O_CLOEXEC: u64 = 0o2000000;
+        // `<pid>`, `<pid>/task/<tid>`, `self`, `thread-self`.
+        let local = who.rsplit('/').next().unwrap_or(who);
+        let global = match local {
+            "self" => Some(cx.cur.tgid),
+            "thread-self" => Some(cx.cur.pid),
+            n => n.parse().ok().and_then(|l| self.global_pid(cx, l)),
+        };
+        let Some(global) = global else {
+            return err(Errno::ENOENT);
+        };
+        let target = {
+            let sh = self.shared.lock().unwrap();
+            let Some(p) = find_proc(&sh, cx, global) else {
+                return err(Errno::ENOENT);
+            };
+            (
+                p.tgid,
+                p.mm,
+                p.creds,
+                p.dumpable,
+                matches!(p.run, RunState::Zombie(_)),
+                p.ns.user,
+            )
+        };
+        let (tgid, mm, creds, dumpable, dead, userns) = target;
+        // CAP_SYS_PTRACE over the target's user namespace.
+        const CAP_SYS_PTRACE: u32 = 19;
+        if tgid != cx.cur.tgid && !self.ns_capable(cx, userns, CAP_SYS_PTRACE) {
+            let me = &cx.cur.creds;
+            let same_user = [creds.ruid, creds.euid, creds.suid]
+                .iter()
+                .all(|&u| u == me.fsuid)
+                && [creds.rgid, creds.egid, creds.sgid]
+                    .iter()
+                    .all(|&g| g == me.fsgid);
+            if !same_user || dumpable != 1 {
+                return err(Errno::EACCES);
+            }
+        }
+        let fd = Fd::ProcMem {
+            // A zombie has no memory: its descriptor reads nothing.
+            pid: if dead { 0 } else { tgid },
+            mm,
+            offset: super::FileOffset::new(0),
+            readable: flags & O_ACCMODE != 1,
+            writable: flags & O_ACCMODE != 0,
+        };
+        let n = cx.cur.fds.alloc(fd);
+        cx.cur.fds.set_cloexec(n, flags & O_CLOEXEC != 0);
+        i64::from(n)
+    }
+
+    /// Move `count` bytes between the caller's `buf` and address `at` of
+    /// address space `mm` (if process `pid` still has it).
+    #[allow(clippy::too_many_arguments)]
+    fn proc_mem_rw(
+        &self,
+        cx: &mut ServiceCtx,
+        pid: i32,
+        mm: usize,
+        at: u64,
+        buf: u64,
+        count: u64,
+        write: bool,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        if count == 0 {
+            return 0;
+        }
+        if mm == cx.cur.mm && pid == cx.cur.tgid {
+            return mem_copy(mem, None, at, buf, count, write);
+        }
+        let sh = self.shared.lock().unwrap();
+        let alive = sh.procs.iter().flatten().any(|p| {
+            p.info.tgid == pid && p.info.mm == mm && !matches!(p.info.run, RunState::Zombie(_))
+        });
+        let Some(space) = sh.spaces.get(mm).filter(|_| alive && pid != 0) else {
+            return 0;
+        };
+        // Memory is the outermost lock and the caller holds its own: only try
+        // the target's, and come back if it's busy on another CPU.
+        let Ok(mut other) = space.try_lock() else {
+            cx.block = true;
+            return 0;
+        };
+        mem_copy(mem, Some(&mut other), at, buf, count, write)
+    }
+}
+
+/// `mem_rw`: copy `count` bytes between the caller's `buf` (in `local`) and
+/// address `at` of `remote` (or `local` itself), a page at a time, stopping at
+/// the first page that can't be accessed. Writes to `remote` ignore its page
+/// protection (`FOLL_FORCE`).
+fn mem_copy(
+    local: &mut GuestMemory,
+    mut remote: Option<&mut GuestMemory>,
+    at: u64,
+    buf: u64,
+    count: u64,
+    write: bool,
+) -> i64 {
+    const PAGE: u64 = crate::vcpu::mem::PAGE_SIZE;
+    let mut done = 0u64;
+    while done < count {
+        let addr = at.wrapping_add(done);
+        let n = (count - done).min(PAGE - addr % PAGE);
+        let (local_ok, remote_ok) = if write {
+            match local.read_vec(buf + done, n as usize) {
+                Ok(data) => {
+                    let target = remote.as_deref_mut().unwrap_or(local);
+                    (true, target.write_init(addr, &data).is_ok())
+                }
+                Err(_) => (false, true),
+            }
+        } else {
+            match remote
+                .as_deref()
+                .unwrap_or(local)
+                .read_vec(addr, n as usize)
+            {
+                Ok(data) => (local.write(buf + done, &data).is_ok(), true),
+                Err(_) => (true, false),
+            }
+        };
+        if !(local_ok && remote_ok) {
+            if done > 0 {
+                break;
+            }
+            return err(if local_ok { Errno::EIO } else { Errno::EFAULT });
+        }
+        done += n;
+    }
+    done as i64
 }
 
 /// Copy between the local iovecs (in `local_mem`) and the remote ones (in

@@ -37,6 +37,7 @@ const PROGRAMS: &[&str] = &[
     "userns_caps",
     "sandbox_fs",
     "ptrace",
+    "seccomp_notify",
 ];
 
 /// A directory of binaries, also used as the guest's root, so that a program can

@@ -467,6 +467,7 @@ impl Kernel {
                 status_ids,
                 id_files,
                 cgroup: self.cgroup_line(cx, info.pid),
+                sandbox: sandbox_of(info),
             })
         };
         let others = sh.procs.iter().flatten().map(|p| &p.info);
@@ -512,15 +513,18 @@ impl Kernel {
             },
             status_ids: self.status_id_lines(cx),
             status_security: format!(
-                "{}NoNewPrivs:\t{}\nSeccomp:\t{}\n",
+                "{}{}",
                 cx.cur.caps.status_lines(),
-                u8::from(cx.cur.no_new_privs),
-                cx.cur.seccomp.mode()
+                sandbox_of(&cx.cur).lines()
             ),
             tracer: self.visible_pid(cx, cx.cur.tracer()) as u32,
             fds,
             auxv: cx.cur.auxv.clone(),
             arch: Some(self.arch),
+            seccomp_logged: Some(super::seccomp::logged_names(
+                self.seccomp_logged
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )),
         }
     }
 
@@ -1102,6 +1106,15 @@ fn write_statfs_or_fault(mem: &mut GuestMemory, addr: u64, magic: u64) -> i64 {
     }
 }
 
+/// A task's `NoNewPrivs:`/`Seccomp:`/`Seccomp_filters:` status lines.
+fn sandbox_of(info: &super::ProcInfo) -> crate::fs::Sandbox {
+    crate::fs::Sandbox {
+        no_new_privs: info.no_new_privs,
+        seccomp: info.seccomp.mode(),
+        filters: info.seccomp.filter_count(),
+    }
+}
+
 /// The `/proc/self/fd/<n>` symlink target for a descriptor: the path for a
 /// file/dir, an `anon_inode:`/`pipe:`/`socket:` name otherwise (matching the
 /// kernel's spellings).
@@ -1128,6 +1141,8 @@ fn fd_link_target(fd: &Fd) -> String {
         Fd::PtyMaster(_) => "/dev/ptmx".to_string(),
         Fd::PtySlave(i) => format!("/dev/pts/{i}"),
         Fd::Mqueue { q, .. } => format!("mqueue:[{q}]"),
+        Fd::SeccompNotify(_) => "anon_inode:seccomp notify".to_string(),
+        Fd::ProcMem { pid, .. } => format!("/proc/{pid}/mem"),
     }
 }
 

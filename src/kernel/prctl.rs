@@ -183,7 +183,11 @@ impl Kernel {
                 }
             }
             PR_GET_SECCOMP => i64::from(cx.cur.seccomp.mode()),
-            PR_SET_SECCOMP => self.seccomp_set_mode(cx, a2, a3, 0, mem),
+            // Strict mode through prctl ignores the filter argument.
+            PR_SET_SECCOMP => {
+                let filter = if a2 == 1 { 0 } else { a3 };
+                self.seccomp_set_mode(None, cx, a2, filter, 0, mem)
+            }
             PR_CAPBSET_READ => {
                 if a2 > CAP_LAST_CAP {
                     err(Errno::EINVAL)

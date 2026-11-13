@@ -140,6 +140,9 @@ const PATHS: &[&str] = &[
     "sys/kernel/ngroups_max",
     "sys/kernel/cap_last_cap",
     "sys/kernel/sched_rr_timeslice_ms",
+    "sys/kernel/seccomp",
+    "sys/kernel/seccomp/actions_avail",
+    "sys/kernel/seccomp/actions_logged",
     "kallsyms",
     "keys",
     "key-users",
@@ -197,6 +200,30 @@ pub struct ProcTask {
     pub id_files: [String; 3],
     /// Body of its `cgroup` file (`0::/path\n`).
     pub cgroup: String,
+    /// Its `NoNewPrivs:`, `Seccomp:` and `Seccomp_filters:` status lines.
+    pub sandbox: Sandbox,
+}
+
+/// What `/proc/<pid>/status` says of a task's sandboxing: its `no_new_privs`
+/// bit, seccomp mode and how many filters it attached.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Sandbox {
+    pub no_new_privs: bool,
+    pub seccomp: u8,
+    pub filters: u32,
+}
+
+impl Sandbox {
+    /// The status lines, as Linux prints them.
+    #[must_use]
+    pub fn lines(self) -> String {
+        format!(
+            "NoNewPrivs:\t{}\nSeccomp:\t{}\nSeccomp_filters:\t{}\n",
+            u8::from(self.no_new_privs),
+            self.seccomp,
+            self.filters
+        )
+    }
 }
 
 impl ProcTask {
@@ -232,14 +259,15 @@ impl ProcTask {
                     self.status_ids.clone()
                 };
                 format!(
-                    "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t{}\n{ids}",
+                    "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t{}\n{ids}{}",
                     self.comm,
                     self.state,
                     state_desc(self.state),
                     self.pid,
                     self.pid,
                     self.ppid,
-                    self.tracer
+                    self.tracer,
+                    self.sandbox.lines()
                 )
                 .into_bytes()
             }
@@ -438,6 +466,12 @@ fn mountinfo_body(mounts: &[super::MountEntry]) -> String {
 }
 
 const CMDLINE: &str = "\n";
+
+/// `sys/kernel/seccomp/actions_avail`: every filter action, as Linux names them.
+const SECCOMP_ACTIONS_AVAIL: &str =
+    "kill_process kill_thread trap errno user_notif trace log allow\n";
+/// `sys/kernel/seccomp/actions_logged`'s default: all but `allow`.
+const SECCOMP_ACTIONS_LOGGED: &str = "kill_process kill_thread trap errno user_notif trace log\n";
 
 const OSTYPE: &str = "Linux\n";
 const OSRELEASE: &str = "6.1.0-nixvm\n";
@@ -699,6 +733,9 @@ pub struct ProcData {
     /// The guest architecture `cpuinfo` describes; `None` until the kernel
     /// says (then the build's own architecture is assumed).
     pub arch: Option<crate::abi::Arch>,
+    /// `sys/kernel/seccomp/actions_logged`'s body; `None` until the kernel
+    /// has said (Linux's default is shown then).
+    pub seccomp_logged: Option<String>,
 }
 
 impl Default for ProcData {
@@ -736,6 +773,7 @@ impl Default for ProcData {
             nproc: 1,
             auxv: Vec::new(),
             arch: None,
+            seccomp_logged: None,
         }
     }
 }
@@ -779,6 +817,8 @@ pub struct ProcSelf {
     pub auxv: Vec<u8>,
     /// The guest architecture (selects the `cpuinfo` shape and features).
     pub arch: Option<crate::abi::Arch>,
+    /// `sys/kernel/seccomp/actions_logged`.
+    pub seccomp_logged: Option<String>,
 }
 
 /// The synthesized `/proc` backend.
@@ -846,6 +886,7 @@ impl ProcFs {
         d.tracer = live.tracer;
         d.fds = live.fds;
         d.auxv = live.auxv;
+        d.seccomp_logged = live.seccomp_logged;
         if live.arch.is_some() {
             d.arch = live.arch;
         }
@@ -955,6 +996,10 @@ impl ProcFs {
             }
             "sys/kernel/hostname" if !self.data.hostname.is_empty() => {
                 return Some(format!("{}\n", self.data.hostname).into_bytes());
+            }
+            "sys/kernel/seccomp/actions_logged" if self.data.seccomp_logged.is_some() => {
+                let names = self.data.seccomp_logged.as_deref().unwrap_or_default();
+                return Some(format!("{names}\n").into_bytes());
             }
             "sys/kernel/domainname" if !self.data.domainname.is_empty() => {
                 return Some(format!("{}\n", self.data.domainname).into_bytes());
@@ -1069,6 +1114,8 @@ fn static_content(rel: &str) -> Option<&'static [u8]> {
         "sys/kernel/ostype" => OSTYPE,
         "sys/kernel/osrelease" => OSRELEASE,
         "sys/kernel/hostname" => HOSTNAME,
+        "sys/kernel/seccomp/actions_avail" => SECCOMP_ACTIONS_AVAIL,
+        "sys/kernel/seccomp/actions_logged" => SECCOMP_ACTIONS_LOGGED,
         "sys/kernel/domainname" => "(none)\n",
         "sys/kernel/overflowuid" | "sys/kernel/overflowgid" => "65534\n",
         "sys/kernel/pid_max" => PID_MAX,
@@ -1500,6 +1547,7 @@ fn is_dir(rel: &str) -> bool {
             | "sys"
             | "sys/kernel"
             | "sys/kernel/random"
+            | "sys/kernel/seccomp"
             | "net"
             | "sys/net"
             | "sys/net/core"
@@ -1751,8 +1799,13 @@ impl MountFs for ProcFs {
             "sys/kernel" => {
                 let mut out = list_files("sys/kernel", SYS_KERNEL_FILES);
                 out.push(entry("random", "sys/kernel/random", NodeKind::Dir));
+                out.push(entry("seccomp", "sys/kernel/seccomp", NodeKind::Dir));
                 Ok(out)
             }
+            "sys/kernel/seccomp" => Ok(list_files(
+                "sys/kernel/seccomp",
+                &["actions_avail", "actions_logged"],
+            )),
             "sys/kernel/random" => Ok(list_files("sys/kernel/random", SYS_KERNEL_RANDOM_FILES)),
             "net" => Ok(list_files("net", NET_FILES)),
             "sys/net" => Ok(vec![
@@ -1854,6 +1907,7 @@ mod tests {
             nproc: 4,
             auxv: Vec::new(),
             arch: None,
+            seccomp_logged: None,
         }
     }
 
@@ -1872,6 +1926,7 @@ mod tests {
             status_ids: String::new(),
             id_files: Default::default(),
             cgroup: "0::/a\n".to_string(),
+            sandbox: Sandbox::default(),
         }];
         fs
     }
@@ -1988,6 +2043,7 @@ mod tests {
             fds: vec![(0, "/dev/null".to_string()), (3, "pipe:[9]".to_string())],
             auxv: vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0],
             arch: None,
+            seccomp_logged: None,
         });
         assert_eq!(read_all(&mut fs, "self/auxv").len(), 16);
         assert_eq!(read_all(&mut fs, "self/comm"), b"myprog\n");

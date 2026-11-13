@@ -309,7 +309,7 @@ impl Kernel {
             Fd::Stdout | Fd::Stderr => POLLOUT,
             // Regular files/dirs never block in this kernel; the console
             // terminal is treated alike (input readiness isn't tracked).
-            Fd::File { .. } | Fd::Dir { .. } | Fd::Tty => POLLIN | POLLOUT,
+            Fd::File { .. } | Fd::Dir { .. } | Fd::ProcMem { .. } | Fd::Tty => POLLIN | POLLOUT,
             // A host-bridged socket gets a precise readable answer (a peek);
             // in-VM loopback sockets stay best-effort always-ready, since
             // their queues aren't observable from here.
@@ -386,6 +386,8 @@ impl Kernel {
             }
             // A message queue: readable with a message, writable with room.
             Fd::Mqueue { q, .. } => pf.mq_ready(q),
+            // A seccomp listener: notifications to receive, to answer.
+            Fd::SeccompNotify(ref l) => l.listener().poll(),
             // Nested epoll readiness is not modeled.
             Fd::Namespace { .. } | Fd::Epoll(_) => 0,
             // Pseudo-terminal ends — `ptys` is the innermost lock (after
