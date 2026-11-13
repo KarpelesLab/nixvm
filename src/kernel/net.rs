@@ -3142,6 +3142,12 @@ impl Kernel {
                 Ok(v) => v,
                 Err(e) => return e,
             };
+        // Nothing yet: the call waits (re-traps) with the caller's `msghdr`
+        // untouched — writing back `msg_controllen = 0` now would leave the
+        // re-run no room for the descriptors it is waiting for.
+        if cx.block {
+            return 0;
+        }
         // Scatter `got` across the iovecs.
         let mut off = 0usize;
         for (base, len) in iovs {
