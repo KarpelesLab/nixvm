@@ -175,6 +175,10 @@ pub struct GuestMemory {
     /// The program break and the window it may move in: the address space's,
     /// so a process's threads share it (as on Linux) and a fork copies it.
     pub heap: Heap,
+    /// How many times this address space was handed a new program
+    /// (`execve`): an SMP worker holding a thread from before checks it
+    /// rather than run the old image's thread in the new image.
+    pub exec_gen: u64,
     /// Set whenever the host puts bytes into a page the guest may execute, or a
     /// frame behind an executable mapping changes (a copy-on-write copy): an
     /// arm64 hardware vcpu must invalidate its instruction cache before running
@@ -335,6 +339,7 @@ impl GuestMemory {
             tlb_dirty: false,
             tlb_gen: 0,
             heap: Heap::default(),
+            exec_gen: 0,
             icache_dirty: true,
             kstack_pa,
             shared: false,
@@ -1096,6 +1101,32 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// Drop the backing of the private anonymous pages covering
+    /// `[addr, addr + len)`, keeping them mapped with their protection: the next touch reads
+    /// zeros (Linux's `MADV_DONTNEED`), and the frames go back to the pool now.
+    /// File-backed pages keep their contents (they'd be re-read from the file)
+    /// and shared ones their frame. Unmapped pages are skipped.
+    pub fn discard(&mut self, addr: u64, len: u64) -> Result<(), MemError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let start = addr - addr % PAGE_SIZE;
+        let end = round_up(addr + len, PAGE_SIZE);
+        let (first, last) = self.page_range(start, (end - start) as usize)?;
+        let mut fa = lock_fa(&self.fa, self.memcg);
+        for p in first..=last {
+            if self.mapped[p]
+                && !self.file_backed[p]
+                && !self.shared_anon[p]
+                && let Some(frame) = self.space.unmap(self.page_base(p), &mut fa, &self.phys)
+            {
+                fa.free(frame);
+                mark_tlb_dirty!(self); // a present leaf was cleared
+            }
+        }
+        Ok(())
+    }
+
     /// Unmap the pages covering `[addr, addr + len)`, returning their frames to
     /// the pool.
     pub fn unmap(&mut self, addr: u64, len: u64) -> Result<(), MemError> {
@@ -1525,6 +1556,7 @@ impl GuestMemory {
             tlb_dirty: false,
             tlb_gen: 0,
             heap: self.heap,
+            exec_gen: 0,
             icache_dirty: true,
             kstack_pa: child_kstack,
             shared: self.shared,
@@ -1542,6 +1574,7 @@ impl GuestMemory {
     /// loader then maps the new image into this same `GuestMemory`.
     pub(crate) fn exec_reset(&mut self) {
         self.reset_space();
+        self.exec_gen = self.exec_gen.wrapping_add(1);
     }
 
     /// Give up everything this address space holds when its last task exits,

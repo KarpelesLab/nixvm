@@ -277,21 +277,25 @@ impl Kernel {
         }
         match advice {
             MADV_DONTNEED | MADV_FREE | MADV_REMOVE => {
-                let zero = [0u8; PAGE_SIZE as usize];
-                let mut p = start;
-                while p < end {
-                    // File-backed (ELF-segment) pages keep their contents: on
-                    // Linux MADV_DONTNEED discards the private copy and the
-                    // next access reloads the file (Bun's embedded bytecode
-                    // lives in such a segment). Shared pages are refaulted
-                    // from the shared object, so they keep theirs too — except
-                    // under MADV_REMOVE, which frees that backing.
-                    let shared = mem.shared_phys(p).is_some();
-                    if !mem.is_file_backed(p) && (!shared || advice == MADV_REMOVE) {
-                        // Only mapped, writable pages take zeros; ignore the rest.
-                        let _ = mem.write(p, &zero);
+                // Private anonymous pages lose their frames and read zeros on
+                // the next touch, whatever their protection now (a runtime
+                // often discards PROT_NONE pages, then maps them writable and
+                // expects zeros). File-backed (ELF-segment) pages keep their
+                // contents: on Linux the next access reloads the file (Bun's
+                // embedded bytecode lives in such a segment). Shared pages are
+                // refaulted from the shared object, so they keep theirs too.
+                let _ = mem.discard(start, end - start);
+                // MADV_REMOVE frees a shared object's backing: its pages read
+                // zeros for every process sharing them.
+                if advice == MADV_REMOVE {
+                    let zero = [0u8; PAGE_SIZE as usize];
+                    let mut p = start;
+                    while p < end {
+                        if mem.shared_phys(p).is_some() && !mem.is_file_backed(p) {
+                            let _ = mem.write(p, &zero);
+                        }
+                        p += PAGE_SIZE;
                     }
-                    p += PAGE_SIZE;
                 }
                 0
             }

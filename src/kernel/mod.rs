@@ -531,6 +531,10 @@ struct ProcInfo {
     /// its handlers and mask may be stale, so a signal posted to it is never
     /// discarded here, only when the running task acts on it.
     in_flight: bool,
+    /// A number no other task has had, kept for life: what the SMP scheduler
+    /// knows a dispatched task by, since an `execve` from a thread can change
+    /// its pid (and the old leader's) while it runs.
+    serial: u64,
     /// While the task is dispatched to an SMP worker, a way to interrupt its
     /// vcpu there ([`crate::vcpu::Vcpu::kicker`]): a signal posted to it uses it,
     /// so a task computing without syscalls takes it now, not at the quantum.
@@ -662,6 +666,7 @@ impl Default for ProcInfo {
             queued_siginfo: [None; NSIG_SLOTS],
             rt_queue: BTreeMap::new(),
             in_flight: false,
+            serial: 0,
             kick: Kicker::default(),
             ptimers: Vec::new(),
             ioprio: 0,
@@ -1372,6 +1377,17 @@ fn run_slice_smp(
 ) -> (usize, Box<dyn Vcpu>, SliceOutcome) {
     let mut count: u32 = 0;
     let mut progressed = false;
+    // A task killed while it waited for this worker (another thread's `execve`
+    // took its process): it never runs again.
+    if kernel.shared.lock().unwrap().procs[i]
+        .as_ref()
+        .is_some_and(|p| matches!(p.info.run, RunState::Zombie(_)))
+    {
+        return (i, vcpu, SliceOutcome::Ended);
+    }
+    // The program its address space held when this task last ran; another
+    // thread's `execve` changes it, and then this thread is gone.
+    let mut image = space.lock().unwrap().exec_gen;
     loop {
         // Step start, for CPU-time accounting (charged in `smp_service_step`).
         let step_start = crate::clock::now_monotonic().as_nanos();
@@ -1391,6 +1407,9 @@ fn run_slice_smp(
         // re-acquires it — so a locked run never self-deadlocks.
         let exit = {
             let mut mem = space.lock().unwrap();
+            if mem.exec_gen != image {
+                return (i, vcpu, SliceOutcome::Ended);
+            }
             if vcpu.needs_locked_run() || mem.is_shared() {
                 vcpu.run(&mut mem)
             } else {
@@ -1422,7 +1441,10 @@ fn run_slice_smp(
         // workers service their syscalls concurrently (step B2). ----
         let step = {
             let mut mem = space.lock().unwrap();
-            kernel.smp_service_step(i, exit, vcpu.as_mut(), &mut mem, step_start)
+            let step = kernel.smp_service_step(i, exit, vcpu.as_mut(), &mut mem, step_start);
+            // This task's own `execve` is its new image.
+            image = mem.exec_gen;
+            step
         };
         match step {
             SliceStep::Continue => {
@@ -1959,7 +1981,14 @@ impl Shared {
             .enumerate()
             .filter_map(|(i, slot)| {
                 let p = slot.as_ref()?;
-                if !matches!(p.info.run, RunState::Zombie(_)) {
+                // (Not one still finishing on another CPU: freeing its slot
+                // would let its check-in clobber whatever took it.)
+                // (Not one dispatched to an SMP worker either, whose slot
+                // has no vcpu until it comes back.)
+                if !matches!(p.info.run, RunState::Zombie(_))
+                    || p.info.in_flight
+                    || p.vcpu.is_none()
+                {
                     return None;
                 }
                 let unwaited = p.info.is_thread
@@ -2582,6 +2611,7 @@ impl Kernel {
         {
             let sh = self.shared.get_mut().unwrap();
             info.pid = 1;
+            info.serial = next_task_serial();
             info.ppid = 0;
             info.tgid = 1;
             info.mm = sh.spaces.len();
@@ -2837,6 +2867,7 @@ impl Kernel {
         let mut info = std::mem::take(&mut self.seed);
         let sh = self.shared.get_mut().unwrap();
         info.pid = 1;
+        info.serial = next_task_serial();
         info.ppid = 0;
         info.tgid = 1;
         info.mm = sh.spaces.len();
@@ -3475,10 +3506,10 @@ impl Kernel {
             // a genuinely deadlocked machine is detected after exactly one
             // fruitless retry instead of spinning or erroring prematurely.
             let mut blocked_at: BTreeMap<usize, u64> = BTreeMap::new();
-            // The task (by pid) each in-flight run of a slot is for, and its
+            // The task (by serial) each in-flight run of a slot is for, and its
             // worker. A slot has one run in flight at most (a reaped task's slot
             // waits for its last run to come back before a new task's goes).
-            let mut dispatched: BTreeMap<usize, (i32, usize)> = BTreeMap::new();
+            let mut dispatched: BTreeMap<usize, (u64, usize)> = BTreeMap::new();
             let mut epoch: u64 = 0;
             let mut inflight = 0usize;
             let mut stalled = false;
@@ -3507,7 +3538,7 @@ impl Kernel {
                         let w = p.info.home_cpu(i, nworkers);
                         p.info.cpu = w as u16;
                         busy[w] = true;
-                        dispatched.insert(i, (p.info.pid, w));
+                        dispatched.insert(i, (p.info.serial, w));
                         let vcpu = p.vcpu.take().unwrap();
                         p.info.kick = Kicker(vcpu.kicker());
                         batch.push((w, i, vcpu, space));
@@ -3579,9 +3610,9 @@ impl Kernel {
                 let (i, vcpu, out) = done_rx.recv().expect("workers outlive the scheduler");
                 inflight -= 1;
                 let mut sh = self.shared.lock().unwrap();
-                let ran = dispatched.remove(&i).map(|(pid, w)| {
+                let ran = dispatched.remove(&i).map(|(serial, w)| {
                     busy[w] = false;
-                    pid
+                    serial
                 });
                 // The task this ran for exited and was reaped while the result was
                 // on its way, and the slot may already hold a new task (a fork
@@ -3589,7 +3620,7 @@ impl Kernel {
                 // one goes, and nothing here is about the new task.
                 if sh.procs[i]
                     .as_ref()
-                    .is_none_or(|p| Some(p.info.pid) != ran || p.vcpu.is_some())
+                    .is_none_or(|p| Some(p.info.serial) != ran || p.vcpu.is_some())
                 {
                     drop(vcpu);
                     if let SliceOutcome::Err(e) = out {
@@ -3651,9 +3682,9 @@ impl Kernel {
             // `None` slot.
             while inflight > 0 {
                 if let Ok((i, vcpu, _)) = done_rx.recv() {
-                    let ran = dispatched.remove(&i).map(|(pid, _)| pid);
+                    let ran = dispatched.remove(&i).map(|(serial, _)| serial);
                     if let Some(p) = self.shared.lock().unwrap().procs[i].as_mut()
-                        && Some(p.info.pid) == ran
+                        && Some(p.info.serial) == ran
                         && p.vcpu.is_none()
                     {
                         p.vcpu = Some(vcpu);
@@ -3798,6 +3829,12 @@ impl Kernel {
                     && !matches!(cx.cur.run, RunState::Zombie(_))
                 {
                     cx.cur.run = RunState::Zombie(cause);
+                    // An exec elsewhere in its group may have renamed it (a
+                    // dead leader takes the exec'ing thread's ID) and made it
+                    // a thread nobody waits for.
+                    cx.cur.pid = stand_in.info.pid;
+                    cx.cur.is_thread = stand_in.info.is_thread;
+                    cx.cur.exit_signal = stand_in.info.exit_signal;
                     killed = true;
                 }
             }
@@ -5329,6 +5366,7 @@ impl Kernel {
         }
         let mut info = cx.cur.clone();
         info.pid = pid;
+        info.serial = next_task_serial();
         info.kick = Kicker::default(); // not dispatched yet
         info.frozen = sched.frozen;
         info.cg_scale = sched.scale;
@@ -5812,6 +5850,9 @@ impl Kernel {
         let spec = ProcessSpec { argv, envp };
         // Point of no return. Record the new program image for `/proc/self/exe`.
         cx.cur.exe = abs.to_string();
+        // The process's other threads end here, and this one becomes the
+        // process (Linux's `de_thread`).
+        Self::de_thread(sh, cx);
         // Capabilities from a user namespace last through exec only for its root.
         if cx.cur.creds.euid != 0 {
             cx.cur.ns_caps = false;
@@ -5883,6 +5924,48 @@ impl Kernel {
         sh.mmap_areas[mm] = Arena::new(top, mid);
         cx.exec_ok = true;
         Some(0)
+    }
+
+    /// `execve` from a multithreaded process: every other thread of the group
+    /// dies (reaped by nobody, as threads are), and if the caller isn't the
+    /// group leader it takes the leader's place — the process ID its parent
+    /// knows and waits on — while the dead leader takes the caller's thread ID.
+    /// Left running, the other threads went on executing the replaced image's
+    /// code in the new one's address space (node's `process.execve` crashed
+    /// that way). A thread still finishing a syscall on another CPU dies when
+    /// it checks back in (its stand-in is marked here).
+    fn de_thread(sh: &mut Shared, cx: &mut ServiceCtx) {
+        let (tgid, me) = (cx.cur.tgid, cx.cur.pid);
+        let mut leader = None;
+        for slot in sh.procs.iter_mut().flatten() {
+            let p = &mut slot.info;
+            if p.tgid != tgid || p.pid == me || matches!(p.run, RunState::Zombie(_)) {
+                continue;
+            }
+            p.run = RunState::Zombie(ExitCause::Signaled(9)); // SIGKILL
+            p.parked = false;
+            if p.pid == tgid {
+                leader = Some((p.ppid, p.exit_signal));
+                // The dead leader becomes the caller's old thread, reaped
+                // with the rest.
+                p.pid = me;
+            }
+            p.is_thread = true;
+            p.exit_signal = 0;
+        }
+        if let Some((ppid, exit_signal)) = leader {
+            cx.cur.pid = tgid;
+            cx.cur.ppid = ppid;
+            cx.cur.exit_signal = exit_signal;
+            cx.cur.is_thread = false;
+            // Children made by the caller as a thread name it by its old ID.
+            for slot in sh.procs.iter_mut().flatten() {
+                if slot.info.ppid == me && slot.info.tgid != tgid {
+                    slot.info.ppid = tgid;
+                }
+            }
+        }
+        sh.reap_unwaited_zombies(cx);
     }
 
     /// `wait4(pid, wstatus, options, rusage)` — reap a zombie child, honoring the
@@ -10766,6 +10849,12 @@ fn rusage_bytes(cpu_ns: u128) -> [u8; 144] {
     ru[0..8].copy_from_slice(&((cpu_ns / 1_000_000_000) as i64).to_le_bytes());
     ru[8..16].copy_from_slice(&((cpu_ns % 1_000_000_000 / 1_000) as i64).to_le_bytes());
     ru
+}
+
+/// A task serial number never used before ([`ProcInfo::serial`]).
+fn next_task_serial() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Encode an errno as a negative syscall return.

@@ -585,8 +585,8 @@ fn default_env() -> Vec<String> {
 }
 
 /// Virtual extent of a [`Vm`]'s address space (see `sandbox::GUEST_VSIZE`):
-/// costs ~4 bytes of per-page metadata per 4 KiB page (32 MiB), not RAM.
-const GUEST_VSIZE: u64 = 32 << 30;
+/// its per-page metadata is sparse, so only what's touched costs anything.
+const GUEST_VSIZE: u64 = 1 << 40;
 
 fn round_up_page(v: u64) -> u64 {
     v.div_ceil(PAGE_SIZE) * PAGE_SIZE

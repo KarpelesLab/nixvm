@@ -74,10 +74,12 @@ const GUEST_BASE: u64 = 0x1_0000;
 /// pool (`mem_bytes`). A JS engine (JSC/V8, i.e. Bun/Node) reserves tens of GiB
 /// of `MAP_NORESERVE` virtual address space at startup but commits only a small
 /// working set; if the virtual arena is too small a plain `mmap` fails with
-/// `ENOMEM` and the engine traps. 32 GiB comfortably fits that (Bun/JSC needs
-/// >8 GiB), costs only ~24 MiB of per-page metadata, and the pool (physical RAM,
-/// > demand-paged, lazily host-committed) bounds the actual footprint.
-const GUEST_VSIZE: u64 = 32 * 1024 * 1024 * 1024;
+/// `ENOMEM` and the engine traps. V8's caged heaps alone (Oilpan's, in Deno)
+/// reserve 32-48 GiB at a time; 1 TiB fits them. The per-page metadata is
+/// sparse (only touched 16 MiB chunks cost anything, plus ~2 MiB of chunk
+/// tables), and the pool (physical RAM, demand-paged, lazily host-committed)
+/// bounds the actual footprint.
+const GUEST_VSIZE: u64 = 1 << 40;
 
 /// A fully-specified sandbox run.
 #[derive(Debug, Clone)]

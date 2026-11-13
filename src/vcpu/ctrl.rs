@@ -25,11 +25,14 @@ use super::mem::{PAGE_SIZE, Prot};
 use super::pagetable::AddrSpace;
 use super::phys::{FrameAllocator, PhysMem};
 
-/// Top of the (old) identity window; the control block sits just below it, so
-/// its virtual addresses stay far above any guest user mapping.
-const IDENTITY_TOP: u64 = 64 << 30;
+/// Top of the window the control block sits just below: near the top of the
+/// 47-bit user half (x86-64's canonical lower half; arm64's `TTBR0` walks 48
+/// bits), so its virtual addresses stay far above any guest mapping however
+/// large the guest's address space is (it was at 64 GiB, which capped guests
+/// below that, and V8's caged heaps reserve 32-48 GiB at a time).
+const IDENTITY_TOP: u64 = (1 << 47) - (14 << 20);
 
-/// Virtual base of the control block — unchanged from the identity-model layout.
+/// Virtual base of the control block.
 pub const CTRL_GPA: u64 = IDENTITY_TOP - (2 << 20);
 
 // Virtual offsets of each page within the control window. These are frozen at

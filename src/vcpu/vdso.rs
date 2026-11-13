@@ -9,10 +9,11 @@
 //! reads `rdtsc` and scales it, all in guest userspace.
 //!
 //! libc finds the symbols via `AT_SYSINFO_EHDR` + the ELF's `DT_HASH`/
-//! `DT_SYMTAB`. The symbols are unversioned: musl matches by name only, and
-//! glibc accepts an unversioned symbol when the object carries no `DT_VERSYM`
-//! (its `check_match` takes the "no version table → accept" path), so both use
-//! the fast path. Every function falls back to the raw syscall for the cases the
+//! `DT_SYMTAB`. Like Linux's, they're versioned (`DT_VERSYM`/`DT_VERDEF`):
+//! `LINUX_2.6` on x86-64 and `LINUX_2.6.39` on arm64, under the base
+//! `linux-vdso.so.1`. glibc and musl look them up by that version, and Go's
+//! runtime walks the version definitions without checking they exist (a Go
+//! 1.26 binary crashed on startup reading a null `verdef`). Every function falls back to the raw syscall for the cases the
 //! calibration can't serve — an uncalibrated vvar, and the clocks the real vDSO
 //! also punts (`CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` and anything
 //! above `CLOCK_MONOTONIC_COARSE`) — so it only ever *adds* a fast path and never
@@ -157,9 +158,21 @@ const SYMS_AARCH64: &[Sym] = &[
 const PHDR: u64 = 0x40; // 2 × 56-byte program headers
 const HASH: u64 = 0xb0; // SysV hash: (2 + nbucket + nchain) × 4 = 36 bytes
 const DYNSYM: u64 = 0xe0; // (1 + SYMS.len()) × 24-byte symbols
-const DYNSTR: u64 = 0x170;
-const DYNAMIC: u64 = 0x1d0; // 6 × 16-byte entries
-const TEXT: u64 = 0x240;
+const VERSYM: u64 = 0x170; // one u16 version index per symbol
+const VERDEF: u64 = 0x180; // 2 × (20-byte Verdef + 8-byte Verdaux)
+const DYNSTR: u64 = 0x1c0;
+const DYNAMIC: u64 = 0x280; // DYN_ENTRIES × 16-byte entries
+const DYN_ENTRIES: u64 = 9;
+const TEXT: u64 = 0x340;
+// The fixed parts of the layout don't overlap.
+const _: () = assert!(VERDEF + 2 * 28 <= DYNSTR, "verdef overlaps dynstr");
+const _: () = assert!(
+    DYNAMIC + DYN_ENTRIES * 16 <= TEXT,
+    "dynamic overlaps the code"
+);
+
+/// The vDSO's base version (its soname), as Linux names it.
+const SONAME: &str = "linux-vdso.so.1";
 
 /// Size of the vDSO ELF page (one page).
 pub const PAGE: usize = 4096;
@@ -179,7 +192,7 @@ fn w16(buf: &mut [u8], off: u64, v: u16) {
 /// mapped at).
 #[must_use]
 pub fn build_image(vvar_va: u64) -> [u8; PAGE] {
-    build(62, CODE, SYMS, &VVAR_PATCH, vvar_va)
+    build(62, CODE, SYMS, &VVAR_PATCH, "LINUX_2.6", vvar_va)
 }
 
 /// [`build_image`] for an aarch64 guest.
@@ -190,13 +203,36 @@ pub fn build_image_aarch64(vvar_va: u64) -> [u8; PAGE] {
         CODE_AARCH64,
         SYMS_AARCH64,
         &VVAR_PATCH_AARCH64,
+        "LINUX_2.6.39",
         vvar_va,
     )
 }
 
+/// The SysV ELF hash of `name` (what `Verdef::vd_hash` holds).
+fn elf_hash(name: &str) -> u32 {
+    let mut h: u32 = 0;
+    for &c in name.as_bytes() {
+        h = (h << 4).wrapping_add(u32::from(c));
+        let g = h & 0xf000_0000;
+        if g != 0 {
+            h ^= g >> 24;
+        }
+        h &= !g;
+    }
+    h
+}
+
 /// Lay out the one-page vDSO for `machine` (`e_machine`) around `code`,
-/// exporting `syms` and patching the vvar VA in at `patches`.
-fn build(machine: u16, code: &[u8], syms: &[Sym], patches: &[usize], vvar_va: u64) -> [u8; PAGE] {
+/// exporting `syms` (all at version `version`) and patching the vvar VA in at
+/// `patches`.
+fn build(
+    machine: u16,
+    code: &[u8],
+    syms: &[Sym],
+    patches: &[usize],
+    version: &str,
+    vvar_va: u64,
+) -> [u8; PAGE] {
     let mut b = [0u8; PAGE];
 
     // ELF header: ET_DYN.
@@ -228,8 +264,8 @@ fn build(machine: u16, code: &[u8], syms: &[Sym], patches: &[usize], vvar_va: u6
     w64(&mut b, PHDR + 56 + 8, DYNAMIC); // p_offset
     w64(&mut b, PHDR + 56 + 16, DYNAMIC); // p_vaddr
     w64(&mut b, PHDR + 56 + 24, DYNAMIC); // p_paddr
-    w64(&mut b, PHDR + 56 + 32, 6 * 16); // p_filesz
-    w64(&mut b, PHDR + 56 + 40, 6 * 16); // p_memsz
+    w64(&mut b, PHDR + 56 + 32, DYN_ENTRIES * 16); // p_filesz
+    w64(&mut b, PHDR + 56 + 40, DYN_ENTRIES * 16); // p_memsz
     w64(&mut b, PHDR + 56 + 48, 8); // p_align
 
     let nsym = syms.len() as u64; // exported symbols (index 1..=nsym)
@@ -257,7 +293,41 @@ fn build(machine: u16, code: &[u8], syms: &[Sym], patches: &[usize], vvar_va: u6
         b[at..at + s.name.len()].copy_from_slice(s.name.as_bytes());
         str_off += s.name.len() as u64 + 1; // + the NUL terminator
     }
+    // The version names: the base (soname) and the one every symbol has.
+    let mut add_str = |name: &str| {
+        let at = (DYNSTR + str_off) as usize;
+        b[at..at + name.len()].copy_from_slice(name.as_bytes());
+        let off = str_off;
+        str_off += name.len() as u64 + 1;
+        off
+    };
+    let soname_off = add_str(SONAME);
+    let version_off = add_str(version);
     let strsz = str_off;
+
+    // Symbol versions: the null symbol is local (0), every export has the
+    // version defined second (index 2; 1 is the base).
+    for i in 1..=nsym {
+        w16(&mut b, VERSYM + i * 2, 2);
+    }
+    // Version definitions: Verdef { vd_version, vd_flags, vd_ndx, vd_cnt,
+    // vd_hash, vd_aux, vd_next } each followed by its Verdaux { vda_name,
+    // vda_next }.
+    for (k, (flags, name, off)) in [(1u16, SONAME, soname_off), (0, version, version_off)]
+        .into_iter()
+        .enumerate()
+    {
+        let d = VERDEF + k as u64 * 28;
+        w16(&mut b, d, 1); // vd_version
+        w16(&mut b, d + 2, flags); // VER_FLG_BASE for the soname
+        w16(&mut b, d + 4, k as u16 + 1); // vd_ndx
+        w16(&mut b, d + 6, 1); // vd_cnt
+        w32(&mut b, d + 8, elf_hash(name)); // vd_hash
+        w32(&mut b, d + 12, 20); // vd_aux: the Verdaux right after
+        w32(&mut b, d + 16, if k == 0 { 28 } else { 0 }); // vd_next
+        w32(&mut b, d + 20, off as u32); // vda_name
+        w32(&mut b, d + 24, 0); // vda_next
+    }
 
     // Dynamic symbols. sym[0] is the reserved null entry (already zero); each
     // exported function follows. st_info = (STB_GLOBAL<<4)|STT_FUNC = 0x12;
@@ -272,14 +342,17 @@ fn build(machine: u16, code: &[u8], syms: &[Sym], patches: &[usize], vvar_va: u6
         w64(&mut b, sym + 16, end - s.off); // st_size
     }
 
-    // Dynamic section: DT_HASH, DT_STRTAB, DT_SYMTAB, DT_STRSZ, DT_SYMENT, DT_NULL.
-    let dyn_entries: [(u64, u64); 6] = [
-        (4, HASH),   // DT_HASH
-        (5, DYNSTR), // DT_STRTAB
-        (6, DYNSYM), // DT_SYMTAB
-        (10, strsz), // DT_STRSZ
-        (11, 24),    // DT_SYMENT
-        (0, 0),      // DT_NULL
+    // Dynamic section.
+    let dyn_entries: [(u64, u64); DYN_ENTRIES as usize] = [
+        (4, HASH),             // DT_HASH
+        (5, DYNSTR),           // DT_STRTAB
+        (6, DYNSYM),           // DT_SYMTAB
+        (10, strsz),           // DT_STRSZ
+        (11, 24),              // DT_SYMENT
+        (0x6fff_fff0, VERSYM), // DT_VERSYM
+        (0x6fff_fffc, VERDEF), // DT_VERDEF
+        (0x6fff_fffd, 2),      // DT_VERDEFNUM
+        (0, 0),                // DT_NULL
     ];
     for (i, (tag, val)) in dyn_entries.iter().enumerate() {
         let o = DYNAMIC + (i as u64) * 16;
@@ -292,7 +365,8 @@ fn build(machine: u16, code: &[u8], syms: &[Sym], patches: &[usize], vvar_va: u6
         HASH + 8 + nchain * 4 <= DYNSYM,
         "hash table overlaps dynsym"
     );
-    debug_assert!(DYNSYM + nchain * 24 <= DYNSTR, "dynsym overlaps dynstr");
+    debug_assert!(DYNSYM + nchain * 24 <= VERSYM, "dynsym overlaps versym");
+    debug_assert!(VERSYM + nchain * 2 <= VERDEF, "versym overlaps verdef");
     debug_assert!(DYNSTR + strsz <= DYNAMIC, "dynstr overlaps dynamic");
     debug_assert!(TEXT as usize + code.len() <= PAGE, "code overruns the page");
 
@@ -316,6 +390,13 @@ mod tests {
     /// Parse the built image the way musl's `__vdsosym` / glibc's `setup_vdso`
     /// do and confirm every exported symbol resolves to its code offset — a
     /// regression guard on the ELF.
+    /// The hashes Go's runtime looks the versions up by (`vdsoLinuxVersion`).
+    #[test]
+    fn version_hashes_are_the_ones_runtimes_expect() {
+        assert_eq!(elf_hash("LINUX_2.6"), 0x3ae_75f6);
+        assert_eq!(elf_hash("LINUX_2.6.39"), 0x75f_cb89);
+    }
+
     #[test]
     fn image_exports_all_clock_symbols() {
         check_image(&build_image(0xF_FFE4_9000), 62, SYMS, &VVAR_PATCH);
@@ -338,7 +419,8 @@ mod tests {
 
         // Walk PT_DYNAMIC → collect DT_HASH/DT_STRTAB/DT_SYMTAB.
         let phoff = u64::from_le_bytes(img[32..40].try_into().unwrap());
-        let (mut hash, mut strtab, mut symtab) = (0u64, 0u64, 0u64);
+        let (mut hash, mut strtab, mut symtab, mut versym, mut verdef) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
         for i in 0..2u64 {
             let p = (phoff + i * 56) as usize;
             if u32::from_le_bytes(img[p..p + 4].try_into().unwrap()) == 2 {
@@ -353,6 +435,8 @@ mod tests {
                         4 => hash = val,
                         5 => strtab = val,
                         6 => symtab = val,
+                        0x6fff_fff0 => versym = val,
+                        0x6fff_fffc => verdef = val,
                         0 => break,
                         _ => {}
                     }
@@ -360,7 +444,40 @@ mod tests {
                 }
             }
         }
-        assert!(hash != 0 && strtab != 0 && symtab != 0);
+        assert!(hash != 0 && strtab != 0 && symtab != 0 && versym != 0 && verdef != 0);
+        let rd16 = |o: u64| u16::from_le_bytes([img[o as usize], img[o as usize + 1]]);
+        let rd32 = |o: u64| u32::from_le_bytes(img[o as usize..o as usize + 4].try_into().unwrap());
+        let cstr = |o: u64| {
+            let start = (strtab + o) as usize;
+            let end = img[start..].iter().position(|&c| c == 0).unwrap() + start;
+            String::from_utf8_lossy(&img[start..end]).into_owned()
+        };
+        // Walk the version definitions as musl's `checkver` and Go's
+        // `vdsoFindVersion` do: the base, then the symbols' version.
+        let mut names = Vec::new();
+        let mut d = verdef;
+        loop {
+            assert_eq!(rd16(d), 1, "vd_version");
+            let name = cstr(u64::from(rd32(d + u64::from(rd32(d + 12)))));
+            assert_eq!(rd32(d + 8), elf_hash(&name), "vd_hash of {name}");
+            names.push((rd16(d + 4), rd16(d + 2), name));
+            match rd32(d + 16) {
+                0 => break,
+                n => d += u64::from(n),
+            }
+        }
+        let want = if machine == 62 {
+            "LINUX_2.6"
+        } else {
+            "LINUX_2.6.39"
+        };
+        assert_eq!(
+            names,
+            vec![(1, 1, SONAME.to_string()), (2, 0, want.to_string())]
+        );
+        for i in 1..=syms.len() as u64 {
+            assert_eq!(rd16(versym + i * 2), 2, "symbol {i} has the {want} version");
+        }
 
         // Walk the whole hash chain from bucket 0 and match names, exactly as a
         // dynamic linker resolving against DT_HASH would.
