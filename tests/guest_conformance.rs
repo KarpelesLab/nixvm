@@ -36,6 +36,7 @@ const PROGRAMS: &[&str] = &[
     "epoll_et",
     "userns_caps",
     "sandbox_fs",
+    "ptrace",
 ];
 
 /// A directory of binaries, also used as the guest's root, so that a program can

@@ -452,12 +452,14 @@ impl Kernel {
             (pid != 0).then(|| crate::fs::ProcTask {
                 pid: pid as u32,
                 ppid: self.visible_pid(cx, info.ppid) as u32,
+                tracer: self.visible_pid(cx, info.tracer()) as u32,
                 comm: info.comm.clone(),
                 cmdline: info.cmdline.clone(),
                 state: match info.run {
                     RunState::Running if info.parked => 'S',
                     RunState::Running => 'R',
                     RunState::Stopped(_) => 'T',
+                    RunState::Traced => 't',
                     RunState::Zombie(_) => 'Z',
                 },
                 uid: owner.0,
@@ -515,6 +517,7 @@ impl Kernel {
                 u8::from(cx.cur.no_new_privs),
                 cx.cur.seccomp.mode()
             ),
+            tracer: self.visible_pid(cx, cx.cur.tracer()) as u32,
             fds,
             auxv: cx.cur.auxv.clone(),
             arch: Some(self.arch),

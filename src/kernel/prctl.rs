@@ -353,7 +353,8 @@ impl Kernel {
                     err(Errno::EINVAL)
                 }
             }
-            // Yama ptrace scope: there is no ptrace, so any tracer is fine.
+            // Yama's ptrace scope: there is no Yama here, so any tracer that
+            // passes the ordinary ptrace checks already may.
             PR_SET_PTRACER => 0,
             // Hardware/kernel features these CPUs and this kernel don't have:
             // unaligned/FP-emulation/endian/FP-exception knobs of other arches

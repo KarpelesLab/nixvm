@@ -242,7 +242,13 @@ impl super::ProcInfo {
     /// not blocked. A blocked one is kept, as the mask or handler may change
     /// before it's unblocked; `SIGKILL` and `SIGSTOP` are never ignored.
     pub(super) fn discards(&self, sig: u64) -> bool {
-        if !(1..=NSIG).contains(&sig) || sig == SIGKILL || sig == SIGSTOP || self.in_flight {
+        // Nor is any signal to a traced task: its tracer sees them all.
+        if !(1..=NSIG).contains(&sig)
+            || sig == SIGKILL
+            || sig == SIGSTOP
+            || self.in_flight
+            || self.tracer() != 0
+        {
             return false;
         }
         if self.blocked & (1u64 << (sig - 1)) != 0 {
@@ -262,6 +268,10 @@ impl super::ProcInfo {
             return false;
         }
         self.pending |= 1u64 << (sig - 1);
+        // `SIGKILL` gets a task out of a ptrace stop, to die.
+        if sig == SIGKILL {
+            self.wake_traced_for_kill();
+        }
         // Out running on another worker: stop it, so it takes the signal now.
         self.kick.kick();
         true
@@ -781,6 +791,21 @@ impl Kernel {
         if !matches!(cx.cur.run, RunState::Running) {
             return false;
         }
+        // A traced task: a signal its tracer passed on is acted on here; any
+        // other stops it for the tracer first.
+        if cx.cur.ptrace.is_some() {
+            loop {
+                match self.ptrace_signal_delivery(cx, vcpu) {
+                    Err(()) => return false,
+                    Ok(None) => break,
+                    Ok(Some(sig)) => {
+                        if let Some(r) = self.act_on_signal(cx, sig, vcpu, mem) {
+                            return r;
+                        }
+                    }
+                }
+            }
+        }
         let deliverable = cx.cur.pending & !cx.cur.blocked;
         for sig in 1..=NSIG {
             let bit = 1u64 << (sig - 1);
@@ -789,36 +814,8 @@ impl Kernel {
             }
             // Clear the pending bit: every branch below acts on this signal.
             cx.cur.pending &= !bit;
-            // Job-control stop: SIGSTOP always stops (uncatchable), and the
-            // other stop signals stop only at their default disposition. A
-            // caught stop signal falls through to run its handler; SIG_IGN
-            // falls through and is dropped. Stopping parks the task and notifies
-            // the parent so its `wait4(WUNTRACED)`/`waitid(WSTOPPED)` wakes.
-            if sig == SIGSTOP
-                || (is_stop_signal(sig) && cx.cur.handlers.get(sig as usize).handler == SIG_DFL)
-            {
-                cx.cur.run = RunState::Stopped(sig as i32);
-                cx.cur.stop_reported = false;
-                // A pending SIGCONT is cancelled by an actual stop.
-                cx.cur.pending &= !CONT_SIG_BIT;
-                self.notify_parent_of_child_event(cx.cur.ppid);
-                return false;
-            }
-            match cx.cur.handlers.get(sig as usize).handler {
-                // Ignored explicitly: drop it (and any queued RT instances).
-                SIG_IGN => cx.cur.drain_rt(sig),
-                // A real handler: push the frame + redirect the vcpu, then STOP —
-                // the guest runs the handler now; any remaining pendings deliver
-                // at the next syscall boundary. Returns whether the frame built.
-                h if h != SIG_DFL => {
-                    return self.deliver_async_signal(cx, sig, vcpu, mem);
-                }
-                // SIG_DFL: ignore the "ignored-by-default" set, else terminate.
-                _ if is_default_ignored(sig) => cx.cur.drain_rt(sig),
-                _ => {
-                    self.die_of_signal(cx, sig as u32, mem);
-                    return false;
-                }
+            if let Some(r) = self.act_on_signal(cx, sig, vcpu, mem) {
+                return r;
             }
         }
         // No handler was entered and we didn't zombie. If a `sigsuspend` woke on
@@ -830,6 +827,50 @@ impl Kernel {
             cx.cur.blocked = prev;
         }
         false
+    }
+
+    /// Act on signal `sig`, just dequeued: stop, run its handler, drop it or
+    /// die of it. `Some(handler entered)` when that ends delivery for now,
+    /// `None` when it was dropped and the next one may go.
+    fn act_on_signal(
+        &self,
+        cx: &mut ServiceCtx,
+        sig: u64,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &mut GuestMemory,
+    ) -> Option<bool> {
+        // Job-control stop: SIGSTOP always stops (uncatchable), and the
+        // other stop signals stop only at their default disposition. A
+        // caught stop signal falls through to run its handler; SIG_IGN
+        // falls through and is dropped. Stopping parks the task and notifies
+        // the parent so its `wait4(WUNTRACED)`/`waitid(WSTOPPED)` wakes.
+        if sig == SIGSTOP
+            || (is_stop_signal(sig) && cx.cur.handlers.get(sig as usize).handler == SIG_DFL)
+        {
+            cx.cur.run = RunState::Stopped(sig as i32);
+            cx.cur.stop_reported = false;
+            // A pending SIGCONT is cancelled by an actual stop.
+            cx.cur.pending &= !CONT_SIG_BIT;
+            self.notify_parent_of_child_event(cx.cur.ppid);
+            return Some(false);
+        }
+        match cx.cur.handlers.get(sig as usize).handler {
+            // Ignored explicitly: drop it (and any queued RT instances).
+            SIG_IGN => cx.cur.drain_rt(sig),
+            // A real handler: push the frame + redirect the vcpu, then STOP —
+            // the guest runs the handler now; any remaining pendings deliver
+            // at the next syscall boundary. Returns whether the frame built.
+            h if h != SIG_DFL => {
+                return Some(self.deliver_async_signal(cx, sig, vcpu, mem));
+            }
+            // SIG_DFL: ignore the "ignored-by-default" set, else terminate.
+            _ if is_default_ignored(sig) => cx.cur.drain_rt(sig),
+            _ => {
+                self.die_of_signal(cx, sig as u32, mem);
+                return Some(false);
+            }
+        }
+        None
     }
 
     /// Notify a parent that a child changed job-control state (stopped or

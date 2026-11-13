@@ -181,9 +181,11 @@ const ROOT_FILES: &[&str] = &[
 pub struct ProcTask {
     pub pid: u32,
     pub ppid: u32,
+    /// The task tracing it (`TracerPid`), 0 for none.
+    pub tracer: u32,
     pub comm: String,
     pub cmdline: Vec<u8>,
-    /// The letter `ps` shows: `R`, `S`, `T` or `Z`.
+    /// The letter `ps` shows: `R`, `S`, `T`, `t` or `Z`.
     pub state: char,
     /// Who owns its `/proc/<pid>` entries: its effective ids, as the VM sees them.
     pub uid: u32,
@@ -230,8 +232,14 @@ impl ProcTask {
                     self.status_ids.clone()
                 };
                 format!(
-                    "Name:\t{}\nState:\t{}\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\n{ids}",
-                    self.comm, self.state, self.pid, self.pid, self.ppid
+                    "Name:\t{}\nState:\t{} ({})\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nTracerPid:\t{}\n{ids}",
+                    self.comm,
+                    self.state,
+                    state_desc(self.state),
+                    self.pid,
+                    self.pid,
+                    self.ppid,
+                    self.tracer
                 )
                 .into_bytes()
             }
@@ -658,6 +666,8 @@ pub struct ProcData {
     pub pid: u32,
     /// Parent process id.
     pub ppid: u32,
+    /// The task tracing it, 0 for none.
+    pub tracer: u32,
     /// Real/effective/saved/filesystem uid (all reported equal, as a static
     /// sandbox has no reason to differ).
     pub uid: u32,
@@ -712,6 +722,7 @@ impl Default for ProcData {
             argv0: "busybox".to_string(),
             pid: 1,
             ppid: 0,
+            tracer: 0,
             uid: 0,
             gid: 0,
             owner: (0, 0),
@@ -760,6 +771,8 @@ pub struct ProcSelf {
     /// `self/status`'s id lines and security lines (see [`ProcData`]).
     pub status_ids: String,
     pub status_security: String,
+    /// The task tracing it, 0 for none.
+    pub tracer: u32,
     /// Open descriptors as `(fd number, symlink target)`, backing `self/fd/`.
     pub fds: Vec<(u32, String)>,
     /// The task's saved auxiliary vector (`self/auxv`).
@@ -830,6 +843,7 @@ impl ProcFs {
         d.owner = live.owner;
         d.status_ids = live.status_ids;
         d.status_security = live.status_security;
+        d.tracer = live.tracer;
         d.fds = live.fds;
         d.auxv = live.auxv;
         if live.arch.is_some() {
@@ -1009,6 +1023,7 @@ impl ProcFs {
                      Tgid:\t{pid}\n\
                      Pid:\t{pid}\n\
                      PPid:\t{ppid}\n\
+                     TracerPid:\t{tracer}\n\
                      {ids}\
                      Threads:\t{threads}\n\
                      VmSize:\t{vsize} kB\n\
@@ -1019,6 +1034,7 @@ impl ProcFs {
                     state_desc = state_desc(d.state),
                     pid = d.pid,
                     ppid = d.ppid,
+                    tracer = d.tracer,
                     threads = d.threads,
                     vsize = d.vm_size_kb,
                     rss = d.vm_rss_kb,
@@ -1293,6 +1309,7 @@ fn state_desc(state: char) -> &'static str {
         'D' => "disk sleep",
         'Z' => "zombie",
         'T' => "stopped",
+        't' => "tracing stop",
         _ => "unknown",
     }
 }
@@ -1819,6 +1836,7 @@ mod tests {
             argv0: "prog".to_string(),
             pid: 42,
             ppid: 7,
+            tracer: 0,
             uid: 1000,
             gid: 1000,
             owner: (1000, 1000),
@@ -1845,6 +1863,7 @@ mod tests {
         fs.data.tasks = vec![ProcTask {
             pid: 7,
             ppid: 1,
+            tracer: 0,
             comm: "worker".to_string(),
             cmdline: b"worker\0-x\0".to_vec(),
             state: 'S',
@@ -1965,6 +1984,7 @@ mod tests {
             owner: (0, 0),
             status_ids: String::new(),
             status_security: String::new(),
+            tracer: 0,
             fds: vec![(0, "/dev/null".to_string()), (3, "pipe:[9]".to_string())],
             auxv: vec![6, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0],
             arch: None,

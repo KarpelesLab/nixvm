@@ -402,6 +402,13 @@ CPUs, rather than pinning one host thread per guest thread.
   delivered, specifically to avoid deadlocking the scheduler. `getpgid`/
   `setpgid`/`getpgrp`/`setsid`/`getsid` **are now implemented** (per-process
   `pgid`/`sid` state), along with `waitid` and `clone3`.
+- ✅ `ptrace` between guest tasks (`src/kernel/ptrace.rs`), enough for `strace -f`:
+  `TRACEME`/`ATTACH`/`SEIZE`/`INTERRUPT`, syscall-entry/exit stops whose number,
+  arguments and result the tracer can rewrite (or skip the call), signal-delivery
+  stops, fork/vfork/clone/exec/exit events with auto-attach, `EXITKILL`, peek/poke,
+  `GETREGS`/`GETREGSET`/`GET_SYSCALL_INFO`, and seccomp's `RET_TRACE`. A tracee
+  stops itself and re-traps the syscall it was in when let go. Not there: single
+  stepping, hardware breakpoints and FPU registers — what a debugger needs.
 
 ### Phase 7 — /proc, /sys, /dev, and IO multiplexing  🟡 mostly done; no real pty
 

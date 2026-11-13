@@ -356,6 +356,17 @@ int main(int argc, char **argv) {
   /* (The conformance root holds the program at /ptrace.) */
   snprintf(self_path, sizeof self_path, "%s", access("/ptrace", X_OK) == 0 ? "/ptrace" : "/proc/self/exe");
   setvbuf(stdout, 0, _IONBF, 0);
+  /* As init (pid 1, as in the VM) every tracee's parent would be pid 1: run
+   * the cases one level down, where a parent pid means a real one. */
+  if (getpid() == 1) {
+    pid_t k = fork();
+    CHECK(k >= 0);
+    if (k) {
+      int st;
+      CHECK(waitpid(k, &st, 0) == k);
+      return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+    }
+  }
   test_exec();
   test_syscalls();
   test_peek_poke();

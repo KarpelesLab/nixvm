@@ -360,6 +360,8 @@ impl Kernel {
             // What wait returns is translated inside it: a reaped child no longer
             // has a number by the time this would see it.
             Sysno::Wait4 => map_arg!(target, 0),
+            // (`PTRACE_TRACEME` names no task.)
+            Sysno::Ptrace if args[0] != 0 => map_arg!(positive, 1),
             Sysno::Waitid => {
                 const P_PID: u64 = 1;
                 const P_PGID: u64 = 2;

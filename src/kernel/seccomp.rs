@@ -381,7 +381,8 @@ impl Kernel {
                 cx.cur.post_siginfo(SIGSYS, info);
                 Some(err(Errno::ENOSYS))
             }
-            SECCOMP_RET_TRACE | SECCOMP_RET_USER_NOTIF => Some(err(Errno::ENOSYS)),
+            SECCOMP_RET_TRACE => Self::seccomp_ret_trace(cx, value),
+            SECCOMP_RET_USER_NOTIF => Some(err(Errno::ENOSYS)),
             // KILL_PROCESS / KILL_THREAD (and anything unknown, which Linux
             // also treats as a kill).
             _ => {

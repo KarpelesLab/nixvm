@@ -49,6 +49,7 @@ mod poll;
 mod prctl;
 mod procx;
 mod ptimer;
+mod ptrace;
 mod pty;
 mod seccomp;
 mod signal;
@@ -571,6 +572,9 @@ struct ProcInfo {
     /// seccomp mode and filters (see [`seccomp`]); inherited by children,
     /// kept across `execve`.
     seccomp: seccomp::SeccompState,
+    /// Who traces this task and the stop it's in (see [`ptrace`]); `None` for
+    /// a task that isn't traced.
+    ptrace: Option<Box<ptrace::PtraceState>>,
 }
 
 /// The subset of `siginfo_t` a queued/sent signal carries beyond its number,
@@ -677,6 +681,7 @@ impl Default for ProcInfo {
             fs_base: 0,
             pr: prctl::PrctlState::default(),
             seccomp: seccomp::SeccompState::default(),
+            ptrace: None,
             creds: Creds::default(),
             sched_policy: 0, // SCHED_OTHER
             sched_priority: 0,
@@ -827,6 +832,9 @@ enum RunState {
     /// flips it back to `Running`. Reported to a `wait4(WUNTRACED)`/
     /// `waitid(WSTOPPED)` parent, then latched via `stop_reported`.
     Stopped(i32),
+    /// In a ptrace stop (see [`ptrace`]): off the CPU until its tracer lets
+    /// it go, whatever job control does meanwhile.
+    Traced,
     Zombie(ExitCause),
 }
 
@@ -1369,11 +1377,22 @@ fn run_slice_smp(
     let mut progressed = false;
     // A task killed while it waited for this worker (another thread's `execve`
     // took its process): it never runs again.
-    if kernel.shared.lock().unwrap().procs[i]
-        .as_ref()
-        .is_some_and(|p| matches!(p.info.run, RunState::Zombie(_)))
     {
-        return (i, vcpu, SliceOutcome::Ended);
+        let mut sh = kernel.shared.lock().unwrap();
+        if sh.procs[i]
+            .as_ref()
+            .is_some_and(|p| matches!(p.info.run, RunState::Zombie(_)))
+        {
+            return (i, vcpu, SliceOutcome::Ended);
+        }
+        // A tracer changed its registers while it was stopped in user mode.
+        if let Some(regs) = sh.procs[i]
+            .as_mut()
+            .and_then(|p| p.info.ptrace.as_mut())
+            .and_then(|t| t.take_user_regs())
+        {
+            ptrace::apply_user(kernel.arch, vcpu.as_mut(), &regs);
+        }
     }
     // The program its address space held when this task last ran; another
     // thread's `execve` changes it, and then this thread is gone.
@@ -1993,6 +2012,7 @@ impl Shared {
                 if !matches!(p.info.run, RunState::Zombie(_))
                     || p.info.in_flight
                     || p.vcpu.is_none()
+                    || p.info.exit_awaits_tracer()
                 {
                     return None;
                 }
@@ -2764,6 +2784,10 @@ impl Kernel {
             }) else {
                 return Ok(progressed);
             };
+            // A tracer changed its registers while it was stopped in user mode.
+            if let Some(regs) = cx.cur.ptrace.as_mut().and_then(|t| t.take_user_regs()) {
+                ptrace::apply_user(self.arch, vcpu.as_mut(), &regs);
+            }
             let mut guard = space_arc.lock().unwrap();
             cx.cur.cpu = 0;
             let cpu_before = cx.cur.cpu_ns;
@@ -3026,7 +3050,9 @@ impl Kernel {
                     // A stop signal took effect at this syscall's return (the task
                     // stopped itself, or was stopped while it ran): its slice ends
                     // here, and only `SIGCONT` makes it runnable again.
-                    if matches!(cx.cur.run, RunState::Stopped(_)) || cx.cur.held() {
+                    if matches!(cx.cur.run, RunState::Stopped(_) | RunState::Traced)
+                        || cx.cur.held()
+                    {
                         return Ok(true);
                     }
                     // `sched_yield`: the call succeeded but ends the slice so
@@ -3045,12 +3071,21 @@ impl Kernel {
                 }
                 // An interrupt ends the slice; so does a fault that left the
                 // task held (allocating past `memory.high`).
-                Serviced::Resume if is_interrupt || cx.cur.held() => return Ok(true),
+                Serviced::Resume
+                    if is_interrupt || cx.cur.held() || cx.cur.run == RunState::Traced =>
+                {
+                    return Ok(true);
+                }
                 Serviced::Resume => progressed = true,
                 // A write that moved data before blocking made progress, even
                 // though the call hasn't returned: counting it as none let a
                 // sweep that ran the reader first, then this, call it a deadlock.
-                Serviced::Blocked => return Ok(progressed || cx.cur.io_progress != io_before),
+                // So does stopping for a tracer, which has something to see.
+                Serviced::Blocked => {
+                    return Ok(progressed
+                        || cx.cur.io_progress != io_before
+                        || cx.cur.run == RunState::Traced);
+                }
                 Serviced::Ended => return Ok(true),
             }
             // Preemption: after a full quantum of syscalls, end the slice so a
@@ -3138,26 +3173,45 @@ impl Kernel {
     ) -> Serviced {
         match exit {
             Exit::Syscall => {
-                let raw = vcpu.syscall_nr();
-                let sys = arch::decode(self.arch, raw);
-                let args = vcpu.syscall_args();
-                cx.slice_syscalls = cx.slice_syscalls.saturating_add(1);
                 cx.block = false;
                 cx.exec_ok = false;
                 cx.restartable = true; // syscalls are restartable unless they opt out
                 cx.restart_syscall = false;
+                // A traced task: its tracer may stop it here, or already did
+                // and left a different syscall number, or a result to return
+                // instead of running the call (again).
+                let (mut raw, mut done) = (vcpu.syscall_nr(), None);
+                if cx.cur.ptrace.is_some() {
+                    match self.ptrace_syscall_enter(cx, vcpu, mem) {
+                        Ok((nr, result)) => {
+                            raw = nr.unwrap_or(raw);
+                            done = result;
+                        }
+                        Err(flow) => return flow,
+                    }
+                }
+                let sys = arch::decode(self.arch, raw);
+                let args = vcpu.syscall_args();
+                cx.slice_syscalls = cx.slice_syscalls.saturating_add(1);
                 // No lock is held here: `dispatch` acquires exactly the lock(s)
                 // each handler needs (sh before vfs). This is what lets other
                 // workers service their own syscalls concurrently (step B2).
                 // seccomp filters see every syscall before it runs.
                 // The embedder's policy comes first: nothing in the guest can
                 // change it.
-                let verdict = if self.policy.is_active()
+                let verdict = if done.is_some() {
+                    done
+                } else if self.policy.is_active()
                     && let Some(r) = self.policy_check(cx, raw, mem)
                 {
                     Some(r)
-                } else if cx.cur.seccomp.active() {
-                    self.seccomp_check(cx, sys, raw, &args, vcpu.pc(), mem)
+                } else if cx.cur.seccomp.active() && Self::ptrace_seccomp_pending(cx) {
+                    let v = self.seccomp_check(cx, sys, raw, &args, vcpu.pc(), mem);
+                    // `SECCOMP_RET_TRACE`: the tracer gets the call first.
+                    if self.ptrace_seccomp_stop(cx, vcpu) {
+                        return Serviced::Blocked;
+                    }
+                    v
                 } else {
                     None
                 };
@@ -3199,6 +3253,16 @@ impl Kernel {
                         cx.cur.futex_woken = false;
                         self.abandon_fifo_wait(cx);
                     }
+                }
+                // A traced task's tracer may stop it once more before the result
+                // goes back (an event, the syscall-exit stop, a signal), and may
+                // change the result.
+                if cx.cur.ptrace.is_some()
+                    && !cx.block
+                    && !matches!(cx.cur.run, RunState::Zombie(_))
+                    && let Some(flow) = self.ptrace_syscall_exit(cx, &mut ret, vcpu)
+                {
+                    return flow;
                 }
                 // Land the syscall's result in the vcpu *before* delivering any
                 // pending signal: if this syscall is interrupted by a handler
@@ -3255,8 +3319,15 @@ impl Kernel {
                 // a loop that makes no syscalls (an `alarm()`-bounded
                 // benchmark, Go's SIGURG preemption). Nothing is restarted
                 // here — clear the flag a previous syscall may have left.
-                if cx.cur.pending & !cx.cur.blocked != 0 && vcpu.async_signal_boundary() {
+                if (cx.cur.pending & !cx.cur.blocked != 0 || Self::ptrace_wants_boundary(&cx.cur))
+                    && vcpu.async_signal_boundary()
+                {
                     cx.restart_syscall = false;
+                    cx.block = false;
+                    // `PTRACE_INTERRUPT` of a task computing in user mode.
+                    if self.ptrace_interrupt_user(cx, vcpu) {
+                        return Serviced::Blocked;
+                    }
                     self.deliver_pending_signals(cx, vcpu, mem);
                     if mem.take_tlb_dirty() {
                         vcpu.flush_tlb();
@@ -3264,7 +3335,7 @@ impl Kernel {
                     if let RunState::Zombie(_) = cx.cur.run {
                         return Serviced::Ended;
                     }
-                    if let RunState::Stopped(_) = cx.cur.run {
+                    if matches!(cx.cur.run, RunState::Stopped(_) | RunState::Traced) {
                         return Serviced::Blocked;
                     }
                 }
@@ -3781,8 +3852,10 @@ impl Kernel {
             );
             let rt_lens: BTreeMap<u32, usize> =
                 cx.cur.rt_queue.iter().map(|(&s, q)| (s, q.len())).collect();
-            (proc, cx, pending, ppid, frozen, cpu, rt_lens)
+            let link = cx.cur.ptrace.as_ref().map(|t| t.link());
+            (proc, cx, pending, ppid, frozen, (cpu, link), rt_lens)
         };
+        let (out_cpu, out_link) = out_cpu;
         if cx.cur.alarm_deadline.is_some() || !cx.cur.ptimers.is_empty() {
             fire_timers_if_due(&mut cx.cur, poll::now_ns());
         }
@@ -3796,6 +3869,7 @@ impl Kernel {
         charge_vruntime(&mut cx.cur, delta);
         self.charge_cpu_time(&mut cx, delta);
         let stopped;
+        let traced = cx.cur.run == RunState::Traced;
         let mut killed = false;
         {
             let mut sh = self.shared.lock().unwrap();
@@ -3826,6 +3900,16 @@ impl Kernel {
                 }
                 if stand_in.info.frozen != out_frozen {
                     cx.cur.frozen = stand_in.info.frozen;
+                }
+                // A tracer attached, detached, set options or asked for a stop.
+                let link = stand_in.info.ptrace.as_ref().map(|t| t.link());
+                if link != out_link
+                    && let Some(link) = link
+                {
+                    cx.cur
+                        .ptrace
+                        .get_or_insert_with(|| stand_in.info.ptrace.clone().unwrap())
+                        .set_link(link);
                 }
                 // Its cgroup's `cpu` settings changed meanwhile.
                 if (
@@ -3878,15 +3962,20 @@ impl Kernel {
             // stand-in still read "running", so a parent whose `wait4` ran in
             // between parked on it and would otherwise wait for a stall retry.
             let ppid = matches!(cx.cur.run, RunState::Zombie(_)).then_some(cx.cur.ppid);
-            stopped = matches!(cx.cur.run, RunState::Stopped(_))
+            // Likewise its tracer, for a stop or an exit it has to hear of.
+            let tracer = match cx.cur.run {
+                RunState::Traced | RunState::Zombie(_) => Some(cx.cur.tracer()).filter(|&t| t != 0),
+                _ => None,
+            };
+            stopped = matches!(cx.cur.run, RunState::Stopped(_) | RunState::Traced)
                 || cx.cur.held()
                 || (self.rt_seen.load(std::sync::atomic::Ordering::Relaxed)
                     && sh.preempts(&cx.cur, self.ncpus));
             proc.info = cx.cur;
             sh.procs[i] = Some(proc);
-            if let Some(ppid) = ppid {
+            for waiter in [ppid, tracer].into_iter().flatten() {
                 for p in sh.procs.iter_mut().flatten() {
-                    if p.info.pid == ppid {
+                    if p.info.pid == waiter {
                         p.info.parked = false;
                     }
                 }
@@ -3909,6 +3998,9 @@ impl Kernel {
             // A fault that left the task held (past `memory.high`) ends it too.
             Serviced::Resume if stopped => SliceStep::Yielded,
             Serviced::Resume => SliceStep::Continue,
+            // Stopped for its tracer: off the CPU, but as progress (the tracer
+            // has something to see), so it's looked at again once let go.
+            Serviced::Blocked if traced => SliceStep::Yielded,
             Serviced::Blocked => SliceStep::Blocked,
             Serviced::Ended => SliceStep::Ended,
         }
@@ -4817,9 +4909,9 @@ impl Kernel {
             Sysno::ClockNanosleep => {
                 self.sys_nanosleep(cx, args[0], args[1], args[2], args[3], mem)
             }
-            // The guest does not own the host clock: refuse to set it. ptrace
-            // is refused too (no debugging surface).
-            Sysno::Settimeofday | Sysno::ClockSettime | Sysno::Ptrace => err(Errno::EPERM),
+            // The guest does not own the host clock: refuse to set it.
+            Sysno::Settimeofday | Sysno::ClockSettime => err(Errno::EPERM),
+            Sysno::Ptrace => self.sys_ptrace(sh, cx, args, mem),
             // Closing the last descriptor of an unlinked file deletes it.
             // Closing a descriptor drops the locks it carried, and closing the
             // last descriptor of an unlinked file deletes it.
@@ -5385,9 +5477,9 @@ impl Kernel {
         // CLONE_FS shares the filesystem context (cwd); CLONE_THREAD implies it,
         // and every pthread sets it, so a `chdir` in one thread is seen by all.
         let share_fs = flags & CLONE_FS != 0;
-        // CLONE_SYSVSEM, CLONE_IO, CLONE_PTRACE, CLONE_UNTRACED and CLONE_DETACHED
-        // need no code here: there's a single SysV semaphore-undo context and IO
-        // context, and no ptrace.
+        // CLONE_SYSVSEM, CLONE_IO and CLONE_DETACHED need no code here: there's
+        // a single SysV semaphore-undo context and IO context. CLONE_PTRACE and
+        // CLONE_UNTRACED are `ptrace_clone`'s, below.
 
         let pid = sh.alloc_pid();
         // The ids the guest sees: the parent's view and the child's differ when the
@@ -5678,6 +5770,19 @@ impl Kernel {
             info.fs_base = tls;
         }
         child_vcpu.set_syscall_ret(0); // child returns 0 and advances past the svc
+        // A traced caller's child may start traced, in a stop of its own; the
+        // caller then reports the event once the call is done.
+        info.ptrace = None;
+        if cx.cur.ptrace.is_some() {
+            self.ptrace_clone(
+                sh,
+                &mut cx.cur,
+                &mut info,
+                flags,
+                ca.exit_signal,
+                child_vcpu.as_mut(),
+            );
+        }
         // A copy-on-write fork (`mem.fork()`) downgraded *this* (parent) address
         // space's pages to read-only behind the running parent vcpu's back. Flush
         // its TLB so the parent's next store faults into `cow_fault` instead of
@@ -5932,6 +6037,7 @@ impl Kernel {
         cx.cur.exe = abs.to_string();
         // The process's other threads end here, and this one becomes the
         // process (Linux's `de_thread`).
+        let old_tid = cx.cur.pid;
         Self::de_thread(sh, cx);
         self.exec_credentials(vfs, cx, abs);
         // execve resets every *caught* signal handler to SIG_DFL — the handler
@@ -5999,6 +6105,9 @@ impl Kernel {
         let mm = cx.cur.mm;
         sh.mmap_areas[mm] = Arena::new(top, mid);
         cx.exec_ok = true;
+        if let Some(t) = cx.cur.ptrace.as_mut() {
+            t.execed = Some(old_tid);
+        }
         Some(0)
     }
 
@@ -6063,12 +6172,7 @@ impl Kernel {
         const WCONTINUED: u64 = 8; // also report a child that was continued
         let cur = cx.cur.pid;
         let cur_pgid = pgid_of(&cx.cur);
-        // Threads (CLONE_THREAD) are not reaped by wait4; only child processes
-        // matching the `pid` filter.
-        let wanted = |p: &ProcInfo| -> bool {
-            if p.ppid != cur || p.is_thread {
-                return false;
-            }
+        let matches_pid = |p: &ProcInfo| -> bool {
             match pid {
                 p_ if p_ > 0 => i64::from(p.pid) == pid,
                 -1 => true,
@@ -6076,6 +6180,9 @@ impl Kernel {
                 _ => i64::from(pgid_of(p)) == -pid, // pid < -1: group -pid
             }
         };
+        // Threads (CLONE_THREAD) are not reaped by wait4; only child processes
+        // matching the `pid` filter.
+        let wanted = |p: &ProcInfo| -> bool { p.ppid == cur && !p.is_thread && matches_pid(p) };
         let mut zombie = None;
         let mut stopped = None; // (pid, stop signal) — an unreported stop
         let mut continued = None; // pid of a continued child
@@ -6087,8 +6194,13 @@ impl Kernel {
                     // A task still finishing its exit on another CPU (its
                     // stand-in marked by `exit_group`) isn't reapable yet:
                     // reaping it frees its slot, which its check-in would then
-                    // take back from whatever was forked into it.
-                    RunState::Zombie(code) if zombie.is_none() && !p.info.in_flight => {
+                    // take back from whatever was forked into it. Nor is one
+                    // whose tracer hasn't yet heard of its exit.
+                    RunState::Zombie(code)
+                        if zombie.is_none()
+                            && !p.info.in_flight
+                            && (p.info.tracer() == 0 || p.info.tracer() == cur) =>
+                    {
                         zombie = Some((p.info.pid, code, p.info.cpu_ns));
                     }
                     RunState::Stopped(sig) if !p.info.stop_reported && stopped.is_none() => {
@@ -6114,6 +6226,22 @@ impl Kernel {
             // Before it's gone: a removed task no longer has a number.
             let visible = self.visible_pid(cx, child);
             sh.remove_task(child, cx);
+            return i64::from(visible);
+        }
+        // A tracer hears of its tracees' stops (whatever the options) and of
+        // the exits of those that aren't its own children.
+        let (traced, report) = Self::ptrace_wait_scan(sh, cur, matches_pid);
+        has_child |= traced;
+        if let Some(r) = report {
+            let (child, status) = match r {
+                ptrace::TraceReport::Stop(p, st) => (p, st),
+                ptrace::TraceReport::Exit(p, cause) => (p, cause.wait_status()),
+            };
+            if wstatus != 0 {
+                let _ = mem.write(wstatus, &status.to_le_bytes());
+            }
+            let visible = self.visible_pid(cx, child);
+            self.ptrace_consume(sh, cx, &r);
             return i64::from(visible);
         }
         // WUNTRACED: report a stopped child (WIFSTOPPED | WSTOPSIG<<8), latching
@@ -6188,6 +6316,7 @@ impl Kernel {
         const WLINUX: u64 = 0xe000_0000;
         const SIGCHLD: i32 = 17;
         const SIGCONT: i32 = 18;
+        const CLD_TRAPPED: i32 = 4;
         const CLD_STOPPED: i32 = 5;
         const CLD_CONTINUED: i32 = 6;
         if options & !(WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | WLINUX) != 0
@@ -6221,9 +6350,13 @@ impl Kernel {
             if p.info.ppid == cur && !p.info.is_thread && matches_id(&p.info) {
                 has_child = true;
                 match p.info.run {
-                    // (Not one still finishing its exit on another CPU: see wait4.)
+                    // (Not one still finishing its exit on another CPU, nor one
+                    // whose tracer hasn't heard of it yet: see wait4.)
                     RunState::Zombie(code)
-                        if zombie.is_none() && options & WEXITED != 0 && !p.info.in_flight =>
+                        if zombie.is_none()
+                            && options & WEXITED != 0
+                            && !p.info.in_flight
+                            && (p.info.tracer() == 0 || p.info.tracer() == cur) =>
                     {
                         zombie = Some((p.info.pid, code, p.info.cpu_ns));
                     }
@@ -6271,6 +6404,26 @@ impl Kernel {
             if options & WNOWAIT == 0 {
                 cx.cur.child_cpu_ns = cx.cur.child_cpu_ns.saturating_add(child_cpu);
                 sh.remove_task(child, cx);
+            }
+            return 0;
+        }
+        // A tracer's tracees: their ptrace stops (CLD_TRAPPED, whatever the
+        // options) and the exits of those that aren't its children.
+        let (traced, report) = Self::ptrace_wait_scan(sh, cur, matches_id);
+        has_child |= traced;
+        let report =
+            report.filter(|r| options & WEXITED != 0 || matches!(r, ptrace::TraceReport::Stop(..)));
+        if let Some(r) = report {
+            match r {
+                ptrace::TraceReport::Stop(child, status) => {
+                    write_child_si(mem, CLD_TRAPPED, child, (status >> 8) as i32);
+                }
+                ptrace::TraceReport::Exit(child, code) => {
+                    write_child_si(mem, code.si_code(), child, code.si_status());
+                }
+            }
+            if options & WNOWAIT == 0 {
+                self.ptrace_consume(sh, cx, &r);
             }
             return 0;
         }
@@ -6786,9 +6939,18 @@ impl Kernel {
             uid: cx.cur.creds.ruid,
             value: u64::from(cld_status as u32),
         };
+        // A tracer that isn't the parent hears of the exit first; the parent
+        // gets its signal, and can reap, once the tracer has.
+        let tracer = cx.cur.tracer();
+        let tracer_first = tracer != 0 && tracer != ppid;
+        if tracer_first {
+            Self::notify_tracer(sh, &cx.cur, tracer, cld_code, cld_status);
+        }
+        // What this task traced is let go, or killed (`PTRACE_O_EXITKILL`).
+        self.ptrace_tracer_exit(sh, me);
         for slot in sh.procs.iter_mut().flatten() {
             if slot.info.pid == ppid {
-                if (1..=64).contains(&exit_sig) {
+                if (1..=64).contains(&exit_sig) && !tracer_first {
                     let info = self.seen_by(slot.info.ns.pid, chld_info);
                     slot.info.raise_with(exit_sig, info);
                 }
@@ -6871,6 +7033,7 @@ impl Kernel {
         // Their `info.fds` are placeholders — the real tables live in
         // `file_tables` (each shared table drained once, below).
         let mut files_ids: Vec<usize> = Vec::new();
+        let mut tracers = Vec::new();
         for slot in &mut sh.procs {
             let Some(p) = slot.as_mut() else { continue };
             if p.info.tgid != tgid || matches!(p.info.run, RunState::Zombie(_)) {
@@ -6880,6 +7043,17 @@ impl Kernel {
                 files_ids.push(p.info.files);
             }
             p.info.run = RunState::Zombie(cause);
+            if p.info.tracer() != 0 {
+                tracers.push(p.info.tracer());
+            }
+        }
+        // Their tracers have exits to hear of.
+        for t in tracers {
+            for p in sh.procs.iter_mut().flatten() {
+                if p.info.pid == t {
+                    p.info.parked = false;
+                }
+            }
         }
         // Close each distinct table's fds (`bump_pipe` briefly takes `pipes`
         // for a pipe fd or `net` for a socket fd — after `sh`, which this holds
