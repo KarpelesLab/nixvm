@@ -246,6 +246,11 @@ impl Kernel {
         self.pids.lock().unwrap().to_global(local, cx.cur.ns.pid)
     }
 
+    /// Whether the current task is the init of a PID namespace below the VM's.
+    pub(super) fn is_namespace_init(&self, cx: &ServiceCtx) -> bool {
+        cx.cur.ns.pid != 0 && self.pids.lock().unwrap().init_of(cx.cur.ns.pid) == Some(cx.cur.tgid)
+    }
+
     /// Whether a signal may reach `target`: a namespace's init is shielded from
     /// signals it hasn't installed a handler for or blocked. Only `SIGKILL` and
     /// `SIGSTOP` from an outer namespace get through regardless.

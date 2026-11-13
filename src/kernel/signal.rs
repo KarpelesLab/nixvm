@@ -875,6 +875,18 @@ impl Kernel {
         vcpu: &mut dyn crate::vcpu::Vcpu,
         mem: &mut GuestMemory,
     ) -> Option<bool> {
+        // A PID namespace's init takes no default action but SIGKILL's and
+        // SIGSTOP's, whenever the signal was sent: one queued while it was
+        // blocked (as around `fork`, which blocks everything) is dropped now,
+        // as Linux's `get_signal` does for `SIGNAL_UNKILLABLE`.
+        if sig != SIGKILL
+            && sig != SIGSTOP
+            && cx.cur.handlers.get(sig as usize).handler == SIG_DFL
+            && self.is_namespace_init(cx)
+        {
+            cx.cur.drain_rt(sig);
+            return None;
+        }
         // Job-control stop: SIGSTOP always stops (uncatchable), and the
         // other stop signals stop only at their default disposition. A
         // caught stop signal falls through to run its handler; SIG_IGN

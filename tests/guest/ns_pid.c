@@ -49,6 +49,11 @@ static int init_main(int outer_pid) {
   CHECK(!kill(1, SIGKILL), "SIGKILL to self from inside"); usleep(5000); puts("ok  : and SIGKILL"); fflush(stdout);
   struct sigaction sa = {0}; sa.sa_handler = on_usr1; sigaction(SIGUSR1, &sa, 0); kill(1, SIGUSR1); usleep(5000); CHECK(usr1, "but a handled signal gets through");
   c = fork(); if (!c) { kill(1, SIGUSR1); kill(1, SIGTERM); _exit(0); } status_of(c); puts("ok  : a child can't kill init either"); fflush(stdout);
+  /* Sent while blocked (as around a fork), a signal is queued; unblocked, init still takes no default action. */
+  { sigset_t m, old; sigemptyset(&m); sigaddset(&m, SIGTERM); sigaddset(&m, SIGHUP); sigprocmask(SIG_BLOCK, &m, &old);
+    c = fork(); if (!c) { kill(1, SIGTERM); kill(1, SIGHUP); _exit(0); } status_of(c);
+    sigset_t pend; sigpending(&pend); CHECK(sigismember(&pend, SIGTERM), "a blocked SIGTERM is queued for init");
+    sigprocmask(SIG_SETMASK, &old, 0); usleep(5000); puts("ok  : and dropped once unblocked"); fflush(stdout); }
   /* Orphans go to this init. */
   int p[2]; pipe(p); c = fork(); if (!c) { pid_t g = fork(); if (!g) { char x; close(p[1]); read(p[0], &x, 1); _exit(getppid() == 1 ? 21 : 22); } _exit(0); } status_of(c); close(p[1]); close(p[0]);
   pid_t any; int got = 0; for (int i = 0; i < 50 && !got; i++) { any = waitpid(-1, &st, WNOHANG); if (any > 0) got = WEXITSTATUS(st); else usleep(10000); } CHECK(got == 21, "an orphan reparents to this namespace's init (%d)", got);
