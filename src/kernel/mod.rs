@@ -1789,6 +1789,10 @@ pub struct Kernel {
     /// while acquiring `shared` or `vfs`.** Handlers that need net plus others
     /// acquire in order sh → vfs → net.
     net: Mutex<Net>,
+    /// Ticks on every socket event ([`Net::note_event`]); shared with `net`
+    /// and read without its lock. The serial scheduler unparks its waiters
+    /// when it moves (see [`Shared::io_seen`]).
+    io_events: Arc<std::sync::atomic::AtomicU64>,
     /// The pipe subsystem (`pipes`), peeled out of the coarse [`Shared`] lock
     /// onto its own sibling lock (step B4) so a pipe read/write holds only this
     /// lock and other tasks' non-pipe syscalls run concurrently on `shared`
@@ -1915,6 +1919,13 @@ pub(super) struct Shared {
     /// When the serial scheduler last had every parked task re-check its
     /// wait (see [`Shared::pick_serial_runnable`]).
     rechecked_at: u128,
+    /// [`Kernel::io_events`] when the serial scheduler last unparked its
+    /// waiters for it. A socket event wakes the tasks parked on one right
+    /// away, as Linux's wakeups do, instead of at the next periodic re-check:
+    /// Xvfb, parked in `epoll_wait` while the shell started its next client,
+    /// saw one client's hangup and the next one's connection in one batch,
+    /// began the reset for its last client leaving, and dropped the new one.
+    io_seen: u64,
     /// The last places handed out at the back and the front of the real-time
     /// queues (see [`ProcInfo::rt_seq`]).
     rt_tail: i64,
@@ -2446,6 +2457,8 @@ impl Kernel {
             .cgroup_tree()
             .unwrap_or_else(crate::fs::CgroupTree::shared);
         let cpu_quotas = cgroups.lock().unwrap().quota_gate();
+        let net = Net::default();
+        let io_events = net.io_events();
         Self {
             pids: pids.clone(),
             users: users.clone(),
@@ -2485,7 +2498,8 @@ impl Kernel {
             interactive: false,
             host_tty: false,
             vfs: Mutex::new(mounts),
-            net: Mutex::new(Net::default()),
+            net: Mutex::new(net),
+            io_events,
             pipes: Mutex::new(Vec::new()),
             pollfds: Mutex::new(PollFds::default()),
             ptys: Mutex::new(pty::Ptys::default()),
@@ -2512,6 +2526,7 @@ impl Kernel {
                 free_cwd_slots: Vec::new(),
                 min_vruntime: 0,
                 rechecked_at: 0,
+                io_seen: 0,
                 rt_tail: 0,
                 rt_head: 0,
                 rt_windows: Vec::new(),
@@ -2831,7 +2846,12 @@ impl Kernel {
             // fd table into `cx`), releasing `sh` before running the slice so the
             // slice's syscalls can take their own per-handler locks.
             let Some((i, mut proc, mut vcpu, space_arc, mut cx)) = ({
+                let io = self.io_events.load(std::sync::atomic::Ordering::Relaxed);
                 let mut sh = self.shared.lock().unwrap();
+                if io != sh.io_seen {
+                    sh.io_seen = io;
+                    sh.unpark_all();
+                }
                 self.rebalance_cpu_weights(&mut sh);
                 sh.pick_serial_runnable().map(|i| {
                     let mut proc = sh.procs[i].take().unwrap();

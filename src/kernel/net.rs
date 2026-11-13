@@ -84,13 +84,47 @@ impl Net {
             return;
         };
         s.edge_seq += 1;
-        if let Kind::Dgram(Dgram {
-            pair_peer: Some(p), ..
-        }) = s.kind
+        let peer = match s.kind {
+            Kind::Dgram(Dgram {
+                pair_peer: Some(p), ..
+            }) => Some(p),
+            _ => None,
+        };
+        self.note_event(sock);
+        if let Some(p) = peer
             && let Some(t) = self.socks.get_mut(p)
         {
             t.edge_seq += 1;
+            self.note_event(p);
         }
+    }
+
+    /// The counter [`Net::note_event`] ticks, for the scheduler to watch.
+    pub(super) fn io_events(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::clone(&self.io_events)
+    }
+
+    /// Advance the event clock and return its new value.
+    pub(super) fn tick(&mut self) -> u64 {
+        self.event_clock += 1;
+        self.event_clock
+    }
+
+    /// Something that can change `sock`'s readiness just happened to it: data
+    /// arrived, an end closed or shut down, a connection was queued on it.
+    /// Stamped with the event clock ([`Sock::last_event`]).
+    pub(super) fn note_event(&mut self, sock: usize) {
+        self.io_events
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = self.tick();
+        if let Some(s) = self.socks.get_mut(sock) {
+            s.last_event = now;
+        }
+    }
+
+    /// When `sock` last had an event ([`Sock::last_event`]), 0 if gone.
+    pub(super) fn last_event(&self, sock: usize) -> u64 {
+        self.socks.get(sock).map_or(0, |s| s.last_event)
     }
 
     /// The socket's edge-trigger sequence ([`Sock::edge_seq`]), 0 if gone.
@@ -414,6 +448,13 @@ pub(super) struct Net {
     /// Network namespaces whose `lo` has been set up or down. Unlisted, `lo` is
     /// up in the VM's first namespace and down in a new one, as on Linux.
     lo_state: BTreeMap<u32, bool>,
+    /// Ticks once per socket event (see [`Sock::last_event`]) and per epoll
+    /// report, so `epoll_wait` can hand back ready fds in the order they
+    /// became ready, as Linux's ready list does.
+    event_clock: u64,
+    /// Counts socket events for the scheduler, readable without this lock
+    /// (see [`Kernel::io_events`](super::Kernel)).
+    io_events: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for Net {
@@ -427,6 +468,8 @@ impl std::fmt::Debug for Net {
             .field("egress", &self.egress.is_some())
             .field("ping_ident", &self.ping_ident)
             .field("lo_state", &self.lo_state)
+            .field("event_clock", &self.event_clock)
+            .field("io_events", &self.io_events)
             .finish()
     }
 }
@@ -458,6 +501,12 @@ struct Sock {
     /// mask alone stays `POLLIN|POLLOUT` across a read and a new arrival, so
     /// that edge would be lost and the waiter would sleep forever.
     edge_seq: u64,
+    /// The event clock ([`Net::note_event`]) at this socket's latest event.
+    /// `epoll_wait` reports ready fds oldest event first: Linux queues an fd
+    /// on the ready list when it becomes ready, and Xvfb depends on that
+    /// order — handed a new connection before an older client's hangup in
+    /// the same batch, it closed the new client along with the old one.
+    last_event: u64,
 }
 
 /// The mutable `setsockopt`-controlled state of a socket, plus `SO_ERROR`.
@@ -1026,8 +1075,12 @@ impl Net {
             *n += 1;
         } else {
             *n = n.saturating_sub(1);
+            let gone = *n == 0;
             if s.refs == 0 && !matches!(s.kind, Kind::Pair(_)) {
                 self.release(sock);
+            } else if gone {
+                // The peer of a closed pair end now sees a hangup.
+                self.note_event(sock);
             }
         }
     }
@@ -1440,6 +1493,7 @@ impl Kernel {
                 opts: SockOpts::default(),
                 refs: 1,
                 edge_seq: 0,
+                last_event: 0,
             });
             let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
             cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
@@ -1491,6 +1545,7 @@ impl Kernel {
                 opts: SockOpts::default(),
                 refs: 1,
                 edge_seq: 0,
+                last_event: 0,
             });
             let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
             cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
@@ -1516,6 +1571,7 @@ impl Kernel {
             opts: SockOpts::default(),
             refs: 1,
             edge_seq: 0,
+            last_event: 0,
         });
         let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
         cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
@@ -1564,6 +1620,7 @@ impl Kernel {
                     opts: SockOpts::default(),
                     refs: 1,
                     edge_seq: 0,
+                    last_event: 0,
                 });
             }
             (a, b, 0, 0)
@@ -1584,6 +1641,7 @@ impl Kernel {
                 opts: SockOpts::default(),
                 refs: 1,
                 edge_seq: 0,
+                last_event: 0,
             });
             (idx, idx, 0, 1)
         };
@@ -1939,6 +1997,7 @@ impl Kernel {
         if let Kind::Listener { backlog, .. } = &mut net.socks[lidx].kind {
             backlog.push_back(sock);
         }
+        net.note_event(lidx);
         // A nonblocking TCP connect can't report success synchronously: real
         // Linux returns EINPROGRESS and the socket becomes writable (POLLOUT)
         // with SO_ERROR==0 once the handshake finishes. This virtual pair is
@@ -2186,6 +2245,7 @@ impl Kernel {
                     }
                     _ => return err(Errno::EINVAL),
                 }
+                net.note_event(sock);
                 0
             }
             Kind::Host(h) => {

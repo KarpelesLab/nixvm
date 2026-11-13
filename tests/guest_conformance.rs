@@ -34,6 +34,7 @@ const PROGRAMS: &[&str] = &[
     "madvise",
     "execthread",
     "epoll_et",
+    "epoll_order",
     "userns_caps",
     "sandbox_fs",
     "ptrace",

@@ -114,6 +114,11 @@ struct EpollWatch {
     /// `EPOLLONESHOT`: once an event is reported the watch is disabled until
     /// re-armed by `EPOLL_CTL_MOD`, so a fd is handed to exactly one waiter.
     disarmed: bool,
+    /// The socket event clock ([`super::net::Net::tick`]) when this watch was
+    /// last reported. With the socket's own latest event it orders a scan's
+    /// results: an fd goes to the back of the line once reported, as Linux
+    /// moves a level-triggered fd to the tail of its ready list.
+    reported: u64,
     /// The process (tgid) whose fd table the watched number belongs to. A
     /// forked child inherits the epoll fd, but closing *its* copy of a watched
     /// fd must not drop the parent's registration (Linux keeps it while any
@@ -753,6 +758,7 @@ impl Kernel {
                         data,
                         last_level: 0,
                         disarmed: false,
+                        reported: 0,
                         owner: cx.cur.tgid,
                     },
                 );
@@ -772,6 +778,7 @@ impl Kernel {
                         data,
                         last_level: 0,
                         disarmed: false,
+                        reported: 0,
                         owner: cx.cur.tgid,
                     },
                 );
@@ -828,7 +835,7 @@ impl Kernel {
         // `fd_ready` needs `&mut pf` (it advances timerfds), so it can't run while
         // an `&mut` into the same `pf.epolls[idx].interest` is held for the
         // edge-trigger bookkeeping below.
-        let mut computed: Vec<(i32, EpollWatch, u32, u64)> = Vec::with_capacity(watches.len());
+        let mut computed: Vec<(i32, EpollWatch, u32, u64, u64)> = Vec::with_capacity(watches.len());
         for (fd, w) in watches {
             let ready =
                 self.fd_ready(&mut net, &pipes, &mut pf, cx, fd) & (w.events | POLLERR | POLLHUP);
@@ -847,9 +854,20 @@ impl Kernel {
                 }
                 _ => u64::from(ready),
             };
-            computed.push((fd, w, ready, level));
+            // Ready-list position: when the fd last had an event, or was last
+            // reported if that is later. Only sockets carry event stamps;
+            // other fds keep fd order among themselves.
+            let since = match cx.cur.fds.get(fd) {
+                Some(Fd::Socket { sock, .. }) => net.last_event(*sock),
+                _ => 0,
+            }
+            .max(w.reported);
+            computed.push((fd, w, ready, level, since));
         }
-        for (fd, w, ready, level) in computed {
+        // Oldest first, as Linux's FIFO ready list hands them out (stable, so
+        // ties keep fd order).
+        computed.sort_by_key(|c| c.4);
+        for (fd, w, ready, level, _) in computed {
             if n >= maxevents {
                 break;
             }
@@ -875,6 +893,10 @@ impl Kernel {
                 return err(Errno::EFAULT);
             }
             n += 1;
+            let now = net.tick();
+            if let Some(e) = pf.epolls[idx].interest.get_mut(&fd) {
+                e.reported = now;
+            }
             // EPOLLONESHOT: disable the watch until EPOLL_CTL_MOD re-arms it.
             if w.events & EPOLLONESHOT != 0
                 && let Some(e) = pf.epolls[idx].interest.get_mut(&fd)
