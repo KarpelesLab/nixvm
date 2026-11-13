@@ -279,6 +279,7 @@ impl Kernel {
                 Err(e) => return io_errno(&e),
             },
         };
+        self.own_new_node(vfs, cx, &hidden);
         self.orphans.lock().unwrap().insert(hidden.clone());
         let fd = cx.cur.fds.alloc(Fd::File {
             path: hidden,

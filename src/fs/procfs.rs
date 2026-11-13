@@ -152,6 +152,8 @@ const PATHS: &[&str] = &[
     "zoneinfo",
     "buddyinfo",
     "consoles",
+    "self/task",
+    "thread-self",
 ];
 
 /// Static top-level file names, in `readdir("")` order.
@@ -316,6 +318,7 @@ const NS_FILES: &[&str] = &[
 /// and `cwd` are symlinks, `fd` is a directory, the rest are files.
 const SELF_FILES: &[&str] = &[
     "ns",
+    "task",
     "timens_offsets",
     "cmdline",
     "status",
@@ -725,6 +728,10 @@ pub struct ProcData {
     pub state: char,
     /// Thread count.
     pub threads: u32,
+    /// The reader's thread id, and every thread of its process, as it numbers
+    /// them: `self/task/` and `thread-self`. Empty until the kernel has said.
+    pub tid: u32,
+    pub tids: Vec<u32>,
     /// Resident + virtual memory footprint, in kB, for `status`/`stat`.
     pub vm_size_kb: u64,
     pub vm_rss_kb: u64,
@@ -775,6 +782,8 @@ impl Default for ProcData {
             status_security: String::new(),
             state: 'R',
             threads: 1,
+            tid: 0,
+            tids: Vec::new(),
             vm_size_kb: 4096,
             vm_rss_kb: 1024,
             fds: Vec::new(),
@@ -815,6 +824,9 @@ pub struct ProcSelf {
     pub ppid: u32,
     /// The reader's effective ids as the VM sees them, which own `self/`.
     pub owner: (u32, u32),
+    /// The reader's thread id and its process's threads (see [`ProcData`]).
+    pub tid: u32,
+    pub tids: Vec<u32>,
     /// `self/status`'s id lines and security lines (see [`ProcData`]).
     pub status_ids: String,
     pub status_security: String,
@@ -892,6 +904,11 @@ impl ProcFs {
         d.pid = live.pid;
         d.ppid = live.ppid;
         d.owner = live.owner;
+        d.tid = live.tid;
+        if !live.tids.is_empty() {
+            d.threads = live.tids.len() as u32;
+        }
+        d.tids = live.tids;
         d.status_ids = live.status_ids;
         d.status_security = live.status_security;
         d.tracer = live.tracer;
@@ -962,6 +979,26 @@ impl ProcFs {
     }
 
     fn normalize(&self, rel: &str) -> String {
+        let rel = self.normalize_pid(rel);
+        // A thread's own directory shows what the process's does.
+        if let Some(rest) = rel.strip_prefix("self/task/") {
+            let (tid, tail) = rest.split_once('/').unwrap_or((rest, ""));
+            if tid
+                .parse::<u32>()
+                .is_ok_and(|t| self.data.tids.contains(&t))
+            {
+                return if tail.is_empty() {
+                    "self".to_string()
+                } else {
+                    format!("self/{tail}")
+                };
+            }
+        }
+        rel
+    }
+
+    /// `rel` with the reader's own `<pid>` spelled `self`.
+    fn normalize_pid(&self, rel: &str) -> String {
         if self.data.pid != 0 {
             let pid_s = self.data.pid.to_string();
             if rel == pid_s {
@@ -1557,6 +1594,7 @@ fn is_dir(rel: &str) -> bool {
         "" | "self"
             | "self/fd"
             | "self/ns"
+            | "self/task"
             | "sys"
             | "sys/kernel"
             | "sys/kernel/random"
@@ -1674,6 +1712,8 @@ impl MountFs for ProcFs {
             )
         } else if rel == "self/root" {
             (NodeKind::Symlink, S_IFLNK | 0o777, ROOT_TARGET.len() as u64)
+        } else if rel == "thread-self" {
+            (NodeKind::Symlink, S_IFLNK | 0o777, 0)
         } else if rel
             .strip_prefix("self/ns/")
             .is_some_and(|n| NS_FILES.contains(&n))
@@ -1690,6 +1730,13 @@ impl MountFs for ProcFs {
         } else {
             (0, 0)
         };
+        // A directory's links are `.`, `..` and its subdirectories: a process's
+        // `task/` has one per thread, which is how a program counts them.
+        let nlink = if rel == "self/task" {
+            2 + self.data.tids.len().max(1) as u32
+        } else {
+            1
+        };
         Some(Attrs {
             kind,
             size,
@@ -1699,7 +1746,7 @@ impl MountFs for ProcFs {
             atime: 0,
             mtime: 0,
             inode,
-            nlink: 1,
+            nlink,
             rdev: 0,
             dev: 0,
         })
@@ -1777,13 +1824,28 @@ impl MountFs for ProcFs {
                 out.push(entry("net", "net", NodeKind::Dir));
                 Ok(out)
             }
+            "self/task" => {
+                let tids = if self.data.tids.is_empty() {
+                    vec![self.data.pid]
+                } else {
+                    self.data.tids.clone()
+                };
+                Ok(tids
+                    .into_iter()
+                    .map(|t| DirEntry {
+                        name: t.to_string(),
+                        kind: NodeKind::Dir,
+                        inode: task_inode(t, 7),
+                    })
+                    .collect())
+            }
             "self" => Ok(SELF_FILES
                 .iter()
                 .map(|n| {
                     let path = format!("self/{n}");
                     let kind = match *n {
                         "exe" | "cwd" | "root" => NodeKind::Symlink,
-                        "fd" | "ns" => NodeKind::Dir,
+                        "fd" | "ns" | "task" => NodeKind::Dir,
                         _ => NodeKind::File,
                     };
                     entry(n, &path, kind)
@@ -1847,6 +1909,14 @@ impl MountFs for ProcFs {
         if rel == "self/root" {
             return Ok(ROOT_TARGET.to_string());
         }
+        if rel == "thread-self" {
+            let tid = if self.data.tid == 0 {
+                self.data.pid
+            } else {
+                self.data.tid
+            };
+            return Ok(format!("{}/task/{tid}", self.data.pid));
+        }
         if let Some(n) = rel
             .strip_prefix("self/fd/")
             .and_then(|s| s.parse::<u32>().ok())
@@ -1906,6 +1976,8 @@ mod tests {
             uid: 1000,
             gid: 1000,
             owner: (1000, 1000),
+            tid: 0,
+            tids: Vec::new(),
             status_ids: String::new(),
             status_security: String::new(),
             state: 'R',
@@ -2052,6 +2124,8 @@ mod tests {
             pid: 7,
             ppid: 3,
             owner: (0, 0),
+            tid: 7,
+            tids: vec![7],
             status_ids: String::new(),
             status_security: String::new(),
             tracer: 0,

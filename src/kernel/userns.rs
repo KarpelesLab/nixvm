@@ -151,6 +151,34 @@ impl UserNamespaces {
         self.owners.get(&ns).copied().unwrap_or(0)
     }
 
+    /// Whether global uid `root` is uid 0 in `ns` or one of its ancestors: where a
+    /// namespaced file capability counts.
+    pub(super) fn is_root_here_or_above(&self, ns: u32, root: u32) -> bool {
+        self.chain(ns)
+            .into_iter()
+            .chain([0])
+            .any(|level| self.seen_from_global(level, IdKind::Uid, root) == 0)
+    }
+
+    /// An id of a task in `ns` as the VM sees it. A task whose id isn't mapped
+    /// there yet is still who created the namespace, as Linux keeps its kuid:
+    /// `newuidmap` checks that the process it maps is its caller's.
+    pub(super) fn kernel_id(&self, ns: u32, kind: IdKind, id: u32) -> u32 {
+        if let Some(global) = self.to_global(ns, kind, id) {
+            return global;
+        }
+        match self.table.get(&ns) {
+            Some(n) if id == OVERFLOW_ID => {
+                let creator = match kind {
+                    IdKind::Uid => n.creator_uid,
+                    IdKind::Gid => n.creator_gid,
+                };
+                self.kernel_id(n.parent, kind, creator)
+            }
+            _ => OVERFLOW_ID,
+        }
+    }
+
     /// The parent of user namespace `ns` and its owner, the euid that created it
     /// as the parent sees it. `None` for the initial namespace.
     pub(super) fn parent_and_owner(&self, ns: u32) -> Option<(u32, u32)> {

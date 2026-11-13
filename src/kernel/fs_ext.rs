@@ -485,6 +485,25 @@ impl Kernel {
             .collect()
     }
 
+    /// The threads of this task's process, as it numbers them.
+    pub(super) fn visible_thread_ids(&self, cx: &ServiceCtx) -> Vec<u32> {
+        use super::RunState;
+        let sh = self.shared.lock().unwrap();
+        let mut tids: Vec<u32> = sh
+            .procs
+            .iter()
+            .flatten()
+            .map(|p| &p.info)
+            .filter(|i| i.tgid == cx.cur.tgid && !matches!(i.run, RunState::Zombie(_)))
+            .chain([&cx.cur])
+            .map(|i| self.visible_pid(cx, i.pid) as u32)
+            .filter(|&t| t != 0)
+            .collect();
+        tids.sort_unstable();
+        tids.dedup();
+        tids
+    }
+
     /// Build the live `/proc/self` view (comm, cmdline, exe, cwd, pid/ppid, open
     /// fds) for the running task, so procfs renders the real running program
     /// instead of the boot-time placeholder. Called just before a `/proc` read.
@@ -518,6 +537,8 @@ impl Kernel {
                 let users = self.users.lock().unwrap();
                 Self::task_ids(&users, cx.cur.ns.user, &cx.cur).0
             },
+            tid: self.visible_pid(cx, cx.cur.pid) as u32,
+            tids: Vec::new(),
             status_ids: self.status_id_lines(cx),
             status_security: format!(
                 "{}{}",
@@ -543,9 +564,9 @@ impl Kernel {
         reader: u32,
         info: &super::ProcInfo,
     ) -> ((u32, u32), String) {
-        use super::userns::{IdKind, OVERFLOW_ID};
+        use super::userns::IdKind;
         let ns = info.ns.user;
-        let global = |kind, id| users.to_global(ns, kind, id).unwrap_or(OVERFLOW_ID);
+        let global = |kind, id| users.kernel_id(ns, kind, id);
         let seen = |kind, id| users.seen_from_global(reader, kind, global(kind, id));
         let c = info.creds;
         let line = |kind, ids: [u32; 4]| ids.map(|id| seen(kind, id).to_string()).join("\t");
@@ -626,8 +647,39 @@ impl Kernel {
         };
         let abs = self.resolve_path(cx, newdirfd, &link);
         match vfs.symlink(&target, &abs) {
-            Ok(()) => 0,
+            Ok(()) => {
+                self.own_new_node(vfs, cx, &abs);
+                0
+            }
             Err(e) => io_errno(&e),
+        }
+    }
+
+    /// Make the node just created at `abs` its creator's (Linux's
+    /// `inode_init_owner`): owned by its fsuid, and its fsgid or, in a
+    /// set-group-ID directory, the directory's group. Seen from a user
+    /// namespace these are the ids it maps; a backend makes everything root's.
+    pub(super) fn own_new_node(&self, vfs: &mut MountTable, cx: &ServiceCtx, abs: &str) {
+        use super::userns::IdKind;
+        const S_ISGID: u32 = 0o2000;
+        let (uid, gid) = {
+            let users = self.users.lock().unwrap();
+            let ns = cx.cur.ns.user;
+            (
+                users.kernel_id(ns, IdKind::Uid, cx.cur.creds.fsuid),
+                users.kernel_id(ns, IdKind::Gid, cx.cur.creds.fsgid),
+            )
+        };
+        let parent = match abs.rsplit_once('/') {
+            Some(("", _)) | None => "/",
+            Some((dir, _)) => dir,
+        };
+        let gid = vfs
+            .stat(parent)
+            .filter(|a| a.mode & S_ISGID != 0)
+            .map_or(gid, |a| a.gid);
+        if uid != 0 || gid != 0 {
+            let _ = vfs.set_owner(abs, Some(uid), Some(gid));
         }
     }
 
@@ -647,6 +699,7 @@ impl Kernel {
         let abs = self.resolve_path(cx, dirfd, &rel);
         match vfs.mkdir(&abs, (mode & 0o777) as u32) {
             Ok(()) => {
+                self.own_new_node(vfs, cx, &abs);
                 // A new cgroup belongs to whoever made it, so a delegate can
                 // manage what it creates.
                 if self
@@ -955,8 +1008,18 @@ impl Kernel {
             abs
         };
         match vfs.set_owner(&abs, decode_id(uid), decode_id(gid)) {
-            Ok(()) => 0,
+            Ok(()) => {
+                Self::chown_kills_caps(vfs, &abs, uid, gid);
+                0
+            }
             Err(e) => io_errno(&e),
+        }
+    }
+
+    /// A file given an owner loses its capabilities (Linux's killpriv).
+    fn chown_kills_caps(vfs: &mut MountTable, path: &str, uid: u64, gid: u64) {
+        if decode_id(uid).is_some() || decode_id(gid).is_some() {
+            let _ = vfs.removexattr(path, super::xattr::FILE_CAPS);
         }
     }
 
@@ -976,7 +1039,10 @@ impl Kernel {
             None => return err(Errno::EBADF),
         };
         match vfs.set_owner(&path, decode_id(uid), decode_id(gid)) {
-            Ok(()) => 0,
+            Ok(()) => {
+                Self::chown_kills_caps(vfs, &path, uid, gid);
+                0
+            }
             Err(e) => io_errno(&e),
         }
     }
@@ -999,7 +1065,10 @@ impl Kernel {
         };
         let abs = self.resolve_path(cx, dirfd, &rel);
         match vfs.mknod(&abs, mode as u32) {
-            Ok(()) => 0,
+            Ok(()) => {
+                self.own_new_node(vfs, cx, &abs);
+                0
+            }
             Err(e) => io_errno(&e),
         }
     }

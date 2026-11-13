@@ -38,6 +38,7 @@ pub(super) const CAP_SYS_RESOURCE: u32 = 24;
 pub(super) const CAP_SYS_TTY_CONFIG: u32 = 26;
 const CAP_MKNOD: u32 = 27;
 const CAP_MAC_OVERRIDE: u32 = 32;
+pub(super) const CAP_SETFCAP: u32 = 31;
 pub(super) const CAP_SYSLOG: u32 = 34;
 
 /// What a change of fsuid to or from root turns off or on (`CAP_FS_MASK`).
@@ -72,6 +73,50 @@ pub(super) struct CapSets {
     pub(super) bounding: u64,
     pub(super) ambient: u64,
     pub(super) securebits: u32,
+}
+
+/// A program file's capabilities, its `security.capability` attribute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FileCaps {
+    pub(super) permitted: u64,
+    pub(super) inheritable: u64,
+    /// The program starts with its permitted set effective.
+    pub(super) effective: bool,
+}
+
+impl FileCaps {
+    /// Decode a `security.capability` value (`struct vfs_cap_data`, revision 1
+    /// to 3). A revision-3 value counts only where its root id is root, here or
+    /// in an ancestor namespace, which `root_ok` says.
+    pub(super) fn parse(raw: &[u8], root_ok: impl Fn(u32) -> bool) -> Option<Self> {
+        const REVISION_MASK: u32 = 0xff00_0000;
+        const FLAGS_EFFECTIVE: u32 = 1;
+        let word = |i: usize| {
+            raw.get(i * 4..i * 4 + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let magic = word(0)?;
+        let (permitted, inheritable) = match (magic & REVISION_MASK, raw.len()) {
+            (0x0100_0000, 12) => (u64::from(word(1)?), u64::from(word(2)?)),
+            (0x0200_0000, 20) | (0x0300_0000, 24) => {
+                if raw.len() == 24 && !root_ok(word(5)?) {
+                    return None;
+                }
+                let lo = (word(1)?, word(2)?);
+                let hi = (word(3)?, word(4)?);
+                (
+                    u64::from(lo.0) | u64::from(hi.0) << 32,
+                    u64::from(lo.1) | u64::from(hi.1) << 32,
+                )
+            }
+            _ => return None,
+        };
+        Some(Self {
+            permitted: permitted & CAP_ALL,
+            inheritable: inheritable & CAP_ALL,
+            effective: magic & FLAGS_EFFECTIVE != 0,
+        })
+    }
 }
 
 /// A task's user ids as the setuid fixups see them: `(real, effective, saved, fs)`.
@@ -236,22 +281,42 @@ impl CapSets {
         }
     }
 
-    /// The sets a program starts with (`cap_bprm_creds_from_file`, for a file
-    /// without capabilities): root, real or effective, gets what its bounding
-    /// and inheritable sets allow; anyone else keeps only the ambient set. A
-    /// set-id program clears that. `ruid`/`euid` are the ids it runs with.
-    pub(super) fn on_exec(&mut self, ruid: u32, euid: u32, set_id: bool) {
-        if set_id {
+    /// The sets a program starts with (`cap_bprm_creds_from_file`): what the
+    /// file's capabilities and the bounding and inheritable sets allow; for
+    /// root, real or effective, whatever the bounding and inheritable sets
+    /// allow; and the ambient set, unless the program is set-id or has file
+    /// capabilities. `ruid`/`euid` are the ids it runs with; with
+    /// `no_new_privs`, it gains nothing it wasn't permitted.
+    pub(super) fn on_exec(
+        &mut self,
+        ruid: u32,
+        euid: u32,
+        set_id: bool,
+        file: Option<FileCaps>,
+        no_new_privs: bool,
+    ) {
+        let old_permitted = self.permitted;
+        let mut effective = false;
+        self.permitted = 0;
+        if let Some(f) = file {
+            self.permitted = (self.bounding & f.permitted) | (self.inheritable & f.inheritable);
+            effective = f.effective;
+        }
+        let set_uid_root = file.is_some() && euid == 0 && ruid != 0;
+        if self.securebits & SECBIT_NOROOT == 0 && !set_uid_root {
+            if euid == 0 || ruid == 0 {
+                self.permitted = self.bounding | self.inheritable;
+            }
+            effective |= euid == 0;
+        }
+        if no_new_privs {
+            self.permitted &= old_permitted;
+        }
+        if set_id || file.is_some() {
             self.ambient = 0;
         }
-        let root = self.securebits & SECBIT_NOROOT == 0 && (euid == 0 || ruid == 0);
-        self.permitted = if root {
-            self.bounding | self.inheritable
-        } else {
-            self.ambient
-        };
         self.permitted |= self.ambient;
-        self.effective = if root && euid == 0 {
+        self.effective = if effective {
             self.permitted
         } else {
             self.ambient
@@ -339,16 +404,16 @@ mod tests {
     fn exec_follows_the_root_rule() {
         let mut c = CapSets::full();
         c.bounding &= !(1 << CAP_SYS_ADMIN);
-        c.on_exec(0, 0, false);
+        c.on_exec(0, 0, false, None, false);
         assert!(!c.has(CAP_SYS_ADMIN));
         assert!(c.has(CAP_CHOWN));
 
         let mut c = CapSets::full();
-        c.on_exec(1000, 1000, false);
+        c.on_exec(1000, 1000, false, None, false);
         assert_eq!((c.effective, c.permitted), (0, 0));
 
         let mut c = CapSets::none();
-        c.on_exec(1000, 0, true);
+        c.on_exec(1000, 0, true, None, false);
         assert_eq!(c.effective, CAP_ALL, "a set-uid-root program");
     }
 
@@ -360,8 +425,33 @@ mod tests {
         c.after_setuid((0, 0, 0, 0), (1000, 1000, 1000, 1000));
         c.capset(bit, CAP_ALL, bit).unwrap();
         c.raise_ambient(CAP_NET_ADMIN).unwrap();
-        c.on_exec(1000, 1000, false);
+        c.on_exec(1000, 1000, false, None, false);
         assert_eq!((c.effective, c.permitted), (bit, bit));
+    }
+
+    #[test]
+    fn file_capabilities_grant_what_they_name() {
+        // newuidmap's: cap_setuid=ep, revision 2.
+        let raw = [
+            1, 0, 0, 2, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let f = FileCaps::parse(&raw, |_| true).unwrap();
+        assert_eq!((f.permitted, f.effective), (1 << CAP_SETUID, true));
+        let mut c = CapSets::none();
+        c.on_exec(1000, 1000, false, Some(f), false);
+        assert_eq!(
+            (c.effective, c.permitted),
+            (1 << CAP_SETUID, 1 << CAP_SETUID)
+        );
+        let mut c = CapSets::none();
+        c.on_exec(1000, 1000, false, Some(f), true);
+        assert_eq!(c.permitted, 0, "no_new_privs gains nothing");
+        let mut rev3 = raw.to_vec();
+        rev3[3] = 3;
+        rev3.extend_from_slice(&1000u32.to_le_bytes());
+        assert!(FileCaps::parse(&rev3, |root| root == 0).is_none());
+        assert!(FileCaps::parse(&rev3, |root| root == 1000).is_some());
+        assert!(FileCaps::parse(&raw[..19], |_| true).is_none());
     }
 
     #[test]

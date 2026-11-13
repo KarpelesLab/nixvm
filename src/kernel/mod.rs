@@ -5965,7 +5965,7 @@ impl Kernel {
     /// The credentials a program runs with (Linux's `bprm_fill_uid` and
     /// `cap_bprm_creds_from_file`): a set-user-ID or set-group-ID file's owner,
     /// if that's mapped in the caller's user namespace and `no_new_privs` isn't
-    /// set; then capabilities by the root rule.
+    /// set; then capabilities, from the file's and by the root rule.
     fn exec_credentials(&self, vfs: &mut MountTable, cx: &mut ServiceCtx, abs: &str) {
         const S_ISUID: u32 = 0o4000;
         const S_ISGID: u32 = 0o2000;
@@ -5996,7 +5996,16 @@ impl Kernel {
         c.fsgid = c.egid;
         let set_id = c.euid != old.euid || (c.egid != old.egid && !cx.cur.groups.contains(&c.egid));
         let (ruid, euid) = (c.ruid, c.euid);
-        cx.cur.caps.on_exec(ruid, euid, set_id);
+        let file = vfs
+            .getxattr(abs, "security.capability")
+            .ok()
+            .and_then(|raw| {
+                let users = self.users.lock().unwrap();
+                let ns = cx.cur.ns.user;
+                caps::FileCaps::parse(&raw, |root| users.is_root_here_or_above(ns, root))
+            });
+        let nnp = cx.cur.no_new_privs;
+        cx.cur.caps.on_exec(ruid, euid, set_id, file, nnp);
     }
 
     /// What `execve` returns for `exec_image`'s result: its own, or — for a
@@ -9510,6 +9519,7 @@ impl Kernel {
                     if let Err(e) = vfs.create(&abs, (mode & 0o777) as u32) {
                         return io_errno(&e);
                     }
+                    self.own_new_node(vfs, cx, &abs);
                 } else if self.has_nondir_component(vfs, &abs) {
                     return err(Errno::ENOTDIR);
                 } else {

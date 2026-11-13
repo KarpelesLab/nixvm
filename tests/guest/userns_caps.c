@@ -19,6 +19,7 @@
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 #include <linux/capability.h>
 #include <linux/securebits.h>
@@ -127,6 +128,60 @@ static int t_parent_maps(void) {
   write(q[1], "x", 1); int st; waitpid(c, &st, 0); CHECK(WIFEXITED(st) && !WEXITSTATUS(st), "the child is uid 0 there (%#x)", st);
   return fails;
 }
+/* A copy of this program at `dst`, to give file capabilities. */
+static int copy_self(const char *dst) {
+  char buf[65536]; int in = open(self_exe, O_RDONLY), out = open(dst, O_CREAT | O_TRUNC | O_WRONLY, 0755); ssize_t n;
+  if (in < 0 || out < 0) return -1;
+  while ((n = read(in, buf, sizeof buf)) > 0) if (write(out, buf, n) != n) return -1;
+  close(in); close(out); chmod(dst, 0755); return 0;
+}
+/* cap_net_raw=ep, as `setcap` writes it (struct vfs_cap_data, revision 2). */
+static const unsigned int net_raw_ep[5] = {0x02000001, 1u << CAP_NET_RAW, 0, 0, 0};
+static char caps_file[256];
+static int exec_file_has(const char *file, int cap) { char n[16]; sprintf(n, "%d", cap); fflush(stdout); pid_t c = fork(); if (!c) { execl(file, "userns_caps", "--has", n, (char *)0); _exit(99); } int st; waitpid(c, &st, 0); return WIFEXITED(st) ? WEXITSTATUS(st) : 98; }
+static int t_file_caps(void) {
+  sprintf(caps_file, "/tmp/userns_caps.fc.%d", getpid()); CHECK(!copy_self(caps_file), "a copy of the program (%d)", errno);
+  CHECK(!setxattr(caps_file, "security.capability", net_raw_ep, sizeof net_raw_ep, 0), "give it cap_net_raw=ep (%d)", errno);
+  fflush(stdout); pid_t c = fork();
+  if (!c) {
+    setgroups(0, 0); setresgid(1000, 1000, 1000); CHECK(!setresuid(1000, 1000, 1000) && eff() == 0, "drop to 1000 with nothing");
+    CHECK(exec_file_has(caps_file, CAP_NET_RAW) == 1, "run as 1000, it has the file's capability");
+    CHECK(exec_file_has(caps_file, CAP_SYS_ADMIN) == 0, "and only that");
+    CHECK(exec_has(CAP_NET_RAW) == 0, "a program without them gets nothing");
+    CHECK(!prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) && exec_file_has(caps_file, CAP_NET_RAW) == 0, "nor does it under no_new_privs");
+    _exit(fails);
+  }
+  int st; waitpid(c, &st, 0); fails += WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+  CHECK(!chown(caps_file, 0, 0), "chown it"); CHECK(getxattr(caps_file, "security.capability", 0, 0) < 0 && errno == ENODATA, "which takes its capabilities away (%d)", errno);
+  unlink(caps_file); return fails;
+}
+static int t_ns_file_caps(void) {
+  as_user(); int uid = getuid(), gid = getgid(); sprintf(caps_file, "/tmp/userns_caps.nsfc.%d", getpid()); CHECK(!copy_self(caps_file), "a copy of the program (%d)", errno);
+  CHECK(setxattr(caps_file, "security.capability", net_raw_ep, sizeof net_raw_ep, 0) < 0 && errno == EPERM, "an ordinary user can't give it capabilities (%d)", errno);
+  fflush(stdout); pid_t c = fork();
+  if (!c) {
+    unshare(CLONE_NEWUSER); map_root(uid, gid);
+    struct stat s; CHECK(!stat(caps_file, &s) && s.st_uid == 0, "root in its own user namespace owns it");
+    CHECK(!setxattr(caps_file, "security.capability", net_raw_ep, sizeof net_raw_ep, 0), "and can give it capabilities (%d)", errno);
+    _exit(fails);
+  }
+  int st; waitpid(c, &st, 0); fails += WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+  unsigned int v[6] = {0}; int n = getxattr(caps_file, "security.capability", v, sizeof v);
+  CHECK(n == 24 && (v[0] >> 24) == 3 && v[5] == (unsigned)uid, "outside, they're kept as the namespace's: revision 3, its root (%d %#x %u)", n, v[0], v[5]);
+  CHECK(exec_file_has(caps_file, CAP_NET_RAW) == 0, "and don't count out here");
+  fflush(stdout); c = fork();
+  if (!c) { unshare(CLONE_NEWUSER); map_root(uid, gid); CHECK(exec_file_has(caps_file, CAP_NET_RAW) == 1, "but do in a namespace whose root that is"); _exit(fails); }
+  waitpid(c, &st, 0); fails += WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+  unlink(caps_file); return fails;
+}
+static int t_new_files(void) {
+  as_user(); int uid = getuid(), gid = getgid(); char f[256]; struct stat s; sprintf(f, "/tmp/userns_caps.nf.%d", getpid());
+  close(open(f, O_CREAT | O_WRONLY, 0644)); CHECK(!stat(f, &s) && s.st_uid == (uid_t)uid && s.st_gid == (gid_t)gid, "a new file is its creator's (%d %d)", s.st_uid, s.st_gid); unlink(f);
+  CHECK(!unshare(CLONE_NEWUSER), "user namespace"); map_root(uid, gid);
+  close(open(f, O_CREAT | O_WRONLY, 0644)); CHECK(!stat(f, &s) && s.st_uid == 0 && s.st_gid == 0, "one made as root there is root's there (%d %d)", s.st_uid, s.st_gid); unlink(f);
+  CHECK(!mkdir(f, 0755) && !stat(f, &s) && s.st_uid == 0, "so is a directory (%d)", s.st_uid); rmdir(f);
+  return fails;
+}
 static int t_setns(void) {
   as_user(); int uid = getuid(), gid = getgid(); int p[2], q[2]; pipe(p); pipe(q);
   int my_uts = open("/proc/self/ns/uts", O_RDONLY); struct utsname u; uname(&u); char host[65]; strcpy(host, u.nodename);
@@ -166,8 +221,13 @@ int main(int argc, char **argv) {
   self_exe = "/proc/self/exe";
   /* The conformance runner puts it at the guest's root; elsewhere, where it is. */
   static char exe[4096]; ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1); if (n > 0) { exe[n] = 0; self_exe = exe; }
+  /* Somewhere every uid can run it from, even root without CAP_DAC_OVERRIDE
+   * (a CI runner's work directory is private to its user). */
+  static char copy[64]; int copied = 0;
   if (!access("/userns_caps", X_OK)) self_exe = "/userns_caps";
-  if (getuid() == 0) { child(t_root_drops); child(t_keepcaps); child(t_bounding); child(t_securebits); child(t_root_without_caps); }
-  child(t_userns); child(t_map_needs_admin); child(t_parent_maps); child(t_setns);
+  else { sprintf(copy, "/tmp/userns_caps.self.%d", getpid()); if (!copy_self(copy)) { self_exe = copy; copied = 1; } }
+  if (getuid() == 0) { child(t_root_drops); child(t_keepcaps); child(t_bounding); child(t_securebits); child(t_root_without_caps); child(t_file_caps); }
+  child(t_ns_file_caps); child(t_new_files); child(t_userns); child(t_map_needs_admin); child(t_parent_maps); child(t_setns);
+  if (copied) unlink(copy);
   puts(fails ? "SOME FAILED" : "PASS"); return fails != 0;
 }

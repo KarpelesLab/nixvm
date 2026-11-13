@@ -3613,6 +3613,13 @@ impl Kernel {
             return 0;
         }
         let peek = flags & MSG_PEEK != 0;
+        // With MSG_TRUNC, a SOCK_SEQPACKET receive says how long the message was.
+        let whole = match &net.socks[sock].kind {
+            Kind::Pair(Pair { msgs: Some(m), .. }) if flags & MSG_TRUNC != 0 => {
+                m[end].front().copied()
+            }
+            _ => None,
+        };
         let data: Vec<u8> = match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
                 let n = p.msg_read_len(end, (count as usize).min(p.to[end].len()));
@@ -3639,7 +3646,7 @@ impl Kernel {
         if mem.write(buf, &data).is_err() {
             return err(Errno::EFAULT);
         }
-        data.len() as i64
+        whole.unwrap_or(data.len()) as i64
     }
 
     /// Host-buffer twin of [`Self::recv_stream`]: dequeue up to `count` stream

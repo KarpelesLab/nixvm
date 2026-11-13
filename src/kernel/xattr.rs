@@ -12,6 +12,9 @@
 //! `rsync -X`, pip and Python's `os.*xattr` all lean on exactly these answers.
 
 use super::{AT_FDCWD, Fd, Kernel, ServiceCtx, err, io_errno, read_path};
+
+/// The attribute that holds a program's file capabilities.
+pub(super) const FILE_CAPS: &str = "security.capability";
 use crate::abi::errno::Errno;
 use crate::fs::{MountTable, NodeKind};
 use crate::vcpu::GuestMemory;
@@ -178,6 +181,68 @@ impl Kernel {
         })
     }
 
+    /// Whether the caller may change `path`'s file capabilities: `CAP_SETFCAP`
+    /// where it is, over a file whose owner that namespace maps
+    /// (`capable_wrt_inode_uidgid`).
+    fn may_set_file_caps(&self, vfs: &mut MountTable, cx: &ServiceCtx, path: &str) -> bool {
+        use super::userns::{IdKind, OVERFLOW_ID};
+        let Some(file) = vfs.stat(path) else {
+            return false;
+        };
+        let users = self.users.lock().unwrap();
+        let ns = cx.cur.ns.user;
+        let mapped =
+            |kind, id| id == OVERFLOW_ID || users.seen_from_global(ns, kind, id) != OVERFLOW_ID;
+        cx.cur.caps.has(super::caps::CAP_SETFCAP)
+            && mapped(IdKind::Uid, file.uid)
+            && mapped(IdKind::Gid, file.gid)
+    }
+
+    /// The `security.capability` value to store for one the caller sets
+    /// (`cap_convert_nscap`). From a user namespace, it only counts where that
+    /// namespace's root is root: stored as revision 3, naming that root.
+    fn file_caps_to_store(
+        &self,
+        vfs: &mut MountTable,
+        cx: &ServiceCtx,
+        path: &str,
+        value: Vec<u8>,
+    ) -> Result<Vec<u8>, Errno> {
+        use super::userns::IdKind;
+        if !self.may_set_file_caps(vfs, cx, path) {
+            return Err(Errno::EPERM);
+        }
+        let ns = cx.cur.ns.user;
+        let magic = value
+            .get(..4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or(Errno::EINVAL)?;
+        let rev = magic & 0xff00_0000;
+        let size_ok = matches!(
+            (rev, value.len()),
+            (0x0100_0000, 12) | (0x0200_0000, 20) | (0x0300_0000, 24)
+        );
+        if !size_ok {
+            return Err(Errno::EINVAL);
+        }
+        if ns == 0 || rev == 0x0100_0000 {
+            return Ok(value);
+        }
+        let users = self.users.lock().unwrap();
+        let root_inside = if rev == 0x0300_0000 {
+            u32::from_le_bytes([value[20], value[21], value[22], value[23]])
+        } else {
+            0
+        };
+        let root = users
+            .to_global(ns, IdKind::Uid, root_inside)
+            .ok_or(Errno::EINVAL)?;
+        let mut out = value[..20].to_vec();
+        out[..4].copy_from_slice(&(0x0300_0000 | (magic & !0xff00_0000)).to_le_bytes());
+        out.extend_from_slice(&root.to_le_bytes());
+        Ok(out)
+    }
+
     /// Whether the caller holds `CAP_SYS_ADMIN` (the `trusted.*` gate). The VM
     /// grants root every capability, so this is "is effectively root".
     fn xattr_admin(cx: &ServiceCtx) -> bool {
@@ -266,6 +331,14 @@ impl Kernel {
         if name.starts_with("user.") && !matches!(kind, NodeKind::File | NodeKind::Dir) {
             return err(Errno::EPERM);
         }
+        let bytes = if name == FILE_CAPS {
+            match self.file_caps_to_store(vfs, cx, &path, bytes) {
+                Ok(b) => b,
+                Err(e) => return err(e),
+            }
+        } else {
+            bytes
+        };
         let exists = vfs.getxattr(&path, &name).is_ok();
         if flags == XATTR_CREATE && exists {
             return err(Errno::EEXIST);
@@ -341,6 +414,9 @@ impl Kernel {
             return err(Errno::EPERM);
         }
         if name.starts_with("user.") && !matches!(kind, NodeKind::File | NodeKind::Dir) {
+            return err(Errno::EPERM);
+        }
+        if name == FILE_CAPS && !self.may_set_file_caps(vfs, cx, &path) {
             return err(Errno::EPERM);
         }
         match vfs.removexattr(&path, &name) {

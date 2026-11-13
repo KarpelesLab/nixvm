@@ -168,6 +168,9 @@ jobs:
       - name: Check the root-only programs against Linux
         if: matrix.backend == 'kvm'
         run: |
+          # Ubuntu keeps capabilities out of unprivileged user namespaces
+          # (AppArmor); userns_caps and sandbox_fs check what Linux does without that.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           for p in cgroups rlimits sched exec fifo devfd threads_mm dualstack madvise execthread epoll_et userns_caps sandbox_fs ptrace seccomp_notify; do
             gcc -static -O2 -pthread -o "$RUNNER_TEMP/$p" "tests/guest/$p.c"
             echo "== $p"

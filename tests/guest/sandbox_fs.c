@@ -4,7 +4,11 @@
  *    EROFS, so "make sure this directory exists" walks a read-only tree;
  *  - a mount target, chdir, or stat through /proc/self/fd/N acts on what that
  *    descriptor has open, wherever it is now;
- *  - a netlink peek with MSG_TRUNC says how long the next message is.
+ *  - a netlink peek with MSG_TRUNC says how long the next message is;
+ *  - SOCK_SEQPACKET socket pairs keep message boundaries and carry fds
+ *    (Chromium's sandbox IPC);
+ *  - /proc/self/task links once per thread (how Chromium checks it's
+ *    single-threaded before sandboxing itself).
  * Runs as anyone (as root it makes its namespaces all the same). */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -19,6 +23,7 @@
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 static int fails;
@@ -93,7 +98,35 @@ static int t_netlink_peek(void) {
   char small[8]; ssize_t t = recv(s, small, sizeof small, MSG_TRUNC); CHECK(t > (ssize_t)sizeof small, "recv with MSG_TRUNC gives the full length too (%zd)", t);
   return fails;
 }
+static int t_seqpacket(void) {
+  int sv[2]; CHECK(!socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv), "SOCK_SEQPACKET socketpair (%d)", errno);
+  int type = 0; socklen_t l = sizeof type; getsockopt(sv[0], SOL_SOCKET, SO_TYPE, &type, &l); CHECK(type == SOCK_SEQPACKET, "SO_TYPE says so (%d)", type);
+  CHECK(write(sv[0], "hello", 5) == 5 && write(sv[0], "wo", 2) == 2, "two messages");
+  char b[64]; CHECK(read(sv[1], b, sizeof b) == 5, "a read takes one message, not both");
+  CHECK(read(sv[1], b, sizeof b) == 2, "then the next");
+  write(sv[0], "abcdef", 6); CHECK(recv(sv[1], b, 2, MSG_TRUNC) == 6, "MSG_TRUNC gives a message's full length");
+  write(sv[0], "after", 5); CHECK(read(sv[1], b, sizeof b) == 5 && !memcmp(b, "after", 5), "the rest of a cut message is gone");
+  write(sv[0], "xyz", 3); struct iovec iov = {b, 1}; struct msghdr m = {0}; m.msg_iov = &iov; m.msg_iovlen = 1;
+  CHECK(recvmsg(sv[1], &m, 0) == 1 && (m.msg_flags & MSG_TRUNC), "recvmsg flags a cut message (%#x)", m.msg_flags);
+  int fds[2]; pipe(fds); char cbuf[CMSG_SPACE(sizeof(int))] = {0}; struct msghdr sm = {0}; struct iovec siov = {"f", 1};
+  sm.msg_iov = &siov; sm.msg_iovlen = 1; sm.msg_control = cbuf; sm.msg_controllen = sizeof cbuf;
+  struct cmsghdr *c = CMSG_FIRSTHDR(&sm); c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int)); memcpy(CMSG_DATA(c), &fds[1], sizeof(int));
+  CHECK(sendmsg(sv[0], &sm, 0) == 1, "send a descriptor (%d)", errno);
+  char rb[CMSG_SPACE(sizeof(int))]; struct msghdr rm = {0}; struct iovec riov = {b, sizeof b}; rm.msg_iov = &riov; rm.msg_iovlen = 1; rm.msg_control = rb; rm.msg_controllen = sizeof rb;
+  CHECK(recvmsg(sv[1], &rm, 0) == 1, "receive it"); struct cmsghdr *rc = CMSG_FIRSTHDR(&rm); int got = -1; if (rc && rc->cmsg_type == SCM_RIGHTS) memcpy(&got, CMSG_DATA(rc), sizeof(int));
+  CHECK(got >= 0 && write(got, "p", 1) == 1 && read(fds[0], b, 1) == 1, "and it works");
+  close(sv[0]); CHECK(read(sv[1], b, sizeof b) == 0, "EOF once the other end closes");
+  return fails;
+}
+static void *sleeper(void *a) { (void)a; pause(); return 0; }
+static int t_task_links(void) {
+  struct stat s; CHECK(!stat("/proc/self/task", &s) && s.st_nlink == 3, "one thread: task/ has 3 links (%lu)", (unsigned long)s.st_nlink);
+  pthread_t t; pthread_create(&t, 0, sleeper, 0); usleep(20000);
+  CHECK(!stat("/proc/self/task", &s) && s.st_nlink == 4, "two threads: 4 (%lu)", (unsigned long)s.st_nlink);
+  char p[64]; sprintf(p, "/proc/self/task/%d/status", getpid()); CHECK(access(p, R_OK) == 0, "task/<tid>/status (%d)", errno);
+  return fails;
+}
 int main(void) {
-  child(t_readonly); child(t_fd_paths); child(t_netlink_peek);
+  child(t_readonly); child(t_fd_paths); child(t_netlink_peek); child(t_seqpacket); child(t_task_links);
   puts(fails ? "SOME FAILED" : "PASS"); return fails != 0;
 }

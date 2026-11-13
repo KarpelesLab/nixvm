@@ -352,8 +352,10 @@ impl Kernel {
     /// tasks have to be read before taking `vfs`, which sorts after `shared`.
     fn refresh_procfs(&self, cx: &ServiceCtx) {
         let tasks = self.visible_tasks(cx);
+        let tids = self.visible_thread_ids(cx);
         let mut live = self.proc_self_live(cx);
         live.tasks = tasks;
+        live.tids = tids;
         {
             let mut sh = self.shared.lock().unwrap();
             let uts = sh.uts(cx.cur.ns.uts);
