@@ -627,7 +627,10 @@ impl Kernel {
             let mut resumed_ppid = None;
             let mut found = false;
             for slot in sh.procs.iter_mut().flatten() {
-                if i64::from(slot.info.pid) == pid {
+                // A thread that exited is gone (Linux reaps it on the spot),
+                // even while its slot waits to be cleared.
+                let gone = slot.info.is_thread && matches!(slot.info.run, RunState::Zombie(_));
+                if i64::from(slot.info.pid) == pid && !gone {
                     if !self.signal_reaches_init(cx, &slot.info, sig) {
                         return 0;
                     }
