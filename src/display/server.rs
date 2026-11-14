@@ -616,7 +616,7 @@ impl Compositor {
         let r = match iface {
             Iface::Display => self.req_display(cid, op, a),
             Iface::Registry => self.req_registry(cid, op, a),
-            Iface::Compositor => self.req_compositor(cid, version, op, a),
+            Iface::Compositor => self.req_compositor(cid, obj, version, op, a),
             Iface::Surface => self.req_surface(kernel, cid, obj, op, a),
             Iface::Region
             | Iface::Buffer
@@ -636,7 +636,7 @@ impl Compositor {
             Iface::XdgSurface => self.req_xdg_surface(cid, obj, version, op, a),
             Iface::Toplevel => self.req_toplevel(cid, obj, op, a),
             Iface::Popup => self.req_popup(cid, obj, op, a),
-            Iface::DataDeviceManager => self.req_data_device_manager(cid, version, op, a),
+            Iface::DataDeviceManager => self.req_data_device_manager(cid, obj, version, op, a),
             Iface::DataSource => self.req_data_source(cid, obj, op, a),
             Iface::DataOffer => self.req_data_offer(kernel, cid, obj, op, a),
             Iface::DataDevice => self.req_data_device(cid, obj, op, a),

@@ -225,16 +225,18 @@ impl Service for Server {
             return;
         }
         self.last_io = io;
-        comp.pump(kernel, self.listener);
-        for ev in input {
-            comp.input(ev);
-        }
+        // The frame was shown before whatever comes in now: its callbacks
+        // go first, and commits read from here on wait for the next one.
         if presented_since {
             comp.fire_frames(presented, false);
         } else if idle_due {
             comp.fire_frames(0, true);
         }
         comp.presented = presented;
+        comp.pump(kernel, self.listener);
+        for ev in input {
+            comp.input(ev);
+        }
         comp.flush(kernel);
         let mut st = self.shared.lock().unwrap();
         let st = &mut *st;

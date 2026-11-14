@@ -196,6 +196,30 @@ int main(int argc, char **argv) {
     if (!g_comp || !g_shm || !g_wm || !g_seat)
         die("missing globals");
 
+    if (argc > 1 && !strcmp(argv[1], "error")) {
+        // A request the compositor doesn't know must earn a protocol error
+        // and a hangup, nothing worse.
+        begin(ID_REGISTRY, 0);
+        put(g_comp);
+        put_str("wl_compositor");
+        put(1);
+        put(ID_COMPOSITOR);
+        send_msg(-1);
+        begin(ID_COMPOSITOR, 77);
+        send_msg(-1);
+        do // past the sync callback's delete_id
+            next_event();
+        while (ev_obj == ID_DISPLAY && ev_op == 1);
+        if (ev_obj != ID_DISPLAY || ev_op != 0)
+            die("expected wl_display.error");
+        printf("ERROR on %u code %u: %s\n", ev[0], ev[1], (char *)&ev[3]);
+        char c;
+        if (recv(sock, &c, 1, 0) != 0)
+            die("expected the compositor to hang up");
+        printf("PASS\n");
+        return 0;
+    }
+
     struct {
         uint32_t name, id, version;
         const char *iface;

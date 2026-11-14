@@ -19,10 +19,14 @@ impl Compositor {
     pub(super) fn req_compositor(
         &mut self,
         cid: u32,
+        obj: u32,
         version: u32,
         op: u16,
         a: &mut Args,
     ) -> Result<(), ProtoError> {
+        if op > 1 {
+            return Err(bad_op(obj));
+        }
         let id = a.uint()?;
         match op {
             0 => {
@@ -43,8 +47,7 @@ impl Compositor {
                 }
                 Ok(())
             }
-            1 => self.create(cid, id, Iface::Region, 1, Data::None),
-            _ => Err(bad_op(id)),
+            _ => self.create(cid, id, Iface::Region, 1, Data::None),
         }
     }
 

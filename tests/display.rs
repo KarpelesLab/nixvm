@@ -134,3 +134,18 @@ fn a_raw_wire_client_on_the_interpreter() {
 fn a_raw_wire_client_with_several_cpus() {
     shows_a_window(|b| b.ncpus(4));
 }
+
+/// A request the compositor doesn't know gets the client a protocol error
+/// and a hangup — and the display goes on serving.
+#[test]
+fn a_bad_request_is_a_protocol_error() {
+    let Some(root) = root() else { return };
+    let sandbox = Sandbox::builder()
+        .root_dir(root)
+        .display(64, 64)
+        .ncpus(1)
+        .command(["/wayland_client", "error"])
+        .build();
+    let code = sandbox.run().expect("the VM ran");
+    assert_eq!(code, 0, "the client got the error, then EOF");
+}

@@ -467,23 +467,24 @@ impl Compositor {
     pub(super) fn req_data_device_manager(
         &mut self,
         cid: u32,
+        obj: u32,
         version: u32,
         op: u16,
         a: &mut Args,
     ) -> Result<(), ProtoError> {
-        let id = a.uint()?;
-        match op {
-            0 => self.create(cid, id, Iface::DataSource, version, Data::Mimes(Vec::new())),
-            1 => {
-                a.uint()?;
-                self.create(cid, id, Iface::DataDevice, version, Data::None)?;
-                if self.kb_focus.is_some_and(|f| f.0 == cid) {
-                    self.send_selection(cid);
-                }
-                Ok(())
-            }
-            _ => Err(bad_op(id)),
+        if op > 1 {
+            return Err(bad_op(obj));
         }
+        let id = a.uint()?;
+        if op == 0 {
+            return self.create(cid, id, Iface::DataSource, version, Data::Mimes(Vec::new()));
+        }
+        a.uint()?;
+        self.create(cid, id, Iface::DataDevice, version, Data::None)?;
+        if self.kb_focus.is_some_and(|f| f.0 == cid) {
+            self.send_selection(cid);
+        }
+        Ok(())
     }
 
     pub(super) fn req_data_source(
