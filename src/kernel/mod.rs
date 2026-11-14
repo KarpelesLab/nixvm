@@ -65,6 +65,16 @@ mod userns;
 mod xattr;
 
 pub use fd::{Fd, FdTable, FifoOpen, FileOffset};
+pub use net::{ServedFd, ServedRecv};
+
+/// Something nixvm serves the guest from outside it, given a turn between
+/// guest slices by the schedulers: the built-in Wayland display answering
+/// its clients, say. It must not block, and it is called with no kernel
+/// lock held.
+pub trait Service: Send {
+    /// Do whatever is due: answer connections, deliver events.
+    fn service(&mut self, kernel: &Kernel);
+}
 use net::Net;
 use poll::{EventFdInst, PidfdInst, PollFds};
 
@@ -1793,6 +1803,11 @@ pub struct Kernel {
     /// and read without its lock. The serial scheduler unparks its waiters
     /// when it moves (see [`Shared::io_seen`]).
     io_events: Arc<std::sync::atomic::AtomicU64>,
+    /// What nixvm itself serves the guest between slices (the built-in
+    /// display), run by the schedulers (see [`Kernel::add_service`]).
+    services: Mutex<Vec<Box<dyn Service>>>,
+    /// Whether any service is installed, readable without its lock.
+    has_services: std::sync::atomic::AtomicBool,
     /// The pipe subsystem (`pipes`), peeled out of the coarse [`Shared`] lock
     /// onto its own sibling lock (step B4) so a pipe read/write holds only this
     /// lock and other tasks' non-pipe syscalls run concurrently on `shared`
@@ -2500,6 +2515,8 @@ impl Kernel {
             vfs: Mutex::new(mounts),
             net: Mutex::new(net),
             io_events,
+            services: Mutex::new(Vec::new()),
+            has_services: std::sync::atomic::AtomicBool::new(false),
             pipes: Mutex::new(Vec::new()),
             pollfds: Mutex::new(PollFds::default()),
             ptys: Mutex::new(pty::Ptys::default()),
@@ -2745,6 +2762,36 @@ impl Kernel {
         }
     }
 
+    /// Install `service`, which the schedulers run between guest slices from
+    /// here on.
+    pub fn add_service(&self, service: Box<dyn Service>) {
+        self.services.lock().unwrap().push(service);
+        self.has_services
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Give every installed service its turn. Never nests: a service that
+    /// is already running (on another CPU's thread) is skipped.
+    fn run_services(&self) {
+        if !self.has_services.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let Ok(mut services) = self.services.try_lock() else {
+            return;
+        };
+        for s in services.iter_mut() {
+            s.service(self);
+        }
+    }
+
+    /// Whether something outside the guest may still wake it with no event
+    /// the scheduler sees: a live host connection, or a service (the display
+    /// takes input from the user whenever they give it).
+    fn host_io_pending(&self) -> bool {
+        self.has_services.load(std::sync::atomic::Ordering::Relaxed)
+            || self.net.lock().unwrap().has_pending_host_io()
+    }
+
     /// Cooperative single-CPU round-robin scheduler.
     fn schedule_serial(&self) -> Result<i32, VcpuError> {
         loop {
@@ -2793,7 +2840,7 @@ impl Kernel {
                 // poll for it (short sleep + re-sweep) rather than declaring a
                 // deadlock. Only a machine with no timer and no host I/O pending
                 // is genuinely stuck.
-                if self.net.lock().unwrap().has_pending_host_io() {
+                if self.host_io_pending() {
                     std::thread::sleep(std::time::Duration::from_nanos(HOST_IO_POLL_NS as u64));
                     continue;
                 }
@@ -2827,7 +2874,7 @@ impl Kernel {
     /// I/O, and an off-thread connect, complete with no wakeup to us), else a
     /// quarter second so a VM-wide time limit still fires.
     fn stall_sleep_cap(&self) -> u128 {
-        if self.net.lock().unwrap().has_pending_host_io() {
+        if self.host_io_pending() {
             HOST_IO_POLL_NS
         } else {
             250_000_000
@@ -2845,6 +2892,7 @@ impl Kernel {
             // Pick the least-vruntime runnable task and check it out (slot → `None`,
             // fd table into `cx`), releasing `sh` before running the slice so the
             // slice's syscalls can take their own per-handler locks.
+            self.run_services();
             let Some((i, mut proc, mut vcpu, space_arc, mut cx)) = ({
                 let io = self.io_events.load(std::sync::atomic::Ordering::Relaxed);
                 let mut sh = self.shared.lock().unwrap();
@@ -2996,8 +3044,7 @@ impl Kernel {
     /// holds, since nothing wakes the cooperative loop from outside.
     #[must_use]
     pub fn has_pending_work(&self) -> bool {
-        self.shared.lock().unwrap().earliest_deadline().is_some()
-            || self.net.lock().unwrap().has_pending_host_io()
+        self.shared.lock().unwrap().earliest_deadline().is_some() || self.host_io_pending()
     }
 
     /// Seed the initial process (pid 1) without running it, for the incremental
@@ -3793,6 +3840,7 @@ impl Kernel {
             let mut inflight = 0usize;
             let mut stalled = false;
             let outcome = loop {
+                self.run_services();
                 // Fill idle workers with runnable tasks (kernel lock held only
                 // for the dispatch decision, not while awaiting results).
                 let dispatch = {
@@ -3843,7 +3891,7 @@ impl Kernel {
                         // retry so the waiter re-checks its now-passed deadline.
                         if let Some(dl) = sh.earliest_deadline() {
                             StallAction::SleepUntil(dl)
-                        } else if self.net.lock().unwrap().has_pending_host_io() {
+                        } else if self.host_io_pending() {
                             // A live host connection may still deliver data
                             // asynchronously (an in-flight HTTP response). There
                             // is no host-side wakeup into this cooperative loop,

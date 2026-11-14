@@ -32,6 +32,9 @@ use crate::vcpu::GuestMemory;
 use super::egress::{Egress, HostConn, HostDgram, Link};
 use super::{Fd, Kernel, ServiceCtx, err};
 
+mod served;
+pub use served::{ServedFd, ServedRecv};
+
 /// One received message: `(source address, payload, out `msg_flags`,
 /// `SCM_RIGHTS` fds delivered with it)`. Returned by [`Kernel::recv_message`].
 type RecvMsg = (Option<Addr>, Vec<u8>, u64, Vec<Fd>);
