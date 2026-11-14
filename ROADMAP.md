@@ -793,6 +793,116 @@ discipline held).
   HVF. The sequencing question in §4 is resolved: the demo shipped ahead of
   the full Phase 10 backend, as a static-ELF-runner rather than a full shell.
 
+### GPU acceleration (virgl → GLES 3.0 / WebGL2)  🟡 phase 1 done: the guest's Mesa renders on the host GPU natively; WebGL2 backend written, not yet run in a browser
+
+Optional (`--features gpu`, off by default) and opt-in at run time
+(`NIXVM_GPU=egl|log|null`, or `Terminal::attach_webgl2(gl)` in the browser);
+without both, no node appears and nothing changes.
+
+**Route.** The guest runs stock Mesa; nixvm is the virtio-gpu "host". Mesa's
+`virgl` Gallium driver talks to `/dev/dri/renderD128` with the virtgpu ioctls,
+nixvm decodes the virgl command stream (virglrenderer's protocol) and replays
+it on GLES 3.0. This was chosen over the alternatives because it needs nothing
+in the guest but distro packages, and GLES 3.0 is exactly what WebGL2 offers:
+
+- *Venus (Vulkan) / gfxstream* — a Vulkan host API the browser lacks
+  (WebGPU differs enough that it would be a second translator).
+- *Translating the guest's GL directly (an LD_PRELOAD'd libGL forwarding
+  calls)* — needs a custom guest library and an RPC per call; virgl batches.
+- *Zink-on-Venus* — two translation layers for no gain at this level.
+
+**Guest view.** `src/gpu/nodes.rs` mounts (only when attached) `/dev/dri/
+renderD128` (char 226:128) and the sysfs pieces libdrm walks: `/sys/dev/char/
+226:128` → `/sys/devices/pci0000:00/0000:00:02.0/drm/renderD128`, the PCI
+function's `vendor`/`device` (`0x1af4`/`0x1050`), `config`, `subsystem` →
+`…/bus/pci`, `/sys/class/drm`. Mesa's loader then maps the PCI id to
+`virtio_gpu` with no environment overrides.
+
+**Kernel side** (`src/kernel/drm.rs`, an `Fd::Drm` open file):
+`DRM_IOCTL_VERSION` (`virtio_gpu` 0.0 — minor 0 tells Mesa not to ask for
+fence fds), `GET_CAP` (no PRIME yet), `GEM_CLOSE`, `GET_UNIQUE`; virtgpu
+`GETPARAM` (3D features, capset-query fix, capsets 1+2; no blobs, no context
+init), `GET_CAPS`, `CONTEXT_INIT`, `RESOURCE_CREATE`, `RESOURCE_INFO`, `MAP`,
+`EXECBUFFER`, `TRANSFER_TO_HOST`/`FROM_HOST`, `WAIT`. A GEM object is a
+shared-memory `FileObj` of guest frames (the resource's backing); `MAP` hands
+out `handle << 32` and `mmap` of the node at that offset maps the object like
+a memfd. The device answers synchronously, so `WAIT` never waits.
+
+**Capset** (`src/gpu/caps.rs`): `virgl_caps_v2` describing a GLES 3.0 host
+the way virglrenderer does on GLES — GLSL level 130, `VIRGL_CAP_HOST_IS_GLES`,
+`host_feature_check_version` 15, the formats of `src/gpu/format.rs` (BGRA
+stored as RGBA and swapped on transfer), 13 constant buffers, 4 render
+targets, 4 stream-out buffers, GLES 3.0 minimum limits. Mesa offers
+**OpenGL ES 3.0** and desktop GL 2.1 (3.0 wants independent blend and
+conditional rendering, which GLES 3.0 lacks).
+
+**Protocol subset** (`src/gpu/virgl.rs`): object create/bind/destroy for
+blend, rasterizer, DSA, shader (incl. split across commands), vertex
+elements, sampler views/states, surfaces, queries; viewport, framebuffer,
+vertex/index/constant/uniform buffers, sampler views/states, stencil ref,
+blend colour, scissor, clear, `DRAW_VBO`, `RESOURCE_COPY_REGION`, `BLIT`,
+`RESOURCE_INLINE_WRITE`, sub-contexts, queries (results faked done, as
+virglrenderer's GLES path does). Unknown commands are logged and skipped.
+
+**Shaders** (`src/gpu/tgsi.rs`, `src/gpu/glsl.rs`): TGSI text (what virgl
+sends) → GLSL ES 3.00, translated per vertex+fragment pair at first draw
+(GLSL ES needs matching interpolation qualifiers, and integer vertex inputs,
+flat shading and colour-buffer types are draw-time state, so they key the
+program cache). Registers are `vec4` words with integer ops through bit
+casts, as in TGSI; constants are `uvec4` uniforms / std140 blocks. Covers
+float/int/uint ALU, comparisons, control flow, `TEX/TXP/TXB/TXL/TXD/TXF/TXQ`
+on 1D/2D/3D/cube/array/shadow targets, `KILL`, derivatives — what es2gears,
+glxgears-style fixed function and typical GLES 2/3 shaders compile to.
+
+**Backend trait** (`src/gpu/backend.rs`): one push-back on the brief —
+`GpuBackend` is the *GLES 3.0 call surface* (create buffer/texture/program,
+attrib pointers, blend/depth state, draw, read pixels …), not a Gallium-level
+"create context/resource/shader/draw" API. Both real backends are GLES 3, so
+translating Gallium state to GL (`src/gpu/renderer.rs`: viewport y-flip via
+`nx_flip_y`, winding, base-vertex via attribute offsets, index buffers via a
+host-only element buffer because WebGL forbids sharing them, BGRA, …) is
+written once and every backend stays a thin 1:1 map:
+
+- `egl` (native): `dlopen`s `libEGL.so.1` + `libGLESv2.so.2`, surfaceless
+  (`EGL_PLATFORM_SURFACELESS_MESA`, else the first `EGL_EXT_platform_device`
+  device), context made current around each batch since guest ioctls arrive
+  on any CPU thread. Nothing is linked; a host without GL simply has no `egl`.
+- `webgl` (wasm): `webgl.js`, shipped as a wasm-bindgen snippet, holds a
+  `WebGL2RenderingContext` and object tables; Rust passes integers. No
+  `web-sys`.
+- `Recorder`: records calls (tests; `NIXVM_GPU=log` prints them).
+
+**Evidence.** On an Alpine 3.22 root with `mesa-dri-gallium` (Mesa 25.1.9),
+`eglinfo -p surfaceless` reports `virgl (nixvm GLES 3.0)`, OpenGL ES 3.0;
+`tests/guest/gpu_triangle.c` passes; `tests/guest/gpu_scene.c` (es2gears'
+own lighting shader, indexed + depth-tested, a textured blended quad with a
+uniform block, a scissored clear) matches llvmpipe within 1 on every pixel;
+`peglgears` runs at ~25k FPS against llvmpipe's ~1.1k (RTX 5080 host). Unit
+tests cover the ioctls (through real syscalls: open, ioctl, mmap,
+transfer round trip), capset, TGSI parsing, GLSL generation, the decoder on a
+recorder, and a draw on the host's GL when present.
+
+**Not yet / phase 2.**
+1. *WebGL2 in a page:* the backend compiles for wasm32 but hasn't run in a
+   browser; wire `Terminal::attach_webgl2` into `web/` (an offscreen canvas is
+   enough), then find what WebGL2 rejects that native GLES accepts.
+2. *Display:* rendered frames reach no compositor yet. Phase 2a: read back to
+   shm (the guest's EGL Wayland platform needs PRIME first). 2b: PRIME
+   (`HANDLE_TO_FD`/`FD_TO_HANDLE` as an fd onto the GEM object) +
+   `zwp_linux_dmabuf_v1` in the built-in compositor, compositing the host
+   texture directly (zero copy in the browser, where display and GPU share
+   the WebGL context).
+3. *Coverage:* sampler-view swizzles (needed for luminance/alpha formats),
+   transform feedback (advertised, not executed), MSAA, per-RT blend,
+   conditional render (desktop GL 3.x), `TXQ` level counts, geometry shaders
+   (GLES 3.2/never on WebGL2), compressed formats beyond what Mesa decodes.
+4. *Performance:* full GL state is re-applied per draw and buffers keep CPU
+   shadows; cache state, upload index ranges once, and consider
+   `VIRGL_CAP_TRANSFER`/blob resources to cut ioctls.
+5. *Robustness:* the guest controls command contents; sizes are checked, but
+   GL resource exhaustion and per-guest accounting against memory limits
+   (host textures aren't charged to the guest yet) need limits.
+
 ---
 
 ## 4. Key risks & open questions
