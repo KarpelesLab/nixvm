@@ -117,3 +117,44 @@ and only calls into the guest (`write_stdin` + `pump`) on Enter, Ctrl-C, or
 Ctrl-D-on-an-empty-line. `pump()` runs the guest synchronously to
 completion of that input, so a long-running command briefly freezes the
 tab — expected, and called out in the page's footer note.
+
+## Graphical display
+
+nixvm has a built-in Wayland compositor (`src/display/`), and the demo can
+show it on a `<canvas>` next to the terminal. It is off unless asked for:
+open the page with `?display=1`, or press the toolbar's **display** button
+before Start (after boot it takes effect at the next Reboot). It works with
+`?image=…` too (`?image=<name>&display=1`).
+
+With the display on, the guest boots with `WAYLAND_DISPLAY=/tmp/wayland-0`
+and a private `XDG_RUNTIME_DIR` (`/run/user/<uid>`, mode 0700), so Wayland
+clients started from the shell find it. The lightest real clients in
+Alpine's repositories (over the demo's network tunnel):
+
+```sh
+apk add havoc wev   # ~1.4 MB each with their dependencies: no cairo, no mesa
+havoc &             # a small Wayland terminal emulator (a shell on a pty)
+wev                 # a window that prints every input event it gets
+```
+
+(`weston-clients`' `weston-simple-shm` is the classic test client, but the
+package drags in mesa and cairo — about 10 MB to download.)
+
+How it's wired:
+
+- `Terminal.display_env()` is the environment to boot with (passed as
+  `new_on`'s / `from_image_on`'s `env`), and `enable_display(w, h)`, right
+  after construction, attaches the compositor to the guest. While a display
+  is attached `has_pending_work()` stays true, so the page keeps pumping the
+  guest (every 20 ms when idle) and its clients stay live.
+- `src/components/NixDisplay.vue` calls `display_frame()` each animation
+  frame — it returns RGBA pixels only when the frame changed, and is also
+  what fires the clients' frame callbacks — and paints them with
+  `putImageData`, one display pixel per CSS pixel. The display is resized to
+  its pane (`display_resize`, debounced).
+- Input goes to the guest while the canvas has the focus (click it): keys
+  as Linux evdev codes from `KeyboardEvent.code` (`src/keymap.js`; the
+  clients repeat held keys themselves, so DOM auto-repeat is dropped), mouse
+  buttons as `BTN_*`, the wheel as pixel scrolling, pointer positions scaled
+  to display pixels. Keys still held when the canvas loses the focus are
+  released. Otherwise the terminal keeps the keyboard.

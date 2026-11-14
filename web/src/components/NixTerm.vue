@@ -5,6 +5,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 
+import NixDisplay from "./NixDisplay.vue";
+
 // ---------------------------------------------------------------------------
 // nixvm browser terminal.
 //
@@ -38,6 +40,10 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 // ---------------------------------------------------------------------------
 
 const PROMPT = "/ $ ";
+/// What the boot banner suggests running once the display is on.
+/// (havoc and wev are the lightest real Wayland clients in Alpine: ~1.4 MB
+/// each with their dependencies, no cairo or mesa.)
+const DISPLAY_TRY = "apk add havoc wev; havoc &";
 
 /// Guest architectures the demo can boot. Both run on the same wasm
 /// interpreter build — the arch is auto-detected from the ELFs inside the
@@ -81,6 +87,33 @@ const pageParams = new URLSearchParams(location.search);
 const imageName = pageParams.get("image");
 const imageCmd = (pageParams.get("cmd") ?? "").split(" ").filter(Boolean);
 const pullProgress = ref("");
+
+// The guest's graphical display (nixvm's built-in Wayland compositor, shown
+// on a canvas): off unless asked for, with `?display=1` or the toolbar's
+// display button. It's set up as the guest boots (the shell gets
+// WAYLAND_DISPLAY), so turning it on or off takes effect at the next boot.
+const displayParam = pageParams.get("display");
+const displayWanted = ref(displayParam !== null && !["0", "false", "off", "no"].includes(displayParam));
+// The running guest has a display.
+const displayOn = ref(false);
+// What the pane shows while the display is on: both, or one of them.
+const view = ref("split");
+const VIEWS = [
+  { id: "split", label: "both" },
+  { id: "terminal", label: "terminal" },
+  { id: "display", label: "display" },
+];
+const displayEl = ref(null);
+const displayPending = computed(() => hasBooted.value && displayWanted.value !== displayOn.value);
+// The layout: the terminal alone without a display; before the guest boots
+// with one, both (the display pane is measured to size the display).
+const paneView = computed(() => {
+  if (displayOn.value) return view.value;
+  return displayWanted.value ? "split" : "terminal";
+});
+const displayLabel = computed(
+  () => `display: ${displayWanted.value ? "on" : "off"}${displayPending.value ? " (at reboot)" : ""}`,
+);
 const statusMessages = {
   idle: imageName
     ? `pick an architecture and press Start to pull ${imageName}`
@@ -817,9 +850,16 @@ async function boot() {
     // Construction or the first pump can trap (panic=abort) — the catch below
     // surfaces it. The bundled rootfs's guest arch is auto-detected from the
     // ELFs inside it; an image's is the one it was pulled for.
+    const withDisplay = displayWanted.value;
+    const env = withDisplay ? mod.Terminal.display_env() : [];
     guestTerm = pull
-      ? mod.Terminal.from_image_on(pull, netLink, imageCmd, [])
-      : mod.Terminal.new_on(targz, ["/bin/busybox", "sh"], netLink);
+      ? mod.Terminal.from_image_on(pull, netLink, imageCmd, env)
+      : mod.Terminal.new_on(targz, ["/bin/busybox", "sh"], netLink, env);
+    if (withDisplay) {
+      // Sized to its pane, before pid 1 runs.
+      const [w, h] = displayEl.value?.paneSize() ?? [640, 400];
+      guestTerm.enable_display(w, h);
+    }
     const out = guestTerm.pump();
     if (imageName) {
       writeBanner(`nixvm — ${imageName} (${archId}), pulled over the network and running in your browser.`);
@@ -827,7 +867,11 @@ async function boot() {
       writeBanner(`nixvm — Alpine Linux (${archId}), running entirely in your browser.`);
       writeBanner('Type commands and press Enter. Try: uname -m; ls /; cat /etc/os-release');
     }
+    if (withDisplay) {
+      writeBanner(`Display on: Wayland clients find it through WAYLAND_DISPLAY. Try: ${DISPLAY_TRY}`);
+    }
     writeBytes(out);
+    displayOn.value = withDisplay;
     hasBooted.value = true;
     status.value = "ready";
     writePrompt();
@@ -843,6 +887,7 @@ async function reboot() {
   netDisconnect();
   cancelPump();
   commandRunning = false;
+  displayOn.value = false;
   try {
     guestTerm?.free?.();
   } catch {
@@ -861,6 +906,24 @@ async function reboot() {
   xterm.reset();
   status.value = "idle";
   await boot();
+}
+
+// ---- display -----------------------------------------------------------
+
+/// The guest the display pane draws and sends input to, while it can.
+function displayTerm() {
+  return guestTerm && !guestDead && displayOn.value && status.value === "ready" ? guestTerm : null;
+}
+
+/// The user gave the display input: run the guest now so it gets it.
+function onDisplayInput() {
+  schedulePump(0);
+}
+
+/// Turn the display on or off for the next boot (the label says so while
+/// the running guest differs).
+function toggleDisplay() {
+  displayWanted.value = !displayWanted.value;
 }
 
 function fit() {
@@ -966,6 +1029,20 @@ onBeforeUnmount(() => {
           ⏻
         </button>
       </div>
+      <button
+        class="display-btn"
+        :class="{ 'is-on': displayWanted, 'is-pending': displayPending }"
+        :aria-pressed="displayWanted"
+        :disabled="rebootDisabled"
+        :title="
+          displayPending
+            ? `The display turns ${displayWanted ? 'on' : 'off'} when you Reboot.`
+            : 'A graphical display for the guest (a built-in Wayland compositor), shown next to the terminal. Takes effect at boot.'
+        "
+        @click="toggleDisplay"
+      >
+        {{ displayLabel }}
+      </button>
       <button class="reboot-btn" :disabled="rebootDisabled" @click="hasBooted ? reboot() : boot()">
         {{ bootLabel }}
       </button>
@@ -978,7 +1055,30 @@ onBeforeUnmount(() => {
       <button class="net-banner-btn" @click="netRetryNow">Retry</button>
       <button class="net-banner-btn" aria-label="Dismiss" @click="netDismissBanner">✕</button>
     </div>
-    <div ref="termEl" class="term-container"></div>
+    <div v-if="displayOn" class="view-picker" role="radiogroup" aria-label="Show">
+      <button
+        v-for="v in VIEWS"
+        :key="v.id"
+        class="arch-btn"
+        :class="{ 'is-selected': view === v.id }"
+        role="radio"
+        :aria-checked="view === v.id"
+        @click="view = v.id"
+      >
+        {{ v.label }}
+      </button>
+    </div>
+    <div class="panes" :class="`view-${paneView}`">
+      <div v-show="paneView !== 'display'" ref="termEl" class="term-container"></div>
+      <NixDisplay
+        v-if="displayWanted || displayOn"
+        v-show="paneView !== 'terminal'"
+        ref="displayEl"
+        :term="displayTerm"
+        @input="onDisplayInput"
+        @crash="surfaceGuestCrash"
+      />
+    </div>
   </div>
 </template>
 
@@ -992,6 +1092,7 @@ onBeforeUnmount(() => {
 
 .term-toolbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem;
   font-size: 0.85rem;
@@ -1037,7 +1138,7 @@ onBeforeUnmount(() => {
 }
 
 .status-text {
-  flex: 1 1 auto;
+  flex: 1 1 8rem;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1182,6 +1283,59 @@ onBeforeUnmount(() => {
 .net-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.display-btn {
+  flex: none;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--panel-border);
+  border-radius: 0.4rem;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.8rem;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.display-btn.is-on {
+  color: var(--accent-strong);
+}
+
+.display-btn.is-pending {
+  border-style: dashed;
+}
+
+.display-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.display-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.view-picker {
+  align-self: flex-end;
+  display: flex;
+  border: 1px solid var(--panel-border);
+  border-radius: 0.4rem;
+  overflow: hidden;
+}
+
+.panes {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+.panes.view-split .term-container {
+  height: min(40vh, 320px);
+  min-height: 180px;
+}
+
+.panes.view-display :deep(.display-pane) {
+  height: min(75vh, 640px);
 }
 
 .reboot-btn {
