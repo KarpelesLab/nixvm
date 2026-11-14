@@ -41,6 +41,7 @@ fn main() -> ExitCode {
 fn cmd_run(args: &[String]) -> ExitCode {
     let mut builder = Sandbox::builder();
     let mut image = false;
+    let mut display_png: Option<String> = None;
     let mut i = 0;
     // Parse options until the `--` separator, then the rest is the command.
     let command: Vec<String> = loop {
@@ -103,6 +104,22 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 builder = builder.entrypoint([prog.clone()]);
                 i += 2;
             }
+            Some("--display") => {
+                let Some((w, h)) = args.get(i + 1).and_then(|s| parse_dims(s)) else {
+                    eprintln!("nixvm: --display needs a size (e.g. 1024x768)");
+                    return ExitCode::FAILURE;
+                };
+                builder = builder.display(w, h);
+                i += 2;
+            }
+            Some("--display-png") => {
+                let Some(path) = args.get(i + 1) else {
+                    eprintln!("nixvm: --display-png needs a path");
+                    return ExitCode::FAILURE;
+                };
+                display_png = Some(path.clone());
+                i += 2;
+            }
             Some("--user" | "-u") => {
                 let Some(user) = args.get(i + 1) else {
                     eprintln!("nixvm: --user needs a user (name, uid, user:group)");
@@ -122,7 +139,14 @@ fn cmd_run(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    match builder.command(command).run() {
+    if display_png.is_some() && builder.clone().build().display().is_none() {
+        builder = builder.display(1024, 768);
+    }
+    let sandbox = builder.command(command).build();
+    if let (Some(path), Some(display)) = (display_png, sandbox.display()) {
+        snapshot_display(display, path);
+    }
+    match sandbox.run() {
         Ok(code) => ExitCode::from(u8::try_from(code & 0xff).unwrap_or(1)),
         Err(e) => {
             eprintln!("nixvm: {e}");
@@ -181,6 +205,33 @@ fn cmd_pull(args: &[String]) -> ExitCode {
     }
 }
 
+/// Parse `WIDTHxHEIGHT`.
+fn parse_dims(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.split_once(['x', 'X'])?;
+    let (w, h) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+    (w > 0 && h > 0 && w <= 8192 && h <= 8192).then_some((w, h))
+}
+
+/// Write the display's frame to `path` as a PNG whenever it changes (at
+/// most once a second) while a client is connected, so a long-running app
+/// can be looked at — and the last such frame stays there after the run.
+fn snapshot_display(display: nixvm::display::Display, path: String) {
+    std::thread::spawn(move || {
+        let mut written = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let generation = display.generation();
+            if generation == written || display.clients() == 0 {
+                continue;
+            }
+            let tmp = format!("{path}.tmp");
+            if std::fs::write(&tmp, display.png()).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+                written = generation;
+            }
+        }
+    });
+}
+
 /// Parse a byte size with an optional K/M/G suffix.
 fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -206,6 +257,8 @@ fn print_usage() {
          nixvm version\n\n\
          The current directory is exposed inside the sandbox at /work.\n\
          --root uses an extracted host rootfs directory as the guest root.\n\
+         --display WxH gives the guest a Wayland display nixvm composites itself\n\
+         (WAYLAND_DISPLAY is set); --display-png PATH saves its frame there.\n\
          The guest architecture follows the command's ELF binary (an x86_64\n\
          root runs as x86_64 on any host); --arch aarch64|x86_64 pins it.\n\
          --image runs a Docker/OCI image (a registry name such as alpine:3.20, or a\n\

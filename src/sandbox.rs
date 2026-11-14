@@ -127,6 +127,9 @@ pub struct Config {
     /// The user PID 1 runs as (`user`, `uid`, `user:group`), looked up in the
     /// root's `/etc/passwd`; for an image root it replaces the image's user.
     pub user: Option<String>,
+    /// The built-in Wayland display the guest gets, if any (see
+    /// [`SandboxBuilder::display`]).
+    pub display: Option<crate::display::Display>,
 }
 
 /// A host directory shared into the sandbox at a guest mount point.
@@ -177,6 +180,7 @@ impl Default for SandboxBuilder {
                 syscall_policy: None,
                 entrypoint: None,
                 user: None,
+                display: None,
             },
         }
     }
@@ -339,6 +343,17 @@ impl SandboxBuilder {
         self
     }
 
+    /// Give the guest a `width` × `height` Wayland display that nixvm
+    /// composites itself ([`crate::display`]): its socket is
+    /// [`crate::display::DEFAULT_SOCKET`], and the guest's environment gets
+    /// `WAYLAND_DISPLAY` and an `XDG_RUNTIME_DIR` unless they're set. Read
+    /// its frames through [`Sandbox::display`].
+    #[must_use]
+    pub fn display(mut self, width: u32, height: u32) -> Self {
+        self.config.display = Some(crate::display::Display::new(width, height));
+        self
+    }
+
     /// Finish building.
     #[must_use]
     pub fn build(self) -> Sandbox {
@@ -368,6 +383,14 @@ impl Sandbox {
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// The guest's display, if it has one ([`SandboxBuilder::display`]): a
+    /// handle to read frames from and send input to, from another thread
+    /// while [`Sandbox::run`] runs.
+    #[must_use]
+    pub fn display(&self) -> Option<crate::display::Display> {
+        self.config.display.clone()
     }
 
     /// Boot the container and run PID 1, returning its exit code.
@@ -447,12 +470,15 @@ impl Sandbox {
         }
         let Pid1 {
             argv,
-            env,
+            mut env,
             cwd,
             uid,
             gid,
             groups,
         } = start;
+        if self.config.display.is_some() {
+            display_env(&mut mounts, &mut env, uid, gid);
+        }
         let argv = crate::vm::resolve_script(&mut mounts, argv).map_err(Error::Config)?;
         let path = argv[0].clone();
         let elf = mounts.read_file(&path).ok_or_else(|| {
@@ -505,6 +531,11 @@ impl Sandbox {
         kernel.set_cmdline(argv); // /proc/self/cmdline + comm for pid 1
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
+        if let Some(display) = &self.config.display {
+            display
+                .attach(&kernel, crate::display::DEFAULT_SOCKET)
+                .map_err(|e| Error::Config(format!("the display's socket: errno {}", -e)))?;
+        }
         // Bridge guest sockets to the real internet when `NIXVM_NET=host`
         // (otherwise the VM is loopback-only and routable connects get
         // ENETUNREACH). No-op unless the env var is set.
@@ -659,6 +690,10 @@ impl Sandbox {
     /// otherwise the best hardware backend for the host.
     fn backend(&self, arch: Arch) -> Result<Box<dyn Backend>, Error> {
         if self.config.prefer_interp {
+            // x86-64 guests have an interpreter of their own.
+            if arch == Arch::X86_64 {
+                return Ok(Box::new(vcpu::interp_x86::X86Backend::new(arch)?));
+            }
             Ok(Box::new(InterpBackend::new(arch)?))
         } else {
             Ok(vcpu::select(arch)?)
@@ -871,6 +906,28 @@ pub(crate) fn calibrate_vdso(vcpu: &dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
             c.base_mono_ns,
             c.base_wall_ns,
         );
+    }
+}
+
+/// What a guest with a display needs: `WAYLAND_DISPLAY` naming its socket,
+/// and an `XDG_RUNTIME_DIR` (made, `0700` and owned by the user PID 1 runs
+/// as) — unless the environment already sets them.
+fn display_env(mounts: &mut MountTable, env: &mut Vec<String>, uid: u32, gid: u32) {
+    let has = |env: &[String], key: &str| env.iter().any(|e| e.split('=').next() == Some(key));
+    let _ = mounts.mkdir("/tmp", 0o1777);
+    if !has(env, "WAYLAND_DISPLAY") {
+        env.push(format!(
+            "WAYLAND_DISPLAY={}",
+            crate::display::DEFAULT_SOCKET
+        ));
+    }
+    if !has(env, "XDG_RUNTIME_DIR") {
+        let dir = format!("/run/user/{uid}");
+        let _ = mounts.mkdir("/run", 0o755);
+        let _ = mounts.mkdir("/run/user", 0o755);
+        let _ = mounts.mkdir(&dir, 0o700);
+        let _ = mounts.set_owner(&dir, Some(uid), Some(gid));
+        env.push(format!("XDG_RUNTIME_DIR={dir}"));
     }
 }
 
