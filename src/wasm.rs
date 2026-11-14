@@ -449,6 +449,18 @@ mod browser {
             self.net.tick();
         }
 
+        /// Give the guest a GPU rendering with `gl`, a
+        /// `WebGL2RenderingContext` (from an on- or off-screen canvas): its
+        /// Mesa then finds a virtio-gpu at `/dev/dri/renderD128` and renders
+        /// through it (built with the `gpu` feature).
+        #[cfg(feature = "gpu")]
+        pub fn attach_webgl2(&mut self, gl: JsValue) -> Result<(), JsError> {
+            crate::gpu::webgl::set_context(gl);
+            let backend = crate::gpu::webgl::WebGl::new().map_err(|e| JsError::new(&e))?;
+            let dev = crate::gpu::GpuDevice::new(Box::new(backend), false);
+            self.vm.attach_gpu(dev).map_err(|e| JsError::new(&e))
+        }
+
         /// Whether the shell finished the last command and wants input.
         #[must_use]
         pub fn awaiting_input(&self) -> bool {

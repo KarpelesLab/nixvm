@@ -315,6 +315,10 @@ impl Kernel {
             // Regular files/dirs never block in this kernel; the console
             // terminal is treated alike (input readiness isn't tracked).
             Fd::File { .. } | Fd::Dir { .. } | Fd::ProcMem { .. } | Fd::Tty => POLLIN | POLLOUT,
+            // Nothing is ever pending: the device completes work as it's
+            // submitted (and sends no DRM events).
+            #[cfg(feature = "gpu")]
+            Fd::Drm(_) => POLLOUT,
             // A host-bridged socket gets a precise readable answer (a peek);
             // in-VM loopback sockets stay best-effort always-ready, since
             // their queues aren't observable from here.

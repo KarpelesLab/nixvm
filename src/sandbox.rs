@@ -540,6 +540,7 @@ impl Sandbox {
         // (otherwise the VM is loopback-only and routable connects get
         // ENETUNREACH). No-op unless the env var is set.
         crate::vm::install_egress(&mut kernel);
+        crate::vm::install_gpu(&kernel);
         calibrate_vdso(vcpu.as_ref(), &mem);
         Ok(kernel.run(vcpu, mem)?)
     }
@@ -682,6 +683,7 @@ impl Sandbox {
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
         crate::vm::install_egress(&mut kernel);
+        crate::vm::install_gpu(&kernel);
         calibrate_vdso(vcpu.as_ref(), &mem);
         Ok(kernel.run(vcpu, mem)?)
     }

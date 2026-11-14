@@ -312,6 +312,7 @@ impl Vm {
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
         install_egress(&mut kernel);
+        install_gpu(&kernel);
         #[cfg(feature = "tunnel")]
         if let Some(t) = &tunnel {
             kernel.set_egress(t.egress());
@@ -329,6 +330,17 @@ impl Vm {
     }
 
     /// Feed terminal input (keystrokes) to the guest's stdin.
+    /// Give the guest the GPU `dev` (`/dev/dri/renderD128`).
+    ///
+    /// # Errors
+    /// If it already has one.
+    #[cfg(feature = "gpu")]
+    pub fn attach_gpu(&self, dev: crate::gpu::GpuDevice) -> Result<(), String> {
+        self.kernel
+            .attach_gpu(dev)
+            .map_err(|_| "a GPU is already attached".to_string())
+    }
+
     pub fn write_stdin(&mut self, bytes: &[u8]) {
         self.kernel.feed_stdin(bytes);
     }
@@ -474,6 +486,17 @@ pub(crate) fn install_egress(kernel: &mut Kernel) {
         kernel.set_egress(Box::new(crate::kernel::egress::HostEgress));
     }
     #[cfg(target_arch = "wasm32")]
+    let _ = kernel;
+}
+
+/// Attach the GPU `NIXVM_GPU` asks for (`egl`, `log`, `null`), when nixvm is
+/// built with the `gpu` feature; otherwise, and by default, there is none.
+pub(crate) fn install_gpu(kernel: &Kernel) {
+    #[cfg(feature = "gpu")]
+    if let Some(dev) = crate::gpu::GpuDevice::from_env() {
+        let _ = kernel.attach_gpu(dev);
+    }
+    #[cfg(not(feature = "gpu"))]
     let _ = kernel;
 }
 

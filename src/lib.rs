@@ -36,6 +36,8 @@ pub mod clock;
 pub mod display;
 pub mod entropy;
 pub mod fs;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod image;
 pub mod kernel;
 pub mod limits;

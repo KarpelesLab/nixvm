@@ -31,6 +31,8 @@ use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 mod attrs;
 mod caps;
 mod cgroup;
+#[cfg(feature = "gpu")]
+mod drm;
 pub mod egress;
 mod fcntl;
 mod fd;
@@ -1806,6 +1808,10 @@ pub struct Kernel {
     /// What nixvm itself serves the guest between slices (the built-in
     /// display), run by the schedulers (see [`Kernel::add_service`]).
     services: Mutex<Vec<Box<dyn Service>>>,
+    /// The virtio-gpu behind `/dev/dri/renderD128`, once one is attached
+    /// ([`Kernel::attach_gpu`]).
+    #[cfg(feature = "gpu")]
+    gpu: std::sync::OnceLock<crate::gpu::GpuDevice>,
     /// Whether any service is installed, readable without its lock.
     has_services: std::sync::atomic::AtomicBool,
     /// The pipe subsystem (`pipes`), peeled out of the coarse [`Shared`] lock
@@ -2516,6 +2522,8 @@ impl Kernel {
             net: Mutex::new(net),
             io_events,
             services: Mutex::new(Vec::new()),
+            #[cfg(feature = "gpu")]
+            gpu: std::sync::OnceLock::new(),
             has_services: std::sync::atomic::AtomicBool::new(false),
             pipes: Mutex::new(Vec::new()),
             pollfds: Mutex::new(PollFds::default()),
@@ -9355,6 +9363,13 @@ impl Kernel {
         if let Fd::PtyMaster(n) | Fd::PtySlave(n) = f {
             return self.pty_ioctl(n, matches!(f, Fd::PtyMaster(_)), req, arg, mem);
         }
+        // The GPU's render node answers its DRM ioctls.
+        #[cfg(feature = "gpu")]
+        if let Fd::Drm(file) = &f
+            && (req >> 8) & 0xff == u32::from(b'd')
+        {
+            return self.drm_ioctl(file, req, arg, mem);
+        }
         // `/dev/tty` on the console: the host terminal's own answers on the CLI
         // path, else the emulated console terminal.
         if matches!(f, Fd::Tty)
@@ -9849,6 +9864,12 @@ impl Kernel {
         // master; `/dev/pts/N` opens the matching slave once unlocked.
         const O_NONBLOCK: u64 = 0o4000;
         const O_CLOEXEC_PTY: u64 = 0o2_000_000;
+        #[cfg(feature = "gpu")]
+        if abs == crate::gpu::nodes::RENDER_NODE
+            && let Some(fd) = self.open_render_node(cx, flags)
+        {
+            return fd;
+        }
         if abs == "/dev/ptmx" {
             let mut ptys = self.ptys.lock().unwrap();
             let n = ptys.alloc();
@@ -10410,6 +10431,14 @@ impl Kernel {
                 nlink: 1,
                 rdev: 0,
                 dev: 0,
+            },
+            // The render node: a character device, 226:128.
+            #[cfg(feature = "gpu")]
+            Some(Fd::Drm(_)) => Attrs {
+                rdev: crate::gpu::nodes::render_rdev(),
+                mode: 0o020_666,
+                inode: 0x4752_0001,
+                ..stat::char_device_attrs()
             },
             // A message queue is a regular file on the mqueue filesystem.
             Some(Fd::Mqueue { q, .. }) => Attrs {
@@ -11004,8 +11033,19 @@ impl Kernel {
 
         // For a file-backed mapping, resolve the backing path up front so a bad
         // fd fails before we disturb the address space.
+        // A GPU buffer object: the render node at the offset `MAP` gave.
+        #[cfg(feature = "gpu")]
+        let mut drm_obj = None;
         let file_src = if flags & MAP_ANONYMOUS == 0 {
             match cx.cur.fds.get(fd as i32) {
+                #[cfg(feature = "gpu")]
+                Some(Fd::Drm(file)) => {
+                    let Some(m) = file.mapping(offset) else {
+                        return err(Errno::EINVAL);
+                    };
+                    drm_obj = Some(m);
+                    None
+                }
                 // A shared mapping of /dev/zero is anonymous shared memory.
                 Some(Fd::File { path, .. }) if path == "/dev/zero" && flags & MAP_SHARED != 0 => {
                     None
@@ -11072,6 +11112,22 @@ impl Kernel {
             };
             base
         };
+        #[cfg(feature = "gpu")]
+        if let Some((obj, pgoff)) = drm_obj {
+            let map = crate::vcpu::filemap::FileMap {
+                obj: Some(obj),
+                pgoff,
+                shared,
+                maywrite: true,
+                name: crate::gpu::nodes::RENDER_NODE.into(),
+                dev: 6,
+                ino: 0x4752_0001,
+            };
+            if mem.map_file(base, len, prot, map).is_err() {
+                return err(Errno::ENOMEM);
+            }
+            return base as i64;
+        }
         // MAP_SHARED|MAP_ANONYMOUS (or of /dev/zero) is shared memory, as on
         // Linux a file of its own of the mapping's size: a fork child shares
         // it, its pages come in as they're first touched, and past its end

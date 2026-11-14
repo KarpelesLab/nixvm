@@ -1437,6 +1437,8 @@ fn fd_link_target(fd: &Fd) -> String {
         Fd::Mqueue { q, .. } => format!("mqueue:[{q}]"),
         Fd::SeccompNotify(_) => "anon_inode:seccomp notify".to_string(),
         Fd::ProcMem { pid, .. } => format!("/proc/{pid}/mem"),
+        #[cfg(feature = "gpu")]
+        Fd::Drm(_) => crate::gpu::nodes::RENDER_NODE.to_string(),
     }
 }
 

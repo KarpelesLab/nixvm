@@ -184,6 +184,9 @@ pub enum Fd {
     },
     /// A seccomp user-notification listener (`SECCOMP_FILTER_FLAG_NEW_LISTENER`).
     SeccompNotify(super::seccomp::NotifFile),
+    /// An open GPU render node (`/dev/dri/renderD128`).
+    #[cfg(feature = "gpu")]
+    Drm(super::drm::DrmFile),
     /// `/proc/<pid>/mem`: process `pid`'s address space `mm` as it was when
     /// opened, at the (shared) position `offset`.
     ProcMem {

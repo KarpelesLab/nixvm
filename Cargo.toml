@@ -71,6 +71,12 @@ oci-net = ["oci", "tunnel", "purecrypto/tls", "purecrypto/embedded-roots"]
 # `targz` to unpack a `.tar.gz` root image in-process, and `fstool` to repack it
 # into an in-memory squashfs (read-only lower of a copy-on-write overlay).
 wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "targz", "fstool", "tunnel", "oci", "oci-net"]
+# GPU acceleration (src/gpu, src/kernel/drm.rs): a virtio-gpu render node the
+# guest's Mesa drives with its `virgl` driver, rendered with GLES 3.0 — host
+# EGL natively (dlopen'd, nothing linked), WebGL2 in the browser. Off by
+# default; a build with it still exposes no GPU until one is attached
+# (`NIXVM_GPU=egl`, `Kernel::attach_gpu`).
+gpu = []
 # HTTP(S) fetching of guest root images (src/image.rs). Off by default so the
 # core stays dependency-free and wasm-buildable; sha256 verification is
 # hand-rolled in image.rs so it needs no extra dep either way.
