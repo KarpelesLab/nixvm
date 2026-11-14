@@ -103,6 +103,9 @@ pub(super) struct Pty {
     output: VecDeque<u8>,
     /// The master fd is open. When it closes, the slave sees EOF.
     master_open: bool,
+    /// Open fds on the master (a fork's or `dup`'s copies count): the master
+    /// closes when the last goes.
+    master_refs: usize,
     /// Count of open slave fds. When it reaches 0, the master sees EOF/`POLLHUP`.
     slave_refs: usize,
     /// `O_NONBLOCK` on each end (set via `fcntl(F_SETFL)`/`ioctl(FIONBIO)`).
@@ -124,6 +127,7 @@ impl Pty {
             canon: Vec::new(),
             output: VecDeque::new(),
             master_open: true,
+            master_refs: 1,
             slave_refs: 0,
             master_nonblock: false,
             slave_nonblock: false,
@@ -379,7 +383,21 @@ impl Ptys {
 
     pub(super) fn close_master(&mut self, n: usize) {
         if let Some(p) = self.table.get_mut(n) {
-            p.master_open = false;
+            p.master_refs = p.master_refs.saturating_sub(1);
+            if p.master_refs == 0 {
+                p.master_open = false;
+            }
+        }
+    }
+    /// Another fd now refers to end `master` of pty `n` (a `dup`, a fork's
+    /// copy, one passed over a socket).
+    pub(super) fn retain(&mut self, n: usize, master: bool) {
+        if let Some(p) = self.table.get_mut(n) {
+            if master {
+                p.master_refs += 1;
+            } else {
+                p.slave_refs += 1;
+            }
         }
     }
     pub(super) fn close_slave(&mut self, n: usize) {
@@ -766,6 +784,20 @@ mod tests {
         // Flush output too.
         t.flush(n, false, true);
         assert_eq!(t.master_avail(n), 0);
+    }
+
+    #[test]
+    fn the_master_stays_open_while_any_copy_does() {
+        // A terminal emulator forks; the child closes its copy of the
+        // master, unlocks and opens the slave.
+        let mut t = Ptys::default();
+        let n = t.alloc();
+        t.retain(n, true); // the fork's copy
+        t.set_lock(n, false);
+        t.close_master(n);
+        assert!(t.slave_openable(n), "the parent still holds the master");
+        t.close_master(n);
+        assert!(!t.slave_openable(n), "the last copy is gone");
     }
 
     #[test]

@@ -5990,11 +5990,21 @@ impl Kernel {
         } else {
             let copy = cx.cur.fds.clone();
             let (mut r, mut w, mut socks) = (Vec::new(), Vec::new(), Vec::new());
+            let mut ptys = Vec::new();
             for fd in copy.values() {
                 r.extend(fd.pipe_in());
                 w.extend(fd.pipe_out());
-                if let Fd::Socket { .. } = fd {
-                    socks.push(fd.clone());
+                match fd {
+                    Fd::Socket { .. } => socks.push(fd.clone()),
+                    Fd::PtyMaster(n) => ptys.push((*n, true)),
+                    Fd::PtySlave(n) => ptys.push((*n, false)),
+                    _ => {}
+                }
+            }
+            if !ptys.is_empty() {
+                let mut t = self.ptys.lock().unwrap();
+                for (n, master) in ptys {
+                    t.retain(n, master);
                 }
             }
             // Socket refcounts live in `net`, pipe refcounts in `pipes`: bump
@@ -9660,8 +9670,12 @@ impl Kernel {
             }
             // `tcdrain`/`tcsendbreak` (output reaches the master queue instantly,
             // nothing to wait for) and `tcflow` (no software flow control is
-            // modelled): accept every selector as a success no-op.
-            TCSBRK | TCSBRKP | TCXONC => 0,
+            // modelled): accept every selector as a success no-op. So are
+            // `TIOCSCTTY`/`TIOCNOTTY` (become, or stop being, the session's
+            // controlling terminal): signals already go to the pty's
+            // foreground group, set when the slave is first opened, so what a
+            // terminal emulator's child does after `setsid` just succeeds.
+            TCSBRK | TCSBRKP | TCXONC | 0x540E | 0x5422 => 0,
             // `TIOCOUTQ`: bytes still queued to transmit. Output is flushed to the
             // master immediately, so nothing is ever pending.
             TIOCOUTQ => {
@@ -9833,9 +9847,16 @@ impl Kernel {
 
         // Pseudo-terminals: `/dev/ptmx` allocates a fresh pty and returns its
         // master; `/dev/pts/N` opens the matching slave once unlocked.
+        const O_NONBLOCK: u64 = 0o4000;
+        const O_CLOEXEC_PTY: u64 = 0o2_000_000;
         if abs == "/dev/ptmx" {
-            let n = self.ptys.lock().unwrap().alloc();
-            return i64::from(cx.cur.fds.alloc(Fd::PtyMaster(n)));
+            let mut ptys = self.ptys.lock().unwrap();
+            let n = ptys.alloc();
+            ptys.set_nonblock(n, true, flags & O_NONBLOCK != 0);
+            drop(ptys);
+            let fd = cx.cur.fds.alloc(Fd::PtyMaster(n));
+            cx.cur.fds.set_cloexec(fd, flags & O_CLOEXEC_PTY != 0);
+            return i64::from(fd);
         }
         if let Some(rest) = abs.strip_prefix("/dev/pts/")
             && let Ok(n) = rest.parse::<usize>()
@@ -9845,7 +9866,13 @@ impl Kernel {
                 return err(Errno::ENXIO);
             }
             ptys.open_slave(n, pgid_of(&cx.cur));
-            return i64::from(cx.cur.fds.alloc(Fd::PtySlave(n)));
+            if flags & O_NONBLOCK != 0 {
+                ptys.set_nonblock(n, false, true);
+            }
+            drop(ptys);
+            let fd = cx.cur.fds.alloc(Fd::PtySlave(n));
+            cx.cur.fds.set_cloexec(fd, flags & O_CLOEXEC_PTY != 0);
+            return i64::from(fd);
         }
 
         match vfs.stat(&abs) {
@@ -10115,11 +10142,6 @@ impl Kernel {
             Some(f) => {
                 self.bump_pipe(&f, false);
                 self.epoll_forget(cx, fd);
-                match f {
-                    Fd::PtyMaster(n) => self.ptys.lock().unwrap().close_master(n),
-                    Fd::PtySlave(n) => self.ptys.lock().unwrap().close_slave(n),
-                    _ => {}
-                }
                 0
             }
             None => err(Errno::EBADF),
@@ -10225,6 +10247,15 @@ impl Kernel {
                 }
             }
             Fd::Socket { .. } => self.net.lock().unwrap().bump(fd, inc),
+            Fd::PtyMaster(n) | Fd::PtySlave(n) => {
+                let master = matches!(fd, Fd::PtyMaster(_));
+                let mut ptys = self.ptys.lock().unwrap();
+                match (inc, master) {
+                    (true, _) => ptys.retain(*n, master),
+                    (false, true) => ptys.close_master(*n),
+                    (false, false) => ptys.close_slave(*n),
+                }
+            }
             // Non-refcounted fds (files, stdio, eventfds, …): nothing to adjust.
             _ => {}
         }
