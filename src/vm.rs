@@ -148,6 +148,21 @@ impl Vm {
         Self::boot_squashfs_with(tar_bytes, argv, Vec::new(), mem_bytes, Some(tunnel))
     }
 
+    /// [`Vm::boot_squashfs`] with `env` (`KEY=VALUE`) added over the shell's
+    /// default environment — e.g. [`display_env`].
+    ///
+    /// # Errors
+    /// As [`Vm::boot_squashfs`].
+    #[cfg(feature = "fstool")]
+    pub fn boot_squashfs_env(
+        tar_bytes: &[u8],
+        argv: Vec<String>,
+        env: Vec<String>,
+        mem_bytes: u64,
+    ) -> Result<Self, String> {
+        Self::boot_squashfs_with(tar_bytes, argv, env, mem_bytes, None)
+    }
+
     /// [`Vm::boot_squashfs_net`] with `env` (`KEY=VALUE`) added over the
     /// shell's default environment — e.g. [`display_env`] for a guest that
     /// talks to a [`Vm::attach_display`] compositor.

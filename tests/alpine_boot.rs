@@ -628,3 +628,102 @@ fn pump_for_yields_during_guest_computation() {
         "each call returns near its budget, longest {longest:?}"
     );
 }
+
+/// Live: a real Wayland client on the built-in display. Boots Alpine with a
+/// display, installs `havoc` (a small Wayland terminal) over host egress,
+/// starts it, and checks that its window reaches the frame and that typing
+/// into it changes what's shown. Gated like `apk_update_over_host_egress`
+/// (x86-64 rootfs, `NIXVM_NET=host`, real internet).
+#[cfg(feature = "fstool")]
+#[test]
+fn a_wayland_terminal_on_the_display() {
+    let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
+        eprintln!("NIXVM_ALPINE_TAR not set; skipping the Wayland client test");
+        return;
+    };
+    if std::env::var("NIXVM_NET").ok().as_deref() != Some("host") {
+        eprintln!("NIXVM_NET != host; skipping the Wayland client test");
+        return;
+    }
+    let tar = std::fs::read(&tar_path).expect("read Alpine tar");
+    let mut vm = Vm::boot_squashfs_env(
+        &tar,
+        vec!["/bin/busybox".to_string(), "sh".to_string()],
+        nixvm::vm::display_env(),
+        256 * 1024 * 1024,
+    )
+    .expect("boot");
+    let display = nixvm::display::Display::new(640, 400);
+    vm.attach_display(&display).expect("attach the display");
+    // Pump like the browser does: present a frame each round (that's what
+    // fires the clients' frame callbacks), until `done` or `rounds` run out.
+    let mut frame = Vec::new();
+    let mut run = |vm: &mut Vm, rounds: usize, done: &dyn Fn(&str, &[u8]) -> bool| {
+        let mut out = Vec::new();
+        for _ in 0..rounds {
+            let step = vm.pump().expect("pump");
+            out.extend_from_slice(&step.stdout);
+            out.extend_from_slice(&step.stderr);
+            display.frame(|px, _, _| frame = px.to_vec());
+            if done(&String::from_utf8_lossy(&out), &frame) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        (String::from_utf8_lossy(&out).into_owned(), frame.clone())
+    };
+    // The frame before any client: its first pixel is the background.
+    let (_, first) = run(&mut vm, 200, &|_, _| false);
+    let background = first[..4].to_vec();
+    vm.write_stdin(b"uname -m\n");
+    let (machine, _) = run(&mut vm, 2000, &|o, _| o.contains('\n'));
+    if !machine.contains("x86_64") {
+        eprintln!("guest is not x86_64; skipping (apk needs x86-64 here)");
+        return;
+    }
+    vm.write_stdin(
+        b"sed -i 's|https|http|' /etc/apk/repositories; apk add -q havoc; echo APK=$?\n",
+    );
+    let (out, _) = run(&mut vm, 200_000, &|o, _| o.contains("APK="));
+    assert!(out.contains("APK=0"), "apk add havoc: {out:?}");
+
+    let drawn = |f: &[u8]| f.chunks(4).filter(|p| *p != &background[..]).count();
+    vm.write_stdin(b"havoc &\n");
+    let (out, shown) = run(&mut vm, 100_000, &|_, f| drawn(f) > 10_000);
+    eprintln!(
+        "--- havoc ---\n{out}\nclients={} drawn={}",
+        display.clients(),
+        drawn(&shown)
+    );
+    assert!(display.clients() >= 1, "havoc connected: {out:?}");
+    assert!(
+        drawn(&shown) > 10_000,
+        "havoc's window is on the frame: {out:?}"
+    );
+
+    // Click into it and type a command: the window changes.
+    use nixvm::display::Input;
+    display.input(Input::PointerMove { x: 100.0, y: 100.0 });
+    display.input(Input::PointerButton {
+        button: 0x110,
+        pressed: true,
+    });
+    display.input(Input::PointerButton {
+        button: 0x110,
+        pressed: false,
+    });
+    let before = shown.clone();
+    for code in [18u32, 46, 35, 24, 57, 30, 48, 46, 28] {
+        // "echo abc\n" as evdev keys
+        display.input(Input::Key {
+            code,
+            pressed: true,
+        });
+        display.input(Input::Key {
+            code,
+            pressed: false,
+        });
+    }
+    let (_, typed) = run(&mut vm, 100_000, &|_, f| f != before.as_slice());
+    assert_ne!(typed, before, "typing into havoc changed its window");
+}
