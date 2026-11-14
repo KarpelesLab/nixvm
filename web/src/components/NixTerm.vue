@@ -41,9 +41,9 @@ import NixDisplay from "./NixDisplay.vue";
 
 const PROMPT = "/ $ ";
 /// What the boot banner suggests running once the display is on.
-/// (havoc and wev are the lightest real Wayland clients in Alpine: ~1.4 MB
-/// each with their dependencies, no cairo or mesa.)
-const DISPLAY_TRY = "apk add havoc wev; havoc &";
+/// (havoc, a Wayland terminal, is the lightest real client in Alpine: 1.4 MB
+/// with its dependencies, no cairo or mesa.)
+const DISPLAY_TRY = "apk add havoc; havoc &";
 
 /// Guest architectures the demo can boot. Both run on the same wasm
 /// interpreter build — the arch is auto-detected from the ELFs inside the

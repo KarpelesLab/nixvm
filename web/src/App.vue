@@ -16,6 +16,8 @@ import NixTerm from "./components/NixTerm.vue";
         type into, runs directly in this tab. The guest even has internet
         access (try <code>apk add curl</code>): its TCP/IP stack runs in the
         sandbox too, and raw IP packets are relayed over a WebSocket tunnel.
+        Turn on <em>display</em> for a graphical screen: nixvm runs a Wayland
+        compositor for the guest (try <code>apk add havoc; havoc &amp;</code>).
       </p>
       <div class="links">
         <a href="https://github.com/KarpelesLab/nixvm" target="_blank" rel="noopener">

@@ -128,14 +128,17 @@ before Start (after boot it takes effect at the next Reboot). It works with
 
 With the display on, the guest boots with `WAYLAND_DISPLAY=/tmp/wayland-0`
 and a private `XDG_RUNTIME_DIR` (`/run/user/<uid>`, mode 0700), so Wayland
-clients started from the shell find it. The lightest real clients in
-Alpine's repositories (over the demo's network tunnel):
+clients started from the shell find it. The lightest real client in
+Alpine's repositories is `havoc`, a small Wayland terminal emulator (1.4 MB
+with its dependencies: no cairo, no mesa). Over the demo's network tunnel:
 
 ```sh
-apk add havoc wev   # ~1.4 MB each with their dependencies: no cairo, no mesa
-havoc &             # a small Wayland terminal emulator (a shell on a pty)
-wev                 # a window that prints every input event it gets
+apk add havoc   # about a minute on the interpreter
+havoc &         # its window shows up within a second; click it and type
 ```
+
+`wev` (`apk add wev`, about as small) opens a window and prints every input
+event it receives, which is handy to check the key and pointer mapping.
 
 (`weston-clients`' `weston-simple-shm` is the classic test client, but the
 package drags in mesa and cairo — about 10 MB to download.)
