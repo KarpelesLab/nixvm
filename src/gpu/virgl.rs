@@ -853,6 +853,61 @@ DCL CONST[0][0]
     }
 
     #[test]
+    fn resources_beyond_the_capset_are_refused() {
+        let (dev, _, _) = device();
+        let tex = |w, h, levels| ResourceDesc {
+            target: target::TEXTURE_2D,
+            format: 67,
+            width: w,
+            height: h,
+            depth: 1,
+            array_size: 1,
+            last_level: levels,
+            ..ResourceDesc::default()
+        };
+        let b = || MemBacking::new(16) as Arc<dyn Backing>;
+        assert!(dev.create_resource(tex(4096, 4096, 12), b()).is_ok());
+        assert!(dev.create_resource(tex(8192, 4, 0), b()).is_err());
+        assert!(dev.create_resource(tex(4, 4, 40), b()).is_err());
+        assert!(dev.create_resource(tex(0, 4, 0), b()).is_err());
+        let buf = |w| ResourceDesc {
+            target: target::BUFFER,
+            width: w,
+            height: 1,
+            depth: 1,
+            array_size: 1,
+            ..ResourceDesc::default()
+        };
+        assert!(dev.create_resource(buf(1 << 30), b()).is_err());
+        // Shadows are counted: four of the largest fill the budget.
+        let big: Vec<u32> = (0..4)
+            .map(|_| dev.create_resource(buf(256 << 20), b()).unwrap())
+            .collect();
+        assert!(dev.create_resource(buf(1), b()).is_err());
+        dev.unref_resource(big[0]);
+        assert!(dev.create_resource(buf(1), b()).is_ok());
+        // A transfer at a silly level is refused, not a panic.
+        let t = dev.create_resource(tex(4, 4, 0), b()).unwrap();
+        let bad = Transfer {
+            res: t,
+            level: 40,
+            bx: Box3 {
+                x: 0,
+                y: 0,
+                z: 0,
+                w: 1,
+                h: 1,
+                d: 1,
+            },
+            offset: 0,
+            stride: 0,
+            layer_stride: 0,
+            to_host: true,
+        };
+        assert!(dev.transfer(&bad).is_err());
+    }
+
+    #[test]
     fn garbage_is_skipped_not_fatal() {
         let (dev, _, _) = device();
         let ctx = dev.create_context();

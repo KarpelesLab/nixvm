@@ -35,6 +35,11 @@ use super::glsl;
 use super::tgsi;
 use super::{Backing, Box3, EINVAL, Errno, GpuBackend, ResourceDesc, Transfer, gl, target};
 
+/// The largest buffer resource, and all of them together: host memory the
+/// guest's limits don't account for.
+const MAX_BUFFER: u32 = 256 << 20;
+const MAX_BUFFER_BYTES: u64 = 1 << 30;
+
 /// The host object behind a resource.
 enum Host {
     Buffer {
@@ -59,7 +64,7 @@ pub(crate) struct Resource {
 
 impl Resource {
     fn level_size(&self, level: u32) -> (u32, u32, u32) {
-        let m = |v: u32| (v >> level).max(1);
+        let m = |v: u32| v.checked_shr(level).unwrap_or(0).max(1);
         let d = if self.desc.target == target::TEXTURE_3D {
             m(self.desc.depth)
         } else {
@@ -285,6 +290,8 @@ pub struct Renderer {
     backend: Box<dyn GpuBackend>,
     trace: bool,
     resources: HashMap<u32, Resource>,
+    /// Bytes of buffer shadows held for the guest.
+    buffer_bytes: u64,
     next_res: u32,
     contexts: HashMap<u32, Context>,
     next_ctx: u32,
@@ -377,6 +384,7 @@ impl Renderer {
             backend,
             trace,
             resources: HashMap::new(),
+            buffer_bytes: 0,
             next_res: 1,
             contexts: HashMap::new(),
             next_ctx: 1,
@@ -442,7 +450,22 @@ impl Renderer {
         desc: ResourceDesc,
         backing: Arc<dyn Backing>,
     ) -> Result<u32, Errno> {
-        if desc.width == 0 || desc.width > 1 << 30 {
+        // What the capset promised, and no more: these become host
+        // allocations the guest's memory limits don't see.
+        let (max_2d, max_3d) = (4096, 256);
+        let ok = if desc.target == target::BUFFER {
+            desc.width > 0
+                && desc.width <= MAX_BUFFER
+                && self.buffer_bytes + u64::from(desc.width) <= MAX_BUFFER_BYTES
+        } else {
+            let dims = if desc.target == target::TEXTURE_3D {
+                desc.width <= max_3d && desc.height <= max_3d && desc.depth <= max_3d
+            } else {
+                desc.width <= max_2d && desc.height <= max_2d && desc.depth <= 1
+            };
+            desc.width > 0 && dims && desc.array_size <= 256 && desc.last_level <= 12
+        };
+        if !ok {
             return Err(EINVAL);
         }
         let fmt = format::lookup(desc.format);
@@ -455,6 +478,7 @@ impl Renderer {
                 None,
                 gl::DYNAMIC_DRAW,
             );
+            self.buffer_bytes += u64::from(desc.width);
             Host::Buffer {
                 gl: b,
                 shadow: vec![0; desc.width as usize],
@@ -514,7 +538,10 @@ impl Renderer {
     pub(crate) fn destroy_resource(&mut self, id: u32) {
         if let Some(r) = self.resources.remove(&id) {
             match r.host {
-                Host::Buffer { gl, .. } => self.backend.delete_buffer(gl),
+                Host::Buffer { gl, shadow } => {
+                    self.buffer_bytes -= shadow.len() as u64;
+                    self.backend.delete_buffer(gl);
+                }
                 Host::Texture { gl, .. } => self.backend.delete_texture(gl),
                 Host::None => {}
             }
@@ -603,6 +630,9 @@ impl Renderer {
             Host::Texture { gl: tex, gl_target } => {
                 let (tex, gl_target) = (*tex, *gl_target);
                 let fmt = r.fmt.ok_or(EINVAL)?;
+                if t.level > r.desc.last_level {
+                    return Err(EINVAL);
+                }
                 let (lw, lh, ld) = r.level_size(t.level);
                 if bx.x + bx.w > lw || bx.y + bx.h > lh || bx.z + bx.d.max(1) > ld.max(1) {
                     return Err(EINVAL);
@@ -1249,7 +1279,9 @@ impl Renderer {
                 self.backend.uniform_4uiv(loc, &data);
             }
             for &k in &ubos[six] {
-                let u = self.sub(ctx).ubos[six][k as usize];
+                let Some(u) = self.sub(ctx).ubos[six].get(k as usize).copied() else {
+                    continue;
+                };
                 if let Some(Host::Buffer { gl: b, .. }) =
                     self.resources.get(&u.res).map(|r| &r.host)
                 {
@@ -1488,11 +1520,17 @@ impl Renderer {
     fn bind_sampler(&mut self, ctx: u32, six: usize, slot: u32, unit: u32) {
         let (view, state) = {
             let sub = self.sub(ctx);
-            let v = match sub.objects.get(&sub.views[six][slot as usize]) {
+            let (Some(&vh), Some(&sh)) = (
+                sub.views[six].get(slot as usize),
+                sub.samplers[six].get(slot as usize),
+            ) else {
+                return;
+            };
+            let v = match sub.objects.get(&vh) {
                 Some(Object::SamplerView(v)) => Some(*v),
                 _ => None,
             };
-            let s = match sub.objects.get(&sub.samplers[six][slot as usize]) {
+            let s = match sub.objects.get(&sh) {
                 Some(Object::SamplerState(s)) => Some(*s),
                 _ => None,
             };
