@@ -128,7 +128,7 @@ impl Vm {
         argv: Vec<String>,
         mem_bytes: u64,
     ) -> Result<Self, String> {
-        Self::boot_squashfs_with(tar_bytes, argv, mem_bytes, None)
+        Self::boot_squashfs_with(tar_bytes, argv, Vec::new(), mem_bytes, None)
     }
 
     /// [`Vm::boot_squashfs`] with the guest's network carried over `tunnel`:
@@ -145,13 +145,31 @@ impl Vm {
         mem_bytes: u64,
         tunnel: crate::tunnel::Tunnel,
     ) -> Result<Self, String> {
-        Self::boot_squashfs_with(tar_bytes, argv, mem_bytes, Some(tunnel))
+        Self::boot_squashfs_with(tar_bytes, argv, Vec::new(), mem_bytes, Some(tunnel))
+    }
+
+    /// [`Vm::boot_squashfs_net`] with `env` (`KEY=VALUE`) added over the
+    /// shell's default environment — e.g. [`display_env`] for a guest that
+    /// talks to a [`Vm::attach_display`] compositor.
+    ///
+    /// # Errors
+    /// As [`Vm::boot_squashfs`].
+    #[cfg(all(feature = "fstool", feature = "tunnel"))]
+    pub fn boot_squashfs_net_env(
+        tar_bytes: &[u8],
+        argv: Vec<String>,
+        env: Vec<String>,
+        mem_bytes: u64,
+        tunnel: crate::tunnel::Tunnel,
+    ) -> Result<Self, String> {
+        Self::boot_squashfs_with(tar_bytes, argv, env, mem_bytes, Some(tunnel))
     }
 
     #[cfg(feature = "fstool")]
     fn boot_squashfs_with(
         tar_bytes: &[u8],
         argv: Vec<String>,
+        env: Vec<String>,
         mem_bytes: u64,
         tunnel: Option<Tunnel>,
     ) -> Result<Self, String> {
@@ -163,7 +181,9 @@ impl Vm {
             "/",
             Box::new(Overlay::new(Box::new(lower), Box::new(TmpFs::new()))),
         );
-        Self::finish(mounts, Start::shell(argv), mem_bytes, tunnel)
+        let mut start = Start::shell(argv);
+        merge_env(&mut start.env, env);
+        Self::finish(mounts, start, mem_bytes, tunnel)
     }
 
     /// Boot a Docker/OCI image: its layers flattened into a read-only root
@@ -228,7 +248,7 @@ impl Vm {
     ) -> Result<Self, String> {
         let Start {
             argv,
-            env,
+            mut env,
             cwd,
             uid,
             gid,
@@ -251,6 +271,7 @@ impl Vm {
                 crate::fs::cgroupfs::ROOT,
             )),
         );
+        install_runtime_dir(&mut mounts, &mut env, uid, gid);
 
         // With host egress enabled, give the guest resolver a nameserver
         // (a stock Alpine minirootfs ships no /etc/resolv.conf, so musl would
@@ -327,6 +348,19 @@ impl Vm {
             stderr,
             finished: None,
         })
+    }
+
+    /// Serve the guest a graphical display: `display` listens on
+    /// [`crate::display::DEFAULT_SOCKET`] and runs as one of the kernel's
+    /// services from the next pump on. Boot with [`display_env`] in the
+    /// environment so the guest's Wayland clients find it.
+    ///
+    /// # Errors
+    /// A message if the socket can't be made (one already exists there).
+    pub fn attach_display(&self, display: &crate::display::Display) -> Result<(), String> {
+        display
+            .attach(&self.kernel, crate::display::DEFAULT_SOCKET)
+            .map_err(|e| format!("attach the display: errno {}", -e))
     }
 
     /// Feed terminal input (keystrokes) to the guest's stdin.
@@ -593,6 +627,63 @@ fn select_backend(arch: Arch) -> Result<Box<dyn crate::vcpu::Backend>, String> {
     // hardware backends don't build, so this always lands on the interpreter
     // there.
     crate::vcpu::select(arch).map_err(|e| e.to_string())
+}
+
+/// The environment a guest needs to reach the display
+/// [`Vm::attach_display`] serves: `WAYLAND_DISPLAY` naming its socket. The
+/// boot adds an `XDG_RUNTIME_DIR` (made 0700 for the guest's user) to an
+/// environment that has `WAYLAND_DISPLAY` but none.
+#[must_use]
+pub fn display_env() -> Vec<String> {
+    vec![format!(
+        "WAYLAND_DISPLAY={}",
+        crate::display::DEFAULT_SOCKET
+    )]
+}
+
+/// Add `extra` (`KEY=VALUE`) to `env`, replacing the entries it names.
+#[cfg(feature = "fstool")]
+fn merge_env(env: &mut Vec<String>, extra: Vec<String>) {
+    let key = |e: &str| e.split_once('=').map_or(e, |(k, _)| k).to_string();
+    for e in extra {
+        let k = key(&e);
+        env.retain(|o| key(o) != k);
+        env.push(e);
+    }
+}
+
+/// Give a guest that talks Wayland its `XDG_RUNTIME_DIR`: where clients
+/// keep their sockets and shared-memory files, and which libraries expect
+/// to exist, private (0700) to the user. Defaults to `/run/user/<uid>` when
+/// `env` has `WAYLAND_DISPLAY` but no `XDG_RUNTIME_DIR`; a directory named
+/// but missing is made.
+fn install_runtime_dir(mounts: &mut MountTable, env: &mut Vec<String>, uid: u32, gid: u32) {
+    let var = |env: &[String], key: &str| {
+        env.iter()
+            .find_map(|e| e.strip_prefix(key)?.strip_prefix('=').map(str::to_string))
+    };
+    let dir = match var(env, "XDG_RUNTIME_DIR") {
+        Some(d) => d,
+        None if var(env, "WAYLAND_DISPLAY").is_some() => {
+            let d = format!("/run/user/{uid}");
+            env.push(format!("XDG_RUNTIME_DIR={d}"));
+            d
+        }
+        None => return,
+    };
+    if !dir.starts_with('/') || mounts.stat(&dir).is_some() {
+        return;
+    }
+    let mut at = String::new();
+    for part in dir.split('/').filter(|p| !p.is_empty()) {
+        at.push('/');
+        at.push_str(part);
+        if mounts.stat(&at).is_none() && mounts.mkdir(&at, 0o755).is_err() {
+            return;
+        }
+    }
+    let _ = mounts.set_mode(&dir, 0o700);
+    let _ = mounts.set_owner(&dir, Some(uid), Some(gid));
 }
 
 fn default_env() -> Vec<String> {

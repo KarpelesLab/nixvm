@@ -128,6 +128,43 @@ fn boots_alpine_from_in_memory_squashfs_overlay() {
     );
 }
 
+/// Boot with the built-in display, as the browser demo's display mode does:
+/// the shell gets `WAYLAND_DISPLAY` and a private `XDG_RUNTIME_DIR`, the
+/// compositor's socket exists in the guest, and the embedder gets a frame.
+#[cfg(all(feature = "fstool", feature = "tunnel"))]
+#[test]
+fn boots_alpine_with_a_display() {
+    let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
+        eprintln!("NIXVM_ALPINE_TAR not set; skipping display boot test");
+        return;
+    };
+    let tar = std::fs::read(&tar_path).expect("read Alpine tar");
+    let mut vm = Vm::boot_squashfs_net_env(
+        &tar,
+        vec!["/bin/busybox".to_string(), "sh".to_string()],
+        nixvm::vm::display_env(),
+        256 * 1024 * 1024,
+        nixvm::tunnel::Tunnel::new(),
+    )
+    .expect("boot");
+    let display = nixvm::display::Display::new(320, 200);
+    vm.attach_display(&display).expect("attach the display");
+    let _ = drain(&mut vm);
+    vm.write_stdin(
+        b"echo \"wd=$WAYLAND_DISPLAY rd=$XDG_RUNTIME_DIR\"; stat -c 'mode=%a uid=%u' $XDG_RUNTIME_DIR; test -S /tmp/wayland-0 && echo socket-ok\n",
+    );
+    let out = drain(&mut vm);
+    eprintln!("--- display env ---\n{out}");
+    assert!(out.contains("wd=/tmp/wayland-0 rd=/run/user/0"), "{out:?}");
+    assert!(out.contains("mode=700 uid=0"), "{out:?}");
+    assert!(out.contains("socket-ok"), "{out:?}");
+    let mut got = None;
+    assert!(display.frame(|px, w, h| got = Some((px.len(), w, h))));
+    assert_eq!(got, Some((320 * 200 * 4, 320, 200)));
+    // Nothing changed since: no new frame.
+    assert!(!display.frame(|_, _, _| {}));
+}
+
 /// Live host-egress smoke test: boot Alpine with `NIXVM_NET=host` set and run
 /// `apk update` against the real mirror over plain HTTP. Gated on **both**
 /// `NIXVM_ALPINE_TAR` *and* `NIXVM_NET=host` (CI doesn't set the latter, so skips it)
