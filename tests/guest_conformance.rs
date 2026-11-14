@@ -46,6 +46,7 @@ const PROGRAMS: &[&str] = &[
     "ptrace_debug",
     "threadwait",
     "connect_again",
+    "pty",
 ];
 
 /// A directory of binaries, also used as the guest's root, so that a program can

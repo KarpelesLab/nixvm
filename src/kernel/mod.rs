@@ -9361,7 +9361,26 @@ impl Kernel {
         // Pty ends answer their own termios/winsize/TIOCGPTN/TIOCSPTLCK/FIONREAD/
         // FIONBIO against the in-VM pty, never the host tty.
         if let Fd::PtyMaster(n) | Fd::PtySlave(n) = f {
-            return self.pty_ioctl(n, matches!(f, Fd::PtyMaster(_)), req, arg, mem);
+            const TIOCSCTTY: u32 = 0x540E;
+            if req == TIOCSCTTY {
+                // `login_tty` (forkpty: every terminal emulator): the pty
+                // becomes the caller's controlling terminal, and its
+                // foreground group the caller's — not that of whoever opened
+                // the slave first (forkpty's parent). Sessions don't track a
+                // controlling terminal here, so only the group is kept.
+                self.ptys.lock().unwrap().set_fg_pgrp(n, pgid_of(&cx.cur));
+                return 0;
+            }
+            let master = matches!(f, Fd::PtyMaster(_));
+            if let Some((plain, get)) = termios2_request(req) {
+                let r = self.pty_ioctl(n, master, plain, arg, mem);
+                return if r == 0 && get {
+                    put_termios2_speeds(arg, mem)
+                } else {
+                    r
+                };
+            }
+            return self.pty_ioctl(n, master, req, arg, mem);
         }
         // The GPU's render node answers its DRM ioctls.
         #[cfg(feature = "gpu")]
@@ -9372,18 +9391,23 @@ impl Kernel {
         }
         // `/dev/tty` on the console: the host terminal's own answers on the CLI
         // path, else the emulated console terminal.
-        if matches!(f, Fd::Tty)
-            && !self.host_tty
-            && let Some(r) = self.console_tty_ioctl(cx, req, arg, mem)
-        {
-            return r;
+        if matches!(f, Fd::Tty) && !self.host_tty {
+            let (plain, get) = termios2_request(req).unwrap_or((req, false));
+            if let Some(r) = self.console_tty_ioctl(cx, plain, arg, mem) {
+                return if r == 0 && get {
+                    put_termios2_speeds(arg, mem)
+                } else {
+                    r
+                };
+            }
         }
         // Terminal-attribute ioctls on the guest's stdio: forward to the real
         // host tty when the guest's stdio is the host's own (the CLI path), so
         // the guest gets a working virtual terminal (size, raw mode, echo). The
         // host ioctl itself returns ENOTTY when the fd isn't actually a tty
         // (output piped), so isatty() stays honest.
-        if self.host_tty && is_tty_ioctl(req) {
+        let (plain, get2) = termios2_request(req).unwrap_or((req, false));
+        if self.host_tty && is_tty_ioctl(plain) {
             let host_fd = match f {
                 Fd::Stdin | Fd::Tty => Some(0),
                 Fd::Stdout => Some(1),
@@ -9391,7 +9415,12 @@ impl Kernel {
                 _ => None,
             };
             if let Some(hfd) = host_fd {
-                return host_tty_ioctl(hfd, req, arg, mem);
+                let r = host_tty_ioctl(hfd, plain, arg, mem);
+                return if r == 0 && get2 {
+                    put_termios2_speeds(arg, mem)
+                } else {
+                    r
+                };
             }
         }
         // Interface queries (`SIOCGIF*`) operate on any socket fd.
@@ -9685,12 +9714,10 @@ impl Kernel {
             }
             // `tcdrain`/`tcsendbreak` (output reaches the master queue instantly,
             // nothing to wait for) and `tcflow` (no software flow control is
-            // modelled): accept every selector as a success no-op. So are
-            // `TIOCSCTTY`/`TIOCNOTTY` (become, or stop being, the session's
-            // controlling terminal): signals already go to the pty's
-            // foreground group, set when the slave is first opened, so what a
-            // terminal emulator's child does after `setsid` just succeeds.
-            TCSBRK | TCSBRKP | TCXONC | 0x540E | 0x5422 => 0,
+            // modelled): accept every selector as a success no-op. So is
+            // `TIOCNOTTY` (stop being the session's controlling terminal;
+            // `TIOCSCTTY` is answered before this, in `sys_ioctl`).
+            TCSBRK | TCSBRKP | TCXONC | 0x5422 => 0,
             // `TIOCOUTQ`: bytes still queued to transmit. Output is flushed to the
             // master immediately, so nothing is ever pending.
             TIOCOUTQ => {
@@ -11897,6 +11924,45 @@ fn page_down(v: u64) -> u64 {
 }
 
 /// The process group of `p` — its explicit `pgid`, or its pid when unset.
+/// The `termios2` requests newer glibc's `tcgetattr`/`tcsetattr` (so
+/// `isatty`) use: `TCGETS2`, `TCSETS2`/`TCSETSW2`/`TCSETSF2`. Their struct
+/// is `struct termios` plus `c_ispeed`/`c_ospeed`, so each is answered as
+/// its plain request; `Some((plain request, whether it's the get))`.
+fn termios2_request(req: u32) -> Option<(u32, bool)> {
+    match req {
+        0x802C_542A => Some((0x5401, true)),  // TCGETS2 → TCGETS
+        0x402C_542B => Some((0x5402, false)), // TCSETS2 → TCSETS
+        0x402C_542C => Some((0x5403, false)), // TCSETSW2 → TCSETSW
+        0x402C_542D => Some((0x5404, false)), // TCSETSF2 → TCSETSF
+        _ => None,
+    }
+}
+
+/// Finish a `TCGETS2` answered as `TCGETS` at `arg`: the input and output
+/// speeds after the `struct termios`, from its `CBAUD` bits.
+fn put_termios2_speeds(arg: u64, mem: &mut GuestMemory) -> i64 {
+    const CBAUD: u32 = 0o10017;
+    let Ok(cflag) = mem.read_u32(arg + 8) else {
+        return err(Errno::EFAULT);
+    };
+    let speed: u32 = match cflag & CBAUD {
+        0o15 => 9600,
+        0o16 => 19200,
+        0o10001 => 57600,
+        0o10002 => 115_200,
+        0o10004 => 460_800,
+        _ => 38400,
+    };
+    let mut b = [0u8; 8];
+    b[..4].copy_from_slice(&speed.to_le_bytes());
+    b[4..].copy_from_slice(&speed.to_le_bytes());
+    if mem.write(arg + pty::TERMIOS_LEN as u64, &b).is_ok() {
+        0
+    } else {
+        err(Errno::EFAULT)
+    }
+}
+
 fn pgid_of(p: &ProcInfo) -> i32 {
     if p.pgid == 0 { p.pid } else { p.pgid }
 }
