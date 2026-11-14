@@ -87,6 +87,7 @@ See [ROADMAP.md](ROADMAP.md) for the phased plan and what's next.
 | **Networking** | in-VM AF_UNIX + AF_INET/AF_INET6 loopback (TCP stream + UDP datagram), plus **host-passthrough egress** (opt-in `NIXVM_NET=host`, native only): guest TCP/UDP to routable addresses is bridged to real host sockets, so **`apk update && apk add` work over the real internet on x86-64**. DNS via a host UDP socket + injected `/etc/resolv.conf`. A browser (WebSocket/pktkit) transport and a `smoltcp` NAT stack are the follow-ups. |
 | **I/O multiplexing** | `poll`/`ppoll`/`select`/`pselect6`, `epoll_create1`/`ctl`/`wait`/`pwait2`, `eventfd2`, `timerfd_*` |
 | **Docker/OCI images** | pull from any registry (Docker Hub, GHCR, Quay, GCR, a mirror; anonymous or with credentials) or load a `docker save` / OCI layout archive, flatten the layers (whiteouts, opaque dirs) and run the entrypoint as `docker run` would — no daemon. CLI, library and wasm ([details](#run-docker-images)) |
+| **GUI apps** | a built-in Wayland compositor (`--display WxH`): foot, GTK 3, weston clients and Chromium run with no compositor in the guest ([details](#gui-apps-the-built-in-wayland-display)) |
 | **Browser demo (wasm)** | working — [**live demo**](https://karpeleslab.github.io/nixvm/): `wasm32-unknown-unknown` + interpreter, built and deployed to GitHub Pages by CI on every push to `main` ([details](#try-it-in-your-browser)) |
 
 The syscall dispatch table in `src/kernel/mod.rs` is broad: process/thread
@@ -199,6 +200,37 @@ env)` boots it on that same link. The live demo does this with
 instead fetch each request `ImagePull` names itself (through a CORS proxy)
 and feed the responses back, or hand `Terminal.from_image_archive` a
 `docker save` file the user picked.
+
+## GUI apps: the built-in Wayland display
+
+nixvm runs a Wayland compositor of its own for the guest — no compositor (and
+no X server) inside it. Guest apps connect to `/tmp/wayland-0` as to any
+compositor and draw into shared memory; nixvm composites their windows into
+one frame and feeds keyboard and pointer input back.
+
+```sh
+target/release/nixvm run --root ./alpine-with-foot --display 1024x768 \
+    --display-png shot.png -- foot
+```
+
+`--display WxH` gives the guest the display, with `WAYLAND_DISPLAY` and an
+`XDG_RUNTIME_DIR` set; `--display-png` saves the frame whenever it changes.
+foot, GTK 3 apps, weston's clients and Chromium
+(`--ozone-platform=wayland`) run on it. The window policy is a kiosk's:
+toplevels fill the display, the newest on top with the keyboard; dialogs are
+centered; menus and other popups go where their positioner puts them. It
+speaks `wl_compositor`, `wl_subcompositor`, `wl_shm`, `wl_seat` (pointer and a
+US keyboard), `wl_output` + `xdg-output`, `xdg-shell`, `xdg-decoration`,
+`wp_viewporter` and a data device (a clipboard shared by the guest's apps);
+apps render in software (no dmabuf/GL).
+
+As a library, `Sandbox::builder().display(w, h)` and `Sandbox::display()`
+give a [`display::Display`](src/display/mod.rs) handle: `frame()` hands over
+the RGBA frame when it changed (each call is a presentation: the apps' frame
+callbacks fire), `input()` sends pointer, keyboard, scroll and resize events,
+`png()` encodes it. The compositor is pure Rust with no threads, so it builds
+for the browser (wasm) too, where the embedder draws the frames on a
+`<canvas>`.
 
 ## Default sandbox layout
 

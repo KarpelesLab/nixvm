@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! nixvm run [--mem <bytes>] [--workdir <dir>] [--root <dir>] [--arch <arch>] -- <cmd> [args...]
+//! nixvm run --root <dir> --display 1024x768 [--display-png <path>] -- <gui app> [args...]
 //! nixvm run --image <name|archive> [--entrypoint <prog>] [--user <user>] [-- <args>...]
 //! nixvm pull <name> [--arch <arch>]
 //! nixvm shell
@@ -249,7 +250,8 @@ fn print_usage() {
         "nixvm — a portable Linux syscall sandbox\n\n\
          USAGE:\n    \
          nixvm run [--mem <size>] [--workdir <dir>] [--root <dir>] [--arch <arch>]\n              \
-                   [--env KEY=VAL]... -- <cmd> [args...]\n    \
+                   [--env KEY=VAL]... [--display WxH [--display-png PATH]]\n              \
+                   -- <cmd> [args...]\n    \
          nixvm run --image <name|archive> [--entrypoint <prog>] [--user <user>]\n              \
                    [--env KEY=VAL]... [-- <args>...]\n    \
          nixvm pull <name> [--arch <arch>]\n    \
