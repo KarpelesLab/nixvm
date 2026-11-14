@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/KarpelesLab/nixvm/compare/v0.0.6...v0.0.7) - 2026-11-14
+
+### Other
+
+- bound what a guest can make the host allocate
+- the GPU acceleration design and status in the roadmap
+- Gallium's blend factors, winding and mip filters, checked against llvmpipe
+- suggest havoc alone; mention the display on the page
+- boot_squashfs_env; a live test runs a Wayland terminal on the display
+- the guest's display on a canvas, with keyboard and mouse
+- forkpty's child owns its terminal; termios2 for newer glibc
+- a Terminal can have a display
+- boot with extra environment, attach the built-in display
+- a virtio-gpu render node for the guest's Mesa, rendered with GLES 3
+- bound what a client can make the host hold
+- the built-in Wayland display, in the README and the CLI's usage
+- frame callbacks before new input; bad opcodes say so
+- a Wayland compositor nixvm runs for the guest
+- the master stays open while any fd on it does
+- a socket nixvm serves in the guest, and the display skeleton
+
 ## [0.0.6](https://github.com/KarpelesLab/nixvm/compare/v0.0.5...v0.0.6) - 2026-11-13
 
 ### Other
