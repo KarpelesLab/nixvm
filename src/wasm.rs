@@ -262,6 +262,30 @@ mod browser {
         /// The last `pump` ran out of its time slice with the guest still
         /// computing (see `is_busy`).
         busy: bool,
+        /// The built-in display, once `enable_display` attached one.
+        display: Option<crate::display::Display>,
+        /// The size of the frame `display_frame` last returned.
+        frame_size: (u32, u32),
+    }
+
+    impl Terminal {
+        fn wrap(vm: crate::vm::Vm, net: crate::tunnel::Tunnel) -> Self {
+            Self {
+                vm,
+                net,
+                out: std::collections::VecDeque::new(),
+                busy: false,
+                display: None,
+                frame_size: (0, 0),
+            }
+        }
+
+        /// Queue `ev` for the display's clients; dropped without a display.
+        fn input(&self, ev: crate::display::Input) {
+            if let Some(d) = &self.display {
+                d.input(ev);
+            }
+        }
     }
 
     #[wasm_bindgen]
@@ -286,20 +310,18 @@ mod browser {
             let net = crate::tunnel::Tunnel::new();
             let vm = crate::vm::Vm::boot_squashfs_net(&tar, argv, MEM_BYTES, net.clone())
                 .map_err(|e| JsError::new(&e))?;
-            Ok(Self {
-                vm,
-                net,
-                out: std::collections::VecDeque::new(),
-                busy: false,
-            })
+            Ok(Self::wrap(vm, net))
         }
 
         /// [`Terminal::new`], on a [`Network`] the page already drives: the
         /// guest's sockets go over it, and either object can pump its packets.
+        /// `env` (`KEY=VALUE`) adds to the shell's environment — say
+        /// [`Terminal::display_env`] to boot for `enable_display`.
         pub fn new_on(
             rootfs_targz: &[u8],
             argv: Vec<String>,
             net: &Network,
+            env: Vec<String>,
         ) -> Result<Terminal, JsError> {
             console_error_panic_hook::set_once();
             let argv = if argv.is_empty() {
@@ -309,14 +331,10 @@ mod browser {
             };
             let tar = crate::fs::tar::gunzip(rootfs_targz, MAX_ROOTFS_BYTES)
                 .map_err(|e| JsError::new(&e))?;
-            let vm = crate::vm::Vm::boot_squashfs_net(&tar, argv, MEM_BYTES, net.net.clone())
-                .map_err(|e| JsError::new(&e))?;
-            Ok(Self {
-                vm,
-                net: net.net.clone(),
-                out: std::collections::VecDeque::new(),
-                busy: false,
-            })
+            let vm =
+                crate::vm::Vm::boot_squashfs_net_env(&tar, argv, env, MEM_BYTES, net.net.clone())
+                    .map_err(|e| JsError::new(&e))?;
+            Ok(Self::wrap(vm, net.net.clone()))
         }
 
         /// Boot a Docker/OCI image a finished [`ImagePull`] fetched, as
@@ -364,12 +382,7 @@ mod browser {
             let net = crate::tunnel::Tunnel::new();
             let vm = crate::vm::Vm::boot_image_net(image, &opts, MEM_BYTES, net.clone())
                 .map_err(|e| JsError::new(&e))?;
-            Ok(Self {
-                vm,
-                net,
-                out: std::collections::VecDeque::new(),
-                busy: false,
-            })
+            Ok(Self::wrap(vm, net))
         }
 
         /// Bring the network link up with the addresses from the tunnel's
@@ -408,12 +421,100 @@ mod browser {
             };
             let vm = crate::vm::Vm::boot_image_net(&image, &opts, MEM_BYTES, net.net.clone())
                 .map_err(|e| JsError::new(&e))?;
-            Ok(Self {
-                vm,
-                net: net.net.clone(),
-                out: std::collections::VecDeque::new(),
-                busy: false,
-            })
+            Ok(Self::wrap(vm, net.net.clone()))
+        }
+
+        /// The environment to boot with (`new_on`'s or `from_image_on`'s
+        /// `env`) for a guest that will use the display `enable_display`
+        /// attaches: `WAYLAND_DISPLAY`, plus a private `XDG_RUNTIME_DIR` the
+        /// boot makes.
+        #[must_use]
+        pub fn display_env() -> Vec<String> {
+            crate::vm::display_env()
+        }
+
+        /// Give the guest a graphical display `width` × `height` pixels:
+        /// nixvm's built-in Wayland compositor, listening on
+        /// `/tmp/wayland-0`. Call right after construction, before the first
+        /// `pump`, with the guest booted with `display_env()`. While a
+        /// display is attached `has_pending_work()` stays true, so the page
+        /// keeps pumping: the user's input can arrive at any time.
+        pub fn enable_display(&mut self, width: u32, height: u32) -> Result<(), JsError> {
+            if self.display.is_some() {
+                return Err(JsError::new("the display is already enabled"));
+            }
+            let display = crate::display::Display::new(width.max(1), height.max(1));
+            self.vm
+                .attach_display(&display)
+                .map_err(|e| JsError::new(&e))?;
+            self.frame_size = display.size();
+            self.display = Some(display);
+            Ok(())
+        }
+
+        /// Whether `enable_display` attached a display.
+        #[must_use]
+        pub fn has_display(&self) -> bool {
+            self.display.is_some()
+        }
+
+        /// The display's frame as RGBA bytes (`width * height * 4`,
+        /// row-major; size from `display_size()`), or `undefined` when it
+        /// hasn't changed since the last call. Calling this is also what
+        /// tells the guest's clients a frame was shown (their frame
+        /// callbacks fire), so call it once per animation frame.
+        #[must_use]
+        pub fn display_frame(&mut self) -> Option<Vec<u8>> {
+            let display = self.display.as_ref()?;
+            let mut out = None;
+            let mut size = self.frame_size;
+            display.frame(|px, w, h| {
+                out = Some(px.to_vec());
+                size = (w, h);
+            });
+            self.frame_size = size;
+            out
+        }
+
+        /// `[width, height]` of the frame `display_frame` last returned (the
+        /// display's size before the first), `[0, 0]` without a display.
+        #[must_use]
+        pub fn display_size(&self) -> Vec<u32> {
+            vec![self.frame_size.0, self.frame_size.1]
+        }
+
+        /// The pointer moved to `(x, y)`, in display pixels.
+        pub fn display_pointer_move(&self, x: f64, y: f64) {
+            self.input(crate::display::Input::PointerMove { x, y });
+        }
+
+        /// A pointer button went down or up: `button` is a Linux `BTN_*`
+        /// code (0x110 left, 0x111 right, 0x112 middle).
+        pub fn display_pointer_button(&self, button: u32, pressed: bool) {
+            self.input(crate::display::Input::PointerButton { button, pressed });
+        }
+
+        /// Scrolling, in pixels: positive `dy` scrolls down.
+        pub fn display_scroll(&self, dx: f64, dy: f64) {
+            self.input(crate::display::Input::Scroll { dx, dy });
+        }
+
+        /// The pointer left the display.
+        pub fn display_pointer_leave(&self) {
+            self.input(crate::display::Input::PointerLeave);
+        }
+
+        /// A key went down or up: `code` is a Linux evdev `KEY_*` code.
+        pub fn display_key(&self, code: u32, pressed: bool) {
+            self.input(crate::display::Input::Key { code, pressed });
+        }
+
+        /// The page's display pane is now `width` × `height` pixels.
+        pub fn display_resize(&self, width: u32, height: u32) {
+            self.input(crate::display::Input::Resize {
+                width: width.max(1),
+                height: height.max(1),
+            });
         }
 
         /// The guest's public IPv6 address while the link is up (the one it
