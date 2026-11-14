@@ -627,9 +627,10 @@ DCL CONST[0][0]
             "{calls:#?}"
         );
         assert!(has("uniform_1f") && has("uniform_4uiv"), "{calls:#?}");
-        // Gallium's default front face is clockwise; flipped, it's CCW.
+        // Gallium's front_ccw = 0 seen with y down is CCW to GL; flipped
+        // by the shader, CW.
         assert!(
-            has("front_face(2305)"),
+            has("front_face(2304)"),
             "flipped viewport inverts the winding: {calls:#?}"
         );
         assert!(
@@ -639,6 +640,125 @@ DCL CONST[0][0]
         let progs = progs.lock().unwrap();
         assert_eq!(progs.len(), 1);
         assert!(progs[0].1.contains("nx_out0 = nx_o0;"));
+    }
+
+    /// The same draw on the host's GL (skipped when it has none), with the
+    /// position and colour in two vertex buffers over one resource, as Mesa
+    /// binds interleaved arrays: the pixels must come back coloured.
+    #[cfg(all(not(target_arch = "wasm32"), target_os = "linux"))]
+    #[test]
+    fn host_gl_draws_from_two_vertex_buffers() {
+        let backend = match crate::gpu::egl::Egl::new() {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skipping: no host EGL ({e})");
+                return;
+            }
+        };
+        let dev = GpuDevice::new(Box::new(backend), false);
+        let ctx = dev.create_context();
+        let tex = |w, h| ResourceDesc {
+            target: target::TEXTURE_2D,
+            format: 67, // R8G8B8A8_UNORM
+            bind: 2,
+            width: w,
+            height: h,
+            depth: 1,
+            array_size: 1,
+            ..ResourceDesc::default()
+        };
+        let fb_backing = MemBacking::new(8 * 8 * 4);
+        let rt = dev.create_resource(tex(8, 8), fb_backing.clone()).unwrap();
+        // Big triangle: (x, y, z) then (r, g, b) per vertex, stride 24.
+        let verts: [f32; 18] = [
+            -3.0, -1.0, 0.0, 0.0, 1.0, 0.0, 1.0, -1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 3.0, 0.0, 0.0, 1.0,
+            0.0,
+        ];
+        let vbacking = MemBacking::new(72);
+        for (i, v) in verts.iter().enumerate() {
+            vbacking.write(i as u64 * 4, &v.to_le_bytes());
+        }
+        let buf = ResourceDesc {
+            target: target::BUFFER,
+            format: 64,
+            bind: 16,
+            width: 72,
+            height: 1,
+            depth: 1,
+            array_size: 1,
+            ..ResourceDesc::default()
+        };
+        let vb = dev.create_resource(buf, vbacking).unwrap();
+        let whole = |res, w, h| Transfer {
+            res,
+            level: 0,
+            bx: Box3 {
+                x: 0,
+                y: 0,
+                z: 0,
+                w,
+                h,
+                d: 1,
+            },
+            offset: 0,
+            stride: 0,
+            layer_stride: 0,
+            to_host: true,
+        };
+        dev.transfer(&whole(vb, 72, 1)).unwrap();
+        let mut cmds = vec![];
+        cmds.extend(shader(10, 0, VS));
+        cmds.extend(shader(11, 1, FS));
+        cmds.extend([cmd0(CREATE_OBJECT, OBJ_SURFACE, 5), 20, rt, 67, 0, 0]);
+        cmds.extend([cmd0(SET_FRAMEBUFFER_STATE, 0, 3), 1, 0, 20]);
+        // Two elements, each from its own vertex buffer.
+        cmds.extend([
+            cmd0(CREATE_OBJECT, OBJ_VERTEX_ELEMENTS, 9),
+            30,
+            0,
+            0,
+            0,
+            30,
+            0,
+            0,
+            1,
+            30,
+        ]);
+        cmds.extend([cmd0(BIND_OBJECT, OBJ_VERTEX_ELEMENTS, 1), 30]);
+        cmds.extend([cmd0(SET_VERTEX_BUFFERS, 0, 6), 24, 0, vb, 24, 12, vb]);
+        cmds.extend([
+            cmd0(BIND_SHADER, 0, 2),
+            10,
+            0,
+            cmd0(BIND_SHADER, 0, 2),
+            11,
+            1,
+        ]);
+        cmds.extend([cmd0(SET_CONSTANT_BUFFER, 0, 6), 1, 0]);
+        cmds.extend([1.0f32, 1.0, 1.0, 1.0].map(f32::to_bits));
+        cmds.extend([cmd0(SET_VIEWPORT_STATE, 0, 7), 0]);
+        cmds.extend([4.0f32, 4.0, 0.5, 4.0, 4.0, 0.5].map(f32::to_bits));
+        cmds.extend([
+            cmd0(CLEAR, 0, 8),
+            4,
+            0x3f80_0000,
+            0,
+            0,
+            0x3f80_0000,
+            0,
+            0,
+            0,
+        ]);
+        cmds.extend([cmd0(DRAW_VBO, 0, 12), 0, 3, 4, 0, 1, 0, 0, 0, 0, 0, !0, 0]);
+        dev.submit(ctx, &cmds).unwrap();
+        dev.transfer(&Transfer {
+            to_host: false,
+            ..whole(rt, 8, 8)
+        })
+        .unwrap();
+        let mut px = [0u8; 4];
+        fb_backing.read(4 * (8 * 4 + 4), &mut px);
+        assert_eq!(px, [0, 255, 0, 255], "on {}", dev.backend_name());
     }
 
     #[test]

@@ -9,8 +9,9 @@
 //!
 //! - **Viewport y flip.** A Gallium viewport may scale y negatively (Mesa
 //!   does for window-system buffers, whose row 0 is the top). GL's can't;
-//!   the vertex shader negates `gl_Position.y` instead (`nx_flip_y`) and the
-//!   front face is inverted to match. Rendering always goes to textures
+//!   the vertex shader negates `gl_Position.y` instead (`nx_flip_y`), which
+//!   inverts the winding too. Gallium's `front_ccw` is measured with window
+//!   y pointing down, GL's with it up, so unflipped the face names swap. Rendering always goes to textures
 //!   attached to an FBO, whose row 0 is window y 0 in both APIs, so the
 //!   guest's memory layout comes out right.
 //! - **Base vertex.** GLES 3.0 has no `glDrawElementsBaseVertex`: the vertex
@@ -315,11 +316,11 @@ fn blend_factor(f: u32) -> u32 {
         0x6 => gl::SRC_ALPHA_SATURATE,
         0x7 => gl::CONSTANT_COLOR,
         0x8 => gl::CONSTANT_ALPHA,
-        0x12 => gl::ZERO,
-        0x13 => gl::ONE_MINUS_SRC_COLOR,
-        0x14 => gl::ONE_MINUS_SRC_ALPHA,
-        0x15 => gl::ONE_MINUS_DST_ALPHA,
-        0x16 => gl::ONE_MINUS_DST_COLOR,
+        0x11 => gl::ZERO,
+        0x12 => gl::ONE_MINUS_SRC_COLOR,
+        0x13 => gl::ONE_MINUS_SRC_ALPHA,
+        0x14 => gl::ONE_MINUS_DST_ALPHA,
+        0x15 => gl::ONE_MINUS_DST_COLOR,
         0x17 => gl::ONE_MINUS_CONSTANT_COLOR,
         0x18 => gl::ONE_MINUS_CONSTANT_ALPHA,
         // ONE, and SRC1_* (dual source), which GLES 3.0 lacks.
@@ -1161,9 +1162,13 @@ impl Renderer {
         let (blend, rs, dsa, ves, vp, scissor, stencil_ref, blend_color) = {
             let sub = self.sub(ctx);
             let get = |h: u32| sub.objects.get(&h).cloned();
-            let blend = match get(sub.blend) {
-                Some(Object::Blend(b)) => *b,
-                _ => Blend::default(),
+            let blend = if let Some(Object::Blend(b)) = get(sub.blend) {
+                *b
+            } else {
+                // None bound: blending off, every channel written.
+                let mut b = Blend::default();
+                b.rt[0].colormask = 0xf;
+                b
             };
             let rs = match get(sub.rasterizer) {
                 Some(Object::Rasterizer(r)) => r,
@@ -1301,10 +1306,13 @@ impl Renderer {
                 });
             }
         }
+        // Gallium measures winding with window y pointing down, GL with it
+        // pointing up: the same triangle is "CCW" to one and "CW" to the
+        // other — unless the vertex shader flipped it vertically too.
         b.front_face(if rs.front_ccw() ^ flip {
-            gl::CCW
-        } else {
             gl::CW
+        } else {
+            gl::CCW
         });
         b.enable(gl::POLYGON_OFFSET_FILL, rs.offset_tri());
         if rs.offset_tri() {
@@ -1363,6 +1371,29 @@ impl Renderer {
         }
         self.backend.bind_vertex_array(self.vao);
         let vbufs = self.sub(ctx).vbufs.clone();
+        if self.trace {
+            let c = &self.sub(ctx).consts;
+            eprintln!(
+                "nixvm gpu: draw {info:?}\n  elements {ves:?}\n  buffers {vbufs:?}\n  vs consts {:?}\n  fs consts {:?}",
+                c[0].iter().map(|w| f32::from_bits(*w)).collect::<Vec<_>>(),
+                c[1].iter().map(|w| f32::from_bits(*w)).collect::<Vec<_>>()
+            );
+            for vb in &vbufs {
+                if let Some(Host::Buffer { shadow, .. }) =
+                    self.resources.get(&vb.res).map(|r| &r.host)
+                {
+                    let start = vb.offset as usize;
+                    let words: Vec<f32> = shadow
+                        [start.min(shadow.len())..(start + 48).min(shadow.len())]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c))
+                        .collect();
+                    eprintln!("  buffer {} @{start}: {words:?}", vb.res);
+                }
+            }
+        }
         let bias = if info.indexed {
             i64::from(info.index_bias)
         } else {
@@ -1488,13 +1519,14 @@ impl Renderer {
         let min_img = (s0 >> 9) & 1;
         let min_mip = (s0 >> 11) & 3;
         let mag = (s0 >> 13) & 1;
+        // PIPE_TEX_MIPFILTER_NEAREST = 0, _LINEAR = 1, _NONE = 2.
         let min = match (min_mip, min_img) {
-            (0 | 3, 0) => gl::NEAREST,
-            (0 | 3, _) => gl::LINEAR,
-            (1, 0) => gl::NEAREST_MIPMAP_NEAREST,
-            (1, _) => gl::LINEAR_MIPMAP_NEAREST,
-            (_, 0) => gl::NEAREST_MIPMAP_LINEAR,
-            _ => gl::LINEAR_MIPMAP_LINEAR,
+            (0, 0) => gl::NEAREST_MIPMAP_NEAREST,
+            (0, _) => gl::LINEAR_MIPMAP_NEAREST,
+            (1, 0) => gl::NEAREST_MIPMAP_LINEAR,
+            (1, _) => gl::LINEAR_MIPMAP_LINEAR,
+            (_, 0) => gl::NEAREST,
+            _ => gl::LINEAR,
         };
         // Samplers are set on the texture: one less object kind for a
         // backend to manage, and every texture is bound fresh each draw.
