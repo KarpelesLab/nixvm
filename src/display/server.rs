@@ -370,6 +370,12 @@ pub struct Compositor {
 /// The background where no window covers the display.
 pub const BACKGROUND: u32 = 0xff20_242c;
 
+/// The most objects one client may have (they're host memory).
+const MAX_OBJECTS: usize = 1 << 16;
+
+/// The most clients connected at once; more are hung up on.
+const MAX_CLIENTS: usize = 128;
+
 /// The first id the server allocates for objects it creates.
 const SERVER_IDS: u32 = 0xff00_0000;
 
@@ -473,6 +479,9 @@ impl Compositor {
         let Some(c) = self.clients.get_mut(&cid) else {
             return Ok(());
         };
+        if c.objects.len() >= MAX_OBJECTS {
+            return Err(ProtoError::new(1, wire::ERR_NO_MEMORY, "too many objects"));
+        }
         if id == 0 || id >= SERVER_IDS || c.objects.contains_key(&id) {
             return Err(ProtoError::new(
                 1,
@@ -504,6 +513,10 @@ impl Compositor {
     /// One turn of the compositor's I/O: accept, read and handle requests.
     pub fn pump(&mut self, kernel: &Kernel, listener: usize) {
         while let Some(conn) = kernel.served_accept(listener) {
+            if self.clients.len() >= MAX_CLIENTS {
+                kernel.served_close(conn);
+                continue;
+            }
             let cid = self.next_client;
             self.next_client += 1;
             let mut objects = HashMap::new();

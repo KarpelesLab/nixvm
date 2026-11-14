@@ -11,6 +11,10 @@ use super::server::{Buffer, Compositor, Data, Iface, Pending, Pool, Rect, Role, 
 use super::wire::{self, Args, Ev, ProtoError};
 use crate::kernel::Kernel;
 
+/// The largest buffer a client may make: per side, and in all.
+const MAX_BUFFER_SIDE: i32 = 8192;
+const MAX_BUFFER_PIXELS: i64 = 8192 * 4096;
+
 fn bad_op(obj: u32) -> ProtoError {
     ProtoError::new(obj, wire::ERR_INVALID_METHOD, "bad opcode")
 }
@@ -454,9 +458,13 @@ impl Compositor {
                 let Some(bpp) = render::bytes_per_pixel(format) else {
                     return Err(ProtoError::new(obj, 0, format!("format {format:#x}")));
                 };
+                // The copy nixvm keeps is host memory: bound it.
                 let ok = offset >= 0
                     && w > 0
                     && h > 0
+                    && w <= MAX_BUFFER_SIDE
+                    && h <= MAX_BUFFER_SIDE
+                    && i64::from(w) * i64::from(h) <= MAX_BUFFER_PIXELS
                     && stride > 0
                     && (stride as usize) >= (w as usize) * bpp
                     && i64::from(offset) + i64::from(stride) * i64::from(h)
@@ -733,14 +741,21 @@ fn upload(kernel: &Kernel, buf: &Buffer, img: &mut Image, rect: Option<Rect>) {
     }
     let bpp = render::bytes_per_pixel(buf.format).unwrap_or(4);
     let stride = buf.stride as usize;
-    // One read covers the damaged rows.
-    let start = buf.offset + (y0 * stride + x0 * bpp) as u64;
-    let len = (rh - 1) * stride + rw * bpp;
-    let mut bytes = vec![0u8; len];
-    kernel.served_file_read(&buf.pool.fd, start, &mut bytes);
-    for row in 0..rh {
-        let src = &bytes[row * stride..row * stride + rw * bpp];
-        let d0 = (y0 + row) * w + x0;
-        render::convert_row(buf.format, src, &mut img.pixels[d0..d0 + rw]);
+    // A read covers as many damaged rows as fit in a megabyte.
+    let per_read = ((1 << 20) / stride).clamp(1, rh);
+    let mut bytes = Vec::new();
+    let mut row = 0;
+    while row < rh {
+        let n = per_read.min(rh - row);
+        let start = buf.offset + ((y0 + row) * stride + x0 * bpp) as u64;
+        bytes.clear();
+        bytes.resize((n - 1) * stride + rw * bpp, 0);
+        kernel.served_file_read(&buf.pool.fd, start, &mut bytes);
+        for r in 0..n {
+            let src = &bytes[r * stride..r * stride + rw * bpp];
+            let d0 = (y0 + row + r) * w + x0;
+            render::convert_row(buf.format, src, &mut img.pixels[d0..d0 + rw]);
+        }
+        row += n;
     }
 }

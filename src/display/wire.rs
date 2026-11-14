@@ -27,6 +27,7 @@ pub struct ProtoError {
 /// `wl_display.error` codes.
 pub const ERR_INVALID_OBJECT: u32 = 0;
 pub const ERR_INVALID_METHOD: u32 = 1;
+pub const ERR_NO_MEMORY: u32 = 2;
 
 impl ProtoError {
     pub fn new(object: u32, code: u32, message: impl Into<String>) -> Self {
