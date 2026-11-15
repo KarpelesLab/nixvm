@@ -231,6 +231,10 @@ jobs:
       - name: Build wasm demo library
         run: cargo build --lib --target wasm32-unknown-unknown --features wasm --no-default-features
 
+      # What pages.yml deploys: the demo with the WebGL2 GPU backend.
+      - name: Build wasm demo library with the GPU
+        run: cargo build --lib --target wasm32-unknown-unknown --features wasm,gpu --no-default-features
+
   docs:
     name: Docs build (warnings denied)
     runs-on: ubuntu-latest

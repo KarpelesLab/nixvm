@@ -18,6 +18,9 @@ import NixTerm from "./components/NixTerm.vue";
         sandbox too, and raw IP packets are relayed over a WebSocket tunnel.
         Turn on <em>display</em> for a graphical screen: nixvm runs a Wayland
         compositor for the guest (try <code>apk add havoc; havoc &amp;</code>).
+        Turn on <em>gpu</em> and the guest's Mesa renders OpenGL ES 3.0
+        through WebGL2 (try <code>apk add mesa-dri-gallium mesa-utils</code>,
+        then <code>eglinfo -B -p surfaceless</code>).
       </p>
       <div class="links">
         <a href="https://github.com/KarpelesLab/nixvm" target="_blank" rel="noopener">

@@ -44,12 +44,14 @@ jobs:
         with:
           version: "latest"
 
-      - name: Build the wasm sandbox (src/wasm.rs, `wasm` feature)
+      - name: Build the wasm sandbox (src/wasm.rs, `wasm` + `gpu` features)
         # wasm-pack already builds only the library target (`cargo build --lib`)
         # internally, so it never touches src/bin/run-elf.rs (a native dev
         # harness gated on `cfg(unix)`). Passing an extra `-- --lib` is a
         # duplicate arg that wasm-pack rejects.
-        run: wasm-pack build --target web --no-default-features --features wasm
+        # `gpu` adds the WebGL2 GPU backend (the page's `gpu` toggle, off by
+        # default): about 200 KB more wasm (80 KB gzipped) on 4.9 MB.
+        run: wasm-pack build --target web --no-default-features --features wasm,gpu
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -87,6 +89,9 @@ jobs:
           set -euo pipefail
           mkdir -p web/dist/pkg
           cp pkg/nixvm.js pkg/nixvm_bg.wasm web/dist/pkg/
+          # JS the Rust side imports (src/gpu/webgl.js), which nixvm.js
+          # loads from ./snippets/.
+          [ -d pkg/snippets ] && cp -r pkg/snippets web/dist/pkg/ || true
           [ -f pkg/nixvm.d.ts ] && cp pkg/nixvm.d.ts web/dist/pkg/ || true
           [ -f pkg/nixvm_bg.wasm.d.ts ] && cp pkg/nixvm_bg.wasm.d.ts web/dist/pkg/ || true
 

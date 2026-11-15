@@ -12,8 +12,10 @@ This directory is a self-contained Vite project (`package.json`,
 biggest pieces the app needs at runtime — neither is a JS/npm artifact:
 
 - **`pkg/`** — the wasm-bindgen output of `wasm-pack build --target web
-  --no-default-features --features wasm`, run against `../src/wasm.rs` at
-  the repo root. This is `nixvm.js` + `nixvm_bg.wasm`.
+  --no-default-features --features wasm,gpu`, run against `../src/wasm.rs`
+  at the repo root. This is `nixvm.js` + `nixvm_bg.wasm`, plus
+  `snippets/` (the GPU backend's JS, `src/gpu/webgl.js`, which `nixvm.js`
+  imports).
 - **`rootfs-aarch64.tar.gz` / `rootfs-x86_64.tar.gz`** — upstream Alpine
   minirootfs tarballs (one per guest architecture the page offers),
   downloaded as-is (nothing repacked).
@@ -72,8 +74,8 @@ and drop them into `public/` (already gitignored — see `.gitignore`):
 # from the repo root
 rustup target add wasm32-unknown-unknown
 cargo install wasm-pack
-wasm-pack build --target web --no-default-features --features wasm
-cp pkg/nixvm.js pkg/nixvm_bg.wasm web/public/pkg/  # mkdir -p web/public/pkg first
+wasm-pack build --target web --no-default-features --features wasm,gpu
+cp -r pkg/nixvm.js pkg/nixvm_bg.wasm pkg/snippets web/public/pkg/  # mkdir -p web/public/pkg first
 
 # any Alpine minirootfs works for local testing (fetch one per arch you
 # want the picker to offer); e.g.:
@@ -161,3 +163,45 @@ How it's wired:
   buttons as `BTN_*`, the wheel as pixel scrolling, pointer positions scaled
   to display pixels. Keys still held when the canvas loses the focus are
   released. Otherwise the terminal keeps the keyboard.
+
+## GPU acceleration
+
+The guest can also get a GPU: a virtio-gpu render node
+(`/dev/dri/renderD128`) that stock Mesa drives with its `virgl` driver, and
+that nixvm replays on **WebGL2** in the page (`src/gpu/`, the `gpu` feature;
+see ROADMAP.md, "GPU acceleration"). It is off unless asked for: open the
+page with `?gpu=1`, or press the toolbar's **gpu** button before Start (after
+boot, at the next Reboot). The boot banner names the WebGL renderer, or says
+why there is no GPU (a build without `gpu`, or no WebGL2).
+
+```sh
+apk add mesa-dri-gallium mesa-utils   # ~70 MB: about 5 minutes on the interpreter
+eglinfo -B -p surfaceless             # "virgl (nixvm GLES 3.0)", OpenGL ES 3.0
+```
+
+Mesa offers OpenGL ES 3.0 and desktop GL 2.1. There is nothing to show the
+pictures yet: programs render off-screen (pbuffers, FBOs) and read back.
+
+How it's wired: `Terminal.attach_webgl2(gl)`, right after construction,
+gives the guest the device; `NixTerm.vue` makes the context on a canvas it
+never shows (1×1, no depth/stencil: the guest renders into its own
+textures). Every GL call runs synchronously on the page's thread, through
+`src/gpu/webgl.js` (shipped in `pkg/snippets/`). A lost context is reported
+in the terminal; GL then fails until a Reboot.
+
+### Checking it without a GPU
+
+`scripts/gpu-check.mjs` boots a root in headless Chromium (WebGL2 on
+SwiftShader), runs `tests/guest/gpu_triangle.c` and `gpu_scene.c` there and
+compares their pictures with references rendered natively
+(`NIXVM_GPU=egl nixvm run …`); `--cmd` runs anything else instead, and
+`--no-gpu` leaves the GPU off (llvmpipe, in the same browser). It needs a
+root with Mesa and the two programs in `/opt` (built with `gcc … -lEGL
+-lGLESv2` in an Alpine root with `mesa-dev`), and a wasm-pack build with
+`gpu`:
+
+```sh
+npm install                       # playwright-core
+npx playwright-core install chromium   # or point $CHROME at one
+node scripts/gpu-check.mjs --pkg ../pkg --rootfs root-with-mesa.tar.gz --ref refs/
+```

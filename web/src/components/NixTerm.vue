@@ -44,6 +44,9 @@ const PROMPT = "/ $ ";
 /// (havoc, a Wayland terminal, is the lightest real client in Alpine: 1.4 MB
 /// with its dependencies, no cairo or mesa.)
 const DISPLAY_TRY = "apk add havoc; havoc &";
+/// What the boot banner suggests running once the GPU is on: Mesa's Gallium
+/// drivers (virgl among them) and eglinfo.
+const GPU_TRY = "apk add mesa-dri-gallium mesa-utils; eglinfo -B -p surfaceless";
 
 /// Guest architectures the demo can boot. Both run on the same wasm
 /// interpreter build — the arch is auto-detected from the ELFs inside the
@@ -111,6 +114,17 @@ const paneView = computed(() => {
   if (displayOn.value) return view.value;
   return displayWanted.value ? "split" : "terminal";
 });
+// GPU acceleration: the guest's Mesa renders through a virtio-gpu that
+// nixvm replays on WebGL2 (a canvas that is never shown). Off unless asked
+// for, with `?gpu=1` or the toolbar's gpu button; like the display it is set
+// up at boot. Needs a nixvm build with the `gpu` feature and a browser with
+// WebGL2.
+const gpuParam = pageParams.get("gpu");
+const gpuWanted = ref(gpuParam !== null && !["0", "false", "off", "no"].includes(gpuParam));
+// The running guest has a GPU.
+const gpuOn = ref(false);
+const gpuPending = computed(() => hasBooted.value && gpuWanted.value !== gpuOn.value);
+const gpuLabel = computed(() => `gpu: ${gpuWanted.value ? "on" : "off"}${gpuPending.value ? " (at reboot)" : ""}`);
 const displayLabel = computed(
   () => `display: ${displayWanted.value ? "on" : "off"}${displayPending.value ? " (at reboot)" : ""}`,
 );
@@ -222,6 +236,8 @@ let pumpDue = 0;
 // Set once the wasm instance has trapped (panicked): the session is
 // unrecoverable and every further guest call would throw. Cleared on reboot.
 let guestDead = false;
+// The canvas whose WebGL2 context the running guest's GPU renders with.
+let gpuCanvas = null;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -860,6 +876,8 @@ async function boot() {
       const [w, h] = displayEl.value?.paneSize() ?? [640, 400];
       guestTerm.enable_display(w, h);
     }
+    // Also before pid 1 runs: the render node exists from boot.
+    const gpu = gpuWanted.value ? attachGpu(guestTerm) : null;
     const out = guestTerm.pump();
     if (imageName) {
       writeBanner(`nixvm — ${imageName} (${archId}), pulled over the network and running in your browser.`);
@@ -870,8 +888,14 @@ async function boot() {
     if (withDisplay) {
       writeBanner(`Display on: Wayland clients find it through WAYLAND_DISPLAY. Try: ${DISPLAY_TRY}`);
     }
+    if (gpu?.renderer) {
+      writeBanner(`GPU on: the guest's Mesa (virgl) renders with WebGL2 on ${gpu.renderer}. Try: ${GPU_TRY}`);
+    } else if (gpu) {
+      writeErrorBanner(`GPU off: ${gpu.error}.`);
+    }
     writeBytes(out);
     displayOn.value = withDisplay;
+    gpuOn.value = !!gpu?.renderer;
     hasBooted.value = true;
     status.value = "ready";
     writePrompt();
@@ -888,6 +912,8 @@ async function reboot() {
   cancelPump();
   commandRunning = false;
   displayOn.value = false;
+  gpuOn.value = false;
+  gpuCanvas = null;
   try {
     guestTerm?.free?.();
   } catch {
@@ -906,6 +932,49 @@ async function reboot() {
   xterm.reset();
   status.value = "idle";
   await boot();
+}
+
+// ---- gpu ---------------------------------------------------------------
+
+/// Give `term` (constructed, not yet pumped) a GPU rendering with WebGL2 on
+/// a fresh canvas that is never shown: the guest renders into its own
+/// buffers, so the canvas's drawing buffer stays 1×1 with no depth or
+/// stencil. Returns `{ renderer }` (the WebGL renderer's name), or
+/// `{ error }` saying why there is no GPU.
+function attachGpu(term) {
+  if (typeof term.attach_webgl2 !== "function") {
+    return { error: "this build of nixvm has no GPU support (the `gpu` feature)" };
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = 1;
+  canvas.height = 1;
+  const gl = canvas.getContext("webgl2", {
+    antialias: false,
+    depth: false,
+    stencil: false,
+    preserveDrawingBuffer: false,
+    powerPreference: "high-performance",
+  });
+  if (!gl) return { error: "this browser has no WebGL2" };
+  canvas.addEventListener("webglcontextlost", (e) => {
+    e.preventDefault();
+    if (gpuCanvas === canvas && !guestDead) {
+      writeErrorBanner("The browser lost the GPU's WebGL2 context: guest GL rendering is broken until you Reboot.");
+    }
+  });
+  try {
+    term.attach_webgl2(gl);
+  } catch (err) {
+    return { error: err?.message ?? String(err) };
+  }
+  gpuCanvas = canvas;
+  const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+  return { renderer: String(dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) };
+}
+
+/// Turn the GPU on or off for the next boot.
+function toggleGpu() {
+  gpuWanted.value = !gpuWanted.value;
 }
 
 // ---- display -----------------------------------------------------------
@@ -1042,6 +1111,20 @@ onBeforeUnmount(() => {
         @click="toggleDisplay"
       >
         {{ displayLabel }}
+      </button>
+      <button
+        class="display-btn gpu-btn"
+        :class="{ 'is-on': gpuWanted, 'is-pending': gpuPending }"
+        :aria-pressed="gpuWanted"
+        :disabled="rebootDisabled"
+        :title="
+          gpuPending
+            ? `The GPU turns ${gpuWanted ? 'on' : 'off'} when you Reboot.`
+            : 'GPU acceleration: the guest\'s Mesa (virgl driver) renders with WebGL2 in this browser. Takes effect at boot.'
+        "
+        @click="toggleGpu"
+      >
+        {{ gpuLabel }}
       </button>
       <button class="reboot-btn" :disabled="rebootDisabled" @click="hasBooted ? reboot() : boot()">
         {{ bootLabel }}
