@@ -221,8 +221,11 @@ toplevels fill the display, the newest on top with the keyboard; dialogs are
 centered; menus and other popups go where their positioner puts them. It
 speaks `wl_compositor`, `wl_subcompositor`, `wl_shm`, `wl_seat` (pointer and a
 US keyboard), `wl_output` + `xdg-output`, `xdg-shell`, `xdg-decoration`,
-`wp_viewporter` and a data device (a clipboard shared by the guest's apps);
-apps render in software (no dmabuf/GL).
+`wp_viewporter` and a data device (a clipboard shared by the guest's apps).
+Apps render in software unless nixvm is built with `--features gpu` and run
+with `NIXVM_GPU=egl`: then it also offers `zwp_linux_dmabuf_v1`, and GL apps
+(Mesa's Wayland EGL: es2gears, weston-simple-egl, GTK's GL area) render on
+the virtual GPU and show up — see the GPU section of ROADMAP.md.
 
 As a library, `Sandbox::builder().display(w, h)` and `Sandbox::display()`
 give a [`display::Display`](src/display/mod.rs) handle: `frame()` hands over
