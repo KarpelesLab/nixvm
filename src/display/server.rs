@@ -47,6 +47,9 @@ pub enum Iface {
     Decoration,
     Viewporter,
     Viewport,
+    LinuxDmabuf,
+    DmabufParams,
+    DmabufFeedback,
 }
 
 /// The globals, in registry order: interface, its name, highest version.
@@ -61,6 +64,8 @@ pub const GLOBALS: &[(Iface, &str, u32)] = &[
     (Iface::DecorationManager, "zxdg_decoration_manager_v1", 1),
     (Iface::Viewporter, "wp_viewporter", 1),
     (Iface::XdgOutputManager, "zxdg_output_manager_v1", 3),
+    // Only offered while the VM has a GPU (see `Compositor::offers`).
+    (Iface::LinuxDmabuf, "zwp_linux_dmabuf_v1", 4),
 ];
 
 /// A client's shared-memory pool: the file it passed, read at commit.
@@ -99,6 +104,10 @@ pub enum Data {
     None,
     Pool(Arc<Pool>),
     Buffer(Buffer),
+    /// A `wl_buffer` that is a GPU buffer (see [`super::dmabuf`]).
+    DmaBuffer(Arc<super::dmabuf::DmaBuffer>),
+    /// A dmabuf params object's planes.
+    Params(Box<super::dmabuf::Params<ServedFd>>),
     Positioner(Positioner),
     /// Objects that extend a surface (`xdg_surface`, `xdg_toplevel`,
     /// `xdg_popup`, `wl_subsurface`, `wp_viewport`, the decoration): its id.
@@ -365,6 +374,12 @@ pub struct Compositor {
     pub presented: u64,
     /// The clipboard: the data source (client, object) that holds it.
     pub selection: Option<SurfRef>,
+    /// The VM's GPU, once a client has needed it (see [`Self::gpu`]).
+    pub gpu: Option<Arc<dyn super::dmabuf::GpuFrames>>,
+    /// Where the dmabuf format table goes in the guest, and whether it's
+    /// there yet.
+    pub format_table_path: String,
+    pub format_table_written: bool,
 }
 
 /// The background where no window covers the display.
@@ -414,6 +429,9 @@ impl Compositor {
             last_fire_ms: 0,
             presented: 0,
             selection: None,
+            gpu: None,
+            format_table_path: String::new(),
+            format_table_written: false,
         }
     }
 
@@ -627,8 +645,8 @@ impl Compositor {
         };
         let (iface, version) = (o.iface, o.version);
         let r = match iface {
-            Iface::Display => self.req_display(cid, op, a),
-            Iface::Registry => self.req_registry(cid, op, a),
+            Iface::Display => self.req_display(kernel, cid, op, a),
+            Iface::Registry => self.req_registry(kernel, cid, op, a),
             Iface::Compositor => self.req_compositor(cid, obj, version, op, a),
             Iface::Surface => self.req_surface(kernel, cid, obj, op, a),
             Iface::Region
@@ -657,6 +675,9 @@ impl Compositor {
             Iface::Decoration => self.req_decoration(cid, obj, op, a),
             Iface::Viewporter => self.req_viewporter(cid, obj, op, a),
             Iface::Viewport => self.req_viewport(cid, obj, op, a),
+            Iface::LinuxDmabuf => self.req_dmabuf(kernel, cid, obj, version, op, a),
+            Iface::DmabufParams => self.req_params(kernel, cid, obj, op, a),
+            Iface::DmabufFeedback => self.req_dmabuf_feedback(cid, obj, op),
             Iface::Callback => Err(ProtoError::new(
                 obj,
                 wire::ERR_INVALID_METHOD,
@@ -685,7 +706,18 @@ impl Compositor {
         Ok(())
     }
 
-    fn req_display(&mut self, cid: u32, op: u16, a: &mut Args) -> Result<(), ProtoError> {
+    /// Whether global `iface` is offered now: the dmabuf one only with a GPU.
+    fn offers(&mut self, kernel: &Kernel, iface: Iface) -> bool {
+        iface != Iface::LinuxDmabuf || self.gpu(kernel).is_some()
+    }
+
+    fn req_display(
+        &mut self,
+        kernel: &Kernel,
+        cid: u32,
+        op: u16,
+        a: &mut Args,
+    ) -> Result<(), ProtoError> {
         match op {
             0 => {
                 // sync
@@ -700,7 +732,10 @@ impl Compositor {
                 // get_registry
                 let id = a.uint()?;
                 self.create(cid, id, Iface::Registry, 1, Data::None)?;
-                for (i, (_, name, version)) in GLOBALS.iter().enumerate() {
+                for (i, (iface, name, version)) in GLOBALS.iter().enumerate() {
+                    if !self.offers(kernel, *iface) {
+                        continue;
+                    }
                     let gname = u32::try_from(i + 1).unwrap_or(0);
                     self.send(cid, Ev::new(id, 0).uint(gname).string(name).uint(*version));
                 }
@@ -710,7 +745,13 @@ impl Compositor {
         }
     }
 
-    fn req_registry(&mut self, cid: u32, op: u16, a: &mut Args) -> Result<(), ProtoError> {
+    fn req_registry(
+        &mut self,
+        kernel: &Kernel,
+        cid: u32,
+        op: u16,
+        a: &mut Args,
+    ) -> Result<(), ProtoError> {
         if op != 0 {
             return Err(ProtoError::new(1, wire::ERR_INVALID_METHOD, "bad opcode"));
         }
@@ -725,7 +766,7 @@ impl Compositor {
                 format!("no global {name}"),
             ));
         };
-        if gname != iface_name || version == 0 || version > max {
+        if gname != iface_name || version == 0 || version > max || !self.offers(kernel, iface) {
             return Err(ProtoError::new(
                 1,
                 wire::ERR_INVALID_OBJECT,
@@ -746,6 +787,7 @@ impl Compositor {
                 }
             }
             Iface::Output => self.send_output(cid, id, version),
+            Iface::LinuxDmabuf => self.bind_dmabuf(cid, id, version),
             _ => {}
         }
         Ok(())
@@ -765,6 +807,13 @@ impl Compositor {
         }
         for f in c.outfds.drain(..) {
             kernel.served_drop_fd(f);
+        }
+        for o in c.objects.values_mut() {
+            if let Data::Params(p) = &mut o.data {
+                for f in p.take_fds() {
+                    kernel.served_drop_fd(f);
+                }
+            }
         }
         kernel.served_close(c.conn);
         self.stack.retain(|s| s.0 != cid);

@@ -15,8 +15,10 @@
 //! (ARGB/XRGB/ABGR/XBGR 8888, RGB565), `wl_seat` (pointer and keyboard, a
 //! US XKB keymap), `wl_output` and `zxdg_output_manager_v1`, `xdg_wm_base`
 //! (toplevels, popups placed by their positioner), `wl_data_device_manager`
-//! (a clipboard between guest clients), `zxdg_decoration_manager_v1` and
-//! `wp_viewporter`. The window policy is a kiosk's: toplevels fill the
+//! (a clipboard between guest clients), `zxdg_decoration_manager_v1`,
+//! `wp_viewporter`, and — when the VM has a GPU — `zwp_linux_dmabuf_v1`
+//! (v4), so GL clients show what they render on the virtual GPU (see
+//! `dmabuf`). The window policy is a kiosk's: toplevels fill the
 //! display, the newest on top with the keyboard; a dialog (a toplevel with
 //! a parent) is centered at its own size.
 
@@ -138,6 +140,7 @@ impl Display {
         let km = keymap::keymap();
         comp.keymap_path = format!("{socket}.xkb");
         comp.keymap_len = u32::try_from(km.len()).unwrap_or(0);
+        comp.format_table_path = format!("{socket}.formats");
         kernel.served_write_file(&comp.keymap_path, &km, 0o444)?;
         let listener = kernel.served_listen(socket)?;
         kernel.add_service(Box::new(Server {
@@ -249,6 +252,7 @@ impl Service for Server {
     }
 }
 
+mod dmabuf;
 mod keymap;
 mod png;
 mod protocol;

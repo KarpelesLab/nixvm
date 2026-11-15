@@ -130,6 +130,10 @@ pub struct Config {
     /// The built-in Wayland display the guest gets, if any (see
     /// [`SandboxBuilder::display`]).
     pub display: Option<crate::display::Display>,
+    /// The virtual GPU the guest gets (see [`SandboxBuilder::gpu`]); `None`
+    /// leaves it to `NIXVM_GPU`.
+    #[cfg(feature = "gpu")]
+    pub gpu: Option<crate::gpu::GpuDevice>,
 }
 
 /// A host directory shared into the sandbox at a guest mount point.
@@ -181,6 +185,8 @@ impl Default for SandboxBuilder {
                 entrypoint: None,
                 user: None,
                 display: None,
+                #[cfg(feature = "gpu")]
+                gpu: None,
             },
         }
     }
@@ -351,6 +357,15 @@ impl SandboxBuilder {
     #[must_use]
     pub fn display(mut self, width: u32, height: u32) -> Self {
         self.config.display = Some(crate::display::Display::new(width, height));
+        self
+    }
+
+    /// Give the guest the virtual GPU `dev` (`/dev/dri/renderD128`) instead
+    /// of whatever `NIXVM_GPU` asks for.
+    #[cfg(feature = "gpu")]
+    #[must_use]
+    pub fn gpu(mut self, dev: crate::gpu::GpuDevice) -> Self {
+        self.config.gpu = Some(dev);
         self
     }
 
@@ -540,7 +555,7 @@ impl Sandbox {
         // (otherwise the VM is loopback-only and routable connects get
         // ENETUNREACH). No-op unless the env var is set.
         crate::vm::install_egress(&mut kernel);
-        crate::vm::install_gpu(&kernel);
+        self.install_gpu(&kernel);
         calibrate_vdso(vcpu.as_ref(), &mem);
         Ok(kernel.run(vcpu, mem)?)
     }
@@ -683,9 +698,20 @@ impl Sandbox {
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
         crate::vm::install_egress(&mut kernel);
-        crate::vm::install_gpu(&kernel);
+        self.install_gpu(&kernel);
         calibrate_vdso(vcpu.as_ref(), &mem);
         Ok(kernel.run(vcpu, mem)?)
+    }
+
+    /// The GPU the builder was given, else the one `NIXVM_GPU` asks for.
+    #[cfg_attr(not(feature = "gpu"), allow(clippy::unused_self))]
+    fn install_gpu(&self, kernel: &Kernel) {
+        #[cfg(feature = "gpu")]
+        if let Some(dev) = &self.config.gpu {
+            let _ = kernel.attach_gpu(dev.clone());
+            return;
+        }
+        crate::vm::install_gpu(kernel);
     }
 
     /// Select the execution backend per config: the interpreter when forced,

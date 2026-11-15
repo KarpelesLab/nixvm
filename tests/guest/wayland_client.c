@@ -5,16 +5,27 @@
 // built-in display, checks the frame's pixels, then presses a key.
 //
 //   wayland_client [RRGGBB]      (default c03060)
+//   wayland_client gpu RRGGBB    the same window, rendered on the GPU
 //
 // Prints CONFIGURED <w> <h>, COMMITTED, then KEY <code> and PASS.
+//
+// The gpu mode needs nixvm's virtual GPU and talks to it by hand too (no
+// Mesa): it makes a texture on /dev/dri/renderD128, clears it to the color
+// with a virgl command buffer, exports it as a dma-buf (PRIME) and shares
+// that through zwp_linux_dmabuf_v1, after checking the dmabuf feedback
+// names the render node and the format. It passes once the buffer was
+// released and its frame callback fired.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -39,7 +50,14 @@ enum {
     ID_POOL,
     ID_BUFFER,
     ID_FRAME,
+    ID_DMABUF,
+    ID_FEEDBACK,
+    ID_PARAMS,
 };
+
+#define IOWR(nr, size) ((3u << 30) | ((size) << 16) | ('d' << 8) | (nr))
+#define XR24 0x34325258u
+#define MOD_INVALID 0x00ffffffffffffffull
 
 static void die(const char *what) {
     printf("FAIL %s (errno %d)\n", what, errno);
@@ -174,7 +192,10 @@ int main(int argc, char **argv) {
     begin(ID_DISPLAY, 0); // sync
     put(ID_SYNC);
     send_msg(-1);
-    uint32_t g_comp = 0, g_shm = 0, g_wm = 0, g_seat = 0;
+    uint32_t g_comp = 0, g_shm = 0, g_wm = 0, g_seat = 0, g_dmabuf = 0;
+    int gpu = argc > 2 && !strcmp(argv[1], "gpu");
+    if (gpu)
+        rgb = strtoul(argv[2], NULL, 16);
     for (;;) {
         next_event();
         if (ev_obj == ID_REGISTRY && ev_op == 0) {
@@ -187,6 +208,8 @@ int main(int argc, char **argv) {
                 g_wm = ev[0];
             if (!strcmp(name, "wl_seat"))
                 g_seat = ev[0];
+            if (!strcmp(name, "zwp_linux_dmabuf_v1"))
+                g_dmabuf = ev[0];
         } else if (ev_obj == ID_SYNC) {
             break;
         } else {
@@ -195,6 +218,8 @@ int main(int argc, char **argv) {
     }
     if (!g_comp || !g_shm || !g_wm || !g_seat)
         die("missing globals");
+    if (gpu && !g_dmabuf)
+        die("no zwp_linux_dmabuf_v1 (no GPU?)");
 
     if (argc > 1 && !strcmp(argv[1], "error")) {
         // A request the compositor doesn't know must earn a protocol error
@@ -236,6 +261,50 @@ int main(int argc, char **argv) {
         put(binds[i].version);
         put(binds[i].id);
         send_msg(-1);
+    }
+    if (gpu) {
+        begin(ID_REGISTRY, 0);
+        put(g_dmabuf);
+        put_str("zwp_linux_dmabuf_v1");
+        put(4);
+        put(ID_DMABUF);
+        send_msg(-1);
+        begin(ID_DMABUF, 2); // get_default_feedback
+        put(ID_FEEDBACK);
+        send_msg(-1);
+        // The feedback: a format table offering XRGB8888 with an implicit
+        // modifier, and the render node (226:128) as the main device.
+        int table_ok = 0, dev_ok = 0;
+        for (;;) {
+            next_event();
+            if (ev_obj == ID_FEEDBACK && ev_op == 1) { // format_table
+                int fd = take_fd();
+                uint32_t size = ev[0];
+                uint8_t *t = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+                if (t == MAP_FAILED)
+                    die("mmap format table");
+                for (uint32_t i = 0; i + 16 <= size; i += 16) {
+                    uint32_t f;
+                    uint64_t m;
+                    memcpy(&f, t + i, 4);
+                    memcpy(&m, t + i + 8, 8);
+                    table_ok |= f == XR24 && m == MOD_INVALID;
+                }
+                munmap(t, size);
+                close(fd);
+            } else if (ev_obj == ID_FEEDBACK && ev_op == 2) { // main_device
+                uint64_t dev;
+                memcpy(&dev, &ev[1], 8);
+                dev_ok = ev[0] == 8 && dev == ((226u << 8) | 128u);
+            } else if (ev_obj == ID_FEEDBACK && ev_op == 0) { // done
+                break;
+            } else {
+                handle_common();
+            }
+        }
+        if (!table_ok || !dev_ok)
+            die("dmabuf feedback");
+        printf("FEEDBACK OK\n");
     }
     begin(ID_SEAT, 1); // get_keyboard
     put(ID_KEYBOARD);
@@ -280,6 +349,76 @@ int main(int argc, char **argv) {
     send_msg(-1);
 
     size_t size = (size_t)w * h * 4;
+    if (gpu) {
+        int drm = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+        if (drm < 0)
+            die("open render node");
+        // A w x h B8G8R8X8 render target (XRGB8888 in memory).
+        uint32_t rc[14] = {2, 2, (1 << 1) | (1 << 3) | (1 << 18), w, h, 1, 1, 0, 0, 0, 0, 0, size, w * 4};
+        if (ioctl(drm, IOWR(0x44, 56), rc) < 0)
+            die("RESOURCE_CREATE");
+        uint32_t bo = rc[10], res = rc[11];
+        // A sub-context; a surface on the resource as the framebuffer;
+        // clear it to the color.
+        float c[4] = {((rgb >> 16) & 0xff) / 255.0f, ((rgb >> 8) & 0xff) / 255.0f,
+                      (rgb & 0xff) / 255.0f, 1.0f};
+        uint32_t cmd[32];
+        int n = 0;
+#define CMD(op, obj, len) (cmd[n++] = (op) | (obj) << 8 | (len) << 16)
+        CMD(29, 0, 1), cmd[n++] = 1; // CREATE_SUB_CTX 1
+        CMD(28, 0, 1), cmd[n++] = 1; // SET_SUB_CTX 1
+        CMD(1, 8, 5);                // CREATE_OBJECT surface 20 on res
+        cmd[n++] = 20, cmd[n++] = res, cmd[n++] = 2, cmd[n++] = 0, cmd[n++] = 0;
+        CMD(5, 0, 3), cmd[n++] = 1, cmd[n++] = 0, cmd[n++] = 20; // SET_FRAMEBUFFER_STATE
+        CMD(7, 0, 8), cmd[n++] = 4;                             // CLEAR color 0
+        memcpy(&cmd[n], c, 16), n += 4;
+        cmd[n++] = 0, cmd[n++] = 0, cmd[n++] = 0; // depth (f64), stencil
+        struct {
+            uint32_t flags, size;
+            uint64_t command, bo_handles;
+            uint32_t num_bo_handles;
+            int32_t fence_fd;
+        } eb = {0, n * 4, (uintptr_t)cmd, 0, 0, -1};
+        if (ioctl(drm, IOWR(0x42, 32), &eb) < 0)
+            die("EXECBUFFER");
+        // Export it: a dma-buf the size of the object.
+        struct {
+            uint32_t handle, flags;
+            int32_t fd;
+        } prime = {bo, O_CLOEXEC | O_RDWR, -1};
+        if (ioctl(drm, IOWR(0x2d, 12), &prime) < 0)
+            die("PRIME_HANDLE_TO_FD");
+        struct stat st;
+        if (lseek(prime.fd, 0, SEEK_END) != (off_t)size || fstat(prime.fd, &st) < 0 ||
+            st.st_size != (off_t)size)
+            die("dma-buf size");
+        // The handle can go: the dma-buf keeps the buffer.
+        uint32_t close_arg[2] = {bo, 0};
+        if (ioctl(drm, IOWR(0x09, 8), close_arg) < 0)
+            die("GEM_CLOSE");
+        begin(ID_DMABUF, 1); // create_params
+        put(ID_PARAMS);
+        send_msg(-1);
+        begin(ID_PARAMS, 1); // add: fd, plane 0, offset 0, stride, modifier
+        put(0);
+        put(0);
+        put(w * 4);
+        put(MOD_INVALID >> 32);
+        put(MOD_INVALID & 0xffffffff);
+        send_msg(prime.fd);
+        close(prime.fd);
+        begin(ID_PARAMS, 3); // create_immed
+        put(ID_BUFFER);
+        put(w);
+        put(h);
+        put(XR24);
+        put(0);
+        send_msg(-1);
+        begin(ID_PARAMS, 0); // destroy
+        send_msg(-1);
+        close(drm); // the compositor's dma-buf holds the buffer now
+        goto attach;
+    }
     int fd = memfd_create("wl_shm", MFD_CLOEXEC);
     if (fd < 0 || ftruncate(fd, size) < 0)
         die("memfd");
@@ -301,6 +440,7 @@ int main(int argc, char **argv) {
     put(w * 4);
     put(1); // XRGB8888
     send_msg(-1);
+attach:
     begin(ID_SURFACE, 1); // attach
     put(ID_BUFFER);
     put(0);
@@ -319,16 +459,21 @@ int main(int argc, char **argv) {
     send_msg(-1);
     printf("COMMITTED\n");
 
-    int framed = 0;
+    int framed = 0, released = !gpu;
     for (;;) {
         next_event();
-        if (ev_obj == ID_FRAME && ev_op == 0 && !framed) {
+        if (ev_obj == ID_BUFFER && ev_op == 0 && !released) {
+            released = 1;
+            printf("RELEASED\n");
+        } else if (ev_obj == ID_FRAME && ev_op == 0 && !framed) {
             framed = 1;
             printf("FRAME DONE\n");
         } else if (ev_obj == ID_KEYBOARD && ev_op == 1) {
             printf("KEYBOARD ENTER\n");
         } else if (ev_obj == ID_KEYBOARD && ev_op == 3 && ev[3] == 1) {
             printf("KEY %u\n", ev[2]);
+            if (!released)
+                die("the buffer was never released");
             printf(framed ? "PASS\n" : "FAIL no frame callback\n");
             return framed ? 0 : 1;
         } else {
