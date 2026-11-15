@@ -20,8 +20,15 @@
 //! uniform block `nx_<s>ub<k>` with member `nx_<s>u<k>[]`, samplers
 //! `nx_<s>s<n>` — `<s>` being `vs` or `fs`. `nx_flip_y` (vertex) flips the
 //! output vertically for a Gallium viewport with negative y scale (a window
-//! system buffer), `nx_fb_height` (fragment) serves lower-left
-//! `gl_FragCoord`.
+//! system buffer).
+//!
+//! `gl_FragCoord` is TGSI's fragment position as it is: the shader's flip
+//! puts every fragment at Gallium's window position, row 0 at the top, which
+//! is upper-left origin with half-integer centres — all virgl's driver
+//! advertises (as llvmpipe), so Mesa lowers anything else itself with its
+//! own y transform. The `FS_COORD_ORIGIN`/`FS_COORD_PIXEL_CENTER`
+//! properties then only echo what the GLSL asked for; honouring them too
+//! flipped GTK's GL area gradient.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -286,9 +293,6 @@ impl<'a> Gen<'a> {
                 let ty = self.cbuf_type(n);
                 let _ = writeln!(head, "layout(location = {n}) out {ty} nx_out{n};");
             }
-            if self.needs_fb_height() {
-                head.push_str("uniform float nx_fb_height;\n");
-            }
         }
         for (i, imm) in self.sh.imms.iter().enumerate() {
             let vals: Vec<String> = (0..4).map(|c| imm_literal(imm.ty, imm.words[c])).collect();
@@ -309,12 +313,6 @@ impl<'a> Gen<'a> {
         src.push_str(&self.body);
         src.push_str("}\n");
         Ok(src)
-    }
-
-    fn needs_fb_height(&self) -> bool {
-        self.sh
-            .prop("FS_COORD_ORIGIN")
-            .is_some_and(|v| v.first().is_some_and(|o| o == "LOWER_LEFT"))
     }
 
     /// How many colour outputs the fragment shader declares.
@@ -470,7 +468,7 @@ impl<'a> Gen<'a> {
                     .sh
                     .decl(File::Input, r.index as u32)
                     .ok_or_else(|| format!("undeclared IN[{}]", r.index))?;
-                self.fs_input(d)?
+                Self::fs_input(d)?
             }
             File::SystemValue => {
                 let d = self
@@ -483,7 +481,7 @@ impl<'a> Gen<'a> {
                     "INSTANCEID" => "intBitsToFloat(ivec4(gl_InstanceID))".into(),
                     "BASEVERTEX" | "BASEINSTANCE" | "DRAWID" => "intBitsToFloat(ivec4(0))".into(),
                     "FACE" => "vec4(gl_FrontFacing ? 1.0 : -1.0)".into(),
-                    "POSITION" => self.frag_coord(),
+                    "POSITION" => "gl_FragCoord".to_string(),
                     _ => return Err(format!("system value {sem} is not supported")),
                 }
             }
@@ -491,22 +489,7 @@ impl<'a> Gen<'a> {
         })
     }
 
-    fn frag_coord(&self) -> String {
-        let mut e = String::from("gl_FragCoord");
-        if self.needs_fb_height() {
-            e = format!("vec4({e}.x, nx_fb_height - {e}.y, {e}.zw)");
-        }
-        if self
-            .sh
-            .prop("FS_COORD_PIXEL_CENTER")
-            .is_some_and(|v| v.first().is_some_and(|c| c == "INTEGER"))
-        {
-            e = format!("({e} - vec4(0.5, 0.5, 0.0, 0.0))");
-        }
-        e
-    }
-
-    fn fs_input(&self, d: &Decl) -> Result<String, String> {
+    fn fs_input(d: &Decl) -> Result<String, String> {
         let (sem, _) = d
             .semantic
             .as_ref()
@@ -515,7 +498,7 @@ impl<'a> Gen<'a> {
             return Ok(name);
         }
         Ok(match sem.as_str() {
-            "POSITION" => self.frag_coord(),
+            "POSITION" => "gl_FragCoord".to_string(),
             "FACE" => "vec4(gl_FrontFacing ? 1.0 : -1.0)".into(),
             "PCOORD" => "vec4(gl_PointCoord, 0.0, 1.0)".into(),
             s => return Err(format!("fragment input {s} is not supported")),

@@ -255,7 +255,6 @@ struct Program {
     ubos: [Vec<u32>; 2],
     samplers: [Vec<(u32, i32)>; 2],
     flip_y: i32,
-    fb_height: i32,
 }
 
 #[derive(Default)]
@@ -1201,7 +1200,6 @@ impl Renderer {
             ubos: [Vec::new(), Vec::new()],
             samplers: [Vec::new(), Vec::new()],
             flip_y: b.uniform_location(prog, "nx_flip_y"),
-            fb_height: b.uniform_location(prog, "nx_fb_height"),
         };
         for (six, st) in ["vs", "fs"].iter().enumerate() {
             if p.layout.consts[six] > 0 {
@@ -1233,7 +1231,7 @@ impl Renderer {
         if info.count == 0 {
             return;
         }
-        let Some((fb_w, fb_h)) = self.bind_framebuffer(ctx) else {
+        let Some(_) = self.bind_framebuffer(ctx) else {
             return;
         };
         let kinds = self.cbuf_kinds(ctx);
@@ -1302,24 +1300,15 @@ impl Renderer {
         };
         let flip = vp.scale[1] < 0.0;
         // Program and its inputs.
-        let (prog_gl, consts, ubos, samplers, flip_loc, fbh_loc) = {
+        let (prog_gl, consts, ubos, samplers, flip_loc) = {
             let p = self.sub(ctx).programs[&key]
                 .as_ref()
                 .expect("checked above");
-            (
-                p.gl,
-                p.consts,
-                p.ubos.clone(),
-                p.samplers.clone(),
-                p.flip_y,
-                p.fb_height,
-            )
+            (p.gl, p.consts, p.ubos.clone(), p.samplers.clone(), p.flip_y)
         };
         self.backend.use_program(prog_gl);
         self.backend
             .uniform_1f(flip_loc, if flip { -1.0 } else { 1.0 });
-        self.backend
-            .uniform_1f(fbh_loc, f32::from(u16::try_from(fb_h).unwrap_or(u16::MAX)));
         for six in 0..2 {
             let (loc, n) = consts[six];
             if loc >= 0 {
@@ -1444,7 +1433,6 @@ impl Renderer {
         b.color_mask(m & 1 != 0, m & 2 != 0, m & 4 != 0, m & 8 != 0);
         b.enable(gl::SAMPLE_ALPHA_TO_COVERAGE, blend.alpha_to_coverage);
         b.enable(gl::DITHER, false);
-        let _ = fb_w;
         // Vertex input.
         if self.vao == 0 {
             self.vao = self.backend.create_vertex_array();
