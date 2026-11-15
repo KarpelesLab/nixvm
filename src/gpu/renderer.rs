@@ -10,8 +10,10 @@
 //! - **Viewport y flip.** A Gallium viewport may scale y negatively (Mesa
 //!   does for window-system buffers, whose row 0 is the top). GL's can't;
 //!   the vertex shader negates `gl_Position.y` instead (`nx_flip_y`), which
-//!   inverts the winding too. Gallium's `front_ccw` is measured with window
-//!   y pointing down, GL's with it up, so unflipped the face names swap. Rendering always goes to textures
+//!   puts every vertex at the window position Gallium's viewport would.
+//!   Gallium's `front_ccw` is measured in those window coordinates with y
+//!   pointing down, GL's with it up, so the face names always swap
+//!   (flipped or not: a window-system draw with culling showed it). Rendering always goes to textures
 //!   attached to an FBO, whose row 0 is window y 0 in both APIs, so the
 //!   guest's memory layout comes out right.
 //! - **Base vertex.** GLES 3.0 has no `glDrawElementsBaseVertex`: the vertex
@@ -1387,12 +1389,11 @@ impl Renderer {
         }
         // Gallium measures winding with window y pointing down, GL with it
         // pointing up: the same triangle is "CCW" to one and "CW" to the
-        // other — unless the vertex shader flipped it vertically too.
-        b.front_face(if rs.front_ccw() ^ flip {
-            gl::CW
-        } else {
-            gl::CCW
-        });
+        // other. A flipped viewport changes nothing here: the shader's
+        // flip lands every vertex where Gallium's negative scale would, so
+        // GL sees the very window coordinates Gallium's front_ccw speaks of
+        // (Mesa sets front_ccw for them, inverting it for its FBOs).
+        b.front_face(if rs.front_ccw() { gl::CW } else { gl::CCW });
         b.enable(gl::POLYGON_OFFSET_FILL, rs.offset_tri());
         if rs.offset_tri() {
             b.polygon_offset(rs.offset_scale, rs.offset_units);

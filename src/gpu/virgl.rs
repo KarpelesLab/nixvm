@@ -627,11 +627,12 @@ DCL CONST[0][0]
             "{calls:#?}"
         );
         assert!(has("uniform_1f") && has("uniform_4uiv"), "{calls:#?}");
-        // Gallium's front_ccw = 0 seen with y down is CCW to GL; flipped
-        // by the shader, CW.
+        // Gallium's front_ccw = 0, measured with y down, is CCW to GL —
+        // with the viewport flipped too, since the shader's flip puts the
+        // vertices where Gallium's would.
         assert!(
-            has("front_face(2304)"),
-            "flipped viewport inverts the winding: {calls:#?}"
+            has("front_face(2305)"),
+            "the winding names swap, flipped or not: {calls:#?}"
         );
         assert!(
             calls.last().unwrap().starts_with("draw_arrays(4, 0, 3, 1)"),
