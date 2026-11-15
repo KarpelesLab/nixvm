@@ -820,13 +820,47 @@ function's `vendor`/`device` (`0x1af4`/`0x1050`), `config`, `subsystem` →
 
 **Kernel side** (`src/kernel/drm.rs`, an `Fd::Drm` open file):
 `DRM_IOCTL_VERSION` (`virtio_gpu` 0.0 — minor 0 tells Mesa not to ask for
-fence fds), `GET_CAP` (no PRIME yet), `GEM_CLOSE`, `GET_UNIQUE`; virtgpu
+fence fds), `GET_CAP` (PRIME import+export), `GEM_CLOSE`, `GET_UNIQUE`,
+`PRIME_HANDLE_TO_FD`/`FD_TO_HANDLE`; virtgpu
 `GETPARAM` (3D features, capset-query fix, capsets 1+2; no blobs, no context
 init), `GET_CAPS`, `CONTEXT_INIT`, `RESOURCE_CREATE`, `RESOURCE_INFO`, `MAP`,
 `EXECBUFFER`, `TRANSFER_TO_HOST`/`FROM_HOST`, `WAIT`. A GEM object is a
 shared-memory `FileObj` of guest frames (the resource's backing); `MAP` hands
 out `handle << 32` and `mmap` of the node at that offset maps the object like
 a memfd. The device answers synchronously, so `WAIT` never waits.
+PRIME exports an object as an `Fd::DmaBuf` — a real descriptor (SCM_RIGHTS,
+fork, `mmap` of the object's pages, `fstat` size and one inode per buffer,
+`lseek(SEEK_END)`, `DMA_BUF_IOCTL_SYNC`) holding its own resource
+reference, so the object outlives `GEM_CLOSE` until its last descriptor
+goes; exporting twice gives the same buffer, importing gives the file's
+existing handle. `Kernel::served_gpu_resource` maps a descriptor a
+compositor received back to its resource.
+
+**Display** (`src/display/dmabuf.rs`): with a GPU attached the built-in
+compositor offers `zwp_linux_dmabuf_v1` v4 — feedback naming renderD128 as
+the main device, AR24/XR24/AB24/XB24 × LINEAR/INVALID from a format table
+next to the socket (v3 format/modifier events for older binds), params
+validated as the protocol says, `create`/`create_immed`. At commit a
+dma-buf buffer is read back from the host GPU (`GpuDevice::read_texture`,
+the damaged box, in the formats GLES/WebGL2 always read) into the surface
+and released at once, like a `wl_shm` copy. The GPU sits behind a narrow
+`GpuFrames` trait, so without `gpu` the compositor builds and offers no
+dmabuf. Mesa's Wayland EGL platform needs nothing more: `es2gears_wayland`,
+`weston-simple-egl` and GTK3's GL area (`GDK_GL=gles`; GTK3 wants desktop
+GL 3.2 otherwise) render on the virtual GPU and show, matching llvmpipe
+(two renderer bugs that only window-system buffers hit were fixed on the
+way: culling under the flipped viewport, and `gl_FragCoord.y`).
+`tests/gpu_display.rs` (skips without host EGL) has a raw-wire client
+clear a texture with virgl, export it with PRIME and share it; the frame's
+pixels are checked. At 1024×768 fullscreen, unthrottled (RTX 5080 host):
+es2gears ~630 FPS on the GPU vs ~360 on llvmpipe/wl_shm,
+weston-simple-egl `-b` ~710 vs ~500 — the per-commit read-back (3 MB of
+`glReadPixels`) dominates, peglgears offscreen does ~25k.
+Chromium (`--ozone-platform=wayland`): the GPU process comes up on ANGLE
+over virgl's GLES 3.0 (ES3 contexts refused: WebGL 1 only) and, with
+`--disable-gpu-compositing`, WebGL renders on the virtual GPU
+(`ANGLE (Mesa, virgl (nixvm GLES 3.0), OpenGL ES 3.0)`); with GPU
+compositing the window stays blank (see below).
 
 **Capset** (`src/gpu/caps.rs`): `virgl_caps_v2` describing a GLES 3.0 host
 the way virglrenderer does on GLES — GLSL level 130, `VIRGL_CAP_HOST_IS_GLES`,
@@ -902,16 +936,16 @@ few guaranteed format/type pairs (read canonically, then packed:
 picture comparison headlessly.
 
 **Not yet / phase 2.**
-1. *WebGL2 left:* `read_texture` (the display's readback) still reads in the
-   resource's own format/type (fine for the 8-bit RGBA/BGRA buffers the
-   display takes); context loss is only reported; GL errors aren't checked
+1. *WebGL2 left:* context loss is only reported; GL errors aren't checked
    per call; everything runs on the page's thread.
-2. *Display:* rendered frames reach no compositor yet. Phase 2a: read back to
-   shm (the guest's EGL Wayland platform needs PRIME first). 2b: PRIME
-   (`HANDLE_TO_FD`/`FD_TO_HANDLE` as an fd onto the GEM object) +
-   `zwp_linux_dmabuf_v1` in the built-in compositor, compositing the host
-   texture directly (zero copy in the browser, where display and GPU share
-   the WebGL context).
+2. *Display:* composite the host texture directly instead of reading every
+   commit back (zero copy in the browser, where display and GPU share the
+   WebGL context; natively, read only what is about to be shown). Chromium
+   with GPU compositing shows nothing: find what its gbm/SharedImage path
+   (gbm on renderD128, `EGL_EXT_image_dma_buf_import`, modifiers) trips on;
+   Chromium also wants ES3 (desktop GL 3.x / GLES 3.1 caps) for WebGL2.
+   No explicit sync (`wp_linux_drm_syncobj_v1`) or sync files: implicit
+   sync is trivially right on a synchronous device.
 3. *Coverage:* sampler-view swizzles (needed for luminance/alpha formats),
    transform feedback (advertised, not executed), MSAA, per-RT blend,
    conditional render (desktop GL 3.x), `TXQ` level counts, geometry shaders
