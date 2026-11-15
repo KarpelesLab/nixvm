@@ -9387,7 +9387,14 @@ impl Kernel {
         if let Fd::Drm(file) = &f
             && (req >> 8) & 0xff == u32::from(b'd')
         {
-            return self.drm_ioctl(file, req, arg, mem);
+            return self.drm_ioctl(cx, file, req, arg, mem);
+        }
+        // A dma-buf's own ioctls (`DMA_BUF_IOCTL_SYNC`, …).
+        #[cfg(feature = "gpu")]
+        if let Fd::DmaBuf(_) = &f
+            && (req >> 8) & 0xff == u32::from(b'b')
+        {
+            return drm::dmabuf_ioctl(req, arg, mem);
         }
         // `/dev/tty` on the console: the host terminal's own answers on the CLI
         // path, else the emulated console terminal.
@@ -10340,6 +10347,16 @@ impl Kernel {
             }
             return newpos;
         }
+        // A dma-buf seeks only to say how big it is (`SEEK_END`), or back to
+        // the start.
+        #[cfg(feature = "gpu")]
+        if let Some(Fd::DmaBuf(b)) = cx.cur.fds.get(fd as i32) {
+            return match (whence, offset) {
+                (0, 0) => 0,
+                (2, 0) => b.size() as i64,
+                _ => err(Errno::EINVAL),
+            };
+        }
         let (cur, path) = match cx.cur.fds.get(fd as i32) {
             Some(Fd::File { path, offset, .. }) => (offset.get(), path.clone()),
             _ => return err(Errno::ESPIPE),
@@ -10466,6 +10483,21 @@ impl Kernel {
                 mode: 0o020_666,
                 inode: 0x4752_0001,
                 ..stat::char_device_attrs()
+            },
+            // A dma-buf: an anonymous file the size of the buffer.
+            #[cfg(feature = "gpu")]
+            Some(Fd::DmaBuf(b)) => Attrs {
+                kind: NodeKind::File,
+                size: b.size(),
+                mode: 0o100_600,
+                uid: 0,
+                gid: 0,
+                atime: 0,
+                mtime: 0,
+                inode: b.inode(),
+                nlink: 1,
+                rdev: 0,
+                dev: 0xd,
             },
             // A message queue is a regular file on the mqueue filesystem.
             Some(Fd::Mqueue { q, .. }) => Attrs {
@@ -11068,6 +11100,14 @@ impl Kernel {
                 #[cfg(feature = "gpu")]
                 Some(Fd::Drm(file)) => {
                     let Some(m) = file.mapping(offset) else {
+                        return err(Errno::EINVAL);
+                    };
+                    drm_obj = Some(m);
+                    None
+                }
+                #[cfg(feature = "gpu")]
+                Some(Fd::DmaBuf(b)) => {
+                    let Some(m) = b.mapping(offset, len) else {
                         return err(Errno::EINVAL);
                     };
                     drm_obj = Some(m);

@@ -319,6 +319,9 @@ impl Kernel {
             // submitted (and sends no DRM events).
             #[cfg(feature = "gpu")]
             Fd::Drm(_) => POLLOUT,
+            // A dma-buf's implicit fences are always signalled.
+            #[cfg(feature = "gpu")]
+            Fd::DmaBuf(_) => POLLIN | POLLOUT,
             // A host-bridged socket gets a precise readable answer (a peek);
             // in-VM loopback sockets stay best-effort always-ready, since
             // their queues aren't observable from here.

@@ -285,6 +285,36 @@ impl GpuDevice {
         self.with(|r| r.submit(ctx, cmds))
     }
 
+    /// What resource `id` was made as, if it exists.
+    #[must_use]
+    pub fn resource_desc(&self, id: u32) -> Option<ResourceDesc> {
+        self.inner.lock().unwrap().resource_desc(id)
+    }
+
+    /// Read `rect` (x, y, width, height) of 4-byte colour texture `res`'s
+    /// first level into `out` — rows packed, top first, in the resource's
+    /// format as the guest lays it out (B8G8R8A8 is ARGB8888's bytes) —
+    /// from the host's copy, leaving the guest's pages alone. How the
+    /// built-in display shows a buffer the guest rendered and shared.
+    ///
+    /// # Errors
+    /// `EINVAL` for an unknown or unsuitable resource, a box outside it, or
+    /// an `out` too small.
+    pub fn read_texture(
+        &self,
+        res: u32,
+        rect: (u32, u32, u32, u32),
+        out: &mut [u8],
+    ) -> Result<(), Errno> {
+        self.with(|r| r.read_texture(res, rect, out))
+    }
+
+    /// Whether `other` is this same device.
+    #[must_use]
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// The renderer name the backend reports.
     #[must_use]
     pub fn backend_name(&self) -> String {

@@ -208,6 +208,18 @@ impl Kernel {
         got
     }
 
+    /// The GPU resource behind `fd` if it is a dma-buf exported from this
+    /// VM's render node (a buffer a client rendered and shared), with the
+    /// buffer's size in bytes. The resource lives at least as long as `fd`.
+    #[cfg(feature = "gpu")]
+    pub fn served_gpu_resource(&self, fd: &ServedFd) -> Option<(u32, u64)> {
+        let Fd::DmaBuf(b) = &fd.0 else {
+            return None;
+        };
+        let dev = self.gpu.get()?;
+        b.device().same(dev).then(|| (b.resource(), b.size()))
+    }
+
     /// A read-only descriptor on the guest file at `path` (absolute, in the
     /// guest's first mount namespace), for sending to a client: a keymap
     /// nixvm wrote into the guest's filesystem, say.

@@ -709,6 +709,53 @@ impl Renderer {
         }
     }
 
+    /// What resource `id` was made as.
+    pub(crate) fn resource_desc(&self, id: u32) -> Option<ResourceDesc> {
+        self.resources.get(&id).map(|r| r.desc)
+    }
+
+    /// Read the box `(x, y, w, h)` of level 0, layer 0 of 4-byte colour
+    /// texture `res` into `out` (rows packed, top row first — the guest's
+    /// row order, as transfers keep it), in the resource's own byte layout:
+    /// what a transfer to the guest would have written, without touching
+    /// the guest's pages. How the display shows what the guest rendered.
+    pub(crate) fn read_texture(
+        &mut self,
+        res: u32,
+        rect: (u32, u32, u32, u32),
+        out: &mut [u8],
+    ) -> Result<(), Errno> {
+        let (x, y, w, h) = rect;
+        let r = self.resources.get(&res).ok_or(EINVAL)?;
+        let Host::Texture { .. } = r.host else {
+            return Err(EINVAL);
+        };
+        let fmt = r.fmt.ok_or(EINVAL)?;
+        if fmt.bpp != 4 || matches!(fmt.kind, Kind::Depth | Kind::DepthStencil) {
+            return Err(EINVAL);
+        }
+        let (lw, lh, _) = r.level_size(0);
+        let n = w as usize * h as usize * 4;
+        if x.checked_add(w).is_none_or(|e| e > lw)
+            || y.checked_add(h).is_none_or(|e| e > lh)
+            || out.len() < n
+        {
+            return Err(EINVAL);
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let fbo = self.read_fbo();
+        self.backend.bind_framebuffer(gl::READ_FRAMEBUFFER, fbo);
+        self.attach(gl::READ_FRAMEBUFFER, gl::COLOR_ATTACHMENT0, res, 0, 0);
+        self.backend.read_buffer(gl::COLOR_ATTACHMENT0);
+        let out = &mut out[..n];
+        self.backend
+            .read_pixels(x as i32, y as i32, w, h, fmt.format, fmt.ty, out);
+        fmt.convert_in_place(out);
+        Ok(())
+    }
+
     pub(crate) fn submit(&mut self, ctx: u32, cmds: &[u32]) -> Result<(), Errno> {
         if !self.contexts.contains_key(&ctx) {
             return Err(EINVAL);

@@ -187,6 +187,9 @@ pub enum Fd {
     /// An open GPU render node (`/dev/dri/renderD128`).
     #[cfg(feature = "gpu")]
     Drm(super::drm::DrmFile),
+    /// A dma-buf: a GPU buffer object exported from a render node.
+    #[cfg(feature = "gpu")]
+    DmaBuf(super::drm::DmaBuf),
     /// `/proc/<pid>/mem`: process `pid`'s address space `mm` as it was when
     /// opened, at the (shared) position `offset`.
     ProcMem {

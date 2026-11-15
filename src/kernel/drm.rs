@@ -16,7 +16,14 @@
 //!
 //! The device answers synchronously, so `WAIT` never waits and execbuffers
 //! carry no fences (the driver reports version 0.0, which tells Mesa not to
-//! ask for fence fds). No blobs, no PRIME sharing yet (phase 2).
+//! ask for fence fds). No blobs.
+//!
+//! PRIME: `PRIME_HANDLE_TO_FD` exports an object as a [`DmaBuf`] descriptor
+//! and `PRIME_FD_TO_HANDLE` imports one back (the same handle if the file
+//! already has the object). That is how Mesa's Wayland platform hands its
+//! rendered buffers to a compositor — nixvm's own ([`crate::display`]),
+//! which finds the resource behind the descriptor and reads it back from
+//! the host GPU.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -51,6 +58,65 @@ struct Bo {
     res: u32,
     obj: Arc<FileObj>,
     size: u64,
+    /// The dma-buf exported from (or imported as) this object, while it
+    /// lives: exporting again hands out the same buffer, as Linux does.
+    dmabuf: std::sync::Weak<DmaBufInner>,
+}
+
+/// A dma-buf: a buffer object exported by `PRIME_HANDLE_TO_FD`, as a file
+/// of its own that outlives the handle and travels between processes
+/// (`SCM_RIGHTS`, `fork`). It holds a reference on the GPU resource, so the
+/// object stays until the last handle *and* the last dma-buf descriptor are
+/// gone. Its pages are the object's: `mmap` maps them like a memfd's.
+#[derive(Debug, Clone)]
+pub struct DmaBuf(Arc<DmaBufInner>);
+
+#[derive(Debug)]
+pub struct DmaBufInner {
+    dev: GpuDevice,
+    res: u32,
+    obj: Arc<FileObj>,
+    size: u64,
+}
+
+impl Drop for DmaBufInner {
+    fn drop(&mut self) {
+        self.dev.unref_resource(self.res);
+    }
+}
+
+impl DmaBuf {
+    /// The GPU resource the buffer is.
+    #[must_use]
+    pub fn resource(&self) -> u32 {
+        self.0.res
+    }
+
+    /// Its size in bytes (what `lseek(SEEK_END)` reports).
+    #[must_use]
+    pub fn size(&self) -> u64 {
+        self.0.size
+    }
+
+    /// The device it belongs to.
+    #[must_use]
+    pub fn device(&self) -> &GpuDevice {
+        &self.0.dev
+    }
+
+    /// The inode `fstat` reports: one per buffer, so clients comparing
+    /// `st_ino` (to see whether two descriptors are the same buffer) can.
+    #[must_use]
+    pub fn inode(&self) -> u64 {
+        0x444d_4142_0000_0000 | u64::from(self.0.res)
+    }
+
+    /// The pages behind map offset `offset` (bytes; page-aligned and
+    /// within the buffer), and the page of them it starts at.
+    pub(super) fn mapping(&self, offset: u64, len: u64) -> Option<(Arc<FileObj>, u64)> {
+        (offset.is_multiple_of(PAGE_SIZE) && offset.checked_add(len)? <= self.0.size)
+            .then(|| (Arc::clone(&self.0.obj), offset / PAGE_SIZE))
+    }
 }
 
 impl Drop for DrmInner {
@@ -124,6 +190,11 @@ const PARAM_3D_FEATURES: u64 = 1;
 const PARAM_CAPSET_QUERY_FIX: u64 = 2;
 const PARAM_SUPPORTED_CAPSET_IDS: u64 = 7;
 
+/// `DRM_CAP_PRIME`, and `drm_prime_handle`'s flags (`O_CLOEXEC`, `O_RDWR`).
+const CAP_PRIME: u64 = 5;
+const DRM_CLOEXEC: u32 = 0o2_000_000;
+const DRM_RDWR: u32 = 2;
+
 /// The largest buffer object a guest may make (and a command buffer).
 const MAX_BO: u64 = 1 << 30;
 const MAX_CMD: usize = 16 << 20;
@@ -164,6 +235,12 @@ impl Kernel {
         Ok(())
     }
 
+    /// The attached GPU, if any.
+    #[must_use]
+    pub fn gpu(&self) -> Option<&GpuDevice> {
+        self.gpu.get()
+    }
+
     /// Open the render node: a new DRM file on the attached GPU.
     pub(super) fn open_render_node(&self, cx: &mut ServiceCtx, flags: u64) -> Option<i64> {
         const O_CLOEXEC: u64 = 0o2_000_000;
@@ -184,6 +261,7 @@ impl Kernel {
     #[allow(clippy::too_many_lines, clippy::unused_self)]
     pub(super) fn drm_ioctl(
         &self,
+        cx: &mut ServiceCtx,
         file: &DrmFile,
         req: u32,
         arg: u64,
@@ -243,15 +321,77 @@ impl Kernel {
                 // Global names are for the primary node; render nodes refuse.
                 DRM_IOCTL_GEM_FLINK | DRM_IOCTL_GEM_OPEN => Err(13),
                 DRM_IOCTL_GET_CAP => {
-                    // DRM_CAP_PRIME (5), DRM_CAP_SYNCOBJ (0x13) …: none.
+                    // DRM_CAP_PRIME: import and export. DRM_CAP_SYNCOBJ
+                    // (0x13) and the rest: none.
                     let cap = le64(&a, 0);
                     if cap == 0 || cap > 0x20 {
                         return Err(EINVAL);
                     }
-                    put64(&mut a, 8, 0);
+                    put64(&mut a, 8, if cap == CAP_PRIME { 3 } else { 0 });
                     Ok(true)
                 }
-                DRM_IOCTL_PRIME_HANDLE_TO_FD | DRM_IOCTL_PRIME_FD_TO_HANDLE => Err(95),
+                DRM_IOCTL_PRIME_HANDLE_TO_FD => {
+                    // struct drm_prime_handle { u32 handle; u32 flags; s32 fd }
+                    let (h, flags) = (le32(&a, 0), le32(&a, 4));
+                    if flags & !(DRM_CLOEXEC | DRM_RDWR) != 0 {
+                        return Err(EINVAL);
+                    }
+                    let buf = {
+                        let mut st = inner.st.lock().unwrap();
+                        let bo = st.handles.get_mut(&h).ok_or(2)?; // ENOENT
+                        if let Some(d) = bo.dmabuf.upgrade() {
+                            DmaBuf(d)
+                        } else {
+                            dev.ref_resource(bo.res);
+                            let d = Arc::new(DmaBufInner {
+                                dev: dev.clone(),
+                                res: bo.res,
+                                obj: Arc::clone(&bo.obj),
+                                size: bo.size,
+                            });
+                            bo.dmabuf = Arc::downgrade(&d);
+                            DmaBuf(d)
+                        }
+                    };
+                    let fd = cx.cur.fds.alloc(Fd::DmaBuf(buf));
+                    cx.cur.fds.set_cloexec(fd, flags & DRM_CLOEXEC != 0);
+                    put32(&mut a, 8, fd.cast_unsigned());
+                    Ok(true)
+                }
+                DRM_IOCTL_PRIME_FD_TO_HANDLE => {
+                    let fd = le32(&a, 8).cast_signed();
+                    let buf = match cx.cur.fds.get(fd) {
+                        Some(Fd::DmaBuf(b)) if b.device().same(dev) => b.clone(),
+                        Some(_) => return Err(EINVAL),
+                        None => return Err(9), // EBADF
+                    };
+                    let mut st = inner.st.lock().unwrap();
+                    // The object already has a handle in this file: that one.
+                    let found = st
+                        .handles
+                        .iter()
+                        .find(|(_, bo)| bo.res == buf.0.res)
+                        .map(|(&h, _)| h);
+                    let h = if let Some(h) = found {
+                        h
+                    } else {
+                        dev.ref_resource(buf.0.res);
+                        let h = st.next_handle;
+                        st.next_handle += 1;
+                        st.handles.insert(
+                            h,
+                            Bo {
+                                res: buf.0.res,
+                                obj: Arc::clone(&buf.0.obj),
+                                size: buf.0.size,
+                                dmabuf: Arc::downgrade(&buf.0),
+                            },
+                        );
+                        h
+                    };
+                    put32(&mut a, 0, h);
+                    Ok(true)
+                }
                 VIRTGPU_GETPARAM => {
                     let v: u32 = match le64(&a, 0) {
                         PARAM_3D_FEATURES | PARAM_CAPSET_QUERY_FIX => 1,
@@ -306,7 +446,15 @@ impl Kernel {
                     let mut st = inner.st.lock().unwrap();
                     let h = st.next_handle;
                     st.next_handle += 1;
-                    st.handles.insert(h, Bo { res, obj, size });
+                    st.handles.insert(
+                        h,
+                        Bo {
+                            res,
+                            obj,
+                            size,
+                            dmabuf: std::sync::Weak::new(),
+                        },
+                    );
                     put32(&mut a, 40, h);
                     put32(&mut a, 44, res);
                     Ok(true)
@@ -395,6 +543,31 @@ impl Kernel {
     }
 }
 
+/// An ioctl on a dma-buf (type `'b'`). `DMA_BUF_IOCTL_SYNC` brackets CPU
+/// access; with the device synchronous there is nothing to wait for, so it
+/// only checks its flags. `DMA_BUF_SET_NAME` is accepted and forgotten.
+/// Sync files can't be had (there are no fences): `ENOTTY`, which callers
+/// take as "use implicit sync".
+pub(super) fn dmabuf_ioctl(req: u32, arg: u64, mem: &GuestMemory) -> i64 {
+    const SYNC: u32 = 0;
+    const SET_NAME: u32 = 1;
+    /// `DMA_BUF_SYNC_RW | DMA_BUF_SYNC_END`.
+    const SYNC_FLAGS: u64 = 3 | 4;
+    match req & 0xff {
+        SYNC => {
+            let Ok(flags) = mem.read_u64(arg) else {
+                return errno(14);
+            };
+            if flags & !SYNC_FLAGS != 0 || flags & 3 == 0 {
+                return errno(22);
+            }
+            0
+        }
+        SET_NAME => 0,
+        _ => err(Errno::ENOTTY),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,7 +590,7 @@ mod tests {
 
     #[test]
     fn version_getparam_caps_create_map_transfer() {
-        let (k, mut mem, _, _) = crate::kernel::testutil::setup();
+        let (k, mut mem, _, mut cx) = crate::kernel::testutil::setup();
         let f = file();
         let base = crate::kernel::testutil::BASE;
         // DRM_IOCTL_VERSION with room for the name.
@@ -425,7 +598,7 @@ mod tests {
         v[16..24].copy_from_slice(&32u64.to_le_bytes());
         v[24..32].copy_from_slice(&(base + 0x100).to_le_bytes());
         mem.write(base, &v).unwrap();
-        assert_eq!(k.drm_ioctl(&f, iowr(0, 64), base, &mut mem), 0);
+        assert_eq!(k.drm_ioctl(&mut cx, &f, iowr(0, 64), base, &mut mem), 0);
         let mut out = [0u8; 64];
         mem.read(base, &mut out).unwrap();
         assert_eq!(le64(&out, 16), 10);
@@ -437,18 +610,21 @@ mod tests {
         g[0..8].copy_from_slice(&1u64.to_le_bytes());
         g[8..16].copy_from_slice(&(base + 0x200).to_le_bytes());
         mem.write(base, &g).unwrap();
-        assert_eq!(k.drm_ioctl(&f, iowr(0x43, 16), base, &mut mem), 0);
+        assert_eq!(k.drm_ioctl(&mut cx, &f, iowr(0x43, 16), base, &mut mem), 0);
         assert_eq!(mem.read_u32(base + 0x200).unwrap(), 1);
         g[0..8].copy_from_slice(&99u64.to_le_bytes());
         mem.write(base, &g).unwrap();
-        assert_eq!(k.drm_ioctl(&f, iowr(0x43, 16), base, &mut mem), -22);
+        assert_eq!(
+            k.drm_ioctl(&mut cx, &f, iowr(0x43, 16), base, &mut mem),
+            -22
+        );
         // GET_CAPS set 2.
         let mut c = [0u8; 24];
         c[0..4].copy_from_slice(&2u32.to_le_bytes());
         c[8..16].copy_from_slice(&(base + 0x1000).to_le_bytes());
         c[16..20].copy_from_slice(&(caps::V2_SIZE as u32).to_le_bytes());
         mem.write(base, &c).unwrap();
-        assert_eq!(k.drm_ioctl(&f, iowr(0x49, 24), base, &mut mem), 0);
+        assert_eq!(k.drm_ioctl(&mut cx, &f, iowr(0x49, 24), base, &mut mem), 0);
         assert_eq!(mem.read_u32(base + 0x1000).unwrap(), 2); // max_version
         // RESOURCE_CREATE a 4x4 BGRA texture.
         let mut rc = [0u8; 56];
@@ -459,7 +635,7 @@ mod tests {
             rc[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
         mem.write(base, &rc).unwrap();
-        assert_eq!(k.drm_ioctl(&f, iowr(0x44, 56), base, &mut mem), 0);
+        assert_eq!(k.drm_ioctl(&mut cx, &f, iowr(0x44, 56), base, &mut mem), 0);
         let mut rc = [0u8; 56];
         mem.read(base, &mut rc).unwrap();
         let (bo, res) = (le32(&rc, 40), le32(&rc, 44));
@@ -468,7 +644,7 @@ mod tests {
         let mut m = [0u8; 16];
         m[8..12].copy_from_slice(&bo.to_le_bytes());
         mem.write(base, &m).unwrap();
-        assert_eq!(k.drm_ioctl(&f, iowr(0x41, 16), base, &mut mem), 0);
+        assert_eq!(k.drm_ioctl(&mut cx, &f, iowr(0x41, 16), base, &mut mem), 0);
         let off = mem.read_u64(base).unwrap();
         let (obj, pgoff) = f.mapping(off).unwrap();
         assert_eq!((obj.size(), pgoff), (PAGE_SIZE, 0));
@@ -478,14 +654,17 @@ mod tests {
             t[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
         }
         mem.write(base, &t).unwrap();
-        assert_eq!(k.drm_ioctl(&f, iowr(0x47, 44), base, &mut mem), 0);
+        assert_eq!(k.drm_ioctl(&mut cx, &f, iowr(0x47, 44), base, &mut mem), 0);
         t[16..20].copy_from_slice(&5u32.to_le_bytes());
         mem.write(base, &t).unwrap();
-        assert_eq!(k.drm_ioctl(&f, iowr(0x47, 44), base, &mut mem), -22);
+        assert_eq!(
+            k.drm_ioctl(&mut cx, &f, iowr(0x47, 44), base, &mut mem),
+            -22
+        );
         // GEM_CLOSE, twice.
         mem.write(base, &bo.to_le_bytes()).unwrap();
-        assert_eq!(k.drm_ioctl(&f, iowr(0x09, 8), base, &mut mem), 0);
-        assert_eq!(k.drm_ioctl(&f, iowr(0x09, 8), base, &mut mem), -22);
+        assert_eq!(k.drm_ioctl(&mut cx, &f, iowr(0x09, 8), base, &mut mem), 0);
+        assert_eq!(k.drm_ioctl(&mut cx, &f, iowr(0x09, 8), base, &mut mem), -22);
         assert!(f.mapping(off).is_none());
     }
 
@@ -587,7 +766,7 @@ mod tests {
 
     #[test]
     fn execbuffer_runs_commands_in_a_context_made_on_demand() {
-        let (k, mut mem, _, _) = crate::kernel::testutil::setup();
+        let (k, mut mem, _, mut cx) = crate::kernel::testutil::setup();
         let f = file();
         let base = crate::kernel::testutil::BASE;
         // CREATE_SUB_CTX 1; SET_SUB_CTX 1.
@@ -605,11 +784,184 @@ mod tests {
         eb[4..8].copy_from_slice(&(cmds.len() as u32).to_le_bytes());
         eb[8..16].copy_from_slice(&(base + 0x800).to_le_bytes());
         mem.write(base, &eb).unwrap();
-        assert_eq!(k.drm_ioctl(&f, iowr(0x42, 64), base, &mut mem), 0);
+        assert_eq!(k.drm_ioctl(&mut cx, &f, iowr(0x42, 64), base, &mut mem), 0);
         assert!(f.0.st.lock().unwrap().ctx.is_some());
         // CONTEXT_INIT after that is EEXIST, as on Linux.
-        assert_eq!(k.drm_ioctl(&f, iowr(0x4b, 16), base, &mut mem), -17);
+        assert_eq!(
+            k.drm_ioctl(&mut cx, &f, iowr(0x4b, 16), base, &mut mem),
+            -17
+        );
         // Not a DRM ioctl.
-        assert_eq!(k.drm_ioctl(&f, 0x5401, base, &mut mem), err(Errno::ENOTTY));
+        assert_eq!(
+            k.drm_ioctl(&mut cx, &f, 0x5401, base, &mut mem),
+            err(Errno::ENOTTY)
+        );
+    }
+
+    /// A guest for the PRIME test: a kernel with a recorded GPU and the
+    /// render node open, driven through real syscalls.
+    struct Guest {
+        k: Kernel,
+        mem: GuestMemory,
+        v: crate::kernel::testutil::DummyVcpu,
+        cx: ServiceCtx,
+        node: u64,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    /// Where ioctl arguments go.
+    const ARGS: u64 = crate::kernel::testutil::BASE + 0x100;
+
+    impl Guest {
+        fn new() -> Self {
+            use crate::kernel::testutil::{BASE, put_str, setup};
+            let (k, mut mem, v, cx) = setup();
+            let rec = Recorder::new(false);
+            let calls = Arc::clone(&rec.calls);
+            k.attach_gpu(GpuDevice::new(Box::new(rec), false)).unwrap();
+            put_str(&mut mem, BASE, nodes::RENDER_NODE);
+            let mut g = Self {
+                k,
+                mem,
+                v,
+                cx,
+                node: 0,
+                calls,
+            };
+            let node = g.sys(
+                crate::abi::arch::Sysno::Openat,
+                [(-100i64).cast_unsigned(), BASE, 2, 0, 0, 0],
+            );
+            assert!(node >= 0);
+            g.node = node as u64;
+            g
+        }
+
+        fn sys(&mut self, no: crate::abi::arch::Sysno, a: [u64; 6]) -> i64 {
+            crate::kernel::testutil::call(&self.k, &mut self.cx, &mut self.mem, &mut self.v, no, a)
+        }
+
+        /// `ioctl(fd, req, ARGS)` with `arg` written there first.
+        fn ioctl(&mut self, fd: u64, req: u32, arg: &[u8]) -> i64 {
+            self.mem.write(ARGS, arg).unwrap();
+            self.sys(
+                crate::abi::arch::Sysno::Ioctl,
+                [fd, u64::from(req), ARGS, 0, 0, 0],
+            )
+        }
+
+        fn words(w: &[u32]) -> Vec<u8> {
+            w.iter().flat_map(|x| x.to_le_bytes()).collect()
+        }
+
+        /// `PRIME_HANDLE_TO_FD`: (result, fd).
+        fn export(&mut self, h: u32, flags: u32) -> (i64, i32) {
+            let r = self.ioctl(self.node, iowr(0x2d, 12), &Self::words(&[h, flags, !0]));
+            (r, self.mem.read_u32(ARGS + 8).unwrap().cast_signed())
+        }
+
+        /// `PRIME_FD_TO_HANDLE`: (result, handle).
+        fn import(&mut self, fd: i32) -> (i64, u32) {
+            let r = self.ioctl(
+                self.node,
+                iowr(0x2e, 12),
+                &Self::words(&[0, 0, fd.cast_unsigned()]),
+            );
+            (r, self.mem.read_u32(ARGS).unwrap())
+        }
+
+        /// `fstat(fd)`: (inode, size).
+        fn stat(&mut self, fd: i32) -> (u64, u64) {
+            let st = ARGS + 0x400;
+            let r = self.sys(crate::abi::arch::Sysno::Fstat, [fd as u64, st, 0, 0, 0, 0]);
+            assert_eq!(r, 0);
+            (
+                self.mem.read_u64(st + 8).unwrap(),
+                self.mem.read_u64(st + 48).unwrap(),
+            )
+        }
+
+        fn deleted(&self) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("delete_texture"))
+        }
+    }
+
+    /// PRIME through real syscalls: export a texture twice (one dma-buf),
+    /// import it back (the same handle), and watch the resource outlive its
+    /// handle while a dma-buf descriptor is open — and go with the last.
+    #[test]
+    fn prime_export_import_and_refcounts() {
+        use crate::abi::arch::Sysno;
+        let mut g = Guest::new();
+        let node = g.node;
+        // A 64x64 B8G8R8A8 render target.
+        let rc = Guest::words(&[2, 1, 2, 64, 64, 1, 1, 0, 0, 0, 0, 0, 16384, 0]);
+        assert_eq!(g.ioctl(node, iowr(0x44, 56), &rc), 0);
+        let bo = g.mem.read_u32(ARGS + 40).unwrap();
+        let res = g.mem.read_u32(ARGS + 44).unwrap();
+        // GET_CAP(DRM_CAP_PRIME): import | export.
+        let cap = Guest::words(&[CAP_PRIME as u32, 0, 0, 0]);
+        assert_eq!(g.ioctl(node, iowr(0x0c, 16), &cap), 0);
+        assert_eq!(g.mem.read_u64(ARGS + 8).unwrap(), 3);
+        // Bad flags, unknown handle.
+        assert_eq!(g.export(bo, 1).0, -22);
+        assert_eq!(g.export(99, DRM_CLOEXEC).0, -2);
+        let (r, d1) = g.export(bo, DRM_CLOEXEC | DRM_RDWR);
+        assert_eq!(r, 0);
+        let (r, d2) = g.export(bo, DRM_CLOEXEC);
+        assert_eq!(r, 0);
+        assert!(d1 >= 0 && d2 >= 0 && d1 != d2);
+        // One buffer: the same inode; lseek(SEEK_END) is its size.
+        let (i1, size) = g.stat(d1);
+        assert_eq!(g.stat(d2).0, i1);
+        assert_eq!(size, 16384);
+        let fd1 = d1 as u64;
+        assert_eq!(g.sys(Sysno::Lseek, [fd1, 0, 2, 0, 0, 0]), 16384);
+        assert_eq!(g.sys(Sysno::Lseek, [fd1, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(g.sys(Sysno::Lseek, [fd1, 5, 0, 0, 0, 0]), -22);
+        // DMA_BUF_IOCTL_SYNC: _IOW('b', 0, u64).
+        let sync = (1 << 30) | (8 << 16) | (u32::from(b'b') << 8);
+        assert_eq!(g.ioctl(fd1, sync, &1u64.to_le_bytes()), 0);
+        assert_eq!(g.ioctl(fd1, sync, &4u64.to_le_bytes()), -22);
+        // It maps like the object: a store through one mapping is seen
+        // through the other.
+        let a1 = g.sys(Sysno::Mmap, [0, 16384, 3, 1, fd1, 0]);
+        let a2 = g.sys(Sysno::Mmap, [0, 4096, 3, 1, d2 as u64, 0]);
+        assert!(a1 > 0 && a2 > 0);
+        g.mem.write(a1 as u64, b"shared").unwrap();
+        assert_eq!(g.mem.read_vec(a2 as u64, 6).unwrap(), b"shared");
+        assert!(
+            g.sys(Sysno::Mmap, [0, 20480, 3, 1, fd1, 0]) < 0,
+            "past its end"
+        );
+        // Importing in the exporting file gives the handle it has.
+        assert_eq!(g.import(d2), (0, bo));
+        assert_eq!(g.import(node as i32).0, -22);
+        assert_eq!(g.import(999).0, -9);
+        // GEM_CLOSE: the handle goes, the resource stays for the dma-bufs.
+        assert_eq!(g.ioctl(node, iowr(0x09, 8), &Guest::words(&[bo, 0])), 0);
+        assert!(!g.deleted());
+        // Re-imported, it gets a new handle naming the same resource.
+        let (r, bo2) = g.import(d1);
+        assert_eq!(r, 0);
+        assert_ne!(bo2, bo);
+        assert_eq!(
+            g.ioctl(node, iowr(0x45, 16), &Guest::words(&[bo2, 0, 0, 0])),
+            0
+        );
+        assert_eq!(g.mem.read_u32(ARGS + 4).unwrap(), res);
+        assert_eq!(g.ioctl(node, iowr(0x09, 8), &Guest::words(&[bo2, 0])), 0);
+        // The mappings and one descriptor go: still there.
+        assert_eq!(g.sys(Sysno::Munmap, [a1 as u64, 16384, 0, 0, 0, 0]), 0);
+        assert_eq!(g.sys(Sysno::Munmap, [a2 as u64, 4096, 0, 0, 0, 0]), 0);
+        assert_eq!(g.sys(Sysno::Close, [fd1, 0, 0, 0, 0, 0]), 0);
+        assert!(!g.deleted());
+        // The last reference: the host texture is deleted.
+        assert_eq!(g.sys(Sysno::Close, [d2 as u64, 0, 0, 0, 0, 0]), 0);
+        assert!(g.deleted());
     }
 }
