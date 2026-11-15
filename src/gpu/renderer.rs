@@ -785,8 +785,13 @@ impl Renderer {
         self.attach(gl::READ_FRAMEBUFFER, gl::COLOR_ATTACHMENT0, res, 0, 0);
         self.backend.read_buffer(gl::COLOR_ATTACHMENT0);
         let out = &mut out[..n];
+        // In a format/type GLES and WebGL2 can always read, then packed to
+        // the resource's layout (as transfers to the guest do).
+        let (rformat, rty, rbpp) = fmt.read_as();
+        let mut read = vec![0u8; w as usize * h as usize * rbpp as usize];
         self.backend
-            .read_pixels(x as i32, y as i32, w, h, fmt.format, fmt.ty, out);
+            .read_pixels(x as i32, y as i32, w, h, rformat, rty, &mut read);
+        fmt.pack_read(&read, out);
         fmt.convert_in_place(out);
         Ok(())
     }
