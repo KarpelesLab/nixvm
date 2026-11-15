@@ -793,7 +793,7 @@ discipline held).
   HVF. The sequencing question in §4 is resolved: the demo shipped ahead of
   the full Phase 10 backend, as a static-ELF-runner rather than a full shell.
 
-### GPU acceleration (virgl → GLES 3.0 / WebGL2)  🟡 phase 1 done: the guest's Mesa renders on the host GPU natively; WebGL2 backend written, not yet run in a browser
+### GPU acceleration (virgl → GLES 3.0 / WebGL2)  🟡 phase 1 done: the guest's Mesa renders on the host GPU natively, and with WebGL2 in the browser demo
 
 Optional (`--features gpu`, off by default) and opt-in at run time
 (`NIXVM_GPU=egl|log|null`, or `Terminal::attach_webgl2(gl)` in the browser);
@@ -882,10 +882,30 @@ tests cover the ioctls (through real syscalls: open, ioctl, mmap,
 transfer round trip), capset, TGSI parsing, GLSL generation, the decoder on a
 recorder, and a draw on the host's GL when present.
 
+**In the browser** (`?gpu=1` or the demo's gpu toggle; `web/README.md`).
+The page gives `attach_webgl2` a context on a hidden 1×1 canvas. In headless
+Chromium (WebGL2 on SwiftShader, no GPU), on the interpreter: the stock
+demo's Alpine 3.20 takes `apk add mesa-dri-gallium mesa-utils` over the
+tunnel in ~5½ min and `eglinfo` shows virgl / GLES 3.0 (Mesa 24.0.9);
+`gpu_triangle` is within 1/255 of the native egl render, `gpu_scene`
+identical but for 4 edge/depth-tie pixels of 12288, and
+`tests/guest/gpu_formats.c` (every renderable colour format read back)
+matches llvmpipe byte for byte. `peglgears` (300×300, pbuffer): ~305 FPS on
+WebGL2 vs ~10.5 FPS on llvmpipe in the same tab (shader cache warm; the
+first llvmpipe run spends ~29 s JIT-compiling: 0.07 FPS). `es2gears_wayland`
+on the display (928×480) shows ~35 frames/s. What WebGL2 rejected, fixed:
+toggling `PRIMITIVE_RESTART_FIXED_INDEX` (always on: indices at the type's
+maximum are widened when a draw has restart off), `glReadPixels` outside the
+few guaranteed format/type pairs (read canonically, then packed:
+`Format::read_as`/`pack_read`), float render targets
+(`EXT_color_buffer_float` enabled). `web/scripts/gpu-check.mjs` repeats the
+picture comparison headlessly.
+
 **Not yet / phase 2.**
-1. *WebGL2 in a page:* the backend compiles for wasm32 but hasn't run in a
-   browser; wire `Terminal::attach_webgl2` into `web/` (an offscreen canvas is
-   enough), then find what WebGL2 rejects that native GLES accepts.
+1. *WebGL2 left:* `read_texture` (the display's readback) still reads in the
+   resource's own format/type (fine for the 8-bit RGBA/BGRA buffers the
+   display takes); context loss is only reported; GL errors aren't checked
+   per call; everything runs on the page's thread.
 2. *Display:* rendered frames reach no compositor yet. Phase 2a: read back to
    shm (the guest's EGL Wayland platform needs PRIME first). 2b: PRIME
    (`HANDLE_TO_FD`/`FD_TO_HANDLE` as an fd onto the GEM object) +

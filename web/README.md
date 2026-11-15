@@ -179,8 +179,10 @@ apk add mesa-dri-gallium mesa-utils   # ~70 MB: about 5 minutes on the interpret
 eglinfo -B -p surfaceless             # "virgl (nixvm GLES 3.0)", OpenGL ES 3.0
 ```
 
-Mesa offers OpenGL ES 3.0 and desktop GL 2.1. There is nothing to show the
-pictures yet: programs render off-screen (pbuffers, FBOs) and read back.
+Mesa offers OpenGL ES 3.0 and desktop GL 2.1. With the display on as well
+(`?display=1&gpu=1`), Wayland EGL clients show there: `apk add mesa-demos`,
+then `es2gears_wayland &` (about 35 frames/s in headless Chromium on
+SwiftShader).
 
 How it's wired: `Terminal.attach_webgl2(gl)`, right after construction,
 gives the guest the device; `NixTerm.vue` makes the context on a canvas it
