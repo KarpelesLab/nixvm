@@ -359,6 +359,35 @@ fn stencil_op(o: u32) -> u32 {
     }
 }
 
+/// Indices for a draw with primitive restart `restart` (at the type's
+/// maximum value, the only restart index GLES has): without restart, an
+/// index at that maximum is a real vertex, but WebGL2 always restarts there
+/// (`PRIMITIVE_RESTART_FIXED_INDEX` can't be turned off), so byte and short
+/// indices holding it are widened to the next type. Elsewhere the copy is
+/// harmless.
+fn widen_restart_indices(data: Vec<u8>, ty: u32, restart: bool) -> (Vec<u8>, u32) {
+    if restart {
+        return (data, ty);
+    }
+    match ty {
+        gl::UNSIGNED_BYTE if data.contains(&0xff) => (
+            data.iter()
+                .flat_map(|&i| u16::from(i).to_ne_bytes())
+                .collect(),
+            gl::UNSIGNED_SHORT,
+        ),
+        gl::UNSIGNED_SHORT if data.as_chunks::<2>().0.contains(&[0xff, 0xff]) => (
+            data.as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|&c| u32::from(u16::from_ne_bytes(c)).to_ne_bytes())
+                .collect(),
+            gl::UNSIGNED_INT,
+        ),
+        _ => (data, ty),
+    }
+}
+
 fn wrap(w: u32) -> i32 {
     (match w {
         0 => gl::REPEAT,
@@ -689,15 +718,20 @@ impl Renderer {
                             bx.z + z,
                         );
                         self.backend.read_buffer(gl::COLOR_ATTACHMENT0);
+                        // In a format/type GLES (and WebGL2) can always
+                        // read, then packed to the resource's own layout.
+                        let (rformat, rty, rbpp) = fmt.read_as();
+                        let mut read = vec![0u8; (bx.w * bx.h * rbpp) as usize];
                         self.backend.read_pixels(
                             bx.x as i32,
                             bx.y as i32,
                             bx.w,
                             bx.h,
-                            fmt.format,
-                            fmt.ty,
-                            &mut px,
+                            rformat,
+                            rty,
+                            &mut read,
                         );
+                        fmt.pack_read(&read, &mut px);
                         fmt.convert_in_place(&mut px);
                         for y in 0..bx.h as usize {
                             backing.write(base + (y * stride) as u64, &px[y * row..(y + 1) * row]);
@@ -1529,6 +1563,7 @@ impl Renderer {
                 self.warn("index range outside the index buffer".into());
                 return;
             };
+            let (data, ty) = widen_restart_indices(data, ty, info.primitive_restart);
             if self.ebo == 0 {
                 self.ebo = self.backend.create_buffer();
             }
@@ -1814,5 +1849,44 @@ impl Renderer {
             }
             Host::None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_indices_widen_only_without_restart() {
+        // A byte index of 255 is a vertex unless restart is on.
+        let (d, ty) = widen_restart_indices(vec![0, 255, 7], gl::UNSIGNED_BYTE, false);
+        assert_eq!(ty, gl::UNSIGNED_SHORT);
+        let v: Vec<u16> = d
+            .as_chunks()
+            .0
+            .iter()
+            .map(|&c| u16::from_ne_bytes(c))
+            .collect();
+        assert_eq!(v, [0, 255, 7]);
+        let (d, ty) = widen_restart_indices(vec![0, 255, 7], gl::UNSIGNED_BYTE, true);
+        assert_eq!((d, ty), (vec![0, 255, 7], gl::UNSIGNED_BYTE));
+
+        let shorts: Vec<u8> = [1u16, 0xffff]
+            .iter()
+            .flat_map(|i| i.to_ne_bytes())
+            .collect();
+        let (d, ty) = widen_restart_indices(shorts, gl::UNSIGNED_SHORT, false);
+        assert_eq!(ty, gl::UNSIGNED_INT);
+        let v: Vec<u32> = d
+            .as_chunks()
+            .0
+            .iter()
+            .map(|&c| u32::from_ne_bytes(c))
+            .collect();
+        assert_eq!(v, [1, 0xffff]);
+
+        // Nothing at the maximum: left alone.
+        let (d, ty) = widen_restart_indices(vec![1, 2, 3, 0], gl::UNSIGNED_SHORT, false);
+        assert_eq!((d, ty), (vec![1, 2, 3, 0], gl::UNSIGNED_SHORT));
     }
 }

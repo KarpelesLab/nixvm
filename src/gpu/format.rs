@@ -518,6 +518,102 @@ impl Format {
         }
     }
 
+    /// The `format`, `type` and bytes per pixel `glReadPixels` reads this
+    /// format with. GLES 3.0 — and WebGL2, strictly — only promise
+    /// `RGBA`/`UNSIGNED_BYTE` for normalized colour (and
+    /// `UNSIGNED_INT_2_10_10_10_REV` for `RGB10_A2`), `RGBA`/`FLOAT` for
+    /// float and `RGBA_INTEGER` with `INT`/`UNSIGNED_INT` for integers;
+    /// anything else is read that way and packed with [`Self::pack_read`].
+    #[must_use]
+    pub fn read_as(&self) -> (u32, u32, u32) {
+        use gl::{RGBA, RGBA_INTEGER, UNSIGNED_INT_2_10_10_10_REV as U2101010};
+        match (self.kind, self.format, self.ty) {
+            // Readable as is (depth isn't read at all on GLES).
+            (Kind::Float, RGBA, UNSIGNED_BYTE | U2101010)
+            | (Kind::Depth | Kind::DepthStencil, ..) => (self.format, self.ty, self.bpp),
+            (
+                Kind::Float,
+                _,
+                FLOAT
+                | HALF_FLOAT
+                | gl::UNSIGNED_INT_10F_11F_11F_REV
+                | gl::UNSIGNED_INT_5_9_9_9_REV,
+            ) => (RGBA, FLOAT, 16),
+            (Kind::Float, ..) => (RGBA, UNSIGNED_BYTE, 4),
+            (Kind::Uint, ..) => (RGBA_INTEGER, UNSIGNED_INT, 16),
+            (Kind::Sint, ..) => (RGBA_INTEGER, INT, 16),
+        }
+    }
+
+    /// Pack `src`, pixels read as [`Self::read_as`] says, into `out` in
+    /// this format's own layout (`out.len() / bpp` pixels).
+    pub fn pack_read(&self, src: &[u8], out: &mut [u8]) {
+        let (_, rty, rbpp) = self.read_as();
+        if (rty, rbpp) == (self.ty, self.bpp) {
+            let n = out.len().min(src.len());
+            out[..n].copy_from_slice(&src[..n]);
+            return;
+        }
+        let channels = match self.format {
+            gl::RED | gl::RED_INTEGER => 1,
+            gl::RG | gl::RG_INTEGER => 2,
+            gl::RGB | gl::RGB_INTEGER => 3,
+            _ => 4,
+        };
+        let word = |p: &[u8], c: usize| {
+            u32::from_le_bytes([p[c * 4], p[c * 4 + 1], p[c * 4 + 2], p[c * 4 + 3]])
+        };
+        let float = |p: &[u8], c: usize| f32::from_bits(word(p, c));
+        let pixels = src
+            .chunks_exact(rbpp as usize)
+            .zip(out.chunks_exact_mut(self.bpp as usize));
+        for (p, o) in pixels {
+            match (rty, self.ty) {
+                // From RGBA8: fewer channels, or 5/6/5 bits.
+                (UNSIGNED_BYTE, gl::UNSIGNED_SHORT_5_6_5) => {
+                    let q = |v: u8, max: u32| (u32::from(v) * max * 2 + 255) / 510;
+                    let v = (q(p[0], 31) << 11) | (q(p[1], 63) << 5) | q(p[2], 31);
+                    o.copy_from_slice(&(v as u16).to_le_bytes());
+                }
+                // From RGBA8 or RGBA float: fewer channels.
+                (UNSIGNED_BYTE, _) | (FLOAT, FLOAT) => o.copy_from_slice(&p[..o.len()]),
+                // From RGBA float: halves, or packed floats.
+                (FLOAT, HALF_FLOAT) => {
+                    for (c, h) in o.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                        let v = small_float(float(p, c), 10, true) as u16;
+                        h.copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                (FLOAT, gl::UNSIGNED_INT_10F_11F_11F_REV) => {
+                    let v = small_float(float(p, 0), 6, false)
+                        | (small_float(float(p, 1), 6, false) << 11)
+                        | (small_float(float(p, 2), 5, false) << 22);
+                    o.copy_from_slice(&v.to_le_bytes());
+                }
+                (FLOAT, _) => o.fill(0), // RGB9_E5: never rendered to
+                // From RGBA 32-bit integers: narrower, fewer, or 10/10/10/2.
+                (_, gl::UNSIGNED_INT_2_10_10_10_REV) => {
+                    let v = (word(p, 0) & 0x3ff)
+                        | ((word(p, 1) & 0x3ff) << 10)
+                        | ((word(p, 2) & 0x3ff) << 20)
+                        | (word(p, 3) << 30);
+                    o.copy_from_slice(&v.to_le_bytes());
+                }
+                (_, ty) => {
+                    let size = match ty {
+                        UNSIGNED_BYTE | BYTE => 1,
+                        UNSIGNED_SHORT | SHORT => 2,
+                        _ => 4,
+                    };
+                    for c in 0..channels {
+                        o[c * size..(c + 1) * size]
+                            .copy_from_slice(&word(p, c).to_le_bytes()[..size]);
+                    }
+                }
+            }
+        }
+    }
+
     /// Pixels on their way to the host: also give `X8` formats an opaque
     /// alpha, since whatever the guest left in that byte must not show.
     pub fn to_host(&self, px: &mut [u8]) {
@@ -530,9 +626,154 @@ impl Format {
     }
 }
 
+/// `v` as a float with a 5-bit exponent and `mantissa` bits (and a sign bit
+/// when `signed`), rounded to nearest even: a half float (10, signed), or
+/// the 11- and 10-bit floats of `R11F_G11F_B10F` (6 and 5, unsigned, where
+/// negatives become zero).
+fn small_float(v: f32, mantissa: u32, signed: bool) -> u32 {
+    let bits = v.to_bits();
+    let inf = 0x1f << mantissa;
+    let abs = bits & 0x7fff_ffff;
+    if abs > 0x7f80_0000 {
+        return inf | (1 << (mantissa - 1)); // NaN
+    }
+    if bits >> 31 == 1 && !signed {
+        return 0;
+    }
+    let sign = if signed {
+        (bits >> 31) << (5 + mantissa)
+    } else {
+        0
+    };
+    // Shift right by `s`, rounding to nearest even.
+    let round = |x: u32, s: u32| {
+        let (q, rem, half) = (x >> s, x & ((1 << s) - 1), 1 << (s - 1));
+        if rem > half || (rem == half && q & 1 == 1) {
+            q + 1
+        } else {
+            q
+        }
+    };
+    let exp = (abs >> 23) as i32 - 127 + 15;
+    let shift = 23 - mantissa;
+    let v = if abs >= 0x7f80_0000 || exp >= 31 {
+        inf
+    } else if exp > 0 {
+        // A carry out of the mantissa bumps the exponent, up to infinity.
+        round(((exp as u32) << 23) | (abs & 0x7f_ffff), shift).min(inf)
+    } else if exp < -(mantissa as i32) {
+        0 // under half the smallest subnormal
+    } else {
+        round((abs & 0x7f_ffff) | 0x80_0000, shift + (1 - exp) as u32)
+    };
+    sign | v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn small_floats() {
+        let h = |v| small_float(v, 10, true);
+        assert_eq!(h(1.0), 0x3c00);
+        assert_eq!(h(-2.0), 0xc000);
+        assert_eq!(h(0.5), 0x3800);
+        assert_eq!(h(65504.0), 0x7bff);
+        assert_eq!(h(65520.0), 0x7c00); // rounds up to infinity
+        assert_eq!(h(1e9), 0x7c00);
+        assert_eq!(h(f32::INFINITY), 0x7c00);
+        assert_eq!(h(2f32.powi(-24)), 0x0001); // smallest subnormal
+        assert_eq!(h(2f32.powi(-26)), 0);
+        assert_eq!(h(1.0 + 2f32.powi(-11)), 0x3c00); // tie: to even
+        assert_eq!(h(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
+        assert_eq!(h(0.0), 0);
+        assert!(h(f32::NAN) & 0x3ff != 0);
+        assert_eq!(small_float(1.0, 6, false), 15 << 6);
+        assert_eq!(small_float(1.0, 5, false), 15 << 5);
+        assert_eq!(small_float(-1.0, 6, false), 0);
+        assert_eq!(small_float(0.25, 5, false), 13 << 5);
+    }
+
+    #[test]
+    fn readback_packs_what_gles_can_read() {
+        // R8: read as RGBA8, keep red.
+        let f = lookup(64).unwrap();
+        assert_eq!(f.read_as(), (gl::RGBA, UNSIGNED_BYTE, 4));
+        let mut out = [0u8; 2];
+        f.pack_read(&[10, 20, 30, 40, 50, 60, 70, 80], &mut out);
+        assert_eq!(out, [10, 50]);
+        // RGBA8 is read as is.
+        let f = lookup(67).unwrap();
+        let mut out = [0u8; 4];
+        f.pack_read(&[1, 2, 3, 4], &mut out);
+        assert_eq!(out, [1, 2, 3, 4]);
+        // B5G6R5: requantized from 8 bits.
+        let f = lookup(7).unwrap();
+        let mut out = [0u8; 2];
+        f.pack_read(&[255, 0, 255, 255], &mut out);
+        assert_eq!(u16::from_le_bytes(out), 0xf81f);
+        f.pack_read(&[0, 255, 0, 255], &mut out);
+        assert_eq!(u16::from_le_bytes(out), 0x07e0);
+        f.pack_read(&[132, 130, 8, 255], &mut out); // 16/31, 32/63, 1/31
+        assert_eq!(u16::from_le_bytes(out), (16 << 11) | (32 << 5) | 1);
+        // RG16F: read as RGBA float, halved.
+        let f = lookup(92).unwrap();
+        assert_eq!(f.read_as(), (gl::RGBA, FLOAT, 16));
+        let src: Vec<u8> = [1.0f32, -2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let mut out = [0u8; 4];
+        f.pack_read(&src, &mut out);
+        assert_eq!(out, [0x00, 0x3c, 0x00, 0xc0]);
+        // R32F: one float of four.
+        let f = lookup(28).unwrap();
+        f.pack_read(&src, &mut out);
+        assert_eq!(f32::from_le_bytes(out), 1.0);
+        // R11G11B10F.
+        let f = lookup(124).unwrap();
+        let src: Vec<u8> = [1.0f32, 1.0, 1.0, 1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        f.pack_read(&src, &mut out);
+        assert_eq!(
+            u32::from_le_bytes(out),
+            (15 << 6) | (15 << 6 << 11) | (15 << 5 << 22)
+        );
+        // RG8UI: read as RGBA_INTEGER words, narrowed.
+        let f = lookup(178).unwrap();
+        assert_eq!(f.read_as(), (gl::RGBA_INTEGER, UNSIGNED_INT, 16));
+        let src: Vec<u8> = [7u32, 200, 9, 1]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let mut out = [0u8; 2];
+        f.pack_read(&src, &mut out);
+        assert_eq!(out, [7, 200]);
+        // RGB10_A2UI: packed from words.
+        let f = lookup(253).unwrap();
+        let src: Vec<u8> = [1u32, 2, 3, 1]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let mut out = [0u8; 4];
+        f.pack_read(&src, &mut out);
+        assert_eq!(
+            u32::from_le_bytes(out),
+            1 | (2 << 10) | (3 << 20) | (1 << 30)
+        );
+        // R32I stays a word.
+        let f = lookup(197).unwrap();
+        assert_eq!(f.read_as(), (gl::RGBA_INTEGER, INT, 16));
+        let src: Vec<u8> = [-5i32, 0, 0, 1]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        f.pack_read(&src, &mut out);
+        assert_eq!(i32::from_le_bytes(out), -5);
+    }
 
     #[test]
     fn ids_are_unique() {

@@ -35,6 +35,14 @@ export function nx_gl_set_context(g) {
   locs.length = 1;
   gl.pixelStorei(gl.PACK_ALIGNMENT, 1);
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  // What a GLES 3.0 driver typically has and WebGL2 only has once asked
+  // for: rendering to float formats (the capset offers R16F … RGBA32F and
+  // R11F_G11F_B10F as render targets), and linear filtering of 32-bit
+  // floats. Without them those framebuffers are incomplete / the textures
+  // sample black, but nothing else changes.
+  for (const ext of ["EXT_color_buffer_float", "EXT_color_buffer_half_float", "OES_texture_float_linear"]) {
+    gl.getExtension(ext);
+  }
 }
 export function nx_gl_has_context() {
   return gl !== null;

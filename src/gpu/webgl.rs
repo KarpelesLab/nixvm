@@ -345,6 +345,12 @@ impl GpuBackend for WebGl {
         nx_gl_vertex_attrib_divisor(index, divisor);
     }
     fn enable(&mut self, cap: u32, on: bool) {
+        // WebGL2 always restarts primitives at the fixed index and rejects
+        // the cap (INVALID_ENUM); the renderer widens indices for draws
+        // without restart instead.
+        if cap == super::gl::PRIMITIVE_RESTART_FIXED_INDEX {
+            return;
+        }
         nx_gl_enable(cap, on);
     }
     fn viewport(&mut self, x: i32, y: i32, width: i32, height: i32) {
