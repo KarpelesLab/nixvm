@@ -518,6 +518,42 @@ pub fn lookup(id: u32) -> Option<&'static Format> {
 }
 
 impl Format {
+    /// The bits of each of red, green, blue and alpha in a renderable
+    /// unsigned normalized (linear) format, or `None` for every other kind.
+    #[must_use]
+    pub fn unorm_bits(&self) -> Option<[u32; 4]> {
+        Some(match self.internal {
+            gl::R8 => [8, 0, 0, 0],
+            gl::RG8 => [8, 8, 0, 0],
+            gl::RGB8 => [8, 8, 8, 0],
+            gl::RGBA8 => [8, 8, 8, 8],
+            gl::RGB565 => [5, 6, 5, 0],
+            gl::RGB10_A2 => [10, 10, 10, 2],
+            _ => return None,
+        })
+    }
+
+    /// `value`, a float colour to clear a buffer of this format to, as the
+    /// exact value of the stored integer it converts to, ties rounding up
+    /// (as llvmpipe and WebGL's SwiftShader do; GLES leaves the tie to the
+    /// implementation, and NVIDIA's rounds down, so a 0.5 clear read back
+    /// 0x7f there and 0x80 elsewhere). Unchanged for other formats.
+    #[must_use]
+    pub fn quantize_clear(&self, value: [f32; 4]) -> [f32; 4] {
+        let Some(bits) = self.unorm_bits() else {
+            return value;
+        };
+        let mut out = value;
+        for (v, b) in out.iter_mut().zip(bits) {
+            if b > 0 && !v.is_nan() {
+                let max = f64::from((1u32 << b) - 1);
+                let q = (f64::from(v.clamp(0.0, 1.0)) * max + 0.5).floor();
+                *v = (q / max) as f32;
+            }
+        }
+        out
+    }
+
     /// Whether the format can be a texture at all (not vertex-only).
     #[must_use]
     pub fn is_texture(&self) -> bool {
@@ -695,6 +731,30 @@ fn small_float(v: f32, mantissa: u32, signed: bool) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clear_to_a_half_rounds_up_on_every_host() {
+        let q = |internal, v| {
+            FORMATS
+                .iter()
+                .find(|f| f.internal == internal)
+                .unwrap()
+                .quantize_clear(v)
+        };
+        let half = [0.25, 0.5, 1.0, 0.75];
+        // 0.5 of 255 is 127.5: stored as 128, whatever the host's tie rule.
+        assert_eq!((q(gl::RGBA8, half)[1] * 255.0).round(), 128.0);
+        assert!((q(gl::RGBA8, half)[1] * 255.0 - 128.0).abs() < 1e-3);
+        // 0.5 of 63 (RGB565's green) is 31.5: 32.
+        assert!((q(gl::RGB565, half)[1] * 63.0 - 32.0).abs() < 1e-3);
+        // Values that aren't ties keep their nearest integer.
+        assert!((q(gl::RG8, half)[0] * 255.0 - 64.0).abs() < 1e-3);
+        assert!((q(gl::RGBA8, half)[3] * 255.0 - 191.0).abs() < 1e-3);
+        // Out of range is clamped; float and sRGB formats are left alone.
+        assert_eq!(q(gl::RGBA8, [-1.0, 2.0, 0.0, 1.0]), [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(q(gl::RGBA16F, half), half);
+        assert_eq!(q(gl::SRGB8_ALPHA8, half), half);
+    }
 
     #[test]
     fn small_floats() {

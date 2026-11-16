@@ -1507,6 +1507,24 @@ impl Renderer {
             .collect()
     }
 
+    /// The format of each bound colour buffer, where known.
+    fn cbuf_formats(&mut self, ctx: u32) -> Vec<Option<&'static Format>> {
+        let sub = self.sub(ctx);
+        let surfaces: Vec<(u32, u32)> = sub
+            .cbufs
+            .iter()
+            .map(|h| match sub.objects.get(h) {
+                Some(Object::Surface(s)) => (s.res, s.format),
+                _ => (0, 0),
+            })
+            .collect();
+        // The surface's own (view) format is what's rendered.
+        surfaces
+            .iter()
+            .map(|&(r, f)| format::lookup(f).or_else(|| self.resources.get(&r).and_then(|r| r.fmt)))
+            .collect()
+    }
+
     pub(crate) fn clear(
         &mut self,
         ctx: u32,
@@ -1519,6 +1537,7 @@ impl Renderer {
             return;
         }
         let kinds = self.cbuf_kinds(ctx);
+        let fmts = self.cbuf_formats(ctx);
         let b = &mut self.backend;
         b.enable(gl::SCISSOR_TEST, false);
         b.enable(gl::RASTERIZER_DISCARD, false);
@@ -1531,7 +1550,15 @@ impl Renderer {
             match k {
                 Kind::Uint => b.clear_buffer_uiv(gl::COLOR, i as u32, color),
                 Kind::Sint => b.clear_buffer_iv(gl::COLOR, i as u32, color.map(u32::cast_signed)),
-                _ => b.clear_buffer_fv(gl::COLOR, i as u32, color.map(f32::from_bits)),
+                _ => {
+                    let value = color.map(f32::from_bits);
+                    let value = fmts
+                        .get(i)
+                        .copied()
+                        .flatten()
+                        .map_or(value, |f| f.quantize_clear(value));
+                    b.clear_buffer_fv(gl::COLOR, i as u32, value);
+                }
             }
         }
         let (d, s) = (buffers & 1 != 0, buffers & 2 != 0);
