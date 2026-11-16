@@ -59,10 +59,15 @@ pub struct Display {
 struct State {
     width: u32,
     height: u32,
-    /// The composited frame, `width * height` RGBA pixels, row-major.
+    /// What makes the frames.
+    compose: server::Shared,
+    /// The frame as last read from the compositor, `width * height` RGBA
+    /// pixels, row-major.
     pixels: Vec<u8>,
-    /// Bumped each time `pixels` changes.
+    /// Bumped each time the compositor makes a new frame.
     generation: u64,
+    /// The generation `pixels` holds.
+    read: u64,
     /// The generation the embedder last took with [`Display::frame`].
     shown: u64,
     /// Input from the embedder not yet delivered to clients.
@@ -84,6 +89,10 @@ struct Server {
     listener: usize,
     /// [`Kernel::io_events`] when the compositor last looked.
     last_io: u64,
+    /// Whether to composite on the VM's GPU when it has one, and whether
+    /// that was settled (it is once a client has connected).
+    gl_wanted: bool,
+    gl_settled: bool,
 }
 
 /// How often frame callbacks fire when no embedder takes frames (ms).
@@ -108,14 +117,15 @@ impl Display {
     #[must_use]
     pub fn new(width: u32, height: u32) -> Self {
         let (width, height) = (width.clamp(1, 8192), height.clamp(1, 8192));
-        let n = width as usize * height as usize;
-        let mut pixels = Vec::with_capacity(n * 4);
-        render::to_rgba(&vec![server::BACKGROUND; n], &mut pixels);
+        let compose: server::Shared =
+            Arc::new(Mutex::new(Box::new(compose::Software::new(width, height))));
         let st = State {
             width,
             height,
-            pixels,
+            compose,
+            pixels: Vec::new(),
             generation: 1,
+            read: 0,
             shown: 0,
             input: Vec::new(),
             presented: 0,
@@ -136,7 +146,8 @@ impl Display {
     /// [`Kernel::served_listen`]) or the keymap written.
     pub fn attach(&self, kernel: &Kernel, socket: &str) -> Result<(), i64> {
         let (w, h) = self.size();
-        let mut comp = server::Compositor::new(w, h);
+        let shared = Arc::clone(&self.inner.lock().unwrap().compose);
+        let mut comp = server::Compositor::new(w, h, shared);
         let km = keymap::keymap();
         comp.keymap_path = format!("{socket}.xkb");
         comp.keymap_len = u32::try_from(km.len()).unwrap_or(0);
@@ -148,6 +159,9 @@ impl Display {
             comp,
             listener,
             last_io: u64::MAX,
+            // `NIXVM_DISPLAY_GL=0` keeps the CPU compositor with a GPU.
+            gl_wanted: std::env::var("NIXVM_DISPLAY_GL").map_or(true, |v| v != "0"),
+            gl_settled: false,
         }));
         Ok(())
     }
@@ -188,15 +202,61 @@ impl Display {
             return false;
         }
         st.shown = st.generation;
+        st.read_frame();
         show(&st.pixels, st.width, st.height);
         true
+    }
+
+    /// Show the current frame on the embedder's GL surface, if it changed
+    /// since the last call or `force` (the surface lost its contents), and
+    /// count it presented as [`Self::frame`] does. Only a display
+    /// compositing on the GPU, whose GL context draws to that surface (the
+    /// browser's display canvas), can: false otherwise, and when nothing
+    /// was drawn.
+    #[must_use]
+    pub fn present(&self, force: bool) -> bool {
+        let mut st = self.inner.lock().unwrap();
+        st.presented += 1;
+        st.last_frame_ms = server::now_ms().max(1);
+        if st.shown == st.generation && !force {
+            return false;
+        }
+        let shown = st.compose.lock().unwrap().present();
+        if shown {
+            st.shown = st.generation;
+        }
+        shown
+    }
+
+    /// Which compositor makes the frames: `software`, or `gl` once it
+    /// composites on the VM's GPU.
+    #[must_use]
+    pub fn compositor(&self) -> &'static str {
+        let compose = Arc::clone(&self.inner.lock().unwrap().compose);
+        compose.lock().unwrap().name()
     }
 
     /// The current frame as a PNG file.
     #[must_use]
     pub fn png(&self) -> Vec<u8> {
-        let st = self.inner.lock().unwrap();
+        let mut st = self.inner.lock().unwrap();
+        st.read_frame();
         png::encode_rgba(&st.pixels, st.width, st.height)
+    }
+}
+
+impl State {
+    /// Bring `pixels` up to the compositor's latest frame.
+    fn read_frame(&mut self) {
+        if self.read == self.generation {
+            return;
+        }
+        let n = self.width as usize * self.height as usize * 4;
+        if self.pixels.len() != n {
+            self.pixels.clear();
+        }
+        self.compose.lock().unwrap().read(&mut self.pixels);
+        self.read = self.generation;
     }
 }
 
@@ -211,6 +271,9 @@ impl Service for Server {
                 st.last_frame_ms,
             )
         };
+        if !self.gl_settled {
+            self.settle_gl(kernel);
+        }
         let now = server::now_ms();
         let comp = &mut self.comp;
         let frames = comp.frames_pending();
@@ -247,12 +310,33 @@ impl Service for Server {
         if comp.scene_dirty || comp.cursor_dirty {
             st.width = comp.width;
             st.height = comp.height;
-            comp.composite(&mut st.pixels, &mut st.generation);
+            comp.composite(&mut st.generation);
         }
     }
 }
 
+impl Server {
+    /// Composite on the VM's GPU if it has one (it may be attached after
+    /// the display, but before the guest's first client connects).
+    fn settle_gl(&mut self, kernel: &Kernel) {
+        if !self.gl_wanted {
+            self.gl_settled = true;
+            return;
+        }
+        if let Some(gl) = dmabuf::gpu_frames(kernel).and_then(|g| g.compositor()) {
+            *self.comp.compose.lock().unwrap() = gl;
+            self.comp.scene_dirty = true;
+            self.gl_settled = true;
+        } else if !self.comp.clients.is_empty() {
+            self.gl_settled = true;
+        }
+    }
+}
+
+mod compose;
 mod dmabuf;
+#[cfg(feature = "gpu")]
+mod gl;
 mod keymap;
 mod png;
 mod protocol;

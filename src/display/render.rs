@@ -96,9 +96,12 @@ fn over(src: u32, dst: u32) -> u32 {
         return dst;
     }
     let inv = 255 - a;
-    // Two channels at a time: 0x00RR00BB and 0x00AA00GG.
-    let rb = (((dst & 0x00ff_00ff) * inv + 0x0080_0080) >> 8) & 0x00ff_00ff;
-    let ag = ((((dst >> 8) & 0x00ff_00ff) * inv + 0x0080_0080) >> 8) & 0x00ff_00ff;
+    // Two channels at a time: 0x00RR00BB and 0x00AA00GG, each rounded
+    // exactly (`round(c * inv / 255)`, as a GPU's blender does, so the GL
+    // compositor gives the same pixels).
+    let div255 = |t: u32| ((t + ((t >> 8) & 0x00ff_00ff)) >> 8) & 0x00ff_00ff;
+    let rb = div255((dst & 0x00ff_00ff) * inv + 0x0080_0080);
+    let ag = div255(((dst >> 8) & 0x00ff_00ff) * inv + 0x0080_0080);
     let d = rb | (ag << 8);
     // Premultiplied channels never overflow: src + dst*(1-a) <= 255.
     src.wrapping_add(d)
@@ -214,6 +217,12 @@ const ARROW: &[&str] = &[
     "      X..X  ",
     "       XX   ",
 ];
+
+/// [`ARROW`]'s size.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+pub fn arrow_size() -> (i32, i32) {
+    (ARROW[0].len() as i32, ARROW.len() as i32)
+}
 
 /// [`ARROW`] as an image.
 #[allow(clippy::cast_possible_truncation)]

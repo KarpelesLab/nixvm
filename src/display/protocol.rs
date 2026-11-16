@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use super::dmabuf::DmaBuffer;
-use super::render::{self, Image};
+use super::render;
 use super::server::{Buffer, Compositor, Data, Iface, Pending, Pool, Rect, Role, SubInfo, Surface};
 use super::wire::{self, Args, Ev, ProtoError};
 use crate::kernel::Kernel;
@@ -136,8 +136,10 @@ impl Compositor {
                 p.stack.retain(|&x| x != sid);
             }
         }
-        if let Some(c) = self.clients.get_mut(&cid) {
-            c.surfaces.remove(&sid);
+        if let Some(c) = self.clients.get_mut(&cid)
+            && c.surfaces.remove(&sid).is_some()
+        {
+            self.compose.lock().unwrap().remove(s);
         }
         if matches!(self.cursor, super::server::Cursor::Surface(c, ..) if c == s) {
             self.cursor = super::server::Cursor::Hidden;
@@ -238,6 +240,7 @@ impl Compositor {
             None => None,
         };
         let gpu = self.gpu.clone();
+        let compose = Arc::clone(&self.compose);
         let Some(surf) = self.surface_mut(s) else {
             return Ok(());
         };
@@ -256,23 +259,29 @@ impl Compositor {
         match buffer {
             Some(Some((id, content))) => {
                 let damage = damage_box(surf, &state, content.size());
+                surf.buf_size = content.size();
+                surf.has_buffer = true;
+                let mut compose = compose.lock().unwrap();
                 match &content {
-                    Content::Shm(buf) => upload(kernel, buf, &mut surf.image, damage),
+                    Content::Shm(buf) => upload(kernel, buf, &mut **compose, s, damage),
                     Content::Gpu(buf) => {
                         if let Some(gpu) = &gpu {
-                            read_back(gpu.as_ref(), buf, &mut surf.image, damage);
+                            compose.write_gpu(s, gpu.as_ref(), buf, damage);
                         }
                     }
                 }
-                surf.has_buffer = true;
                 released = Some(id);
             }
             Some(None) => {
                 surf.has_buffer = false;
-                surf.image = Image::default();
+                surf.buf_size = (0, 0);
+                compose.lock().unwrap().remove(s);
             }
             None => {}
         }
+        let Some(surf) = self.surface_mut(s) else {
+            return Ok(());
+        };
         if matches!(surf.role, Role::Cursor) {
             let (dx, dy) = state.offset;
             if let super::server::Cursor::Surface(cs, hx, hy) = self.cursor
@@ -694,8 +703,7 @@ impl Compositor {
 /// for all of it.
 #[allow(clippy::cast_possible_wrap)]
 fn damage_box(surf: &Surface, state: &Pending, (bw, bh): (u32, u32)) -> Option<Rect> {
-    if surf.image.width != bw
-        || surf.image.height != bh
+    if surf.buf_size != (bw, bh)
         || surf.vp_src.is_some()
         || surf.vp_dst.is_some()
         || (state.damage.is_empty() && state.damage_buffer.is_empty())
@@ -747,78 +755,40 @@ impl Content {
     }
 }
 
-/// Size `img` for a `width` × `height` buffer of `format`, keeping its
-/// pixels if it already is.
-fn fit(img: &mut Image, width: u32, height: u32, format: u32) {
-    if img.width != width || img.height != height {
-        img.width = width;
-        img.height = height;
-        img.pixels = vec![0; width as usize * height as usize];
-    }
-    img.opaque = render::is_opaque(format);
-}
-
-/// Copy `rect` (all of it if `None`) of GPU buffer `buf` into `img`, read
-/// back from the host's copy of the resource.
-#[allow(clippy::cast_sign_loss)]
-fn read_back(
-    gpu: &dyn super::dmabuf::GpuFrames,
-    buf: &DmaBuffer,
-    img: &mut Image,
+/// Copy `rect` (all of it if `None`) of `buf` into surface `key`'s content.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn upload(
+    kernel: &Kernel,
+    buf: &Buffer,
+    compose: &mut dyn super::compose::Compositor,
+    key: super::server::SurfRef,
     rect: Option<Rect>,
 ) {
     let (w, h) = (buf.width as usize, buf.height as usize);
-    fit(img, buf.width, buf.height, buf.format);
-    // A bottom-up buffer is read whole and flipped.
-    let (x0, y0, rw, rh) = match rect {
-        Some((x, y, rw, rh)) if !buf.y_invert => (x as usize, y as usize, rw as usize, rh as usize),
-        _ => (0, 0, w, h),
-    };
-    if rw == 0 || rh == 0 {
-        return;
-    }
-    let mut bytes = vec![0u8; rw * rh * 4];
-    #[allow(clippy::cast_possible_truncation)]
-    let r = (x0 as u32, y0 as u32, rw as u32, rh as u32);
-    if !gpu.read(buf.res, r, &mut bytes) {
-        return;
-    }
-    for (i, src) in bytes.chunks_exact(rw * 4).enumerate() {
-        let y = if buf.y_invert { h - 1 - i } else { y0 + i };
-        let d0 = y * w + x0;
-        render::convert_row(buf.format, src, &mut img.pixels[d0..d0 + rw]);
-    }
-}
-
-/// Copy `rect` (all of it if `None`) of `buf` into `img`.
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-fn upload(kernel: &Kernel, buf: &Buffer, img: &mut Image, rect: Option<Rect>) {
-    let (w, h) = (buf.width as usize, buf.height as usize);
-    fit(img, buf.width, buf.height, buf.format);
     let (x0, y0, rw, rh) = match rect {
         Some((x, y, rw, rh)) => (x as usize, y as usize, rw as usize, rh as usize),
         None => (0, 0, w, h),
     };
-    if rw == 0 || rh == 0 {
-        return;
-    }
     let bpp = render::bytes_per_pixel(buf.format).unwrap_or(4);
     let stride = buf.stride as usize;
     // A read covers as many damaged rows as fit in a megabyte.
-    let per_read = ((1 << 20) / stride).clamp(1, rh);
+    let per_read = ((1 << 20) / stride.max(1)).clamp(1, rh.max(1));
     let mut bytes = Vec::new();
-    let mut row = 0;
-    while row < rh {
-        let n = per_read.min(rh - row);
-        let start = buf.offset + ((y0 + row) * stride + x0 * bpp) as u64;
-        bytes.clear();
-        bytes.resize((n - 1) * stride + rw * bpp, 0);
-        kernel.served_file_read(&buf.pool.fd, start, &mut bytes);
-        for r in 0..n {
-            let src = &bytes[r * stride..r * stride + rw * bpp];
-            let d0 = (y0 + row + r) * w + x0;
-            render::convert_row(buf.format, src, &mut img.pixels[d0..d0 + rw]);
+    let mut first = 0;
+    let size = (buf.width, buf.height);
+    let opaque = render::is_opaque(buf.format);
+    #[allow(clippy::cast_possible_wrap)]
+    let r = Some((x0 as i32, y0 as i32, rw as i32, rh as i32));
+    compose.write(key, size, opaque, r, &mut |row, out| {
+        if row == 0 || row >= first + per_read {
+            first = row;
+            let n = per_read.min(rh - row);
+            let start = buf.offset + ((y0 + row) * stride + x0 * bpp) as u64;
+            bytes.clear();
+            bytes.resize((n - 1) * stride + rw * bpp, 0);
+            kernel.served_file_read(&buf.pool.fd, start, &mut bytes);
         }
-        row += n;
-    }
+        let o = (row - first) * stride;
+        render::convert_row(buf.format, &bytes[o..o + rw * bpp], out);
+    });
 }

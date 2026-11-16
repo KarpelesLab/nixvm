@@ -73,6 +73,11 @@ pub trait GpuFrames: Send + Sync {
     /// Read `rect` (x, y, w, h) of texture `res` into `out`: rows packed,
     /// top first, in the resource's byte layout.
     fn read(&self, res: u32, rect: (u32, u32, u32, u32), out: &mut [u8]) -> bool;
+    /// A compositor drawing on this GPU (see [`super::compose`]), if it
+    /// can have one.
+    fn compositor(&self) -> Option<Box<dyn super::compose::Compositor>> {
+        None
+    }
 }
 
 /// The VM's GPU as the compositor sees it, if one is attached.
@@ -107,6 +112,10 @@ impl GpuFrames for VirtGpu {
     }
     fn read(&self, res: u32, rect: (u32, u32, u32, u32), out: &mut [u8]) -> bool {
         self.0.read_texture(res, rect, out).is_ok()
+    }
+    fn compositor(&self) -> Option<Box<dyn super::compose::Compositor>> {
+        super::gl::GlCompositor::new(self.0.clone())
+            .map(|c| Box::new(c) as Box<dyn super::compose::Compositor>)
     }
 }
 

@@ -6,7 +6,8 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
-use super::render::{self, Canvas, Image};
+use super::compose::{self, Draw};
+use super::render;
 use super::wire::{self, Args, Ev, ProtoError};
 use crate::kernel::{Kernel, ServedFd, ServedRecv};
 
@@ -224,7 +225,8 @@ pub struct Surface {
     pub pending: Pending,
     /// A synchronized subsurface's commits, waiting for its parent's.
     pub cached: Option<Pending>,
-    pub image: Image,
+    /// The size of the buffer it shows (its pixels are the compositor's).
+    pub buf_size: (u32, u32),
     pub has_buffer: bool,
     pub scale: i32,
     pub vp_src: Option<(f64, f64, f64, f64)>,
@@ -254,7 +256,7 @@ impl Surface {
             return (w as i32, h as i32);
         }
         let s = self.scale.max(1);
-        (self.image.width as i32 / s, self.image.height as i32 / s)
+        (self.buf_size.0 as i32 / s, self.buf_size.1 as i32 / s)
     }
 
     /// Its window geometry (`xdg_surface.set_window_geometry`, else its
@@ -366,9 +368,8 @@ pub struct Compositor {
     pub scene_dirty: bool,
     /// Only the pointer moved.
     pub cursor_dirty: bool,
-    scene: Vec<u32>,
-    out: Vec<u32>,
-    arrow: Image,
+    /// What makes the frames (shared with the embedder's [`super::Display`]).
+    pub compose: Shared,
     pub last_fire_ms: u64,
     /// How many frames the embedder has taken (see [`super::Display::frame`]).
     pub presented: u64,
@@ -381,6 +382,9 @@ pub struct Compositor {
     pub format_table_path: String,
     pub format_table_written: bool,
 }
+
+/// The compositor, as the display's service and its embedder share it.
+pub type Shared = Arc<std::sync::Mutex<Box<dyn compose::Compositor>>>;
 
 /// The background where no window covers the display.
 pub const BACKGROUND: u32 = 0xff20_242c;
@@ -405,7 +409,7 @@ pub fn time32() -> u32 {
 }
 
 impl Compositor {
-    pub fn new(width: u32, height: u32) -> Self {
+    pub fn new(width: u32, height: u32, compose: Shared) -> Self {
         Self {
             width,
             height,
@@ -423,9 +427,7 @@ impl Compositor {
             keymap_len: 0,
             scene_dirty: true,
             cursor_dirty: false,
-            scene: Vec::new(),
-            out: Vec::new(),
-            arrow: render::arrow(),
+            compose,
             last_fire_ms: 0,
             presented: 0,
             selection: None,
@@ -816,6 +818,12 @@ impl Compositor {
             }
         }
         kernel.served_close(c.conn);
+        {
+            let mut compose = self.compose.lock().unwrap();
+            for &sid in c.surfaces.keys() {
+                compose.remove((cid, sid));
+            }
+        }
         self.stack.retain(|s| s.0 != cid);
         self.popups.retain(|s| s.0 != cid);
         if self.ptr.focus.is_some_and(|s| s.0 == cid) {
@@ -967,74 +975,67 @@ impl Compositor {
         self.layout().into_iter().find(|p| p.surf == s)
     }
 
-    /// Composite the scene and the pointer into `pixels` (RGBA) if anything
-    /// changed, bumping `generation`.
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_sign_loss
-    )]
-    pub fn composite(&mut self, pixels: &mut Vec<u8>, generation: &mut u64) {
+    /// Composite the scene and the pointer if anything changed, bumping
+    /// `generation`.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub fn composite(&mut self, generation: &mut u64) {
         if !self.scene_dirty && !self.cursor_dirty {
             return;
         }
-        let n = self.width as usize * self.height as usize;
-        if self.scene_dirty {
-            self.scene.clear();
-            self.scene.resize(n, BACKGROUND);
-            let layout = self.layout();
-            let mut canvas = Canvas {
-                width: self.width,
-                height: self.height,
-                pixels: &mut self.scene,
-            };
-            for p in layout {
-                let Some(surf) = self
-                    .clients
-                    .get(&p.surf.0)
-                    .and_then(|c| c.surfaces.get(&p.surf.1))
-                else {
-                    continue;
-                };
-                canvas.draw(&surf.image, src_rect(surf), p.x, p.y, p.w, p.h);
-            }
-        }
-        self.out.clear();
-        self.out.extend_from_slice(&self.scene);
-        if self.ptr.inside {
+        let scene: Vec<Draw> = self
+            .layout()
+            .into_iter()
+            .filter_map(|p| {
+                let surf = self.surface(p.surf)?;
+                Some(Draw {
+                    key: p.surf,
+                    src: src_rect(surf),
+                    x: p.x,
+                    y: p.y,
+                    w: p.w,
+                    h: p.h,
+                })
+            })
+            .collect();
+        let cursor = if self.ptr.inside {
             let (px, py) = (self.ptr.x.floor() as i32, self.ptr.y.floor() as i32);
-            let mut canvas = Canvas {
-                width: self.width,
-                height: self.height,
-                pixels: &mut self.out,
-            };
             match self.cursor {
-                Cursor::Hidden => {}
+                Cursor::Hidden => None,
                 Cursor::Default => {
-                    let a = &self.arrow;
-                    canvas.draw(
-                        a,
-                        (0, 0, a.width as i32, a.height as i32),
-                        px,
-                        py,
-                        a.width as i32,
-                        a.height as i32,
-                    );
+                    let (w, h) = super::render::arrow_size();
+                    Some(Draw {
+                        key: compose::ARROW,
+                        src: (0, 0, w, h),
+                        x: px,
+                        y: py,
+                        w,
+                        h,
+                    })
                 }
                 Cursor::Surface(s, hx, hy) => {
-                    if let Some(surf) = self
-                        .clients
-                        .get(&s.0)
-                        .and_then(|c| c.surfaces.get(&s.1))
-                        .filter(|s| s.has_buffer)
-                    {
+                    self.surface(s).filter(|s| s.has_buffer).map(|surf| {
                         let (w, h) = surf.size();
-                        canvas.draw(&surf.image, src_rect(surf), px - hx, py - hy, w, h);
-                    }
+                        Draw {
+                            key: s,
+                            src: src_rect(surf),
+                            x: px - hx,
+                            y: py - hy,
+                            w,
+                            h,
+                        }
+                    })
                 }
             }
-        }
-        render::to_rgba(&self.out, pixels);
+        } else {
+            None
+        };
+        self.compose.lock().unwrap().render(
+            self.width,
+            self.height,
+            &scene,
+            cursor,
+            self.scene_dirty,
+        );
         *generation += 1;
         self.scene_dirty = false;
         self.cursor_dirty = false;
@@ -1052,6 +1053,6 @@ fn src_rect(surf: &Surface) -> Rect {
             (w * f64::from(s)) as i32,
             (h * f64::from(s)) as i32,
         ),
-        None => (0, 0, surf.image.width as i32, surf.image.height as i32),
+        None => (0, 0, surf.buf_size.0 as i32, surf.buf_size.1 as i32),
     }
 }
