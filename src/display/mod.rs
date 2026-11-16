@@ -11,6 +11,12 @@
 //! browser. The embedder holds a [`Display`] handle (cheap to clone) to read
 //! frames and push input from its own thread or event loop.
 //!
+//! How frames are made is a `compose::Compositor`'s business: on the CPU,
+//! or — when the VM has a GPU — on the GPU, in the host GL context the
+//! guest renders in, the frame read back only when the embedder takes it
+//! ([`Display::frame`]) or, in the browser, blitted to the page's WebGL2
+//! canvas without reading it back at all ([`Display::present`]).
+//!
 //! What it speaks: `wl_compositor` (v6), `wl_subcompositor`, `wl_shm`
 //! (ARGB/XRGB/ABGR/XBGR 8888, RGB565), `wl_seat` (pointer and keyboard, a
 //! US XKB keymap), `wl_output` and `zxdg_output_manager_v1`, `xdg_wm_base`

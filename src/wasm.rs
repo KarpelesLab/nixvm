@@ -500,7 +500,10 @@ mod browser {
         /// The display's size now: what a `display_present` would draw.
         #[must_use]
         pub fn display_current_size(&self) -> Vec<u32> {
-            let (w, h) = self.display.as_ref().map_or((0, 0), crate::display::Display::size);
+            let (w, h) = self
+                .display
+                .as_ref()
+                .map_or((0, 0), crate::display::Display::size);
             vec![w, h]
         }
 

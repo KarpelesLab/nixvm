@@ -840,27 +840,62 @@ compositor received back to its resource.
 compositor offers `zwp_linux_dmabuf_v1` v4 — feedback naming renderD128 as
 the main device, AR24/XR24/AB24/XB24 × LINEAR/INVALID from a format table
 next to the socket (v3 format/modifier events for older binds), params
-validated as the protocol says, `create`/`create_immed`. At commit a
-dma-buf buffer is read back from the host GPU (`GpuDevice::read_texture`,
-the damaged box, in the formats GLES/WebGL2 always read) into the surface
-and released at once, like a `wl_shm` copy. The GPU sits behind a narrow
-`GpuFrames` trait, so without `gpu` the compositor builds and offers no
-dmabuf. Mesa's Wayland EGL platform needs nothing more: `es2gears_wayland`,
+validated as the protocol says, `create`/`create_immed`. The GPU sits
+behind a narrow `GpuFrames` trait, so without `gpu` the compositor builds
+and offers no dmabuf. Mesa's Wayland EGL platform needs nothing more: `es2gears_wayland`,
 `weston-simple-egl` and GTK3's GL area (`GDK_GL=gles`; GTK3 wants desktop
 GL 3.2 otherwise) render on the virtual GPU and show, matching llvmpipe
 (two renderer bugs that only window-system buffers hit were fixed on the
 way: culling under the flipped viewport, and `gl_FragCoord.y`).
 `tests/gpu_display.rs` (skips without host EGL) has a raw-wire client
 clear a texture with virgl, export it with PRIME and share it; the frame's
-pixels are checked. At 1024×768 fullscreen, unthrottled (RTX 5080 host):
-es2gears ~630 FPS on the GPU vs ~360 on llvmpipe/wl_shm,
-weston-simple-egl `-b` ~710 vs ~500 — the per-commit read-back (3 MB of
-`glReadPixels`) dominates, peglgears offscreen does ~25k.
-Chromium (`--ozone-platform=wayland`): the GPU process comes up on ANGLE
-over virgl's GLES 3.0 (ES3 contexts refused: WebGL 1 only) and, with
-`--disable-gpu-compositing`, WebGL renders on the virtual GPU
-(`ANGLE (Mesa, virgl (nixvm GLES 3.0), OpenGL ES 3.0)`); with GPU
-compositing the window stays blank (see below).
+pixels are checked.
+
+**Compositing on the GPU** (`src/display/compose.rs`, `src/display/gl.rs`).
+How a frame is made sits behind `display::compose::Compositor`: the
+protocol side hands it each surface's new pixels at commit (`write` for
+`wl_shm` damage, `write_gpu` for a dma-buf) and a frame's draw list
+(`render`: surfaces bottom to top, then the cursor); the embedder reads the
+frame (`read`) or has it shown (`present`). `Software` is the CPU
+compositor as before. With a GPU attached the display switches to
+`GlCompositor` (`NIXVM_DISPLAY_GL=0` keeps the CPU one), which draws in the
+host GL context the guest renders in, reached through
+`GpuDevice::with_gl` (backend + a resource → host texture lookup; the
+renderer re-applies its own state afterwards). Each surface is an RGBA8
+texture: `wl_shm` damage is uploaded, a dma-buf's damaged box is copied in
+with `glBlitFramebuffer` — GPU to GPU, so the client still gets its buffer
+back at once, as with shared memory, but nothing is read back per commit.
+A frame is drawn into a framebuffer texture (row 0 at the top) by a
+texelFetch shader using the CPU compositor's integer nearest-neighbour
+mapping, blended `ONE, ONE_MINUS_SRC_ALPHA`; the CPU `over` now rounds
+exactly (`round(c·(255−a)/255)`, what a GPU blender does), so the two give
+identical pixels — a unit test (`display::gl`) composites translucent,
+scaled, clipped and partially rewritten surfaces both ways on the host's
+EGL and compares every byte. Natively the frame is read back only when the
+embedder takes one (`Display::frame`/`png`), and only the region that
+changed since its last read (damage from the draw lists and content
+versions); in the browser it is never read back (below). At 1024×768
+fullscreen, unthrottled (`vblank_mode=0`, RTX 5080 host): es2gears ~2500
+FPS (was ~580 with a 3 MB `glReadPixels` per commit; ~340 on
+llvmpipe/`wl_shm`), weston-simple-egl `-b` ~2250 (was ~690; ~530);
+peglgears offscreen does ~25k. Chromium's spinning-box page also stopped
+tearing (the read-back raced the next frame).
+Chromium (`--ozone-platform=wayland`, Alpine 3.22's 14x): with GPU
+compositing it allocates its window buffers on the render node (GBM,
+`R8G8B8A8` resources with scanout|shared binds, 1280×1024 with a
+`wp_viewport` source, later 1024×768), imports them with
+`create_immed` and commits them with damage: web content rasterized on the
+GPU shows, WebGL included, and animates. What doesn't: everything viz
+draws through an intermediate render pass — the browser's own tab strip
+and toolbar (the CSD frame, under rounded corners) come out transparent
+black, and a page with a CSS `filter`/`backdrop-filter` is blank as a
+whole; with `--disable-gpu-rasterization` only the animated layer shows.
+`--disable-gpu-compositing` shows everything. Not the compositor (the
+buffers hold transparent black there, with either compositor) nor GBM: a
+GLES2 render-to-texture-then-sample test (`RGBA`/`BGRA_EXT`, `glTexImage`
+or `glTexStorage`, cleared or drawn) is right on virgl, so it is in what
+ANGLE (`opengl` and `gles` backends alike, and still with desktop GL 3.3
+caps) emits for render passes.
 
 **Capset** (`src/gpu/caps.rs`): `virgl_caps_v2` describing a GLES 3.0 host
 the way virglrenderer does on GLES — GLSL level 130, `VIRGL_CAP_HOST_IS_GLES`,
@@ -917,7 +952,13 @@ transfer round trip), capset, TGSI parsing, GLSL generation, the decoder on a
 recorder, and a draw on the host's GL when present.
 
 **In the browser** (`?gpu=1` or the demo's gpu toggle; `web/README.md`).
-The page gives `attach_webgl2` a context on a hidden 1×1 canvas. In headless
+With the display on, the page gives `attach_webgl2` a context on the
+display pane's own canvas, so nixvm composites the guest's windows there
+on the GPU and `display_present` blits each frame onto it: no read-back,
+no pixels crossing into JS (es2gears at 640×400 on SwiftShader: showing a
+frame costs ~0.02 ms, against ~0.5 ms for read-back + `putImageData`,
+~54 frames/s shown; `web/scripts/display-check.mjs` measures it). Without
+the display the context is on a hidden 1×1 canvas. In headless
 Chromium (WebGL2 on SwiftShader, no GPU), on the interpreter: the stock
 demo's Alpine 3.20 takes `apk add mesa-dri-gallium mesa-utils` over the
 tunnel in ~5½ min and `eglinfo` shows virgl / GLES 3.0 (Mesa 24.0.9);
@@ -938,14 +979,14 @@ picture comparison headlessly.
 **Not yet / phase 2.**
 1. *WebGL2 left:* context loss is only reported; GL errors aren't checked
    per call; everything runs on the page's thread.
-2. *Display:* composite the host texture directly instead of reading every
-   commit back (zero copy in the browser, where display and GPU share the
-   WebGL context; natively, read only what is about to be shown). Chromium
-   with GPU compositing shows nothing: find what its gbm/SharedImage path
-   (gbm on renderD128, `EGL_EXT_image_dma_buf_import`, modifiers) trips on;
-   Chromium also wants ES3 (desktop GL 3.x / GLES 3.1 caps) for WebGL2.
-   No explicit sync (`wp_linux_drm_syncobj_v1`) or sync files: implicit
-   sync is trivially right on a synchronous device.
+2. *Display:* Chromium's render passes under ANGLE (above): trace the
+   framebuffer/sampler-view state of its intermediate passes against
+   llvmpipe. The GL compositor copies a dma-buf into the surface's texture
+   (cheap, but a copy): sampling the client's buffer in place needs holding
+   it until it's replaced, as real compositors do. Only frame-level damage
+   is tracked (a changed surface damages its whole area). No explicit sync
+   (`wp_linux_drm_syncobj_v1`) or sync files: implicit sync is trivially
+   right on a synchronous device.
 3. *Coverage:* sampler-view swizzles (needed for luminance/alpha formats),
    transform feedback (advertised, not executed), MSAA, per-RT blend,
    conditional render (desktop GL 3.x), `TXQ` level counts, geometry shaders

@@ -225,7 +225,12 @@ US keyboard), `wl_output` + `xdg-output`, `xdg-shell`, `xdg-decoration`,
 Apps render in software unless nixvm is built with `--features gpu` and run
 with `NIXVM_GPU=egl`: then it also offers `zwp_linux_dmabuf_v1`, and GL apps
 (Mesa's Wayland EGL: es2gears, weston-simple-egl, GTK's GL area) render on
-the virtual GPU and show up — see the GPU section of ROADMAP.md.
+the virtual GPU and show up. With a GPU the compositor itself draws on it
+too: windows are textures in the GPU's context, a GPU buffer is copied in
+GPU-to-GPU and the frame is read back only when it is taken (and only what
+changed) — es2gears at 1024×768 runs at ~2500 frames/s instead of ~580
+when every commit was read back (`NIXVM_DISPLAY_GL=0` keeps the CPU
+compositor). See the GPU section of ROADMAP.md.
 
 As a library, `Sandbox::builder().display(w, h)` and `Sandbox::display()`
 give a [`display::Display`](src/display/mod.rs) handle: `frame()` hands over
@@ -233,7 +238,8 @@ the RGBA frame when it changed (each call is a presentation: the apps' frame
 callbacks fire), `input()` sends pointer, keyboard, scroll and resize events,
 `png()` encodes it. The compositor is pure Rust with no threads, so it builds
 for the browser (wasm) too, where the embedder draws the frames on a
-`<canvas>`.
+`<canvas>` — or, with the GPU on, `present()` blits them onto the WebGL2
+canvas the GPU renders with, and no pixels leave the GPU.
 
 ## Default sandbox layout
 

@@ -7,9 +7,10 @@
 //! device and offers the 8888 formats, linear or with an implicit
 //! (`INVALID`) modifier, from a format table nixvm writes into the guest
 //! next to its socket. A buffer made from a dma-buf is a GPU resource: at
-//! commit nixvm reads it back from the host GPU (`glReadPixels` on the
-//! resource's texture, through [`GpuFrames`]) into the surface's image, as
-//! it copies a `wl_shm` buffer, and releases it at once.
+//! commit the compositor takes its damaged box — copied GPU-to-GPU into the
+//! surface's texture when it composites on the GPU (`super::gl`), else read
+//! back (`glReadPixels`, through [`GpuFrames`]) into the surface's image —
+//! as it copies a `wl_shm` buffer, and releases it at once.
 //!
 //! Everything GPU-specific is behind [`GpuFrames`], so the compositor builds
 //! without the `gpu` feature; it then has no GPU and offers no dmabuf

@@ -7,7 +7,7 @@
 //        --rootfs <x86_64 root .tar.gz with Mesa and the client> \
 //        [--no-gpu] [--cmd '<shell command>'] [--seconds 20] [--size 640x400] \
 //        [--out <file.png>] [--expect '<regexp the output must match>']
-//        [--resize WxH (halfway through)] [--pointer (move it all along)]
+//        [--resize WxH[@seconds] (default: halfway)] [--pointer (move it all along)]
 //        [--2d (with the GPU on a hidden canvas, copy frames out instead)]
 //        [--interactive (type the command into an interactive shell)]
 //
@@ -132,7 +132,7 @@ window.runGuest = async (cmd, useGpu, w, h, seconds, resize, pointer, use2d, int
   let resized = !resize;
   let k = 0;
   while (term.is_running() && performance.now() - t0 < seconds * 1000) {
-    if (!resized && performance.now() - t0 > (seconds * 1000) / 2) {
+    if (!resized && performance.now() - t0 > (resize[2] ?? seconds / 2) * 1000) {
       resized = true;
       term.display_resize(resize[0], resize[1]);
     }
@@ -141,7 +141,9 @@ window.runGuest = async (cmd, useGpu, w, h, seconds, resize, pointer, use2d, int
       term.display_pointer_move(50 + (k % 200), 50 + ((k >> 1) % 100));
     }
     chunks.push(term.pump());
-    await new Promise((r) => setTimeout(r, 0));
+    // As the page paces it: straight on while the guest computes, else
+    // back in 20 ms (it waits on a timer or the display).
+    await new Promise((r) => setTimeout(r, term.is_busy() ? 0 : 20));
   }
   done = true;
   // The last frame, drawn and captured in one animation frame (the drawing
@@ -232,7 +234,8 @@ try {
   await page.waitForFunction(() => window.harnessReady);
   page.setDefaultTimeout((Number(opt.seconds) + 600) * 1000);
   const script = `[ -e /bin/ls ] || /bin/busybox --install -s; ${opt.cmd}`;
-  const resize = opt.resize ? opt.resize.split("x").map(Number) : null;
+  // WxH[@seconds]: halfway through unless said.
+  const resize = opt.resize ? opt.resize.split(/[x@]/).map(Number) : null;
   const r = await page.evaluate(([c, g, w, h, s, z, p, d, i]) => window.runGuest(c, g, w, h, s, z, p, d, i), [
     script,
     !opt["no-gpu"],
