@@ -14,6 +14,12 @@ import { BUTTON_CODES, evdevKey } from "../keymap.js";
 // putImageData. One display pixel is one CSS pixel: the display is resized to
 // the pane (debounced), so it's drawn 1:1.
 //
+// With the GPU on, the canvas is instead the WebGL2 canvas the guest's GPU
+// renders with (NixTerm's attachGpu takes it with `glCanvas()` and hands the
+// context back with `useGl()`): nixvm composites the guest's windows on the
+// GPU and `display_present()` blits the frame onto the canvas — no pixels
+// cross into JS.
+//
 // Keys go to the guest only while the canvas has the focus (click it); the
 // terminal keeps them otherwise. Codes are physical keys (`KeyboardEvent.code`)
 // mapped to Linux evdev codes; the guest's keymap does the rest.
@@ -40,6 +46,8 @@ const MAX_EDGE = 4096;
 const RESIZE_DEBOUNCE_MS = 250;
 
 let ctx = null;
+// The canvas's WebGL2 context, when the GPU presents on it.
+let gl = null;
 let raf = 0;
 let resizeObserver = null;
 let resizeTimer = 0;
@@ -58,7 +66,17 @@ function paneSize() {
   return [clamp(el.clientWidth), clamp(el.clientHeight)];
 }
 
-defineExpose({ paneSize });
+/// The canvas, for the GPU's WebGL2 context: null once it has a 2D one.
+function glCanvas() {
+  return ctx ? null : canvasEl.value;
+}
+
+/// The GPU's context is on our canvas: present frames with it.
+function useGl(context) {
+  gl = context;
+}
+
+defineExpose({ paneSize, glCanvas, useGl });
 
 /// Call into the guest; a throw means the wasm instance trapped.
 function call(fn) {
@@ -97,6 +115,10 @@ function frame() {
   }
   if (!t) return;
   flushMove();
+  if (gl) {
+    presentGl();
+    return;
+  }
   const px = call((tt) => tt.display_frame());
   if (!px) return;
   const [w, h] = call((tt) => tt.display_size()) ?? [0, 0];
@@ -110,6 +132,21 @@ function frame() {
   ctx ??= canvas.getContext("2d");
   ctx.putImageData(new ImageData(new Uint8ClampedArray(px.buffer, px.byteOffset, px.length), w, h), 0, 0);
   hasFrame.value = true;
+}
+
+/// Show the frame on the WebGL2 canvas: nixvm draws it there itself.
+function presentGl() {
+  const [w, h] = call((tt) => tt.display_current_size()) ?? [0, 0];
+  if (!w || !h) return;
+  const canvas = canvasEl.value;
+  let force = false;
+  if (canvas.width !== w || canvas.height !== h) {
+    // Resizing clears the drawing buffer: draw again even if nothing changed.
+    canvas.width = w;
+    canvas.height = h;
+    force = true;
+  }
+  if (call((tt) => tt.display_present(force))) hasFrame.value = true;
 }
 
 function scheduleResize() {

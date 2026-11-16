@@ -186,11 +186,17 @@ then `es2gears_wayland &` (about 35 frames/s in headless Chromium on
 SwiftShader).
 
 How it's wired: `Terminal.attach_webgl2(gl)`, right after construction,
-gives the guest the device; `NixTerm.vue` makes the context on a canvas it
-never shows (1×1, no depth/stencil: the guest renders into its own
-textures). Every GL call runs synchronously on the page's thread, through
-`src/gpu/webgl.js` (shipped in `pkg/snippets/`). A lost context is reported
-in the terminal; GL then fails until a Reboot.
+gives the guest the device. With the display on, `NixTerm.vue` makes that
+context on the display pane's own canvas (`NixDisplay.vue`'s `glCanvas()`,
+remade at each boot since a canvas keeps the first kind of context it
+gets): nixvm then composites the guest's windows on the GPU too, and each
+animation frame `display_present()` blits the frame onto the canvas — no
+pixels are read back or cross into JS (`display_frame()` + `putImageData`
+remain the path without a GPU). Without the display the context is on a
+canvas that is never shown (1×1, no depth/stencil: the guest renders into
+its own textures). Every GL call runs synchronously on the page's thread,
+through `src/gpu/webgl.js` (shipped in `pkg/snippets/`). A lost context is
+reported in the terminal; GL then fails until a Reboot.
 
 ### Checking it without a GPU
 
@@ -210,4 +216,18 @@ gpu_gl33) in an Alpine root with `mesa-dev`), and a wasm-pack build with
 npm install                       # playwright-core
 npx playwright-core install chromium   # or point $CHROME at one
 node scripts/gpu-check.mjs --pkg ../pkg --rootfs root-with-mesa.tar.gz --ref refs/
+```
+
+`scripts/display-check.mjs` does the same for the display: it boots a root
+with the display on a canvas sized like the pane, runs a Wayland client
+(`es2gears_wayland` by default, `--cmd` otherwise), shows its frames as
+the page does — `display_present` on the GPU's canvas, or
+`display_frame` + `putImageData` with `--no-gpu` (or `--2d`: GPU on, frames
+copied out) — and prints how many frames were shown and what showing one
+cost, saving the canvas with `--out`. `--resize`, `--pointer` and
+`--interactive` (type the command into a shell, as on the page) cover
+what the page adds:
+
+```sh
+node scripts/display-check.mjs --pkg ../pkg --rootfs root-with-mesa.tar.gz --out gears.png
 ```

@@ -107,6 +107,9 @@ const VIEWS = [
   { id: "display", label: "display" },
 ];
 const displayEl = ref(null);
+// Bumped at each boot: the display pane (and its canvas) is made afresh, as a
+// canvas that had a 2D context can't get a WebGL2 one and vice versa.
+const displayKey = ref(0);
 const displayPending = computed(() => hasBooted.value && displayWanted.value !== displayOn.value);
 // The layout: the terminal alone without a display; before the guest boots
 // with one, both (the display pane is measured to size the display).
@@ -115,7 +118,9 @@ const paneView = computed(() => {
   return displayWanted.value ? "split" : "terminal";
 });
 // GPU acceleration: the guest's Mesa renders through a virtio-gpu that
-// nixvm replays on WebGL2 (a canvas that is never shown). Off unless asked
+// nixvm replays on WebGL2 — on the display's canvas when there is a display
+// (nixvm composites the guest's windows there on the GPU too), else on a
+// canvas that is never shown. Off unless asked
 // for, with `?gpu=1` or the toolbar's gpu button; like the display it is set
 // up at boot. Needs a nixvm build with the `gpu` feature and a browser with
 // WebGL2.
@@ -872,12 +877,17 @@ async function boot() {
       ? mod.Terminal.from_image_on(pull, netLink, imageCmd, env)
       : mod.Terminal.new_on(targz, ["/bin/busybox", "sh"], netLink, env);
     if (withDisplay) {
+      // A fresh pane, whose canvas can take either kind of context.
+      displayKey.value++;
+      await tick();
+    }
+    if (withDisplay) {
       // Sized to its pane, before pid 1 runs.
       const [w, h] = displayEl.value?.paneSize() ?? [640, 400];
       guestTerm.enable_display(w, h);
     }
     // Also before pid 1 runs: the render node exists from boot.
-    const gpu = gpuWanted.value ? attachGpu(guestTerm) : null;
+    const gpu = gpuWanted.value ? attachGpu(guestTerm, withDisplay ? displayEl.value : null) : null;
     const out = guestTerm.pump();
     if (imageName) {
       writeBanner(`nixvm — ${imageName} (${archId}), pulled over the network and running in your browser.`);
@@ -936,25 +946,32 @@ async function reboot() {
 
 // ---- gpu ---------------------------------------------------------------
 
-/// Give `term` (constructed, not yet pumped) a GPU rendering with WebGL2 on
-/// a fresh canvas that is never shown: the guest renders into its own
-/// buffers, so the canvas's drawing buffer stays 1×1 with no depth or
-/// stencil. Returns `{ renderer }` (the WebGL renderer's name), or
-/// `{ error }` saying why there is no GPU.
-function attachGpu(term) {
+/// Give `term` (constructed, not yet pumped) a GPU rendering with WebGL2.
+/// With a display pane (`display`), on its canvas: nixvm composites the
+/// guest's windows on the GPU and presents them there, with no copy back
+/// to the page. Without one, on a fresh canvas that is never shown (the
+/// guest renders into its own buffers, so its drawing buffer stays 1×1).
+/// Returns `{ renderer }` (the WebGL renderer's name), or `{ error }`
+/// saying why there is no GPU.
+function attachGpu(term, display) {
   if (typeof term.attach_webgl2 !== "function") {
     return { error: "this build of nixvm has no GPU support (the `gpu` feature)" };
   }
-  const canvas = document.createElement("canvas");
-  canvas.width = 1;
-  canvas.height = 1;
-  const gl = canvas.getContext("webgl2", {
+  const opts = {
+    alpha: false,
     antialias: false,
     depth: false,
     stencil: false,
     preserveDrawingBuffer: false,
     powerPreference: "high-performance",
-  });
+  };
+  let canvas = display?.glCanvas() ?? null;
+  if (!canvas) {
+    canvas = document.createElement("canvas");
+    canvas.width = 1;
+    canvas.height = 1;
+  }
+  const gl = canvas.getContext("webgl2", opts);
   if (!gl) return { error: "this browser has no WebGL2" };
   canvas.addEventListener("webglcontextlost", (e) => {
     e.preventDefault();
@@ -968,6 +985,7 @@ function attachGpu(term) {
     return { error: err?.message ?? String(err) };
   }
   gpuCanvas = canvas;
+  display?.useGl(gl);
   const dbg = gl.getExtension("WEBGL_debug_renderer_info");
   return { renderer: String(dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)) };
 }
@@ -1155,6 +1173,7 @@ onBeforeUnmount(() => {
       <div v-show="paneView !== 'display'" ref="termEl" class="term-container"></div>
       <NixDisplay
         v-if="displayWanted || displayOn"
+        :key="displayKey"
         v-show="paneView !== 'terminal'"
         ref="displayEl"
         :term="displayTerm"
