@@ -476,6 +476,44 @@ mod browser {
             out
         }
 
+        /// Show the display's frame on the canvas whose WebGL2 context
+        /// `attach_webgl2` was given — the GPU composites it there, nothing
+        /// is copied out — if it changed since the last call, or `force`
+        /// (the canvas was resized, which clears it). Size the canvas to
+        /// `display_current_size()` first. Like `display_frame`, it tells
+        /// the guest's clients a frame was shown, so call it once per
+        /// animation frame instead. False when nothing was drawn, and
+        /// always without a GPU (then use `display_frame`).
+        #[must_use]
+        pub fn display_present(&mut self, force: bool) -> bool {
+            let Some(display) = self.display.as_ref() else {
+                return false;
+            };
+            let size = display.size();
+            let drawn = display.present(force);
+            if drawn {
+                self.frame_size = size;
+            }
+            drawn
+        }
+
+        /// The display's size now: what a `display_present` would draw.
+        #[must_use]
+        pub fn display_current_size(&self) -> Vec<u32> {
+            let (w, h) = self.display.as_ref().map_or((0, 0), crate::display::Display::size);
+            vec![w, h]
+        }
+
+        /// Which compositor makes the display's frames: `gl` (on the GPU,
+        /// for `display_present`), `software`, or `none` without a display.
+        #[must_use]
+        pub fn display_compositor(&self) -> String {
+            self.display
+                .as_ref()
+                .map_or("none", |d| d.compositor())
+                .to_string()
+        }
+
         /// `[width, height]` of the frame `display_frame` last returned (the
         /// display's size before the first), `[0, 0]` without a display.
         #[must_use]
