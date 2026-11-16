@@ -26,6 +26,7 @@
 //! fences and waits are trivially complete.
 
 pub mod backend;
+pub mod cache;
 pub mod caps;
 #[cfg(all(not(target_arch = "wasm32"), target_os = "linux"))]
 pub mod egl;

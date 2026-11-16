@@ -2,10 +2,11 @@
 //! sub-context the way virglrenderer keeps it, and turned into GLES 3.0
 //! calls on a [`GpuBackend`] at each draw, clear, copy and transfer.
 //!
-//! GL state is applied in full before every draw (the guest's state objects
-//! are small and draws are few next to the cost of the ioctl that carried
-//! them), so contexts sharing the one host GL context never see each
-//! other's leftovers. Gallium conventions that GLES lacks are emulated here:
+//! GL state is applied in full before every draw, so contexts sharing the
+//! one host GL context never see each other's leftovers; a state cache in
+//! front of the backend ([`super::cache`]) drops the calls that would set
+//! what is already set (peglgears: 53 host calls a draw become 5). Gallium
+//! conventions that GLES lacks are emulated here:
 //!
 //! - **Viewport y flip.** A Gallium viewport may scale y negatively (Mesa
 //!   does for window-system buffers, whose row 0 is the top). GL's can't;
@@ -29,10 +30,11 @@
 //! (`TRANSFER_FROM_HOST`, copies between buffers, index uploads) never need
 //! GL to read a buffer back, which GLES 3.0 / WebGL2 make awkward.
 
-use std::collections::HashMap;
+use super::cache::FxMap;
 use std::sync::Arc;
 
 use super::backend::HostCaps;
+use super::cache::StateCache;
 use super::format::{self, Format, Kind};
 use super::glsl::{self, StreamOutput};
 use super::tgsi;
@@ -308,7 +310,7 @@ struct Program {
 
 #[derive(Default)]
 pub(crate) struct SubCtx {
-    objects: HashMap<u32, Object>,
+    objects: FxMap<u32, Object>,
     blend: u32,
     rasterizer: u32,
     dsa: u32,
@@ -331,8 +333,8 @@ pub(crate) struct SubCtx {
     /// Bound stream-output targets (object handles), by buffer index.
     so_targets: Vec<u32>,
     /// Queries begun and not yet ended.
-    queries: HashMap<u32, QueryRun>,
-    programs: HashMap<(u32, u32, glsl::Options), Option<Program>>,
+    queries: FxMap<u32, QueryRun>,
+    programs: FxMap<(u32, u32, glsl::Options), Option<Program>>,
 }
 
 /// A query between `BEGIN_QUERY` and `END_QUERY`: what it counts so far.
@@ -347,19 +349,20 @@ struct QueryRun {
 
 #[derive(Default)]
 pub(crate) struct Context {
-    subs: HashMap<u32, SubCtx>,
+    subs: FxMap<u32, SubCtx>,
     cur: u32,
 }
 
 /// See the module docs.
 pub struct Renderer {
-    backend: Box<dyn GpuBackend>,
+    /// The backend, behind a cache that drops redundant state calls.
+    backend: StateCache,
     trace: bool,
-    resources: HashMap<u32, Resource>,
+    resources: FxMap<u32, Resource>,
     /// Bytes of buffer shadows held for the guest.
     buffer_bytes: u64,
     next_res: u32,
-    contexts: HashMap<u32, Context>,
+    contexts: FxMap<u32, Context>,
     next_ctx: u32,
     /// What the backend's GL offers beyond GLES 3.0.
     host: HostCaps,
@@ -376,7 +379,7 @@ pub struct Renderer {
     xfb_buf: u32,
     /// Texel buffers as 2D textures, by (buffer, format, first and last
     /// element).
-    tbos: HashMap<(u32, u32, u32, u32), Tbo>,
+    tbos: FxMap<(u32, u32, u32, u32), Tbo>,
     /// The guest's failures, logged once each.
     warned: std::collections::HashSet<String>,
 }
@@ -579,12 +582,12 @@ impl Renderer {
         let host = backend.host_caps();
         backend.end();
         Self {
-            backend,
+            backend: StateCache::new(backend),
             trace,
-            resources: HashMap::new(),
+            resources: FxMap::default(),
             buffer_bytes: 0,
             next_res: 1,
-            contexts: HashMap::new(),
+            contexts: FxMap::default(),
             next_ctx: 1,
             vao: 0,
             draw_fbo: 0,
@@ -592,7 +595,7 @@ impl Renderer {
             ebo: 0,
             resolve_fbos: (0, 0),
             xfb_buf: 0,
-            tbos: HashMap::new(),
+            tbos: FxMap::default(),
             host,
             warned: std::collections::HashSet::new(),
         }
@@ -1048,8 +1051,8 @@ impl Renderer {
     /// Run `f` on the backend for a caller outside the guest's command
     /// stream (the display's GL compositor), with a lookup from resource
     /// ids to their host textures. `f` may change any GL binding or state:
-    /// whatever the renderer keeps of the GL state must be re-applied
-    /// before its next draw (today it applies its full state per draw).
+    /// it gets the state cache, which so stays right, and the renderer
+    /// applies its full state at every draw.
     pub(crate) fn external<T>(
         &mut self,
         f: impl FnOnce(&mut dyn GpuBackend, &dyn Fn(u32) -> Option<super::HostTexture>) -> T,
@@ -1072,7 +1075,7 @@ impl Renderer {
             let (width, height, _) = r.level_size(0);
             Some(super::HostTexture { gl, width, height })
         };
-        f(&mut *self.backend, &lookup)
+        f(&mut self.backend, &lookup)
     }
 
     /// Read the box `(x, y, w, h)` of level 0, layer 0 of 4-byte colour
@@ -2032,7 +2035,7 @@ impl Renderer {
     /// host can (`draw_buffers_indexed`), else buffer 0's for all.
     fn apply_blend(&mut self, blend: &Blend, color: [f32; 4], nr_cbufs: usize) {
         let b = &mut self.backend;
-        let set = |b: &mut Box<dyn GpuBackend>, i: Option<u32>, rt: &RtBlend| {
+        let set = |b: &mut StateCache, i: Option<u32>, rt: &RtBlend| {
             let (src_rgb, dst_rgb) = (blend_factor(rt.rgb_src), blend_factor(rt.rgb_dst));
             let (src_a, dst_a) = (blend_factor(rt.alpha_src), blend_factor(rt.alpha_dst));
             let (eq_rgb, eq_a) = (blend_func(rt.rgb_func), blend_func(rt.alpha_func));
