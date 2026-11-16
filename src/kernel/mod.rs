@@ -1423,6 +1423,15 @@ fn run_slice_smp(
 ) -> (usize, Box<dyn Vcpu>, SliceOutcome) {
     let mut count: u32 = 0;
     let mut progressed = false;
+    // The program its address space held when this task last ran; another
+    // thread's `execve` changes it, and then this thread is gone. Read *before*
+    // the zombie check below: an `execve` marks its siblings dead (`de_thread`)
+    // and only then replaces the image, both under this memory lock, so either
+    // the generation read here is the old one (and the run below sees it
+    // change) or the kill is already visible. Read after the check, an exec
+    // landing in between let this thread run its old registers in the new
+    // image — faulting there and corrupting the program just loaded.
+    let mut image = space.lock().unwrap().exec_gen;
     // A task killed while it waited for this worker (another thread's `execve`
     // took its process): it never runs again.
     {
@@ -1446,9 +1455,6 @@ fn run_slice_smp(
             }
         }
     }
-    // The program its address space held when this task last ran; another
-    // thread's `execve` changes it, and then this thread is gone.
-    let mut image = space.lock().unwrap().exec_gen;
     loop {
         // Step start, for CPU-time accounting (charged in `smp_service_step`).
         let step_start = crate::clock::now_monotonic().as_nanos();
@@ -1502,6 +1508,14 @@ fn run_slice_smp(
         // workers service their syscalls concurrently (step B2). ----
         let step = {
             let mut mem = space.lock().unwrap();
+            // A sibling's `execve` replaced the image between the run and
+            // here: this thread is dead, and its exit (a page fault, a
+            // syscall) belongs to the old program. Serviced against the new
+            // one, a fault found nothing mapped and its SIGSEGV killed the
+            // freshly exec'd process.
+            if mem.exec_gen != image {
+                return (i, vcpu, SliceOutcome::Ended);
+            }
             let step = kernel.smp_service_step(i, exit, vcpu.as_mut(), &mut mem, step_start);
             // This task's own `execve` is its new image.
             image = mem.exec_gen;
