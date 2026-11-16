@@ -2159,7 +2159,9 @@ impl Renderer {
             2 => (gl::UNSIGNED_SHORT, 2),
             _ => (gl::UNSIGNED_INT, 4),
         };
-        let start = ib.offset as usize + info.start as usize * size;
+        // The index buffer's offset already points at the draw's first
+        // index (Mesa folds `start` into it, as virglrenderer reads it).
+        let start = ib.offset as usize;
         let len = info.count as usize * size;
         let Some(Host::Buffer { shadow, .. }) = self.resources.get(&ib.res).map(|r| &r.host) else {
             self.warn("indexed draw without an index buffer".into());

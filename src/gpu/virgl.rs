@@ -682,6 +682,75 @@ DCL CONST[0][0]
         assert!(progs[0].1.contains("nx_out0 = nx_o0;"));
     }
 
+    /// An indexed draw's first index is where the index buffer's offset
+    /// points: Mesa folds the draw's `start` into the offset (and still
+    /// sends `start`), as virglrenderer reads it.
+    #[test]
+    fn indexed_draws_start_at_the_index_buffer_offset() {
+        let (dev, calls, _) = device();
+        let ctx = dev.create_context();
+        let rt = dev
+            .create_resource(
+                ResourceDesc {
+                    target: target::TEXTURE_2D,
+                    format: 67,
+                    bind: 2,
+                    width: 8,
+                    height: 8,
+                    depth: 1,
+                    array_size: 1,
+                    ..ResourceDesc::default()
+                },
+                MemBacking::new(256),
+            )
+            .unwrap();
+        // 5 u32 indices: draw 3 of them from index 2 on.
+        let ib = dev
+            .create_resource(
+                ResourceDesc {
+                    target: target::BUFFER,
+                    format: 64,
+                    bind: 16,
+                    width: 20,
+                    height: 1,
+                    depth: 1,
+                    array_size: 1,
+                    ..ResourceDesc::default()
+                },
+                MemBacking::new(20),
+            )
+            .unwrap();
+        let mut cmds = vec![];
+        cmds.extend(shader(10, 0, VS));
+        cmds.extend(shader(11, 1, FS));
+        cmds.extend([cmd0(CREATE_OBJECT, OBJ_SURFACE, 5), 20, rt, 67, 0, 0]);
+        cmds.extend([cmd0(SET_FRAMEBUFFER_STATE, 0, 3), 1, 0, 20]);
+        cmds.extend([
+            cmd0(BIND_SHADER, 0, 2),
+            10,
+            0,
+            cmd0(BIND_SHADER, 0, 2),
+            11,
+            1,
+        ]);
+        cmds.extend([cmd0(SET_INDEX_BUFFER, 0, 3), ib, 4, 8]);
+        cmds.extend([cmd0(DRAW_VBO, 0, 12), 2, 3, 4, 1, 1, 0, 0, 0, 0, 0, !0, 0]);
+        dev.submit(ctx, &cmds).unwrap();
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("buffer_data(34963, 12, Some(12)")),
+            "{calls:#?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("draw_elements(4, 3, 5125, 0, 1)")),
+            "{calls:#?}"
+        );
+    }
+
     /// Desktop GL 3.x paths on a recorder that claims indexed blending:
     /// a multisampled target drawn through its renderbuffer and resolved
     /// when read, independent blend per buffer, and transform feedback's
