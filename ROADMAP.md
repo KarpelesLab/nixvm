@@ -819,15 +819,20 @@ function's `vendor`/`device` (`0x1af4`/`0x1050`), `config`, `subsystem` →
 `virtio_gpu` with no environment overrides.
 
 **Kernel side** (`src/kernel/drm.rs`, an `Fd::Drm` open file):
-`DRM_IOCTL_VERSION` (`virtio_gpu` 0.0 — minor 0 tells Mesa not to ask for
-fence fds), `GET_CAP` (PRIME import+export), `GEM_CLOSE`, `GET_UNIQUE`,
+`DRM_IOCTL_VERSION` (`virtio_gpu` 0.1 — minor 1 tells Mesa execbuffers
+return fence fds), `GET_CAP` (PRIME import+export), `GEM_CLOSE`, `GET_UNIQUE`,
 `PRIME_HANDLE_TO_FD`/`FD_TO_HANDLE`; virtgpu
 `GETPARAM` (3D features, capset-query fix, capsets 1+2; no blobs, no context
 init), `GET_CAPS`, `CONTEXT_INIT`, `RESOURCE_CREATE`, `RESOURCE_INFO`, `MAP`,
 `EXECBUFFER`, `TRANSFER_TO_HOST`/`FROM_HOST`, `WAIT`. A GEM object is a
 shared-memory `FileObj` of guest frames (the resource's backing); `MAP` hands
 out `handle << 32` and `mmap` of the node at that offset maps the object like
-a memfd. The device answers synchronously, so `WAIT` never waits.
+a memfd. The device answers synchronously, so `WAIT` never waits, and the
+fence an execbuffer returns (`VIRTGPU_EXECBUF_FENCE_FD_OUT`) is an
+`Fd::SyncFile` signalled from the start: `poll` readable,
+`SYNC_IOC_FILE_INFO` signalled with its timestamp, `SYNC_IOC_MERGE` a new
+one; an in-fence has nothing to wait for. They exist for what they make
+Mesa do: offer `EGL_ANDROID_native_fence_sync` (below, Chromium).
 PRIME exports an object as an `Fd::DmaBuf` — a real descriptor (SCM_RIGHTS,
 fork, `mmap` of the object's pages, `fstat` size and one inode per buffer,
 `lseek(SEEK_END)`, `DMA_BUF_IOCTL_SYNC`) holding its own resource
@@ -884,20 +889,27 @@ Chromium (`--ozone-platform=wayland`, Alpine 3.22's 14x): with GPU
 compositing it allocates its window buffers on the render node (GBM,
 `R8G8B8A8` resources with scanout|shared binds, 1280×1024 with a
 `wp_viewport` source, later 1024×768), imports them with
-`create_immed` and commits them with damage: web content rasterized on the
-GPU shows, WebGL included, and animates. What doesn't: everything viz
-draws through an intermediate render pass — the browser's own tab strip
-and toolbar (the CSD frame, under rounded corners) come out transparent
-black, and a page with a CSS `filter`/`backdrop-filter` is blank as a
-whole; with `--disable-gpu-rasterization` only the animated layer shows.
-`--disable-gpu-compositing` shows everything. Not the compositor (the
-buffers hold transparent black there, with either compositor) nor GBM: a
-GLES2 render-to-texture-then-sample test (`RGBA`/`BGRA_EXT`, `glTexImage`
-or `glTexStorage`, cleared or drawn) is right on virgl, while the same
-Chromium on the guest's llvmpipe (no render node: `wl_shm` buffers) draws
-the toolbar and the filters right — so it is in how what ANGLE emits for
-render passes (`opengl` and `gles` backends alike, and still with desktop
-GL 3.3 caps) goes through virgl to the host. With `--disable-gpu-compositing`, **WebGL 2**
+`create_immed` and commits them with damage: everything shows — tab
+strip and toolbar (rounded CSD frame), web content rasterized on the GPU,
+WebGL, CSS `filter: blur()`, `backdrop-filter`, opacity and rounded-clip
+layers, static pages and animations alike. It didn't until the render node
+returned fences: the browser's own frame came out transparent black and a
+static page (one with a filter looked like the culprit) blank. The cause
+was not render passes at all: Mesa's virgl keeps commands in the guest
+until a flush, and Chromium flushes a frame only by asking for an
+`EGL_ANDROID_native_fence_sync` fence — which Mesa offers only when
+execbuffers can return fence fds. Without it the GPU process committed
+each buffer to Wayland with its commands still in the guest (a trace:
+dozens of commits of the window buffers, one execbuffer every few frames,
+and after the window settled at 1024×768 a fresh buffer committed that no
+command ever drew into); the compositor copied what the buffer held then.
+Animated content was redrawn, and so caught up, a frame late; anything
+drawn once (the toolbar, a static page) stayed as the buffer had been.
+`tests/guest/gpu_fence.c` checks the mechanism: two contexts (separate
+command streams, as the GPU process and a compositor), one renders into a
+GBM dma-buf and takes a native fence without flushing, the fence polls
+signalled, and the other reads the finished frame; then it waits on the
+fence as an in-fence (merged). With `--disable-gpu-compositing`, **WebGL 2**
 renders on the virtual GPU (`WebGL 2.0 (OpenGL ES 3.0 Chromium)` / `ANGLE
 (Mesa, virgl (nixvm GLES 3.0), OpenGL ES 3.0)`, MAX_SAMPLES 8, antialiased
 canvas): it was WebGL 1 only until real multisampling — ANGLE wants 4
@@ -1059,14 +1071,14 @@ in the tab: the interpreter running Mesa is the bound, not WebGL calls.
 **Not yet / phase 2.**
 1. *WebGL2 left:* context loss is only reported; GL errors aren't checked
    per call; everything runs on the page's thread.
-2. *Display:* Chromium's render passes under ANGLE (above): trace the
-   framebuffer/sampler-view state of its intermediate passes against
-   llvmpipe. The GL compositor copies a dma-buf into the surface's texture
+2. *Display:* the GL compositor copies a dma-buf into the surface's texture
    (cheap, but a copy): sampling the client's buffer in place needs holding
    it until it's replaced, as real compositors do. Only frame-level damage
    is tracked (a changed surface damages its whole area). No explicit sync
-   (`wp_linux_drm_syncobj_v1`) or sync files: implicit sync is trivially
-   right on a synchronous device.
+   (`wp_linux_drm_syncobj_v1`, `zwp_linux_explicit_synchronization_v1`) nor
+   dma-buf sync-file export/import: implicit sync is trivially right on a
+   synchronous device — once the client has flushed (render-node fences,
+   above).
 3. *Coverage:* geometry/tessellation shaders and GLES 3.1 (compute, SSBOs,
    images) — possible natively on a GLES 3.1+ host (the capset is per
    backend already), never on WebGL2; real occlusion counts (GLES has
@@ -1075,7 +1087,7 @@ in the tab: the interpreter running Mesa is the bound, not WebGL calls.
    would do it); first-vertex provoking (`WEBGL_provoking_vertex` /
    none on GLES); a vertex shader using all 16 varyings plus emulated clip
    planes overflows GLES's 15/16; `TXQ` level counts; compressed formats
-   beyond what Mesa decodes; Chromium's render passes (item 2).
+   beyond what Mesa decodes.
 4. *Performance:* buffers keep CPU shadows (index uploads, texel buffers and
    stream output read them); upload index ranges once, and consider
    `VIRGL_CAP_TRANSFER`/blob resources to cut ioctls.

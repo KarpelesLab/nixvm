@@ -9414,6 +9414,13 @@ impl Kernel {
         {
             return drm::dmabuf_ioctl(req, arg, mem);
         }
+        // A fence's (`SYNC_IOC_MERGE`, `SYNC_IOC_FILE_INFO`).
+        #[cfg(feature = "gpu")]
+        if let Fd::SyncFile(sf) = &f
+            && (req >> 8) & 0xff == u32::from(b'>')
+        {
+            return drm::sync_file_ioctl(cx, sf, req, arg, mem);
+        }
         // `/dev/tty` on the console: the host terminal's own answers on the CLI
         // path, else the emulated console terminal.
         if matches!(f, Fd::Tty) && !self.host_tty {
@@ -10516,6 +10523,21 @@ impl Kernel {
                 nlink: 1,
                 rdev: 0,
                 dev: 0xd,
+            },
+            // A fence: an anonymous inode, as Linux's sync files are.
+            #[cfg(feature = "gpu")]
+            Some(Fd::SyncFile(f)) => Attrs {
+                kind: NodeKind::File,
+                size: 0,
+                mode: 0o600,
+                uid: 0,
+                gid: 0,
+                atime: 0,
+                mtime: 0,
+                inode: f.inode(),
+                nlink: 1,
+                rdev: 0,
+                dev: 0xe,
             },
             // A message queue is a regular file on the mqueue filesystem.
             Some(Fd::Mqueue { q, .. }) => Attrs {

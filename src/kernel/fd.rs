@@ -190,6 +190,9 @@ pub enum Fd {
     /// A dma-buf: a GPU buffer object exported from a render node.
     #[cfg(feature = "gpu")]
     DmaBuf(super::drm::DmaBuf),
+    /// A GPU fence (`sync_file`), as an execbuffer returns it.
+    #[cfg(feature = "gpu")]
+    SyncFile(super::drm::SyncFile),
     /// `/proc/<pid>/mem`: process `pid`'s address space `mm` as it was when
     /// opened, at the (shared) position `offset`.
     ProcMem {

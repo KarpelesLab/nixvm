@@ -322,6 +322,9 @@ impl Kernel {
             // A dma-buf's implicit fences are always signalled.
             #[cfg(feature = "gpu")]
             Fd::DmaBuf(_) => POLLIN | POLLOUT,
+            // So is every fence.
+            #[cfg(feature = "gpu")]
+            Fd::SyncFile(_) => POLLIN,
             // A host-bridged socket gets a precise readable answer (a peek);
             // in-VM loopback sockets stay best-effort always-ready, since
             // their queues aren't observable from here.

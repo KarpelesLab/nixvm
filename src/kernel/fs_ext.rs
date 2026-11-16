@@ -1441,6 +1441,8 @@ fn fd_link_target(fd: &Fd) -> String {
         Fd::Drm(_) => crate::gpu::nodes::RENDER_NODE.to_string(),
         #[cfg(feature = "gpu")]
         Fd::DmaBuf(_) => "/dmabuf:".to_string(),
+        #[cfg(feature = "gpu")]
+        Fd::SyncFile(_) => "anon_inode:sync_file".to_string(),
     }
 }
 

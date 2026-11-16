@@ -14,9 +14,13 @@
 //! and so is the rendering context, made on first use. The last descriptor
 //! going drops its handles and context.
 //!
-//! The device answers synchronously, so `WAIT` never waits and execbuffers
-//! carry no fences (the driver reports version 0.0, which tells Mesa not to
-//! ask for fence fds). No blobs.
+//! The device answers synchronously, so `WAIT` never waits. Execbuffers
+//! still hand out fences when asked (`VIRTGPU_EXECBUF_FENCE_FD_OUT`): sync
+//! files ([`SyncFile`]) that are signalled from the start. The driver
+//! reports version 0.1, which is what tells Mesa it may ask, and Mesa then
+//! offers `EGL_ANDROID_native_fence_sync` — the only thing that makes
+//! Chromium flush its frames before handing them to the compositor. No
+//! blobs.
 //!
 //! PRIME: `PRIME_HANDLE_TO_FD` exports an object as a [`DmaBuf`] descriptor
 //! and `PRIME_FD_TO_HANDLE` imports one back (the same handle if the file
@@ -119,6 +123,45 @@ impl DmaBuf {
     }
 }
 
+/// A sync file (`sync_file`): the fence an execbuffer hands back with
+/// `VIRTGPU_EXECBUF_FENCE_FD_OUT`. The device completes work as it is
+/// submitted, so every fence is signalled from the start: `poll` reports it
+/// readable at once and `SYNC_IOC_FILE_INFO` says so. Having them at all is
+/// what matters: Mesa exposes `EGL_ANDROID_native_fence_sync` only when
+/// execbuffers can return fences, and Chromium flushes each frame only to
+/// get one (without it, frames reach the compositor before their commands
+/// reach the device).
+#[derive(Debug, Clone)]
+pub struct SyncFile(Arc<SyncFileInner>);
+
+#[derive(Debug)]
+pub struct SyncFileInner {
+    /// When the fence signalled (`CLOCK_MONOTONIC`, ns): when it was made.
+    timestamp_ns: u64,
+    /// One inode per fence (merges make new ones), for `fstat`.
+    inode: u64,
+}
+
+impl SyncFile {
+    /// A fence that signalled now.
+    #[must_use]
+    pub fn signalled() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(Arc::new(SyncFileInner {
+            timestamp_ns: u64::try_from(crate::clock::now_monotonic().as_nanos())
+                .unwrap_or(u64::MAX),
+            inode: 0x5359_4e43_0000_0000 | (n & 0xffff_ffff),
+        }))
+    }
+
+    /// The inode `fstat` reports.
+    #[must_use]
+    pub fn inode(&self) -> u64 {
+        self.0.inode
+    }
+}
+
 impl Drop for DrmInner {
     fn drop(&mut self) {
         let st = self.st.get_mut().unwrap();
@@ -184,6 +227,9 @@ const VIRTGPU_TRANSFER_TO_HOST: u32 = 0x47;
 const VIRTGPU_WAIT: u32 = 0x48;
 const VIRTGPU_GET_CAPS: u32 = 0x49;
 const VIRTGPU_CONTEXT_INIT: u32 = 0x4b;
+
+/// `drm_virtgpu_execbuffer.flags`: return a fence fd.
+const EXECBUF_FENCE_FD_OUT: u32 = 2;
 
 // VIRTGPU_PARAM_*.
 const PARAM_3D_FEATURES: u64 = 1;
@@ -287,8 +333,10 @@ impl Kernel {
                 DRM_IOCTL_VERSION => {
                     // struct drm_version: three ints, then (len, ptr) for
                     // name, date and desc.
+                    // Version 0.1: minor 1 tells Mesa execbuffers can
+                    // return fence fds (sync files).
                     put32(&mut a, 0, 0);
-                    put32(&mut a, 4, 0);
+                    put32(&mut a, 4, 1);
                     put32(&mut a, 8, 0);
                     for (i, s) in ["virtio_gpu", "0", "virtio GPU"].iter().enumerate() {
                         let (len_off, ptr_off) = (16 + i * 16, 24 + i * 16);
@@ -522,8 +570,18 @@ impl Kernel {
                         *st.ctx.get_or_insert_with(|| dev.create_context())
                     };
                     dev.submit(ctx, &words)?;
-                    // No fence: fence_fd stays -1.
-                    put32(&mut a, 28, u32::MAX);
+                    // VIRTGPU_EXECBUF_FENCE_FD_OUT: a sync file for the
+                    // work, done already. An in-fence (FENCE_FD_IN) has
+                    // signalled too: nothing to wait for.
+                    let flags = le32(&a, 0);
+                    let out = if flags & EXECBUF_FENCE_FD_OUT != 0 {
+                        let fd = cx.cur.fds.alloc(Fd::SyncFile(SyncFile::signalled()));
+                        cx.cur.fds.set_cloexec(fd, true);
+                        fd.cast_unsigned()
+                    } else {
+                        u32::MAX
+                    };
+                    put32(&mut a, 28, out);
                     Ok(size >= 32)
                 }
                 // SET_CLIENT_CAP (none apply to a render node),
@@ -546,8 +604,9 @@ impl Kernel {
 /// An ioctl on a dma-buf (type `'b'`). `DMA_BUF_IOCTL_SYNC` brackets CPU
 /// access; with the device synchronous there is nothing to wait for, so it
 /// only checks its flags. `DMA_BUF_SET_NAME` is accepted and forgotten.
-/// Sync files can't be had (there are no fences): `ENOTTY`, which callers
-/// take as "use implicit sync".
+/// A buffer's implicit fences can't be had as sync files
+/// (`EXPORT_SYNC_FILE`/`IMPORT_SYNC_FILE`): `ENOTTY`, which callers take as
+/// "use implicit sync" — always signalled here anyway.
 pub(super) fn dmabuf_ioctl(req: u32, arg: u64, mem: &GuestMemory) -> i64 {
     const SYNC: u32 = 0;
     const SET_NAME: u32 = 1;
@@ -564,6 +623,83 @@ pub(super) fn dmabuf_ioctl(req: u32, arg: u64, mem: &GuestMemory) -> i64 {
             0
         }
         SET_NAME => 0,
+        _ => err(Errno::ENOTTY),
+    }
+}
+
+/// An ioctl on a sync file (type `'>'`): `SYNC_IOC_MERGE` (a new fence
+/// for both — signalled, as both are), `SYNC_IOC_FILE_INFO` (signalled, one
+/// fence, its timestamp), `SYNC_IOC_SET_DEADLINE` (nothing to hurry).
+pub(super) fn sync_file_ioctl(
+    cx: &mut ServiceCtx,
+    file: &SyncFile,
+    req: u32,
+    arg: u64,
+    mem: &mut GuestMemory,
+) -> i64 {
+    const MERGE: u32 = 3;
+    const FILE_INFO: u32 = 4;
+    const SET_DEADLINE: u32 = 5;
+    /// `struct sync_fence_info`: obj_name[32], driver_name[32], status,
+    /// flags, timestamp_ns.
+    const FENCE_INFO: usize = 80;
+    fn name(b: &mut [u8], s: &str) {
+        b[..s.len()].copy_from_slice(s.as_bytes());
+    }
+    match req & 0xff {
+        MERGE => {
+            // struct sync_merge_data { name[32]; s32 fd2; s32 fence; u32 flags; u32 pad }
+            let mut d = [0u8; 48];
+            if mem.read(arg, &mut d).is_err() {
+                return errno(14);
+            }
+            if le32(&d, 40) != 0 || le32(&d, 44) != 0 {
+                return errno(22);
+            }
+            match cx.cur.fds.get(le32(&d, 32).cast_signed()) {
+                Some(Fd::SyncFile(_)) => {}
+                Some(_) => return errno(22),
+                None => return errno(9),
+            }
+            let fd = cx.cur.fds.alloc(Fd::SyncFile(SyncFile::signalled()));
+            cx.cur.fds.set_cloexec(fd, true);
+            put32(&mut d, 36, fd.cast_unsigned());
+            if mem.write(arg, &d).is_err() {
+                return errno(14);
+            }
+            0
+        }
+        FILE_INFO => {
+            // struct sync_file_info { name[32]; s32 status; u32 flags;
+            // u32 num_fences; u32 pad; u64 sync_fence_info }
+            let mut d = [0u8; 56];
+            if mem.read(arg, &mut d).is_err() {
+                return errno(14);
+            }
+            if le32(&d, 36) != 0 || le32(&d, 44) != 0 {
+                return errno(22);
+            }
+            let asked = le32(&d, 40);
+            if asked != 0 {
+                let mut f = [0u8; FENCE_INFO];
+                name(&mut f[..32], "virtio_gpu");
+                name(&mut f[32..64], "virtio_gpu");
+                put32(&mut f, 64, 1);
+                put64(&mut f, 72, file.0.timestamp_ns);
+                if mem.write(le64(&d, 48), &f).is_err() {
+                    return errno(14);
+                }
+            }
+            d[..32].fill(0);
+            name(&mut d[..32], "virtio_gpu");
+            put32(&mut d, 32, 1);
+            put32(&mut d, 40, 1);
+            if mem.write(arg, &d).is_err() {
+                return errno(14);
+            }
+            0
+        }
+        SET_DEADLINE => 0,
         _ => err(Errno::ENOTTY),
     }
 }
@@ -963,5 +1099,65 @@ mod tests {
         // The last reference: the host texture is deleted.
         assert_eq!(g.sys(Sysno::Close, [d2 as u64, 0, 0, 0, 0, 0]), 0);
         assert!(g.deleted());
+    }
+
+    /// Fences: the device reports version 0.1 (fence fds), an execbuffer
+    /// asked for one returns a sync file that is signalled at once —
+    /// `poll` says readable, `SYNC_IOC_FILE_INFO` signalled — and merging
+    /// two makes a third. Chromium's frames depend on it (it flushes each
+    /// frame only to get the fence).
+    #[test]
+    fn execbuffer_fence_out_is_a_signalled_sync_file() {
+        use crate::abi::arch::Sysno;
+        let mut g = Guest::new();
+        let node = g.node;
+        assert_eq!(g.ioctl(node, iowr(0, 64), &[0u8; 64]), 0);
+        assert_eq!(g.mem.read_u32(ARGS + 4).unwrap(), 1, "minor: fences");
+        // An execbuffer without FENCE_FD_OUT leaves fence_fd at -1.
+        let cmds = Guest::words(&[crate::gpu::virgl::cmd0(29, 0, 1), 1]);
+        g.mem.write(ARGS + 0x800, &cmds).unwrap();
+        let eb = |flags: u32| {
+            let mut eb = Guest::words(&[flags, cmds.len() as u32]);
+            eb.extend_from_slice(&(ARGS + 0x800).to_le_bytes());
+            eb.resize(32, 0);
+            eb
+        };
+        assert_eq!(g.ioctl(node, iowr(0x42, 32), &eb(0)), 0);
+        assert_eq!(g.mem.read_u32(ARGS + 28).unwrap(), u32::MAX);
+        // With it: a descriptor.
+        assert_eq!(g.ioctl(node, iowr(0x42, 32), &eb(EXECBUF_FENCE_FD_OUT)), 0);
+        let fence = g.mem.read_u32(ARGS + 28).unwrap();
+        assert!(fence.cast_signed() >= 0);
+        let fence = u64::from(fence);
+        // poll: readable now.
+        let pfd = ARGS + 0x600;
+        g.mem.write(pfd, &Guest::words(&[fence as u32, 1])).unwrap();
+        assert_eq!(g.sys(Sysno::Ppoll, [pfd, 1, 0, 0, 0, 0]), 1);
+        assert_eq!(g.mem.read_u32(pfd + 4).unwrap() >> 16, 1, "POLLIN");
+        // SYNC_IOC_FILE_INFO: _IOWR('>', 4, 56). First the count, then the
+        // fence's own info.
+        let sync_ioc = |nr: u32, size: u32| (3 << 30) | (size << 16) | (u32::from(b'>') << 8) | nr;
+        let mut fi = vec![0u8; 56];
+        assert_eq!(g.ioctl(fence, sync_ioc(4, 56), &fi), 0);
+        assert_eq!(g.mem.read_u32(ARGS + 32).unwrap(), 1, "signalled");
+        assert_eq!(g.mem.read_u32(ARGS + 40).unwrap(), 1, "one fence");
+        fi[40..44].copy_from_slice(&1u32.to_le_bytes());
+        fi[48..56].copy_from_slice(&(ARGS + 0x700).to_le_bytes());
+        assert_eq!(g.ioctl(fence, sync_ioc(4, 56), &fi), 0);
+        assert_eq!(g.mem.read_vec(ARGS + 0x700, 10).unwrap(), b"virtio_gpu");
+        assert_eq!(g.mem.read_u32(ARGS + 0x700 + 64).unwrap(), 1);
+        assert_ne!(g.mem.read_u64(ARGS + 0x700 + 72).unwrap(), 0, "timestamp");
+        // SYNC_IOC_MERGE with itself: a new fence; with the node: EINVAL.
+        let mut md = vec![0u8; 48];
+        md[32..36].copy_from_slice(&(fence as u32).to_le_bytes());
+        assert_eq!(g.ioctl(fence, sync_ioc(3, 48), &md), 0);
+        let merged = g.mem.read_u32(ARGS + 36).unwrap();
+        assert!(merged.cast_signed() >= 0 && u64::from(merged) != fence);
+        md[32..36].copy_from_slice(&(node as u32).to_le_bytes());
+        assert_eq!(g.ioctl(fence, sync_ioc(3, 48), &md), -22);
+        // Not a DRM device: DRM ioctls are ENOTTY on it.
+        assert_eq!(g.ioctl(fence, iowr(0, 64), &[0u8; 64]), err(Errno::ENOTTY));
+        assert_eq!(g.sys(Sysno::Close, [fence, 0, 0, 0, 0, 0]), 0);
+        assert_eq!(g.sys(Sysno::Close, [u64::from(merged), 0, 0, 0, 0, 0]), 0);
     }
 }

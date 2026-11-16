@@ -224,8 +224,9 @@ US keyboard), `wl_output` + `xdg-output`, `xdg-shell`, `xdg-decoration`,
 `wp_viewporter` and a data device (a clipboard shared by the guest's apps).
 Apps render in software unless nixvm is built with `--features gpu` and run
 with `NIXVM_GPU=egl`: then it also offers `zwp_linux_dmabuf_v1`, and GL apps
-(Mesa's Wayland EGL: es2gears, weston-simple-egl, GTK's GL area) render on
-the virtual GPU and show up. With a GPU the compositor itself draws on it
+(Mesa's Wayland EGL: es2gears, weston-simple-egl, GTK's GL area; Chromium
+with GPU rasterization and compositing) render on the virtual GPU and show
+up. With a GPU the compositor itself draws on it
 too: windows are textures in the GPU's context, a GPU buffer is copied in
 GPU-to-GPU and the frame is read back only when it is taken (and only what
 changed) — es2gears at 1024×768 runs at ~2500 frames/s instead of ~580

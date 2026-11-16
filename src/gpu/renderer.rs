@@ -750,6 +750,9 @@ impl Renderer {
         };
         let id = self.next_res;
         self.next_res += 1;
+        if self.trace {
+            eprintln!("nixvm gpu: resource {id} = {desc:?}");
+        }
         self.resources.insert(
             id,
             Resource {
@@ -1171,6 +1174,7 @@ impl Renderer {
     }
 
     pub(crate) fn create_object(&mut self, ctx: u32, handle: u32, obj: Object) {
+        let trace = self.trace;
         let sub = self.sub(ctx);
         // A shader arriving in pieces continues the object it started.
         if let (Object::Shader(more), Some(Object::Shader(cur))) =
@@ -1183,6 +1187,9 @@ impl Renderer {
             return;
         }
         let mut obj = obj;
+        if trace && !matches!(obj, Object::Shader(_)) {
+            eprintln!("nixvm gpu: object {handle} = {obj:?}");
+        }
         if let Object::Shader(s) = &mut obj {
             Self::finish_shader(s);
         }

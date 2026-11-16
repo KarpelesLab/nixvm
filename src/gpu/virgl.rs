@@ -92,7 +92,12 @@ pub fn decode(r: &mut Renderer, ctx: u32, cmds: &[u32]) {
         };
         i += 1 + len;
         if r.trace() {
-            eprintln!("nixvm gpu: ctx {ctx} cmd {cmd} obj {obj} len {len}");
+            // The payload too, but for shader text and long data.
+            if cmd == CREATE_OBJECT && obj == OBJ_SHADER || len > 32 {
+                eprintln!("nixvm gpu: ctx {ctx} cmd {cmd} obj {obj} len {len}");
+            } else {
+                eprintln!("nixvm gpu: ctx {ctx} cmd {cmd} obj {obj} len {len} {p:x?}");
+            }
         }
         if let Err(e) = command(r, ctx, cmd, obj, p) {
             r.warn(format!("command {cmd} (object {obj}): {e}"));
