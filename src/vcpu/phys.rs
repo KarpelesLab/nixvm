@@ -346,6 +346,9 @@ pub struct FrameAllocator {
     /// The memory cgroup whose `memory.max` last refused a frame, until
     /// [`Self::take_memcg_oom`] collects it.
     oom: Option<u16>,
+    /// The pool itself had no frame for an allocation (none free, nothing to
+    /// reclaim), until [`Self::take_exhausted`] collects it.
+    exhausted: bool,
     /// Bit `slot % 64` is set while memory cgroup `slot` has a batch charged
     /// past `memory.high` waiting for [`Self::take_over_high`]; shared outside
     /// the lock so an interpreter can notice and hand the task to the kernel.
@@ -466,6 +469,7 @@ impl FrameAllocator {
             memcgs: vec![Memcg::ROOT],
             charge_to: 0,
             oom: None,
+            exhausted: false,
             due: Arc::new(AtomicU64::new(0)),
             cache: FileCache::default(),
         }
@@ -899,6 +903,13 @@ impl FrameAllocator {
         self.oom.take()
     }
 
+    /// Whether the pool ran out of frames for an allocation since the last
+    /// call: the whole guest is out of memory (what Linux's global
+    /// out-of-memory killer answers), as opposed to one memory cgroup.
+    pub fn take_exhausted(&mut self) -> bool {
+        std::mem::take(&mut self.exhausted)
+    }
+
     /// Validate `pa`, returning its frame number, or `None` if `pa` is not
     /// frame-aligned or names a frame outside the pool. Callers treat `None` as a
     /// bug in the caller (a bad physical address) and ignore it.
@@ -921,10 +932,11 @@ impl FrameAllocator {
     /// frame is free, so zeroing it races with no other owner.
     pub fn alloc(&mut self, phys: &PhysMem) -> Option<u64> {
         self.make_room(1);
-        if !self.use_reserve && self.free_list.len() <= self.reserve {
+        if self.free_list.is_empty() || !self.use_reserve && self.free_list.len() <= self.reserve {
+            self.exhausted = true;
             return None;
         }
-        if self.free_list.is_empty() || !self.charge(self.charge_to) {
+        if !self.charge(self.charge_to) {
             return None;
         }
         let f = self.free_list.pop()?;

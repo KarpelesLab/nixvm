@@ -86,8 +86,11 @@ pub enum MemError {
     Unmapped(u64),
     /// The page is mapped but the access violates its protection.
     Protection { addr: u64, needed: Prot },
-    /// Host-side allocation/mapping failure (e.g. the frame pool is exhausted).
+    /// Host-side allocation/mapping failure.
     Host(String),
+    /// No frame could be had for the page at this address: the pool is
+    /// exhausted, or the task's memory cgroup is at its `memory.max`.
+    NoMemory(u64),
     /// The page maps a part of a file past its end: `SIGBUS` for the guest,
     /// `EFAULT` for a syscall.
     Bus(u64),
@@ -99,7 +102,10 @@ impl MemError {
     #[must_use]
     pub fn fault_addr(&self) -> u64 {
         match self {
-            MemError::OutOfBounds(a) | MemError::Unmapped(a) | MemError::Bus(a) => *a,
+            MemError::OutOfBounds(a)
+            | MemError::Unmapped(a)
+            | MemError::Bus(a)
+            | MemError::NoMemory(a) => *a,
             MemError::Protection { addr, .. } => *addr,
             MemError::Host(_) => 0,
         }
@@ -419,6 +425,14 @@ impl GuestMemory {
     #[must_use]
     pub fn take_memcg_oom(&self) -> Option<u16> {
         self.fa.lock().unwrap().take_memcg_oom()
+    }
+
+    /// Whether the frame pool ran dry for an allocation since the last call:
+    /// none free and nothing to reclaim — the whole guest out of memory, as
+    /// opposed to a memory cgroup at its `memory.max`.
+    #[must_use]
+    pub fn take_exhausted(&self) -> bool {
+        self.fa.lock().unwrap().take_exhausted()
     }
 
     /// Whether the kernel wants this space's task back as soon as it can be
@@ -828,7 +842,7 @@ impl GuestMemory {
             self.shared_anon[p] = true;
             let va = self.base + (p as u64) * PAGE_SIZE;
             if !Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, va) {
-                return Err(MemError::Host("frame pool exhausted".into()));
+                return Err(MemError::NoMemory(va));
             }
         }
         Ok(())
@@ -943,7 +957,7 @@ impl GuestMemory {
                 Ok(None) => {}
                 Err(_) => {
                     fa.free(frame);
-                    return Err(MemError::Host("frame pool exhausted".into()));
+                    return Err(MemError::NoMemory(va));
                 }
             }
             self.mapped_count += usize::from(!self.mapped[p]);
@@ -1339,7 +1353,7 @@ impl GuestMemory {
                     .is_err()
                 {
                     fa.free(frame);
-                    return Err(MemError::Host("frame pool exhausted".into()));
+                    return Err(MemError::NoMemory(self.page_base(p)));
                 }
             }
         }
@@ -1884,7 +1898,7 @@ impl GuestMemory {
             // it takes the `else` branch and just gets its leaf write bit set.)
             // No frame must be an error: carrying on would write into the frame
             // another process still shares.
-            let exhausted = || MemError::Host("frame pool exhausted".into());
+            let exhausted = || MemError::NoMemory(va);
             let new = fa.alloc(phys).ok_or_else(exhausted)?;
             phys.copy_frame(new, frame);
             let Ok(old) = space.map(va, new, prot, false, fa, phys) else {
@@ -1920,7 +1934,7 @@ impl GuestMemory {
                 // Demand-back the page (first touch), then privatize if it is a
                 // copy-on-write share.
                 if !Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, va) {
-                    return Err(MemError::Host("frame pool exhausted".into()));
+                    return Err(MemError::NoMemory(va));
                 }
                 changed |= Self::make_writable(
                     &mut self.space,
@@ -2030,7 +2044,7 @@ impl GuestMemory {
             for p in first..=last {
                 let va = self.base + (p as u64) * PAGE_SIZE;
                 if !Self::ensure_backed(&mut self.space, &self.phys, self.prot[p], &mut fa, va) {
-                    return Err(MemError::Host("frame pool exhausted".into()));
+                    return Err(MemError::NoMemory(va));
                 }
                 changed |= Self::make_writable(
                     &mut self.space,
@@ -2539,8 +2553,18 @@ mod tests {
             let mut fa = parent.fa.lock().unwrap();
             std::iter::from_fn(|| fa.alloc(&parent.phys)).collect()
         };
-        assert!(child.write_u64(0x1_0000, 99).is_err());
+        // The error names the page (an interpreter reports the fault there)
+        // and the pool remembers running dry: the kernel's cue for an
+        // out-of-memory kill rather than a segfault.
+        let _ = child.take_exhausted();
+        assert_eq!(
+            child.write_u64(0x1_0008, 99),
+            Err(MemError::NoMemory(0x1_0000))
+        );
+        assert!(child.take_exhausted());
+        assert!(!child.take_exhausted(), "taken once");
         assert!(!child.cow_fault(0x1_0000, true), "reported, not retried");
+        assert!(child.take_exhausted());
         assert_eq!(parent.read_u64(0x1_0000).unwrap(), 7);
         parent.release_frames(&held);
         child.write_u64(0x1_0000, 99).unwrap();

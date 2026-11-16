@@ -281,14 +281,24 @@ fn a_loop_of_forks_outlasts_the_kvm_vcpu_id_limit() {
     }
 }
 
+/// Out of guest RAM, a fault that can't get a frame is Linux's out-of-memory
+/// kill (`SIGKILL`, said on stderr), not a segfault — on the interpreter too,
+/// which once blamed it on address 0.
 #[test]
 fn running_out_of_guest_ram_on_copy_on_write_kills_the_task_not_the_vm() {
-    let out = contained(&["cowfill", "200"], &[], "120");
-    if !out.is_empty() {
-        assert!(
-            out.contains("child status 0xb"),
-            "expected a SIGSEGV:\n{out}"
-        );
+    for env in [&[][..], &[("NIXVM_INTERP", "1")][..]] {
+        let out = contained(&["cowfill", "200"], env, "120");
+        if !out.is_empty() {
+            assert!(
+                out.contains("child status 0x9\n"),
+                "expected an out-of-memory SIGKILL ({env:?}):\n{out}"
+            );
+            assert!(
+                out.contains("nixvm: out of memory: killed pid"),
+                "expected the kill to be reported ({env:?}):\n{out}"
+            );
+            assert!(!out.contains("at 0x0 "), "the faulting page, not 0:\n{out}");
+        }
     }
 }
 

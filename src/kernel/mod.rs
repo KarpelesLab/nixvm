@@ -3541,6 +3541,9 @@ impl Kernel {
                 // write to read-only/unmapped memory, or an already-private page
                 // — is a genuine segfault. This is the software mirror of a
                 // hardware MMU's page-fault-driven COW.
+                // Whether the pool runs dry resolving this fault (and not
+                // before: an `mmap` refused for want of frames got ENOMEM).
+                let _ = mem.take_exhausted();
                 let file = mem.file_fault(addr);
                 if file == crate::vcpu::FileFault::Bus {
                     // Past the end of a mapped file.
@@ -3573,6 +3576,12 @@ impl Kernel {
                     } else {
                         Serviced::Resume
                     }
+                } else if mem.take_exhausted() {
+                    // The guest's RAM is used up: Linux's out-of-memory kill
+                    // (of the task asking, as with `oom_kill_allocating_task`),
+                    // not a segfault the program would be blamed for.
+                    self.oom_kill_for_fault(cx, addr, mem);
+                    Serviced::Ended
                 } else if vcpu.shadow_stale(mem, addr) {
                     // SMP/KVM only: a sibling mapped or re-protected this page
                     // (serviced here on the main thread) while this vcpu was mid
@@ -4373,6 +4382,27 @@ impl Kernel {
             })
             .collect();
         eprintln!("[fault]   [rsp+0..64]: {}", stack.join(" "));
+    }
+
+    /// The task's page fault at `addr` found no free frame in the whole
+    /// pool: kill it with `SIGKILL`, saying so on stderr as Linux's
+    /// out-of-memory killer says so in the kernel log.
+    fn oom_kill_for_fault(&self, cx: &mut ServiceCtx, addr: u64, mem: &mut GuestMemory) {
+        let (used, free) = mem.with_allocator(|fa| (fa.alloc_count(), fa.free_count()));
+        let mib = |frames: usize| (frames as u64 * crate::vcpu::mem::PAGE_SIZE) >> 20;
+        let comm = if cx.cur.comm.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", cx.cur.comm)
+        };
+        eprintln!(
+            "nixvm: out of memory: killed pid {}{comm}: no guest RAM left for its page at \
+             {addr:#x} ({} MiB in use, {} MiB free; --mem raises the limit)",
+            cx.cur.pid,
+            mib(used),
+            mib(free)
+        );
+        self.die_of_signal(cx, 9, mem); // SIGKILL
     }
 
     /// `NIXVM_TRACE` wrapper around [`Kernel::dispatch_inner`]: logs each call

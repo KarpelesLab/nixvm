@@ -1045,8 +1045,11 @@ the display the context is on a hidden 1×1 canvas. `es2gears_wayland`
 EGL error): llvmpipe ran the browser's 256 MiB of guest RAM dry, and a
 store the frame allocator couldn't back came out as a fault at address 0;
 the browser's guest now has 1 GiB (committed by the browser only as it is
-touched). (The kernel still reports such an exhaustion as `SIGSEGV` at 0
-rather than as an out-of-memory kill.) In headless
+touched). Such an exhaustion is now what Linux makes of it, an
+out-of-memory kill: the task gets `SIGKILL` and stderr says
+`nixvm: out of memory: killed pid N (comm): no guest RAM left for its page
+at …` (the interpreter used to blame address 0: its frame-allocation
+error carried no address). In headless
 Chromium (WebGL2 on SwiftShader, no GPU), on the interpreter: the stock
 demo's Alpine 3.20 takes `apk add mesa-dri-gallium mesa-utils` over the
 tunnel in ~5½ min and `eglinfo` shows virgl / GLES 3.0 (Mesa 24.0.9);
