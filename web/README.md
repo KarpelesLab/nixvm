@@ -179,7 +179,8 @@ apk add mesa-dri-gallium mesa-utils   # ~70 MB: about 5 minutes on the interpret
 eglinfo -B -p surfaceless             # "virgl (nixvm GLES 3.0)", OpenGL ES 3.0
 ```
 
-Mesa offers OpenGL ES 3.0 and desktop GL 2.1. With the display on as well
+Mesa offers OpenGL ES 3.0 and desktop GL 3.2 core/compatibility (3.3
+where the browser has `WEBGL_blend_func_extended`). With the display on as well
 (`?display=1&gpu=1`), Wayland EGL clients show there: `apk add mesa-demos`,
 then `es2gears_wayland &` (about 35 frames/s in headless Chromium on
 SwiftShader).
@@ -194,12 +195,15 @@ in the terminal; GL then fails until a Reboot.
 ### Checking it without a GPU
 
 `scripts/gpu-check.mjs` boots a root in headless Chromium (WebGL2 on
-SwiftShader), runs `tests/guest/gpu_triangle.c` and `gpu_scene.c` there and
-compares their pictures with references rendered natively
-(`NIXVM_GPU=egl nixvm run …`); `--cmd` runs anything else instead, and
-`--no-gpu` leaves the GPU off (llvmpipe, in the same browser). It needs a
-root with Mesa and the two programs in `/opt` (built with `gcc … -lEGL
--lGLESv2` in an Alpine root with `mesa-dev`), and a wasm-pack build with
+SwiftShader), runs `tests/guest/gpu_triangle.c`, `gpu_scene.c` and
+`gpu_gl33.c` (desktop GL 3.x core) there and compares their pictures with
+references rendered natively (`NIXVM_GPU=egl nixvm run …`); `--cmd` runs
+anything else instead, `--progs` picks the programs, and `--no-gpu` leaves
+the GPU off (llvmpipe, in the same browser). SwiftShader's WebGL2 has no
+dual-source blending, so the guest gets GL 3.2 there and `gpu_gl33` runs as
+`GL32=1`, compared with `refs/gpu_gl33.gl32.ppm`. It needs a root with Mesa
+and the programs in `/opt` (built with `gcc … -lEGL -lGLESv2` (`-lGL` for
+gpu_gl33) in an Alpine root with `mesa-dev`), and a wasm-pack build with
 `gpu`:
 
 ```sh

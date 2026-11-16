@@ -4,11 +4,16 @@
 //   node scripts/gpu-check.mjs --pkg <wasm-pack out dir, built with `gpu`> \
 //        --rootfs <x86_64 root .tar.gz with Mesa and the test programs> \
 //        [--ref <dir>] [--out <dir>] [--no-gpu] [--cmd '<shell command>']
+//        [--progs gpu_triangle,gpu_scene,gpu_gl33]
 //
 // Serves a bare harness page (no Vue app), boots the root with a canvas's
 // WebGL2 context attached (`Terminal.attach_webgl2`; `--no-gpu` leaves it
 // off, so Mesa falls back to llvmpipe in the same browser), and runs
-// `/opt/gpu_triangle` and `/opt/gpu_scene` (tests/guest/*.c) or `--cmd`.
+// `/opt/gpu_triangle`, `/opt/gpu_scene` and `/opt/gpu_gl33` (tests/guest/*.c;
+// `--progs` picks others) or `--cmd`. gpu_gl33 wants desktop GL 3.3, which
+// needs dual-source blending from the browser (WEBGL_blend_func_extended);
+// without it the guest gets GL 3.2 and the program runs as `GL32=1`, whose
+// reference must then be rendered the same way.
 // Each picture comes back over the guest's stdout as base64 and is saved as
 // `<out>/<prog>.ppm`; with `--ref`, it is compared with `<ref>/<prog>.ppm`
 // (a native `NIXVM_GPU=egl` render) and the run fails past a small
@@ -36,6 +41,7 @@ const { values: opt } = parseArgs({
     cmd: { type: "string" },
     timeout: { type: "string", default: "600" },
     tolerance: { type: "string", default: "8" },
+    progs: { type: "string", default: "gpu_triangle,gpu_scene,gpu_gl33" },
   },
 });
 if (!opt.pkg || !opt.rootfs) {
@@ -43,7 +49,7 @@ if (!opt.pkg || !opt.rootfs) {
   process.exit(2);
 }
 
-const PROGS = ["gpu_triangle", "gpu_scene"];
+const PROGS = opt.progs.split(",").filter(Boolean);
 // One shell command: each program renders to a file, which is printed as
 // base64 between markers. (A root installed without running apk's scripts
 // lacks busybox's applet links: make them first.)
@@ -52,7 +58,8 @@ const script =
   (opt.cmd ??
   PROGS.map(
     (p) =>
-      `/opt/${p} /tmp/${p}.ppm; echo "@@EXIT ${p} $?"; ` +
+      `{ /opt/${p} /tmp/${p}.ppm || { [ ${p} = gpu_gl33 ] && echo "@@GL32 ${p}" && GL32=1 /opt/${p} /tmp/${p}.ppm; }; }; ` +
+      `echo "@@EXIT ${p} $?"; ` +
       `[ -f /tmp/${p}.ppm ] && { echo "@@PPM ${p}"; base64 /tmp/${p}.ppm; echo "@@END"; }`,
   ).join("; "));
 
@@ -157,7 +164,10 @@ try {
       const ppm = Buffer.from(m[1].replace(/\s+/g, ""), "base64");
       writeFileSync(join(opt.out, `${p}.ppm`), ppm);
       if (!opt.ref) continue;
-      const cmp = comparePpm(ppm, readFileSync(join(opt.ref, `${p}.ppm`)), tol);
+      // A GL 3.2 run compares with `<prog>.gl32.ppm` (rendered natively with
+      // `GL32=1`).
+      const ref = r.out.includes(`@@GL32 ${p}`) ? `${p}.gl32` : p;
+      const cmp = comparePpm(ppm, readFileSync(join(opt.ref, `${ref}.ppm`)), tol);
       // GL lets implementations rasterize edges and resolve depth ties a
       // little differently (SwiftShader vs. a host GPU or llvmpipe): allow
       // a few pixels off, everything else within the tolerance.
