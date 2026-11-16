@@ -793,7 +793,7 @@ discipline held).
   HVF. The sequencing question in §4 is resolved: the demo shipped ahead of
   the full Phase 10 backend, as a static-ELF-runner rather than a full shell.
 
-### GPU acceleration (virgl → GLES 3.0 / WebGL2)  🟡 phase 1 done: the guest's Mesa renders on the host GPU natively, and with WebGL2 in the browser demo
+### GPU acceleration (virgl → GLES 3.0 / WebGL2)  🟡 phases 1–2 done: the guest's Mesa renders on the host GPU natively and with WebGL2 in the browser demo — OpenGL ES 3.0 and desktop OpenGL 3.3 core/compat (3.2 on WebGL2 without dual-source blending)
 
 Optional (`--features gpu`, off by default) and opt-in at run time
 (`NIXVM_GPU=egl|log|null`, or `Terminal::attach_webgl2(gl)` in the browser);
@@ -843,8 +843,8 @@ next to the socket (v3 format/modifier events for older binds), params
 validated as the protocol says, `create`/`create_immed`. The GPU sits
 behind a narrow `GpuFrames` trait, so without `gpu` the compositor builds
 and offers no dmabuf. Mesa's Wayland EGL platform needs nothing more: `es2gears_wayland`,
-`weston-simple-egl` and GTK3's GL area (`GDK_GL=gles`; GTK3 wants desktop
-GL 3.2 otherwise) render on the virtual GPU and show, matching llvmpipe
+`weston-simple-egl` and GTK3's GL area (desktop GL 3.2 core since the GL
+3.3 work; `GDK_GL=gles` before) render on the virtual GPU and show, matching llvmpipe
 (two renderer bugs that only window-system buffers hit were fixed on the
 way: culling under the flipped viewport, and `gl_FragCoord.y`).
 `tests/gpu_display.rs` (skips without host EGL) has a raw-wire client
@@ -895,23 +895,68 @@ buffers hold transparent black there, with either compositor) nor GBM: a
 GLES2 render-to-texture-then-sample test (`RGBA`/`BGRA_EXT`, `glTexImage`
 or `glTexStorage`, cleared or drawn) is right on virgl, so it is in what
 ANGLE (`opengl` and `gles` backends alike, and still with desktop GL 3.3
-caps) emits for render passes.
+caps) emits for render passes. With `--disable-gpu-compositing`, **WebGL 2**
+renders on the virtual GPU (`WebGL 2.0 (OpenGL ES 3.0 Chromium)` / `ANGLE
+(Mesa, virgl (nixvm GLES 3.0), OpenGL ES 3.0)`, MAX_SAMPLES 8, antialiased
+canvas): it was WebGL 1 only until real multisampling — ANGLE wants 4
+samples on every ES 3.0 renderbuffer format — and 64 vertex output
+components came.
 
-**Capset** (`src/gpu/caps.rs`): `virgl_caps_v2` describing a GLES 3.0 host
-the way virglrenderer does on GLES — GLSL level 130, `VIRGL_CAP_HOST_IS_GLES`,
-`host_feature_check_version` 15, the formats of `src/gpu/format.rs` (BGRA
-stored as RGBA and swapped on transfer), 13 constant buffers, 4 render
-targets, 4 stream-out buffers, GLES 3.0 minimum limits. Mesa offers
-**OpenGL ES 3.0** and desktop GL 2.1 (3.0 wants independent blend and
-conditional rendering, which GLES 3.0 lacks).
+**Capset** (`src/gpu/caps.rs`), per backend: `virgl_caps_v2` starting from
+what virglrenderer reports for a GLES 3.0 host (`VIRGL_CAP_HOST_IS_GLES`,
+`host_feature_check_version` 15, the formats of `src/gpu/format.rs` — BGRA
+stored as RGBA and swapped on transfer —, 13 constant buffers, 4 render
+targets, 4 stream-out buffers, GLES 3.0 minimum limits) and going past it:
+virglrenderer stops at GLSL 130 on GLES 3.0 (desktop GL 2.1 for the guest);
+nixvm offers **GLSL 330** plus independent blend enables, conditional
+rendering, timer queries, multisampled textures, depth-clip disable, texel
+buffers (up to 1 M elements) and the host's sample count (≤ 8), and
+emulates each where GLES 3.0 lacks it (below). Mesa then offers **OpenGL ES
+3.0** and **desktop OpenGL 3.3 core and compatibility**. What can't be
+emulated follows the backend's `HostCaps` (`GpuBackend::host_caps`: the EGL
+extension string, WebGL `getExtension`): dual-source blending
+(`EXT_blend_func_extended`; GL 3.3 needs it, without it Mesa stops at 3.2),
+per-buffer blend functions (`draw_buffers_indexed`, GL 4.0's), 16 varyings
+(GLES promises 15; Chromium wants 16 for WebGL 2). `NIXVM_GPU_GLES30=1`
+ignores the host's extensions, to run every fallback. How Mesa's version
+checks map onto caps (and why `max_samples == 1` "fake MSAA" would have
+sufficed for GL 3.3 but not for ANGLE) is in the commit that did it.
+
+**Emulated on GLES 3.0** (`src/gpu/renderer.rs`, `glsl.rs`):
+- *Texel buffers*: a buffer's sampler view is a 2D texture 4096 texels wide,
+  refilled from the buffer's shadow when it changed; `TXF`/`TXQ` on
+  `BUFFER` fetch from it.
+- *Sampler-view swizzles* in the shader (WebGL2 has no `TEXTURE_SWIZZLE`;
+  luminance/alpha formats, `GL_TEXTURE_SWIZZLE_*`), `X8` views read alpha 1.
+- *Multisampling*: a resource with samples is drawn in a multisampled
+  renderbuffer and resolved into its texture before being sampled
+  (`2D_MSAA` fetches read the resolve), blitted or read back.
+- *Transform feedback* runs: the vertex shader is run again over the
+  draw's vertices as points, rasterizer off, capturing every stream output
+  bit-exactly; primitives are assembled on the CPU (strips, fans, loops,
+  indices, restarts, instances) and each output scattered into its target
+  at its offset — what GLES 3.0's own capture can't express. Feeds
+  `PRIMITIVES_GENERATED/EMITTED`.
+- *Per-buffer blend* (indexed calls when the host has them, else buffer 0's
+  for all), *dual-source* factors and `layout(index = 1)`, *depth clamp*
+  (`EXT_depth_clamp`, else z clamped in the vertex shader), *user clip
+  planes / `gl_ClipDistance`* (varyings + discard), point size from the
+  rasterizer, BGRA and 10/10/10/2 vertex formats (Mesa sends any plain
+  format), timer queries from the host clock, conditional rendering as
+  "always draw" (occlusion queries report passing, as virglrenderer's GLES
+  path does).
 
 **Protocol subset** (`src/gpu/virgl.rs`): object create/bind/destroy for
 blend, rasterizer, DSA, shader (incl. split across commands), vertex
 elements, sampler views/states, surfaces, queries; viewport, framebuffer,
 vertex/index/constant/uniform buffers, sampler views/states, stencil ref,
 blend colour, scissor, clear, `DRAW_VBO`, `RESOURCE_COPY_REGION`, `BLIT`,
-`RESOURCE_INLINE_WRITE`, sub-contexts, queries (results faked done, as
-virglrenderer's GLES path does). Unknown commands are logged and skipped.
+`RESOURCE_INLINE_WRITE`, sub-contexts, queries, stream-output targets and
+shaders' stream-output info, clip state, render conditions. Unknown
+commands are logged and skipped. Indexed draws start where the index
+buffer's offset points (Mesa folds `start` into it; adding it again broke
+every display-list / vertex-array app drawing from a nonzero first index
+until the GL 3.3 work found it with eglgears).
 
 **Shaders** (`src/gpu/tgsi.rs`, `src/gpu/glsl.rs`): TGSI text (what virgl
 sends) → GLSL ES 3.00, translated per vertex+fragment pair at first draw
@@ -920,8 +965,10 @@ flat shading and colour-buffer types are draw-time state, so they key the
 program cache). Registers are `vec4` words with integer ops through bit
 casts, as in TGSI; constants are `uvec4` uniforms / std140 blocks. Covers
 float/int/uint ALU, comparisons, control flow, `TEX/TXP/TXB/TXL/TXD/TXF/TXQ`
-on 1D/2D/3D/cube/array/shadow targets, `KILL`, derivatives — what es2gears,
-glxgears-style fixed function and typical GLES 2/3 shaders compile to.
+on 1D/2D/3D/cube/array/shadow/buffer/multisample targets, `KILL`,
+derivatives — what es2gears, fixed function, GLSL 330 core and typical
+GLES 2/3 shaders compile to. Geometry and tessellation shaders are refused
+(draw skipped, logged): GLES 3.0 / WebGL2 have none.
 
 **Backend trait** (`src/gpu/backend.rs`): one push-back on the brief —
 `GpuBackend` is the *GLES 3.0 call surface* (create buffer/texture/program,
@@ -941,15 +988,36 @@ written once and every backend stays a thin 1:1 map:
   `web-sys`.
 - `Recorder`: records calls (tests; `NIXVM_GPU=log` prints them).
 
+A state cache (`src/gpu/cache.rs`) sits in front of whichever backend:
+the renderer still applies the full Gallium state per draw, and calls that
+would set what is already set never reach the host (global state, bindings,
+per-texture parameters, per-framebuffer attachments, per-VAO attributes,
+per-program uniforms; deleting an object forgets whatever named it). The
+display's GL compositor goes through it too. peglgears: 53 host calls a
+draw → 5.
+
 **Evidence.** On an Alpine 3.22 root with `mesa-dri-gallium` (Mesa 25.1.9),
 `eglinfo -p surfaceless` reports `virgl (nixvm GLES 3.0)`, OpenGL ES 3.0;
 `tests/guest/gpu_triangle.c` passes; `tests/guest/gpu_scene.c` (es2gears'
 own lighting shader, indexed + depth-tested, a textured blended quad with a
 uniform block, a scissored clear) matches llvmpipe within 1 on every pixel;
-`peglgears` runs at ~25k FPS against llvmpipe's ~1.1k (RTX 5080 host). Unit
+`tests/guest/gpu_gl33.c` — a desktop GL 3.3 core context, one tile per
+emulated feature (texel buffer, swizzles, BGRA/2_10_10_10 vertices,
+dual-source blend, clip distances, depth clamp, instancing, glPointSize,
+per-buffer blend/colour mask, 4× MSAA resolved by a blit, a multisampled
+texture fetched, transform feedback from a strip drawn back, conditional
+render) — matches llvmpipe within 1 on every pixel and prints the same
+captured values and query results (with `NIXVM_GPU_GLES30=1` / GL 3.2 only
+the per-buffer blend tile differs, as expected). `eglgears_wayland`
+(compat-profile fixed function, display lists) is identical to llvmpipe.
+`peglgears` runs at ~34k FPS (it was ~27k before the state cache and
+cheaper hashing) against llvmpipe's ~1.1k (RTX 5080 host). Unit
 tests cover the ioctls (through real syscalls: open, ioctl, mmap,
-transfer round trip), capset, TGSI parsing, GLSL generation, the decoder on a
-recorder, and a draw on the host's GL when present.
+transfer round trip), capset (per host), TGSI parsing, GLSL generation
+(texel buffers, swizzles, MSAA fetches, dual-source outputs, clip planes,
+stream outputs, depth clamp), primitive assembly, the state cache, the
+decoder on a recorder (MSAA resolve, indexed blend, capture pass, index
+offsets), and a draw on the host's GL when present.
 
 **In the browser** (`?gpu=1` or the demo's gpu toggle; `web/README.md`).
 With the display on, the page gives `attach_webgl2` a context on the
@@ -974,7 +1042,11 @@ maximum are widened when a draw has restart off), `glReadPixels` outside the
 few guaranteed format/type pairs (read canonically, then packed:
 `Format::read_as`/`pack_read`), float render targets
 (`EXT_color_buffer_float` enabled). `web/scripts/gpu-check.mjs` repeats the
-picture comparison headlessly.
+picture comparison headlessly, `gpu_gl33` included: SwiftShader's WebGL2
+has `OES_draw_buffers_indexed` but no `WEBGL_blend_func_extended`, so the
+guest gets **desktop GL 3.2** core/compat there and the test runs its GL
+3.2 variant, matching the native render within 1. peglgears stays ~310 FPS
+in the tab: the interpreter running Mesa is the bound, not WebGL calls.
 
 **Not yet / phase 2.**
 1. *WebGL2 left:* context loss is only reported; GL errors aren't checked
@@ -987,12 +1059,17 @@ picture comparison headlessly.
    is tracked (a changed surface damages its whole area). No explicit sync
    (`wp_linux_drm_syncobj_v1`) or sync files: implicit sync is trivially
    right on a synchronous device.
-3. *Coverage:* sampler-view swizzles (needed for luminance/alpha formats),
-   transform feedback (advertised, not executed), MSAA, per-RT blend,
-   conditional render (desktop GL 3.x), `TXQ` level counts, geometry shaders
-   (GLES 3.2/never on WebGL2), compressed formats beyond what Mesa decodes.
-4. *Performance:* full GL state is re-applied per draw and buffers keep CPU
-   shadows; cache state, upload index ranges once, and consider
+3. *Coverage:* geometry/tessellation shaders and GLES 3.1 (compute, SSBOs,
+   images) — possible natively on a GLES 3.1+ host (the capset is per
+   backend already), never on WebGL2; real occlusion counts (GLES has
+   `ANY_SAMPLES_PASSED` only) and so real conditional rendering;
+   per-buffer blend without indexed blend state (a draw per state group
+   would do it); first-vertex provoking (`WEBGL_provoking_vertex` /
+   none on GLES); a vertex shader using all 16 varyings plus emulated clip
+   planes overflows GLES's 15/16; `TXQ` level counts; compressed formats
+   beyond what Mesa decodes; Chromium's render passes (item 2).
+4. *Performance:* buffers keep CPU shadows (index uploads, texel buffers and
+   stream output read them); upload index ranges once, and consider
    `VIRGL_CAP_TRANSFER`/blob resources to cut ioctls.
 5. *Robustness:* the guest controls command contents; sizes are checked, but
    GL resource exhaustion and per-guest accounting against memory limits
