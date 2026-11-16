@@ -136,6 +136,17 @@ pub struct Transfer {
     pub to_host: bool,
 }
 
+/// A resource's host texture, as [`GpuDevice::with_gl`] hands it out: a
+/// `TEXTURE_2D` whose level 0 is `width` × `height`, rows top first (the
+/// guest's order), channels in their logical places (a B8G8R8A8 resource
+/// samples as red, green, blue, alpha).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostTexture {
+    pub gl: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Why a device call failed: the errno the ioctl returns.
 pub type Errno = i32;
 const EINVAL: Errno = 22;
@@ -307,6 +318,18 @@ impl GpuDevice {
         out: &mut [u8],
     ) -> Result<(), Errno> {
         self.with(|r| r.read_texture(res, rect, out))
+    }
+
+    /// Run `f` on the host GL context, outside the guest's command stream:
+    /// how the built-in display composites with the GPU, sampling the
+    /// guest's buffers where they are. `f` gets the backend and a lookup of
+    /// a resource's host texture (4-byte colour 2D textures only). It may
+    /// leave any GL state behind; the renderer re-applies its own.
+    pub fn with_gl<T>(
+        &self,
+        f: impl FnOnce(&mut dyn GpuBackend, &dyn Fn(u32) -> Option<HostTexture>) -> T,
+    ) -> T {
+        self.with(|r| r.external(f))
     }
 
     /// Whether `other` is this same device.

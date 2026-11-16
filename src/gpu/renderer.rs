@@ -749,6 +749,35 @@ impl Renderer {
         self.resources.get(&id).map(|r| r.desc)
     }
 
+    /// Run `f` on the backend for a caller outside the guest's command
+    /// stream (the display's GL compositor), with a lookup from resource
+    /// ids to their host textures. `f` may change any GL binding or state:
+    /// whatever the renderer keeps of the GL state must be re-applied
+    /// before its next draw (today it applies its full state per draw).
+    pub(crate) fn external<T>(
+        &mut self,
+        f: impl FnOnce(&mut dyn GpuBackend, &dyn Fn(u32) -> Option<super::HostTexture>) -> T,
+    ) -> T {
+        let resources = &self.resources;
+        let lookup = |id: u32| {
+            let r = resources.get(&id)?;
+            let Host::Texture {
+                gl,
+                gl_target: gl::TEXTURE_2D,
+            } = r.host
+            else {
+                return None;
+            };
+            let fmt = r.fmt?;
+            if fmt.bpp != 4 || matches!(fmt.kind, Kind::Depth | Kind::DepthStencil) {
+                return None;
+            }
+            let (width, height, _) = r.level_size(0);
+            Some(super::HostTexture { gl, width, height })
+        };
+        f(&mut *self.backend, &lookup)
+    }
+
     /// Read the box `(x, y, w, h)` of level 0, layer 0 of 4-byte colour
     /// texture `res` into `out` (rows packed, top row first — the guest's
     /// row order, as transfers keep it), in the resource's own byte layout:
