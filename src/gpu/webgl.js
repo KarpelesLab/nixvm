@@ -44,6 +44,37 @@ export function nx_gl_set_context(g) {
     gl.getExtension(ext);
   }
 }
+// Optional extensions the renderer uses when the browser has them.
+let dbi = null;
+// What the extensions offer: [draw_buffers_indexed, blend_func_extended,
+// depth_clamp, max_samples, max_varyings] (HostCaps on the Rust side).
+export function nx_gl_caps() {
+  dbi = gl.getExtension("OES_draw_buffers_indexed");
+  const bfe = gl.getExtension("WEBGL_blend_func_extended");
+  const clamp = gl.getExtension("EXT_depth_clamp");
+  return new Uint32Array([dbi ? 1 : 0, bfe ? 1 : 0, clamp ? 1 : 0, gl.getParameter(gl.MAX_SAMPLES) | 0,
+                          gl.getParameter(gl.MAX_VARYING_VECTORS) | 0]);
+}
+export function nx_gl_enable_i(cap, i, on) {
+  if (!dbi) return;
+  if (on) dbi.enableiOES(cap, i); else dbi.disableiOES(cap, i);
+}
+export function nx_gl_blend_func_separate_i(buf, a, b, c, d) { if (dbi) dbi.blendFuncSeparateiOES(buf, a, b, c, d); }
+export function nx_gl_blend_equation_separate_i(buf, a, b) { if (dbi) dbi.blendEquationSeparateiOES(buf, a, b); }
+export function nx_gl_color_mask_i(buf, r, g, b, a) { if (dbi) dbi.colorMaskiOES(buf, r, g, b, a); }
+export function nx_gl_get_buffer_sub_data(t, off, out) { gl.getBufferSubData(t, off, out); }
+export function nx_gl_create_renderbuffer() { return put(gl.createRenderbuffer()); }
+export function nx_gl_delete_renderbuffer(r) { gl.deleteRenderbuffer(drop(r)); }
+export function nx_gl_renderbuffer_storage(r, samples, internal, w, h) {
+  gl.bindRenderbuffer(gl.RENDERBUFFER, get(r));
+  gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, internal, w, h);
+}
+export function nx_gl_framebuffer_renderbuffer(t, att, r) {
+  gl.framebufferRenderbuffer(t, att, gl.RENDERBUFFER, get(r));
+}
+export function nx_gl_bind_buffer_base(t, i, b) { gl.bindBufferBase(t, i, get(b)); }
+export function nx_gl_begin_transform_feedback(mode) { gl.beginTransformFeedback(mode); }
+export function nx_gl_end_transform_feedback() { gl.endTransformFeedback(); }
 export function nx_gl_has_context() {
   return gl !== null;
 }
@@ -130,7 +161,7 @@ function compile(kind, src) {
   }
   return s;
 }
-export function nx_gl_create_program(vs, fs) {
+export function nx_gl_create_program(vs, fs, xfb, interleaved) {
   const v = compile(gl.VERTEX_SHADER, vs);
   if (!v) return 0;
   const f = compile(gl.FRAGMENT_SHADER, fs);
@@ -138,6 +169,9 @@ export function nx_gl_create_program(vs, fs) {
   const p = gl.createProgram();
   gl.attachShader(p, v);
   gl.attachShader(p, f);
+  if (xfb.length) {
+    gl.transformFeedbackVaryings(p, xfb.split("\n"), interleaved ? gl.INTERLEAVED_ATTRIBS : gl.SEPARATE_ATTRIBS);
+  }
   gl.linkProgram(p);
   gl.deleteShader(v);
   gl.deleteShader(f);
@@ -162,6 +196,7 @@ export function nx_gl_uniform_block_binding(p, i, b) { gl.uniformBlockBinding(ge
 export function nx_gl_uniform_1i(l, v) { if (l > 0) gl.uniform1i(locs[l], v); }
 export function nx_gl_uniform_1f(l, v) { if (l > 0) gl.uniform1f(locs[l], v); }
 export function nx_gl_uniform_4uiv(l, v) { if (l > 0) gl.uniform4uiv(locs[l], v); }
+export function nx_gl_uniform_4fv(l, v) { if (l > 0) gl.uniform4fv(locs[l], v); }
 
 export function nx_gl_create_vertex_array() { return put(gl.createVertexArray()); }
 export function nx_gl_bind_vertex_array(v) { gl.bindVertexArray(get(v)); }

@@ -17,6 +17,7 @@
 use std::ffi::{CString, c_char, c_void};
 
 use super::GpuBackend;
+use super::backend::HostCaps;
 
 type Ptr = *const c_void;
 
@@ -46,6 +47,8 @@ const GL_PACK_ALIGNMENT: u32 = 0x0D05;
 const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
 const GL_RENDERER: u32 = 0x1F01;
 const GL_VERSION: u32 = 0x1F02;
+const GL_EXTENSIONS: u32 = 0x1F03;
+const GL_MAP_READ_BIT: u32 = 0x0001;
 
 macro_rules! fns {
     ($table:ident, $prefix:literal: $($name:ident ( $($arg:ty),* ) $(-> $ret:ty)?;)*) => {
@@ -140,6 +143,7 @@ fns!(GlFns, "gl":
     Uniform1i(i32, i32);
     Uniform1f(i32, f32);
     Uniform4uiv(i32, i32, *const u32);
+    Uniform4fv(i32, i32, *const f32);
     GenVertexArrays(i32, *mut u32);
     BindVertexArray(u32);
     EnableVertexAttribArray(u32);
@@ -171,12 +175,66 @@ fns!(GlFns, "gl":
     GetError() -> u32;
     PixelStorei(u32, i32);
     GetString(u32) -> *const u8;
+    GetIntegerv(u32, *mut i32);
+    MapBufferRange(u32, isize, isize, u32) -> *mut c_void;
+    UnmapBuffer(u32) -> u8;
+    GenRenderbuffers(i32, *mut u32);
+    DeleteRenderbuffers(i32, *const u32);
+    BindRenderbuffer(u32, u32);
+    RenderbufferStorageMultisample(u32, i32, u32, i32, i32);
+    FramebufferRenderbuffer(u32, u32, u32, u32);
+    BindBufferBase(u32, u32, u32);
+    BeginTransformFeedback(u32);
+    EndTransformFeedback();
+    TransformFeedbackVaryings(u32, i32, *const *const c_char, u32);
 );
+
+/// `EXT/OES_draw_buffers_indexed` (core in GLES 3.2), when the host has it.
+#[allow(non_snake_case)]
+struct IndexedFns {
+    Enablei: unsafe extern "C" fn(u32, u32),
+    Disablei: unsafe extern "C" fn(u32, u32),
+    BlendFuncSeparatei: unsafe extern "C" fn(u32, u32, u32, u32, u32),
+    BlendEquationSeparatei: unsafe extern "C" fn(u32, u32, u32),
+    ColorMaski: unsafe extern "C" fn(u32, u8, u8, u8, u8),
+}
+
+impl IndexedFns {
+    /// The entry points under the first suffix (core, `EXT`, `OES`) that
+    /// has all of them.
+    fn load(get: &dyn Fn(&str) -> Ptr) -> Option<Self> {
+        ["", "EXT", "OES"].iter().find_map(|sfx| {
+            let f = |n: &str| {
+                let p = get(&format!("gl{n}{sfx}"));
+                (!p.is_null()).then_some(p)
+            };
+            // SAFETY: each pointer is the GL function of that name, with
+            // the prototype in the Khronos headers.
+            type F2 = unsafe extern "C" fn(u32, u32);
+            type F3 = unsafe extern "C" fn(u32, u32, u32);
+            type F5 = unsafe extern "C" fn(u32, u32, u32, u32, u32);
+            type Mask = unsafe extern "C" fn(u32, u8, u8, u8, u8);
+            unsafe {
+                Some(Self {
+                    Enablei: std::mem::transmute::<Ptr, F2>(f("Enablei")?),
+                    Disablei: std::mem::transmute::<Ptr, F2>(f("Disablei")?),
+                    BlendFuncSeparatei: std::mem::transmute::<Ptr, F5>(f("BlendFuncSeparatei")?),
+                    BlendEquationSeparatei: std::mem::transmute::<Ptr, F3>(f(
+                        "BlendEquationSeparatei",
+                    )?),
+                    ColorMaski: std::mem::transmute::<Ptr, Mask>(f("ColorMaski")?),
+                })
+            }
+        })
+    }
+}
 
 /// See the module docs.
 pub struct Egl {
     api: EglFns,
     gl: GlFns,
+    indexed: Option<IndexedFns>,
+    caps: HostCaps,
     display: Ptr,
     context: Ptr,
     name: String,
@@ -230,10 +288,12 @@ impl Egl {
             // SAFETY: a NUL-terminated name.
             unsafe { get_proc(c.as_ptr()) }
         };
-        let gl = GlFns::load(&|n| {
+        let lookup = |n: &str| {
             let p = sym(libgles, n);
             if p.is_null() { proc_addr(n) } else { p }
-        })?;
+        };
+        let gl = GlFns::load(&lookup)?;
+        let indexed = IndexedFns::load(&lookup);
         type GetPlatformDisplay = unsafe extern "C" fn(u32, Ptr, *const i32) -> Ptr;
         type QueryDevices = unsafe extern "C" fn(i32, *mut Ptr, *mut i32) -> u32;
         let gpd = proc_addr("eglGetPlatformDisplayEXT");
@@ -303,6 +363,8 @@ impl Egl {
         let mut me = Self {
             api: egl,
             gl,
+            indexed,
+            caps: HostCaps::default(),
             display,
             context,
             name: String::new(),
@@ -321,6 +383,32 @@ impl Egl {
                         .into_owned()
                 }
             };
+            let exts = s((me.gl.GetString)(GL_EXTENSIONS));
+            let has = |e: &str| exts.split_ascii_whitespace().any(|x| x == e);
+            let mut samples = 0;
+            (me.gl.GetIntegerv)(super::gl::MAX_SAMPLES, &raw mut samples);
+            let mut varyings = 0;
+            (me.gl.GetIntegerv)(super::gl::MAX_VARYING_VECTORS, &raw mut varyings);
+            let version = s((me.gl.GetString)(GL_VERSION));
+            // GLES 3.2 has indexed blend state in core.
+            let es32 = version.strip_prefix("OpenGL ES ").is_some_and(|v| {
+                v.as_bytes()
+                    .get(..3)
+                    .is_some_and(|m| m >= b"3.2".as_slice())
+            });
+            me.caps = HostCaps {
+                draw_buffers_indexed: me.indexed.is_some()
+                    && (es32
+                        || has("GL_EXT_draw_buffers_indexed")
+                        || has("GL_OES_draw_buffers_indexed")),
+                blend_func_extended: has("GL_EXT_blend_func_extended"),
+                depth_clamp: has("GL_EXT_depth_clamp"),
+                max_samples: samples.max(0) as u32,
+                max_varyings: varyings.max(0) as u32,
+            };
+            if !me.caps.draw_buffers_indexed {
+                me.indexed = None;
+            }
             let vendor = s((me.api.QueryString)(display, EGL_VENDOR).cast());
             me.name = format!(
                 "{} ({}, EGL {major}.{minor} {vendor})",
@@ -370,6 +458,9 @@ fn cstr(s: &str) -> CString {
 impl GpuBackend for Egl {
     fn name(&self) -> String {
         self.name.clone()
+    }
+    fn host_caps(&mut self) -> HostCaps {
+        self.caps
     }
     fn begin(&mut self) {
         unsafe {
@@ -425,6 +516,23 @@ impl GpuBackend for Egl {
         size: usize,
     ) {
         unsafe { (self.gl.BindBufferRange)(target, index, buffer, offset as isize, size as isize) };
+    }
+    fn get_buffer_sub_data(&mut self, target: u32, offset: usize, out: &mut [u8]) {
+        if out.is_empty() {
+            return;
+        }
+        unsafe {
+            let p = (self.gl.MapBufferRange)(
+                target,
+                offset as isize,
+                out.len() as isize,
+                GL_MAP_READ_BIT,
+            );
+            if !p.is_null() {
+                std::ptr::copy_nonoverlapping(p.cast::<u8>(), out.as_mut_ptr(), out.len());
+                (self.gl.UnmapBuffer)(target);
+            }
+        }
     }
     fn create_texture(&mut self) -> u32 {
         let mut t = 0;
@@ -579,6 +687,31 @@ impl GpuBackend for Egl {
     fn read_buffer(&mut self, buffer: u32) {
         unsafe { (self.gl.ReadBuffer)(buffer) };
     }
+    fn create_renderbuffer(&mut self) -> u32 {
+        let mut r = 0;
+        unsafe { (self.gl.GenRenderbuffers)(1, &raw mut r) };
+        r
+    }
+    fn delete_renderbuffer(&mut self, rb: u32) {
+        unsafe { (self.gl.DeleteRenderbuffers)(1, &raw const rb) };
+    }
+    fn renderbuffer_storage(&mut self, rb: u32, samples: u32, internal: u32, w: u32, h: u32) {
+        unsafe {
+            (self.gl.BindRenderbuffer)(super::gl::RENDERBUFFER, rb);
+            (self.gl.RenderbufferStorageMultisample)(
+                super::gl::RENDERBUFFER,
+                samples as i32,
+                internal,
+                w as i32,
+                h as i32,
+            );
+        }
+    }
+    fn framebuffer_renderbuffer(&mut self, target: u32, attachment: u32, rb: u32) {
+        unsafe {
+            (self.gl.FramebufferRenderbuffer)(target, attachment, super::gl::RENDERBUFFER, rb);
+        }
+    }
     fn check_framebuffer_status(&mut self, target: u32) -> u32 {
         unsafe { (self.gl.CheckFramebufferStatus)(target) }
     }
@@ -621,7 +754,12 @@ impl GpuBackend for Egl {
     fn clear_buffer_fi(&mut self, depth: f32, stencil: i32) {
         unsafe { (self.gl.ClearBufferfi)(super::gl::DEPTH_STENCIL, 0, depth, stencil) };
     }
-    fn create_program(&mut self, vs: &str, fs: &str) -> Result<u32, String> {
+    fn create_program_xfb(
+        &mut self,
+        vs: &str,
+        fs: &str,
+        xfb: Option<(&[String], bool)>,
+    ) -> Result<u32, String> {
         let v = self
             .compile(GL_VERTEX_SHADER, vs)
             .map_err(|e| format!("vertex: {e}"))?;
@@ -636,6 +774,20 @@ impl GpuBackend for Egl {
             let p = (self.gl.CreateProgram)();
             (self.gl.AttachShader)(p, v);
             (self.gl.AttachShader)(p, f);
+            if let Some((names, interleaved)) = xfb {
+                let c: Vec<CString> = names.iter().map(|n| cstr(n)).collect();
+                let ptrs: Vec<*const c_char> = c.iter().map(|n| n.as_ptr()).collect();
+                (self.gl.TransformFeedbackVaryings)(
+                    p,
+                    ptrs.len() as i32,
+                    ptrs.as_ptr(),
+                    if interleaved {
+                        super::gl::INTERLEAVED_ATTRIBS
+                    } else {
+                        super::gl::SEPARATE_ATTRIBS
+                    },
+                );
+            }
             (self.gl.LinkProgram)(p);
             (self.gl.DeleteShader)(v);
             (self.gl.DeleteShader)(f);
@@ -684,6 +836,9 @@ impl GpuBackend for Egl {
     }
     fn uniform_4uiv(&mut self, location: i32, values: &[u32]) {
         unsafe { (self.gl.Uniform4uiv)(location, (values.len() / 4) as i32, values.as_ptr()) };
+    }
+    fn uniform_4fv(&mut self, location: i32, values: &[f32]) {
+        unsafe { (self.gl.Uniform4fv)(location, (values.len() / 4) as i32, values.as_ptr()) };
     }
     fn create_vertex_array(&mut self) -> u32 {
         let mut v = 0;
@@ -745,6 +900,39 @@ impl GpuBackend for Egl {
             }
         }
     }
+    fn enable_i(&mut self, cap: u32, index: u32, on: bool) {
+        if let Some(f) = &self.indexed {
+            unsafe {
+                if on {
+                    (f.Enablei)(cap, index);
+                } else {
+                    (f.Disablei)(cap, index);
+                }
+            }
+        }
+    }
+    fn blend_func_separate_i(
+        &mut self,
+        buf: u32,
+        src_rgb: u32,
+        dst_rgb: u32,
+        src_a: u32,
+        dst_a: u32,
+    ) {
+        if let Some(f) = &self.indexed {
+            unsafe { (f.BlendFuncSeparatei)(buf, src_rgb, dst_rgb, src_a, dst_a) };
+        }
+    }
+    fn blend_equation_separate_i(&mut self, buf: u32, rgb: u32, alpha: u32) {
+        if let Some(f) = &self.indexed {
+            unsafe { (f.BlendEquationSeparatei)(buf, rgb, alpha) };
+        }
+    }
+    fn color_mask_i(&mut self, buf: u32, r: bool, g: bool, b: bool, a: bool) {
+        if let Some(f) = &self.indexed {
+            unsafe { (f.ColorMaski)(buf, u8::from(r), u8::from(g), u8::from(b), u8::from(a)) };
+        }
+    }
     fn viewport(&mut self, x: i32, y: i32, width: i32, height: i32) {
         unsafe { (self.gl.Viewport)(x, y, width, height) };
     }
@@ -798,6 +986,15 @@ impl GpuBackend for Egl {
     }
     fn draw_elements(&mut self, mode: u32, count: i32, ty: u32, offset: usize, instances: i32) {
         unsafe { (self.gl.DrawElementsInstanced)(mode, count, ty, offset as Ptr, instances) };
+    }
+    fn bind_buffer_base(&mut self, target: u32, index: u32, buffer: u32) {
+        unsafe { (self.gl.BindBufferBase)(target, index, buffer) };
+    }
+    fn begin_transform_feedback(&mut self, mode: u32) {
+        unsafe { (self.gl.BeginTransformFeedback)(mode) };
+    }
+    fn end_transform_feedback(&mut self) {
+        unsafe { (self.gl.EndTransformFeedback)() };
     }
     fn finish(&mut self) {
         unsafe { (self.gl.Finish)() };

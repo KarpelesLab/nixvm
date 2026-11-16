@@ -1,16 +1,24 @@
 //! The virgl capability set nixvm hands Mesa (`DRM_IOCTL_VIRTGPU_GET_CAPS`):
 //! what the guest's `virgl` driver builds its GL feature level from.
 //!
-//! It describes a GLES 3.0 host — the WebGL2 feature level — the way
-//! virglrenderer describes one when it runs on GLES (`vrend_renderer_fill_caps`
-//! with `gles_ver == 30`): GLSL level 130, `VIRGL_CAP_HOST_IS_GLES`, the
-//! formats of [`super::format::FORMATS`], and GLES 3.0's minimum limits, so
-//! whatever the guest is promised every WebGL2 implementation can keep. Mesa
-//! then offers applications OpenGL ES 3.0 and desktop GL 3.0.
+//! It starts from what virglrenderer reports for a GLES 3.0 host — the
+//! WebGL2 feature level (`vrend_renderer_fill_caps` with `gles_ver == 30`):
+//! `VIRGL_CAP_HOST_IS_GLES`, the formats of [`super::format::FORMATS`],
+//! GLES 3.0's minimum limits — and then goes further than virglrenderer
+//! does there: GLSL level 330 and the bits desktop GL 3.x needs, each of
+//! which the renderer emulates on GLES 3.0 where the host lacks it
+//! (texture buffers as 2D textures, sampler-view swizzles in the shader,
+//! depth clamp by clamping, timer queries from the host clock, conditional
+//! rendering as "always draw", multisampled textures as multisampled
+//! renderbuffers resolved for sampling). Mesa then offers OpenGL ES 3.0 and
+//! desktop OpenGL 3.3 core and compatibility. The few things that can't be
+//! emulated follow the backend's [`HostCaps`]: dual-source blending (GL 3.3
+//! needs it; without it Mesa stops at 3.2) and per-buffer blend functions.
 //!
 //! The layout is `union virgl_caps` from virglrenderer's `virgl_hw.h`
 //! (`struct virgl_caps_v2`, 1408 bytes); the offsets below are that struct's.
 
+use super::backend::HostCaps;
 use super::format::{FORMATS, Kind};
 
 /// `VIRTGPU_DRM_CAPSET_VIRGL`.
@@ -36,9 +44,11 @@ const BSET: usize = 260;
 const GLSL_LEVEL: usize = 264;
 const MAX_TEXTURE_ARRAY_LAYERS: usize = 268;
 const MAX_STREAMOUT_BUFFERS: usize = 272;
+const MAX_DUAL_SOURCE_RENDER_TARGETS: usize = 276;
 const MAX_RENDER_TARGETS: usize = 280;
 const MAX_SAMPLES: usize = 284;
 const PRIM_MASK: usize = 288;
+const MAX_TBO_SIZE: usize = 292;
 const MAX_UNIFORM_BLOCKS: usize = 296;
 const MAX_VIEWPORTS: usize = 300;
 const MIN_ALIASED_POINT_SIZE: usize = 308;
@@ -54,6 +64,7 @@ const MAX_VERTEX_OUTPUTS: usize = 352;
 const MAX_VERTEX_ATTRIBS: usize = 356;
 const MIN_TEXEL_OFFSET: usize = 364;
 const MAX_TEXEL_OFFSET: usize = 368;
+const TEXTURE_BUFFER_OFFSET_ALIGNMENT: usize = 380;
 const UNIFORM_BUFFER_OFFSET_ALIGNMENT: usize = 384;
 const CAPABILITY_BITS: usize = 392;
 const MAX_VERTEX_ATTRIB_STRIDE: usize = 428;
@@ -66,16 +77,23 @@ const MASK_SCANOUT: usize = 624;
 const RENDERER_STR: usize = 696;
 const MAX_ANISOTROPY: usize = 760;
 const MAX_TEXTURE_SAMPLERS: usize = 764;
+const MASK_MULTISAMPLE: usize = 768;
 const MAX_CONST_BUFFER_SIZE: usize = 832;
 const MAX_UNIFORM_BLOCK_SIZE: usize = 1372;
 
 // `struct virgl_caps_bool_set1` bits.
+const BSET_INDEP_BLEND_ENABLE: u32 = 1 << 0;
+const BSET_INDEP_BLEND_FUNC: u32 = 1 << 1;
+const BSET_CONDITIONAL_RENDER: u32 = 1 << 4;
 const BSET_PRIMITIVE_RESTART: u32 = 1 << 6;
 const BSET_BLEND_EQ_SEP: u32 = 1 << 7;
 const BSET_INSTANCEID: u32 = 1 << 8;
 const BSET_VERTEX_ELEMENT_INSTANCE_DIVISOR: u32 = 1 << 9;
 const BSET_SEAMLESS_CUBE_MAP: u32 = 1 << 10;
 const BSET_OCCLUSION_QUERY: u32 = 1 << 11;
+const BSET_TIMER_QUERY: u32 = 1 << 12;
+const BSET_TEXTURE_MULTISAMPLE: u32 = 1 << 14;
+const BSET_DEPTH_CLIP_DISABLE: u32 = 1 << 16;
 const BSET_UBO: u32 = 1 << 18;
 
 // `capability_bits`.
@@ -86,6 +104,23 @@ const VIRGL_CAP_HOST_IS_GLES: u32 = 1 << 19;
 /// The `host_feature_check_version` nixvm's decoder keeps up with: it
 /// understands every command a guest checking for this level may send.
 pub const FEATURE_VERSION: u32 = 15;
+
+/// The GLSL level offered (`#version 330` and below): the translator
+/// lowers what TGSI from such shaders uses to GLSL ES 3.00.
+pub const GLSL_LEVEL_OFFERED: u32 = 330;
+
+/// Texel buffers live in 2D textures this wide (`super::renderer`), up to
+/// [`MAX_TEXEL_BUFFER`] elements.
+pub const TBO_WIDTH: u32 = 4096;
+/// The largest texel buffer, in elements: 256 rows of [`TBO_WIDTH`].
+pub const MAX_TEXEL_BUFFER: u32 = TBO_WIDTH * 256;
+
+/// The most samples a multisampled resource may have: what the host's
+/// renderbuffers hold, at most 8 (and GLES 3.0 promises 4).
+#[must_use]
+pub fn max_samples(host: &HostCaps) -> u32 {
+    host.max_samples.min(8)
+}
 
 struct Caps(Vec<u8>);
 
@@ -103,10 +138,11 @@ impl Caps {
     }
 }
 
-/// Capset `set` at `version` as Mesa reads it, or `None` for one nixvm
-/// doesn't offer. Capset 1 is the leading `struct virgl_caps_v1` of 2.
+/// Capset `set` at `version` as Mesa reads it for a backend with `host`'s
+/// extensions, or `None` for one nixvm doesn't offer. Capset 1 is the
+/// leading `struct virgl_caps_v1` of 2.
 #[must_use]
-pub fn capset(set: u32, version: u32) -> Option<Vec<u8>> {
+pub fn capset(set: u32, version: u32, host: &HostCaps) -> Option<Vec<u8>> {
     let (max_version, size) = match set {
         CAPSET_VIRGL if version <= 1 => (1, V1_SIZE),
         CAPSET_VIRGL2 if version <= 2 => (2, V2_SIZE),
@@ -123,10 +159,18 @@ pub fn capset(set: u32, version: u32) -> Option<Vec<u8>> {
         }
         c.bit(MASK_SAMPLER, f.id);
         match f.kind {
-            Kind::Depth | Kind::DepthStencil => c.bit(MASK_DEPTHSTENCIL, f.id),
+            Kind::Depth | Kind::DepthStencil => {
+                c.bit(MASK_DEPTHSTENCIL, f.id);
+                c.bit(MASK_MULTISAMPLE, f.id);
+            }
             _ if f.render => {
                 c.bit(MASK_RENDER, f.id);
                 c.bit(MASK_READBACK, f.id);
+                // GLES 3.0 multisamples every renderable format but the
+                // integer ones.
+                if f.kind == Kind::Float {
+                    c.bit(MASK_MULTISAMPLE, f.id);
+                }
             }
             _ => {}
         }
@@ -135,21 +179,36 @@ pub fn capset(set: u32, version: u32) -> Option<Vec<u8>> {
     for id in [1, 2, 67, 134] {
         c.bit(MASK_SCANOUT, id);
     }
-    c.u32(
-        BSET,
-        BSET_PRIMITIVE_RESTART
-            | BSET_BLEND_EQ_SEP
-            | BSET_INSTANCEID
-            | BSET_VERTEX_ELEMENT_INSTANCE_DIVISOR
-            | BSET_SEAMLESS_CUBE_MAP
-            | BSET_OCCLUSION_QUERY
-            | BSET_UBO,
-    );
-    c.u32(GLSL_LEVEL, 130);
+    // Per-buffer blend enables and colour masks are desktop GL 3.0; without
+    // indexed blend state on the host they follow buffer 0's (as on any
+    // GLES 3.0 virgl host). Per-buffer functions are GL 4.0: only offered
+    // when the host has them.
+    let mut bset = BSET_INDEP_BLEND_ENABLE
+        | BSET_CONDITIONAL_RENDER
+        | BSET_PRIMITIVE_RESTART
+        | BSET_BLEND_EQ_SEP
+        | BSET_INSTANCEID
+        | BSET_VERTEX_ELEMENT_INSTANCE_DIVISOR
+        | BSET_SEAMLESS_CUBE_MAP
+        | BSET_OCCLUSION_QUERY
+        | BSET_TIMER_QUERY
+        | BSET_TEXTURE_MULTISAMPLE
+        | BSET_DEPTH_CLIP_DISABLE
+        | BSET_UBO;
+    if host.draw_buffers_indexed {
+        bset |= BSET_INDEP_BLEND_FUNC;
+    }
+    c.u32(BSET, bset);
+    c.u32(GLSL_LEVEL, GLSL_LEVEL_OFFERED);
     c.u32(MAX_TEXTURE_ARRAY_LAYERS, 256);
     c.u32(MAX_STREAMOUT_BUFFERS, 4);
+    c.u32(
+        MAX_DUAL_SOURCE_RENDER_TARGETS,
+        u32::from(host.blend_func_extended),
+    );
     c.u32(MAX_RENDER_TARGETS, 4);
-    c.u32(MAX_SAMPLES, 0);
+    c.u32(MAX_SAMPLES, max_samples(host));
+    c.u32(MAX_TBO_SIZE, MAX_TEXEL_BUFFER);
     // POINTS, LINES, LINE_LOOP, LINE_STRIP, TRIANGLES, TRIANGLE_STRIP,
     // TRIANGLE_FAN: GLES's primitive set.
     c.u32(PRIM_MASK, 0x7f);
@@ -166,10 +225,13 @@ pub fn capset(set: u32, version: u32) -> Option<Vec<u8>> {
         c.f32(MIN_SMOOTH_LINE_WIDTH, 1.0);
         c.f32(MAX_SMOOTH_LINE_WIDTH, 1.0);
         c.f32(MAX_TEXTURE_LOD_BIAS, 2.0);
-        c.u32(MAX_VERTEX_OUTPUTS, 15);
+        // What the host passes between stages (GLES 3.0 promises 15 vec4s;
+        // Chromium wants 16 for WebGL 2), at most 32.
+        c.u32(MAX_VERTEX_OUTPUTS, host.max_varyings.clamp(15, 32));
         c.u32(MAX_VERTEX_ATTRIBS, 16);
         c.u32(MIN_TEXEL_OFFSET, (-8i32).cast_unsigned());
         c.u32(MAX_TEXEL_OFFSET, 7);
+        c.u32(TEXTURE_BUFFER_OFFSET_ALIGNMENT, 16);
         c.u32(UNIFORM_BUFFER_OFFSET_ALIGNMENT, 256);
         c.u32(
             CAPABILITY_BITS,
@@ -207,10 +269,19 @@ mod tests {
 
     #[test]
     fn capset2_describes_a_gles3_host() {
-        let c = capset(CAPSET_VIRGL2, 0).unwrap();
+        let c = capset(CAPSET_VIRGL2, 0, &HostCaps::default()).unwrap();
         assert_eq!(c.len(), V2_SIZE);
         assert_eq!(word(&c, MAX_VERSION), 2);
-        assert_eq!(word(&c, GLSL_LEVEL), 130);
+        assert_eq!(word(&c, GLSL_LEVEL), 330);
+        // Bare GLES 3.0: no dual-source blending, no per-buffer functions.
+        assert_eq!(word(&c, MAX_DUAL_SOURCE_RENDER_TARGETS), 0);
+        assert_eq!(word(&c, BSET) & BSET_INDEP_BLEND_FUNC, 0);
+        assert_ne!(word(&c, BSET) & BSET_TEXTURE_MULTISAMPLE, 0);
+        assert_eq!(word(&c, MAX_SAMPLES), 4);
+        assert_eq!(word(&c, MAX_TBO_SIZE), MAX_TEXEL_BUFFER);
+        // RGBA8 multisamples; RGBA8UI (180) doesn't.
+        assert_ne!(word(&c, MASK_MULTISAMPLE + 8) & 1 << (67 - 64), 0);
+        assert_eq!(word(&c, MASK_MULTISAMPLE + 20) & 1 << (180 - 160), 0);
         assert_ne!(word(&c, CAPABILITY_BITS) & VIRGL_CAP_HOST_IS_GLES, 0);
         // B8G8R8A8_UNORM (1) is renderable; Z24_UNORM_S8_UINT (19) is depth.
         assert_ne!(word(&c, MASK_RENDER) & 1 << 1, 0);
@@ -223,10 +294,26 @@ mod tests {
 
     #[test]
     fn capset1_is_the_v1_prefix_and_unknown_sets_are_refused() {
-        let c = capset(CAPSET_VIRGL, 1).unwrap();
+        let h = HostCaps::default();
+        let c = capset(CAPSET_VIRGL, 1, &h).unwrap();
         assert_eq!(c.len(), V1_SIZE);
         assert_eq!(word(&c, MAX_VERSION), 1);
-        assert!(capset(CAPSET_VIRGL2, 3).is_none());
-        assert!(capset(4, 0).is_none());
+        assert!(capset(CAPSET_VIRGL2, 3, &h).is_none());
+        assert!(capset(4, 0, &h).is_none());
+    }
+
+    #[test]
+    fn host_extensions_raise_what_is_offered() {
+        let h = HostCaps {
+            draw_buffers_indexed: true,
+            blend_func_extended: true,
+            depth_clamp: true,
+            max_samples: 32,
+            max_varyings: 31,
+        };
+        let c = capset(CAPSET_VIRGL2, 2, &h).unwrap();
+        assert_eq!(word(&c, MAX_DUAL_SOURCE_RENDER_TARGETS), 1);
+        assert_ne!(word(&c, BSET) & BSET_INDEP_BLEND_FUNC, 0);
+        assert_eq!(word(&c, MAX_SAMPLES), 8);
     }
 }

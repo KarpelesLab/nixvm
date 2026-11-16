@@ -8,9 +8,10 @@
 //! skipped; like virtio, the guest has no way to be told which.
 
 use super::Box3;
+use super::glsl::StreamOutput;
 use super::renderer::{
     Blend, DrawInfo, Dsa, IndexBuffer, Object, Query, Rasterizer, Renderer, RtBlend, SamplerState,
-    SamplerView, ShaderObj, Surface, Ubo, VertexBuffer, VertexElement, Viewport,
+    SamplerView, ShaderObj, StreamTarget, Surface, Ubo, VertexBuffer, VertexElement, Viewport,
 };
 
 // enum virgl_context_cmd.
@@ -109,9 +110,11 @@ fn w(p: &[u32], n: usize) -> Result<u32, String> {
 #[allow(clippy::too_many_lines)]
 fn command(r: &mut Renderer, ctx: u32, cmd: u32, obj: u32, p: &[u32]) -> Result<(), String> {
     match cmd {
+        // Conditional rendering always draws: occlusion results are
+        // reported as passing (see `Renderer::end_query`), so the
+        // condition would hold anyway.
         NOP
         | SET_POLYGON_STIPPLE
-        | SET_CLIP_STATE
         | SET_SAMPLE_MASK
         | SET_MIN_SAMPLES
         | SET_FRAMEBUFFER_STATE_NO_ATTACH
@@ -122,9 +125,19 @@ fn command(r: &mut Renderer, ctx: u32, cmd: u32, obj: u32, p: &[u32]) -> Result<
         | LINK_SHADER
         | SET_TESS_STATE
         | GET_QUERY_RESULT
-        | BEGIN_QUERY
-        | SET_RENDER_CONDITION
-        | SET_STREAMOUT_TARGETS => {}
+        | SET_RENDER_CONDITION => {}
+        SET_CLIP_STATE => {
+            let mut planes = [[0f32; 4]; 8];
+            for (i, w) in p.iter().take(32).enumerate() {
+                planes[i / 4][i % 4] = f(*w);
+            }
+            r.set_clip_planes(ctx, planes);
+        }
+        SET_STREAMOUT_TARGETS => {
+            let append = w(p, 1)?;
+            r.set_streamout_targets(ctx, append, &p[1..]);
+        }
+        BEGIN_QUERY => r.begin_query(ctx, w(p, 1)?),
         CREATE_OBJECT => create_object(r, ctx, obj, p)?,
         BIND_OBJECT => r.bind_object(ctx, obj, w(p, 1)?),
         DESTROY_OBJECT => r.destroy_object(ctx, w(p, 1)?),
@@ -364,6 +377,7 @@ fn create_object(r: &mut Renderer, ctx: u32, obj: u32, p: &[u32]) -> Result<(), 
             line_width: f(w(p, 6)?),
             offset_units: f(w(p, 7)?),
             offset_scale: f(w(p, 8)?),
+            clip_planes: (w(p, 5)? >> 24) as u8,
         }),
         OBJ_DSA => Object::Dsa(Dsa {
             s0: w(p, 2)?,
@@ -381,6 +395,21 @@ fn create_object(r: &mut Renderer, ctx: u32, obj: u32, p: &[u32]) -> Result<(), 
             } else {
                 5 + 4 + 2 * nso
             };
+            let mut so = Vec::new();
+            let mut so_stride = [0; 4];
+            if stage != 5 && nso > 0 {
+                let words = p.get(5..skip).ok_or("short stream output info")?;
+                so_stride.copy_from_slice(&words[..4]);
+                for c in words[4..].as_chunks::<2>().0 {
+                    so.push(StreamOutput {
+                        reg: c[0] & 0xff,
+                        start: (c[0] >> 8) & 3,
+                        count: ((c[0] >> 10) & 7).clamp(1, 4),
+                        buffer: (c[0] >> 13) & 7,
+                        dst_offset: c[0] >> 16,
+                    });
+                }
+            }
             let text: Vec<u8> = p
                 .get(skip..)
                 .unwrap_or(&[])
@@ -403,6 +432,8 @@ fn create_object(r: &mut Renderer, ctx: u32, obj: u32, p: &[u32]) -> Result<(), 
                 total,
                 parsed: None,
                 error: None,
+                so,
+                so_stride,
             })
         }
         OBJ_VERTEX_ELEMENTS => Object::VertexElements(
@@ -425,6 +456,9 @@ fn create_object(r: &mut Renderer, ctx: u32, obj: u32, p: &[u32]) -> Result<(), 
                 format: w(p, 3)? & 0xff_ffff,
                 first_level: lv & 0xff,
                 last_level: (lv >> 8) & 0xff,
+                // A buffer's view: its first and last element instead.
+                first_element: w(p, 4)?,
+                last_element: lv,
                 swizzle: w(p, 6)?,
             })
         }
@@ -445,7 +479,12 @@ fn create_object(r: &mut Renderer, ctx: u32, obj: u32, p: &[u32]) -> Result<(), 
             offset: w(p, 3)?,
             res: w(p, 4)?,
         }),
-        OBJ_STREAMOUT_TARGET => Object::Other(obj),
+        OBJ_STREAMOUT_TARGET => Object::StreamTarget(StreamTarget {
+            res: w(p, 2)?,
+            offset: w(p, 3)?,
+            size: w(p, 4)?,
+            filled: 0,
+        }),
         _ => return Err("unknown object type".into()),
     };
     r.create_object(ctx, handle, o);
@@ -464,7 +503,7 @@ mod tests {
 
     use super::*;
     use crate::gpu::backend::Recorder;
-    use crate::gpu::{Backing, GpuDevice, MemBacking, ResourceDesc, Transfer, target};
+    use crate::gpu::{Backing, GpuDevice, MemBacking, ResourceDesc, Transfer, gl, target};
 
     fn words(text: &str) -> Vec<u32> {
         let mut b = text.as_bytes().to_vec();
@@ -641,6 +680,152 @@ DCL CONST[0][0]
         let progs = progs.lock().unwrap();
         assert_eq!(progs.len(), 1);
         assert!(progs[0].1.contains("nx_out0 = nx_o0;"));
+    }
+
+    /// Desktop GL 3.x paths on a recorder that claims indexed blending:
+    /// a multisampled target drawn through its renderbuffer and resolved
+    /// when read, independent blend per buffer, and transform feedback's
+    /// capture pass.
+    #[test]
+    fn msaa_indexed_blend_and_stream_output_reach_the_backend() {
+        let mut rec = Recorder::new(false);
+        rec.caps.draw_buffers_indexed = true;
+        let calls = Arc::clone(&rec.calls);
+        let dev = GpuDevice::new(Box::new(rec), false);
+        let ctx = dev.create_context();
+        let tex = |samples| ResourceDesc {
+            target: target::TEXTURE_2D,
+            format: 67, // R8G8B8A8_UNORM
+            bind: 2,
+            width: 16,
+            height: 16,
+            depth: 1,
+            array_size: 1,
+            nr_samples: samples,
+            ..ResourceDesc::default()
+        };
+        let ms = dev
+            .create_resource(tex(4), MemBacking::new(16 * 16 * 4))
+            .unwrap();
+        let plain = dev
+            .create_resource(tex(0), MemBacking::new(16 * 16 * 4))
+            .unwrap();
+        let buf = |size| ResourceDesc {
+            target: target::BUFFER,
+            format: 64,
+            bind: 16,
+            width: size,
+            height: 1,
+            depth: 1,
+            array_size: 1,
+            ..ResourceDesc::default()
+        };
+        let vb = dev.create_resource(buf(64), MemBacking::new(64)).unwrap();
+        let so_buf = dev.create_resource(buf(256), MemBacking::new(256)).unwrap();
+        let mut cmds = vec![];
+        // A vertex shader whose OUT[1].xy is captured to buffer 0.
+        let t = words(VS);
+        cmds.extend([
+            cmd0(CREATE_OBJECT, OBJ_SHADER, 5 + 4 + 2 + t.len() as u32),
+            10,
+            0,
+            VS.len() as u32 + 1,
+            0,
+            1,
+            2,
+            0,
+            0,
+            0,
+            1 | (2 << 10),
+            0,
+        ]);
+        cmds.extend(t);
+        cmds.extend(shader(11, 1, FS));
+        cmds.extend([cmd0(CREATE_OBJECT, OBJ_SURFACE, 5), 20, ms, 67, 0, 0]);
+        cmds.extend([cmd0(CREATE_OBJECT, OBJ_SURFACE, 5), 21, plain, 67, 0, 0]);
+        cmds.extend([cmd0(SET_FRAMEBUFFER_STATE, 0, 4), 2, 0, 20, 21]);
+        // Independent blend: buffer 0 off, buffer 1 on.
+        let rt1 = 1 | (1 << 4) | (1 << 9) | (1 << 17) | (1 << 22) | (0xf << 27);
+        cmds.extend([cmd0(CREATE_OBJECT, OBJ_BLEND, 10), 40, 1, 0, 0xf << 27, rt1]);
+        cmds.extend([0; 6]);
+        cmds.extend([cmd0(BIND_OBJECT, OBJ_BLEND, 1), 40]);
+        cmds.extend([
+            cmd0(CREATE_OBJECT, OBJ_VERTEX_ELEMENTS, 9),
+            30,
+            0,
+            0,
+            0,
+            31,
+            16,
+            0,
+            0,
+            31,
+        ]);
+        cmds.extend([cmd0(BIND_OBJECT, OBJ_VERTEX_ELEMENTS, 1), 30]);
+        cmds.extend([cmd0(SET_VERTEX_BUFFERS, 0, 3), 32, 0, vb]);
+        cmds.extend([
+            cmd0(BIND_SHADER, 0, 2),
+            10,
+            0,
+            cmd0(BIND_SHADER, 0, 2),
+            11,
+            1,
+        ]);
+        cmds.extend([
+            cmd0(CREATE_OBJECT, OBJ_STREAMOUT_TARGET, 4),
+            50,
+            so_buf,
+            0,
+            256,
+        ]);
+        cmds.extend([cmd0(SET_STREAMOUT_TARGETS, 0, 2), 0, 50]);
+        cmds.extend([cmd0(DRAW_VBO, 0, 12), 0, 3, 4, 0, 1, 0, 0, 0, 0, 0, !0, 0]);
+        // Read the multisampled target back through a copy.
+        cmds.extend([cmd0(RESOURCE_COPY_REGION, 0, 13), plain, 0, 0, 0, 0, ms, 0]);
+        cmds.extend([0, 0, 0, 16, 16, 1]);
+        dev.submit(ctx, &cmds).unwrap();
+        let calls = calls.lock().unwrap();
+        let pos = |s: &str| calls.iter().position(|c| c.starts_with(s));
+        let has = |s: &str| pos(s).is_some();
+        assert!(has("renderbuffer_storage("), "{calls:#?}");
+        assert!(
+            has(&format!(
+                "framebuffer_renderbuffer({}, {}",
+                gl::DRAW_FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0
+            )),
+            "{calls:#?}"
+        );
+        assert!(has("enable_i(3042, 0, false)"), "{calls:#?}");
+        assert!(has("enable_i(3042, 1, true)"), "{calls:#?}");
+        assert!(has("color_mask_i(1, true, true, true, true)"), "{calls:#?}");
+        // The capture pass: points, rasterizer off, read back.
+        assert!(
+            has("transform_feedback_varyings([\"nx_xfb0\"], true)"),
+            "{calls:#?}"
+        );
+        let begin = pos("begin_transform_feedback(0)").expect("captured");
+        assert!(
+            calls[begin + 1].starts_with("draw_arrays(0, 0, 3, 1)"),
+            "{calls:#?}"
+        );
+        assert!(has("get_buffer_sub_data("), "{calls:#?}");
+        // The copy resolves the renderbuffer first.
+        let resolve = calls
+            .iter()
+            .rposition(|c| {
+                c.starts_with(&format!(
+                    "framebuffer_renderbuffer({}",
+                    gl::READ_FRAMEBUFFER
+                ))
+            })
+            .expect("resolved");
+        assert!(
+            calls[resolve..]
+                .iter()
+                .any(|c| c.starts_with("blit_framebuffer([0, 0, 16, 16], [0, 0, 16, 16]")),
+            "{calls:#?}"
+        );
     }
 
     /// The same draw on the host's GL (skipped when it has none), with the

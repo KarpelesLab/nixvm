@@ -11,6 +11,7 @@
 use wasm_bindgen::prelude::*;
 
 use super::GpuBackend;
+use super::backend::HostCaps;
 
 #[wasm_bindgen(module = "/src/gpu/webgl.js")]
 extern "C" {
@@ -64,7 +65,20 @@ extern "C" {
     fn nx_gl_clear_buffer_iv(b: u32, db: u32, v: &[i32]);
     fn nx_gl_clear_buffer_uiv(b: u32, db: u32, v: &[u32]);
     fn nx_gl_clear_buffer_fi(depth: f32, stencil: i32);
-    fn nx_gl_create_program(vs: &str, fs: &str) -> u32;
+    fn nx_gl_create_program(vs: &str, fs: &str, xfb: &str, interleaved: bool) -> u32;
+    fn nx_gl_caps() -> Vec<u32>;
+    fn nx_gl_enable_i(cap: u32, i: u32, on: bool);
+    fn nx_gl_blend_func_separate_i(buf: u32, a: u32, b: u32, c: u32, d: u32);
+    fn nx_gl_blend_equation_separate_i(buf: u32, a: u32, b: u32);
+    fn nx_gl_color_mask_i(buf: u32, r: bool, g: bool, b: bool, a: bool);
+    fn nx_gl_get_buffer_sub_data(t: u32, off: f64, out: &mut [u8]);
+    fn nx_gl_create_renderbuffer() -> u32;
+    fn nx_gl_delete_renderbuffer(r: u32);
+    fn nx_gl_renderbuffer_storage(r: u32, samples: u32, internal: u32, w: u32, h: u32);
+    fn nx_gl_framebuffer_renderbuffer(t: u32, att: u32, r: u32);
+    fn nx_gl_bind_buffer_base(t: u32, i: u32, b: u32);
+    fn nx_gl_begin_transform_feedback(mode: u32);
+    fn nx_gl_end_transform_feedback();
     fn nx_gl_last_log() -> String;
     fn nx_gl_delete_program(p: u32);
     fn nx_gl_use_program(p: u32);
@@ -74,6 +88,7 @@ extern "C" {
     fn nx_gl_uniform_1i(l: i32, v: i32);
     fn nx_gl_uniform_1f(l: i32, v: f32);
     fn nx_gl_uniform_4uiv(l: i32, v: &[u32]);
+    fn nx_gl_uniform_4fv(l: i32, v: &[f32]);
     fn nx_gl_create_vertex_array() -> u32;
     fn nx_gl_bind_vertex_array(v: u32);
     fn nx_gl_enable_vertex_attrib_array(i: u32, on: bool);
@@ -143,6 +158,60 @@ fn n(v: usize) -> f64 {
 impl GpuBackend for WebGl {
     fn name(&self) -> String {
         nx_gl_name()
+    }
+    fn host_caps(&mut self) -> HostCaps {
+        let c = nx_gl_caps();
+        let at = |i: usize| c.get(i).copied().unwrap_or(0);
+        HostCaps {
+            draw_buffers_indexed: at(0) != 0,
+            blend_func_extended: at(1) != 0,
+            depth_clamp: at(2) != 0,
+            max_samples: at(3),
+            max_varyings: at(4),
+        }
+    }
+    fn get_buffer_sub_data(&mut self, target: u32, offset: usize, out: &mut [u8]) {
+        nx_gl_get_buffer_sub_data(target, n(offset), out);
+    }
+    fn create_renderbuffer(&mut self) -> u32 {
+        nx_gl_create_renderbuffer()
+    }
+    fn delete_renderbuffer(&mut self, rb: u32) {
+        nx_gl_delete_renderbuffer(rb);
+    }
+    fn renderbuffer_storage(&mut self, rb: u32, samples: u32, internal: u32, w: u32, h: u32) {
+        nx_gl_renderbuffer_storage(rb, samples, internal, w, h);
+    }
+    fn framebuffer_renderbuffer(&mut self, target: u32, attachment: u32, rb: u32) {
+        nx_gl_framebuffer_renderbuffer(target, attachment, rb);
+    }
+    fn enable_i(&mut self, cap: u32, index: u32, on: bool) {
+        nx_gl_enable_i(cap, index, on);
+    }
+    fn blend_func_separate_i(
+        &mut self,
+        buf: u32,
+        src_rgb: u32,
+        dst_rgb: u32,
+        src_a: u32,
+        dst_a: u32,
+    ) {
+        nx_gl_blend_func_separate_i(buf, src_rgb, dst_rgb, src_a, dst_a);
+    }
+    fn blend_equation_separate_i(&mut self, buf: u32, rgb: u32, alpha: u32) {
+        nx_gl_blend_equation_separate_i(buf, rgb, alpha);
+    }
+    fn color_mask_i(&mut self, buf: u32, r: bool, g: bool, b: bool, a: bool) {
+        nx_gl_color_mask_i(buf, r, g, b, a);
+    }
+    fn bind_buffer_base(&mut self, target: u32, index: u32, buffer: u32) {
+        nx_gl_bind_buffer_base(target, index, buffer);
+    }
+    fn begin_transform_feedback(&mut self, mode: u32) {
+        nx_gl_begin_transform_feedback(mode);
+    }
+    fn end_transform_feedback(&mut self) {
+        nx_gl_end_transform_feedback();
     }
     fn create_buffer(&mut self) -> u32 {
         nx_gl_create_buffer()
@@ -290,8 +359,14 @@ impl GpuBackend for WebGl {
     fn clear_buffer_fi(&mut self, depth: f32, stencil: i32) {
         nx_gl_clear_buffer_fi(depth, stencil);
     }
-    fn create_program(&mut self, vs: &str, fs: &str) -> Result<u32, String> {
-        match nx_gl_create_program(vs, fs) {
+    fn create_program_xfb(
+        &mut self,
+        vs: &str,
+        fs: &str,
+        xfb: Option<(&[String], bool)>,
+    ) -> Result<u32, String> {
+        let (names, interleaved) = xfb.map_or((String::new(), false), |(n, i)| (n.join("\n"), i));
+        match nx_gl_create_program(vs, fs, &names, interleaved) {
             0 => Err(nx_gl_last_log()),
             p => Ok(p),
         }
@@ -319,6 +394,9 @@ impl GpuBackend for WebGl {
     }
     fn uniform_4uiv(&mut self, location: i32, values: &[u32]) {
         nx_gl_uniform_4uiv(location, values);
+    }
+    fn uniform_4fv(&mut self, location: i32, values: &[f32]) {
+        nx_gl_uniform_4fv(location, values);
     }
     fn create_vertex_array(&mut self) -> u32 {
         nx_gl_create_vertex_array()

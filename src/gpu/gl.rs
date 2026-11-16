@@ -200,3 +200,24 @@ pub const TRIANGLES: u32 = 4;
 
 // Errors.
 pub const NO_ERROR: u32 = 0;
+
+// Extensions the renderer uses when the host has them.
+/// `EXT_blend_func_extended` (dual-source blending).
+pub const SRC1_COLOR: u32 = 0x88F9;
+pub const SRC1_ALPHA: u32 = 0x8589;
+pub const ONE_MINUS_SRC1_COLOR: u32 = 0x88FA;
+pub const ONE_MINUS_SRC1_ALPHA: u32 = 0x88FB;
+/// `EXT_depth_clamp`.
+pub const DEPTH_CLAMP: u32 = 0x864F;
+
+// Renderbuffers (multisampling).
+pub const RENDERBUFFER: u32 = 0x8D41;
+pub const MAX_SAMPLES: u32 = 0x8D57;
+pub const MAX_VARYING_VECTORS: u32 = 0x8DFC;
+
+// Transform feedback.
+pub const TRANSFORM_FEEDBACK_BUFFER: u32 = 0x8C8E;
+pub const INTERLEAVED_ATTRIBS: u32 = 0x8C8C;
+pub const SEPARATE_ATTRIBS: u32 = 0x8C8D;
+pub const LINES: u32 = 1;
+pub const STATIC_DRAW: u32 = 0x88E4;

@@ -156,6 +156,8 @@ const EINVAL: Errno = 22;
 #[derive(Clone)]
 pub struct GpuDevice {
     inner: Arc<Mutex<renderer::Renderer>>,
+    /// What the backend's GL offers beyond GLES 3.0 (the capset follows).
+    host: backend::HostCaps,
     /// The resources' host-side reference counts (one per GEM handle any
     /// file holds): separate from the renderer so the kernel can count
     /// without taking the GL context.
@@ -173,8 +175,11 @@ impl GpuDevice {
     /// guest submits to stderr.
     #[must_use]
     pub fn new(backend: Box<dyn GpuBackend>, trace: bool) -> Self {
+        let r = renderer::Renderer::new(backend, trace);
+        let host = r.host_caps();
         Self {
-            inner: Arc::new(Mutex::new(renderer::Renderer::new(backend, trace))),
+            inner: Arc::new(Mutex::new(r)),
+            host,
             refs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -210,7 +215,17 @@ impl GpuDevice {
             return None;
         }
         let trace = std::env::var_os("NIXVM_GPU_TRACE").is_some();
-        Self::from_spec(&spec, trace)
+        let mut dev = Self::from_spec(&spec, trace)?;
+        // Test what a bare GLES 3.0 / WebGL2 host gets: ignore the host's
+        // extensions (every emulation path then runs).
+        if std::env::var_os("NIXVM_GPU_GLES30").is_some() {
+            dev.host = backend::HostCaps {
+                max_samples: dev.host.max_samples.min(4),
+                ..backend::HostCaps::default()
+            };
+            dev.inner.lock().unwrap().set_host_caps(dev.host);
+        }
+        Some(dev)
     }
 
     /// Run `f` on the renderer with the backend's context current.
@@ -225,7 +240,7 @@ impl GpuDevice {
     /// The capability set `set` at `version` (`DRM_IOCTL_VIRTGPU_GET_CAPS`).
     #[must_use]
     pub fn capset(&self, set: u32, version: u32) -> Option<Vec<u8>> {
-        caps::capset(set, version)
+        caps::capset(set, version, &self.host)
     }
 
     /// A new rendering context (one per guest DRM file that renders).

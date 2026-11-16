@@ -85,6 +85,14 @@ const fn xa(mut fm: Format) -> Format {
     fm
 }
 
+/// A vertex-only format in BGRA order: fetched as RGBA, then the vertex
+/// shader swaps red and blue (GLES has no BGRA vertex formats).
+const fn vob(id: u32, bpp: u32, n: u32, ty: u32, norm: bool) -> Format {
+    let mut fm = vo(id, bpp, n, ty, norm);
+    fm.swap_rb = true;
+    fm
+}
+
 /// A vertex-only format: never a texture.
 const fn vo(id: u32, bpp: u32, n: u32, ty: u32, norm: bool) -> Format {
     Format {
@@ -107,8 +115,13 @@ use gl::{BYTE, FLOAT, HALF_FLOAT, INT, SHORT, UNSIGNED_BYTE, UNSIGNED_INT, UNSIG
 /// Every format the host holds, by virgl id.
 pub const FORMATS: &[Format] = &[
     // The BGRA family, stored as RGBA.
-    bgr(f(1, 4, gl::RGBA8, gl::RGBA, UNSIGNED_BYTE, Float), false), // B8G8R8A8_UNORM
-    bgr(f(2, 4, gl::RGBA8, gl::RGBA, UNSIGNED_BYTE, Float), true),  // B8G8R8X8_UNORM
+    v(
+        bgr(f(1, 4, gl::RGBA8, gl::RGBA, UNSIGNED_BYTE, Float), false),
+        4,
+        UNSIGNED_BYTE,
+        true,
+    ), // B8G8R8A8_UNORM
+    bgr(f(2, 4, gl::RGBA8, gl::RGBA, UNSIGNED_BYTE, Float), true), // B8G8R8X8_UNORM
     bgr(
         f(100, 4, gl::SRGB8_ALPHA8, gl::RGBA, UNSIGNED_BYTE, Float),
         false,
@@ -117,7 +130,7 @@ pub const FORMATS: &[Format] = &[
         f(101, 4, gl::SRGB8_ALPHA8, gl::RGBA, UNSIGNED_BYTE, Float),
         true,
     ), // B8G8R8X8_SRGB
-    f(7, 2, gl::RGB565, gl::RGB, gl::UNSIGNED_SHORT_5_6_5, Float),  // B5G6R5_UNORM
+    f(7, 2, gl::RGB565, gl::RGB, gl::UNSIGNED_SHORT_5_6_5, Float), // B5G6R5_UNORM
     v(
         f(
             8,
@@ -326,6 +339,16 @@ pub const FORMATS: &[Format] = &[
     )),
     xa(f(134, 4, gl::RGBA8, gl::RGBA, UNSIGNED_BYTE, Float)), // R8G8B8X8_UNORM
     vo(173, 4, 4, gl::INT_2_10_10_10_REV, true),              // R10G10B10A2_SNORM
+    // The rest of the 10/10/10/2 and BGRA vertex formats.
+    vo(123, 4, 4, gl::UNSIGNED_INT_2_10_10_10_REV, false), // R10G10B10A2_USCALED
+    vo(172, 4, 4, gl::INT_2_10_10_10_REV, false),          // R10G10B10A2_SSCALED
+    vob(131, 4, 4, gl::UNSIGNED_INT_2_10_10_10_REV, true), // B10G10R10A2_UNORM
+    vob(174, 4, 4, gl::UNSIGNED_INT_2_10_10_10_REV, false), // B10G10R10A2_USCALED
+    vob(175, 4, 4, gl::INT_2_10_10_10_REV, false),         // B10G10R10A2_SSCALED
+    vob(176, 4, 4, gl::INT_2_10_10_10_REV, true),          // B10G10R10A2_SNORM
+    vob(380, 4, 4, BYTE, true),                            // B8G8R8A8_SNORM
+    vob(381, 4, 4, BYTE, false),                           // B8G8R8A8_SSCALED
+    vob(383, 4, 4, UNSIGNED_BYTE, false),                  // B8G8R8A8_USCALED
     // Integer.
     v(
         f(177, 1, gl::R8UI, gl::RED_INTEGER, UNSIGNED_BYTE, Uint),

@@ -10,11 +10,50 @@
 //! Translating Gallium state into these calls is the renderer's job
 //! ([`super::renderer`]), done once for every backend.
 
+/// What a backend's GL offers beyond GLES 3.0 / WebGL2: the extensions the
+/// renderer uses when present (and the capset then promises the guest what
+/// they make possible), and limits that vary by host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct HostCaps {
+    /// `EXT/OES_draw_buffers_indexed` (GLES 3.2): blend state per colour
+    /// buffer ([`GpuBackend::enable_i`] and friends work).
+    pub draw_buffers_indexed: bool,
+    /// `EXT_blend_func_extended` / `WEBGL_blend_func_extended`: dual-source
+    /// blending (`SRC1_*` factors, `layout(index = 1)` outputs).
+    pub blend_func_extended: bool,
+    /// `EXT_depth_clamp`: `DEPTH_CLAMP` can be enabled.
+    pub depth_clamp: bool,
+    /// `GL_MAX_SAMPLES`: the most samples a multisampled renderbuffer has.
+    pub max_samples: u32,
+    /// `GL_MAX_VARYING_VECTORS`: vec4s a vertex shader may pass on.
+    pub max_varyings: u32,
+}
+
+impl Default for HostCaps {
+    /// Bare GLES 3.0 / WebGL2: no extensions, its minimums (4 samples, 15
+    /// varyings).
+    fn default() -> Self {
+        Self {
+            draw_buffers_indexed: false,
+            blend_func_extended: false,
+            depth_clamp: false,
+            max_samples: 4,
+            max_varyings: 15,
+        }
+    }
+}
+
 /// The GLES 3.0 calls the renderer makes. See the module docs.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub trait GpuBackend: Send {
     /// What to show as the host renderer (logs, `GL_RENDERER`'s suffix).
     fn name(&self) -> String;
+    /// The extensions and limits of this backend's GL ([`HostCaps`]),
+    /// asked once when the device is made, with the context current.
+    fn host_caps(&mut self) -> HostCaps {
+        HostCaps::default()
+    }
     /// Make the backend's context current on this thread before a batch of
     /// calls (an EGL context is bound to one thread at a time; the guest's
     /// ioctls arrive on whichever CPU thread runs the caller).
@@ -38,6 +77,10 @@ pub trait GpuBackend: Send {
         offset: usize,
         size: usize,
     );
+    /// `glGetBufferSubData` (WebGL2) / a read mapping (GLES 3.0) of the
+    /// buffer bound to `target`: what the GPU wrote there (transform
+    /// feedback) brought back.
+    fn get_buffer_sub_data(&mut self, target: u32, offset: usize, out: &mut [u8]);
 
     // Textures and samplers.
     fn create_texture(&mut self) -> u32;
@@ -95,6 +138,12 @@ pub trait GpuBackend: Send {
     );
     fn draw_buffers(&mut self, buffers: &[u32]);
     fn read_buffer(&mut self, buffer: u32);
+    fn create_renderbuffer(&mut self) -> u32;
+    fn delete_renderbuffer(&mut self, rb: u32);
+    /// Bind `rb` and give it storage: `glRenderbufferStorageMultisample`
+    /// (`samples == 0`: single-sampled).
+    fn renderbuffer_storage(&mut self, rb: u32, samples: u32, internal: u32, w: u32, h: u32);
+    fn framebuffer_renderbuffer(&mut self, target: u32, attachment: u32, rb: u32);
     fn check_framebuffer_status(&mut self, target: u32) -> u32;
     /// `glReadPixels` from the bound read framebuffer into `out`.
     fn read_pixels(
@@ -116,7 +165,18 @@ pub trait GpuBackend: Send {
     // Programs.
     /// Compile and link a program from GLSL ES 3.00 sources; the info log
     /// on failure.
-    fn create_program(&mut self, vs: &str, fs: &str) -> Result<u32, String>;
+    fn create_program(&mut self, vs: &str, fs: &str) -> Result<u32, String> {
+        self.create_program_xfb(vs, fs, None)
+    }
+    /// [`Self::create_program`], with `xfb` naming the vertex outputs
+    /// transform feedback captures (`glTransformFeedbackVaryings` before
+    /// linking) and whether they interleave into one buffer.
+    fn create_program_xfb(
+        &mut self,
+        vs: &str,
+        fs: &str,
+        xfb: Option<(&[String], bool)>,
+    ) -> Result<u32, String>;
     fn delete_program(&mut self, program: u32);
     fn use_program(&mut self, program: u32);
     /// A uniform's location in `program`, `-1` if it has none (unused or
@@ -127,6 +187,7 @@ pub trait GpuBackend: Send {
     fn uniform_1i(&mut self, location: i32, value: i32);
     fn uniform_1f(&mut self, location: i32, value: f32);
     fn uniform_4uiv(&mut self, location: i32, values: &[u32]);
+    fn uniform_4fv(&mut self, location: i32, values: &[f32]);
 
     // Vertex input.
     fn create_vertex_array(&mut self) -> u32;
@@ -148,6 +209,20 @@ pub trait GpuBackend: Send {
 
     // Fixed-function state.
     fn enable(&mut self, cap: u32, on: bool);
+    /// Per colour buffer blend state (`glEnablei(BLEND, i)`,
+    /// `glBlendFuncSeparatei` …): only called when
+    /// [`HostCaps::draw_buffers_indexed`].
+    fn enable_i(&mut self, cap: u32, index: u32, on: bool);
+    fn blend_func_separate_i(
+        &mut self,
+        buf: u32,
+        src_rgb: u32,
+        dst_rgb: u32,
+        src_a: u32,
+        dst_a: u32,
+    );
+    fn blend_equation_separate_i(&mut self, buf: u32, rgb: u32, alpha: u32);
+    fn color_mask_i(&mut self, buf: u32, r: bool, g: bool, b: bool, a: bool);
     fn viewport(&mut self, x: i32, y: i32, width: i32, height: i32);
     fn depth_range(&mut self, near: f32, far: f32);
     fn scissor(&mut self, x: i32, y: i32, width: i32, height: i32);
@@ -168,6 +243,11 @@ pub trait GpuBackend: Send {
     // Drawing.
     fn draw_arrays(&mut self, mode: u32, first: i32, count: i32, instances: i32);
     fn draw_elements(&mut self, mode: u32, count: i32, ty: u32, offset: usize, instances: i32);
+    /// `glBindBufferBase`.
+    fn bind_buffer_base(&mut self, target: u32, index: u32, buffer: u32);
+    /// `glBeginTransformFeedback(mode)` (`POINTS`, `LINES`, `TRIANGLES`).
+    fn begin_transform_feedback(&mut self, mode: u32);
+    fn end_transform_feedback(&mut self);
     fn finish(&mut self);
     fn get_error(&mut self) -> u32;
 }
@@ -184,6 +264,8 @@ pub struct Recorder {
     pub programs: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
     /// Print each call to stderr as well.
     pub echo: bool,
+    /// What [`GpuBackend::host_caps`] reports.
+    pub caps: HostCaps,
     next: u32,
 }
 
@@ -221,6 +303,60 @@ macro_rules! rec {
 impl GpuBackend for Recorder {
     fn name(&self) -> String {
         "recorder".into()
+    }
+    fn host_caps(&mut self) -> HostCaps {
+        self.caps
+    }
+    fn get_buffer_sub_data(&mut self, target: u32, offset: usize, out: &mut [u8]) {
+        rec!(self, "get_buffer_sub_data", target, offset, out.len());
+    }
+    fn create_renderbuffer(&mut self) -> u32 {
+        self.name_obj("create_renderbuffer")
+    }
+    fn delete_renderbuffer(&mut self, rb: u32) {
+        rec!(self, "delete_renderbuffer", rb);
+    }
+    fn renderbuffer_storage(&mut self, rb: u32, samples: u32, internal: u32, w: u32, h: u32) {
+        rec!(self, "renderbuffer_storage", rb, samples, internal, w, h);
+    }
+    fn framebuffer_renderbuffer(&mut self, target: u32, attachment: u32, rb: u32) {
+        rec!(self, "framebuffer_renderbuffer", target, attachment, rb);
+    }
+    fn enable_i(&mut self, cap: u32, index: u32, on: bool) {
+        rec!(self, "enable_i", cap, index, on);
+    }
+    fn blend_func_separate_i(
+        &mut self,
+        buf: u32,
+        src_rgb: u32,
+        dst_rgb: u32,
+        src_a: u32,
+        dst_a: u32,
+    ) {
+        rec!(
+            self,
+            "blend_func_separate_i",
+            buf,
+            src_rgb,
+            dst_rgb,
+            src_a,
+            dst_a
+        );
+    }
+    fn blend_equation_separate_i(&mut self, buf: u32, rgb: u32, alpha: u32) {
+        rec!(self, "blend_equation_separate_i", buf, rgb, alpha);
+    }
+    fn color_mask_i(&mut self, buf: u32, r: bool, g: bool, b: bool, a: bool) {
+        rec!(self, "color_mask_i", buf, r, g, b, a);
+    }
+    fn bind_buffer_base(&mut self, target: u32, index: u32, buffer: u32) {
+        rec!(self, "bind_buffer_base", target, index, buffer);
+    }
+    fn begin_transform_feedback(&mut self, mode: u32) {
+        rec!(self, "begin_transform_feedback", mode);
+    }
+    fn end_transform_feedback(&mut self) {
+        rec!(self, "end_transform_feedback");
     }
     fn create_buffer(&mut self) -> u32 {
         self.name_obj("create_buffer")
@@ -418,7 +554,15 @@ impl GpuBackend for Recorder {
     fn clear_buffer_fi(&mut self, depth: f32, stencil: i32) {
         rec!(self, "clear_buffer_fi", depth, stencil);
     }
-    fn create_program(&mut self, vs: &str, fs: &str) -> Result<u32, String> {
+    fn create_program_xfb(
+        &mut self,
+        vs: &str,
+        fs: &str,
+        xfb: Option<(&[String], bool)>,
+    ) -> Result<u32, String> {
+        if let Some((v, interleaved)) = xfb {
+            rec!(self, "transform_feedback_varyings", v, interleaved);
+        }
         self.programs
             .lock()
             .unwrap()
@@ -456,6 +600,9 @@ impl GpuBackend for Recorder {
     }
     fn uniform_4uiv(&mut self, location: i32, values: &[u32]) {
         rec!(self, "uniform_4uiv", location, values.len());
+    }
+    fn uniform_4fv(&mut self, location: i32, values: &[f32]) {
+        rec!(self, "uniform_4fv", location, values.len());
     }
     fn create_vertex_array(&mut self) -> u32 {
         self.name_obj("create_vertex_array")
