@@ -5842,8 +5842,26 @@ impl Kernel {
         // with no reaped children's time (a thread shares its group's).
         info.cpu_ns = 0;
         info.rt_run_ns = 0;
-        // A new real-time task joins the back of its priority's queue.
-        info.rt_requeue = RT_TAIL;
+        // A new real-time task joins the back of its priority's queue now,
+        // at fork, as on Linux: ahead of its parent should the parent yield
+        // before the scheduler next looks (queued in the same pass, the two
+        // would be ordered by slot instead).
+        // The parent takes the place it was due first (it may have just been
+        // given its priority), so the child still queues behind it.
+        match std::mem::take(&mut cx.cur.rt_requeue) {
+            RT_TAIL => {
+                sh.rt_tail += 1;
+                cx.cur.rt_seq = sh.rt_tail;
+            }
+            RT_HEAD => {
+                sh.rt_head -= 1;
+                cx.cur.rt_seq = sh.rt_head;
+            }
+            _ => {}
+        }
+        sh.rt_tail += 1;
+        info.rt_seq = sh.rt_tail;
+        info.rt_requeue = 0;
         info.rt_slice_ns = 0;
         if flags & CLONE_THREAD == 0 {
             info.child_cpu_ns = 0;
@@ -15420,6 +15438,45 @@ mod tests {
             "clamped up to the floor"
         );
         assert_eq!(sh.min_vruntime, 250, "floor stays monotonic");
+    }
+
+    /// A real-time child forked in a slice that then ends in a `sched_yield`
+    /// runs next, ahead of its parent, though the scheduler never looked in
+    /// between (on SMP the coordinator needn't loop while one CPU's slice
+    /// runs). It used to be queued only when next looked at, in the same pass
+    /// as the yielding parent, which took the place before it from a lower
+    /// slot: the `sched` conformance program's FIFO check on CI, 3 CPUs.
+    #[test]
+    fn a_real_time_child_runs_before_the_parent_that_yields_to_it() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        cx.cur.sched_policy = 1; // SCHED_FIFO 10, just set: due a place at the back
+        cx.cur.sched_priority = 10;
+        cx.cur.rt_requeue = RT_TAIL;
+        let child = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Clone,
+            [0x11, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(child, 2);
+        let mut sh = k.shared.lock().unwrap();
+        let mut parent = Process {
+            vcpu: Some(Box::new(DummyVcpu)),
+            info: std::mem::take(&mut cx.cur),
+        };
+        parent.info.run = RunState::Running;
+        // It yields with the scheduler not having looked since the fork: to
+        // the back, behind its child.
+        parent.info.rt_requeue = RT_TAIL;
+        sh.procs.insert(0, Some(parent));
+        let next = sh.pick_serial_runnable().unwrap();
+        assert_eq!(
+            sh.procs[next].as_ref().unwrap().info.pid,
+            2,
+            "the child runs next"
+        );
     }
 
     #[test]
