@@ -893,9 +893,11 @@ whole; with `--disable-gpu-rasterization` only the animated layer shows.
 `--disable-gpu-compositing` shows everything. Not the compositor (the
 buffers hold transparent black there, with either compositor) nor GBM: a
 GLES2 render-to-texture-then-sample test (`RGBA`/`BGRA_EXT`, `glTexImage`
-or `glTexStorage`, cleared or drawn) is right on virgl, so it is in what
-ANGLE (`opengl` and `gles` backends alike, and still with desktop GL 3.3
-caps) emits for render passes. With `--disable-gpu-compositing`, **WebGL 2**
+or `glTexStorage`, cleared or drawn) is right on virgl, while the same
+Chromium on the guest's llvmpipe (no render node: `wl_shm` buffers) draws
+the toolbar and the filters right — so it is in how what ANGLE emits for
+render passes (`opengl` and `gles` backends alike, and still with desktop
+GL 3.3 caps) goes through virgl to the host. With `--disable-gpu-compositing`, **WebGL 2**
 renders on the virtual GPU (`WebGL 2.0 (OpenGL ES 3.0 Chromium)` / `ANGLE
 (Mesa, virgl (nixvm GLES 3.0), OpenGL ES 3.0)`, MAX_SAMPLES 8, antialiased
 canvas): it was WebGL 1 only until real multisampling — ANGLE wants 4
@@ -1026,7 +1028,13 @@ on the GPU and `display_present` blits each frame onto it: no read-back,
 no pixels crossing into JS (es2gears at 640×400 on SwiftShader: showing a
 frame costs ~0.02 ms, against ~0.5 ms for read-back + `putImageData`,
 ~54 frames/s shown; `web/scripts/display-check.mjs` measures it). Without
-the display the context is on a hidden 1×1 canvas. In headless
+the display the context is on a hidden 1×1 canvas. `es2gears_wayland`
+*without* the GPU used to die on the page ("Segmentation fault", or an
+EGL error): llvmpipe ran the browser's 256 MiB of guest RAM dry, and a
+store the frame allocator couldn't back came out as a fault at address 0;
+the browser's guest now has 1 GiB (committed by the browser only as it is
+touched). (The kernel still reports such an exhaustion as `SIGSEGV` at 0
+rather than as an out-of-memory kill.) In headless
 Chromium (WebGL2 on SwiftShader, no GPU), on the interpreter: the stock
 demo's Alpine 3.20 takes `apk add mesa-dri-gallium mesa-utils` over the
 tunnel in ~5½ min and `eglinfo` shows virgl / GLES 3.0 (Mesa 24.0.9);

@@ -86,9 +86,13 @@ mod browser {
     /// Guest base address for the flat process address space (mirrors
     /// `sandbox::GUEST_BASE` / `run-elf`'s constant of the same value).
     const GUEST_BASE: u64 = 0x1_0000;
-    /// Guest RAM ceiling for the browser demo: kept small since it backs a
-    /// `Vec<u8>` in the wasm linear memory, not a real mmap.
-    const MEM_BYTES: u64 = 256 * 1024 * 1024;
+    /// Guest RAM for the browser demo: one zeroed allocation in the wasm
+    /// linear memory, which the browser commits only as frames are touched.
+    /// 256 MiB was too little for Mesa's llvmpipe (LLVM compiling shaders,
+    /// per-thread tiles): es2gears_wayland without the GPU ran the pool dry
+    /// and died of a "segfault at 0" (a store the frame allocator couldn't
+    /// back).
+    const MEM_BYTES: u64 = 1024 * 1024 * 1024;
     /// Decompression-bomb guard for the `.tar.gz` root image (a minirootfs is
     /// well under this uncompressed).
     const MAX_ROOTFS_BYTES: u64 = 512 * 1024 * 1024;
