@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/KarpelesLab/nixvm/compare/v0.0.7...v0.0.8) - 2026-11-16
+
+### Other
+
+- a clear to an exact half stores the same value on every host
+- out of guest RAM, a fault is an out-of-memory kill, not SIGSEGV at 0
+- execbuffers return fences — Chromium's frames reach the compositor finished
+- a real-time child takes its place in the queue at fork
+- 1 GiB of guest RAM — llvmpipe ran 256 MiB dry (es2gears segfault)
+- ROADMAP — desktop GL 3.3 on GLES 3.0/WebGL2, what's emulated, the state cache
+- compositing on the GPU, the browser's display canvas, Chromium's render passes
+- gpu_display through the GL compositor — interpreter, shared memory
+- indexed draws start where the index buffer's offset points
+- with the GPU on, the display canvas is the GPU's WebGL2 canvas
+- display_present — show the frame on the GPU's WebGL2 canvas
+- a GL state cache, and cheap hashing on the renderer's per-draw maps
+- gpu_gl33 — desktop GL 3.3 core against llvmpipe, natively and in the browser
+- desktop OpenGL 3.3 (and WebGL 2 in Chromium) on a GLES 3.0 / WebGL2 host
+- a Compositor interface; with a GPU, frames are made on the GPU
+- GpuDevice::with_gl — the host GL context for callers outside the guest
+- README — GL apps on the display with the GPU
+- PRIME, the display's dmabuf support and what runs on it
+- the display's read-back reads what GLES/WebGL2 always can
+- the WebGL2 backend's first browser runs — results, fixes, what's left
+- a gpu toggle — the guest's Mesa renders with WebGL2 in the page
+- what WebGL2 rejects — fixed-index restart, read formats, float targets
+- gl_FragCoord is TGSI's fragment position as it is
+- zwp_linux_dmabuf_v1 — show what clients render on the GPU
+- winding on window-system buffers (flipped viewport)
+- PRIME — GPU buffers as dma-buf descriptors
+
 ## [0.0.7](https://github.com/KarpelesLab/nixvm/compare/v0.0.6...v0.0.7) - 2026-11-14
 
 ### Other
