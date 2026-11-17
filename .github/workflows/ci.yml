@@ -62,6 +62,12 @@ jobs:
       - name: Test (Docker/OCI images, offline parts)
         run: cargo test --features oci,oci-net --lib oci
 
+      - name: Clippy (released root images, warnings denied)
+        run: cargo clippy --all-targets --features images -- -D warnings
+
+      - name: Test (released root images, overlay)
+        run: cargo test --features images --lib -- image:: fs::overlay
+
       - name: Clippy (tunnel networking, warnings denied)
         run: cargo clippy --all-targets --features tunnel -- -D warnings
 
@@ -222,6 +228,17 @@ jobs:
             exit 1
           fi
 
+      # A host-directory upper over the Alpine image: what one guest writes
+      # and deletes, the next sees.
+      - name: Run the persistent root layer test
+        run: |
+          set -o pipefail
+          cargo test --features images --test root_images -- --nocapture 2>&1 | tee images.log
+          if grep -q 'NIXVM_ALPINE_TAR not set' images.log; then
+            echo '::error::the persistent upper test skipped itself'
+            exit 1
+          fi
+
   wasm:
     name: wasm build guard
     runs-on: ubuntu-latest
@@ -278,6 +295,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # `--all-features` is avoided (wasm/hvf/kvm don't build on a host doc run);
-      # `fstool` and `oci,fetch` cover the optional modules with public docs.
-      - name: cargo doc --no-deps --features fstool,oci,fetch,oci-net
-        run: cargo doc --no-deps --features fstool,oci,fetch,oci-net
+      # `fstool`, `oci,fetch` and `images` cover the optional modules with public docs.
+      - name: cargo doc --no-deps --features fstool,oci,fetch,oci-net,images
+        run: cargo doc --no-deps --features fstool,oci,fetch,oci-net,images

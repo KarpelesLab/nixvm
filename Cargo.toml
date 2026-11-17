@@ -90,6 +90,12 @@ gpu = []
 # core stays dependency-free and wasm-buildable; sha256 verification is
 # hand-rolled in image.rs so it needs no extra dep either way.
 fetch = ["dep:ureq"]
+# Released root images (src/image.rs `fetch`): download a pinned Alpine (or
+# Alpine-with-a-compiler) squashfs over HTTPS and open it to mount read-only,
+# without unpacking. The client is our own, its TLS purecrypto's — pure Rust,
+# no C and no libc of its own, so it builds where `fetch`'s ureq/ring can't —
+# and it adds no crate the default build doesn't already have.
+images = ["fstool", "purecrypto/tls", "purecrypto/embedded-roots"]
 # Guest networking over an L3 packet tunnel (src/tunnel.rs): guest sockets are
 # terminated by pktkit's userspace TCP/IP stack (`vclient`), which exchanges
 # raw IP packets with the embedder — the browser demo relays them over a

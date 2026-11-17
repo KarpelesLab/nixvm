@@ -1,0 +1,242 @@
+name: Root images
+
+# Builds the guest root images nixvm pins (src/image/pinned.txt) and
+# publishes them as a GitHub release of their own, `images-<alpine>-<n>`:
+#
+#   alpine-<ver>-<arch>.sqfs      the Alpine minirootfs (busybox, apk)
+#   alpine-dev-<ver>-<arch>.sqfs  the same with git, make, gcc, musl-dev
+#
+# for x86_64 and aarch64, with SHA256SUMS and `pinned.txt` — the file to copy
+# over src/image/pinned.txt (scripts/pin-images.sh <tag>) so that the next
+# nixvm release pins these images. The images are squashfs (gzip), which
+# nixvm mounts read-only straight from the file (`image::fetch`).
+#
+# Run by hand (Actions → Root images → Run workflow), not on every nixvm
+# release: an image release is never rebuilt in place, so the digests a
+# published nixvm pins keep naming exactly what they named. Each image is
+# booted in nixvm before anything is published.
+
+on:
+  workflow_dispatch:
+    inputs:
+      alpine:
+        description: "Alpine branch to build from (e.g. v3.22, or latest-stable)"
+        required: true
+        default: latest-stable
+        type: string
+      dev_packages:
+        description: "Packages the dev image adds"
+        required: true
+        default: git make gcc musl-dev
+        type: string
+      publish:
+        description: "Publish the release (off: build and test only)"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.arch }}
+    # Native runners for both, so the dev image's `apk add` (and its package
+    # scripts) run without an emulator, and nixvm boots each image on KVM or
+    # its interpreter for the host's own architecture.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { arch: x86_64, os: ubuntu-24.04 }
+          - { arch: aarch64, os: ubuntu-24.04-arm }
+    outputs:
+      version: ${{ steps.alpine.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install squashfs-tools
+        run: sudo apt-get update && sudo apt-get install -y squashfs-tools
+
+      - name: Fetch and verify the Alpine minirootfs
+        id: alpine
+        env:
+          BRANCH: ${{ inputs.alpine }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          base="https://dl-cdn.alpinelinux.org/alpine/$BRANCH/releases/$ARCH"
+          file=$(curl -fsSL --retry 5 "$base/latest-releases.yaml" \
+            | grep -m1 -oE "alpine-minirootfs-[0-9.]+-$ARCH\.tar\.gz")
+          version=${file#alpine-minirootfs-}
+          version=${version%-$ARCH.tar.gz}
+          echo "Alpine $version ($file)"
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/$file" "$base/$file"
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/$file.sha256" "$base/$file.sha256"
+          (cd "$RUNNER_TEMP" && sha256sum -c "$file.sha256")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "TARBALL=$RUNNER_TEMP/$file" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Unpack the root
+        run: |
+          set -euo pipefail
+          # As root, so owners, modes and setuid bits are the image's.
+          sudo mkdir "$RUNNER_TEMP/base"
+          sudo tar -xzpf "$TARBALL" --numeric-owner -C "$RUNNER_TEMP/base"
+
+      - name: Build the dev root
+        env:
+          PACKAGES: ${{ inputs.dev_packages }}
+        run: |
+          set -euo pipefail
+          dev="$RUNNER_TEMP/dev"
+          sudo cp -a "$RUNNER_TEMP/base" "$dev"
+          sudo cp /etc/resolv.conf "$dev/etc/resolv.conf"
+          for d in dev proc sys; do sudo mount --bind "/$d" "$dev/$d"; done
+          sudo chroot "$dev" /sbin/apk add --no-cache $PACKAGES
+          for d in dev proc sys; do sudo umount "$dev/$d"; done
+          # The minirootfs ships no resolv.conf (nixvm writes the guest's own).
+          sudo rm -f "$dev/etc/resolv.conf"
+          sudo chroot "$dev" /sbin/apk info | sort | tee "$RUNNER_TEMP/dev-packages.txt"
+
+      - name: Make the squashfs images
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # gzip: the compressor nixvm's squashfs reader is built with. Fixed
+          # times so the image depends only on its contents.
+          epoch=$(stat -c %Y "$TARBALL")
+          for v in base dev; do
+            name=alpine; [ "$v" = dev ] && name=alpine-dev
+            sudo mksquashfs "$RUNNER_TEMP/$v" "out/$name-$VERSION-$ARCH.sqfs" \
+              -comp gzip -b 131072 -noappend -no-xattrs \
+              -mkfs-time "$epoch" -all-time "$epoch" -quiet
+          done
+          sudo chown "$(id -u):$(id -g)" out/*
+          cp "$RUNNER_TEMP/dev-packages.txt" "out/alpine-dev-$VERSION-$ARCH.packages.txt"
+          ls -l out
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: images-${{ matrix.arch }}
+
+      - name: Give the runner access to /dev/kvm
+        if: matrix.arch == 'x86_64'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # Through `image::fetch`, as an embedder would: digest-verified, cached,
+      # mounted from the file. The dev image must also build a C program.
+      - name: Boot each image in nixvm
+        env:
+          ARCH: ${{ matrix.arch }}
+          PACKAGES: ${{ inputs.dev_packages }}
+        run: |
+          set -euo pipefail
+          cargo build --release --features images --tests
+          for name in alpine alpine-dev; do
+            img="$PWD/out/$name-$VERSION-$ARCH.sqfs"
+            expect="busybox apk"
+            [ "$name" = alpine-dev ] && expect="$expect $(echo "$PACKAGES" | tr ' ' '\n' | grep -vE -- '-(dev|headers|doc)$' | tr '\n' ' ')"
+            echo "== $name: expecting $expect"
+            NIXVM_ROOT_IMAGE="$img" \
+            NIXVM_ROOT_IMAGE_SHA256=$(sha256sum "$img" | cut -d' ' -f1) \
+            NIXVM_ROOT_IMAGE_EXPECT="$expect" \
+              cargo test --release --features images --test root_images a_root_image_boots -- --nocapture 2>&1 | tee boot.log
+            if grep -q 'skipping' boot.log; then
+              echo '::error::the root image test skipped itself'
+              exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: images-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      # gh release create/upload.
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: images-*
+          path: out
+          merge-multiple: true
+
+      - name: Choose the tag
+        run: |
+          set -euo pipefail
+          # images-<alpine version>-<n>: the next n for this Alpine version.
+          n=1
+          while gh release view "images-$VERSION-$n" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; do
+            n=$((n + 1))
+          done
+          echo "TAG=images-$VERSION-$n" >> "$GITHUB_ENV"
+
+      - name: Digests and pins
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum -- *.sqfs | tee SHA256SUMS
+          {
+            echo "# The root images this version of nixvm pins: what \`ImageRef::released\` knows,"
+            echo "# and what \`nixvm::image::fetch\` downloads and verifies."
+            echo "#"
+            echo "# Release $TAG, built from Alpine $VERSION by .github/workflows/images.yml."
+            echo "# To move to a newer image release: scripts/pin-images.sh <tag>, then commit."
+            echo "#"
+            echo "# Format: a \`release <tag>\` line, then one line per image:"
+            echo "#   <name> <alpine version> <arch> <sha256> <size in bytes>"
+            echo "# The image is <name>-<alpine version>-<arch>.sqfs among the release's assets."
+            echo "release $TAG"
+            for arch in x86_64 aarch64; do
+              for name in alpine alpine-dev; do
+                f="$name-$VERSION-$arch.sqfs"
+                echo "$name $VERSION $arch $(sha256sum "$f" | cut -d' ' -f1) $(stat -c %s "$f")"
+              done
+            done
+          } | tee pinned.txt
+
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Guest root images for nixvm, built from Alpine $VERSION by the
+          [Root images workflow]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID).
+
+          | Image | What it is |
+          |---|---|
+          | \`alpine-$VERSION-<arch>.sqfs\` | the Alpine minirootfs: busybox and apk |
+          | \`alpine-dev-$VERSION-<arch>.sqfs\` | the same with ${{ inputs.dev_packages }} (full list: \`*.packages.txt\`) |
+
+          squashfs (gzip), for \`x86_64\` and \`aarch64\`. \`SHA256SUMS\` has the
+          digests; \`pinned.txt\` is what nixvm pins (\`scripts/pin-images.sh $TAG\`).
+          EOF
+          # Not "latest": that stays the newest nixvm release (its binaries).
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Root images $TAG" --notes-file notes.md --latest=false \
+            out/*.sqfs out/*.packages.txt out/SHA256SUMS out/pinned.txt
+          echo "Published $TAG. To pin it: scripts/pin-images.sh $TAG" >> "$GITHUB_STEP_SUMMARY"

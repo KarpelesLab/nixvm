@@ -161,6 +161,26 @@ Useful environment variables (both harnesses):
   off by default = loopback-only). Lets `apk`/`wget`/`curl` fetch from the
   network.
 
+## Released root images and a persistent root
+
+nixvm releases ready-made guest roots as squashfs images (`images-*`
+releases, x86-64 and arm64): `alpine`, the minirootfs, and `alpine-dev`, the
+same with git, make and gcc. Each nixvm version pins one image release by
+digest (`src/image/pinned.txt`). With the `images` feature, an embedder fetches
+one — HTTPS in pure Rust, verified, cached — and mounts it straight from the
+file; `fs::Overlay::persistent` puts a host directory under it as the
+writable layer, so what `apk add` installs is there for the next guest:
+
+```rust
+let img = nixvm::image::ImageRef::released("alpine-dev", nixvm::Arch::X86_64).unwrap();
+let lower = nixvm::image::fetch(&img, cache_dir)?;
+let root = nixvm::fs::Overlay::persistent(Box::new(lower), upper_dir)?;
+let vm = nixvm::vm::Vm::boot_root(Box::new(root), vec!["/bin/sh".into()], 1 << 30)?;
+```
+
+The upper directory holds changed files at their paths, and deletions as
+`.wh.<name>` marker files (the OCI-layer convention; see `src/fs/overlay.rs`).
+
 ## Run Docker images
 
 Docker without dockerd: nixvm pulls an image (or reads a `docker save` /
