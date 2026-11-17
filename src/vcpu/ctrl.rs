@@ -89,6 +89,12 @@ pub const KSTACK_TOP: u64 = CTRL_GPA + KSTACK_OFF + 0x1000;
 /// heavily-threaded SMP guests.
 pub const KSTACK_PAGE_VA: u64 = CTRL_GPA + KSTACK_OFF;
 
+/// Where a process's local descriptor table (`modify_ldt`) is mapped, in its
+/// own address space, supervisor-only: `LDTR` points here, and the CPU reads
+/// the descriptors an LDT selector names from it. Up to 8192 entries, 16
+/// pages.
+pub const LDT_VA: u64 = CTRL_GPA + 0x10_0000;
+
 /// Virtual base of the vDSO ELF image (user-readable/executable) — the value the
 /// loader advertises as `AT_SYSINFO_EHDR`. See [`super::vdso`].
 pub const VDSO_VA: u64 = CTRL_GPA + VDSO_OFF;
@@ -216,10 +222,12 @@ pub fn default_gdt() -> [u64; GDT_ENTRIES] {
     g
 }
 
-/// Number of private GDTs: one for each thread that has a TLS entry in use
-/// (a thread with none runs on the shared one at [`GDT_BASE`]). Each is
-/// [`GDT_ENTRIES`] × 8 = 128 bytes, 32 to a page.
-#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
+/// Number of private GDTs: one for each host thread that runs vcpus whose
+/// guest threads have TLS entries in use (a thread with none runs on the
+/// shared one at [`GDT_BASE`]), as Linux has one GDT a CPU and loads the
+/// running task's TLS entries into it. The SMP workers are at most 256, so
+/// this never runs out, however many guest threads have TLS entries. Each
+/// is [`GDT_ENTRIES`] × 8 = 128 bytes, 32 to a page.
 pub const GDT_POOL_SLOTS: usize = GDT_POOL_FRAMES as usize * GDT_SLOTS_PER_FRAME;
 #[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 const GDT_SLOTS_PER_FRAME: usize = PAGE_SIZE as usize / (GDT_ENTRIES * 8);

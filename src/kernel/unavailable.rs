@@ -90,13 +90,10 @@ impl Kernel {
             // ioctl, which reports ENOTTY on our filesystems.
             | Sysno::FileGetattr
             | Sysno::FileSetattr
-            // x86-64 legacy segment/TLS management: there is no LDT, and a
-            // kernel without CONFIG_MODIFY_LDT_SYSCALL answers ENOSYS, which
-            // Wine/dosemu-style callers handle. The GDT TLS entries are only
-            // reachable through the i386 entry (`int $0x80`, dispatched before
-            // this): the x86-64 table's `set_thread_area`/`get_thread_area`
-            // are `sys_ni_syscall`, ENOSYS on Linux too.
-            | Sysno::ModifyLdt
+            // The GDT TLS entries are only reachable through the i386 entry
+            // (`int $0x80`, dispatched before this): the x86-64 table's
+            // `set_thread_area`/`get_thread_area` are `sys_ni_syscall`,
+            // ENOSYS on Linux too. (`modify_ldt` is dispatched before this.)
             | Sysno::SetThreadArea
             | Sysno::GetThreadArea
             // `uselib` (CONFIG_USELIB=n on every modern distro) and `_sysctl`

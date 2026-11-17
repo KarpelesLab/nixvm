@@ -266,6 +266,9 @@ pub struct GuestMemory {
     /// `mm->context.ldt`: the 8-byte descriptors, empty when it has none.
     /// Replaced whole on a change, so a vcpu can keep the one it loaded.
     ldt: Arc<[u64]>,
+    /// The frames backing the LDT at [`ctrl::LDT_VA`] in this address space,
+    /// for a hardware vcpu: one per page of descriptors.
+    ldt_frames: Vec<u64>,
     /// Where this process's 32-bit vDSO is mapped (0: it has none), whose
     /// `int $0x80` landing pad a fast 32-bit system call returns to.
     vdso32: u64,
@@ -457,6 +460,7 @@ impl GuestMemory {
             files: std::collections::BTreeMap::new(),
             shrink_seen: SHRINK_EPOCH.load(std::sync::atomic::Ordering::Acquire),
             ldt: Arc::from([]),
+            ldt_frames: Vec::new(),
             vdso32: 0,
             fast32: crate::vcpu::vdso32::FastEntry::Int80,
             ia32: false,
@@ -497,9 +501,45 @@ impl GuestMemory {
         &self.ldt
     }
 
-    /// Install a new local descriptor table (the whole of it).
+    /// Install a new local descriptor table (the whole of it), and back it
+    /// at [`ctrl::LDT_VA`] for a hardware vcpu.
     pub fn set_ldt(&mut self, ldt: Arc<[u64]>) {
+        let pages = (ldt.len() * 8).div_ceil(PAGE_SIZE as usize);
+        if self.ldt_frames.len() < pages {
+            let mut fa = lock_fa(&self.fa, self.memcg);
+            while self.ldt_frames.len() < pages {
+                let Some(frame) = fa.alloc(&self.phys) else {
+                    break;
+                };
+                let va = ctrl::LDT_VA + self.ldt_frames.len() as u64 * PAGE_SIZE;
+                match self.space.map(va, frame, Prot::rw(), true, &mut fa, &self.phys) {
+                    Ok(old) => {
+                        if let Some(old) = old {
+                            fa.free(old);
+                        }
+                        self.ldt_frames.push(frame);
+                    }
+                    Err(_) => {
+                        fa.free(frame);
+                        break;
+                    }
+                }
+            }
+        }
+        for (i, d) in ldt.iter().enumerate() {
+            let page = i * 8 / PAGE_SIZE as usize;
+            if let Some(&pa) = self.ldt_frames.get(page) {
+                self.phys
+                    .write(pa + (i * 8) as u64 % PAGE_SIZE, &d.to_le_bytes());
+            }
+        }
         self.ldt = ldt;
+    }
+
+    /// How many LDT descriptors the CPU can read at [`ctrl::LDT_VA`].
+    #[must_use]
+    pub fn ldt_backed(&self) -> usize {
+        self.ldt.len().min(self.ldt_frames.len() * (PAGE_SIZE as usize / 8))
     }
 
     /// Where the 32-bit vDSO is mapped, if the process has one.
@@ -2242,7 +2282,7 @@ impl GuestMemory {
     /// pool can't hold the child's page tables.
     #[must_use]
     pub fn try_fork(&mut self) -> Option<Self> {
-        let (child_space, parent_kstack, child_kstack) = {
+        let (child_space, parent_kstack, child_kstack, child_ldt) = {
             let mut fa = lock_fa(&self.fa, self.memcg);
             let mut child = self.space.fork_cow(&mut fa, &self.phys)?;
             // Past this point the fork can't fail, and it needs a couple more
@@ -2285,7 +2325,24 @@ impl GuestMemory {
                     fa.free(frame);
                 }
             }
-            (child, parent_kstack, child_kstack)
+            // The LDT's frames are the address space's own too: the child
+            // gets a copy (the CPU never writes them: their accessed bits are
+            // set).
+            let mut child_ldt = Vec::with_capacity(self.ldt_frames.len());
+            for (i, &pa) in self.ldt_frames.iter().enumerate() {
+                let Some(frame) = fa.alloc(&self.phys) else {
+                    break;
+                };
+                let mut page = vec![0u8; PAGE_SIZE as usize];
+                self.phys.read(pa, &mut page);
+                self.phys.write(frame, &page);
+                let va = ctrl::LDT_VA + i as u64 * PAGE_SIZE;
+                if let Ok(Some(old)) = child.map(va, frame, Prot::rw(), true, &mut fa, &self.phys) {
+                    fa.free(old);
+                }
+                child_ldt.push(frame);
+            }
+            (child, parent_kstack, child_kstack, child_ldt)
         };
         // Every page is copy-on-write now, read-only in this space too: each
         // vcpu running it — every thread's, not only the forking one — must
@@ -2336,6 +2393,7 @@ impl GuestMemory {
             files: self.files.clone(),
             shrink_seen: self.shrink_seen,
             ldt: Arc::clone(&self.ldt),
+            ldt_frames: child_ldt,
             vdso32: self.vdso32,
             fast32: self.fast32,
             ia32: self.ia32,
@@ -2349,6 +2407,7 @@ impl GuestMemory {
     pub(crate) fn exec_reset(&mut self) {
         self.reset_space();
         self.ldt = Arc::from([]);
+        self.ldt_frames.clear();
         self.vdso32 = 0;
         self.ia32 = false;
         self.exec_gen = self.exec_gen.wrapping_add(1);
@@ -2365,6 +2424,7 @@ impl GuestMemory {
         drop(fa);
         self.files.clear();
         self.kstack_pa = 0;
+        self.ldt_frames.clear();
         self.prot.clear();
         self.mapped.clear();
         self.mapped_count = 0;

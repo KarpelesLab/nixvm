@@ -482,6 +482,82 @@ impl Kernel {
         }
     }
 
+    /// `modify_ldt(func, ptr, bytecount)` (`arch/x86/kernel/ldt.c`): 0 reads
+    /// the process's LDT (zero-filled to `bytecount`), 2 reads the "default
+    /// LDT" (zeroes), 1 and 0x11 (the old mode) write the entry the `struct
+    /// user_desc` at `ptr` describes, growing the table to hold it. The
+    /// table is the process's: its threads share it, a fork copies it and
+    /// `execve` drops it. Like Linux, the result is a 32-bit `int` in a
+    /// zero-extended register (`(unsigned int)ret`), errors included.
+    pub(super) fn sys_modify_ldt(func: u64, ptr: u64, bytecount: u64, mem: &mut GuestMemory) -> i64 {
+        /// `LDT_ENTRIES`.
+        const LDT_ENTRIES: usize = 8192;
+        let r = match func as u32 as i32 {
+            0 => {
+                let n = bytecount.min(LDT_ENTRIES as u64 * 8) as usize;
+                let mut out = vec![0u8; n];
+                for (i, d) in mem.ldt().iter().enumerate().take(n.div_ceil(8)) {
+                    let b = d.to_le_bytes();
+                    let end = (i * 8 + 8).min(n);
+                    out[i * 8..end].copy_from_slice(&b[..end - i * 8]);
+                }
+                if mem.ldt().is_empty() {
+                    0
+                } else if mem.write(ptr, &out).is_err() {
+                    err(Errno::EFAULT)
+                } else {
+                    n as i64
+                }
+            }
+            2 => {
+                let n = bytecount.min(128) as usize;
+                if mem.write(ptr, &vec![0u8; n]).is_err() {
+                    err(Errno::EFAULT)
+                } else {
+                    n as i64
+                }
+            }
+            1 | 0x11 => Self::write_ldt(ptr, bytecount, func == 1, mem),
+            _ => err(Errno::ENOSYS),
+        };
+        i64::from(r as u32)
+    }
+
+    /// `write_ldt`: one entry from a `struct user_desc`.
+    fn write_ldt(ptr: u64, bytecount: u64, oldmode: bool, mem: &mut GuestMemory) -> i64 {
+        if bytecount != 16 {
+            return err(Errno::EINVAL);
+        }
+        let mut raw = [0u8; 16];
+        if mem.read(ptr, &mut raw).is_err() {
+            return err(Errno::EFAULT);
+        }
+        let info = UserDesc::parse(&raw);
+        let idx = info.entry_number as usize;
+        if idx >= 8192 {
+            return err(Errno::EINVAL);
+        }
+        // A conforming code segment must be marked not present (as Linux).
+        if info.contents == 3 && (oldmode || !info.seg_not_present) {
+            return err(Errno::EINVAL);
+        }
+        let desc = if (oldmode && info.base_addr == 0 && info.limit == 0) || info.is_ldt_empty() {
+            0
+        } else if oldmode {
+            info.fill() & !(1 << 52) // no AVL in the old mode
+        } else {
+            info.fill()
+        };
+        let old = mem.ldt();
+        let mut new: Vec<u64> = old.to_vec();
+        if new.len() <= idx {
+            new.resize(idx + 1, 0);
+        }
+        new[idx] = desc;
+        mem.set_ldt(std::sync::Arc::from(new));
+        0
+    }
+
     /// i386 `get_thread_area(u_info)`: the `struct user_desc` of TLS entry
     /// `u_info->entry_number` (Linux's `fill_user_desc`).
     pub(super) fn sys_get_thread_area(
@@ -573,6 +649,18 @@ impl UserDesc {
             || (!self.read_exec_only && !self.seg_not_present))
     }
 
+    /// `LDT_empty`: what `modify_ldt` takes as "clear this entry".
+    fn is_ldt_empty(&self) -> bool {
+        self.base_addr == 0
+            && self.limit == 0
+            && self.contents == 0
+            && self.read_exec_only
+            && !self.seg_32bit
+            && !self.limit_in_pages
+            && self.seg_not_present
+            && !self.useable
+    }
+
     /// `tls_desc_okay`: empty, or a present 32-bit data segment.
     fn tls_okay(&self) -> bool {
         self.is_empty() || (self.seg_32bit && self.contents <= 1 && !self.seg_not_present)
@@ -584,6 +672,12 @@ impl UserDesc {
         if self.is_empty() {
             return 0;
         }
+        self.fill()
+    }
+
+    /// `fill_ldt`: the descriptor, accessed bit set (so the CPU never writes
+    /// it), never long mode.
+    fn fill(&self) -> u64 {
         let base = u64::from(self.base_addr);
         let limit = u64::from(self.limit);
         let ty = (u64::from(!self.read_exec_only) << 1) | (u64::from(self.contents) << 2) | 1;

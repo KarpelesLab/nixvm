@@ -5809,6 +5809,8 @@ impl Kernel {
             // The GDT TLS entries, through the i386 entry only: the x86-64
             // table's numbers for these are `sys_ni_syscall` (ENOSYS, below).
             Sysno::SetThreadArea if cx.ia32 => Self::sys_set_thread_area(args[0], vcpu, mem),
+            // The process's LDT, from either entry (CONFIG_MODIFY_LDT_SYSCALL).
+            Sysno::ModifyLdt => Self::sys_modify_ldt(args[0], args[1], args[2], mem),
             Sysno::GetThreadArea if cx.ia32 => Self::sys_get_thread_area(args[0], vcpu, mem),
             // Succeed as root / no-op: uid queries, signal setup, robust list,
             // permission/ownership/timestamp changes, socket options, clock
