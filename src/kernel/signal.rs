@@ -982,6 +982,11 @@ impl Kernel {
 // `uc_mcontext.gregs[REG_RIP]` (JSC does, to inspect/skip its own traps) sees
 // the right value.
 const UC_OFF: u64 = 8; // ucontext within the frame
+/// `__USER_CS` and `__USER_DS`, the 64-bit user code and data selectors.
+const USER_CS: u16 = 0x33;
+const USER_DS: u16 = 0x2b;
+/// `uc_flags`: restore `%ss` exactly as the frame has it.
+const UC_STRICT_RESTORE_SS: u64 = 0x4;
 const MCTX_OFF: u64 = UC_OFF + 40; // uc_mcontext within the frame
 const GREG_COUNT: usize = 23;
 /// Byte offset of each greg within `uc_mcontext`, in `REG_*` order.
@@ -1085,24 +1090,24 @@ impl Kernel {
         // A sigsuspend restores its pre-call mask when the handler returns; take
         // it so it isn't double-restored by `deliver_pending_signals`.
         let restore = cx.cur.sigsuspend_prev.take().unwrap_or(cx.cur.blocked);
+        // Where the syscall instruction is, read before the vcpu leaves it.
+        let syscall_pc = vcpu.syscall_ip().wrapping_sub(2);
         // Async delivery happens at a syscall boundary: the (KVM) vcpu is parked
         // at CPL0 on the return trampoline. Collapse that to the logical user
         // state first, so the frame saves the real user rip/rflags (not the
         // trampoline's `sysretq`) and the handler runs at CPL3, not supervisor.
         vcpu.settle_syscall_return();
         // Restarting an `SA_RESTART`-interrupted blocking syscall: rewind the saved
-        // rip to the 2-byte `syscall` instruction so the handler's `rt_sigreturn`
-        // re-executes it. `rcx` holds the syscall's return address on both x86-64
-        // backends (KVM's `settle` set rip←rcx just above; the interpreter set rcx
-        // at `syscall` entry), so the instruction is at `rcx − 2`. RAX still holds
-        // the syscall number — a restarted syscall skips `set_syscall_ret`.
+        // rip to the 2-byte `syscall` (or `int $0x80`) instruction so the
+        // handler's `rt_sigreturn` re-executes it: it is just before the
+        // address the syscall returns to. RAX still holds the syscall number — a
+        // restarted syscall skips `set_syscall_ret`.
         //
         // On aarch64 the interpreter never advanced past the `svc #0` for a
         // blocked-then-interrupted syscall (`set_syscall_ret` — which does `pc +=
         // 4` — runs only on completion), so `pc` already sits on the `svc`; no
         // rewind is needed. x8 still holds the syscall number for the re-issue.
         if cx.restart_syscall && self.arch == Arch::X86_64 {
-            let syscall_pc = vcpu.reg(1).wrapping_sub(2); // rcx − len(`syscall`)
             vcpu.set_pc(syscall_pc);
         }
         // Carry the siginfo the sender queued (sigqueue's si_value/si_code, or a
@@ -1155,6 +1160,8 @@ impl Kernel {
         // one is configured, else just below the current rsp (with the ABI red
         // zone skipped).
         let cur_sp = vcpu.sp();
+        // The mode it was in: 32-bit code (`__USER32_CS`) can take a signal too.
+        let (user_cs, user_ss) = vcpu.user_segments();
         let (alt_sp, alt_size, alt_flags) = cx.cur.altstack;
         let base = if act.flags & SA_ONSTACK != 0 && alt_flags & SS_DISABLE == 0 && alt_size != 0 {
             alt_sp + alt_size
@@ -1212,8 +1219,8 @@ impl Kernel {
                 REG_RSP => cur_sp,
                 REG_RIP => vcpu.pc(),
                 REG_EFL => vcpu.rflags(),
-                // cs=0x33 (user code), gs=fs=0, ss=0x2b (UC_SIGCONTEXT_SS).
-                REG_CSGSFS => 0x002b_0000_0000_0033,
+                // cs, gs=fs=0, ss (UC_SIGCONTEXT_SS).
+                REG_CSGSFS => u64::from(user_cs) | u64::from(user_ss) << 48,
                 19 => si.err,       // err (#PF error code)
                 20 => si.trapno,    // trapno (#PF / #UD / #BP; 0 for async)
                 21 => restore_mask, // oldmask
@@ -1276,6 +1283,9 @@ impl Kernel {
         // handler's first instruction, with SIGTRAP blocked: killed.
         const DF_RF_TF: u64 = (1 << 10) | (1 << 16) | (1 << 8);
         vcpu.set_rflags(vcpu.rflags() & !DF_RF_TF);
+        // The handler is 64-bit code: `__USER_CS` and `__USER_DS`, whatever
+        // the interrupted code ran in.
+        vcpu.set_user_segments(USER_CS, USER_DS);
         vcpu.set_sp(frame);
         vcpu.set_pc(act.handler);
         Self::enter_handler_mask(cx, sig);
@@ -1333,6 +1343,23 @@ impl Kernel {
         vcpu.set_sp(read(REG_RSP));
         vcpu.set_rflags(read(REG_EFL));
         vcpu.set_pc(read(REG_RIP));
+        // `%cs` and `%ss`, at CPL 3: back to 32-bit code if that is where the
+        // signal came. Without `UC_STRICT_RESTORE_SS` a 64-bit return gets a
+        // usable `%ss` whatever the frame says (`force_valid_ss`). A selector
+        // that can't be loaded leaves the task in 64-bit mode.
+        let uc = mctx.wrapping_sub(MCTX_OFF - UC_OFF);
+        let segs = read(REG_CSGSFS);
+        let cs = (segs as u16) | 3;
+        let mut ss = ((segs >> 48) as u16) | 3;
+        let strict_ss = mem
+            .read_u64(uc)
+            .is_ok_and(|f| f & UC_STRICT_RESTORE_SS != 0);
+        if !strict_ss && cs == USER_CS && !vcpu.set_user_segments(cs, ss) {
+            ss = USER_DS;
+        }
+        if !vcpu.set_user_segments(cs, ss) {
+            vcpu.set_user_segments(USER_CS, USER_DS);
+        }
         // The FPU image (a NULL fpstate means "no FPU state", as on Linux):
         // the whole XSAVE area when both magics check out (`check_xstate_in_
         // sigframe`), else only the legacy fxsave region — `fxrstor`, the
@@ -1353,7 +1380,6 @@ impl Kernel {
             }
         }
         // Restore the signal mask the handler ran under (uc_sigmask).
-        let uc = mctx.wrapping_sub(MCTX_OFF - UC_OFF);
         if let Ok(mask) = mem.read_u64(uc + 296) {
             cx.cur.blocked = mask;
         }

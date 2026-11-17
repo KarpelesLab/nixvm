@@ -420,6 +420,247 @@ impl Kernel {
             }
         }
     }
+
+    /// i386 `set_thread_area(u_info)`: install one of the thread's three GDT
+    /// TLS entries (12-14) from a `struct user_desc`, as Linux's
+    /// `do_set_thread_area`. `entry_number` -1 takes the first empty one and
+    /// writes its number back. Only data segments that are 32-bit and present
+    /// are allowed, or an empty entry (`LDT_empty`/`LDT_zero`), which clears
+    /// it. A segment register holding the entry's selector is reloaded.
+    pub(super) fn sys_set_thread_area(
+        u_info: u64,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        let mut raw = [0u8; 16];
+        if mem.read(u_info, &mut raw).is_err() {
+            return err(Errno::EFAULT);
+        }
+        let info = UserDesc::parse(&raw);
+        if !info.tls_okay() {
+            return err(Errno::EINVAL);
+        }
+        let mut idx = info.entry_number;
+        if idx == u32::MAX {
+            let Some(free) = (0..TLS_ENTRIES).find(|&i| vcpu.tls_desc(i) == 0) else {
+                return err(Errno::ESRCH);
+            };
+            idx = (TLS_MIN + free) as u32;
+            if mem.write(u_info, &idx.to_le_bytes()).is_err() {
+                return err(Errno::EFAULT);
+            }
+        }
+        let idx = idx as usize;
+        if !(TLS_MIN..TLS_MIN + TLS_ENTRIES).contains(&idx) {
+            return err(Errno::EINVAL);
+        }
+        if vcpu.set_tls_desc(idx - TLS_MIN, info.descriptor()) {
+            0
+        } else {
+            err(Errno::ENOMEM)
+        }
+    }
+
+    /// i386 `get_thread_area(u_info)`: the `struct user_desc` of TLS entry
+    /// `u_info->entry_number` (Linux's `fill_user_desc`).
+    pub(super) fn sys_get_thread_area(
+        u_info: u64,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        let Ok(idx) = mem.read_u32(u_info) else {
+            return err(Errno::EFAULT);
+        };
+        let idx = idx as usize;
+        if !(TLS_MIN..TLS_MIN + TLS_ENTRIES).contains(&idx) {
+            return err(Errno::EINVAL);
+        }
+        let out = UserDesc::from_descriptor(idx as u32, vcpu.tls_desc(idx - TLS_MIN));
+        if mem.write(u_info, &out.to_bytes()).is_err() {
+            return err(Errno::EFAULT);
+        }
+        0
+    }
+}
+
+/// `GDT_ENTRY_TLS_MIN` and the number of TLS entries.
+const TLS_MIN: usize = crate::vcpu::ctrl::GDT_ENTRY_TLS_MIN;
+const TLS_ENTRIES: usize = crate::vcpu::ctrl::GDT_TLS_ENTRIES;
+
+/// `struct user_desc` (`asm/ldt.h`): a segment as `set_thread_area` and
+/// `modify_ldt` take it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)] // the struct's own bit fields
+struct UserDesc {
+    entry_number: u32,
+    base_addr: u32,
+    limit: u32,
+    seg_32bit: bool,
+    contents: u8,
+    read_exec_only: bool,
+    limit_in_pages: bool,
+    seg_not_present: bool,
+    useable: bool,
+    lm: bool,
+}
+
+impl UserDesc {
+    fn parse(b: &[u8; 16]) -> Self {
+        let word = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let f = word(12);
+        Self {
+            entry_number: word(0),
+            base_addr: word(4),
+            limit: word(8),
+            seg_32bit: f & 1 != 0,
+            contents: ((f >> 1) & 3) as u8,
+            read_exec_only: f & 8 != 0,
+            limit_in_pages: f & 16 != 0,
+            seg_not_present: f & 32 != 0,
+            useable: f & 64 != 0,
+            lm: f & 128 != 0,
+        }
+    }
+
+    fn to_bytes(self) -> [u8; 16] {
+        let f = u32::from(self.seg_32bit)
+            | u32::from(self.contents) << 1
+            | u32::from(self.read_exec_only) << 3
+            | u32::from(self.limit_in_pages) << 4
+            | u32::from(self.seg_not_present) << 5
+            | u32::from(self.useable) << 6
+            | u32::from(self.lm) << 7;
+        let mut b = [0u8; 16];
+        for (i, w) in [self.entry_number, self.base_addr, self.limit, f]
+            .iter()
+            .enumerate()
+        {
+            b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        b
+    }
+
+    /// `LDT_empty` or `LDT_zero`: "no segment at all".
+    fn is_empty(&self) -> bool {
+        let none = self.base_addr == 0
+            && self.limit == 0
+            && self.contents == 0
+            && !self.seg_32bit
+            && !self.limit_in_pages
+            && !self.useable;
+        none && ((self.read_exec_only && self.seg_not_present)
+            || (!self.read_exec_only && !self.seg_not_present))
+    }
+
+    /// `tls_desc_okay`: empty, or a present 32-bit data segment.
+    fn tls_okay(&self) -> bool {
+        self.is_empty() || (self.seg_32bit && self.contents <= 1 && !self.seg_not_present)
+    }
+
+    /// The 8-byte descriptor (`fill_ldt`; 0 for an empty one). The `lm` bit
+    /// is never set.
+    fn descriptor(&self) -> u64 {
+        if self.is_empty() {
+            return 0;
+        }
+        let base = u64::from(self.base_addr);
+        let limit = u64::from(self.limit);
+        let ty = (u64::from(!self.read_exec_only) << 1) | (u64::from(self.contents) << 2) | 1;
+        (limit & 0xFFFF)
+            | (base & 0xFF_FFFF) << 16
+            | ty << 40
+            | 1 << 44 // S: code/data
+            | 3 << 45 // DPL 3
+            | u64::from(!self.seg_not_present) << 47
+            | ((limit >> 16) & 0xF) << 48
+            | u64::from(self.useable) << 52
+            | u64::from(self.seg_32bit) << 54
+            | u64::from(self.limit_in_pages) << 55
+            | (base >> 24) << 56
+    }
+
+    /// `fill_user_desc`: entry `idx` as `get_thread_area` shows it.
+    fn from_descriptor(idx: u32, d: u64) -> Self {
+        let ty = (d >> 40) & 0xF;
+        Self {
+            entry_number: idx,
+            base_addr: (((d >> 16) & 0xFF_FFFF) | ((d >> 56) << 24)) as u32,
+            limit: ((d & 0xFFFF) | ((d >> 32) & 0xF_0000)) as u32,
+            seg_32bit: d & (1 << 54) != 0,
+            contents: (ty >> 2) as u8,
+            read_exec_only: ty & 2 == 0,
+            limit_in_pages: d & (1 << 55) != 0,
+            seg_not_present: d & (1 << 47) == 0,
+            useable: d & (1 << 52) != 0,
+            lm: d & (1 << 53) != 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod user_desc_tests {
+    use super::UserDesc;
+
+    /// Wine's `%fs` for 32-bit code: base = the 32-bit TEB, a page limit,
+    /// 32-bit. The descriptor is the one Linux's `fill_ldt` builds, and
+    /// `get_thread_area` gives it back as it was set.
+    #[test]
+    fn a_tls_segment_round_trips_through_its_descriptor() {
+        let u = UserDesc {
+            entry_number: 12,
+            base_addr: 0x1234_5678,
+            limit: 0xFFF,
+            seg_32bit: true,
+            ..UserDesc::default()
+        };
+        assert!(u.tls_okay());
+        let d = u.descriptor();
+        assert_eq!(d, 0x1240_f334_5678_0fff);
+        assert_eq!(UserDesc::from_descriptor(12, d), u);
+        assert_eq!(UserDesc::parse(&u.to_bytes()), u);
+    }
+
+    #[test]
+    fn empty_entries_and_bad_segments() {
+        let zero = UserDesc::default();
+        assert!(zero.tls_okay());
+        assert_eq!(zero.descriptor(), 0);
+        let empty = UserDesc {
+            read_exec_only: true,
+            seg_not_present: true,
+            ..UserDesc::default()
+        };
+        assert_eq!(empty.descriptor(), 0);
+        // 16-bit, code, or not-present segments are refused.
+        let base = UserDesc {
+            base_addr: 0x1000,
+            limit: 1,
+            seg_32bit: true,
+            ..UserDesc::default()
+        };
+        assert!(base.tls_okay());
+        assert!(
+            !UserDesc {
+                seg_32bit: false,
+                ..base
+            }
+            .tls_okay()
+        );
+        assert!(
+            !UserDesc {
+                contents: 2,
+                ..base
+            }
+            .tls_okay()
+        );
+        assert!(
+            !UserDesc {
+                seg_not_present: true,
+                ..base
+            }
+            .tls_okay()
+        );
+    }
 }
 
 /// `sched_getparam(pid, param)` — write a `sched_param { sched_priority = 0 }`.

@@ -405,8 +405,9 @@ fn snapshot(arch: Arch, vcpu: &mut dyn Vcpu, phase: Phase, fs_base: u64) -> [u64
                 r[X86_EFLAGS] = vcpu.reg(11);
                 r[X86_ORIG_RAX] = vcpu.syscall_nr();
             }
-            r[17] = 0x33; // cs
-            r[20] = 0x2b; // ss
+            let (cs, ss) = vcpu.user_segments();
+            r[17] = u64::from(cs);
+            r[20] = u64::from(ss);
             r[21] = fs_base;
             r[22] = vcpu.gs_base();
         }

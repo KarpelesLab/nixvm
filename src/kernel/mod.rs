@@ -1700,6 +1700,9 @@ pub(super) struct ServiceCtx {
     /// Syscalls serviced in the current slice (preemption quantum counter). (Was
     /// `Kernel::slice_syscalls`.)
     slice_syscalls: u32,
+    /// The syscall being serviced came through the i386 entry (`int $0x80`):
+    /// the calls only that table has (`set_thread_area`) are there.
+    ia32: bool,
 }
 
 impl ServiceCtx {
@@ -1730,6 +1733,7 @@ impl ServiceCtx {
             dontwait: false,
             unix_identity: None,
             slice_syscalls: 0,
+            ia32: false,
         }
     }
 }
@@ -3421,6 +3425,17 @@ impl Kernel {
                 // and left a different syscall number, or a result to return
                 // instead of running the call (again).
                 let (mut raw, mut done) = (vcpu.syscall_nr(), None);
+                // `int $0x80`: the i386 table, in a 64-bit task too.
+                cx.ia32 = vcpu.syscall_ia32();
+                let mut ia32_signed = 0;
+                if cx.ia32 {
+                    if let Some((nr, signed)) = crate::abi::arch::i386::to_x86_64(raw) {
+                        (raw, ia32_signed) = (nr, signed);
+                    } else {
+                        self.note_unsupported("i386 syscall", raw);
+                        done = Some(err(Errno::ENOSYS));
+                    }
+                }
                 if cx.cur.ptrace.is_some() {
                     match self.ptrace_syscall_enter(cx, vcpu, mem) {
                         Ok((nr, result)) => {
@@ -3431,7 +3446,10 @@ impl Kernel {
                     }
                 }
                 let sys = arch::decode(self.arch, raw);
-                let args = vcpu.syscall_args();
+                let mut args = vcpu.syscall_args();
+                if cx.ia32 {
+                    args = crate::abi::arch::i386::widen_args(ia32_signed, args);
+                }
                 cx.cur.last_syscall = (raw, args, vcpu.sp(), vcpu.syscall_ip());
                 cx.slice_syscalls = cx.slice_syscalls.saturating_add(1);
                 // No lock is held here: `dispatch` acquires exactly the lock(s)
@@ -5731,6 +5749,10 @@ impl Kernel {
             // CLONE_SETTLS instead, so this arm only ever fires for x86-64).
             // The GS and GET_* subcommands aren't modeled.
             Sysno::ArchPrctl => self.sys_arch_prctl(cx, args[0], args[1], vcpu, mem),
+            // The GDT TLS entries, through the i386 entry only: the x86-64
+            // table's numbers for these are `sys_ni_syscall` (ENOSYS, below).
+            Sysno::SetThreadArea if cx.ia32 => Self::sys_set_thread_area(args[0], vcpu, mem),
+            Sysno::GetThreadArea if cx.ia32 => Self::sys_get_thread_area(args[0], vcpu, mem),
             // Succeed as root / no-op: uid queries, signal setup, robust list,
             // permission/ownership/timestamp changes, socket options, clock
             // adjustment (TIME_OK), and scheduling/process-attr setters — none
