@@ -1167,7 +1167,7 @@ impl Kernel {
         // bytes (`struct _fpx_sw_bytes`: FP_XSTATE_MAGIC1, extended_size,
         // xfeatures, xstate_size) and FP_XSTATE_MAGIC2 right after the area,
         // 64-byte aligned below the red zone. A backend without XSAVE state
-        // (KVM here) passes none: fpstate stays NULL.
+        // passes none: fpstate stays NULL.
         let simd = vcpu.simd_state();
         let (fpstate, below, xstate) = if simd.len() >= crate::vcpu::X86_XSAVE_SIZE {
             let size = crate::vcpu::X86_XSAVE_SIZE as u64;
@@ -1270,6 +1270,12 @@ impl Kernel {
         vcpu.set_reg(6, si_base); // rsi = &siginfo
         vcpu.set_reg(2, frame + UC_OFF); // rdx = &ucontext
         vcpu.set_reg(0, 0); // rax cleared, per the SysV entry convention
+        // The handler starts with the direction, resume and trap flags clear
+        // (Linux's `handle_signal`); the frame keeps them. A program
+        // single-stepping itself with TF would otherwise trap again on the
+        // handler's first instruction, with SIGTRAP blocked: killed.
+        const DF_RF_TF: u64 = (1 << 10) | (1 << 16) | (1 << 8);
+        vcpu.set_rflags(vcpu.rflags() & !DF_RF_TF);
         vcpu.set_sp(frame);
         vcpu.set_pc(act.handler);
         Self::enter_handler_mask(cx, sig);
