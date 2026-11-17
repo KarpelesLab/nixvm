@@ -1444,15 +1444,21 @@ fn run_slice_smp(
     // change) or the kill is already visible. Read after the check, an exec
     // landing in between let this thread run its old registers in the new
     // image — faulting there and corrupting the program just loaded.
-    let mut image = space.lock().unwrap().exec_gen;
+    //
+    // The same goes for a sibling's `exit_group` (`kill_gen`): it marks this
+    // thread dead and tears the address space down under the space's lock,
+    // between two of this worker's steps — neither of which holds the lock
+    // across the gap — and the thread must not then go back to user code
+    // (it faulted on the first instruction after its syscall, in nothing).
+    let (mut image, mut kills) = {
+        let mem = space.lock().unwrap();
+        (mem.exec_gen, mem.kill_gen)
+    };
     // A task killed while it waited for this worker (another thread's `execve`
-    // took its process): it never runs again.
+    // or `exit_group` took its process): it never runs again.
     {
         let mut sh = kernel.shared.lock().unwrap();
-        if sh.procs[i]
-            .as_ref()
-            .is_some_and(|p| matches!(p.info.run, RunState::Zombie(_)))
-        {
+        if is_zombie(&sh, i) {
             return (i, vcpu, SliceOutcome::Ended);
         }
         // A tracer changed its registers while it was stopped in user mode.
@@ -1489,6 +1495,14 @@ fn run_slice_smp(
             let mut mem = space.lock().unwrap();
             if mem.exec_gen != image {
                 return (i, vcpu, SliceOutcome::Ended);
+            }
+            // Some thread of this space killed its siblings since this one's
+            // last look (memory → kernel lock is the lock order).
+            if mem.kill_gen != kills {
+                kills = mem.kill_gen;
+                if is_zombie(&kernel.shared.lock().unwrap(), i) {
+                    return (i, vcpu, SliceOutcome::Ended);
+                }
             }
             if vcpu.needs_locked_run() || mem.is_shared() {
                 vcpu.run(&mut mem)
@@ -1529,9 +1543,17 @@ fn run_slice_smp(
             if mem.exec_gen != image {
                 return (i, vcpu, SliceOutcome::Ended);
             }
+            // Likewise a sibling's `exit_group` while this ran without the
+            // lock (a KVM run): the exit is a dead thread's, not to be
+            // serviced in the space that exit tore down.
+            if mem.kill_gen != kills && is_zombie(&kernel.shared.lock().unwrap(), i) {
+                return (i, vcpu, SliceOutcome::Ended);
+            }
             let step = kernel.smp_service_step(i, exit, vcpu.as_mut(), &mut mem, step_start);
-            // This task's own `execve` is its new image.
+            // This task's own `execve` is its new image, and its own
+            // `exit_group` ends it below.
             image = mem.exec_gen;
+            kills = mem.kill_gen;
             step
         };
         match step {
@@ -1555,6 +1577,13 @@ fn run_slice_smp(
             SliceStep::Ended => return (i, vcpu, SliceOutcome::Ended),
         }
     }
+}
+
+/// Whether task slot `i` is a zombie: killed, or exited.
+fn is_zombie(sh: &Shared, i: usize) -> bool {
+    sh.procs[i]
+        .as_ref()
+        .is_some_and(|p| matches!(p.info.run, RunState::Zombie(_)))
 }
 
 /// A guest task (process or thread): its vcpu and per-task state. Its address
@@ -7649,6 +7678,7 @@ impl Kernel {
         // `file_tables` (each shared table drained once, below).
         let mut files_ids: Vec<usize> = Vec::new();
         let mut tracers = Vec::new();
+        let mut killed = false;
         for slot in &mut sh.procs {
             let Some(p) = slot.as_mut() else { continue };
             if p.info.tgid != tgid || matches!(p.info.run, RunState::Zombie(_)) {
@@ -7657,11 +7687,18 @@ impl Kernel {
             if !files_ids.contains(&p.info.files) {
                 files_ids.push(p.info.files);
             }
+            killed |= p.info.mm == cx.cur.mm;
             p.info.run = RunState::Zombie(cause);
             seccomp::release(&mut p.info);
             if p.info.tracer() != 0 {
                 tracers.push(p.info.tracer());
             }
+        }
+        // A sibling between two steps on another CPU's worker (not checked
+        // out, so marked dead right here) must not run again: its worker sees
+        // this move under the memory lock this step holds.
+        if killed {
+            mem.kill_gen = mem.kill_gen.wrapping_add(1);
         }
         // Their tracers have exits to hear of.
         for t in tracers {

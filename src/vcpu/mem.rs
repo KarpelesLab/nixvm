@@ -209,6 +209,12 @@ pub struct GuestMemory {
     /// (`execve`): an SMP worker holding a thread from before checks it
     /// rather than run the old image's thread in the new image.
     pub exec_gen: u64,
+    /// How many times a task of this address space killed its sibling
+    /// threads (`exit_group`, a fatal signal): an SMP worker between two steps
+    /// of one of those threads checks it before running the thread again, so a
+    /// thread that was killed while its worker held no lock doesn't go back to
+    /// user code in an address space its exit tore down.
+    pub kill_gen: u64,
     /// Set whenever the host puts bytes into a page the guest may execute, or a
     /// frame behind an executable mapping changes (a copy-on-write copy): an
     /// arm64 hardware vcpu must invalidate its instruction cache before running
@@ -422,6 +428,7 @@ impl GuestMemory {
             tlb_gen: 0,
             heap: Heap::default(),
             exec_gen: 0,
+            kill_gen: 0,
             icache_dirty: true,
             kstack_pa,
             shared: false,
@@ -2227,6 +2234,7 @@ impl GuestMemory {
             tlb_gen: 0,
             heap: self.heap,
             exec_gen: 0,
+            kill_gen: 0,
             icache_dirty: true,
             kstack_pa: child_kstack,
             shared: self.shared,

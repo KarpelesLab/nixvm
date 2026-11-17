@@ -49,6 +49,7 @@ const PROGRAMS: &[&str] = &[
     "pty",
     "wine_abi",
     "compat32",
+    "exit_race",
 ];
 
 /// A directory of binaries, also used as the guest's root, so that a program can
@@ -203,6 +204,27 @@ fn programs_pass_on_the_interpreter() {
 #[test]
 fn programs_pass_with_several_cpus() {
     conformance(&[("NIXVM_CPUS", "3")], "120");
+}
+
+/// A thread killed by a sibling's `exit_group` or `execve` while its worker
+/// is between two steps never runs again: on the interpreter, a thread coming
+/// back from a syscall went on into the torn-down address space and faulted on
+/// its next instruction. The guest can't see that (its process had already
+/// exited as asked), so the fault reports are what's checked.
+#[test]
+fn threads_of_an_exiting_process_stay_dead_on_several_cpus() {
+    let Some(root) = built() else { return };
+    for interp in ["1", "0"] {
+        for _ in 0..2 {
+            let env = [("NIXVM_INTERP", interp), ("NIXVM_CPUS", "4")];
+            let out = text(&run(root, "exit_race", &[], &env, "120"));
+            assert!(out.contains("ncpus=4"), "NIXVM_CPUS not read:\n{out}");
+            assert!(
+                out.lines().any(|l| l == "PASS") && !out.contains("[fault]"),
+                "interp={interp}:\n{out}"
+            );
+        }
+    }
 }
 
 /// On an aarch64 guest, which runs on the interpreter on this host.
