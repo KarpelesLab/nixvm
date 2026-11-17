@@ -209,7 +209,7 @@ pub fn build_image_aarch64(vvar_va: u64) -> [u8; PAGE] {
 }
 
 /// The SysV ELF hash of `name` (what `Verdef::vd_hash` holds).
-fn elf_hash(name: &str) -> u32 {
+pub(crate) fn elf_hash(name: &str) -> u32 {
     let mut h: u32 = 0;
     for &c in name.as_bytes() {
         h = (h << 4).wrapping_add(u32::from(c));

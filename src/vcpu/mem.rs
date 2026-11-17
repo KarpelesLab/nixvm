@@ -261,6 +261,14 @@ pub struct GuestMemory {
     files: std::collections::BTreeMap<usize, FileVma>,
     /// The [`SHRINK_EPOCH`] this space last dropped lost file pages at.
     shrink_seen: u64,
+    /// The process's local descriptor table (`modify_ldt`), shared by its
+    /// threads, copied by a fork and emptied by `execve`, as Linux's
+    /// `mm->context.ldt`: the 8-byte descriptors, empty when it has none.
+    /// Replaced whole on a change, so a vcpu can keep the one it loaded.
+    ldt: Arc<[u64]>,
+    /// Where this process's 32-bit vDSO is mapped (0: it has none), whose
+    /// `int $0x80` landing pad a fast 32-bit system call returns to.
+    vdso32: u64,
 }
 
 /// What [`GuestMemory::file_fault`] made of a fault.
@@ -439,6 +447,8 @@ impl GuestMemory {
             space_id: new_space_id(),
             files: std::collections::BTreeMap::new(),
             shrink_seen: SHRINK_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+            ldt: Arc::from([]),
+            vdso32: 0,
         }
     }
 
@@ -467,6 +477,39 @@ impl GuestMemory {
         ctrl::build_arm_kernel_tables(&self.phys);
         mark_tlb_dirty!(self);
         Ok(())
+    }
+
+    /// The local descriptor table (`modify_ldt`): its descriptors, in the
+    /// CPU's 8-byte format; empty when the process has none.
+    #[must_use]
+    pub fn ldt(&self) -> &Arc<[u64]> {
+        &self.ldt
+    }
+
+    /// Install a new local descriptor table (the whole of it).
+    pub fn set_ldt(&mut self, ldt: Arc<[u64]>) {
+        self.ldt = ldt;
+    }
+
+    /// Where the 32-bit vDSO is mapped, if the process has one.
+    #[must_use]
+    pub fn vdso32(&self) -> Option<u64> {
+        (self.vdso32 != 0).then_some(self.vdso32)
+    }
+
+    /// Record where the 32-bit vDSO is mapped.
+    pub fn set_vdso32(&mut self, base: u64) {
+        self.vdso32 = base;
+    }
+
+    /// Where a fast 32-bit system call (`sysenter`, or `syscall` from
+    /// compatibility mode) returns: the vDSO's `int $0x80` landing pad,
+    /// just past an `int $0x80`, as Linux's `do_fast_syscall_32` does. `None`
+    /// without a 32-bit vDSO.
+    #[must_use]
+    pub fn vdso32_landing(&self) -> Option<u64> {
+        self.vdso32()
+            .map(|b| b + crate::vcpu::vdso32::INT80_LANDING_PAD)
     }
 
     /// The format of this space's page tables.
@@ -2245,6 +2288,8 @@ impl GuestMemory {
             space_id: new_space_id(),
             files: self.files.clone(),
             shrink_seen: self.shrink_seen,
+            ldt: Arc::clone(&self.ldt),
+            vdso32: self.vdso32,
         })
     }
 
@@ -2254,6 +2299,8 @@ impl GuestMemory {
     /// loader then maps the new image into this same `GuestMemory`.
     pub(crate) fn exec_reset(&mut self) {
         self.reset_space();
+        self.ldt = Arc::from([]);
+        self.vdso32 = 0;
         self.exec_gen = self.exec_gen.wrapping_add(1);
     }
 

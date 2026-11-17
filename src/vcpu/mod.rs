@@ -26,6 +26,7 @@ mod pagevec;
 pub(crate) mod phys;
 pub(crate) mod region;
 pub(crate) mod vdso;
+pub(crate) mod vdso32;
 
 pub use mem::{FileFault, GuestMemory, MemError, Prot};
 pub use pagetable::PtFormat;
@@ -363,6 +364,24 @@ pub trait Vcpu: Send {
     /// stack segment the task can use; nothing changes when they are not.
     fn set_user_segments(&mut self, cs: u16, ss: u16) -> bool {
         (cs, ss) == (0x33, 0x2b)
+    }
+
+    /// The selector in x86 segment register `seg`, numbered as a ModRM
+    /// `Sreg` field: 0 `%es`, 1 `%cs`, 2 `%ss`, 3 `%ds`, 4 `%fs`, 5 `%gs`.
+    fn segment_selector(&self, seg: usize) -> u16 {
+        match seg {
+            1 => 0x33,
+            2 => 0x2b,
+            _ => 0,
+        }
+    }
+
+    /// Load data segment register `seg` (0 `%es`, 3 `%ds`, 4 `%fs`, 5
+    /// `%gs`) with `sel` as a CPL-3 `mov` would, from the GDT or the
+    /// process's LDT (`%fs` and `%gs` take the descriptor's base). Whether it
+    /// loaded; nothing changes when the load would fault.
+    fn load_data_segment(&mut self, _seg: usize, sel: u16) -> bool {
+        sel & !3 == 0
     }
 
     /// x86 TLS descriptor `i` (GDT entry 12 + `i`, `set_thread_area`), in the
