@@ -51,10 +51,10 @@ impl Kernel {
             Err(e) => return e,
         };
         if self.trace {
-            eprintln!(
+            self.trace_line(format!(
                 "[mount] pid={} target {rel:?} -> {abs:?} flags={flags:#x}",
                 cx.cur.pid
-            );
+            ));
         }
         match vfs.stat(&abs) {
             Some(st) if st.kind == NodeKind::Dir => {}
@@ -1338,7 +1338,7 @@ impl Kernel {
         let had_slash = rel.len() > 1 && rel.ends_with('/');
         let abs = self.resolve_path(cx, dirfd, &rel);
         if self.trace {
-            eprintln!("[access] pid={} {abs:?}", cx.cur.pid);
+            self.trace_line(format!("[access] pid={} {abs:?}", cx.cur.pid));
         }
         let abs = match self.follow_or_eloop(vfs, cx, &abs) {
             Ok(p) => p,

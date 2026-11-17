@@ -27,6 +27,7 @@ seq 1 5000 | xargs -n 100 echo | wc -l | grep -qx 50
 
 #[test]
 fn x86_64_programs_run() {
+    nixvm::env::Env::from_process().install();
     let Ok(root) = std::env::var("NIXVM_X86_ROOT") else {
         eprintln!("NIXVM_X86_ROOT not set; skipping x86-64 program tests");
         return;

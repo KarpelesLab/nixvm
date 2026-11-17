@@ -63,6 +63,7 @@ fn build_elf(vaddr: u64, body: &[u8]) -> Vec<u8> {
 
 #[test]
 fn static_elf_prints_and_exits() {
+    nixvm::env::Env::from_process().install();
     let vaddr = 0x1_0000u64;
     // "hi\n" sits right after the 9-instruction (36-byte) program, so its guest
     // address is vaddr + (EHDR+PHDR) + 36 = 0x1_0000 + 156 = 0x1_009C.

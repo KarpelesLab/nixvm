@@ -158,7 +158,7 @@ impl ImageStore {
     /// The default per-user cache location.
     #[must_use]
     pub fn default_location() -> Self {
-        let root = std::env::var_os("NIXVM_CACHE")
+        let root = crate::env::var("NIXVM_CACHE")
             .map(PathBuf::from)
             .or_else(|| std::env::home_dir().map(|h| h.join(".nixvm")))
             .unwrap_or_else(|| PathBuf::from(".nixvm"));
@@ -245,7 +245,7 @@ fn classify_source(s: &str) -> Source {
 /// Resolves where to fetch `image` from: the `NIXVM_IMAGE_<NAME>` environment
 /// override takes priority over [`ImageRef::source`].
 fn resolve_source(image: &ImageRef) -> Option<Source> {
-    if let Ok(v) = std::env::var(image.env_override_name())
+    if let Some(v) = crate::env::var(&image.env_override_name())
         && !v.is_empty()
     {
         return Some(classify_source(&v));

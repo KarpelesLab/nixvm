@@ -186,10 +186,10 @@ impl SyscallPolicy {
     /// A rule that doesn't parse is an `Err`: a policy that silently allowed a
     /// misspelt syscall would be worse than none.
     pub fn from_env() -> Result<Self, String> {
-        let log = std::env::var("NIXVM_LOG_DENIALS").is_ok_and(|v| !v.is_empty() && v != "0");
-        let policy = match std::env::var("NIXVM_DENY_SYSCALLS") {
-            Ok(spec) => Self::parse(&spec).map_err(|e| format!("NIXVM_DENY_SYSCALLS: {e}"))?,
-            Err(_) => Self::new(),
+        let log = crate::env::var("NIXVM_LOG_DENIALS").is_some_and(|v| !v.is_empty() && v != "0");
+        let policy = match crate::env::var("NIXVM_DENY_SYSCALLS") {
+            Some(spec) => Self::parse(&spec).map_err(|e| format!("NIXVM_DENY_SYSCALLS: {e}"))?,
+            None => Self::new(),
         };
         Ok(policy.log_denials(log))
     }

@@ -122,16 +122,19 @@ fn shows_a_window(
 
 #[test]
 fn a_raw_wire_client_shows_a_window_and_gets_a_key() {
+    nixvm::env::Env::from_process().install();
     shows_a_window(|b| b.ncpus(1));
 }
 
 #[test]
 fn a_raw_wire_client_on_the_interpreter() {
+    nixvm::env::Env::from_process().install();
     shows_a_window(|b| b.ncpus(1).prefer_interp(true));
 }
 
 #[test]
 fn a_raw_wire_client_with_several_cpus() {
+    nixvm::env::Env::from_process().install();
     shows_a_window(|b| b.ncpus(4));
 }
 
@@ -139,6 +142,7 @@ fn a_raw_wire_client_with_several_cpus() {
 /// and a hangup — and the display goes on serving.
 #[test]
 fn a_bad_request_is_a_protocol_error() {
+    nixvm::env::Env::from_process().install();
     let Some(root) = root() else { return };
     let sandbox = Sandbox::builder()
         .root_dir(root)

@@ -150,16 +150,19 @@ fn shows(ncpus: usize, interp: bool, command: &[&str], color: [u8; 4]) {
 
 #[test]
 fn a_gpu_buffer_shows_on_the_display() {
+    nixvm::env::Env::from_process().install();
     shows_a_gpu_buffer(1);
 }
 
 #[test]
 fn a_gpu_buffer_shows_on_the_display_with_several_cpus() {
+    nixvm::env::Env::from_process().install();
     shows_a_gpu_buffer(4);
 }
 
 #[test]
 fn a_gpu_buffer_shows_on_the_display_on_the_interpreter() {
+    nixvm::env::Env::from_process().install();
     shows(1, true, &["/wayland_client", "gpu", "2080c0"], GPU_COLOR);
 }
 
@@ -167,5 +170,6 @@ fn a_gpu_buffer_shows_on_the_display_on_the_interpreter() {
 /// shared memory is uploaded to a texture, and shows the same.
 #[test]
 fn a_shared_memory_buffer_shows_through_the_gl_compositor() {
+    nixvm::env::Env::from_process().install();
     shows(1, false, &["/wayland_client", "c03060"], SHM_COLOR);
 }

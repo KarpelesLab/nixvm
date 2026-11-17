@@ -329,7 +329,7 @@ impl Vm {
             .map_err(|e| e.to_string())?;
         // Let the guest's vDSO read the clock without a syscall where the
         // backend can calibrate it (hardware; a no-op on the interpreter).
-        crate::sandbox::calibrate_vdso(vcpu.as_ref(), &mem);
+        mem.calibrate_vdso(vcpu.as_ref());
 
         let stdout = Arc::new(Mutex::new(Vec::new()));
         let stderr = Arc::new(Mutex::new(Vec::new()));
@@ -435,6 +435,12 @@ impl Vm {
         self.kernel.set_limits(limits);
     }
 
+    /// Where the kernel's notices (faults, limits, logged denials) go; without
+    /// a sink they're dropped (see [`Kernel::set_notice_sink`]).
+    pub fn set_notice_sink(&mut self, sink: crate::kernel::notice::NoticeSink) {
+        self.kernel.set_notice_sink(sink);
+    }
+
     /// Refuse syscalls to every guest task, whatever it does (see
     /// [`crate::policy`]).
     pub fn set_syscall_policy(&mut self, policy: &crate::policy::SyscallPolicy) {
@@ -520,7 +526,7 @@ impl Vm {
 pub(crate) fn egress_enabled() -> bool {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        std::env::var_os("NIXVM_NET").is_some_and(|v| v == "host")
+        crate::env::var("NIXVM_NET").is_some_and(|v| v == "host")
     }
     #[cfg(target_arch = "wasm32")]
     {

@@ -247,6 +247,7 @@ const EXPECTED_EXIT: i32 = 7 + 14 + 21 + 28;
 
 #[test]
 fn smp_scheduling_matches_serial_fork_sum() {
+    nixvm::env::Env::from_process().install();
     let vaddr = 0x1_0000u64;
 
     let code_words = build_code(0).len() as u64;

@@ -34,6 +34,7 @@ fn drain(vm: &mut Vm) -> String {
 
 #[test]
 fn boots_alpine_and_runs_shell_commands() {
+    nixvm::env::Env::from_process().install();
     let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
         eprintln!("NIXVM_ALPINE_TAR not set; skipping live Alpine boot test");
         return;
@@ -82,6 +83,7 @@ fn boots_alpine_and_runs_shell_commands() {
 #[cfg(feature = "fstool")]
 #[test]
 fn boots_alpine_from_in_memory_squashfs_overlay() {
+    nixvm::env::Env::from_process().install();
     let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
         eprintln!("NIXVM_ALPINE_TAR not set; skipping squashfs-overlay boot test");
         return;
@@ -134,6 +136,7 @@ fn boots_alpine_from_in_memory_squashfs_overlay() {
 #[cfg(all(feature = "fstool", feature = "tunnel"))]
 #[test]
 fn boots_alpine_with_a_display() {
+    nixvm::env::Env::from_process().install();
     let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
         eprintln!("NIXVM_ALPINE_TAR not set; skipping display boot test");
         return;
@@ -173,6 +176,7 @@ fn boots_alpine_with_a_display() {
 #[cfg(feature = "fstool")]
 #[test]
 fn apk_update_over_host_egress() {
+    nixvm::env::Env::from_process().install();
     let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
         eprintln!("NIXVM_ALPINE_TAR not set; skipping egress test");
         return;
@@ -247,6 +251,7 @@ fn apk_update_over_host_egress() {
 #[cfg(feature = "targz")]
 #[test]
 fn boots_alpine_from_targz_via_compcol() {
+    nixvm::env::Env::from_process().install();
     let Ok(gz_path) = std::env::var("NIXVM_ALPINE_TARGZ") else {
         eprintln!("NIXVM_ALPINE_TARGZ not set; skipping compcol .tar.gz boot test");
         return;
@@ -276,6 +281,7 @@ fn boots_alpine_from_targz_via_compcol() {
 #[cfg(feature = "fstool")]
 #[test]
 fn squashfs_relative_symlinks_resolve_for_apk() {
+    nixvm::env::Env::from_process().install();
     let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
         eprintln!("NIXVM_ALPINE_TAR not set; skipping squashfs symlink test");
         return;
@@ -302,6 +308,7 @@ fn squashfs_relative_symlinks_resolve_for_apk() {
 #[cfg(all(feature = "fstool", feature = "tunnel"))]
 #[test]
 fn ping_over_tunnel_and_loopback() {
+    nixvm::env::Env::from_process().install();
     use nixvm::tunnel::{Lease, Tunnel};
     use std::net::Ipv4Addr;
 
@@ -444,6 +451,7 @@ fn ping_over_tunnel_and_loopback() {
 #[cfg(all(feature = "fstool", feature = "tunnel"))]
 #[test]
 fn tunnel_live_apk_update() {
+    nixvm::env::Env::from_process().install();
     use nixvm::tunnel::{Lease, Tunnel};
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
@@ -565,6 +573,7 @@ fn tunnel_live_apk_update() {
 #[cfg(feature = "fstool")]
 #[test]
 fn pump_for_yields_during_guest_computation() {
+    nixvm::env::Env::from_process().install();
     use std::time::{Duration, Instant};
     let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
         eprintln!("NIXVM_ALPINE_TAR not set; skipping pump_for test");
@@ -637,6 +646,7 @@ fn pump_for_yields_during_guest_computation() {
 #[cfg(feature = "fstool")]
 #[test]
 fn a_wayland_terminal_on_the_display() {
+    nixvm::env::Env::from_process().install();
     let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
         eprintln!("NIXVM_ALPINE_TAR not set; skipping the Wayland client test");
         return;

@@ -41,6 +41,22 @@ use std::sync::{Arc, Mutex};
 /// Guest page size advertised to the guest (`AT_PAGESZ`, `sysconf(_SC_PAGESIZE)`).
 pub const PAGE_SIZE: u64 = 4096;
 
+/// Where a process address space starts ([`GuestMemory::with_default_layout`]).
+pub const DEFAULT_GUEST_BASE: u64 = 0x1_0000;
+
+/// The virtual extent of a process address space
+/// ([`GuestMemory::with_default_layout`]), decoupled from the physical RAM
+/// pool. A JS engine (JSC/V8, i.e. Bun/Node) reserves tens of GiB of
+/// `MAP_NORESERVE` virtual address space at startup but commits only a small
+/// working set; if the virtual arena is too small a plain `mmap` fails with
+/// `ENOMEM` and the engine traps. V8's caged heaps alone (Oilpan's, in Deno)
+/// reserve 32-48 GiB at a time; 1 TiB fits them. The per-page metadata is
+/// sparse (only touched 16 MiB chunks cost anything, plus ~2 MiB of chunk
+/// tables), and the pool (physical RAM, demand-paged, lazily host-committed)
+/// bounds the actual footprint. It may change between releases; use
+/// [`GuestMemory::with_default_layout`] rather than copying it.
+pub const DEFAULT_GUEST_VSIZE: u64 = 1 << 40;
+
 /// Page size as a `usize`, for indexing metadata.
 const PS: usize = PAGE_SIZE as usize;
 
@@ -312,6 +328,40 @@ impl GuestMemory {
     pub fn new(base: u64, size: u64) -> Self {
         // The tied form (virtual bound == physical pool), used by tests.
         Self::new_split(base, size, size)
+    }
+
+    /// A process address space laid out as [`crate::Sandbox`] lays out its
+    /// own: from [`DEFAULT_GUEST_BASE`] over [`DEFAULT_GUEST_VSIZE`] of
+    /// virtual space, backed by a pool of `phys_bytes` of guest RAM (rounded
+    /// up to a page; capped by [`crate::limits::guest_memory_ceiling`]). Use
+    /// this rather than a size of one's own: the extent is what this release
+    /// of nixvm is tested with, on every backend.
+    #[must_use]
+    pub fn with_default_layout(phys_bytes: u64) -> Self {
+        Self::new_split(
+            DEFAULT_GUEST_BASE,
+            DEFAULT_GUEST_VSIZE,
+            phys_bytes.div_ceil(PAGE_SIZE) * PAGE_SIZE,
+        )
+    }
+
+    /// Calibrate the guest's clock vDSO for `vcpu` (TSC to nanoseconds) and
+    /// publish it in this address space's shared vvar page, so the guest
+    /// reads the time without a syscall. Call once, after loading the first
+    /// program and creating its vcpu, before running it. A no-op for a
+    /// backend that can't calibrate (the interpreters): the guest then falls
+    /// back to the `clock_gettime` syscall.
+    pub fn calibrate_vdso(&self, vcpu: &dyn crate::vcpu::Vcpu) {
+        if let Some(c) = vcpu.vdso_calibration() {
+            crate::vcpu::ctrl::write_vvar(
+                &self.phys_arc(),
+                c.mult,
+                c.shift,
+                c.base_tsc,
+                c.base_mono_ns,
+                c.base_wall_ns,
+            );
+        }
     }
 
     /// Reserve a guest address space whose *virtual* extent (`[base, base+vsize)`)

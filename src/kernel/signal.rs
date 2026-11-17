@@ -1034,7 +1034,7 @@ impl Kernel {
         // Debug escape hatch: skip delivery so a fault is fatal and the kernel
         // dumps its context (used to inspect a stack overflow that a guest
         // handler would otherwise catch and hide).
-        if std::env::var_os("NIXVM_NOSIG").is_some() {
+        if crate::env::is_set("NIXVM_NOSIG") {
             return false;
         }
         let act = cx.cur.handlers.get(sig as usize);
@@ -1254,16 +1254,16 @@ impl Kernel {
             return false; // couldn't build the frame (guest stack unusable)
         }
 
-        if std::env::var_os("NIXVM_SIGTRACE").is_some() {
+        if crate::env::is_set("NIXVM_SIGTRACE") {
             let hb = mem.read_vec(act.handler, 8).unwrap_or_default();
-            eprintln!(
+            self.trace_line(format!(
                 "[sig] deliver sig={sig} fault={si_addr:#x} pc={:#x} -> handler={:#x} restorer={:#x} frame={frame:#x} onstack={} handler_bytes={:02x?}",
                 vcpu.pc(),
                 act.handler,
                 act.restorer,
                 act.flags & SA_ONSTACK != 0,
                 hb,
-            );
+            ));
         }
         // Enter the handler: SysV entry regs, masked signals, redirected pc/sp.
         vcpu.set_reg(7, sig); // rdi = signum
@@ -1456,15 +1456,15 @@ impl Kernel {
             return false; // couldn't build the frame (guest stack unusable)
         }
 
-        if std::env::var_os("NIXVM_SIGTRACE").is_some() {
+        if crate::env::is_set("NIXVM_SIGTRACE") {
             let hb = mem.read_vec(act.handler, 8).unwrap_or_default();
-            eprintln!(
+            self.trace_line(format!(
                 "[sig] deliver(aa64) sig={sig} pc={:#x} -> handler={:#x} restorer={:#x} frame={frame:#x} handler_bytes={:02x?}",
                 vcpu.pc(),
                 act.handler,
                 act.restorer,
                 hb,
-            );
+            ));
         }
         // The return path: `sa_restorer` with SA_RESTORER, else the
         // `rt_sigreturn` trampoline (Linux's vDSO sigtramp).

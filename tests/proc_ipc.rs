@@ -227,6 +227,7 @@ fn run_program(vaddr: u64, body: &[u8]) -> (i32, Vec<u8>, Kernel) {
 
 #[test]
 fn fork_propagates_child_exit_code() {
+    nixvm::env::Env::from_process().install();
     const CHILD_EXIT_CODE: u32 = 55;
 
     fn build(wstatus_addr: u32) -> Vec<u32> {
@@ -291,6 +292,7 @@ fn fork_propagates_child_exit_code() {
 
 #[test]
 fn pipe_write_read_roundtrips_to_stdout() {
+    nixvm::env::Env::from_process().install();
     const MSG: &[u8] = b"hi!\n";
     const MSG_LEN: u32 = MSG.len() as u32;
 
@@ -366,6 +368,7 @@ fn pipe_write_read_roundtrips_to_stdout() {
 
 #[test]
 fn fork_pipe_parent_reads_child_writes_and_exits() {
+    nixvm::env::Env::from_process().install();
     const MSG: &[u8] = b"ok\n";
     const MSG_LEN: u32 = MSG.len() as u32;
 
@@ -455,6 +458,7 @@ fn fork_pipe_parent_reads_child_writes_and_exits() {
 
 #[test]
 fn mmap_anonymous_store_load_roundtrip() {
+    nixvm::env::Env::from_process().install();
     const MAP_ANONYMOUS: u32 = 0x20 | 0x02; // with MAP_PRIVATE: a map type is required
     const PROT_RW: u32 = 0x3; // PROT_READ | PROT_WRITE
     const VALUE: u32 = 0x2A; // 42

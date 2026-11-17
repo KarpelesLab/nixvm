@@ -69,6 +69,7 @@ const PROG_LEN: u64 = 31;
 
 #[test]
 fn static_x86_64_elf_prints_and_exits() {
+    nixvm::env::Env::from_process().install();
     let vaddr = 0x1_0000u64;
     let body_off = (EHDR_LEN + PHDR_LEN) as u64;
 

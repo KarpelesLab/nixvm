@@ -60,8 +60,7 @@ pub(crate) fn preempt_quantum() -> Option<std::time::Duration> {
         use std::sync::OnceLock;
         static Q: OnceLock<Option<std::time::Duration>> = OnceLock::new();
         *Q.get_or_init(|| {
-            let ms = std::env::var("NIXVM_QUANTUM_MS")
-                .ok()
+            let ms = crate::env::var("NIXVM_QUANTUM_MS")
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(10);
             (ms > 0).then(|| std::time::Duration::from_millis(ms))
@@ -443,7 +442,7 @@ pub(crate) mod softfloat;
 /// probes entirely (a debugging/parity escape hatch, the env twin of
 /// `SandboxBuilder::prefer_interp`).
 pub fn select(guest: Arch) -> Result<Box<dyn Backend>, VcpuError> {
-    let force_interp = std::env::var_os("NIXVM_INTERP").is_some_and(|v| v == "1");
+    let force_interp = crate::env::var("NIXVM_INTERP").is_some_and(|v| v == "1");
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         // When the hypervisor is unavailable/unentitled, `new` fails and we fall
@@ -468,10 +467,27 @@ pub fn select(guest: Arch) -> Result<Box<dyn Backend>, VcpuError> {
     }
     let _ = force_interp;
     // TODO(Phase 10): KVM on Linux/arm64.
-    // x86-64 guests run on the dedicated x86 software interpreter; other guest
-    // arches fall back to `interp::InterpBackend`.
+    interpreter(guest)
+}
+
+/// The software interpreter for `guest`, whatever the host has: x86-64 guests
+/// run on [`interp_x86::X86Backend`], aarch64 guests on
+/// [`interp::InterpBackend`] (whose `new` refuses any other architecture).
+pub fn interpreter(guest: Arch) -> Result<Box<dyn Backend>, VcpuError> {
     if guest == Arch::X86_64 {
         return interp_x86::X86Backend::new(guest).map(|b| Box::new(b) as Box<dyn Backend>);
     }
     interp::InterpBackend::new(guest).map(|b| Box::new(b) as Box<dyn Backend>)
+}
+
+/// [`interpreter`] when `prefer_interp`, else [`select`].
+pub fn select_or_interpreter(
+    guest: Arch,
+    prefer_interp: bool,
+) -> Result<Box<dyn Backend>, VcpuError> {
+    if prefer_interp {
+        interpreter(guest)
+    } else {
+        select(guest)
+    }
 }

@@ -414,6 +414,7 @@ fn run_program(vaddr: u64, body: &[u8]) -> (i32, Vec<u8>, Kernel) {
 
 #[test]
 fn integer_chain_with_summation_loop_exit_code() {
+    nixvm::env::Env::from_process().install();
     let vaddr = 0x1_0000u64;
 
     let mut code = Vec::new();
@@ -473,6 +474,7 @@ fn integer_chain_with_summation_loop_exit_code() {
 
 #[test]
 fn bitfield_extract_and_conditional_chain_exit_code() {
+    nixvm::env::Env::from_process().install();
     let vaddr = 0x1_0000u64;
 
     let mut code = Vec::new();
@@ -509,6 +511,7 @@ fn bitfield_extract_and_conditional_chain_exit_code() {
 
 #[test]
 fn scalar_fp_sqrt_chain_exit_code() {
+    nixvm::env::Env::from_process().install();
     let vaddr = 0x1_0000u64;
 
     let mut code = Vec::new();
@@ -549,6 +552,7 @@ fn scalar_fp_sqrt_chain_exit_code() {
 
 #[test]
 fn neon_build_and_reduce_exit_code() {
+    nixvm::env::Env::from_process().install();
     let vaddr = 0x1_0000u64;
 
     let mut code = Vec::new();
@@ -590,6 +594,7 @@ fn neon_build_and_reduce_exit_code() {
 
 #[test]
 fn lse_atomics_ldadd_then_cas_exit_code() {
+    nixvm::env::Env::from_process().install();
     fn build(word_addr: u32) -> Vec<u32> {
         let mut code = Vec::new();
         code.extend(mov_addr(0, word_addr)); // x0 = &word (2 words, fixed length)
@@ -643,6 +648,7 @@ fn lse_atomics_ldadd_then_cas_exit_code() {
 
 #[test]
 fn mmap_pattern_multi_width_load_exit_code() {
+    nixvm::env::Env::from_process().install();
     const MAP_ANONYMOUS: u32 = 0x20 | 0x02; // with MAP_PRIVATE: a map type is required
     const PROT_RW: u32 = 0x3; // PROT_READ | PROT_WRITE
     let vaddr = 0x1_0000u64;

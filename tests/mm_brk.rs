@@ -11,6 +11,7 @@ use nixvm::vcpu::mem::{PAGE_SIZE, Prot};
 
 #[test]
 fn brk_grows_heap_and_memory_is_usable() {
+    nixvm::env::Env::from_process().install();
     let base = 0x1_0000u64;
     let heap_start = base + PAGE_SIZE; // 0x1_1000
     let heap_limit = base + 200 * PAGE_SIZE;
@@ -63,6 +64,7 @@ fn brk_grows_heap_and_memory_is_usable() {
 /// every later canary check "detected" stack smashing.)
 #[test]
 fn brk_grow_preserves_live_bytes_on_partial_page() {
+    nixvm::env::Env::from_process().install();
     let base = 0x1_0000u64;
     let heap_start = base + PAGE_SIZE;
     let heap_limit = base + 200 * PAGE_SIZE;

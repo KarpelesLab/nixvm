@@ -26,6 +26,7 @@ fn run(vm: &mut Vm, command: &str) -> String {
 
 #[test]
 fn real_namespace_tools_work() {
+    nixvm::env::Env::from_process().install();
     let Ok(tar_path) = std::env::var("NIXVM_BWRAP_TAR") else {
         eprintln!("NIXVM_BWRAP_TAR not set; skipping namespace tools test");
         return;

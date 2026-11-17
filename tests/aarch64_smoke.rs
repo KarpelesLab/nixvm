@@ -178,6 +178,7 @@ fn words_to_bytes(words: &[u32]) -> Vec<u8> {
 
 #[test]
 fn write_and_exit() {
+    nixvm::env::Env::from_process().install();
     // x0=1(1 word) ; x1=msg_addr(2 words) ; x2=3(1) ; x8=64(1) ; svc(1) ;
     // x0=0(1) ; x8=93(1) ; svc(1)
     const CODE_WORDS: u64 = 9;
@@ -218,6 +219,7 @@ fn write_and_exit() {
 
 #[test]
 fn arithmetic_into_exit_code() {
+    nixvm::env::Env::from_process().install();
     let vaddr = 0x1_0000u64;
 
     let mut code = Vec::new();
@@ -239,6 +241,7 @@ fn arithmetic_into_exit_code() {
 
 #[test]
 fn getpid_and_gettid_reflect_pid_one() {
+    nixvm::env::Env::from_process().install();
     let vaddr = 0x1_0000u64;
 
     let mut code = Vec::new();
@@ -266,6 +269,7 @@ fn getpid_and_gettid_reflect_pid_one() {
 
 #[test]
 fn write_from_computed_buffer() {
+    nixvm::env::Env::from_process().install();
     // x1=buf_addr(2 words) + 3x(movz+strb) + x0=1(1) + x2=3(1) + x8=64(1) +
     // svc(1) + x0=0(1) + x8=93(1) + svc(1) = 2+6+7 = 15
     const CODE_WORDS: u64 = 15;
@@ -315,6 +319,7 @@ fn write_from_computed_buffer() {
 
 #[test]
 fn brk_then_write() {
+    nixvm::env::Env::from_process().install();
     // Code length is fixed (nothing trails it), so `program_break` can be
     // predicted with the same `round_up` the loader uses, then baked into the
     // guest code as constants ahead of assembling it.

@@ -42,6 +42,7 @@ mod ipc;
 mod mem_syscalls;
 mod mqueue;
 mod net;
+pub mod notice;
 mod ns;
 mod orphan;
 mod pagecache;
@@ -1773,6 +1774,11 @@ pub struct Kernel {
     /// the host tty is unrelated to where the guest's output actually goes.
     host_tty: bool,
     trace: bool,
+    /// Where notices go ([`Kernel::set_notice_sink`]); `None` drops them.
+    notice_sink: Option<notice::NoticeSink>,
+    /// Notices made before a sink was set (a bad syscall policy, read by
+    /// [`Kernel::new`]): handed to the sink when one is.
+    early_notices: Mutex<Vec<notice::Notice>>,
     /// Debug (`NIXVM_SCHEDTRACE`): log every scheduler slice (pid, syscalls run,
     /// how it ended) to see how threads interleave.
     schedtrace: bool,
@@ -2475,6 +2481,7 @@ impl Kernel {
     #[must_use]
     pub fn new(arch: Arch, mut mounts: MountTable) -> Self {
         let limits = crate::limits::Limits::for_this_host();
+        let policy = crate::policy::SyscallPolicy::from_env();
         let memory_quota = crate::limits::Quota::new(limits.kernel_memory);
         mounts.attach_quota(&memory_quota);
         let disk_quota = crate::limits::Quota::new(limits.disk_bytes);
@@ -2507,12 +2514,9 @@ impl Kernel {
             started_at: Mutex::new(None),
             total_cpu_ns: AtomicU64::new(0),
             limit_hit: std::sync::atomic::AtomicBool::new(false),
-            policy: match crate::policy::SyscallPolicy::from_env() {
+            policy: match &policy {
                 Ok(p) => p.compile(arch),
-                Err(e) => {
-                    eprintln!("nixvm: {e}; refusing every syscall");
-                    crate::policy::SyscallPolicy::deny_everything()
-                }
+                Err(_) => crate::policy::SyscallPolicy::deny_everything(),
             },
             denials: Mutex::new(VecDeque::new()),
             denied: AtomicU64::new(0),
@@ -2521,10 +2525,14 @@ impl Kernel {
             max_open_files: AtomicUsize::new(limits.open_files as usize),
             seccomp_logged: std::sync::atomic::AtomicU32::new(seccomp::DEFAULT_LOGGED),
             arch,
-            trace: std::env::var_os("NIXVM_TRACE").is_some(),
-            schedtrace: std::env::var_os("NIXVM_SCHEDTRACE").is_some(),
-            slice_cap: std::env::var("NIXVM_SLICE")
-                .ok()
+            trace: crate::env::is_set("NIXVM_TRACE"),
+            notice_sink: None,
+            early_notices: Mutex::new(match policy {
+                Ok(_) => Vec::new(),
+                Err(e) => vec![notice::Notice::BadPolicy(e)],
+            }),
+            schedtrace: crate::env::is_set("NIXVM_SCHEDTRACE"),
+            slice_cap: crate::env::var("NIXVM_SLICE")
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(1024),
             seed: ProcInfo::default(),
@@ -2578,8 +2586,7 @@ impl Kernel {
                 stdin_waiting: false,
                 next_pid: 2,
                 pids_wrapped: false,
-                watch_addr: std::env::var("NIXVM_WATCHCODE")
-                    .ok()
+                watch_addr: crate::env::var("NIXVM_WATCHCODE")
                     .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
                 watch_last: 0,
                 uts_namespaces: BTreeMap::new(),
@@ -2602,6 +2609,34 @@ impl Kernel {
     /// Redirect the source backing guest fd 0 (`stdin`).
     pub fn set_stdin(&mut self, r: Box<dyn Read + Send>) {
         self.shared.get_mut().unwrap().stdin = r;
+    }
+
+    /// Send the kernel's [notices](notice::Notice) — limits reached, guest
+    /// faults, the out-of-memory killer, logged policy denials, traces — to
+    /// `sink`. Without one they're dropped (traces, which are only made when
+    /// asked for through [`crate::env`], go to stderr): the library prints
+    /// nothing on its own. [`notice::stderr_sink`] prints them as the `nixvm`
+    /// binaries do.
+    pub fn set_notice_sink(&mut self, sink: notice::NoticeSink) {
+        for n in std::mem::take(&mut *self.early_notices.lock().unwrap()) {
+            sink(&n);
+        }
+        self.notice_sink = Some(sink);
+    }
+
+    /// Hand `n` to the notice sink (see [`Kernel::set_notice_sink`]).
+    fn notify(&self, n: &notice::Notice) {
+        match &self.notice_sink {
+            Some(sink) => sink(n),
+            // Unit tests show everything, as the binaries do.
+            None if cfg!(test) || matches!(n, notice::Notice::Trace(_)) => eprintln!("{n}"),
+            None => {}
+        }
+    }
+
+    /// A debugging trace line (only called when a trace was asked for).
+    fn trace_line(&self, line: String) {
+        self.notify(&notice::Notice::Trace(line));
     }
 
     /// Replace the VM-wide resource ceilings.
@@ -2643,10 +2678,12 @@ impl Kernel {
         self.denied
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.policy.logs() {
-            eprintln!(
-                "nixvm: denied {name} (syscall {raw}) to pid {}: {action:?}",
-                cx.cur.tgid
-            );
+            self.notify(&notice::Notice::Denied {
+                pid: cx.cur.tgid,
+                syscall: name.to_string(),
+                nr: raw,
+                action,
+            });
         }
         {
             let mut log = self.denials.lock().unwrap();
@@ -2966,10 +3003,10 @@ impl Kernel {
                 } else {
                     "yield"
                 };
-                eprintln!(
+                self.trace_line(format!(
                     "[sched] pid={} slot={} vr={} syscalls={} end={end}",
                     cx.cur.pid, i, cx.cur.vruntime, cx.slice_syscalls
-                );
+                ));
             }
             // The slice ended by exiting, yielding, preemption, or blocking;
             // `cx.block` reflects the last syscall. A blocked task parks.
@@ -3632,12 +3669,11 @@ impl Kernel {
                     // The guest caught it (JIT trap handler): run the handler.
                     Serviced::Resume
                 } else {
-                    eprintln!(
-                        "[fault] pid {} memory fault at {addr:#x} (write={write}, pc={:#x})",
-                        cx.cur.pid,
+                    let what = format!(
+                        "memory fault at {addr:#x} (write={write}, pc={:#x})",
                         vcpu.pc()
                     );
-                    self.dump_fault_context(vcpu, mem);
+                    self.report_fault(cx, SIGSEGV as u32, what, vcpu, mem);
                     self.die_of_signal(cx, SIGSEGV as u32, mem);
                     Serviced::Ended
                 }
@@ -3656,12 +3692,8 @@ impl Kernel {
                 }
                 let bytes = mem.read_vec(pc, 16).unwrap_or_default();
                 let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-                self.dump_fault_context(vcpu, mem);
-                eprintln!(
-                    "[fault] pid {} illegal instruction at {pc:#x} [{}]",
-                    cx.cur.pid,
-                    hex.join(" ")
-                );
+                let what = format!("illegal instruction at {pc:#x} [{}]", hex.join(" "));
+                self.report_fault(cx, SIGILL as u32, what, vcpu, mem);
                 self.die_of_signal(cx, SIGILL as u32, mem);
                 Serviced::Ended
             }
@@ -3673,11 +3705,9 @@ impl Kernel {
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume;
                 }
-                eprintln!(
-                    "[fault] pid {} arithmetic exception (vector {vector}, si_code {code}) at {pc:#x}",
-                    cx.cur.pid
-                );
-                self.dump_fault_context(vcpu, mem);
+                let what =
+                    format!("arithmetic exception (vector {vector}, si_code {code}) at {pc:#x}");
+                self.report_fault(cx, SIGFPE as u32, what, vcpu, mem);
                 self.die_of_signal(cx, SIGFPE as u32, mem);
                 Serviced::Ended
             }
@@ -3689,11 +3719,8 @@ impl Kernel {
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume;
                 }
-                eprintln!(
-                    "[fault] pid {} general protection fault at {pc:#x}",
-                    cx.cur.pid
-                );
-                self.dump_fault_context(vcpu, mem);
+                let what = format!("general protection fault at {pc:#x}");
+                self.report_fault(cx, SIGSEGV as u32, what, vcpu, mem);
                 self.die_of_signal(cx, SIGSEGV as u32, mem);
                 Serviced::Ended
             }
@@ -3707,8 +3734,8 @@ impl Kernel {
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume;
                 }
-                eprintln!("[fault] pid {} breakpoint trap at {pc:#x}", cx.cur.pid);
-                self.dump_fault_context(vcpu, mem);
+                let what = format!("breakpoint trap at {pc:#x}");
+                self.report_fault(cx, SIGTRAP as u32, what, vcpu, mem);
                 self.die_of_signal(cx, SIGTRAP as u32, mem);
                 Serviced::Ended
             }
@@ -3721,8 +3748,8 @@ impl Kernel {
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume;
                 }
-                eprintln!("[fault] pid {} debug trap at {pc:#x}", cx.cur.pid);
-                self.dump_fault_context(vcpu, mem);
+                let what = format!("debug trap at {pc:#x}");
+                self.report_fault(cx, SIGTRAP as u32, what, vcpu, mem);
                 self.die_of_signal(cx, SIGTRAP as u32, mem);
                 Serviced::Ended
             }
@@ -3734,12 +3761,11 @@ impl Kernel {
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume;
                 }
-                eprintln!(
-                    "[fault] pid {} alignment fault at {addr:#x} (write={write}, pc={:#x})",
-                    cx.cur.pid,
+                let what = format!(
+                    "alignment fault at {addr:#x} (write={write}, pc={:#x})",
                     vcpu.pc()
                 );
-                self.dump_fault_context(vcpu, mem);
+                self.report_fault(cx, SIGBUS as u32, what, vcpu, mem);
                 self.die_of_signal(cx, SIGBUS as u32, mem);
                 Serviced::Ended
             }
@@ -4328,11 +4354,11 @@ impl Kernel {
         };
         let now = mem.read_u64(addr).unwrap_or(0);
         if now != sh.watch_last {
-            eprintln!(
+            self.trace_line(format!(
                 "[watch] {addr:#x}: {:#018x} -> {now:#018x} in the window before {after:?} (pc={:#x})",
                 sh.watch_last,
                 vcpu.pc()
-            );
+            ));
             sh.watch_last = now;
         }
     }
@@ -4371,8 +4397,26 @@ impl Kernel {
             .is_ok()
     }
 
-    #[allow(clippy::unused_self)] // reads self.cur.pid context in the caller; kept a method for symmetry
-    fn dump_fault_context(&self, vcpu: &dyn Vcpu, mem: &GuestMemory) {
+    /// Report a fault the guest had no handler for, with its context.
+    fn report_fault(
+        &self,
+        cx: &ServiceCtx,
+        signal: u32,
+        what: String,
+        vcpu: &dyn Vcpu,
+        mem: &GuestMemory,
+    ) {
+        self.notify(&notice::Notice::Fault {
+            pid: cx.cur.pid,
+            signal,
+            what,
+            context: Self::fault_context(vcpu, mem),
+        });
+    }
+
+    /// Registers, code at the pc and the top of the stack, as dump lines.
+    fn fault_context(vcpu: &dyn Vcpu, mem: &GuestMemory) -> Vec<String> {
+        let mut lines = Vec::with_capacity(3);
         const NAMES: [&str; 16] = [
             "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11",
             "r12", "r13", "r14", "r15",
@@ -4382,11 +4426,11 @@ impl Kernel {
             .enumerate()
             .map(|(i, n)| format!("{n}={:#x}", vcpu.reg(i)))
             .collect();
-        eprintln!("[fault]   regs: {}", line.join(" "));
+        lines.push(format!("regs: {}", line.join(" ")));
         let pc = vcpu.pc();
         if let Ok(b) = mem.read_vec(pc, 16) {
             let hex: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
-            eprintln!("[fault]   code@pc: {}", hex.join(" "));
+            lines.push(format!("code@pc: {}", hex.join(" ")));
         }
         let sp = vcpu.sp();
         let stack: Vec<String> = (0..8u64)
@@ -4395,7 +4439,8 @@ impl Kernel {
                 Err(_) => "<unmapped>".to_string(),
             })
             .collect();
-        eprintln!("[fault]   [rsp+0..64]: {}", stack.join(" "));
+        lines.push(format!("[rsp+0..64]: {}", stack.join(" ")));
+        lines
     }
 
     /// The task's page fault at `addr` found no free frame in the whole
@@ -4404,18 +4449,13 @@ impl Kernel {
     fn oom_kill_for_fault(&self, cx: &mut ServiceCtx, addr: u64, mem: &mut GuestMemory) {
         let (used, free) = mem.with_allocator(|fa| (fa.alloc_count(), fa.free_count()));
         let mib = |frames: usize| (frames as u64 * crate::vcpu::mem::PAGE_SIZE) >> 20;
-        let comm = if cx.cur.comm.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", cx.cur.comm)
-        };
-        eprintln!(
-            "nixvm: out of memory: killed pid {}{comm}: no guest RAM left for its page at \
-             {addr:#x} ({} MiB in use, {} MiB free; --mem raises the limit)",
-            cx.cur.pid,
-            mib(used),
-            mib(free)
-        );
+        self.notify(&notice::Notice::OutOfMemory {
+            pid: cx.cur.pid,
+            comm: cx.cur.comm.clone(),
+            addr,
+            used_mib: mib(used),
+            free_mib: mib(free),
+        });
         self.die_of_signal(cx, 9, mem); // SIGKILL
     }
 
@@ -4437,12 +4477,14 @@ impl Kernel {
             return self.dispatch_layers(cx, sys, raw, args, vcpu, mem);
         }
         let (pid, pc) = (cx.cur.pid, vcpu.pc());
-        eprintln!("[trace] pid={pid} pc={pc:#x} {sys:?} raw={raw} args={args:x?}");
+        self.trace_line(format!(
+            "[trace] pid={pid} pc={pc:#x} {sys:?} raw={raw} args={args:x?}"
+        ));
         let ret = self.dispatch_layers(cx, sys, raw, args, vcpu, mem);
         if (-4095..0).contains(&ret) {
-            eprintln!("[trace]   = {ret} (errno {})", -ret);
+            self.trace_line(format!("[trace]   = {ret} (errno {})", -ret));
         } else {
-            eprintln!("[trace]   = {ret:#x}");
+            self.trace_line(format!("[trace]   = {ret:#x}"));
         }
         ret
     }
@@ -6239,7 +6281,7 @@ impl Kernel {
         let argv = read_string_array(mem, argv_ptr);
         let envp = read_string_array(mem, envp_ptr);
         if self.trace {
-            eprintln!("[exec] pid={} {abs:?} {argv:?}", cx.cur.pid);
+            self.trace_line(format!("[exec] pid={} {abs:?} {argv:?}", cx.cur.pid));
         }
         let r = self.exec_image(sh, &mut vfs, cx, &abs, argv, envp, vcpu, mem);
         drop(vfs);
@@ -9304,6 +9346,17 @@ impl Kernel {
         0
     }
 
+    /// The signal pid 1 died of, once [`Kernel::run`] has returned, if a
+    /// signal (rather than `exit`) ended it.
+    #[must_use]
+    pub fn pid1_signal(&self) -> Option<i32> {
+        let sh = self.shared.lock().unwrap();
+        sh.procs.iter().flatten().find_map(|p| match p.info.run {
+            RunState::Zombie(ExitCause::Signaled(s)) if p.info.pid == 1 => Some(s),
+            _ => None,
+        })
+    }
+
     /// Whether a VM-wide time ceiling stopped the guest
     /// (see [`crate::limits::Limits::cpu_time`]).
     #[must_use]
@@ -9329,8 +9382,11 @@ impl Kernel {
             return;
         }
         self.limit_hit.store(true, Relaxed);
-        let which = if out_of_wall { "run time" } else { "CPU time" };
-        eprintln!("nixvm: the VM's {which} limit was reached; killing the guest");
+        self.notify(&notice::Notice::LimitReached(if out_of_wall {
+            notice::TimeLimit::Wall
+        } else {
+            notice::TimeLimit::Cpu
+        }));
         const SIGKILL_BIT: u64 = 1 << (9 - 1);
         for p in sh.procs.iter_mut().flatten() {
             if !matches!(p.info.run, RunState::Zombie(_)) {
@@ -9934,7 +9990,7 @@ impl Kernel {
             return self.reopen_fd(vfs, cx, n, flags, mode);
         }
         if self.trace {
-            eprintln!("[open] pid={} {abs:?}", cx.cur.pid);
+            self.trace_line(format!("[open] pid={} {abs:?}", cx.cur.pid));
         }
         // A `/proc` open (of a file to read or a directory to list) must see this
         // task's live identity — its program name, cmdline, and open fds — not the

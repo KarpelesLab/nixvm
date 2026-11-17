@@ -32,6 +32,7 @@ impl Write for SharedBuf {
 
 #[test]
 fn hello_world_runs_and_exits() {
+    nixvm::env::Env::from_process().install();
     let base = 0x1_0000u64;
     let code = base;
     let data = base + PAGE_SIZE; // 0x1_1000

@@ -15,9 +15,9 @@ use crate::abi::Arch;
 /// What the registry or the network said, or what's wrong with the image.
 pub fn pull(name: &str, arch: Arch) -> Result<Image, OciError> {
     let mut p = Pull::new(name, arch)?;
-    if let (Ok(u), Ok(pw)) = (
-        std::env::var("NIXVM_REGISTRY_USER"),
-        std::env::var("NIXVM_REGISTRY_PASSWORD"),
+    if let (Some(u), Some(pw)) = (
+        crate::env::var("NIXVM_REGISTRY_USER"),
+        crate::env::var("NIXVM_REGISTRY_PASSWORD"),
     ) {
         p = p.with_credentials(&u, &pw);
     }

@@ -21,6 +21,8 @@ const GUEST_BASE: u64 = 0x1_0000;
 const MEM_BYTES: u64 = 512 * 1024 * 1024;
 
 fn main() {
+    // The library reads no environment itself: hand it our NIXVM_* settings.
+    nixvm::env::Env::from_process().install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(host) = args.first() else {
         eprintln!("usage: run-elf-x86 <host-elf> [guest-argv...]");
@@ -99,6 +101,7 @@ fn main() {
     }
 
     let mut kernel = Kernel::new(Arch::X86_64, mounts);
+    kernel.set_notice_sink(nixvm::kernel::notice::stderr_sink());
     // `/proc/self/exe`: the program as the guest sees it, when it's in the
     // guest's root (as the conformance programs are).
     if let Ok(root) = std::env::var("NIXVM_ROOT")

@@ -391,11 +391,9 @@ impl KvmVcpu {
         // Debug: NIXVM_EBP=0xADDR arms an execute breakpoint on DR0 (fires
         // *before* the instruction); otherwise NIXVM_WATCHPOINT arms up to four
         // 4-byte write watchpoints (DR0..3). Both exit with KVM_EXIT_DEBUG.
-        let ebp = std::env::var("NIXVM_EBP")
-            .ok()
+        let ebp = crate::env::var("NIXVM_EBP")
             .and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
-        let watchpoints: Vec<u64> = std::env::var("NIXVM_WATCHPOINT")
-            .ok()
+        let watchpoints: Vec<u64> = crate::env::var("NIXVM_WATCHPOINT")
             .map(|s| {
                 s.split(',')
                     .filter_map(|p| u64::from_str_radix(p.trim().trim_start_matches("0x"), 16).ok())

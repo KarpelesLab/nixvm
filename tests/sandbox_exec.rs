@@ -41,6 +41,7 @@ fn build_elf(vaddr: u64, body: &[u8]) -> Vec<u8> {
 
 #[test]
 fn sandbox_runs_static_elf_and_returns_exit_code() {
+    nixvm::env::Env::from_process().install();
     // movz x0,#42 ; movz x8,#93 ; svc   -> exit(42)
     let program: [u32; 3] = [0xD280_0540, 0xD280_0BA8, 0xD400_0001];
     let mut body = Vec::new();
@@ -65,6 +66,7 @@ fn sandbox_runs_static_elf_and_returns_exit_code() {
 
 #[test]
 fn a_plain_root_runs_pid1_as_the_user_asked_for() {
+    nixvm::env::Env::from_process().install();
     // getuid ; sub x0,x0,#990 ; exit   -> exit(uid - 990)
     let program: [u32; 5] = [
         0xD280_15C8, // movz x8,#174 (getuid)

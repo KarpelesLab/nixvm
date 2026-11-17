@@ -35,6 +35,7 @@ pub mod abi;
 pub mod clock;
 pub mod display;
 pub mod entropy;
+pub mod env;
 pub mod fs;
 #[cfg(feature = "gpu")]
 pub mod gpu;

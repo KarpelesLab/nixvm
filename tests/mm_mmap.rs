@@ -11,6 +11,7 @@ use nixvm::vcpu::mem::{PAGE_SIZE, Prot};
 
 #[test]
 fn anonymous_mmap_returns_usable_memory() {
+    nixvm::env::Env::from_process().install();
     let base = 0x1_0000u64;
 
     //   mov  x0,#0            ; addr = NULL (let the kernel choose)

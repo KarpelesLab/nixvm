@@ -93,7 +93,7 @@ fn default_disk_bytes() -> u64 {
 
 /// A positive integer from environment variable `name`.
 fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok()?.trim().parse().ok()
+    crate::env::var(name)?.trim().parse().ok()
 }
 
 /// Physical memory on this machine, or a conservative guess if it can't be told.
@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn defaults_are_within_their_clamp() {
         let l = Limits::for_this_host();
-        if std::env::var_os("NIXVM_LIMIT_KERNEL_MEMORY").is_none() {
+        if !crate::env::is_set("NIXVM_LIMIT_KERNEL_MEMORY") {
             assert!((256 << 20..=8192 << 20).contains(&l.kernel_memory));
         }
     }

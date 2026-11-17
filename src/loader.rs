@@ -333,7 +333,7 @@ fn map_image(
             // Debug: read the segment back from guest memory and compare with
             // the source, to catch a loader/memory bug that drops bytes on a
             // large segment.
-            if std::env::var_os("NIXVM_VERIFY_LOAD").is_some() {
+            if crate::env::is_set("NIXVM_VERIFY_LOAD") {
                 let back = mem.read_vec(vaddr, ph.filesz as usize).unwrap_or_default();
                 let mism = back.iter().zip(bytes).position(|(a, b)| a != b);
                 eprintln!(

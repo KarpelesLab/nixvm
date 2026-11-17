@@ -166,7 +166,7 @@ impl Display {
             listener,
             last_io: u64::MAX,
             // `NIXVM_DISPLAY_GL=0` keeps the CPU compositor with a GPU.
-            gl_wanted: std::env::var("NIXVM_DISPLAY_GL").map_or(true, |v| v != "0"),
+            gl_wanted: crate::env::var("NIXVM_DISPLAY_GL").is_none_or(|v| v != "0"),
             gl_settled: false,
         }));
         Ok(())

@@ -6,6 +6,7 @@ use nixvm::vm::Vm;
 // allocations at teardown). Expect a clean [EXIT 0] with the right sum.
 #[test]
 fn nodejit_default() {
+    nixvm::env::Env::from_process().install();
     let Ok(tar) = std::env::var("NIXVM_NODE_TAR") else {
         return;
     };

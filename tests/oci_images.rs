@@ -43,6 +43,7 @@ fn run(vm: &mut Vm) -> (i32, String) {
 
 #[test]
 fn an_image_runs_with_its_config_and_docker_run_overrides() {
+    nixvm::env::Env::from_process().install();
     if !enabled() {
         return;
     }
@@ -97,6 +98,7 @@ fn an_image_runs_with_its_config_and_docker_run_overrides() {
 
 #[test]
 fn a_script_entrypoint_and_layers_with_whiteouts_run() {
+    nixvm::env::Env::from_process().install();
     if !enabled() {
         return;
     }
@@ -125,6 +127,7 @@ fn a_script_entrypoint_and_layers_with_whiteouts_run() {
 #[cfg(feature = "oci-net")]
 #[test]
 fn a_pull_over_a_network_link_with_nixvm_doing_dns_tls_and_http() {
+    nixvm::env::Env::from_process().install();
     if !enabled() {
         return;
     }
@@ -155,6 +158,7 @@ fn a_pull_over_a_network_link_with_nixvm_doing_dns_tls_and_http() {
 /// squashfs writer to settle its metadata offsets (fstool 0.5.4).
 #[test]
 fn an_ubuntu_root_builds_and_runs() {
+    nixvm::env::Env::from_process().install();
     if !enabled() {
         return;
     }

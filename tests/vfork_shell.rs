@@ -14,6 +14,7 @@ fn one_pump(vm: &mut Vm, label: &str) -> String {
 
 #[test]
 fn shell_survives_a_sequence_of_vfork_exec_commands() {
+    nixvm::env::Env::from_process().install();
     let Ok(p) = std::env::var("NIXVM_ALPINE_TAR") else {
         return;
     };

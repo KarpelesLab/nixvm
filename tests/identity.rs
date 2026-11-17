@@ -34,6 +34,7 @@ fn run(program: &[u32], rw_page: Option<u64>) -> i32 {
 
 #[test]
 fn getpid_returns_one() {
+    nixvm::env::Env::from_process().install();
     // movz x8,#172 ; svc ; movz x8,#93 ; svc   -> exit(getpid())
     let program = [0xD280_1588, 0xD400_0001, 0xD280_0BA8, 0xD400_0001];
     assert_eq!(run(&program, None), 1);
@@ -41,6 +42,7 @@ fn getpid_returns_one() {
 
 #[test]
 fn uname_fills_sysname() {
+    nixvm::env::Env::from_process().install();
     // x0 = 0x1_2000 (an rw scratch page); uname; exit(sysname[0]) == 'L' (76)
     let program = [
         0xD284_0000, // movz x0,#0x2000

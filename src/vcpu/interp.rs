@@ -252,8 +252,7 @@ impl Aarch64Interp {
             fpsr: 0,
             flags: Flags::default(),
             v: [0; 32],
-            watch: std::env::var("NIXVM_WATCH")
-                .ok()
+            watch: crate::env::var("NIXVM_WATCH")
                 .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
             excl_monitor: false,
             excl_addr: 0,

@@ -211,15 +211,15 @@ impl GpuDevice {
     /// `NIXVM_GPU_TRACE`), if any.
     #[must_use]
     pub fn from_env() -> Option<Self> {
-        let spec = std::env::var("NIXVM_GPU").ok()?;
+        let spec = crate::env::var("NIXVM_GPU")?;
         if spec.is_empty() || spec == "0" || spec == "off" {
             return None;
         }
-        let trace = std::env::var_os("NIXVM_GPU_TRACE").is_some();
+        let trace = crate::env::is_set("NIXVM_GPU_TRACE");
         let mut dev = Self::from_spec(&spec, trace)?;
         // Test what a bare GLES 3.0 / WebGL2 host gets: ignore the host's
         // extensions (every emulation path then runs).
-        if std::env::var_os("NIXVM_GPU_GLES30").is_some() {
+        if crate::env::is_set("NIXVM_GPU_GLES30") {
             dev.host = backend::HostCaps {
                 max_samples: dev.host.max_samples.min(4),
                 ..backend::HostCaps::default()
