@@ -15,7 +15,6 @@ use nixvm::loader::{ProcessSpec, interp_path, load_dynamic, load_static};
 use nixvm::vcpu::GuestMemory;
 use nixvm::vcpu::mem::PAGE_SIZE;
 
-const GUEST_BASE: u64 = 0x1_0000;
 const MEM_BYTES: u64 = 512 * 1024 * 1024;
 
 fn main() {
@@ -79,7 +78,9 @@ fn main() {
         mounts.mount("/work", Box::new(Passthrough::new(cwd).protect(paths)));
     }
 
-    let mut mem = GuestMemory::new(GUEST_BASE, MEM_BYTES);
+    // The address space every embedder gets (`Sandbox`, `Vm`), over a
+    // `MEM_BYTES` pool of RAM.
+    let mut mem = GuestMemory::with_default_layout(MEM_BYTES);
     // arm64 page tables: what HVF's MMU walks (the interpreter reads either).
     mem.set_guest_arch(Arch::Aarch64)
         .expect("a fresh pool takes any format");

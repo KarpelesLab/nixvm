@@ -737,9 +737,10 @@ fn default_env() -> Vec<String> {
     ]
 }
 
-/// Virtual extent of a [`Vm`]'s address space (see `sandbox::GUEST_VSIZE`):
-/// its per-page metadata is sparse, so only what's touched costs anything.
-const GUEST_VSIZE: u64 = 1 << 40;
+/// Virtual extent of a [`Vm`]'s address space (see
+/// [`crate::vcpu::mem::DEFAULT_GUEST_VSIZE`], which it ends where): its
+/// per-page metadata is sparse, so only what's touched costs anything.
+const GUEST_VSIZE: u64 = crate::vcpu::mem::DEFAULT_GUEST_VSIZE;
 
 fn round_up_page(v: u64) -> u64 {
     v.div_ceil(PAGE_SIZE) * PAGE_SIZE

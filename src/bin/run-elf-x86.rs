@@ -17,7 +17,6 @@ use nixvm::loader::{ProcessSpec, load_static};
 use nixvm::vcpu::GuestMemory;
 use nixvm::vcpu::mem::PAGE_SIZE;
 
-const GUEST_BASE: u64 = 0x1_0000;
 const MEM_BYTES: u64 = 512 * 1024 * 1024;
 
 fn main() {
@@ -48,7 +47,9 @@ fn main() {
         "PWD=/work".to_string(),
     ];
 
-    let mut mem = GuestMemory::new(GUEST_BASE, MEM_BYTES);
+    // The address space every embedder gets (`Sandbox`, `Vm`), over a
+    // `MEM_BYTES` pool of RAM.
+    let mut mem = GuestMemory::with_default_layout(MEM_BYTES);
     let spec = ProcessSpec { argv, envp };
     let img = match load_static(&mut mem, &elf, &spec) {
         Ok(i) => i,

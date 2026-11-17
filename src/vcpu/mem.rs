@@ -53,9 +53,13 @@ pub const DEFAULT_GUEST_BASE: u64 = 0x1_0000;
 /// reserve 32-48 GiB at a time; 1 TiB fits them. The per-page metadata is
 /// sparse (only touched 16 MiB chunks cost anything, plus ~2 MiB of chunk
 /// tables), and the pool (physical RAM, demand-paged, lazily host-committed)
-/// bounds the actual footprint. It may change between releases; use
+/// bounds the actual footprint. It ends at 1 TiB exactly: like Linux's
+/// (`TASK_SIZE`, just under 2^47), the top of the address space is a power
+/// of two, which programs probe for — Wine finds it by `mmap`ing at each
+/// power of two down from 2^63 and takes twice the first that fits as the
+/// end. It may change between releases; use
 /// [`GuestMemory::with_default_layout`] rather than copying it.
-pub const DEFAULT_GUEST_VSIZE: u64 = 1 << 40;
+pub const DEFAULT_GUEST_VSIZE: u64 = (1 << 40) - DEFAULT_GUEST_BASE;
 
 /// Page size as a `usize`, for indexing metadata.
 const PS: usize = PAGE_SIZE as usize;
