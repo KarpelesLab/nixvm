@@ -20,14 +20,14 @@
 //!
 //! ## Root images from a registry
 //!
-//! With the `images` feature, [`pull`] takes a root image from any OCI
+//! With the `images` feature, `pull` takes a root image from any OCI
 //! registry — Docker Hub, GHCR, Quay, a mirror such as `mirror.gcr.io` — for
 //! one architecture, pinned by digest: every manifest and blob is checked
 //! against the digest that names it, starting from the one in the reference.
 //! Blobs are cached on disk by digest, and the flattened root is cached as a
 //! squashfs file keyed by the image manifest's digest, so a later boot makes
 //! no request at all (for a reference by digest) and mounts the root
-//! read-only straight from that file. [`ALPINE`] names the official Alpine
+//! read-only straight from that file. `ALPINE` names the official Alpine
 //! image by digest.
 //!
 //! A tool the image lacks goes in a persistent writable layer
@@ -49,7 +49,7 @@
 //!
 //! The pull is HTTPS in pure Rust (rsurl, TLS on purecrypto with its
 //! embedded CA roots; no C, no libc of its own) over the host's TCP, or the
-//! embedder's [`Connector`].
+//! embedder's `Connector`.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
