@@ -1108,6 +1108,17 @@ impl Vcpu for KvmVcpu {
         self.sregs.gs.base
     }
 
+    /// A signal frame's FPU image is the same `XSAVE` area: Linux always
+    /// gives a handler one (Wine reads and rewrites XMM registers in it, and
+    /// without it lost them across an exception).
+    fn simd_state(&self) -> Vec<u8> {
+        self.fp_state()
+    }
+
+    fn set_simd_state(&mut self, bytes: &[u8]) {
+        self.set_fp_state(bytes);
+    }
+
     /// The `XSAVE` image KVM keeps for the vcpu, cut to the components the
     /// guest has (x87, SSE, AVX: `XCR0` = 7).
     fn fp_state(&self) -> Vec<u8> {
