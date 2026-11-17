@@ -161,25 +161,44 @@ Useful environment variables (both harnesses):
   off by default = loopback-only). Lets `apk`/`wget`/`curl` fetch from the
   network.
 
-## Released root images and a persistent root
+## Root images from a registry, and a persistent root
 
-nixvm releases ready-made guest roots as squashfs images (`images-*`
-releases, x86-64 and arm64): `alpine`, the minirootfs, and `alpine-dev`, the
-same with git, make and gcc. Each nixvm version pins one image release by
-digest (`src/image/pinned.txt`). With the `images` feature, an embedder fetches
-one — HTTPS in pure Rust, verified, cached — and mounts it straight from the
-file; `fs::Overlay::persistent` puts a host directory under it as the
-writable layer, so what `apk add` installs is there for the next guest:
+nixvm ships no images of its own: a guest root is an image from any OCI
+registry, pinned by digest. With the `images` feature, `image::pull` takes
+one for an architecture — over HTTPS in pure Rust (rsurl, TLS on purecrypto;
+no C, no libc of its own, so it builds for the libc-free fullrust target too),
+every manifest and blob checked against its digest — caches its blobs and the
+flattened root (a squashfs file keyed by the manifest digest) on disk, and
+mounts the root read-only straight from that file. A later boot of a
+reference by digest makes no request at all. `image::ALPINE` names the
+official Alpine image (`docker.io/library/alpine:3.22@sha256:49340b34…`; the
+same digest works on `mirror.gcr.io/library/alpine` when Docker Hub
+rate-limits). A tag-only reference (`alpine:3.22`) works too, but only a
+digest pins what you get.
+
+`fs::Overlay::persistent` puts a host directory under the image as its
+writable layer, so a development image is the official one plus a layer of
+your own: install the tools once, in a guest with the network, and every later
+guest over the same directory has them.
 
 ```rust
-let img = nixvm::image::ImageRef::released("alpine-dev", nixvm::Arch::X86_64).unwrap();
-let lower = nixvm::image::fetch(&img, cache_dir)?;
-let root = nixvm::fs::Overlay::persistent(Box::new(lower), upper_dir)?;
-let vm = nixvm::vm::Vm::boot_root(Box::new(root), vec!["/bin/sh".into()], 1 << 30)?;
+use nixvm::{Arch, fs::Overlay, image, vm::Vm};
+let lower = image::pull(image::ALPINE, Arch::X86_64, cache_dir, image::PullOptions::default())?;
+let root = Overlay::persistent(Box::new(lower), upper_dir)?;
+// Once, with NIXVM_NET=host (or the embedder's network):
+//     apk add git make gcc musl-dev
+// From then on, guests booted over `upper_dir` have them.
+let vm = Vm::boot_root(Box::new(root), vec!["/bin/sh".into()], 1 << 30)?;
 ```
+
+`PullOptions` takes credentials, a mirror (`registry_base`), a proxy, extra
+CA certificates and a custom connector (rsurl's `Connector`, re-exported as
+`image::Connector`) for an embedder that routes connections itself.
 
 The upper directory holds changed files at their paths, and deletions as
 `.wh.<name>` marker files (the OCI-layer convention; see `src/fs/overlay.rs`).
+Run as a host user who isn't root, the upper can't take a guest's `chown` to
+root: `apk add` installs everything but reports those as errors (and exits 1).
 
 ## Run Docker images
 

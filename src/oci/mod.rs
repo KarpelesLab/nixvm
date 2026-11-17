@@ -13,13 +13,13 @@
 //! client and in a browser over `fetch()` — where, since registries send no
 //! CORS headers, the embedder routes the requests through a proxy.
 
-mod flatten;
+pub(crate) mod flatten;
 pub mod json;
 mod pull;
 mod reference;
 
 #[cfg(all(feature = "fetch", not(target_arch = "wasm32")))]
-mod fetch;
+pub(crate) mod fetch;
 #[cfg(feature = "oci-net")]
 pub mod net;
 

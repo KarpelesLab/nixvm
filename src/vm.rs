@@ -116,8 +116,8 @@ impl Vm {
     }
 
     /// Boot `argv[0]` from `root`, any filesystem, mounted at `/` — e.g. an
-    /// [`Overlay`](crate::fs::Overlay) of a released image
-    /// (`nixvm::image::fetch`, the `images` feature) under a host-directory upper
+    /// [`Overlay`](crate::fs::Overlay) of an image pulled from a registry
+    /// (`nixvm::image::pull`, the `images` feature) under a host-directory upper
     /// ([`Overlay::persistent`](crate::fs::Overlay::persistent)), so that what
     /// the guest installs is there the next time. Otherwise as [`Vm::boot`].
     ///

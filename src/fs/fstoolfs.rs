@@ -210,6 +210,43 @@ impl FsToolMount {
         })
     }
 
+    /// Write a **squashfs** file at `path` from an (uncompressed) tar archive
+    /// — what [`FsToolMount::from_tar`] builds in memory, on disk instead, so
+    /// that [`FsToolMount::open_squashfs`] serves it from the file. The file
+    /// is created sparse, written through, and cut to the image's length.
+    ///
+    /// # Errors
+    /// I/O error on the file, or an fstool error building the squashfs.
+    pub fn write_squashfs(tar: &[u8], path: &Path) -> io::Result<()> {
+        let cap = tar.len() as u64 + (8 << 20);
+        {
+            let mut dev = FileBackend::create(path, cap).map_err(to_io)?;
+            let opts = squashfs::FormatOpts::default();
+            let mut writer = squashfs::Squashfs::format(&mut dev, &opts).map_err(to_io)?;
+            {
+                let mut sink = repack::FsSink::new(&mut writer, &mut dev).lossy();
+                let mut stream =
+                    fstool::fs::tar::stream::TarArchiveStream::new(io::Cursor::new(tar));
+                repack::walk_stream(&mut stream, &mut sink).map_err(to_io)?;
+            }
+            Filesystem::flush(&mut writer, &mut dev).map_err(to_io)?;
+        }
+        // The superblock's `bytes_used` is the image's length; squashfs pads
+        // the file to 4 KiB.
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        let mut sb = [0u8; 48];
+        io::Read::read_exact(&mut f, &mut sb)?;
+        let used = u64::from_le_bytes(sb[40..48].try_into().expect("8 bytes"));
+        if used == 0 || used > cap {
+            return Err(io::Error::other("the squashfs writer left no image"));
+        }
+        f.set_len(used.div_ceil(4096) * 4096)?;
+        f.sync_all()
+    }
+
     /// Format a fresh writable **ext4** filesystem in RAM (`size` bytes, min
     /// 4 MiB) — the writable-overlay-as-ext option and the test fixture.
     ///

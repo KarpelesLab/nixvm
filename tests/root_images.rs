@@ -1,11 +1,12 @@
-//! Root images an embedder runs: a released squashfs fetched and booted
-//! straight from the file, and a persistent writable layer that keeps what one
-//! guest did for the next.
+//! Root images an embedder runs: an image pulled from a registry and booted
+//! straight from its cached squashfs, and a persistent writable layer that
+//! keeps what one guest did for the next.
 //!
-//! * `a_root_image_boots` needs `NIXVM_ROOT_IMAGE` (a path or URL of a
-//!   squashfs root) and `NIXVM_ROOT_IMAGE_SHA256`; `NIXVM_ROOT_IMAGE_EXPECT`
-//!   lists programs it must have (with `gcc` among them, a C program is built
-//!   and run too). The images workflow runs it on every image it builds.
+//! * `a_pulled_image_boots` needs `NIXVM_PULL_IMAGE`: an image reference, or
+//!   `alpine` for `nixvm::image::ALPINE`; it pulls from the real registry,
+//!   for `NIXVM_PULL_ARCH` (`x86_64`/`aarch64`; default the host's).
+//!   With `NIXVM_NET=host` as well, it `apk add`s make into a persistent upper
+//!   and checks that the next guest has it.
 //! * `the_persistent_upper_outlives_the_guest` needs `NIXVM_ALPINE_TAR` (an
 //!   uncompressed minirootfs `.tar`), as `tests/alpine_boot.rs`.
 //!
@@ -40,7 +41,9 @@ fn run(root: Box<dyn MountFs>, script: &str) -> String {
     let _ = drain(&mut vm);
     vm.write_stdin(format!("{script}\necho END-OF-SCRIPT\nexit\n").as_bytes());
     let mut out = String::new();
-    for _ in 0..64 {
+    // Long enough for an `apk add` over the network.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    while std::time::Instant::now() < deadline {
         out.push_str(&drain(&mut vm));
         if vm.exit_code().is_some() {
             break;
@@ -72,45 +75,61 @@ impl Drop for TempDir {
 
 #[cfg(feature = "images")]
 #[test]
-fn a_root_image_boots() {
+fn a_pulled_image_boots() {
     nixvm::env::Env::from_process().install();
-    use nixvm::image::{ImageRef, fetch, parse_hex};
-    use std::fmt::Write as _;
-    let (Ok(source), Ok(sha)) = (
-        std::env::var("NIXVM_ROOT_IMAGE"),
-        std::env::var("NIXVM_ROOT_IMAGE_SHA256"),
-    ) else {
-        eprintln!("NIXVM_ROOT_IMAGE/NIXVM_ROOT_IMAGE_SHA256 not set; skipping root image test");
+    let Ok(reference) = std::env::var("NIXVM_PULL_IMAGE") else {
+        eprintln!("NIXVM_PULL_IMAGE not set; skipping the registry pull test");
         return;
     };
-    let expect = std::env::var("NIXVM_ROOT_IMAGE_EXPECT").unwrap_or_default();
-    let cache = TempDir::new("root-image-cache");
-    let image = ImageRef {
-        distro: "test".into(),
-        version: "0".into(),
-        arch: nixvm::Arch::X86_64, // only names the cache file
-        sha256: Some(parse_hex(&sha).expect("a 64-digit sha256")),
-        source: Some(source),
+    let reference = if reference == "alpine" {
+        nixvm::image::ALPINE.to_string()
+    } else {
+        reference
     };
-    let lower = fetch(&image, &cache.0).expect("fetch and open the image");
-    let root = Overlay::new(Box::new(lower), Box::new(nixvm::fs::TmpFs::new()));
-    let mut script = String::from("cat /etc/alpine-release; apk --version\n");
-    for p in expect.split_whitespace() {
-        let _ = writeln!(script, "command -v {p} >/dev/null || echo MISSING-{p}");
-    }
-    if expect.split_whitespace().any(|p| p == "gcc") {
-        script.push_str(
-            "printf '#include <stdio.h>\\nint main(void){puts(\"built-by-gcc\");return 0;}\\n' > /tmp/h.c && gcc -O2 -o /tmp/h /tmp/h.c && /tmp/h\n",
-        );
-    }
-    let out = run(Box::new(root), &script);
-    assert!(out.contains("apk-tools"), "apk runs: {out}");
-    assert!(
-        !out.contains("MISSING-"),
-        "every expected program is there: {out}"
+    let arch = match std::env::var("NIXVM_PULL_ARCH").as_deref() {
+        Ok("aarch64") => nixvm::Arch::Aarch64,
+        Ok("x86_64") => nixvm::Arch::X86_64,
+        _ if cfg!(target_arch = "aarch64") => nixvm::Arch::Aarch64,
+        _ => nixvm::Arch::X86_64,
+    };
+    let cache = TempDir::new("pull-cache");
+    let opts = nixvm::image::PullOptions::default;
+    let pulled =
+        nixvm::image::pull_image(&reference, arch, &cache.0, opts()).expect("pull the image");
+    let size = std::fs::metadata(&pulled.path).expect("the root").len();
+    eprintln!(
+        "pulled {} as {}: {} ({size} bytes)",
+        pulled.reference,
+        pulled.manifest_digest,
+        pulled.path.display()
     );
-    if expect.split_whitespace().any(|p| p == "gcc") {
-        assert!(out.contains("built-by-gcc"), "gcc builds a program: {out}");
+    let lower = pulled.open().expect("open the root");
+    let root = Overlay::new(Box::new(lower), Box::new(nixvm::fs::TmpFs::new()));
+    let out = run(Box::new(root), "cat /etc/alpine-release; apk --version");
+    assert!(out.contains("apk-tools"), "apk runs: {out}");
+
+    // Pulled again: from the cache, the same root.
+    let again = nixvm::image::pull_image(&reference, arch, &cache.0, opts()).expect("again");
+    assert_eq!(again.path, pulled.path);
+
+    // With the network, what `apk add` installs in a persistent upper is
+    // there for the next guest: a "dev image" as a layer of one's own.
+    if std::env::var("NIXVM_NET").as_deref() == Ok("host") {
+        let upper = TempDir::new("pull-upper");
+        let root = || {
+            let lower = again.open().expect("open the root");
+            Box::new(Overlay::persistent(Box::new(lower), &upper.0).expect("the upper"))
+        };
+        // apk's exit status isn't checked: as a host user who isn't root, the
+        // upper directory can't take apk's chown to root (EPERM), which apk
+        // reports as an error after installing.
+        let out = run(root(), "apk add --no-progress make 2>&1 | tail -n 5");
+        assert!(
+            out.contains("OK:") || out.contains("MiB in"),
+            "apk add: {out}"
+        );
+        let out = run(root(), "make --version | head -n1");
+        assert!(out.contains("GNU Make"), "make is still there: {out}");
     }
 }
 

@@ -87,6 +87,8 @@ pub struct Pull {
     layer_digests: Vec<String>,
     layer_sizes: Vec<u64>,
     layers: Vec<Vec<u8>>,
+    /// Layers the caller kept itself ([`Pull::layer_kept`]).
+    kept: usize,
     bytes: u64,
 }
 
@@ -114,6 +116,7 @@ impl Pull {
             layer_digests: Vec::new(),
             layer_sizes: Vec::new(),
             layers: Vec::new(),
+            kept: 0,
             bytes: 0,
         })
     }
@@ -375,6 +378,51 @@ impl Pull {
         })
     }
 
+    /// The digest of the image manifest for the wanted platform, once it's in.
+    #[must_use]
+    pub fn manifest_digest(&self) -> Option<&str> {
+        self.manifest_digest.as_deref()
+    }
+
+    /// The image's config, once it's in (before the first layer is asked
+    /// for).
+    #[must_use]
+    pub fn config(&self) -> Option<&ImageConfig> {
+        self.config.as_ref()
+    }
+
+    /// The layers' digests, bottom first, once the manifest is in.
+    #[must_use]
+    pub fn layer_digests(&self) -> &[String] {
+        &self.layer_digests
+    }
+
+    /// Which layer [`Pull::next_request`] asks for, when it asks for one.
+    #[must_use]
+    pub fn wanted_layer(&self) -> Option<usize> {
+        match self.step {
+            Step::Layer(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Instead of [`Pull::feed`]ing the layer [`Pull::wanted_layer`] names,
+    /// say that the caller has it — fetched (or found) and checked against
+    /// its digest — and keeps it itself: a driver that streams layers to disk
+    /// rather than through memory. The pull moves on without the layer, and
+    /// [`Pull::finish`] refuses then: the caller assembles the image.
+    pub fn layer_kept(&mut self) {
+        if let Step::Layer(i) = self.step {
+            self.bytes += self.layer_sizes[i];
+            self.kept += 1;
+            self.step = if i + 1 < self.layer_digests.len() {
+                Step::Layer(i + 1)
+            } else {
+                Step::Done
+            };
+        }
+    }
+
     /// Whether everything has been fetched.
     #[must_use]
     pub fn is_done(&self) -> bool {
@@ -386,7 +434,7 @@ impl Pull {
     #[must_use]
     pub fn progress(&self) -> (usize, usize, u64, u64) {
         (
-            self.layers.len(),
+            self.layers.len() + self.kept,
             self.layer_digests.len(),
             self.bytes,
             self.layer_sizes.iter().sum(),
@@ -396,11 +444,17 @@ impl Pull {
     /// The pulled image, its layers uncompressed.
     ///
     /// # Errors
-    /// [`OciError::Fetch`] if the pull isn't done; [`OciError::Layer`] for a
-    /// layer that doesn't uncompress.
+    /// [`OciError::Fetch`] if the pull isn't done, or the caller kept layers
+    /// itself ([`Pull::layer_kept`]); [`OciError::Layer`] for a layer that
+    /// doesn't uncompress.
     pub fn finish(self) -> Result<Image, OciError> {
         if !self.is_done() {
             return Err(OciError::Fetch("the pull isn't finished".into()));
+        }
+        if self.kept > 0 {
+            return Err(OciError::Fetch(
+                "the caller kept the layers: the pull has none to hand over".into(),
+            ));
         }
         let layers = self
             .layers

@@ -62,11 +62,13 @@ jobs:
       - name: Test (Docker/OCI images, offline parts)
         run: cargo test --features oci,oci-net --lib oci
 
-      - name: Clippy (released root images, warnings denied)
+      - name: Clippy (root images from registries, warnings denied)
         run: cargo clippy --all-targets --features images -- -D warnings
 
-      - name: Test (released root images, overlay)
-        run: 'cargo test --features images --lib -- image:: fs::overlay'
+      # A fake registry on loopback (HTTP and HTTPS): token auth, a
+      # multi-platform index, digests refused, the cache reused.
+      - name: Test (root images from registries, overlay)
+        run: 'cargo test --features images --lib -- image:: oci:: fs::overlay'
 
       - name: Clippy (tunnel networking, warnings denied)
         run: cargo clippy --all-targets --features tunnel -- -D warnings
@@ -228,14 +230,18 @@ jobs:
             exit 1
           fi
 
-      # A host-directory upper over the Alpine image: what one guest writes
-      # and deletes, the next sees.
-      - name: Run the persistent root layer test
+      # The official Alpine image pulled by digest from Docker Hub and booted
+      # from its cached squashfs; a host-directory upper over the Alpine
+      # image: what one guest writes and deletes, the next sees.
+      - name: Run the root image tests
+        env:
+          NIXVM_PULL_IMAGE: alpine
+          NIXVM_PULL_ARCH: ${{ matrix.guest }}
         run: |
           set -o pipefail
           cargo test --features images --test root_images -- --nocapture 2>&1 | tee images.log
-          if grep -q 'NIXVM_ALPINE_TAR not set' images.log; then
-            echo '::error::the persistent upper test skipped itself'
+          if grep -Eq 'NIXVM_(ALPINE_TAR|PULL_IMAGE) not set' images.log; then
+            echo '::error::a root image test skipped itself'
             exit 1
           fi
 
@@ -274,11 +280,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # `images` brings rsurl (HTTP, TLS on purecrypto) and the OCI pull:
+      # what an embedder on this target pulls its root image with.
       - name: Build the library with the sandbox features
-        run: cargo build --lib --features fstool,targz,tunnel
+        run: cargo build --lib --features fstool,targz,tunnel,images
 
       - name: Test the library
-        run: cargo test --lib --features fstool,targz,tunnel
+        run: cargo test --lib --features fstool,targz,tunnel,images
 
   docs:
     name: Docs build (warnings denied)

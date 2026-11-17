@@ -11,134 +11,60 @@
 //! 3. Otherwise, [`ImageError::NotCached`].
 //!
 //! A local path or `file://` source is always supported. An `http(s)://`
-//! source needs the `images` cargo feature (the pure-Rust client below) or
-//! `fetch` (ureq), both off by default so the core stays dependency-free;
-//! without either, `ensure()` returns a clear error explaining
+//! source needs the `fetch` cargo feature (rsurl, pure Rust), off by default
+//! so the core stays dependency-free; without it, `ensure()` returns a clear
+//! error explaining
 //! how to enable it. SHA-256 verification (when [`ImageRef::sha256`] is
 //! pinned) uses a small hand-rolled implementation below rather than an extra
 //! dependency, so it's available in every build.
 //!
-//! ## Released images
+//! ## Root images from a registry
 //!
-//! nixvm publishes root images as squashfs files on its GitHub releases
-//! (`images-*` tags, built by `.github/workflows/images.yml`), for x86-64 and
-//! arm64:
+//! With the `images` feature, [`pull`] takes a root image from any OCI
+//! registry — Docker Hub, GHCR, Quay, a mirror such as `mirror.gcr.io` — for
+//! one architecture, pinned by digest: every manifest and blob is checked
+//! against the digest that names it, starting from the one in the reference.
+//! Blobs are cached on disk by digest, and the flattened root is cached as a
+//! squashfs file keyed by the image manifest's digest, so a later boot makes
+//! no request at all (for a reference by digest) and mounts the root
+//! read-only straight from that file. [`ALPINE`] names the official Alpine
+//! image by digest.
 //!
-//! * **`alpine`** — the Alpine minirootfs: busybox and `apk`.
-//! * **`alpine-dev`** — the same with git, make, gcc and the musl headers.
-//!
-//! Each nixvm version pins one image release by digest (`src/image/pinned.txt`,
-//! listed by [`released`]); [`ImageRef::released`] names a pinned image, and
-//! `fetch` (the `images` feature) downloads it once into a cache directory,
-//! verifies it, and opens it as a filesystem to mount — read-only, straight
-//! from the file, no unpacking:
+//! A tool the image lacks goes in a persistent writable layer
+//! ([`Overlay::persistent`](crate::fs::Overlay::persistent)): install it once
+//! in a guest with network (`NIXVM_NET=host`, or the embedder's), and every
+//! later guest over the same upper directory has it:
 //!
 //! ```no_run
 //! # #[cfg(feature = "images")] {
-//! use nixvm::{Arch, fs::Overlay, image};
-//! let img = image::ImageRef::released("alpine-dev", Arch::X86_64).expect("pinned");
-//! let lower = image::fetch(&img, "/var/cache/me/images".as_ref())?;
-//! // `apk add` in this guest stays in ~/.local/share/me/upper for the next one.
+//! use nixvm::{Arch, fs::Overlay, image, vm::Vm};
+//! let lower = image::pull(image::ALPINE, Arch::X86_64, "/var/cache/me/images".as_ref(),
+//!     image::PullOptions::default())?;
 //! let root = Overlay::persistent(Box::new(lower), "/home/me/.local/share/me/upper")?;
+//! // Once, with network: `apk add git make gcc musl-dev`. Later guests have them.
+//! let vm = Vm::boot_root(Box::new(root), vec!["/bin/sh".into()], 1 << 30)?;
 //! # }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! The download is HTTPS in pure Rust (purecrypto's TLS and CA roots, no C,
-//! no libc of its own) over the host's TCP, or the embedder's `Connector`.
-//!
-//! **Updating the pins** — run the "Root images" workflow (Actions → Run
-//! workflow). It builds the four images from the current Alpine release,
-//! publishes them under a new `images-<alpine version>-<n>` release with their
-//! `SHA256SUMS`, and attaches `pinned.txt`: copy that over
-//! `src/image/pinned.txt` (`scripts/pin-images.sh <tag>`), commit, and the next
-//! nixvm release pins the new images. An image release is never changed in
-//! place: the pins in a published nixvm keep naming exactly what they named.
+//! The pull is HTTPS in pure Rust (rsurl, TLS on purecrypto with its
+//! embedded CA roots; no C, no libc of its own) over the host's TCP, or the
+//! embedder's [`Connector`].
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::abi::Arch;
 
-#[cfg(feature = "images")]
-mod http;
-#[cfg(feature = "images")]
-pub use http::{Connector, TcpConnector, Transport};
+#[cfg(all(feature = "fetch", not(target_arch = "wasm32")))]
+pub use crate::http::{Connector, NetStream};
 
-/// Where the image releases are downloaded from.
-pub const RELEASE_BASE: &str = "https://github.com/KarpelesLab/nixvm/releases/download";
-
-/// The pinned image releases, as `.github/workflows/images.yml` writes them.
-const PINNED: &str = include_str!("image/pinned.txt");
-
-/// A released root image this version of nixvm pins (see the
-/// [module docs](self)).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Released {
-    /// `alpine` or `alpine-dev`.
-    pub name: String,
-    /// The Alpine release it's built from, e.g. `3.22.2`.
-    pub version: String,
-    pub arch: Arch,
-    /// The image file's SHA-256.
-    pub sha256: [u8; 32],
-    /// The image file's size in bytes.
-    pub size: u64,
-    /// Where to download it.
-    pub url: String,
-}
-
-/// The released images this version of nixvm pins.
-#[must_use]
-pub fn released() -> Vec<Released> {
-    parse_pinned(PINNED).expect("src/image/pinned.txt is well-formed (a unit test checks)")
-}
-
-/// Parse a `pinned.txt` (see the file for its format).
-fn parse_pinned(text: &str) -> Result<Vec<Released>, String> {
-    let mut tag = None;
-    let mut out = Vec::new();
-    for (n, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let bad = || format!("pinned.txt line {}: {line:?}", n + 1);
-        let f: Vec<&str> = line.split_whitespace().collect();
-        match f.as_slice() {
-            ["release", t] => tag = Some((*t).to_string()),
-            [name, version, arch, sha, size] => {
-                let tag = tag.as_deref().ok_or_else(bad)?;
-                let arch = match *arch {
-                    "x86_64" => Arch::X86_64,
-                    "aarch64" => Arch::Aarch64,
-                    _ => return Err(bad()),
-                };
-                let ok = |s: &str| {
-                    !s.is_empty()
-                        && s.bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-                };
-                if !ok(name) || !ok(version) {
-                    return Err(bad());
-                }
-                out.push(Released {
-                    url: format!(
-                        "{RELEASE_BASE}/{tag}/{name}-{version}-{}.sqfs",
-                        arch.as_str()
-                    ),
-                    name: (*name).to_string(),
-                    version: (*version).to_string(),
-                    arch,
-                    sha256: parse_hex(sha).ok_or_else(bad)?,
-                    size: size.parse().map_err(|_| bad())?,
-                });
-            }
-            _ => return Err(bad()),
-        }
-    }
-    Ok(out)
-}
+#[cfg(all(feature = "images", not(target_arch = "wasm32")))]
+mod pull;
+#[cfg(all(test, feature = "images"))]
+mod test_server;
+#[cfg(all(feature = "images", not(target_arch = "wasm32")))]
+pub use pull::{ALPINE, PullOptions, Pulled, pull, pull_image};
 
 /// A 64-digit hex SHA-256.
 #[must_use]
@@ -165,7 +91,7 @@ pub struct ImageRef {
     pub sha256: Option<[u8; 32]>,
     /// Where to fetch the image from if it isn't already cached: a local
     /// filesystem path, a `file://` URL, or an `http(s)://` URL (the latter
-    /// needs the `images` or `fetch` feature). `None` means "cache-only, unless the
+    /// needs the `fetch` feature). `None` means "cache-only, unless the
     /// `NIXVM_IMAGE_<NAME>` environment override is set".
     pub source: Option<String>,
 }
@@ -181,23 +107,6 @@ impl ImageRef {
             sha256: None,
             source: None,
         }
-    }
-
-    /// The pinned released image `name` (`alpine`, `alpine-dev`) for `arch`:
-    /// its download URL as the source and its digest pinned. `None` if this
-    /// version of nixvm pins no such image (see [`released`]).
-    #[must_use]
-    pub fn released(name: &str, arch: Arch) -> Option<Self> {
-        released()
-            .into_iter()
-            .find(|r| r.name == name && r.arch == arch)
-            .map(|r| Self {
-                distro: r.name,
-                version: r.version,
-                arch,
-                sha256: Some(r.sha256),
-                source: Some(r.url),
-            })
     }
 
     /// Sets the source to fetch this image from, if it isn't already cached.
@@ -376,11 +285,15 @@ impl ImageStore {
 #[cfg(feature = "images")]
 #[derive(Default)]
 pub struct FetchOptions<'a> {
-    /// Opens the connections: the host's TCP ([`TcpConnector`]) when `None`.
-    pub connector: Option<&'a dyn Connector>,
-    /// CA certificates (DER) to trust besides the embedded roots — for a
-    /// mirror behind a private CA.
-    pub extra_roots: Vec<Vec<u8>>,
+    /// Opens the connections: the host's TCP when `None`.
+    pub connector: Option<std::sync::Arc<dyn Connector>>,
+    /// A PEM file of CA certificates to trust *instead of* the embedded
+    /// roots — a mirror behind a private CA.
+    pub ca_bundle: Option<String>,
+    /// A directory of PEM CA certificates to trust *besides* them.
+    pub ca_path: Option<String>,
+    /// A proxy, curl-style: `http://host:port`, `socks5h://host:port`.
+    pub proxy: Option<String>,
     /// Hears (bytes so far, total when known) as the download goes.
     pub progress: Option<&'a mut dyn FnMut(u64, Option<u64>)>,
     /// Hash an already-cached image again before using it. By default the
@@ -394,7 +307,9 @@ impl core::fmt::Debug for FetchOptions<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("FetchOptions")
             .field("connector", &self.connector.is_some())
-            .field("extra_roots", &self.extra_roots.len())
+            .field("ca_bundle", &self.ca_bundle)
+            .field("ca_path", &self.ca_path)
+            .field("proxy", &self.proxy)
             .field("progress", &self.progress.is_some())
             .field("reverify", &self.reverify)
             .finish()
@@ -403,11 +318,12 @@ impl core::fmt::Debug for FetchOptions<'_> {
 
 /// Download `image` into `cache_dir` unless it's already there, verify it
 /// against its pinned digest, and open it to mount: a read-only squashfs
-/// served straight from the cached file. See the [module docs](self).
+/// served straight from the cached file. For an image published as a squashfs
+/// at a URL of the embedder's choosing; for one in an OCI registry, see
+/// [`pull`].
 ///
 /// The image's source is its `NIXVM_IMAGE_<NAME>` override, else
-/// [`ImageRef::source`]: an `http(s)://` URL (a [`ImageRef::released`] image's
-/// is its release asset), a `file://` URL or a path.
+/// [`ImageRef::source`]: an `http(s)://` URL, a `file://` URL or a path.
 ///
 /// # Errors
 /// The image has no pinned digest or no source, the download fails, what
@@ -466,15 +382,14 @@ pub fn fetch_file(
     let digest = match source {
         Source::Local(src) => stage_local(&src, &tmp)?,
         Source::Http(url) => {
-            let tcp = TcpConnector::default();
+            let http = crate::http::Http {
+                connector: opts.connector,
+                ca_bundle: opts.ca_bundle,
+                ca_path: opts.ca_path,
+                proxy: opts.proxy,
+            };
             let mut quiet = |_: u64, _: Option<u64>| {};
-            download(
-                &url,
-                &tmp,
-                opts.connector.unwrap_or(&tcp),
-                &opts.extra_roots,
-                opts.progress.unwrap_or(&mut quiet),
-            )?
+            download(&http, &url, &tmp, opts.progress.unwrap_or(&mut quiet))?
         }
     };
     if digest != expected {
@@ -487,31 +402,23 @@ pub fn fetch_file(
     Ok(path)
 }
 
-/// Download `url` into the new file `tmp` with the pure-Rust client; the
-/// SHA-256 of what arrived.
-#[cfg(feature = "images")]
+/// Download `url` into the new file `tmp`; the SHA-256 of what arrived.
+#[cfg(all(feature = "fetch", not(target_arch = "wasm32")))]
 fn download(
+    http: &crate::http::Http,
     url: &str,
     tmp: &Path,
-    connector: &dyn Connector,
-    extra_roots: &[Vec<u8>],
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<[u8; 32], ImageError> {
-    let mut roots = purecrypto::tls::RootCertStore::with_embedded_roots();
-    for der in extra_roots {
-        roots
-            .add_der(der.clone())
-            .map_err(|e| ImageError::Fetch(format!("an extra CA certificate: {e:?}")))?;
-    }
-    let client = http::Client { connector, roots };
     let mut file = std::io::BufWriter::with_capacity(
         256 << 10,
         std::fs::File::create(tmp).map_err(ImageError::Io)?,
     );
     let mut hasher = Sha256::new();
-    client
-        .get(
+    let reply = http
+        .get_to(
             url,
+            &[],
             &mut |b| {
                 hasher.update(b);
                 file.write_all(b)
@@ -519,6 +426,12 @@ fn download(
             progress,
         )
         .map_err(ImageError::Fetch)?;
+    if reply.status != 200 {
+        return Err(ImageError::Fetch(format!(
+            "GET {url}: HTTP {}",
+            reply.status
+        )));
+    }
     let file = file
         .into_inner()
         .map_err(|e| ImageError::Io(e.into_error()))?;
@@ -602,28 +515,16 @@ fn stage_local(src: &Path, tmp: &Path) -> Result<[u8; 32], ImageError> {
     Ok(hasher.finalize())
 }
 
-#[cfg(feature = "images")]
+#[cfg(all(feature = "fetch", not(target_arch = "wasm32")))]
 fn stage_http(url: &str, tmp: &Path) -> Result<[u8; 32], ImageError> {
-    download(url, tmp, &TcpConnector::default(), &[], &mut |_, _| {})
+    download(&crate::http::Http::default(), url, tmp, &mut |_, _| {})
 }
 
-#[cfg(all(feature = "fetch", not(feature = "images")))]
-fn stage_http(url: &str, tmp: &Path) -> Result<[u8; 32], ImageError> {
-    let resp = ureq::get(url)
-        .call()
-        .map_err(|e| ImageError::Fetch(format!("GET {url}: {e}")))?;
-    let mut reader = resp.into_body().into_reader();
-    let mut output = std::fs::File::create(tmp).map_err(ImageError::Io)?;
-    let mut hasher = Sha256::new();
-    copy_with_hash(&mut reader, &mut output, &mut hasher).map_err(ImageError::Io)?;
-    Ok(hasher.finalize())
-}
-
-#[cfg(not(any(feature = "fetch", feature = "images")))]
+#[cfg(not(all(feature = "fetch", not(target_arch = "wasm32"))))]
 fn stage_http(url: &str, _tmp: &Path) -> Result<[u8; 32], ImageError> {
     Err(ImageError::Fetch(format!(
-        "cannot fetch {url}: nixvm was built without the `images` feature \
-         (rebuild with `--features images`, or set a local ImageRef::source / \
+        "cannot fetch {url}: nixvm was built without the `fetch` feature \
+         (rebuild with `--features fetch`, or set a local ImageRef::source / \
          NIXVM_IMAGE_<NAME> override instead)"
     )))
 }
@@ -680,7 +581,7 @@ const SHA256_H0: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
-struct Sha256 {
+pub(crate) struct Sha256 {
     state: [u32; 8],
     buf: [u8; 64],
     buf_len: usize,
@@ -690,7 +591,7 @@ struct Sha256 {
 }
 
 impl Sha256 {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: SHA256_H0,
             buf: [0; 64],
@@ -699,7 +600,7 @@ impl Sha256 {
         }
     }
 
-    fn update(&mut self, data: &[u8]) {
+    pub(crate) fn update(&mut self, data: &[u8]) {
         self.msg_len = self.msg_len.wrapping_add(data.len() as u64);
         self.absorb(data);
     }
@@ -729,7 +630,7 @@ impl Sha256 {
         }
     }
 
-    fn finalize(mut self) -> [u8; 32] {
+    pub(crate) fn finalize(mut self) -> [u8; 32] {
         let bit_len = self.msg_len.wrapping_mul(8);
         let mut pad = [0u8; 64];
         pad[0] = 0x80;
@@ -921,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(any(feature = "fetch", feature = "images")))]
+    #[cfg(not(feature = "fetch"))]
     fn http_source_without_fetch_feature_errors() {
         let cache = TempCache::new("http-no-fetch-cache");
         let store = ImageStore::new(cache.0.clone());
@@ -937,60 +838,26 @@ mod tests {
         );
         assert!(!store.path_for(&image).exists());
     }
-
-    #[test]
-    fn pinned_file_parses() {
-        // Whatever is committed must parse (`released()` relies on it).
-        let pins = super::parse_pinned(super::PINNED).expect("src/image/pinned.txt parses");
-        for p in &pins {
-            assert!(p.url.starts_with(super::RELEASE_BASE), "{p:?}");
-        }
-        let text = format!(
-            "# comment\nrelease images-3.22.2-1\nalpine-dev 3.22.2 aarch64 {} 1234\n",
-            "ab".repeat(32)
-        );
-        let pins = super::parse_pinned(&text).unwrap();
-        assert_eq!(pins.len(), 1);
-        assert_eq!(pins[0].arch, Arch::Aarch64);
-        assert_eq!(pins[0].sha256, [0xab; 32]);
-        assert_eq!(pins[0].size, 1234);
-        assert_eq!(
-            pins[0].url,
-            "https://github.com/KarpelesLab/nixvm/releases/download/images-3.22.2-1/alpine-dev-3.22.2-aarch64.sqfs"
-        );
-        for bad in [
-            "alpine 3.22.2 x86_64 {d} 1\n", // no release line
-            "release t\nalpine 3.22.2 x86_64 00 1\n",
-            "release t\nalpine 3.22.2 riscv64 {d} 1\n",
-            "release t\nal/pine 3.22.2 x86_64 {d} 1\n",
-            "release t\nalpine 3.22.2 x86_64 {d}\n",
-        ] {
-            let bad = bad.replace("{d}", &"00".repeat(32));
-            assert!(super::parse_pinned(&bad).is_err(), "{bad:?}");
-        }
-    }
 }
 
 /// [`fetch`] against a fixture image: from a file, over HTTP and over HTTPS
 /// from a server on loopback.
 #[cfg(all(test, feature = "images"))]
 mod fetch_tests {
-    use super::{Connector, FetchOptions, ImageError, ImageRef, Transport, fetch_with, hex};
+    use super::test_server::{Req, Resp, To, pem, self_signed, serve};
+    use super::{FetchOptions, ImageError, ImageRef, fetch_with, hex};
     use crate::abi::Arch;
     use crate::fs::MountFs;
-    use std::io::{self, BufRead, BufReader, Read, Write};
-    use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A small squashfs made by `mksquashfs -comp gzip`, as the images
-    /// workflow makes them.
+    /// A small squashfs made by `mksquashfs -comp gzip`.
     const TINY: &[u8] = include_bytes!("../tests/data/tiny.sqfs");
 
-    struct TempDir(PathBuf);
+    pub(super) struct TempDir(pub PathBuf);
     impl TempDir {
-        fn new(tag: &str) -> Self {
+        pub(super) fn new(tag: &str) -> Self {
             static N: AtomicUsize = AtomicUsize::new(0);
             let p = std::env::temp_dir().join(format!(
                 "nixvm-fetch-{tag}-{}-{}",
@@ -1025,7 +892,7 @@ mod fetch_tests {
     }
 
     /// Cache files (not the in-progress ones) in `dir`.
-    fn cached(dir: &Path) -> Vec<String> {
+    pub(super) fn cached(dir: &Path) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(dir)
             .map(|d| {
                 d.filter_map(|e| e.ok()?.file_name().into_string().ok())
@@ -1073,198 +940,23 @@ mod fetch_tests {
         ));
     }
 
-    /// Serve `body` at `/dir/tiny.sqfs?sig=x` (behind a redirect from `/r`),
-    /// chunked when `chunked`, over TLS with `tls`'s identity when given; how
-    /// many connections it took.
-    fn serve(
-        listener: TcpListener,
-        tls: Option<(Vec<u8>, purecrypto::tls::SigningKey)>,
-        chunked: bool,
-        body: &'static [u8],
-    ) -> Arc<AtomicUsize> {
-        let count = Arc::new(AtomicUsize::new(0));
-        let c = count.clone();
-        std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                let Ok(conn) = conn else { return };
-                c.fetch_add(1, Ordering::Relaxed);
-                let tls = tls.clone();
-                std::thread::spawn(move || {
-                    let mut stream: Box<dyn Transport> = match tls {
-                        Some((cert, key)) => match tls_accept(conn, cert, key) {
-                            Ok(s) => Box::new(s),
-                            Err(_) => return,
-                        },
-                        None => Box::new(conn),
-                    };
-                    let _ = answer(&mut *stream, chunked, body);
-                });
-            }
-        });
-        count
-    }
-
-    fn answer(stream: &mut dyn Transport, chunked: bool, body: &[u8]) -> io::Result<()> {
-        let mut r = BufReader::new(&mut *stream);
-        let mut first = String::new();
-        r.read_line(&mut first)?;
-        loop {
-            let mut l = String::new();
-            r.read_line(&mut l)?;
-            if l.trim().is_empty() {
-                break;
-            }
-        }
-        drop(r);
-        let path = first.split(' ').nth(1).unwrap_or("");
-        let mut out = Vec::new();
-        match path {
-            "/r" => out.extend_from_slice(
-                b"HTTP/1.1 302 Found\r\nLocation: /dir/tiny.sqfs?sig=x\r\nContent-Length: 0\r\n\r\n",
-            ),
-            "/dir/tiny.sqfs?sig=x" if chunked => {
-                out.extend_from_slice(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
-                for c in body.chunks(1000) {
-                    out.extend_from_slice(format!("{:x}\r\n", c.len()).as_bytes());
-                    out.extend_from_slice(c);
-                    out.extend_from_slice(b"\r\n");
-                }
-                out.extend_from_slice(b"0\r\n\r\n");
-            }
-            "/dir/tiny.sqfs?sig=x" => {
-                out.extend_from_slice(
-                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
-                        .as_bytes(),
-                );
-                out.extend_from_slice(body);
-            }
-            _ => out.extend_from_slice(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"),
-        }
-        stream.write_all(&out)?;
-        stream.flush()
-    }
-
-    /// The server side of TLS over a connection, as a blocking stream.
-    struct ServerTls {
-        io: TcpStream,
-        tls: purecrypto::tls::Connection,
-        plain: Vec<u8>,
-        at: usize,
-    }
-
-    fn tls_err(e: &purecrypto::tls::Error) -> io::Error {
-        io::Error::other(format!("{e:?}"))
-    }
-
-    fn tls_accept(
-        io: TcpStream,
-        cert: Vec<u8>,
-        key: purecrypto::tls::SigningKey,
-    ) -> io::Result<ServerTls> {
-        use purecrypto::tls::{Config, Connection};
-        let cfg = Config::builder().os_rng().identity(vec![cert], key).build();
-        let tls = Connection::server(&cfg).map_err(|e| tls_err(&e))?;
-        let mut s = ServerTls {
-            io,
-            tls,
-            plain: Vec::new(),
-            at: 0,
-        };
-        let mut buf = [0u8; 16384];
-        while !s.tls.is_handshake_complete() {
-            let n = s.io.read(&mut buf)?;
-            if n == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-            s.feed(&buf[..n])?;
-        }
-        Ok(s)
-    }
-
-    impl ServerTls {
-        fn feed(&mut self, mut wire: &[u8]) -> io::Result<()> {
-            while !wire.is_empty() {
-                let n = self.tls.feed(wire).map_err(|e| tls_err(&e))?;
-                if n == 0 {
-                    break;
-                }
-                wire = &wire[n..];
-            }
-            if !self.tls.is_handshake_complete() {
-                while let purecrypto::tls::Step::WantWrite =
-                    self.tls.drive().map_err(|e| tls_err(&e))?
-                {
-                    let out = self.tls.pop().map_err(|e| tls_err(&e))?;
-                    self.io.write_all(&out)?;
-                }
-            }
-            self.out()
-        }
-
-        fn out(&mut self) -> io::Result<()> {
-            loop {
-                let out = self.tls.pop().map_err(|e| tls_err(&e))?;
-                if out.is_empty() {
-                    return Ok(());
-                }
-                self.io.write_all(&out)?;
-            }
-        }
-    }
-
-    impl Read for ServerTls {
-        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-            let mut buf = [0u8; 16384];
-            while self.at == self.plain.len() {
-                self.plain.clear();
-                self.at = 0;
-                if self
-                    .tls
-                    .recv_into(&mut self.plain)
-                    .map_err(|e| tls_err(&e))?
-                    > 0
-                {
-                    break;
-                }
-                let n = self.io.read(&mut buf)?;
-                if n == 0 {
-                    return Ok(0);
-                }
-                self.feed(&buf[..n])?;
-            }
-            let n = out.len().min(self.plain.len() - self.at);
-            out[..n].copy_from_slice(&self.plain[self.at..self.at + n]);
-            self.at += n;
-            Ok(n)
-        }
-    }
-
-    impl Write for ServerTls {
-        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-            self.tls.send(data).map_err(|e| tls_err(&e))?;
-            self.out()?;
-            Ok(data.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            self.out()
-        }
-    }
-
-    /// Connects every host name to one address: the test server's.
-    struct To(SocketAddr);
-    impl Connector for To {
-        fn connect(&self, _host: &str, _port: u16) -> io::Result<Box<dyn Transport>> {
-            Ok(Box::new(TcpStream::connect(self.0)?))
-        }
+    /// Serves `body` at `/dir/tiny.sqfs?sig=x`, behind a redirect from `/r`.
+    fn handler(body: &'static [u8], chunked: bool) -> Arc<dyn Fn(&Req) -> Resp + Send + Sync> {
+        Arc::new(move |r: &Req| match r.path.as_str() {
+            "/r" => Resp::status(302).with("Location", "/dir/tiny.sqfs?sig=x"),
+            "/dir/tiny.sqfs?sig=x" => Resp {
+                chunked,
+                ..Resp::ok(body)
+            },
+            _ => Resp::status(404),
+        })
     }
 
     #[test]
     fn an_image_downloads_over_http_through_a_redirect() {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        let hits = serve(l, None, true, TINY);
+        let srv = serve(None, handler(TINY, true));
         let cache = TempDir::new("http");
-        let img = tiny_ref(format!("http://{addr}/r"));
+        let img = tiny_ref(format!("http://{}/r", srv.addr));
         let mut seen = Vec::new();
         let mut progress = |n: u64, total: Option<u64>| seen.push((n, total));
         let opts = FetchOptions {
@@ -1272,71 +964,52 @@ mod fetch_tests {
             ..FetchOptions::default()
         };
         check_mounts(fetch_with(&img, &cache.0, opts).unwrap());
-        assert_eq!(
-            hits.load(Ordering::Relaxed),
-            2,
-            "the redirect, then the file"
-        );
-        assert_eq!(seen.last(), Some(&(TINY.len() as u64, None)));
+        assert_eq!(srv.take_log(), ["/r", "/dir/tiny.sqfs?sig=x"]);
+        assert_eq!(seen.last().map(|s| s.0), Some(TINY.len() as u64));
         // Cached: no more requests.
         check_mounts(fetch_with(&img, &cache.0, FetchOptions::default()).unwrap());
-        assert_eq!(hits.load(Ordering::Relaxed), 2);
+        assert_eq!(srv.take_log(), Vec::<String>::new());
     }
 
     #[test]
     fn a_download_that_does_not_match_its_digest_is_not_kept() {
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = l.local_addr().unwrap();
-        serve(l, None, false, b"something else entirely");
+        let srv = serve(None, handler(b"something else entirely", false));
         let cache = TempDir::new("mismatch");
-        let img = tiny_ref(format!("http://{addr}/r"));
+        let img = tiny_ref(format!("http://{}/r", srv.addr));
         let err = fetch_with(&img, &cache.0, FetchOptions::default()).unwrap_err();
         assert!(matches!(err, ImageError::DigestMismatch { .. }), "{err:?}");
         assert_eq!(cached(&cache.0), Vec::<String>::new());
-        let missing = tiny_ref(format!("http://{addr}/nope"));
+        let missing = tiny_ref(format!("http://{}/nope", srv.addr));
         let err = fetch_with(&missing, &cache.0, FetchOptions::default()).unwrap_err();
         assert!(err.to_string().contains("HTTP 404"), "{err}");
+        assert_eq!(cached(&cache.0), Vec::<String>::new());
     }
 
     #[test]
     fn an_image_downloads_over_https() {
-        use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
-        use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
-        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut purecrypto::rng::OsRng);
-        let now = crate::clock::now_unix().as_secs();
-        let validity = Validity::new(Time::from_unix(now - 3600), Time::from_unix(now + 86400));
-        let cert = Certificate::self_signed_general(
-            &CertSigner::Ecdsa(&key),
-            &DistinguishedName::common_name("images.test"),
-            &validity,
-            1,
-            false,
-            &["images.test"],
-        )
-        .unwrap()
-        .to_der()
-        .to_vec();
-        let l = TcpListener::bind("127.0.0.1:0").unwrap();
-        let to = To(l.local_addr().unwrap());
-        let tls = Some((cert.clone(), purecrypto::tls::SigningKey::Ecdsa(key)));
-        serve(l, tls, false, TINY);
+        let (cert, key) = self_signed(&["images.test"]);
+        let srv = serve(Some((cert.clone(), key)), handler(TINY, false));
+        let to = Arc::new(To(srv.addr));
         let img = tiny_ref("https://images.test/r".into());
 
         // Not trusted by the embedded roots alone.
         let cache = TempDir::new("https-untrusted");
         let opts = FetchOptions {
-            connector: Some(&to),
+            connector: Some(to.clone()),
             ..FetchOptions::default()
         };
         let err = fetch_with(&img, &cache.0, opts).unwrap_err();
-        assert!(err.to_string().contains("TLS"), "{err}");
+        assert!(matches!(err, ImageError::Fetch(_)), "{err}");
         assert_eq!(cached(&cache.0), Vec::<String>::new());
 
-        // Trusted once its certificate is added.
+        // Trusted once its certificate is.
         let cache = TempDir::new("https");
+        std::fs::create_dir_all(&cache.0).unwrap();
+        let ca = cache.0.join("ca.pem");
+        std::fs::write(&ca, pem(&cert)).unwrap();
         let opts = FetchOptions {
-            connector: Some(&to),
-            extra_roots: vec![cert],
+            connector: Some(to),
+            ca_bundle: Some(ca.display().to_string()),
             ..FetchOptions::default()
         };
         check_mounts(fetch_with(&img, &cache.0, opts).unwrap());

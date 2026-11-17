@@ -41,6 +41,8 @@ pub mod env;
 pub mod fs;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+#[cfg(all(feature = "fetch", not(target_arch = "wasm32")))]
+mod http;
 pub mod image;
 pub mod kernel;
 pub mod limits;
