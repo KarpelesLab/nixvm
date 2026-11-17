@@ -661,6 +661,15 @@ struct X86Interp {
     /// (`[bx+si]` forms, `CX`/`SI`/`DI` for string ops and `LOOP`).
     /// Transient, like `addr32` (which stays set with it).
     addr16: bool,
+    /// The next instruction fetch takes [`Self::fill_ibuf_slow`]: while
+    /// [`Self::segmented`], or after a `0x67` in compatibility mode, which
+    /// resets the transient `addr16`/`seg_ovr`/`ea_seg` there, so the
+    /// common path doesn't pay for them per instruction.
+    fetch_slow: bool,
+    /// Linear addresses wrap at 32 bits in compatibility mode (the
+    /// `%fs`/`%gs` base included): `0xffff_ffff` there, all ones in 64-bit
+    /// mode.
+    lin_mask: u64,
     /// The process's LDT as of the last [`Vcpu::run`] (see
     /// [`GuestMemory::ldt`]), for selectors with `TI` set. A segment register
     /// already loaded keeps what it loaded, as on hardware.
@@ -774,6 +783,8 @@ impl X86Interp {
             ea_seg: Cell::new(SEG_DS as u8),
             acc_seg: Cell::new(SEG_DS as u8),
             addr16: false,
+            fetch_slow: false,
+            lin_mask: u64::MAX,
             ldt: Arc::from([]),
             addr32: false,
             seg_base: 0,
@@ -930,6 +941,8 @@ impl X86Interp {
                     let f = c[s];
                     SegCache { base: 0, ..f }.is_flat(true)
                 }));
+        self.fetch_slow = self.segmented || self.addr16;
+        self.lin_mask = if self.mode32 { 0xffff_ffff } else { u64::MAX };
     }
 
     /// The code segment a far jump, call or return to `sel` would enter: a
@@ -985,12 +998,10 @@ impl X86Interp {
 
     /// Offset `off` in segment `seg` as a linear address, recorded as the
     /// segment the next access is checked against. Compatibility mode keeps
-    /// linear addresses to 32 bits (but a 64-bit `%fs`/`%gs` base set by
-    /// `arch_prctl` is used whole, as on the fast path).
+    /// linear addresses to 32 bits.
     fn seg_lin(&self, seg: usize, off: u64) -> u64 {
         self.acc_seg.set(seg as u8);
-        let a = self.seg_base_of(seg).wrapping_add(off);
-        if seg >= SEG_FS { a } else { a & 0xffff_ffff }
+        self.seg_base_of(seg).wrapping_add(off) & 0xffff_ffff
     }
 
     /// [`Self::lin`] while [`Self::segmented`]: in the segment the
@@ -1016,7 +1027,7 @@ impl X86Interp {
         if self.segmented {
             self.lin_slow(off)
         } else {
-            off.wrapping_add(self.seg_base)
+            off.wrapping_add(self.seg_base) & self.lin_mask
         }
     }
 
@@ -1064,18 +1075,39 @@ impl X86Interp {
     /// stopping early at a following page that isn't executable (an
     /// instruction that actually extends into it then faults there, precisely
     /// like hardware).
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn fill_ibuf(&mut self, mem: &GuestMemory) -> Result<(), Step> {
-        if self.segmented {
-            // `rip` is the offset in a code segment with a base or a limit.
-            let (rip, room) = self.code_lin()?;
-            self.fill_ibuf_at(mem, rip)?;
-            self.ilen = self.ilen.min(room as u8);
-            return Ok(());
+        if self.fetch_slow {
+            return self.fill_ibuf_slow(mem);
         }
         self.fill_ibuf_at(mem, self.rip)
     }
 
+    /// [`Self::fill_ibuf`] after a `0x67` in compatibility mode, or while
+    /// [`Self::segmented`]: reset the transient addressing state, and fetch
+    /// through a code segment with a base or a limit (`rip` is the offset in
+    /// it).
+    #[cold]
+    fn fill_ibuf_slow(&mut self, mem: &GuestMemory) -> Result<(), Step> {
+        self.addr16 = false;
+        self.seg_ovr = SEG_NONE;
+        self.ea_seg.set(SEG_DS as u8);
+        self.fetch_slow = self.segmented;
+        if !self.segmented {
+            return self.fill_ibuf_at(mem, self.rip);
+        }
+        let (rip, room) = self.code_lin()?;
+        self.fill_ibuf_at(mem, rip)?;
+        self.ilen = self.ilen.min(room as u8);
+        Ok(())
+    }
+
     /// [`Self::fill_ibuf`] from linear address `rip`.
+    // Once per instruction: left to itself the compiler outlines it, which
+    // costs the hot loop about 6% (callgrind).
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn fill_ibuf_at(&mut self, mem: &GuestMemory, rip: u64) -> Result<(), Step> {
         let page = rip & !(PAGE - 1);
         let off = (rip - page) as usize;
@@ -1221,15 +1253,20 @@ impl X86Interp {
         if self.addr16 {
             return self.modrm16(md, rm_field, reg, pc);
         }
-        // An `%esp`/`%ebp` base addresses the stack segment by default.
-        let mut ss_based = rm_field == 0b101;
+        // The base register field (`%esp`/`%ebp` address the stack segment
+        // by default), 0b1000 for none.
+        let mut base_reg = rm_field;
         let (ea, pc) = if rm_field == 0b100 {
             // SIB byte follows.
             let (sib, pc) = self.fetch8(pc)?;
             let scale = sib >> 6;
             let idx_field = (sib >> 3) & 7;
             let base_field = sib & 7;
-            ss_based = base_field == 0b100 || (base_field == 0b101 && md != 0b00);
+            base_reg = if base_field == 0b101 && md == 0b00 {
+                0b1000
+            } else {
+                base_field
+            };
             // index field 0b100 (before REX.X extension) means "no index";
             // REX.X turns it into r12, which *is* usable as an index.
             let index_val = if idx_field == 0b100 && !rex.x {
@@ -1260,7 +1297,7 @@ impl X86Interp {
             )
         } else if rm_field == 0b101 && md == 0b00 && self.mode32 {
             // No RIP-relative form outside 64-bit mode: an absolute disp32.
-            ss_based = false;
+            base_reg = 0b1000;
             let (disp, pc) = self.fetch32(pc)?;
             (u64::from(disp), pc)
         } else if rm_field == 0b101 && md == 0b00 {
@@ -1287,7 +1324,7 @@ impl X86Interp {
             }
         };
         let ea = if self.addr32 { ea & 0xffff_ffff } else { ea };
-        if self.segmented && ss_based && self.seg_ovr == SEG_NONE {
+        if self.segmented && (base_reg == 0b100 || base_reg == 0b101) && self.seg_ovr == SEG_NONE {
             self.ea_seg.set(SEG_SS as u8);
         }
         Ok((
@@ -1364,7 +1401,7 @@ impl X86Interp {
         if self.segmented {
             return self.lin_slow(ea);
         }
-        ea.wrapping_add(self.seg_base)
+        ea.wrapping_add(self.seg_base) & self.lin_mask
     }
 
     /// Resolve a (non-8-bit) r/m operand.
@@ -2814,9 +2851,7 @@ impl X86Interp {
         }
         // Compatibility mode addresses with 32 bits throughout.
         self.addr32 = self.mode32;
-        self.addr16 = false;
         self.seg_base = 0;
-        self.seg_ovr = SEG_NONE;
         let mut p = Pfx {
             mode32: self.mode32,
             ..Pfx::default()
@@ -2835,38 +2870,37 @@ impl X86Interp {
                 }
                 0x66 => p.opsize = true,
                 // 16-bit addressing in compatibility mode.
-                0x67 if self.mode32 => self.addr16 = true,
+                0x67 if self.mode32 => {
+                    self.addr16 = true;
+                    self.fetch_slow = true;
+                }
                 0x67 => self.addr32 = true,
                 0xF0 => p.lock = true,
                 0xF2 => p.rep = 2,
                 0xF3 => p.rep = 1,
                 // es/cs/ss/ds: zero-based but in a segmented compatibility
-                // mode (where `seg_ovr` picks the segment).
+                // mode (where `seg_ovr`/`ea_seg` pick the segment; they are
+                // reset for each instruction only there).
                 0x26 | 0x2E | 0x36 | 0x3E => {
                     self.seg_base = 0;
                     self.seg_ovr = (b >> 3) & 3;
+                    self.ea_seg.set(self.seg_ovr);
                 }
                 0x64 => {
                     self.seg_base = self.fs_base;
                     self.seg_ovr = SEG_FS as u8;
+                    self.ea_seg.set(self.seg_ovr);
                 }
                 0x65 => {
                     self.seg_base = self.gs_base;
                     self.seg_ovr = SEG_GS as u8;
+                    self.ea_seg.set(self.seg_ovr);
                 }
                 _ => break b,
             }
             p.rex = Rex::default();
             p.has_rex = false;
         };
-        if self.segmented {
-            let s = if self.seg_ovr == SEG_NONE {
-                SEG_DS as u8
-            } else {
-                self.seg_ovr
-            };
-            self.ea_seg.set(s);
-        }
         if p.lock && op != 0x0F && !self.lock_ok(op, false, pc) {
             return Step::Illegal;
         }
@@ -4329,6 +4363,9 @@ impl Vcpu for X86Interp {
         self.segs = [0, USER_CS, USER_SS, 0, 0, 0];
         self.seg_cache = [SegCache::FLAT; 6];
         self.segmented = false;
+        self.addr16 = false;
+        self.fetch_slow = false;
+        self.lin_mask = u64::MAX;
         self.ldt = Arc::from([]);
         self.tls = [0; 3];
         self.syscall32 = false;
@@ -7581,6 +7618,35 @@ mod tests {
         assert!(matches!(s, Step::Branched) && c.segs[SEG_CS] == ldt_sel(0));
         assert_eq!(m.read_u32(STACK - 4).unwrap(), 0x23);
         assert_eq!(u64::from(m.read_u32(STACK - 8).unwrap()), CODE + 7);
+    }
+
+    /// Compatibility mode wraps linear addresses at 32 bits after adding the
+    /// segment base, `%fs`/`%gs` included: i386 glibc reaches its TLS with
+    /// negative offsets (`%gs:4(%edx)`, `%edx` = -0x60).
+    #[test]
+    fn compatibility_mode_linear_addresses_wrap_at_4_gib() {
+        let mut m = mem();
+        m.write_init(0x1_4004, &0x1234_5678u32.to_le_bytes())
+            .unwrap();
+        // mov eax, gs:[edx+4] / mov eax, fs:[edx+4]
+        for code in [&[0x65, 0x8B, 0x42, 0x04][..], &[0x64, 0x8B, 0x42, 0x04]] {
+            let (c, s) = run32_with(&mut m, code, |c| {
+                c.set_tls_desc(0, seg_desc(0x1_4060, 0xfffff, 0x2, D32_G));
+                assert!(c.load_data_segment(SEG_GS, 0x63));
+                assert!(c.load_data_segment(SEG_FS, 0x63));
+                c.gpr[RDX] = 0xffff_ffa0;
+            });
+            assert!(matches!(s, Step::Next), "{code:x?}: {s:?}");
+            assert_eq!(c.gpr[RAX], 0x1234_5678);
+        }
+        // ds with a base too (the segmented path).
+        let (c, s) = run32_with(&mut m, &[0x8B, 0x42, 0x04], |c| {
+            c.set_tls_desc(0, seg_desc(0x1_4060, 0xfffff, 0x2, D32_G));
+            assert!(c.load_data_segment(SEG_DS, 0x63));
+            c.gpr[RDX] = 0xffff_ffa0;
+        });
+        assert!(matches!(s, Step::Next) && c.segmented);
+        assert_eq!(c.gpr[RAX], 0x1234_5678);
     }
 
     /// The vcpu interface: segment selectors read back, data segment loads
