@@ -27,7 +27,7 @@ pub mod devfs;
 pub mod fstoolfs;
 pub mod mount;
 pub mod overlay;
-#[cfg(unix)]
+#[cfg(any(unix, nixvm_linux))]
 pub mod passthrough;
 pub mod procfs;
 #[cfg(unix)]
@@ -42,7 +42,7 @@ pub use devfs::DevFs;
 pub use fstoolfs::FsToolMount;
 pub use mount::{MountEntry, MountTable, PathMove, PivotMap, Propagation};
 pub use overlay::Overlay;
-#[cfg(unix)]
+#[cfg(any(unix, nixvm_linux))]
 pub use passthrough::Passthrough;
 pub use procfs::{ProcFs, ProcSelf, ProcTask, Sandbox};
 pub use sysfs::SysFs;

@@ -7,7 +7,10 @@
 //! terminal. Every clock read in the crate goes through [`now_unix`], which
 //! picks a working source per platform:
 //!
-//! * native: `SystemTime`, as before;
+//! * native: `SystemTime`, as before; on Linux the monotonic and CPU clocks
+//!   are the host's own `clock_gettime` — libc's (the vDSO, no kernel entry),
+//!   or the raw system call where there is no libc (`cfg(nixvm_libc_free)`:
+//!   the fullrust target, or the `linux-raw` feature);
 //! * wasm32 with the `wasm` feature: JavaScript's `performance.now()` via a
 //!   hand-declared wasm-bindgen import (sub-millisecond), anchored to the
 //!   wall clock with one `Date.now()` reading for `CLOCK_REALTIME`;
@@ -58,23 +61,37 @@ mod imp {
     // `CLOCK_PROCESS_CPUTIME_ID` = 2, `CLOCK_THREAD_CPUTIME_ID` = 3), so we read
     // the real host clocks directly — a since-boot monotonic and genuine CPU
     // time, exactly like a native process sees.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", nixvm_linux))]
     mod host {
         use std::time::Duration;
+        #[cfg(not(nixvm_libc_free))]
         #[repr(C)]
         struct Ts {
             sec: i64,
             nsec: i64,
         }
+        #[cfg(not(nixvm_libc_free))]
         unsafe extern "C" {
             fn clock_gettime(clk: i32, tp: *mut Ts) -> i32;
         }
-        pub fn read(clk: i32) -> Option<Duration> {
+        #[cfg(not(nixvm_libc_free))]
+        fn raw_read(clk: i32) -> Option<(i64, i64)> {
             let mut ts = Ts { sec: 0, nsec: 0 };
             // SAFETY: `ts` is a valid, writable `timespec`; `clk` is a fixed,
             // valid POSIX clock id. `clock_gettime` writes only `ts`.
-            (unsafe { clock_gettime(clk, &raw mut ts) } == 0)
-                .then(|| Duration::new(ts.sec.max(0) as u64, ts.nsec.clamp(0, 999_999_999) as u32))
+            (unsafe { clock_gettime(clk, &raw mut ts) } == 0).then_some((ts.sec, ts.nsec))
+        }
+        #[cfg(nixvm_libc_free)]
+        fn raw_read(clk: i32) -> Option<(i64, i64)> {
+            let ts = crate::linux_raw::clock_gettime(clk).ok()?;
+            Some((ts.tv_sec, ts.tv_nsec))
+        }
+        pub fn read(clk: i32) -> Option<Duration> {
+            let (sec, nsec) = raw_read(clk)?;
+            Some(Duration::new(
+                sec.max(0) as u64,
+                nsec.clamp(0, 999_999_999) as u32,
+            ))
         }
     }
 
@@ -87,7 +104,7 @@ mod imp {
     }
 
     pub fn now_monotonic() -> Duration {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", nixvm_linux))]
         if let Some(d) = host::read(1) {
             return d;
         }
@@ -95,7 +112,7 @@ mod imp {
     }
 
     pub fn now_cpu_process() -> Duration {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", nixvm_linux))]
         if let Some(d) = host::read(2) {
             return d;
         }
@@ -104,7 +121,7 @@ mod imp {
     }
 
     pub fn now_cpu_thread() -> Duration {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", nixvm_linux))]
         if let Some(d) = host::read(3) {
             return d;
         }

@@ -11686,13 +11686,8 @@ fn is_tty_ioctl(req: u32) -> bool {
 /// `struct winsize` (8 bytes) are byte-identical — copy the fixed-size struct
 /// across. A host failure (notably `ENOTTY` when stdio is a pipe) maps straight
 /// back to the guest as that negative errno, keeping `isatty()` honest.
-#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[cfg(all(any(unix, nixvm_linux), not(target_arch = "wasm32")))]
 fn host_tty_ioctl(host_fd: i32, req: u32, arg: u64, mem: &mut GuestMemory) -> i64 {
-    use core::ffi::{c_ulong, c_void};
-    // Variadic to match the C prototype (and the vcpu crate's declaration).
-    unsafe extern "C" {
-        fn ioctl(fd: i32, request: c_ulong, ...) -> i32;
-    }
     let (size, write) = match req {
         0x5401 => (36usize, false),    // TCGETS
         0x5402..=0x5404 => (36, true), // TCSETS/TCSETSW/TCSETSF
@@ -11707,17 +11702,8 @@ fn host_tty_ioctl(host_fd: i32, req: u32, arg: u64, mem: &mut GuestMemory) -> i6
     } else {
         vec![0u8; size]
     };
-    // SAFETY: `host_fd` is one of this process's own std streams; `buf` is
-    // exactly the `size` bytes the request reads or writes.
-    let r = unsafe {
-        ioctl(
-            host_fd,
-            c_ulong::from(req),
-            buf.as_mut_ptr().cast::<c_void>(),
-        )
-    };
-    if r < 0 {
-        return -i64::from(std::io::Error::last_os_error().raw_os_error().unwrap_or(25));
+    if let Err(e) = host_ioctl(host_fd, req, &mut buf) {
+        return -i64::from(e.raw_os_error().unwrap_or(25));
     }
     if !write && mem.write(arg, &buf).is_err() {
         return err(Errno::EFAULT);
@@ -11725,8 +11711,36 @@ fn host_tty_ioctl(host_fd: i32, req: u32, arg: u64, mem: &mut GuestMemory) -> i6
     0
 }
 
+/// `ioctl(fd, req, buf)` on the host, where `buf` is exactly the bytes the
+/// request reads or writes: a raw system call on a Linux-ABI host, libc's
+/// `ioctl` elsewhere.
+#[cfg(all(any(unix, nixvm_linux), not(target_arch = "wasm32")))]
+fn host_ioctl(fd: i32, req: u32, buf: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(nixvm_linux)]
+    {
+        // SAFETY: `fd` is one of this process's own std streams; `buf` is
+        // exactly the bytes the request reads or writes.
+        unsafe { crate::linux_raw::ioctl(fd, u64::from(req), buf.as_mut_ptr() as usize) }.map(drop)
+    }
+    #[cfg(not(nixvm_linux))]
+    {
+        use core::ffi::{c_ulong, c_void};
+        // Variadic to match the C prototype.
+        unsafe extern "C" {
+            fn ioctl(fd: i32, request: c_ulong, ...) -> i32;
+        }
+        // SAFETY: as above.
+        let r = unsafe { ioctl(fd, c_ulong::from(req), buf.as_mut_ptr().cast::<c_void>()) };
+        if r < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// No host tty to forward to (wasm / non-unix): every terminal ioctl is ENOTTY.
-#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
+#[cfg(not(all(any(unix, nixvm_linux), not(target_arch = "wasm32"))))]
 fn host_tty_ioctl(_host_fd: i32, _req: u32, _arg: u64, _mem: &mut GuestMemory) -> i64 {
     err(Errno::ENOTTY)
 }
@@ -14988,7 +15002,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     #[test]
     fn reads_host_file_through_passthrough_hole() {
         use crate::fs::Passthrough;

@@ -52,7 +52,7 @@ pub fn check(ret: c_int, what: &str) -> Result<c_int, VcpuError> {
     } else {
         Err(VcpuError::Backend(format!(
             "{what} failed: {}",
-            std::io::Error::last_os_error()
+            sys::last_error()
         )))
     }
 }
@@ -209,7 +209,7 @@ impl Vm {
                 (*run).immediate_exit = 1;
                 let ret = sys::ioctl(fd.0, sys::KVM_RUN, 0u64);
                 (*run).immediate_exit = 0;
-                ret < 0 && std::io::Error::last_os_error().raw_os_error() == Some(EINTR)
+                ret < 0 && sys::last_error().raw_os_error() == Some(EINTR)
             };
             if settled {
                 return Some((fd, run));
@@ -245,7 +245,7 @@ impl Vm {
         if run == sys::MAP_FAILED {
             return Err(VcpuError::Backend(format!(
                 "mmap(kvm_run) failed: {}",
-                std::io::Error::last_os_error()
+                sys::last_error()
             )));
         }
         Ok((fd, run.cast()))

@@ -77,7 +77,7 @@ mod preempt {
                 sa_restorer: 0,
             };
             // SAFETY: `act` is a valid, fully-initialized sigaction; we install
-            // our own no-op handler for a signal nothing else uses. glibc's
+            // our own no-op handler for a signal nothing else uses. The
             // wrapper supplies the SA_RESTORER trampoline.
             unsafe {
                 sys::sigaction(PREEMPT_SIG, std::ptr::from_ref(&act), std::ptr::null_mut());
@@ -658,7 +658,7 @@ impl KvmVcpu {
             preempt::disarm();
         }
         let interrupted = if ret < 0 {
-            let err = std::io::Error::last_os_error();
+            let err = sys::last_error();
             // EINTR/EAGAIN: a host signal broke us out of the guest.
             if !matches!(err.raw_os_error(), Some(4 | 11)) {
                 return Err(VcpuError::Backend(format!("KVM_RUN failed: {err}")));

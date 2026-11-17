@@ -30,7 +30,8 @@ pub const HOST_PAGE: usize = 16384;
 
 /// A raw, zero-filled, `HOST_PAGE`-aligned allocation owning `len` bytes.
 ///
-/// On unix the backing is a lazily-committed `mmap(MAP_ANON | MAP_NORESERVE)`, so
+/// On unix and any Linux-ABI host (libc or not) the backing is a lazily-committed
+/// `mmap(MAP_ANON | MAP_NORESERVE)`, so
 /// a large pool (the guest's physical RAM ceiling — tens of GiB) costs almost
 /// nothing until pages are actually touched: demand paging then faults in one
 /// 4 KiB host page per committed guest frame. An eager `alloc_zeroed` would
@@ -44,13 +45,14 @@ pub struct Region {
     /// On unix, the base and length of the whole `mmap` (which may be larger than
     /// `[ptr, ptr+len)` to carve out a `HOST_PAGE`-aligned `ptr`); `munmap`ed on
     /// drop. Unused on the `alloc_zeroed` fallback path.
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     map: (*mut u8, usize),
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, nixvm_linux))]
 mod sys {
     use std::ffi::c_void;
+    #[cfg(not(nixvm_linux))]
     unsafe extern "C" {
         pub fn mmap(
             addr: *mut c_void,
@@ -63,16 +65,42 @@ mod sys {
         pub fn munmap(addr: *mut c_void, len: usize) -> i32;
         pub fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
     }
+
+    // On a Linux-ABI host (libc-free ones included): the same three, as raw
+    // system calls with libc's return conventions.
+    #[cfg(nixvm_linux)]
+    pub unsafe fn mmap(
+        addr: *mut c_void,
+        len: usize,
+        prot: i32,
+        flags: i32,
+        fd: i32,
+        off: i64,
+    ) -> *mut c_void {
+        // SAFETY: forwarded from the caller.
+        unsafe { crate::linux_raw::mmap(addr as usize, len, prot, flags, fd, off) }
+            .map_or(MAP_FAILED, |a| a as *mut c_void)
+    }
+    #[cfg(nixvm_linux)]
+    pub unsafe fn munmap(addr: *mut c_void, len: usize) -> i32 {
+        // SAFETY: forwarded from the caller.
+        unsafe { crate::linux_raw::munmap(addr as usize, len) }.map_or(-1, |()| 0)
+    }
+    #[cfg(nixvm_linux)]
+    pub unsafe fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32 {
+        // SAFETY: forwarded from the caller.
+        unsafe { crate::linux_raw::madvise(addr as usize, len, advice) }.map_or(-1, |()| 0)
+    }
     pub const PROT_RW: i32 = 0x1 | 0x2; // PROT_READ | PROT_WRITE
     pub const MAP_PRIVATE: i32 = 0x2;
     pub const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", nixvm_linux))]
     pub const MAP_ANON_NORESERVE: i32 = 0x20 | 0x4000; // MAP_ANONYMOUS | MAP_NORESERVE
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", nixvm_linux))]
     pub const MADV_NOHUGEPAGE: i32 = 18;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", nixvm_linux)))]
     pub const MAP_ANON_NORESERVE: i32 = 0x1000 | 0x40; // macOS MAP_ANON | MAP_NORESERVE
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", nixvm_linux)))]
     pub const MADV_NOHUGEPAGE: i32 = 0; // no-op advice off Linux
 }
 
@@ -87,7 +115,7 @@ impl Region {
     /// never zero — zero-filled and `HOST_PAGE`-aligned. On unix the backing is a
     /// lazily-committed `mmap` (see the type doc); elsewhere an eager
     /// `alloc_zeroed`.
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     #[must_use]
     pub fn new(len: usize) -> Self {
         use std::ffi::c_void;
@@ -125,7 +153,7 @@ impl Region {
     }
 
     /// Non-unix fallback: an eager, zero-filled, aligned allocation.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, nixvm_linux)))]
     #[must_use]
     pub fn new(len: usize) -> Self {
         use std::alloc::{self, Layout};
@@ -266,14 +294,14 @@ impl Region {
 }
 
 impl Drop for Region {
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     fn drop(&mut self) {
         // SAFETY: `map` is the exact base/len returned by `mmap` in `new`,
         // unmapped exactly once here.
         unsafe { sys::munmap(self.map.0.cast::<std::ffi::c_void>(), self.map.1) };
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, nixvm_linux)))]
     fn drop(&mut self) {
         use std::alloc::{self, Layout};
         let layout = Layout::from_size_align(self.len, HOST_PAGE).expect("region layout");

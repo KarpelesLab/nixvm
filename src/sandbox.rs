@@ -62,7 +62,7 @@ use embed::{FromShared, Io, ToShared};
 
 use crate::Error;
 use crate::abi::Arch;
-#[cfg(unix)]
+#[cfg(any(unix, nixvm_linux))]
 use crate::fs::Passthrough;
 use crate::fs::{DevFs, MountFs, MountTable, Overlay, ProcFs, SysFs, TmpFs};
 use crate::image::{ImageRef, ImageStore};
@@ -1063,7 +1063,7 @@ impl Sandbox {
             )),
         );
 
-        #[cfg(unix)]
+        #[cfg(any(unix, nixvm_linux))]
         {
             if self.config.mount_work {
                 mounts.mount(
@@ -1105,11 +1105,11 @@ impl Sandbox {
                 }
             }
             RootSource::Dir(dir) => {
-                #[cfg(unix)]
+                #[cfg(any(unix, nixvm_linux))]
                 {
                     Ok(Some(Box::new(Passthrough::read_only(dir.clone()))))
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(any(unix, nixvm_linux)))]
                 {
                     let _ = dir;
                     Err(Error::Config("a host-directory root requires unix".into()))
@@ -1376,7 +1376,7 @@ mod tests {
         build_elf(2, 0x1_0000, None, &exit_words(code))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("nixvm-sb-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1384,7 +1384,7 @@ mod tests {
         dir
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     #[test]
     fn nude_mode_boots_the_command_from_a_host_dir_root() {
         let dir = temp_root("nude");
@@ -1405,7 +1405,7 @@ mod tests {
 
     /// PID 1 named through an *absolute* symlink (`/bin/sh -> /bin/busybox`)
     /// resolves inside the guest root, not on the host.
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     #[test]
     fn pid1_through_an_absolute_symlink_resolves_in_the_root() {
         let dir = temp_root("symlink");
@@ -1424,7 +1424,7 @@ mod tests {
 
     /// Without `.arch()`, the guest arch follows PID 1's ELF header; pinning
     /// a different one is a clear error.
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     #[test]
     fn guest_arch_follows_the_elf_unless_pinned() {
         let dir = temp_root("arch");
@@ -1450,7 +1450,7 @@ mod tests {
         assert_eq!(Arch::from_name("riscv64"), None);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     #[test]
     fn boots_a_dynamic_pid1_via_its_interpreter() {
         let dir = temp_root("dyn");
@@ -1477,7 +1477,7 @@ mod tests {
         assert_eq!(code, 55, "control transferred to the interpreter's entry");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     #[test]
     fn dynamic_pid1_missing_interpreter_is_a_clear_error() {
         let dir = temp_root("dyn-noint");
@@ -1497,7 +1497,7 @@ mod tests {
         assert!(matches!(err, Error::Config(m) if m.contains("dynamic linker")));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     #[test]
     fn booted_mode_runs_sbin_init() {
         let dir = temp_root("booted");
@@ -1514,7 +1514,7 @@ mod tests {
         assert_eq!(code, 7, "booted mode runs /sbin/init as PID 1");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     #[test]
     fn same_result_on_four_cpus() {
         let dir = temp_root("smp");

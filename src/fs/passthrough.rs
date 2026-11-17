@@ -12,8 +12,9 @@
 //! This module is the one deliberate exception to the project's "`unsafe`
 //! lives only in `vcpu::hvf`" rule: safe, TOCTOU-free confinement genuinely
 //! requires the dirfd-relative `*at(2)` syscalls, which `std` does not expose,
-//! so they are declared by hand below (see the security note). The `unsafe` is
-//! confined to those thin FFI shims.
+//! so the `host` submodule provides them (see the security note): raw system
+//! calls on a Linux-ABI host — libc-free ones included — and hand-declared
+//! libc functions elsewhere (macOS). The `unsafe` is confined to those shims.
 //!
 //! # Security: confined, symlink/TOCTOU-safe path resolution
 //!
@@ -59,10 +60,10 @@
 //! uniformly on both platforms instead.
 
 use std::collections::VecDeque;
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_int};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,12 +72,15 @@ use super::protect::{Op, Protected};
 use super::{Attrs, DirEntry, MountFs, NodeKind, SetTime};
 use crate::limits::Quota;
 
+mod host;
+use host::Timespec;
+
 /// `openat(2)`-family flag and errno values `std` doesn't expose. Declared
 /// by hand (rather than depending on the `libc` crate, which is not a
 /// dependency of this crate) directly from each platform's headers
 /// (`<fcntl.h>` / `<sys/errno.h>`); these are stable, documented ABI
 /// constants, not implementation details.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", nixvm_linux))]
 mod sys {
     pub const O_RDONLY: c_int = 0o0;
     pub const O_WRONLY: c_int = 0o1;
@@ -127,78 +131,8 @@ mod sys {
     use std::ffi::c_int;
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", nixvm_linux, target_os = "macos")))]
 compile_error!("passthrough: openat(2) flag/errno constants are only defined for linux and macos");
-
-// The handful of dirfd-relative syscalls confined resolution needs. `std`
-// exposes none of these; declaring exactly these six by hand keeps this
-// crate free of a `libc` dependency. Argument types mirror each function's
-// POSIX prototype; `mode` is always passed (even where the callee ignores
-// it, e.g. `openat` without `O_CREAT`) since C's variadic argument-promotion
-// rules mean a real caller would pass a promoted (register-width) value
-// there too.
-unsafe extern "C" {
-    fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: u32) -> c_int;
-    fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int;
-    fn statvfs(path: *const c_char, buf: *mut c_void) -> c_int;
-    fn mkdirat(dirfd: c_int, path: *const c_char, mode: u32) -> c_int;
-    fn symlinkat(target: *const c_char, dirfd: c_int, linkpath: *const c_char) -> c_int;
-    fn renameat(
-        olddirfd: c_int,
-        oldpath: *const c_char,
-        newdirfd: c_int,
-        newpath: *const c_char,
-    ) -> c_int;
-    fn linkat(
-        olddirfd: c_int,
-        oldpath: *const c_char,
-        newdirfd: c_int,
-        newpath: *const c_char,
-        flags: c_int,
-    ) -> c_int;
-    fn readlinkat(dirfd: c_int, path: *const c_char, buf: *mut c_char, bufsiz: usize) -> isize;
-    fn utimensat(dirfd: c_int, path: *const c_char, times: *const Timespec, flags: c_int) -> c_int;
-    fn fchmodat(dirfd: c_int, path: *const c_char, mode: u32, flags: c_int) -> c_int;
-    fn fchownat(dirfd: c_int, path: *const c_char, owner: u32, group: u32, flags: c_int) -> c_int;
-    fn mknodat(dirfd: c_int, path: *const c_char, mode: u32, dev: u64) -> c_int;
-    /// Takes ownership of `fd` (POSIX: on success the fd must not be used or
-    /// closed independently afterward — only via `closedir`).
-    fn fdopendir(fd: c_int) -> *mut c_void;
-    /// Returns `NULL` both at end-of-stream and on error; see
-    /// [`list_dir_fd`] for how that ambiguity is handled here.
-    fn readdir(dirp: *mut c_void) -> *mut c_void;
-    fn closedir(dirp: *mut c_void) -> c_int;
-}
-
-/// Mirrors the *leading* fields of the platform's real `struct dirent`
-/// (verified against `<sys/dirent.h>` for macOS; the standard glibc/musl
-/// `dirent64` layout for Linux — stable, undocumented-but-unchanged-in-decades
-/// ABI). Only used to compute the byte offset of `d_name` via `offset_of!`;
-/// the trailing array's declared length is irrelevant to that offset (it's
-/// the last field), so a 1-element stub is deliberately used instead of the
-/// real (1024/256-byte) array size.
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[allow(clippy::struct_field_names)] // names mirror the C `struct dirent` fields verbatim
-struct RawDirentHeader {
-    d_ino: u64,
-    d_seekoff: u64,
-    d_reclen: u16,
-    d_namlen: u16,
-    d_type: u8,
-    d_name: [c_char; 1],
-}
-
-#[cfg(target_os = "linux")]
-#[repr(C)]
-#[allow(clippy::struct_field_names)] // names mirror the C `struct dirent64` fields verbatim
-struct RawDirentHeader {
-    d_ino: u64,
-    d_off: i64,
-    d_reclen: u16,
-    d_type: u8,
-    d_name: [c_char; 1],
-}
 
 /// Bound on symlink hops resolved per lookup (matches Linux's own
 /// `MAXSYMLINKS`), so a symlink cycle fails with `ELOOP` instead of looping
@@ -272,18 +206,9 @@ fn normalize_errno(err: io::Error) -> io::Error {
     io::Error::from_raw_os_error(linux)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "macos"))]
 fn normalize_errno(err: io::Error) -> io::Error {
     err
-}
-
-/// The kernel `struct timespec` (64-bit `tv_sec`/`tv_nsec`) passed to
-/// `utimensat`. Same layout on Linux and macOS for 64-bit targets.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
 }
 
 /// Translate one [`SetTime`] into a host `timespec` for `utimensat`.
@@ -310,138 +235,69 @@ fn to_timespec(t: SetTime) -> Timespec {
 /// for).
 fn raw_utimensat(dirfd: RawFd, name: &CStr, atime: SetTime, mtime: SetTime) -> io::Result<()> {
     let times = [to_timespec(atime), to_timespec(mtime)];
-    let r = unsafe {
-        utimensat(
-            dirfd,
-            name.as_ptr(),
-            times.as_ptr(),
-            sys::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if r < 0 {
-        Err(normalize_errno(io::Error::last_os_error()))
-    } else {
-        Ok(())
-    }
+    host::utimensat(dirfd, name, &times, sys::AT_SYMLINK_NOFOLLOW).map_err(normalize_errno)
 }
 
 fn raw_fchmodat(dirfd: RawFd, name: &CStr, mode: u32) -> io::Result<()> {
     // The confined resolution already followed any symlink the guest wanted
     // followed, so the final component is a concrete node; flags = 0.
-    let r = unsafe { fchmodat(dirfd, name.as_ptr(), mode & 0o7777, 0) };
-    if r < 0 {
-        Err(normalize_errno(io::Error::last_os_error()))
-    } else {
-        Ok(())
-    }
+    host::fchmodat(dirfd, name, mode & 0o7777).map_err(normalize_errno)
 }
 
 fn raw_fchownat(dirfd: RawFd, name: &CStr, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
     // A `-1` (u32::MAX) owner/group means "leave unchanged", matching chown(2).
     let owner = uid.unwrap_or(u32::MAX);
     let group = gid.unwrap_or(u32::MAX);
-    let r = unsafe { fchownat(dirfd, name.as_ptr(), owner, group, sys::AT_SYMLINK_NOFOLLOW) };
-    if r < 0 {
-        Err(normalize_errno(io::Error::last_os_error()))
-    } else {
-        Ok(())
-    }
+    host::fchownat(dirfd, name, owner, group, sys::AT_SYMLINK_NOFOLLOW).map_err(normalize_errno)
 }
 
 fn raw_mknodat(dirfd: RawFd, name: &CStr, mode: u32) -> io::Result<()> {
-    let r = unsafe { mknodat(dirfd, name.as_ptr(), mode, 0) };
-    if r < 0 {
-        Err(normalize_errno(io::Error::last_os_error()))
-    } else {
-        Ok(())
-    }
+    host::mknodat(dirfd, name, mode).map_err(normalize_errno)
 }
 
 fn raw_openat(dirfd: RawFd, name: &CStr, flags: c_int, mode: u32) -> io::Result<OwnedFd> {
-    let fd = unsafe { openat(dirfd, name.as_ptr(), flags | sys::O_CLOEXEC, mode) };
-    if fd < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
+    host::openat(dirfd, name, flags | sys::O_CLOEXEC, mode)
 }
 
 /// `Ok(Some(target))` if `name` is a symlink, `Ok(None)` if it exists but
 /// isn't one (`EINVAL`), `Err` for any other failure (including not found).
 fn raw_readlinkat(dirfd: RawFd, name: &CStr) -> io::Result<Option<String>> {
     let mut buf = [0u8; 4096];
-    let n = unsafe {
-        readlinkat(
-            dirfd,
-            name.as_ptr(),
-            buf.as_mut_ptr().cast::<c_char>(),
-            buf.len(),
-        )
-    };
-    if n < 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(22) {
-            return Ok(None); // EINVAL: exists, but isn't a symlink
-        }
-        return Err(normalize_errno(err));
+    match host::readlinkat(dirfd, name, &mut buf) {
+        Ok(n) => Ok(Some(String::from_utf8_lossy(&buf[..n]).into_owned())),
+        // EINVAL: exists, but isn't a symlink
+        Err(err) if err.raw_os_error() == Some(22) => Ok(None),
+        Err(err) => Err(normalize_errno(err)),
     }
-    Ok(Some(
-        String::from_utf8_lossy(&buf[..n as usize]).into_owned(),
-    ))
 }
 
 fn raw_unlinkat(dirfd: RawFd, name: &CStr, flags: c_int) -> io::Result<()> {
-    let r = unsafe { unlinkat(dirfd, name.as_ptr(), flags) };
-    if r < 0 {
-        Err(normalize_errno(io::Error::last_os_error()))
-    } else {
-        Ok(())
-    }
+    host::unlinkat(dirfd, name, flags).map_err(normalize_errno)
 }
 
 fn raw_mkdirat(dirfd: RawFd, name: &CStr, mode: u32) -> io::Result<()> {
-    let r = unsafe { mkdirat(dirfd, name.as_ptr(), mode) };
-    if r < 0 {
-        Err(normalize_errno(io::Error::last_os_error()))
-    } else {
-        Ok(())
-    }
+    host::mkdirat(dirfd, name, mode).map_err(normalize_errno)
 }
 
 fn raw_symlinkat(target: &CStr, dirfd: RawFd, name: &CStr) -> io::Result<()> {
-    let r = unsafe { symlinkat(target.as_ptr(), dirfd, name.as_ptr()) };
-    if r < 0 {
-        Err(normalize_errno(io::Error::last_os_error()))
-    } else {
-        Ok(())
-    }
+    host::symlinkat(target, dirfd, name).map_err(normalize_errno)
 }
 
 fn raw_renameat(from_dirfd: RawFd, from: &CStr, to_dirfd: RawFd, to: &CStr) -> io::Result<()> {
-    let r = unsafe { renameat(from_dirfd, from.as_ptr(), to_dirfd, to.as_ptr()) };
-    if r < 0 {
-        Err(normalize_errno(io::Error::last_os_error()))
-    } else {
-        Ok(())
-    }
+    host::renameat(from_dirfd, from, to_dirfd, to).map_err(normalize_errno)
 }
 
 /// Hard-link `to` (under `to_dirfd`) to the existing `from` (under `from_dirfd`).
 /// `flags = 0`: the final component of `from` is not followed, so linking a
 /// symlink links the link itself — matching `link(2)`.
 fn raw_linkat(from_dirfd: RawFd, from: &CStr, to_dirfd: RawFd, to: &CStr) -> io::Result<()> {
-    let r = unsafe { linkat(from_dirfd, from.as_ptr(), to_dirfd, to.as_ptr(), 0) };
-    if r < 0 {
-        Err(normalize_errno(io::Error::last_os_error()))
-    } else {
-        Ok(())
-    }
+    host::linkat(from_dirfd, from, to_dirfd, to).map_err(normalize_errno)
 }
 
 /// Open an fd on a symlink *itself* (not its target) — the fd-based
 /// equivalent of `lstat`, needed because `stat()` must describe the symlink
 /// even though the confined walk otherwise only ever opens non-symlinks.
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "macos"))]
 fn open_symlink_itself(parent: RawFd, name: &CStr) -> io::Result<OwnedFd> {
     raw_openat(parent, name, sys::O_PATH | sys::O_NOFOLLOW, 0)
 }
@@ -451,62 +307,22 @@ fn open_symlink_itself(parent: RawFd, name: &CStr) -> io::Result<OwnedFd> {
     raw_openat(parent, name, sys::O_SYMLINK, 0)
 }
 
-/// RAII guard closing a `DIR *` (and, transitively, its underlying fd) on
-/// every exit path, including early returns on error.
-struct DirGuard(*mut c_void);
-impl Drop for DirGuard {
-    fn drop(&mut self) {
-        unsafe {
-            closedir(self.0);
-        }
-    }
-}
-
 /// List a directory we already hold open (and have therefore already
 /// confined/verified via [`Passthrough::resolve`]) by its fd — never by
 /// re-opening any path, which would reintroduce a symlink-swap TOCTOU
-/// window. Consumes `fd`: `fdopendir` takes ownership of it on success.
+/// window. Consumes `fd`.
 fn list_dir_fd(fd: OwnedFd) -> io::Result<Vec<DirEntry>> {
-    let raw = fd.into_raw_fd();
-    let dirp = unsafe { fdopendir(raw) };
-    if dirp.is_null() {
-        let err = io::Error::last_os_error();
-        // `fdopendir` failing leaves the fd unowned by it; reclaim it as an
-        // `OwnedFd` purely so it gets closed on drop.
-        drop(unsafe { OwnedFd::from_raw_fd(raw) });
-        return Err(err);
-    }
-    // Keeps `raw` open (via `closedir` on drop) for the whole function, so
-    // it's still valid for the per-entry `openat`/`fstat` lookups below —
-    // `openat`/`fstat` on `raw` don't touch the `readdir` cursor, so using
-    // it directly alongside the `DIR *` stream is safe.
-    let guard = DirGuard(dirp);
-
-    let name_offset = std::mem::offset_of!(RawDirentHeader, d_name);
-    let mut names = Vec::new();
-    loop {
-        // POSIX: `readdir` returns NULL at end-of-stream *and* on error,
-        // distinguished only by whether it left `errno` set. `std` has no
-        // portable way to reset/inspect `errno` directly, so — like most
-        // hand-rolled `readdir` loops — end-of-stream is assumed on every
-        // NULL; a genuine mid-stream I/O error just truncates the listing
-        // rather than surfacing as an `Err`. Confinement/TOCTOU-safety is
-        // unaffected either way (`d_name` extraction below never touches
-        // the actual filesystem).
-        let entry = unsafe { readdir(dirp) };
-        if entry.is_null() {
-            break;
-        }
-        // Safety: `entry` is a non-null `dirent`/`dirent64` pointer just
-        // returned by `readdir`; `d_name` is NUL-terminated within it.
-        let name_ptr = unsafe { entry.cast::<u8>().add(name_offset).cast::<c_char>() };
-        let name = unsafe { CStr::from_ptr(name_ptr) }
-            .to_string_lossy()
-            .into_owned();
-        if name != "." && name != ".." {
-            names.push(name);
-        }
-    }
+    // `dir` keeps the descriptor open for the whole function, so it's still
+    // valid for the per-entry `openat`/`fstat` lookups below. Confinement/
+    // TOCTOU-safety doesn't depend on the listing: each name is only ever
+    // looked up again relative to this same fd.
+    let (dir, raw_names) = host::read_dir(fd)?;
+    let raw = dir.as_raw_fd();
+    let names: Vec<String> = raw_names
+        .iter()
+        .map(|n| String::from_utf8_lossy(n).into_owned())
+        .filter(|n| n != "." && n != "..")
+        .collect();
 
     // Per-entry metadata via our own confined `stat`-style lookup (an
     // `openat(O_NOFOLLOW)` + `fstat`, falling back to the symlink-itself fd
@@ -536,7 +352,7 @@ fn list_dir_fd(fd: OwnedFd) -> io::Result<Vec<DirEntry>> {
         out.push(DirEntry { name, kind, inode });
     }
 
-    drop(guard); // closedir(dirp) — also closes `raw`.
+    drop(dir); // closes `raw`.
     Ok(out)
 }
 
@@ -1308,30 +1124,13 @@ pub struct HostSpace {
 #[must_use]
 pub fn host_space(path: &Path) -> Option<HostSpace> {
     let cpath = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
-    // `struct statvfs`, whose start is all we read: f_bsize, f_frsize, then
-    // f_blocks, f_bfree, f_bavail, f_files, f_ffree, f_favail. Those last six are
-    // 64-bit on Linux and 32-bit on macOS. Oversized for either's whole struct.
-    let mut buf = [0u64; 64];
-    // SAFETY: `cpath` is NUL-terminated, and `buf` is larger than `struct statvfs`
-    // on every target here; the callee only writes within that struct.
-    if unsafe { statvfs(cpath.as_ptr(), buf.as_mut_ptr().cast()) } != 0 {
-        return None;
-    }
-    let frsize = buf[1];
-    #[cfg(target_os = "linux")]
-    let (blocks, bavail, files, favail) = (buf[2], buf[4], buf[5], buf[7]);
-    #[cfg(target_os = "macos")]
-    let (blocks, bavail, files, favail) = {
-        let field = |i: usize| {
-            let word = buf[2 + i / 2];
-            if i.is_multiple_of(2) {
-                word & 0xffff_ffff
-            } else {
-                word >> 32
-            }
-        };
-        (field(0), field(2), field(3), field(5))
-    };
+    let host::VfsStat {
+        frsize,
+        blocks,
+        bavail,
+        files,
+        favail,
+    } = host::statvfs(&cpath).ok()?;
     Some(HostSpace {
         total: blocks.saturating_mul(frsize),
         avail: bavail.saturating_mul(frsize),

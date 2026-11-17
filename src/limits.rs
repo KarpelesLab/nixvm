@@ -78,7 +78,7 @@ pub fn guest_memory_ceiling() -> u64 {
 /// on the filesystem of the working directory, at least 1 GiB (no ceiling if
 /// that can't be told).
 fn default_disk_bytes() -> u64 {
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     {
         let free = std::env::current_dir()
             .ok()

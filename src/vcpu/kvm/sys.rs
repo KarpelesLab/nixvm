@@ -6,44 +6,198 @@
 //! (`ioctl` request numbers encode the struct size, so a wrong layout fails
 //! loudly with `EINVAL`/`EFAULT` rather than corrupting memory).
 //!
-//! This module only *declares*; the callers own the `unsafe` (with SAFETY
-//! notes) since correctness depends on call-site invariants (live fds, valid
-//! pointers, struct layouts matching the running kernel's ABI).
+//! The calls themselves (`open`, `ioctl`, `mmap`, the preemption timer's POSIX
+//! timer and signal handler) are raw system calls ([`crate::linux_raw`]) — no
+//! libc, so the backend also builds for a libc-free Linux target (fullrust).
+//! They keep libc's shapes and conventions: `-1` on failure, with the error
+//! read back by [`last_error`] (a raw call doesn't set libc's `errno`, so
+//! `io::Error::last_os_error()` must not be used after one). The callers own
+//! the `unsafe` (with SAFETY notes) since correctness depends on call-site
+//! invariants (live fds, valid pointers, struct layouts matching the running
+//! kernel's ABI).
 
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 
-use std::ffi::{c_char, c_int, c_ulong, c_void};
+use std::cell::Cell;
+use std::ffi::{CStr, c_char, c_int, c_ulong, c_void};
+use std::io;
 
-unsafe extern "C" {
-    pub fn open(path: *const c_char, flags: c_int, ...) -> c_int;
-    pub fn close(fd: c_int) -> c_int;
-    pub fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
-    pub fn mmap(
-        addr: *mut c_void,
-        len: usize,
-        prot: c_int,
-        flags: c_int,
-        fd: c_int,
-        offset: i64,
-    ) -> *mut c_void;
-    pub fn munmap(addr: *mut c_void, len: usize) -> c_int;
+use crate::linux_raw as raw;
 
-    // Per-thread wall-clock preemption (see `vcpu::preempt`): a POSIX timer
-    // whose expiry signal breaks the running thread out of `KVM_RUN` with
-    // EINTR. These live in libc on glibc ≥ 2.34 (the old librt was merged in),
-    // which every current Linux host provides — the same C runtime the ioctls
-    // above already link against.
-    pub fn gettid() -> c_int;
-    pub fn sigaction(signum: c_int, act: *const sigaction, oldact: *mut sigaction) -> c_int;
-    pub fn timer_create(clockid: c_int, sevp: *mut sigevent, timerid: *mut timer_t) -> c_int;
-    pub fn timer_settime(
-        timerid: timer_t,
-        flags: c_int,
-        new_value: *const itimerspec,
-        old_value: *mut itimerspec,
-    ) -> c_int;
-    pub fn timer_delete(timerid: timer_t) -> c_int;
+thread_local! {
+    /// The error of this thread's last failed call below (libc's `errno`).
+    static ERRNO: Cell<i32> = const { Cell::new(0) };
+}
+
+/// The error of this thread's last failed call in this module.
+pub fn last_error() -> io::Error {
+    io::Error::from_raw_os_error(ERRNO.with(Cell::get))
+}
+
+/// A raw result in libc's convention: the value, or `-1` with the error saved.
+fn libc_ret<T: TryFrom<usize>>(r: io::Result<usize>, fail: T) -> T {
+    match r {
+        Ok(v) => T::try_from(v).unwrap_or(fail),
+        Err(e) => {
+            ERRNO.with(|c| c.set(e.raw_os_error().unwrap_or(5))); // EIO
+            fail
+        }
+    }
+}
+
+/// `open(path, flags)` (no `O_CREAT`, so no mode).
+///
+/// # Safety
+/// `path` must be NUL-terminated.
+pub unsafe fn open(path: *const c_char, flags: c_int) -> c_int {
+    // SAFETY: the caller vouches for `path`.
+    let path = unsafe { CStr::from_ptr(path) };
+    let r = raw::openat(raw::AT_FDCWD, path, flags, 0).map(|fd| {
+        use std::os::fd::IntoRawFd;
+        fd.into_raw_fd() as usize
+    });
+    libc_ret(r, -1)
+}
+
+/// # Safety
+/// `fd` must be a descriptor nothing else owns or still uses.
+pub unsafe fn close(fd: c_int) -> c_int {
+    libc_ret(raw::close(fd).map(|()| 0), -1)
+}
+
+/// An `ioctl` argument: an integer, or a pointer to the request's struct.
+pub trait IoctlArg {
+    fn word(self) -> usize;
+}
+macro_rules! ioctl_int {
+    ($($t:ty),*) => {$(
+        impl IoctlArg for $t {
+            fn word(self) -> usize {
+                self as usize
+            }
+        }
+    )*};
+}
+ioctl_int!(i32, u32, u64, usize);
+impl<T> IoctlArg for *const T {
+    fn word(self) -> usize {
+        self as usize
+    }
+}
+impl<T> IoctlArg for *mut T {
+    fn word(self) -> usize {
+        self as usize
+    }
+}
+
+/// `ioctl(fd, request, arg)`.
+///
+/// # Safety
+/// `arg` must be what `request` expects: for a pointer, live memory of the
+/// struct the request reads or writes.
+pub unsafe fn ioctl(fd: c_int, request: c_ulong, arg: impl IoctlArg) -> c_int {
+    // SAFETY: forwarded from the caller. Results that don't fit an int (none of
+    // the KVM ioctls return one) read as failure.
+    libc_ret(unsafe { raw::ioctl(fd, request, arg.word()) }, -1)
+}
+
+/// # Safety
+/// As `mmap(2)`.
+pub unsafe fn mmap(
+    addr: *mut c_void,
+    len: usize,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    offset: i64,
+) -> *mut c_void {
+    // SAFETY: forwarded from the caller.
+    let r = unsafe { raw::mmap(addr as usize, len, prot, flags, fd, offset) };
+    libc_ret(r, MAP_FAILED as usize) as *mut c_void
+}
+
+/// # Safety
+/// `[addr, addr+len)` must be a mapping nothing still uses.
+pub unsafe fn munmap(addr: *mut c_void, len: usize) -> c_int {
+    // SAFETY: forwarded from the caller.
+    libc_ret(unsafe { raw::munmap(addr as usize, len) }.map(|()| 0), -1)
+}
+
+/// The calling thread's id.
+///
+/// # Safety
+/// None; `unsafe` only to keep the libc shape.
+pub unsafe fn gettid() -> c_int {
+    raw::gettid()
+}
+
+// Per-thread wall-clock preemption (see `vcpu::preempt`): a POSIX timer whose
+// expiry signal breaks the running thread out of `KVM_RUN` with EINTR.
+
+/// Install `act`'s handler for `signum`, as libc's `sigaction` does (with the
+/// signal-return trampoline set up). Only what the preemption handler uses is
+/// honoured: the handler and flags, an empty mask; `oldact` must be null.
+///
+/// # Safety
+/// `act` must point at a valid `sigaction` whose handler is an
+/// `extern "C" fn(c_int)`.
+pub unsafe fn sigaction(signum: c_int, act: *const sigaction, oldact: *mut sigaction) -> c_int {
+    debug_assert!(
+        oldact.is_null(),
+        "sigaction: the old action is not reported"
+    );
+    // SAFETY: the caller vouches for `act`.
+    let act = unsafe { &*act };
+    // SAFETY: the caller vouches that the handler is an `extern "C" fn(c_int)`.
+    let handler: extern "C" fn(c_int) = unsafe { std::mem::transmute(act.sa_handler) };
+    let r = raw::set_signal_handler(signum, handler, u64::from(act.sa_flags as u32));
+    libc_ret(r.map(|()| 0), -1)
+}
+
+/// `timer_create` for a `SIGEV_THREAD_ID` timer (the only kind used here);
+/// the kernel's timer id is stored in `*timerid` as glibc does.
+///
+/// # Safety
+/// `sevp` and `timerid` must be valid; `sevp` must ask for `SIGEV_THREAD_ID`.
+pub unsafe fn timer_create(clockid: c_int, sevp: *mut sigevent, timerid: *mut timer_t) -> c_int {
+    // SAFETY: the caller vouches for both pointers.
+    let ev = unsafe { &*sevp };
+    debug_assert_eq!(ev.sigev_notify, SIGEV_THREAD_ID);
+    match raw::timer_create_thread(clockid, ev.sigev_signo, ev.sigev_notify_thread_id) {
+        Ok(id) => {
+            // SAFETY: as above.
+            unsafe { *timerid = id as isize as timer_t };
+            0
+        }
+        Err(e) => libc_ret(Err(e), -1),
+    }
+}
+
+/// # Safety
+/// `timerid` must come from [`timer_create`]; `new_value` must be valid;
+/// `old_value` must be null.
+pub unsafe fn timer_settime(
+    timerid: timer_t,
+    flags: c_int,
+    new_value: *const itimerspec,
+    old_value: *mut itimerspec,
+) -> c_int {
+    debug_assert!(flags == 0 && old_value.is_null());
+    // SAFETY: the caller vouches for `new_value`.
+    let v = unsafe { &*new_value };
+    let ts = |t: timespec| raw::Timespec {
+        tv_sec: t.tv_sec,
+        tv_nsec: t.tv_nsec,
+    };
+    let r = raw::timer_settime(timerid as isize as c_int, ts(v.it_interval), ts(v.it_value));
+    libc_ret(r.map(|()| 0), -1)
+}
+
+/// # Safety
+/// `timerid` must come from [`timer_create`] and not be used after.
+pub unsafe fn timer_delete(timerid: timer_t) -> c_int {
+    libc_ret(raw::timer_delete(timerid as isize as c_int).map(|()| 0), -1)
 }
 
 /// Opaque POSIX timer handle (`timer_t`), written by [`timer_create`].
@@ -97,7 +251,7 @@ pub struct itimerspec {
 }
 
 /// `struct sigaction` in glibc's userspace layout (handler, mask, flags,
-/// restorer). We call libc's `sigaction`, so glibc installs its own SA_RESTORER
+/// restorer), as [`sigaction()`] takes it. It installs its own SA_RESTORER
 /// trampoline regardless of `sa_restorer`; the fields we set are the no-op
 /// handler and empty mask, with `sa_flags` deliberately lacking `SA_RESTART` so
 /// the delivered signal interrupts `KVM_RUN` (EINTR) instead of restarting it.

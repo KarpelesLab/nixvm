@@ -519,7 +519,7 @@ impl GuestMemory {
     #[must_use]
     #[cfg_attr(
         not(any(
-            all(target_os = "linux", target_arch = "x86_64"),
+            all(nixvm_linux, target_arch = "x86_64"),
             all(target_os = "macos", target_arch = "aarch64")
         )),
         allow(dead_code)
@@ -533,7 +533,7 @@ impl GuestMemory {
     #[must_use]
     #[cfg_attr(
         not(any(
-            all(target_os = "linux", target_arch = "x86_64"),
+            all(nixvm_linux, target_arch = "x86_64"),
             all(target_os = "macos", target_arch = "aarch64")
         )),
         allow(dead_code)
@@ -546,7 +546,7 @@ impl GuestMemory {
     #[must_use]
     #[cfg_attr(
         not(any(
-            all(target_os = "linux", target_arch = "x86_64"),
+            all(nixvm_linux, target_arch = "x86_64"),
             all(target_os = "macos", target_arch = "aarch64")
         )),
         allow(dead_code)
@@ -566,10 +566,7 @@ impl GuestMemory {
     /// KVM vcpu can read the pushed `#PF` exception frame lock-free (no
     /// `GuestMemory` borrow) on the SMP path. Changes on `fork`/`exec_reset`.
     #[must_use]
-    #[cfg_attr(
-        not(all(target_os = "linux", target_arch = "x86_64")),
-        allow(dead_code)
-    )] // KVM-only
+    #[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
     pub(crate) fn kstack_pa(&self) -> u64 {
         self.kstack_pa
     }

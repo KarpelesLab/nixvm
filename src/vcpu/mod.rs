@@ -425,7 +425,7 @@ pub trait Backend {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod hvf;
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(nixvm_linux, target_arch = "x86_64"))]
 pub mod kvm;
 
 pub mod interp;
@@ -454,7 +454,7 @@ pub fn select(guest: Arch) -> Result<Box<dyn Backend>, VcpuError> {
             return Ok(Box::new(backend) as Box<dyn Backend>);
         }
     }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(nixvm_linux, target_arch = "x86_64"))]
     {
         // When `/dev/kvm` is unavailable/inaccessible (a container, CI without
         // the device), `new` fails and we fall through to the interpreter.

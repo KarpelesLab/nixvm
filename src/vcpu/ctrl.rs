@@ -49,16 +49,10 @@ const VDSO_OFF: u64 = 0x48000;
 const VVAR_OFF: u64 = 0x49000;
 
 /// The virtual address `IA32_LSTAR` points at: the `hlt; sysretq` trampoline.
-#[cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)] // KVM-only
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const LSTAR_VA: u64 = CTRL_GPA + TRAMP_OFF;
 /// Linear address of the GDT.
-#[cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)] // KVM-only
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const GDT_BASE: u64 = CTRL_GPA + GDT_OFF;
 /// The `#PF` trampoline's virtual address (the host recognizes a fault exit by
 /// the vcpu `rip` landing just past it).
@@ -67,26 +61,17 @@ pub const FAULT_TRAMP_VA: u64 = CTRL_GPA + FAULT_TRAMP_OFF;
 /// that a user-mode one exits cleanly with its frame (instead of
 /// triple-faulting, which loses the registers): `#DE`, `#DB`, `#BP`, `#OF`,
 /// `#BR`, `#UD`, `#NP`, `#SS`, `#GP`, `#MF`, `#AC`, `#XM`.
-#[cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)] // KVM-only
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const EXC_VECTORS: [u64; 12] = [0, 1, 3, 4, 5, 6, 11, 12, 13, 16, 17, 19];
 /// Where in the fault-trampoline page vector `v`'s own `hlt` is (the `#PF`
 /// one is at the start): the host tells the exceptions apart by the `rip`
 /// just past it.
-#[cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)] // KVM-only
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const fn exc_tramp_va(v: u64) -> u64 {
     FAULT_TRAMP_VA + 0x100 + v * 0x10
 }
 /// Linear address of the IDT and of the TSS.
-#[cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)] // KVM-only
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const IDT_BASE: u64 = CTRL_GPA + IDT_OFF;
 pub const TSS_BASE: u64 = CTRL_GPA + TSS_OFF;
 /// Kernel stack top the TSS switches to on a CPL3→CPL0 exception (`RSP0`).
@@ -155,35 +140,20 @@ pub mod vectors {
 }
 
 /// GDT selector of the TSS descriptor (a 16-byte descriptor at slots 5–6).
-#[cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)] // KVM-only
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const SEL_TSS: u16 = 0x28;
 pub const SEL_KCODE: u16 = 0x08;
 #[allow(dead_code)]
 pub const SEL_KDATA: u16 = 0x10;
-#[cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)] // KVM-only
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const SEL_UDATA: u16 = 0x18 | 3;
-#[cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)] // KVM-only
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const SEL_UCODE: u16 = 0x20 | 3;
 /// `IA32_STAR`: `sysretq` base selector in [63:48], `syscall` CS in [47:32].
-#[cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)] // KVM-only
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const STAR_VALUE: u64 = (((SEL_UDATA as u64 & !3) - 8) | 3) << 48 | (SEL_KCODE as u64) << 32;
 /// GDTR limit: 5 segment descriptors + a 16-byte TSS descriptor.
-#[cfg_attr(
-    not(all(target_os = "linux", target_arch = "x86_64")),
-    allow(dead_code)
-)] // KVM-only
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const GDT_LIMIT: u16 = 7 * 8 - 1;
 
 /// Physical base of the control block's frames in the pool — the first

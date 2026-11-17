@@ -239,9 +239,9 @@ mod native {
             ConnOption::NoDelay(on) => {
                 let _ = stream.set_nodelay(on);
             }
-            #[cfg(unix)]
+            #[cfg(any(unix, nixvm_linux))]
             other => super::sockopt::apply(stream, other),
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, nixvm_linux)))]
             _ => {}
         }
     }
@@ -322,7 +322,7 @@ mod native {
                 None => self.options.push(opt),
             }
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, nixvm_linux))]
         fn unsent(&mut self) -> Option<usize> {
             super::sockopt::unsent(self.stream()?)
         }
@@ -374,58 +374,149 @@ mod native {
 
 /// Setting the options `std` has no call for on a host socket.
 ///
-/// `unsafe`: `setsockopt(2)` is declared here by hand, since `std` doesn't expose
-/// it and the crate takes no FFI dependency. Every call passes a live descriptor
-/// borrowed from a `TcpStream` and a pointer to a local `c_int` with its size.
-#[cfg(all(unix, not(target_arch = "wasm32")))]
+/// `unsafe`: `std` doesn't expose `setsockopt(2)`, and the crate takes no FFI
+/// dependency, so on a Linux-ABI host (`cfg(nixvm_linux)`, libc-free ones
+/// included) it is a raw system call ([`crate::linux_raw`]), and elsewhere a
+/// hand-declared libc function. Every call passes a live descriptor borrowed
+/// from a `TcpStream` and a pointer to a local `c_int` with its size.
+#[cfg(all(any(unix, nixvm_linux), not(target_arch = "wasm32")))]
 mod sockopt {
     use super::ConnOption;
     use std::os::fd::AsRawFd;
-    use std::os::raw::{c_int, c_void};
+    use std::os::raw::c_int;
 
-    unsafe extern "C" {
-        fn setsockopt(fd: c_int, level: c_int, name: c_int, val: *const c_void, len: u32) -> c_int;
-        #[cfg(target_os = "linux")]
-        fn ioctl(fd: c_int, request: std::os::raw::c_ulong, ...) -> c_int;
-        #[cfg(not(target_os = "linux"))]
-        fn getsockopt(
-            fd: c_int,
+    /// The host calls, as `Ok`/`Err` of the host's errno.
+    #[cfg(nixvm_linux)]
+    pub(super) mod host {
+        use crate::linux_raw as raw;
+        use std::io;
+        use std::os::fd::RawFd;
+        use std::os::raw::c_int;
+
+        pub fn setsockopt(fd: RawFd, level: c_int, name: c_int, val: &[c_int]) -> io::Result<()> {
+            let bytes: Vec<u8> = val.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            raw::setsockopt(fd, level, name, &bytes)
+        }
+
+        /// Fills `val` from the front; returns how many bytes were written.
+        #[cfg(test)]
+        pub fn getsockopt(
+            fd: RawFd,
             level: c_int,
             name: c_int,
-            val: *mut c_void,
-            len: *mut u32,
-        ) -> c_int;
+            val: &mut [c_int],
+        ) -> io::Result<usize> {
+            let mut bytes = vec![0u8; std::mem::size_of_val(val)];
+            let n = raw::getsockopt(fd, level, name, &mut bytes)?;
+            for (v, b) in val.iter_mut().zip(bytes.as_chunks::<4>().0) {
+                *v = c_int::from_ne_bytes(*b);
+            }
+            Ok(n)
+        }
+
+        /// Linux's `SIOCOUTQ`: bytes sent but not acknowledged (FIN included).
+        pub fn outq(fd: RawFd) -> io::Result<c_int> {
+            let mut n: c_int = 0;
+            // SAFETY: a live descriptor, and `SIOCOUTQ` writes one int to `n`.
+            unsafe { raw::ioctl(fd, 0x5411, (&raw mut n) as usize) }?;
+            Ok(n)
+        }
+    }
+
+    #[cfg(not(nixvm_linux))]
+    pub(super) mod host {
+        use std::io;
+        use std::os::fd::RawFd;
+        use std::os::raw::{c_int, c_void};
+
+        mod c {
+            use std::os::raw::{c_int, c_void};
+            unsafe extern "C" {
+                pub fn setsockopt(
+                    fd: c_int,
+                    level: c_int,
+                    name: c_int,
+                    val: *const c_void,
+                    len: u32,
+                ) -> c_int;
+                pub fn getsockopt(
+                    fd: c_int,
+                    level: c_int,
+                    name: c_int,
+                    val: *mut c_void,
+                    len: *mut u32,
+                ) -> c_int;
+                #[cfg(target_os = "linux")]
+                pub fn ioctl(fd: c_int, request: std::os::raw::c_ulong, ...) -> c_int;
+            }
+        }
+
+        fn check(r: c_int) -> io::Result<()> {
+            if r == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+
+        pub fn setsockopt(fd: RawFd, level: c_int, name: c_int, val: &[c_int]) -> io::Result<()> {
+            let len = std::mem::size_of_val(val) as u32;
+            // SAFETY: `val` points at `len` readable bytes.
+            check(unsafe { c::setsockopt(fd, level, name, val.as_ptr().cast(), len) })
+        }
+
+        /// Fills `val` from the front; returns how many bytes were written.
+        #[allow(dead_code)] // Linux reads `unsent` with an ioctl; only its tests use this
+        pub fn getsockopt(
+            fd: RawFd,
+            level: c_int,
+            name: c_int,
+            val: &mut [c_int],
+        ) -> io::Result<usize> {
+            let mut len = std::mem::size_of_val(val) as u32;
+            // SAFETY: `val` is `len` writable bytes.
+            check(unsafe {
+                c::getsockopt(
+                    fd,
+                    level,
+                    name,
+                    val.as_mut_ptr().cast::<c_void>(),
+                    &raw mut len,
+                )
+            })?;
+            Ok(len as usize)
+        }
+
+        /// Linux's `SIOCOUTQ`: bytes sent but not acknowledged (FIN included).
+        #[cfg(target_os = "linux")]
+        pub fn outq(fd: RawFd) -> io::Result<c_int> {
+            let mut n: c_int = 0;
+            // SAFETY: a live descriptor, and `SIOCOUTQ` writes one int to `n`.
+            check(unsafe { c::ioctl(fd, 0x5411, &raw mut n) })?;
+            Ok(n)
+        }
     }
 
     /// Bytes sent on `sock` that the peer hasn't acknowledged yet (Linux's
     /// `SIOCOUTQ`, which counts the FIN too; the BSDs' `SO_NWRITE`).
     pub(super) fn unsent(sock: &impl AsRawFd) -> Option<usize> {
-        let mut n: c_int = 0;
-        #[cfg(target_os = "linux")]
-        // SAFETY: a live descriptor, and `SIOCOUTQ` writes one int to `n`.
-        let r = unsafe { ioctl(sock.as_raw_fd(), 0x5411, &raw mut n) };
-        #[cfg(not(target_os = "linux"))]
-        let r = {
-            let mut len = std::mem::size_of::<c_int>() as u32;
-            // SAFETY: a live descriptor, and `n` is `len` writable bytes.
-            unsafe {
-                getsockopt(
-                    sock.as_raw_fd(),
-                    consts::SOL_SOCKET,
-                    0x1024, // SO_NWRITE
-                    (&raw mut n).cast(),
-                    &raw mut len,
-                )
-            }
+        #[cfg(any(target_os = "linux", nixvm_linux))]
+        let n = host::outq(sock.as_raw_fd());
+        #[cfg(not(any(target_os = "linux", nixvm_linux)))]
+        let n = {
+            let mut n = [0 as c_int];
+            host::getsockopt(
+                sock.as_raw_fd(),
+                consts::SOL_SOCKET,
+                0x1024, // SO_NWRITE
+                &mut n,
+            )
+            .map(|_| n[0])
         };
-        if r == 0 {
-            usize::try_from(n).ok()
-        } else {
-            None
-        }
+        n.ok().and_then(|n| usize::try_from(n).ok())
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", nixvm_linux))]
     mod consts {
         use std::os::raw::c_int;
         pub(super) const SOL_SOCKET: c_int = 1;
@@ -435,7 +526,7 @@ mod sockopt {
         pub(super) const TCP_KEEPINTVL: c_int = 5;
         pub(super) const TCP_KEEPCNT: c_int = 6;
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", nixvm_linux)))]
     mod consts {
         // The BSDs and macOS.
         use std::os::raw::c_int;
@@ -474,12 +565,7 @@ mod sockopt {
     }
 
     fn set(sock: &impl AsRawFd, level: c_int, name: c_int, val: &[c_int]) {
-        let len = std::mem::size_of_val(val) as u32;
-        // SAFETY: the descriptor is open for the borrow's lifetime, and `val`
-        // points at `len` readable bytes.
-        unsafe {
-            setsockopt(sock.as_raw_fd(), level, name, val.as_ptr().cast(), len);
-        }
+        let _ = host::setsockopt(sock.as_raw_fd(), level, name, val);
     }
 
     #[cfg(test)]
@@ -487,32 +573,11 @@ mod sockopt {
         use super::{ConnOption, apply};
         use std::net::{TcpListener, TcpStream};
         use std::os::fd::AsRawFd;
-        use std::os::raw::{c_int, c_void};
-
-        unsafe extern "C" {
-            fn getsockopt(
-                fd: c_int,
-                level: c_int,
-                name: c_int,
-                val: *mut c_void,
-                len: *mut u32,
-            ) -> c_int;
-        }
+        use std::os::raw::c_int;
 
         fn get(s: &TcpStream, level: c_int, name: c_int) -> [c_int; 2] {
             let mut v = [0 as c_int; 2];
-            let mut len = std::mem::size_of_val(&v) as u32;
-            // SAFETY: a live descriptor and a buffer of `len` writable bytes.
-            let r = unsafe {
-                getsockopt(
-                    s.as_raw_fd(),
-                    level,
-                    name,
-                    v.as_mut_ptr().cast(),
-                    &raw mut len,
-                )
-            };
-            assert_eq!(r, 0);
+            super::host::getsockopt(s.as_raw_fd(), level, name, &mut v).unwrap();
             v
         }
 
@@ -557,7 +622,7 @@ mod sockopt {
     }
 }
 
-#[cfg(all(test, unix, not(target_arch = "wasm32")))]
+#[cfg(all(test, any(unix, nixvm_linux), not(target_arch = "wasm32")))]
 mod connect_tests {
     use super::{Egress, HostEgress};
     use std::net::TcpListener;
