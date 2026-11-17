@@ -10702,7 +10702,11 @@ impl Kernel {
         }
         let had_slash = rel.len() > 1 && rel.ends_with('/');
         let mut abs = self.resolve_path(cx, dirfd, &rel);
-        if flags & AT_SYMLINK_NOFOLLOW == 0 {
+        // A trailing slash makes the last component a directory to look up,
+        // so a symlink there is followed even by lstat (Linux's
+        // LOOKUP_FOLLOW | LOOKUP_DIRECTORY): `lstat("link-to-dir/")` is the
+        // directory. Wine stats its `dosdevices/c:/` that way.
+        if flags & AT_SYMLINK_NOFOLLOW == 0 || had_slash {
             abs = self.follow_or_eloop(vfs, cx, &abs)?;
         }
         let Some(attrs) = vfs.stat(&abs) else {

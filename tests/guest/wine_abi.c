@@ -11,10 +11,13 @@
  *    select(0, 0, 0, 0, &tv)): it returns 0 when the timeout runs out, with
  *    the time left (none) written back, and with a ready descriptor it
  *    returns at once, leaving most of the timeout.
+ *  - lstat("link/") follows the link, the trailing slash asking for the
+ *    directory (Wine stats dosdevices/c:/ to see drive C's root).
  */
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -22,6 +25,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -181,6 +185,39 @@ static void select_sleeps(void) {
   CHECK(r == -1 && errno == EINVAL, "select with tv_usec -1 returned %d (errno %d)", r, errno);
 }
 
+static void trailing_slash_follows(void) {
+  char dir[] = "/tmp/wine_abi.XXXXXX";
+  if (!mkdtemp(dir)) {
+    CHECK(0, "mkdtemp: %s", strerror(errno));
+    return;
+  }
+  char sub[64], dlink[64], file[64], flink[64], dslash[64], fslash[64];
+  snprintf(sub, sizeof sub, "%s/d", dir);
+  snprintf(dlink, sizeof dlink, "%s/c:", dir);
+  snprintf(file, sizeof file, "%s/f", dir);
+  snprintf(flink, sizeof flink, "%s/fl", dir);
+  snprintf(dslash, sizeof dslash, "%s/", dlink);
+  snprintf(fslash, sizeof fslash, "%s/", flink);
+  mkdir(sub, 0755);
+  symlink("d", dlink);
+  close(open(file, O_CREAT | O_WRONLY, 0644));
+  symlink("f", flink);
+  struct stat st;
+  CHECK(lstat(dlink, &st) == 0 && S_ISLNK(st.st_mode), "lstat(link) isn't the link");
+  CHECK(lstat(dslash, &st) == 0 && S_ISDIR(st.st_mode),
+        "lstat(\"link/\") isn't the directory (%s)", strerror(errno));
+  CHECK(fstatat(AT_FDCWD, dslash, &st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISDIR(st.st_mode),
+        "fstatat(\"link/\", NOFOLLOW) isn't the directory");
+  errno = 0;
+  CHECK(lstat(fslash, &st) == -1 && errno == ENOTDIR,
+        "lstat(\"link-to-file/\") gave %s, not ENOTDIR", strerror(errno));
+  unlink(flink);
+  unlink(file);
+  unlink(dlink);
+  rmdir(sub);
+  rmdir(dir);
+}
+
 int main(int argc, char **argv) {
 #if defined(__x86_64__)
   if (argc > 1 && !strcmp(argv[1], "gs-after-exec"))
@@ -193,6 +230,7 @@ int main(int argc, char **argv) {
 #endif
   address_space_top();
   select_sleeps();
+  trailing_slash_follows();
   if (failures)
     return 1;
   printf("PASS\n");
