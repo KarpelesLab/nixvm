@@ -30,6 +30,8 @@ pub mod overlay;
 #[cfg(unix)]
 pub mod passthrough;
 pub mod procfs;
+#[cfg(unix)]
+pub mod protect;
 pub mod sysfs;
 pub mod tar;
 pub mod tmpfs;
@@ -249,6 +251,17 @@ pub trait MountFs: std::fmt::Debug + Send {
     /// so `st_nlink`, the shared inode, and write-through all behave.
     fn link(&mut self, _old_rel: &str, _new_rel: &str) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(95)) // EOPNOTSUPP
+    }
+
+    /// Whether `rel`'s contents may be written: asked when it's opened for
+    /// writing (or with `O_TRUNC`) and when it's mapped shared and writable,
+    /// so a file whose every write would fail is refused up front, as Linux
+    /// refuses it. `rel` may not exist yet (an `O_CREAT` open). The default
+    /// allows it, leaving each write to answer for itself; a backend with
+    /// read-only paths inside a writable tree
+    /// ([`Passthrough::protect`]) refuses those.
+    fn check_write(&mut self, _rel: &str) -> io::Result<()> {
+        Ok(())
     }
 
     // ---- extended attributes ----

@@ -1164,6 +1164,17 @@ impl MountTable {
         fs.readdir(&rel)
     }
 
+    /// Whether the file at `abs_path` (which may not exist yet) may be opened
+    /// for writing, or mapped shared and writable (see
+    /// [`MountFs::check_write`]).
+    pub fn check_write(&mut self, abs_path: &str) -> io::Result<()> {
+        // No mount there: the open fails on its own.
+        let Some((mut fs, rel)) = self.resolve(abs_path) else {
+            return Ok(());
+        };
+        fs.check_write(&rel)
+    }
+
     pub fn write_at(&mut self, abs_path: &str, off: u64, buf: &[u8]) -> io::Result<usize> {
         let (mut fs, rel) = self.resolve_for_write(abs_path)?;
         fs.write_at(&rel, off, buf)

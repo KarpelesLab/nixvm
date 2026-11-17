@@ -9999,7 +9999,20 @@ impl Kernel {
             return i64::from(fd);
         }
 
-        match vfs.stat(&abs) {
+        let found = vfs.stat(&abs);
+        // Opening for writing (or truncating) a file the backend keeps
+        // read-only — a protected path in a host directory — fails here, as
+        // Linux fails it at open rather than at each write. Only a regular
+        // file (or a new one) has contents to protect: a directory is left to
+        // the EISDIR below, and a FIFO or device opens for writing on a
+        // read-only filesystem too.
+        if (flags & O_ACCMODE != 0 || flags & O_TRUNC != 0)
+            && found.as_ref().is_none_or(|a| a.kind == NodeKind::File)
+            && let Err(e) = vfs.check_write(&abs)
+        {
+            return io_errno(&e);
+        }
+        match found {
             None => {
                 if flags & O_CREAT != 0 {
                     // Creating a name with a trailing slash asks for a directory,
@@ -11234,7 +11247,15 @@ impl Kernel {
                 if sealed && prot.contains(Prot::WRITE) {
                     return err(Errno::EPERM);
                 }
-                maywrite = *writable && !sealed;
+                // A file its backend won't let be written (a protected path:
+                // see `Passthrough::protect`) maps as if opened read-only —
+                // its descriptor may predate the path becoming unwritable,
+                // as when it was opened through a name since redirected.
+                let refused = *writable && vfs.check_write(path).is_err();
+                if refused && prot.contains(Prot::WRITE) {
+                    return err(Errno::EACCES);
+                }
+                maywrite = *writable && !sealed && !refused;
             }
         }
 
@@ -14955,6 +14976,134 @@ mod tests {
         );
         assert_eq!(mem.read_vec(buf, 1).unwrap(), b"Z");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A protected path in a host directory (`Passthrough::protect`) as the
+    /// guest's syscalls meet it: refused at open for writing, at a shared
+    /// writable mapping, and around the rename-a-parent attack.
+    #[cfg(unix)]
+    #[test]
+    fn protected_host_paths_refuse_the_guest_writing_them() {
+        use crate::fs::Passthrough;
+        const O_WRONLY: u64 = 1;
+        const O_RDWR: u64 = 2;
+        const O_CREAT: u64 = 0o100;
+        const O_TRUNC: u64 = 0o1000;
+        const MAP_SHARED: u64 = 0x01;
+        let dir = std::env::temp_dir().join(format!("nixvm-protect-k-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git/hooks")).unwrap();
+        std::fs::write(dir.join(".git/hooks/pre-commit"), b"good").unwrap();
+
+        let mut mounts = MountTable::new();
+        mounts.mount("/", Box::new(TmpFs::new()));
+        mounts.mount(
+            "/work",
+            Box::new(Passthrough::new(dir.clone()).protect([".git/hooks"])),
+        );
+        let mut k = Kernel::new(Arch::Aarch64, mounts);
+        let mut cx = ServiceCtx::default();
+        cx.cur.pid = 1;
+        cx.cur.tgid = 1;
+        cx.cur.mm = 0;
+        k.shared
+            .get_mut()
+            .unwrap()
+            .mmap_areas
+            .push(Arena::new(0x1_8000, 0x1_5000));
+        let mut mem = GuestMemory::new(0x1_0000, 64 * PAGE);
+        mem.map(0x1_0000, 8 * PAGE, Prot::rw()).unwrap();
+        let mut v = DummyVcpu;
+        let mut sys =
+            |mem: &mut GuestMemory, nr, a: [u64; 6]| call(&k, &mut cx, mem, &mut v, nr, a);
+        let (p1, p2, p3, buf) = (0x1_0000, 0x1_0100, 0x1_0200, 0x1_1000);
+        let erofs = -i64::from(Errno::EROFS.0);
+        let eperm = -i64::from(Errno::EPERM.0);
+
+        mem.write_init(p1, b"/work/.git/hooks/pre-commit\0")
+            .unwrap();
+        for flags in [O_WRONLY, O_RDWR, O_TRUNC, O_CREAT | O_WRONLY] {
+            assert_eq!(
+                sys(&mut mem, Sysno::Openat, [AT_CWD, p1, flags, 0o755, 0, 0]),
+                erofs
+            );
+        }
+        mem.write_init(p2, b"/work/.git/hooks/post-merge\0")
+            .unwrap();
+        assert_eq!(
+            sys(
+                &mut mem,
+                Sysno::Openat,
+                [AT_CWD, p2, O_CREAT | O_WRONLY, 0o755, 0, 0]
+            ),
+            erofs
+        );
+        // Reading is fine, and so is a private mapping; a shared writable one
+        // is not (the descriptor can't be opened for writing to begin with).
+        let ro = sys(&mut mem, Sysno::Openat, [AT_CWD, p1, 0, 0, 0, 0]);
+        assert!(ro >= 3, "{ro}");
+        assert_eq!(
+            sys(
+                &mut mem,
+                Sysno::Mmap,
+                [0, PAGE, 0x3, MAP_SHARED, ro as u64, 0]
+            ),
+            -i64::from(Errno::EACCES.0)
+        );
+        assert!(sys(&mut mem, Sysno::Mmap, [0, PAGE, 0x3, 0x02, ro as u64, 0]) > 0);
+
+        // mv .git g && echo evil > g/hooks/pre-commit && mv g .git
+        mem.write_init(p2, b"/work/.git\0").unwrap();
+        mem.write_init(p3, b"/work/g\0").unwrap();
+        assert_eq!(
+            sys(&mut mem, Sysno::Renameat, [AT_CWD, p2, AT_CWD, p3, 0, 0]),
+            eperm
+        );
+
+        // A file opened for writing in a directory that's then moved away and
+        // replaced by a link into .git/hooks keeps writing where it went (the
+        // descriptor follows the rename), never into the hooks.
+        mem.write_init(p1, b"/work/d\0").unwrap();
+        assert_eq!(
+            sys(&mut mem, Sysno::Mkdirat, [AT_CWD, p1, 0o755, 0, 0, 0]),
+            0
+        );
+        mem.write_init(p2, b"/work/d/pre-commit\0").unwrap();
+        let fd = sys(
+            &mut mem,
+            Sysno::Openat,
+            [AT_CWD, p2, O_CREAT | O_RDWR, 0o755, 0, 0],
+        );
+        assert!(fd >= 3, "{fd}");
+        mem.write_init(p3, b"/work/d2\0").unwrap();
+        assert_eq!(
+            sys(&mut mem, Sysno::Renameat, [AT_CWD, p1, AT_CWD, p3, 0, 0]),
+            0
+        );
+        mem.write_init(p3, b".git/hooks\0").unwrap();
+        assert_eq!(
+            sys(&mut mem, Sysno::Symlinkat, [p3, AT_CWD, p1, 0, 0, 0]),
+            0
+        );
+        mem.write_init(buf, b"evil").unwrap();
+        assert_eq!(sys(&mut mem, Sysno::Write, [fd as u64, buf, 4, 0, 0, 0]), 4);
+        assert_eq!(std::fs::read(dir.join("d2/pre-commit")).unwrap(), b"evil");
+        // Through the link, it's the protected directory.
+        mem.write_init(p2, b"/work/d/pre-commit\0").unwrap();
+        assert_eq!(
+            sys(&mut mem, Sysno::Openat, [AT_CWD, p2, O_WRONLY, 0, 0, 0]),
+            erofs
+        );
+
+        assert_eq!(
+            std::fs::read(dir.join(".git/hooks/pre-commit")).unwrap(),
+            b"good"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.join(".git/hooks")).unwrap().count(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

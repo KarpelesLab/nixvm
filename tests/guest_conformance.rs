@@ -53,7 +53,7 @@ const PROGRAMS: &[&str] = &[
 /// `exec` itself there. `None` if there's no compiler to build them with.
 fn built() -> Option<&'static Path> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    DIR.get_or_init(|| build_with("gcc", "guest_root", &["attacks", "policy"]))
+    DIR.get_or_init(|| build_with("gcc", "guest_root", &["attacks", "policy", "protect"]))
         .as_deref()
 }
 
@@ -352,4 +352,61 @@ fn the_syscall_policy_binds_every_task() {
     ));
     assert!(out.contains("unknown syscall"), "{out}");
     assert!(!out.contains("getpid="), "ran with a broken policy:\n{out}");
+}
+
+/// Paths protected in a writable host directory stay unchanged on the host
+/// whatever the guest tries, starting with renaming a parent out of the way
+/// (`tests/guest/protect.c`).
+#[test]
+fn protected_host_paths_stay_unchanged() {
+    let Some(root) = built() else { return };
+    let work = Path::new(env!("CARGO_TARGET_TMPDIR")).join("protect_work");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(work.join(".git/hooks")).unwrap();
+    std::fs::create_dir_all(work.join("bare")).unwrap();
+    std::fs::write(work.join(".git/hooks/pre-commit"), "good\n").unwrap();
+    std::fs::write(work.join(".git/config"), "[core]\n").unwrap();
+    std::fs::write(work.join("atelier.toml"), "safe = true\n").unwrap();
+    for backend in [None, Some("1")] {
+        let mut cmd = Command::new("timeout");
+        cmd.args(["--foreground", "60"])
+            .arg(env!("CARGO_BIN_EXE_run-elf-x86"))
+            .arg(root.join("protect"))
+            .arg("protect")
+            .current_dir(&work)
+            .env("NIXVM_ROOT", root)
+            .env("NIXVM_PROTECT", ".git/hooks:atelier.toml:bare/.git/hooks")
+            .env_remove("NIXVM_CPUS")
+            .stdin(Stdio::null());
+        match backend {
+            Some(v) => cmd.env("NIXVM_INTERP", v),
+            None => cmd.env_remove("NIXVM_INTERP"),
+        };
+        let out = text(&cmd.output().expect("run the VM"));
+        assert!(out.contains("protecting"), "NIXVM_PROTECT not read:\n{out}");
+        assert!(
+            out.lines().any(|l| l == "PASS") && !out.contains("FAIL"),
+            "{backend:?}:\n{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.join(".git/hooks/pre-commit")).unwrap(),
+            "good\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(work.join(".git/hooks")).unwrap().count(),
+            1
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.join("atelier.toml")).unwrap(),
+            "safe = true\n"
+        );
+        assert!(!work.join("bare/.git/hooks").exists());
+        // What the guest may change, it did; undo it for the next run.
+        assert_eq!(
+            std::fs::read_to_string(work.join(".git/config")).unwrap(),
+            "[user]\n"
+        );
+        std::fs::remove_dir(work.join("bare/.git")).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&work);
 }

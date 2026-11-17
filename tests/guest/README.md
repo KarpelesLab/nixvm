@@ -26,3 +26,6 @@ as root `userns_caps` also checks how dropping uid 0 drops capabilities, so CI
 runs both as root on the runner, and they're worth running as an ordinary user too.
 `attacks.c` isn't a pass/fail
 program: the Rust test checks that each thing it tries is contained.
+`protect.c` isn't a Linux program either: it checks `Passthrough::protect` in a
+`/work` the Rust test lays out and protects (`NIXVM_PROTECT`), and the test then
+checks the host directory is unchanged.

@@ -88,7 +88,14 @@ fn main() {
         )),
     );
     if let Ok(cwd) = std::env::current_dir() {
-        mounts.mount("/work", Box::new(Passthrough::new(cwd)));
+        // NIXVM_PROTECT=a:b/c keeps those paths under /work read-only (see
+        // `Passthrough::protect`).
+        let protect = std::env::var("NIXVM_PROTECT").unwrap_or_default();
+        let paths: Vec<&str> = protect.split(':').filter(|p| !p.is_empty()).collect();
+        if !paths.is_empty() {
+            eprintln!("{}: protecting {paths:?} in /work", env!("CARGO_BIN_NAME"));
+        }
+        mounts.mount("/work", Box::new(Passthrough::new(cwd).protect(paths)));
     }
 
     let mut kernel = Kernel::new(Arch::X86_64, mounts);

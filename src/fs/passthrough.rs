@@ -67,6 +67,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::protect::{Op, Protected};
 use super::{Attrs, DirEntry, MountFs, NodeKind, SetTime};
 use crate::limits::Quota;
 
@@ -550,6 +551,8 @@ pub struct Passthrough {
     since_host_check: Option<u64>,
     /// The VM's disk this is (see [`super::blockdev`]), once mounted.
     dev: Option<u64>,
+    /// Paths kept read-only inside the tree (see [`Self::protect`]).
+    protected: Protected,
 }
 
 /// What a new directory entry is charged, since it takes host disk too.
@@ -567,6 +570,7 @@ impl Passthrough {
             disk: Quota::unlimited(),
             since_host_check: None,
             dev: None,
+            protected: Protected::default(),
         }
     }
 
@@ -579,7 +583,63 @@ impl Passthrough {
             disk: Quota::unlimited(),
             since_host_check: None,
             dev: None,
+            protected: Protected::default(),
         }
+    }
+
+    /// Keep `paths` (relative to the mapped directory: directories, which
+    /// protects everything under them, or single files) read-only for the
+    /// guest, as the host nodes they are rather than by the names they're
+    /// reached through: renaming a parent doesn't move them out of reach, a
+    /// symlink into one doesn't get past it, and one that doesn't exist yet
+    /// can't be made. Writes, creation, removal, renames, links and metadata
+    /// changes under a protected path fail `EROFS`; renaming or removing a
+    /// directory leading to one, or putting anything but a directory at its
+    /// name, fails `EPERM`, as does hard-linking a protected file. Names
+    /// compare case-insensitively. See [`super::protect`] for the details.
+    ///
+    /// ```no_run
+    /// # use nixvm::fs::Passthrough;
+    /// let project = Passthrough::new("/home/me/project").protect([".git/hooks", "atelier.toml"]);
+    /// ```
+    #[must_use]
+    pub fn protect<I, S>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for p in paths {
+            self.protected.add(p.as_ref());
+        }
+        self
+    }
+
+    /// Refuse `op` on `rel` if it touches a protected path (see
+    /// [`Self::protect`]). `rel` is resolved exactly as the operation itself
+    /// resolves it (`follow_final`, `allow_missing_final` as for
+    /// [`Self::resolve`]), symlinks and all, and the check is made on where
+    /// that lands. The backend is behind the mount table's lock for the whole
+    /// call, so nothing in the guest can change the tree between this walk
+    /// and the operation's own.
+    fn guard(
+        &self,
+        op: Op,
+        rel: &str,
+        follow_final: bool,
+        allow_missing_final: bool,
+    ) -> io::Result<()> {
+        if self.protected.is_empty() {
+            return Ok(());
+        }
+        if Self::split_rel(rel)?.is_empty() {
+            // The mount root: an ancestor of everything, never itself made,
+            // removed or renamed (resolution refuses it).
+            let none: [&str; 0] = [];
+            return self.protected.check(op, &none);
+        }
+        let (_, name, mut path) = self.resolve_traced(rel, follow_final, allow_missing_final)?;
+        path.push(name);
+        self.protected.check(op, &path)
     }
 
     /// Charge `bytes` of new disk use, or fail with `ENOSPC` if that's over the
@@ -766,6 +826,20 @@ impl Passthrough {
         follow_final: bool,
         allow_missing_final: bool,
     ) -> io::Result<(OwnedFd, String)> {
+        self.resolve_traced(rel, follow_final, allow_missing_final)
+            .map(|(parent, name, _)| (parent, name))
+    }
+
+    /// [`Self::resolve`], also giving the path from the mount root to the
+    /// returned parent directory as it was actually walked — one name per
+    /// directory fd opened, symlinks already followed and `..` applied — which
+    /// is what [`Self::guard`] checks.
+    fn resolve_traced(
+        &self,
+        rel: &str,
+        follow_final: bool,
+        allow_missing_final: bool,
+    ) -> io::Result<(OwnedFd, String, Vec<String>)> {
         let mut queue = Self::split_rel(rel)?;
         if queue.is_empty() {
             // The mount root itself: none of the (parent, name) operations
@@ -775,6 +849,8 @@ impl Passthrough {
         }
 
         let mut stack: Vec<OwnedFd> = vec![self.root_fd()?];
+        // The name of each frame above the root: `names[i]` is `stack[i + 1]`.
+        let mut names: Vec<String> = Vec::new();
         let mut budget = MAX_SYMLINKS;
         let mut seen = 0u32;
 
@@ -794,6 +870,7 @@ impl Passthrough {
             if name == ".." {
                 if stack.len() > 1 {
                     stack.pop();
+                    names.pop();
                 }
                 continue;
             }
@@ -804,7 +881,7 @@ impl Passthrough {
 
             if is_last && !follow_final {
                 let parent = stack.pop().expect("root frame always present");
-                return Ok((parent, name));
+                return Ok((parent, name, names));
             }
 
             let open_flags = if is_last {
@@ -822,9 +899,10 @@ impl Passthrough {
                         // touches the node.
                         drop(fd);
                         let parent = stack.pop().expect("root frame always present");
-                        return Ok((parent, name));
+                        return Ok((parent, name, names));
                     }
                     stack.push(fd);
+                    names.push(name);
                 }
                 Err(e)
                     if is_last
@@ -836,7 +914,7 @@ impl Passthrough {
                     // fine creating it (e.g. `create`): hand back the name
                     // for the caller's own O_CREAT open.
                     let parent = stack.pop().expect("root frame always present");
-                    return Ok((parent, name));
+                    return Ok((parent, name, names));
                 }
                 // A symlink: ELOOP from `O_NOFOLLOW` — or, for a directory
                 // component, ENOTDIR, which Linux reports for `O_DIRECTORY`
@@ -855,6 +933,7 @@ impl Passthrough {
                     let (absolute, mut target_comps) = Self::split_target(&target);
                     if absolute {
                         stack.truncate(1);
+                        names.clear();
                     }
                     while let Some(c) = target_comps.pop_back() {
                         queue.push_front(c);
@@ -991,6 +1070,7 @@ impl MountFs for Passthrough {
 
     fn write_at(&mut self, rel: &str, off: u64, buf: &[u8]) -> io::Result<usize> {
         self.deny_if_ro()?;
+        self.guard(Op::Write, rel, true, false)?;
         let (parent, name) = self.resolve(rel, true, false)?;
         let cname = cstr(&name)?;
         let fd = raw_openat(
@@ -1017,31 +1097,38 @@ impl MountFs for Passthrough {
 
     fn create(&mut self, rel: &str, mode: u32) -> io::Result<()> {
         self.deny_if_ro()?;
+        self.guard(Op::Make, rel, true, true)?;
         self.with_entry_charge(|fs| fs.create_entry(rel, mode))
     }
 
     fn mkdir(&mut self, rel: &str, mode: u32) -> io::Result<()> {
         self.deny_if_ro()?;
+        self.guard(Op::MakeDir, rel, false, false)?;
         self.with_entry_charge(|fs| fs.mkdir_entry(rel, mode))
     }
 
     fn mknod(&mut self, rel: &str, mode: u32) -> io::Result<()> {
         self.deny_if_ro()?;
+        self.guard(Op::Make, rel, false, false)?;
         self.with_entry_charge(|fs| fs.mknod_entry(rel, mode))
     }
 
     fn symlink(&mut self, target: &str, linkpath: &str) -> io::Result<()> {
         self.deny_if_ro()?;
+        self.guard(Op::Make, linkpath, false, false)?;
         self.with_entry_charge(|fs| fs.symlink_entry(target, linkpath))
     }
 
     fn link(&mut self, old_rel: &str, new_rel: &str) -> io::Result<()> {
         self.deny_if_ro()?;
+        self.guard(Op::LinkSource, old_rel, false, false)?;
+        self.guard(Op::Make, new_rel, false, false)?;
         self.with_entry_charge(|fs| fs.link_entry(old_rel, new_rel))
     }
 
     fn set_times(&mut self, rel: &str, atime: SetTime, mtime: SetTime) -> io::Result<()> {
         self.deny_if_ro()?;
+        self.guard(Op::Attr, rel, false, false)?;
         let (parent, name) = self.resolve(rel, false, false)?;
         let cname = cstr(&name)?;
         raw_utimensat(parent.as_raw_fd(), &cname, atime, mtime)
@@ -1049,6 +1136,7 @@ impl MountFs for Passthrough {
 
     fn set_mode(&mut self, rel: &str, mode: u32) -> io::Result<()> {
         self.deny_if_ro()?;
+        self.guard(Op::Attr, rel, false, false)?;
         let (parent, name) = self.resolve(rel, false, false)?;
         let cname = cstr(&name)?;
         raw_fchmodat(parent.as_raw_fd(), &cname, mode)
@@ -1056,6 +1144,7 @@ impl MountFs for Passthrough {
 
     fn set_owner(&mut self, rel: &str, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
         self.deny_if_ro()?;
+        self.guard(Op::Attr, rel, false, false)?;
         let (parent, name) = self.resolve(rel, false, false)?;
         let cname = cstr(&name)?;
         raw_fchownat(parent.as_raw_fd(), &cname, uid, gid)
@@ -1063,6 +1152,7 @@ impl MountFs for Passthrough {
 
     fn unlink(&mut self, rel: &str) -> io::Result<()> {
         self.deny_if_ro()?;
+        self.guard(Op::Remove, rel, false, false)?;
         let (parent, name) = self.resolve(rel, false, false)?;
         let cname = cstr(&name)?;
         // unlink(2)/unlinkat(2) on a directory is nonstandard across
@@ -1104,6 +1194,7 @@ impl MountFs for Passthrough {
 
     fn rmdir(&mut self, rel: &str) -> io::Result<()> {
         self.deny_if_ro()?;
+        self.guard(Op::Remove, rel, false, false)?;
         let (parent, name) = self.resolve(rel, false, false)?;
         let cname = cstr(&name)?;
         raw_unlinkat(parent.as_raw_fd(), &cname, sys::AT_REMOVEDIR)?;
@@ -1113,6 +1204,7 @@ impl MountFs for Passthrough {
 
     fn truncate(&mut self, rel: &str, len: u64) -> io::Result<()> {
         self.deny_if_ro()?;
+        self.guard(Op::Write, rel, true, false)?;
         let (parent, name) = self.resolve(rel, true, false)?;
         let cname = cstr(&name)?;
         // O_NONBLOCK guards against a FIFO's write-open blocking forever
@@ -1146,6 +1238,10 @@ impl MountFs for Passthrough {
         Ok(())
     }
 
+    fn check_write(&mut self, rel: &str) -> io::Result<()> {
+        self.guard(Op::Write, rel, true, true)
+    }
+
     fn readlink(&mut self, rel: &str) -> io::Result<String> {
         // The mount root is a directory, and `readlink` on any non-symlink is
         // EINVAL ("not a symbolic link") — never EISDIR. `resolve` reports the
@@ -1165,6 +1261,8 @@ impl MountFs for Passthrough {
 
     fn rename(&mut self, from: &str, to: &str) -> io::Result<()> {
         self.deny_if_ro()?;
+        self.guard(Op::Remove, from, false, false)?;
+        self.guard(Op::Make, to, false, false)?;
         let (from_parent, from_name) = self.resolve(from, false, false)?;
         let (to_parent, to_name) = self.resolve(to, false, false)?;
         let cfrom = cstr(&from_name)?;
