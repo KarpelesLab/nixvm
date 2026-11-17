@@ -282,6 +282,82 @@ static void *signaller(void *arg) {
   return 0;
 }
 
+/* More threads with a TLS entry in use, all alive at once, than a GDT a
+ * thread would allow (the KVM backend once kept 512): each has its own
+ * %gs base. */
+#define MANY_TLS 600
+static uint32_t many_words[MANY_TLS];
+static pthread_barrier_t many_barrier;
+static void *many_tls(void *arg) {
+  int i = (int)(uintptr_t)arg;
+  /* Its own user_desc, below 4 GiB (a static array: non-PIE). */
+  static struct user_desc descs[MANY_TLS];
+  struct user_desc *d = &descs[i];
+  memset(d, 0, sizeof *d);
+  d->entry_number = -1;
+  d->base_addr = (uint32_t)(uintptr_t)&many_words[i];
+  d->limit = 3;
+  d->seg_32bit = 1;
+  long r = int80(243, (long)d, 0, 0);
+  pthread_barrier_wait(&many_barrier);
+  if (r != 0)
+    return (void *)1;
+  load_gs((unsigned short)(d->entry_number << 3 | 3));
+  sched_yield();
+  uint32_t v = gs_read(0);
+  load_gs(0);
+  return (void *)(uintptr_t)(v == many_words[i] ? 0 : 2);
+}
+
+static void many_tls_checks(void) {
+  pthread_t t[MANY_TLS];
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, 64 * 1024);
+  pthread_barrier_init(&many_barrier, NULL, MANY_TLS);
+  int made = 0;
+  for (int i = 0; i < MANY_TLS; i++) {
+    many_words[i] = 0x5000 + i;
+    if (pthread_create(&t[i], &attr, many_tls, (void *)(uintptr_t)i) != 0)
+      break;
+    made++;
+  }
+  CHECK(made == MANY_TLS, "made %d threads", made);
+  if (made != MANY_TLS) {
+    /* The barrier would never open: nothing more to check. */
+    return;
+  }
+  int bad = 0;
+  for (int i = 0; i < made; i++) {
+    void *r;
+    pthread_join(t[i], &r);
+    bad += r != NULL;
+  }
+  CHECK(bad == 0, "%d of %d threads lost their TLS entry", bad, made);
+}
+
+/* modify_ldt from 64-bit code: an LDT data segment for %gs. */
+static uint32_t ldt_words[2] = {0xaaaa5555, 0x12345678};
+static void ldt_checks(void) {
+  struct user_desc d;
+  memset(&d, 0, sizeof d);
+  d.entry_number = 3;
+  d.base_addr = (uint32_t)(uintptr_t)ldt_words;
+  d.limit = 7;
+  d.seg_32bit = 1;
+  CHECK(syscall(SYS_modify_ldt, 1, &d, sizeof d) == 0, "modify_ldt write");
+  unsigned short s = 3 << 3 | 4 | 3;
+  load_gs(s);
+  CHECK(gs_read(4) == 0x12345678, "LDT %%gs:4 is %#x", gs_read(4));
+  load_gs(0);
+  /* Its result is an int in a zero-extended register, errors too. */
+  CHECK(syscall(SYS_modify_ldt, 7, &d, 0) == 0xffffffdaL, "modify_ldt(7) is (unsigned)-ENOSYS");
+  static unsigned char buf[32]; /* below 4 GiB, for int $0x80 */
+  CHECK(syscall(SYS_modify_ldt, 0, buf, sizeof buf) == sizeof buf, "read_ldt");
+  /* The same through int $0x80. */
+  CHECK(int80(123, 0, (long)buf, sizeof buf) == sizeof buf, "int $0x80 modify_ldt");
+}
+
 static void mode_checks(void) {
   cs32 = 0;
   uint32_t r = via_lretq(6);
@@ -361,6 +437,8 @@ int main(void) {
         "built as non-PIE, below 2 GiB");
   tls_checks();
   mode_checks();
+  ldt_checks();
+  many_tls_checks();
   exec_ia32();
   if (!failures)
     printf("PASS\n");

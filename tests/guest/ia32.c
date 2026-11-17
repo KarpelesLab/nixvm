@@ -566,6 +566,88 @@ static void test_signals(void)
           "sigtimedwait value %d pid %d", info.si_value.sival_int, info.si_pid);
 }
 
+/* A struct user_desc, as modify_ldt takes it. */
+struct udesc {
+    unsigned int entry, base, limit;
+    unsigned int flags; /* seg_32bit 1, contents 2<<1 (code), read_exec_only 8, limit_in_pages 16, not_present 32, useable 64 */
+};
+
+static int ldt_data[4] = {11, 22, 33, 44};
+
+/* A far call into an LDT code segment, which returns to __USER32_CS. */
+extern char ldt_far_target[];
+__asm__(".text\n"
+        "ldt_far_target:\n"
+        "  movl $0x1234, %eax\n"
+        "  lret\n");
+
+static int read_fs4(unsigned short sel)
+{
+    int v;
+    __asm__ volatile("mov %w1, %%fs\n\t"
+                     "movl %%fs:4, %0\n\t"
+                     "mov %w2, %%fs"
+                     : "=r"(v)
+                     : "r"(sel), "r"(0)
+                     : "memory");
+    return v;
+}
+
+static void test_ldt(void)
+{
+    unsigned char buf[256];
+    memset(buf, 0xaa, sizeof buf);
+    CHECK(syscall(SYS_modify_ldt, 0, buf, sizeof buf) == 0, "read an empty LDT");
+    CHECK(syscall(SYS_modify_ldt, 2, buf, sizeof buf) == 128 && buf[0] == 0 && buf[127] == 0 && buf[128] == 0xaa,
+          "read_default_ldt");
+    struct udesc d = {1, (unsigned int)(uintptr_t)ldt_data, sizeof ldt_data - 1, 1};
+    CHECK(syscall(SYS_modify_ldt, 1, &d, sizeof d) == 0, "write_ldt data");
+    CHECK(syscall(SYS_modify_ldt, 1, &d, 15) == -1 && errno == EINVAL, "write_ldt size");
+    struct udesc bad = {8192, 0, 0, 1};
+    CHECK(syscall(SYS_modify_ldt, 1, &bad, sizeof bad) == -1 && errno == EINVAL, "write_ldt entry");
+    CHECK(syscall(SYS_modify_ldt, 9, buf, 1) == -1 && errno == ENOSYS, "modify_ldt func");
+    /* %fs from the LDT: entry 1, TI, RPL 3. */
+    unsigned short sel = (1 << 3) | 4 | 3;
+    CHECK(read_fs4(sel) == 22, "LDT data segment base");
+    memset(buf, 0xaa, sizeof buf);
+    CHECK(syscall(SYS_modify_ldt, 0, buf, 24) == 24, "read_ldt");
+    unsigned long long e1;
+    memcpy(&e1, buf + 8, 8);
+    unsigned int base = (unsigned int)((e1 >> 16) & 0xffffff) | (unsigned int)(e1 >> 56) << 24;
+    CHECK(base == (unsigned int)(uintptr_t)ldt_data && (e1 & 0xffff) == sizeof ldt_data - 1, "read back %#llx", e1);
+    CHECK(buf[0] == 0 && buf[16] == 0 && buf[23] == 0, "read_ldt zero-fills");
+    /* A 32-bit code segment in the LDT: a far call there and back. */
+    struct udesc code = {2, 0, 0xfffff, 1 | 2 << 1 | 16};
+    CHECK(syscall(SYS_modify_ldt, 1, &code, sizeof code) == 0, "write_ldt code");
+    unsigned int r = 0;
+    struct { unsigned int off; unsigned short sel; } __attribute__((packed)) far = {
+        (unsigned int)(uintptr_t)ldt_far_target, (2 << 3) | 4 | 3};
+    __asm__ volatile("lcall *%1" : "=a"(r) : "m"(far) : "memory");
+    CHECK(r == 0x1234, "far call into the LDT: %#x", r);
+    /* A fork child has a copy of the LDT. */
+    pid_t c = fork();
+    if (c == 0)
+        _exit(read_fs4(sel) == 22 ? 0 : 1);
+    int status;
+    CHECK(waitpid(c, &status, 0) == c && WIFEXITED(status) && WEXITSTATUS(status) == 0, "LDT in a fork child");
+    /* Clearing the entry (LDT_empty): loading it now faults. */
+    struct udesc empty = {1, 0, 0, 8 | 32};
+    CHECK(syscall(SYS_modify_ldt, 1, &empty, sizeof empty) == 0, "clear an entry");
+    struct sigaction sa = {0}, old;
+    sa.sa_sigaction = on_info;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, &old);
+    got_sig = 0;
+    if (sigsetjmp(jb, 1) == 0)
+        read_fs4(sel);
+    unsigned short fs;
+    __asm__("mov %%fs, %0" : "=r"(fs));
+    if (fs != 0)
+        __asm__ volatile("mov %w0, %%fs" : : "r"(0));
+    CHECK(got_sig == SIGSEGV, "loading a cleared LDT entry faults: %d", got_sig);
+    sigaction(SIGSEGV, &old, NULL);
+}
+
 static void test_processes(char *self)
 {
     pid_t c = fork();
@@ -635,6 +717,8 @@ int main(int argc, char **argv)
             test_signals();
         if (strcmp(argv[2], "files") == 0)
             test_files();
+        if (strcmp(argv[2], "ldt") == 0)
+            test_ldt();
         printf(failures ? "FAILED\n" : "PASS\n");
         return failures != 0;
     }
@@ -648,6 +732,7 @@ int main(int argc, char **argv)
     test_ipc();
     test_mmap();
     test_signals();
+    test_ldt();
     test_processes(argv[0]);
     test_threads();
     if (failures == 0)
