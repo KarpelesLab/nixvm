@@ -254,6 +254,10 @@ const SOCK_NONBLOCK: u64 = 0o4000;
 /// `SOCK_CLOEXEC` in a `socket`/`socketpair`/`accept4` type/flags argument.
 pub(super) const SOCK_CLOEXEC: u64 = 0o2000000;
 const NETLINK_ROUTE: u64 = 0;
+/// The kernel's device-event (uevent) multicast family: what udev and
+/// libudev monitors listen on. Nothing is ever hot-plugged here, so such a
+/// socket binds to its groups and never has an event to read.
+const NETLINK_KOBJECT_UEVENT: u64 = 15;
 
 const SOL_SOCKET: u64 = 1;
 const IPPROTO_IP: u64 = 0;
@@ -873,7 +877,8 @@ impl std::fmt::Debug for Dgram {
     }
 }
 
-/// An `AF_NETLINK` endpoint (only `NETLINK_ROUTE` is modeled). There is no
+/// An `AF_NETLINK` endpoint: `NETLINK_ROUTE`, and a quiet
+/// `NETLINK_KOBJECT_UEVENT` (no device events ever arrive). There is no
 /// "connection": a guest `send`/`sendto`/`write`s a request (an `nlmsghdr`
 /// stream, one or more messages back to back) which is answered synchronously
 /// by enqueuing the reply message(s) onto `queue`, in order, for a later
@@ -888,6 +893,9 @@ struct Netlink {
     /// The `SOCK_RAW`/`SOCK_DGRAM` requested at `socket()` time, echoed back
     /// by `getsockopt(SO_TYPE)`.
     sotype: u64,
+    /// The netlink family (`NETLINK_ROUTE` or `NETLINK_KOBJECT_UEVENT`),
+    /// echoed back by `getsockopt(SO_PROTOCOL)`.
+    protocol: u64,
     /// Fully encoded (`nlmsghdr`-framed, `NLMSG_ALIGN`-ed) response messages
     /// awaiting `recv`; each entry is one complete message.
     queue: VecDeque<Vec<u8>>,
@@ -1478,12 +1486,13 @@ impl Kernel {
             if base_type != SOCK_RAW && base_type != SOCK_DGRAM {
                 return err(Errno::EOPNOTSUPP);
             }
-            if protocol != NETLINK_ROUTE {
+            if protocol != NETLINK_ROUTE && protocol != NETLINK_KOBJECT_UEVENT {
                 return err(Errno::EPROTONOSUPPORT);
             }
             let nonblock = sotype & SOCK_NONBLOCK != 0;
             let kind = Kind::Netlink(Netlink {
                 sotype: base_type,
+                protocol,
                 ..Netlink::default()
             });
             let idx = net.socks.len();
@@ -2565,9 +2574,10 @@ impl Kernel {
                 SO_ACCEPTCONN => u32::from(matches!(net.socks[sock].kind, Kind::Listener { .. })),
                 SO_DOMAIN => u32::from(net.socks[sock].domain),
                 SO_PROTOCOL => match (&net.socks[sock].kind, net.socks[sock].domain) {
-                    (Kind::Dgram(_), _) => 17,                      // IPPROTO_UDP
-                    (_, d) if d == AF_UNIX || d == AF_NETLINK => 0, // NETLINK_ROUTE == 0
-                    _ => 6,                                         // IPPROTO_TCP
+                    (Kind::Dgram(_), _) => 17, // IPPROTO_UDP
+                    (Kind::Netlink(nl), _) => nl.protocol as u32,
+                    (_, d) if d == AF_UNIX => 0,
+                    _ => 6, // IPPROTO_TCP
                 },
                 // SO_PEERCRED: `struct ucred { pid, uid, gid }` of the process
                 // on the other end when the connection was made. A socket that
@@ -2828,9 +2838,9 @@ impl Kernel {
             }
             // A datagram socket is readable when a datagram is queued.
             Some(Kind::Dgram(d)) => POLLOUT | if d.queue.is_empty() { 0 } else { POLLIN },
-            // Netlink replies are synchronous; an unconnected/idle socket is just
-            // writable. Neither should report a spurious POLLIN.
-            Some(Kind::Netlink(_)) => POLLIN | POLLOUT,
+            // Netlink replies are queued synchronously by the request: readable
+            // only with one waiting (a uevent socket never is), always writable.
+            Some(Kind::Netlink(nl)) => POLLOUT | if nl.queue.is_empty() { 0 } else { POLLIN },
             _ => POLLOUT,
         }
     }
@@ -3885,6 +3895,12 @@ impl Kernel {
         data: &[u8],
         nosignal: bool,
     ) -> i64 {
+        if let Kind::Netlink(nl) = &net.socks[sock].kind
+            && nl.protocol == NETLINK_KOBJECT_UEVENT
+        {
+            // No uevent listener to deliver to: the message is taken and dropped.
+            return data.len() as i64;
+        }
         if matches!(net.socks[sock].kind, Kind::Netlink(_)) {
             let privileged = self.capable_over(cx, cx.cur.ns.net, super::caps::CAP_NET_ADMIN);
             return self.handle_netlink_request(net, sock, data, privileged);
@@ -6731,6 +6747,96 @@ mod tests {
         let (ty, seq, _) = &msgs[1];
         assert_eq!(*ty, NLMSG_DONE);
         assert_eq!(*seq, 42);
+    }
+
+    /// A `NETLINK_KOBJECT_UEVENT` socket (a udev monitor's) opens, binds to
+    /// its multicast group, reports its protocol, takes and drops what it's
+    /// sent, and is never readable: no device events happen in the VM.
+    #[test]
+    fn netlink_uevent_socket_is_quiet() {
+        let (k, mut mem, mut v, mut cx) = setup();
+        let fd = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Socket,
+            [
+                u64::from(AF_NETLINK),
+                SOCK_RAW | SOCK_NONBLOCK,
+                NETLINK_KOBJECT_UEVENT,
+                0,
+                0,
+                0,
+            ],
+        );
+        assert!(fd >= 3, "socket: {fd}");
+        let fd = fd as u64;
+        // sockaddr_nl { AF_NETLINK, pad, nl_pid = 0, nl_groups = 1 }
+        let sa = 0x1_1000;
+        let mut b = [0u8; 12];
+        b[0..2].copy_from_slice(&AF_NETLINK.to_le_bytes());
+        b[8..12].copy_from_slice(&1u32.to_le_bytes());
+        mem.write_init(sa, &b).unwrap();
+        let bind = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Bind,
+            [fd, sa, 12, 0, 0, 0],
+        );
+        assert_eq!(bind, 0);
+        // getsockopt(SOL_SOCKET, SO_PROTOCOL)
+        let (val, len) = (0x1_2000, 0x1_2010);
+        mem.write_init(len, &4u32.to_le_bytes()).unwrap();
+        let got = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Getsockopt,
+            [fd, SOL_SOCKET, 38, val, len, 0],
+        );
+        assert_eq!(got, 0);
+        assert_eq!(mem.read_u32(val).unwrap(), 15, "SO_PROTOCOL");
+        // A send is taken whole, and leaves nothing to read.
+        write_nlmsghdr(&mut mem, 0x1_2300, 0x10, NLM_F_REQUEST, 1);
+        let sent = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Write,
+            [fd, 0x1_2300, 16, 0, 0, 0],
+        );
+        assert_eq!(sent, 16);
+        // poll: writable, not readable.
+        let pfd = 0x1_2100;
+        let mut p = [0u8; 8];
+        p[0..4].copy_from_slice(&(fd as u32).to_le_bytes());
+        p[4..6].copy_from_slice(&(0x1u16 | 0x4).to_le_bytes());
+        mem.write_init(pfd, &p).unwrap();
+        let n = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Poll,
+            [pfd, 1, 0, 0, 0, 0],
+        );
+        assert_eq!(n, 1);
+        let revents = u16::from_le_bytes(mem.read_vec(pfd + 6, 2).unwrap().try_into().unwrap());
+        assert_eq!(revents, 0x4, "POLLOUT only");
+        let r = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Read,
+            [fd, 0x1_2200, 64, 0, 0, 0],
+        );
+        assert_eq!(r, -i64::from(Errno::EAGAIN.0));
     }
 
     /// An egress backend that only provides a link, to show `tun0`.
