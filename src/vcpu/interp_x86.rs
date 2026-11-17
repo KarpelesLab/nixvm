@@ -3284,10 +3284,9 @@ impl X86Interp {
     /// mode), `PUSH`/`POP` of `%es`/`%cs`/`%ss`/`%ds`, `PUSHA`/`POPA`, `82`
     /// (an alias of `80`), the direct far `CALL`/`JMP ptr16:32`, `INTO`, and
     /// the `LES`/`LDS` forms of `C4`/`C5` (a VEX prefix when the ModRM is a
-    /// register form, as in 64-bit mode); [`Self::is_legacy32`] says which.
-    /// The BCD adjustments (`DAA`/`DAS`/`AAA`/`AAS`/`AAM`/`AAD`),
-    /// `BOUND`, `ARPL`, `SALC` and the segment loads `LES`/`LDS` aren't here
-    /// (`#UD`).
+    /// register form, as in 64-bit mode), the BCD adjustments
+    /// (`DAA`/`DAS`/`AAA`/`AAS`/`AAM`/`AAD`), `BOUND`, `ARPL` (`MOVSXD` in
+    /// 64-bit mode) and `SALC`; [`Self::is_legacy32`] says which.
     fn exec_legacy32(&mut self, mem: &mut GuestMemory, pc: u64, p: Pfx, op: u8) -> Step {
         let width = p.width();
         let w = p.stack_width();
@@ -3358,8 +3357,155 @@ impl X86Interp {
                     self.next(pc)
                 }
             }
+            0x27 | 0x2F => {
+                self.daa_das(op == 0x2F);
+                self.next(pc)
+            }
+            0x37 | 0x3F => {
+                self.aaa_aas(op == 0x3F);
+                self.next(pc)
+            }
+            0xD4 => {
+                // AAM imm8: AH = AL / imm8, AL = AL % imm8 (#DE for 0).
+                let (imm, end) = fetch!(self.fetch8(pc));
+                if imm == 0 {
+                    return Step::Trap(Trap::Divide);
+                }
+                let al = self.gpr[RAX] as u8;
+                let (q, r) = (al / imm, al % imm);
+                self.set_reg(RAX, (u64::from(q) << 8) | u64::from(r), 16);
+                // OF/AF/CF are undefined: cleared, as hardware does.
+                self.logic_flags(u64::from(r), 8);
+                self.flags.af = false;
+                self.next(end)
+            }
+            0xD5 => {
+                // AAD imm8: AL = AL + AH * imm8, AH = 0. The undefined
+                // OF/AF/CF are the byte addition's, as hardware has them.
+                let (imm, end) = fetch!(self.fetch8(pc));
+                let (al, ah) = (self.gpr[RAX] & 0xff, (self.gpr[RAX] >> 8) & 0xff);
+                let r = self.add_flags(al, ah.wrapping_mul(u64::from(imm)) & 0xff, false, 8);
+                self.set_reg(RAX, r, 16);
+                self.next(end)
+            }
+            0xD6 => {
+                // SALC: AL = CF ? 0xFF : 0, no flags.
+                let v = if self.flags.cf { 0xff } else { 0 };
+                self.set_reg(RAX, v, 8);
+                self.next(pc)
+            }
+            0x62 => self.bound(mem, pc, p),
+            0x63 => {
+                // ARPL r/m16, r16: raise the destination selector's RPL to
+                // the source's (ZF says whether it did).
+                let (m, end) = fetch!(self.modrm(pc, p.rex));
+                let dst = self.op_of(m.kind, end);
+                let d = fetch!(self.read_operand(mem, dst, 16));
+                let src = self.gpr[m.reg] & 3;
+                self.flags.zf = d & 3 < src;
+                if self.flags.zf {
+                    fetch!(self.write_operand(mem, dst, (d & !3) | src, 16));
+                }
+                self.next(end)
+            }
+            0xC4 => self.load_far_ptr(mem, pc, p, SEG_ES),
+            0xC5 => self.load_far_ptr(mem, pc, p, SEG_DS),
             _ => Step::Illegal,
         }
+    }
+
+    /// `DAA` / `DAS` (`sub`): decimal-adjust `AL` after a packed BCD
+    /// addition or subtraction (Intel SDM). `OF` is undefined: set as the
+    /// whole adjustment's signed overflow, as hardware does.
+    fn daa_das(&mut self, sub: bool) {
+        let old = self.gpr[RAX] as u8;
+        let (old_cf, af) = (self.flags.cf, self.flags.af);
+        let mut al = old;
+        let mut cf = false;
+        let low = (al & 0xf) > 9 || af;
+        if low {
+            if sub {
+                cf = old_cf || al < 6;
+                al = al.wrapping_sub(6);
+            } else {
+                al = al.wrapping_add(6);
+            }
+        }
+        if old > 0x99 || old_cf {
+            al = if sub {
+                al.wrapping_sub(0x60)
+            } else {
+                al.wrapping_add(0x60)
+            };
+            cf = true;
+        }
+        self.set_reg(RAX, u64::from(al), 8);
+        self.szp(u64::from(al), 8);
+        self.flags.cf = cf;
+        self.flags.af = low;
+        // An addition overflows from a clear sign bit to a set one, a
+        // subtraction the other way.
+        self.flags.of = (old ^ al) & 0x80 != 0 && (al & 0x80 != 0) != sub;
+    }
+
+    /// `AAA` / `AAS` (`sub`): ASCII-adjust after an unpacked BCD addition or
+    /// subtraction: `AX` plus or minus 0x106 when `AL`'s low nibble
+    /// overflowed (or `AF`), then `AL &= 0x0F`. The undefined `SF`/`ZF`/`PF`
+    /// are the 16-bit adjustment's (`PF` of its low byte, before the mask),
+    /// `OF` clear, as hardware has them.
+    fn aaa_aas(&mut self, sub: bool) {
+        let mut ax = self.gpr[RAX] as u16;
+        let adjust = (ax & 0xf) > 9 || self.flags.af;
+        if adjust {
+            ax = if sub {
+                ax.wrapping_sub(0x106)
+            } else {
+                ax.wrapping_add(0x106)
+            };
+        }
+        self.flags = Flags {
+            cf: adjust,
+            af: adjust,
+            pf: parity(u64::from(ax)),
+            zf: ax == 0,
+            sf: ax & 0x8000 != 0,
+            of: false,
+        };
+        self.set_reg(RAX, u64::from(ax & 0xff0f), 16);
+    }
+
+    /// `BOUND r, m16&16 / m32&32`: a `#BR` (`SIGSEGV`, as Linux delivers
+    /// it) unless the signed index lies within the bounds pair in memory.
+    /// The register form is `#UD` (an `EVEX` prefix there, which isn't
+    /// supported either).
+    fn bound(&mut self, mem: &GuestMemory, pc: u64, p: Pfx) -> Step {
+        let (m, end) = fetch!(self.modrm(pc, p.rex));
+        let a = fetch!(self.mem_only(m.kind, end));
+        let w = p.width();
+        let lower = sign_extend_w(fetch!(self.read_mem(mem, a, w)), w);
+        let upper = sign_extend_w(
+            fetch!(self.read_mem(mem, a.wrapping_add(u64::from(w / 8)), w)),
+            w,
+        );
+        let idx = sign_extend_w(self.gpr[m.reg], w);
+        if idx < lower || idx > upper {
+            return Step::Trap(Trap::Protection);
+        }
+        self.next(end)
+    }
+
+    /// `LES`/`LDS`/`LSS`/`LFS`/`LGS r, m16:16/32/64`: load the offset into
+    /// `r` and the selector after it into segment register `seg`, checked
+    /// as `MOV Sreg` checks it (the register is unchanged when that faults).
+    fn load_far_ptr(&mut self, mem: &GuestMemory, pc: u64, p: Pfx, seg: usize) -> Step {
+        let (m, end) = fetch!(self.modrm(pc, p.rex));
+        let a = fetch!(self.mem_only(m.kind, end));
+        let w = p.width();
+        let off = fetch!(self.read_mem(mem, a, w));
+        let sel = fetch!(self.read_mem(mem, a.wrapping_add(u64::from(w / 8)), 16));
+        fetch!(self.load_seg(seg, sel as u16));
+        self.set_reg(m.reg, off, w);
+        self.next(end)
     }
 
     /// Whether `op` (its ModRM, if any, at `pc`) is one of the opcodes
@@ -3500,14 +3646,10 @@ impl X86Interp {
             0xAF => self.imul_rm(mem, pc, p, 0),
             0xB0 => self.cmpxchg(mem, pc, p, 8),
             0xB1 => self.cmpxchg(mem, pc, p, width),
-            // LSS/LFS/LGS: far-pointer loads need descriptor tables.
-            0xB2 | 0xB4 | 0xB5 => {
-                let (m, end) = fetch!(self.modrm(pc, p.rex));
-                if let Err(s) = self.mem_only(m.kind, end) {
-                    return s;
-                }
-                Step::Trap(Trap::Protection)
-            }
+            // LSS/LFS/LGS: far-pointer loads (m16:64 under REX.W, as on Intel).
+            0xB2 => self.load_far_ptr(mem, pc, p, SEG_SS),
+            0xB4 => self.load_far_ptr(mem, pc, p, SEG_FS),
+            0xB5 => self.load_far_ptr(mem, pc, p, SEG_GS),
             0xB6 | 0xB7 | 0xBE | 0xBF => {
                 // MOVZX/MOVSX Gv, Eb/Ew.
                 let src_w = if op & 1 == 0 { 8 } else { 16 };
@@ -6892,6 +7034,96 @@ mod tests {
         assert!(matches!(s, Step::Trap(Trap::Protection)));
     }
 
+    /// The arithmetic flags of `RFLAGS` (`OF SF ZF AF PF CF`).
+    const ARITH: u64 = 0x8d5;
+
+    /// The BCD and ASCII adjustments, against what an x86 CPU produced for
+    /// the same `AX` and incoming `CF`/`AF` (all six flags, the undefined
+    /// ones included: these were read from hardware).
+    #[test]
+    fn bcd_adjustments_match_hardware() {
+        let mut m = mem();
+        // (opcode, ax, CF | AF << 1 in, ax out, flags out)
+        let cases: &[(u8, u16, u8, u16, u64)] = &[
+            (0x27, 0x0000, 1, 0x0060, 0x005),
+            (0x27, 0x0000, 3, 0x0066, 0x015),
+            (0x27, 0x0080, 2, 0x0086, 0x090),
+            (0x27, 0x009a, 0, 0x0000, 0x055),
+            (0x27, 0x00f9, 0, 0x0059, 0x005),
+            (0x27, 0x0106, 2, 0x010c, 0x014),
+            (0x2F, 0x0000, 1, 0x00a0, 0x085),
+            (0x2F, 0x0000, 3, 0x009a, 0x095),
+            (0x2F, 0x0080, 2, 0x007a, 0x810),
+            (0x2F, 0x009a, 0, 0x0034, 0x811),
+            (0x2F, 0x00fa, 0, 0x0094, 0x091),
+            (0x2F, 0x0106, 2, 0x0100, 0x054),
+            (0x37, 0x0000, 1, 0x0000, 0x044),
+            (0x37, 0x0000, 3, 0x0106, 0x015),
+            (0x37, 0x0079, 2, 0x010f, 0x011),
+            (0x37, 0x00f9, 0, 0x0009, 0x004),
+            (0x37, 0x00fa, 0, 0x0200, 0x015),
+            (0x37, 0x0106, 2, 0x020c, 0x015),
+            (0x3F, 0x0000, 3, 0xfe0a, 0x095),
+            (0x3F, 0x0007, 2, 0xff01, 0x091),
+            (0x3F, 0x009a, 0, 0xff04, 0x091),
+            (0x3F, 0x00f9, 0, 0x0009, 0x004),
+            (0x3F, 0x0100, 0, 0x0100, 0x004),
+            (0x3F, 0x0106, 2, 0x0000, 0x055),
+        ];
+        for &(op, ax, cfaf, out_ax, out_fl) in cases {
+            let (c, s) = run32_with(&mut m, &[op], |c| {
+                c.gpr[RAX] = 0xdead_0000 | u64::from(ax);
+                c.set_rflags_user(0x202 | ARITH);
+                c.flags.cf = cfaf & 1 != 0;
+                c.flags.af = cfaf & 2 != 0;
+            });
+            assert!(matches!(s, Step::Next), "{op:#x} {ax:#x}");
+            assert_eq!(
+                (c.gpr[RAX], c.rflags_word() & ARITH),
+                (0xdead_0000 | u64::from(out_ax), out_fl),
+                "{op:#x} ax {ax:#x} cf/af {cfaf}"
+            );
+        }
+        // AAM / AAD (base 10), from the same hardware.
+        for &(op, ax, out_ax, out_fl) in &[
+            (0xD4u8, 0x00ffu16, 0x1905u16, 0x004u64),
+            (0xD4, 0x0d8f, 0x0e03, 0x004),
+            (0xD4, 0x0000, 0x0000, 0x044),
+            (0xD5, 0x00ff, 0x00ff, 0x084),
+            (0xD5, 0x0270, 0x0084, 0x884),
+            (0xD5, 0x0d8f, 0x0011, 0x815),
+        ] {
+            let (c, _) = run32_with(&mut m, &[op, 10], |c| c.gpr[RAX] = u64::from(ax));
+            assert_eq!(
+                (c.gpr[RAX], c.rflags_word() & ARITH, c.rip),
+                (u64::from(out_ax), out_fl, CODE + 2),
+                "{op:#x} {ax:#x}"
+            );
+        }
+        // AAM 0 is a divide error, on the instruction.
+        let (c, s) = run32_with(&mut m, &[0xD4, 0], |c| c.gpr[RAX] = 5);
+        assert!(matches!(s, Step::Trap(Trap::Divide)) && c.rip == CODE);
+        // AAM 16 splits nibbles; AAD 16 joins them.
+        let (c, _) = run32_with(&mut m, &[0xD4, 16], |c| c.gpr[RAX] = 0x4b);
+        assert_eq!(c.gpr[RAX], 0x040b);
+        let (c, _) = run32_with(&mut m, &[0xD5, 16], |c| c.gpr[RAX] = 0x040b);
+        assert_eq!(c.gpr[RAX], 0x4b);
+        // SALC: AL from CF, no flags changed.
+        for cf in [false, true] {
+            let (c, _) = run32_with(&mut m, &[0xD6], |c| {
+                c.gpr[RAX] = 0x1234_5678;
+                c.flags.cf = cf;
+            });
+            assert_eq!(c.gpr[RAX], if cf { 0x1234_56ff } else { 0x1234_5600 });
+            assert_eq!(c.flags.cf, cf);
+        }
+        // None of them exist in 64-bit mode.
+        for code in [&[0x27][..], &[0x37], &[0xD4, 10], &[0xD6]] {
+            let (_, s) = run_with(&mut m, code, |_| {});
+            assert!(matches!(s, Step::Illegal));
+        }
+    }
+
     /// A CPU in compatibility mode with `m`'s LDT.
     fn cpu32(m: &GuestMemory) -> X86Interp {
         let mut cpu = X86Interp::new(CODE, STACK);
@@ -6912,6 +7144,101 @@ mod tests {
         setup(&mut cpu);
         let s = cpu.exec(mem);
         (cpu, s)
+    }
+
+    /// `BOUND` (a #BR, `SIGSEGV`, outside the bounds), `ARPL`, and the far
+    /// pointer loads `LES`/`LDS` (and `LSS`/`LFS`/`LGS` in 64-bit mode).
+    #[test]
+    fn bound_arpl_and_far_pointer_loads() {
+        let mut m = mem();
+        // Bounds -5..=100 at 0x14000; 16-bit bounds -2..=3 at 0x14008.
+        m.write_init(0x1_4000, &(-5i32).to_le_bytes()).unwrap();
+        m.write_init(0x1_4004, &100i32.to_le_bytes()).unwrap();
+        m.write_init(0x1_4008, &[0xfe, 0xff, 0x03, 0x00]).unwrap();
+        let bound = [0x62, 0x05, 0x00, 0x40, 0x01, 0x00]; // bound eax, [0x14000]
+        for (v, ok) in [
+            (0u64, true),
+            (100, true),
+            (0xffff_fffb, true),
+            (101, false),
+            (0xffff_fffa, false),
+        ] {
+            let (c, s) = run32_with(&mut m, &bound, |c| c.gpr[RAX] = v);
+            if ok {
+                assert!(matches!(s, Step::Next) && c.rip == CODE + 6, "{v:#x}");
+            } else {
+                assert!(
+                    matches!(s, Step::Trap(Trap::Protection)) && c.rip == CODE,
+                    "{v:#x}"
+                );
+            }
+        }
+        let bound16 = [0x66, 0x62, 0x05, 0x08, 0x40, 0x01, 0x00];
+        let (_, s) = run32_with(&mut m, &bound16, |c| c.gpr[RAX] = 0x1_fffe); // ax = -2
+        assert!(matches!(s, Step::Next));
+        let (_, s) = run32_with(&mut m, &bound16, |c| c.gpr[RAX] = 4);
+        assert!(matches!(s, Step::Trap(Trap::Protection)));
+        let (_, s) = run32_with(&mut m, &[0x62, 0xC0], |_| {});
+        assert!(matches!(s, Step::Illegal), "no register form");
+
+        // ARPL cx, ax (63 C1): raise RPL 1 to 3, ZF set; already 3: ZF clear.
+        let (c, _) = run32_with(&mut m, &[0x63, 0xC1], |c| {
+            c.gpr[RCX] = 0xabcd_0029;
+            c.gpr[RAX] = 0x2b;
+        });
+        assert_eq!((c.gpr[RCX], c.flags.zf), (0xabcd_002b, true));
+        let (c, _) = run32_with(&mut m, &[0x63, 0xC1], |c| {
+            c.gpr[RCX] = 0x2b;
+            c.gpr[RAX] = 0x28;
+            c.flags.zf = true;
+        });
+        assert_eq!((c.gpr[RCX], c.flags.zf), (0x2b, false));
+        // ...to memory: arpl [0x14010], ax.
+        m.write_init(0x1_4010, &[0x20, 0x00, 0x77]).unwrap();
+        let (c, _) = run32_with(&mut m, &[0x63, 0x05, 0x10, 0x40, 0x01, 0x00], |c| {
+            c.gpr[RAX] = 2;
+        });
+        assert!(c.flags.zf);
+        assert_eq!(m.read_u32(0x1_4010).unwrap() & 0xff_ffff, 0x77_0022);
+        // In 64-bit mode 63 is MOVSXD.
+        let (c, _) = run_with(&mut m, &[0x48, 0x63, 0xC1], |c| c.gpr[RCX] = 0x8000_0000);
+        assert_eq!(c.gpr[RAX], 0xffff_ffff_8000_0000);
+
+        // m16:32 at 0x14020: 0x2b:0x12345678; m16:32 with selector 0x08
+        // (the kernel's code) at 0x14030.
+        m.write_init(0x1_4020, &[0x78, 0x56, 0x34, 0x12, 0x2b, 0x00])
+            .unwrap();
+        m.write_init(0x1_4030, &[0x78, 0x56, 0x34, 0x12, 0x08, 0x00])
+            .unwrap();
+        // les ebx, [0x14020]; lds ecx, [0x14020]
+        let (c, s) = run32_with(&mut m, &[0xC4, 0x1D, 0x20, 0x40, 0x01, 0x00], |_| {});
+        assert!(matches!(s, Step::Next));
+        assert_eq!((c.gpr[RBX], c.segs[SEG_ES]), (0x1234_5678, 0x2b));
+        let (c, _) = run32_with(&mut m, &[0xC5, 0x0D, 0x20, 0x40, 0x01, 0x00], |_| {});
+        assert_eq!((c.gpr[RCX], c.segs[SEG_DS]), (0x1234_5678, 0x2b));
+        // 16-bit: lds cx, [0x14020] -> offset 0x5678, selector 0x1234: no
+        // such entry, #GP, cx unchanged.
+        let (c, s) = run32_with(&mut m, &[0x66, 0xC5, 0x0D, 0x20, 0x40, 0x01, 0x00], |c| {
+            c.gpr[RCX] = 7;
+        });
+        assert!(matches!(s, Step::Trap(Trap::Protection)) && c.gpr[RCX] == 7);
+        // A DPL-0 segment can't be loaded: #GP, nothing changed.
+        let (c, s) = run32_with(&mut m, &[0xC4, 0x1D, 0x30, 0x40, 0x01, 0x00], |c| {
+            c.gpr[RBX] = 1;
+        });
+        assert!(matches!(s, Step::Trap(Trap::Protection)));
+        assert_eq!((c.gpr[RBX], c.segs[SEG_ES]), (1, 0));
+
+        // 64-bit mode: lss/lfs/lgs (0F B2/B4/B5) with a 32-bit offset.
+        for (op, seg) in [(0xB2u8, SEG_SS), (0xB4, SEG_FS), (0xB5, SEG_GS)] {
+            // lXs edx, [rip + disp] -> 0x14020
+            let rel = (0x1_4020u64.wrapping_sub(CODE + 7)) as u32;
+            let mut code = vec![0x0F, op, 0x15];
+            code.extend_from_slice(&rel.to_le_bytes());
+            let (c, s) = run_with(&mut m, &code, |_| {});
+            assert!(matches!(s, Step::Next), "{op:#x}");
+            assert_eq!((c.gpr[RDX], c.segs[seg]), (0x1234_5678, 0x2b));
+        }
     }
 
     /// A segment descriptor: `ty` is the 4-bit type, `flags` the `G`, `D/B`,
