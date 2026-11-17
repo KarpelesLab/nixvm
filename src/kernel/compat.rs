@@ -308,7 +308,7 @@ impl Kernel {
                     return err(Errno::EFAULT);
                 };
                 let v: Vec<u64> = (0..6).map(|i| r32(&raw, i * 4)).collect();
-                if v[5] % PAGE_SIZE != 0 {
+                if !v[5].is_multiple_of(PAGE_SIZE) {
                     return err(Errno::EINVAL);
                 }
                 Ok(self.c_mmap(cx, [v[0], v[1], v[2], v[3], v[4], v[5]], vcpu, mem))

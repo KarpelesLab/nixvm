@@ -734,19 +734,18 @@ impl KvmVcpu {
             // its `Weak` is kept: drop those now.)
             t.retain(|s| s.owner.strong_count() > 0);
             let me = Arc::downgrade(&self.vm);
-            let i = match t.iter().position(|s| Weak::ptr_eq(&s.owner, &me)) {
-                Some(i) => i,
-                None => {
-                    let slot = self.vm.alloc_gdt_slot().ok_or_else(|| {
-                        VcpuError::Backend("more host threads than private GDTs".into())
-                    })?;
-                    t.push(ThreadGdt {
-                        owner: me,
-                        slot,
-                        tag: 0,
-                    });
-                    t.len() - 1
-                }
+            let i = if let Some(i) = t.iter().position(|s| Weak::ptr_eq(&s.owner, &me)) {
+                i
+            } else {
+                let slot = self.vm.alloc_gdt_slot().ok_or_else(|| {
+                    VcpuError::Backend("more host threads than private GDTs".into())
+                })?;
+                t.push(ThreadGdt {
+                    owner: me,
+                    slot,
+                    tag: 0,
+                });
+                t.len() - 1
             };
             let s = &mut t[i];
             if s.tag != self.tls_tag {

@@ -467,7 +467,7 @@ impl Kernel {
         if r < 0 {
             return Ok(r);
         }
-        Ok(mem.read_u64(op).map_err(efault)? as u32 as i64)
+        Ok(i64::from(mem.read_u64(op).map_err(efault)? as u32))
     }
 
     /// `sgetmask()` / `ssetmask(mask)`: the first 32 signals' mask.
@@ -1000,7 +1000,7 @@ impl Kernel {
         mem: &mut GuestMemory,
     ) -> R {
         let len = a[1];
-        if len % 4 != 0 {
+        if !len.is_multiple_of(4) {
             return Ok(err(Errno::EINVAL));
         }
         let len64 = len.min(1 << 16).next_multiple_of(8);

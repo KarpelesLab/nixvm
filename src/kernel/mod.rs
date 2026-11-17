@@ -3475,15 +3475,12 @@ impl Kernel {
                             Err(_) => done = Some(err(Errno::EFAULT)),
                         }
                     }
-                    match entry.nr64() {
-                        Some(nr) => {
-                            ia32 = Some((raw, entry));
-                            raw = nr;
-                        }
-                        None => {
-                            self.note_unsupported("i386 syscall", raw);
-                            done = Some(err(Errno::ENOSYS));
-                        }
+                    if let Some(nr) = entry.nr64() {
+                        ia32 = Some((raw, entry));
+                        raw = nr;
+                    } else {
+                        self.note_unsupported("i386 syscall", raw);
+                        done = Some(err(Errno::ENOSYS));
                     }
                 }
                 if cx.cur.ptrace.is_some() {

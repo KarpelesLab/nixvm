@@ -154,6 +154,7 @@ impl Heap {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent per-space flags
 pub struct GuestMemory {
     base: u64,
     size: u64,
@@ -502,7 +503,7 @@ impl GuestMemory {
     }
 
     /// Install a new local descriptor table (the whole of it), and back it
-    /// at [`ctrl::LDT_VA`] for a hardware vcpu.
+    /// at `ctrl::LDT_VA` for a hardware vcpu.
     pub fn set_ldt(&mut self, ldt: Arc<[u64]>) {
         let pages = (ldt.len() * 8).div_ceil(PAGE_SIZE as usize);
         if self.ldt_frames.len() < pages {
@@ -512,18 +513,15 @@ impl GuestMemory {
                     break;
                 };
                 let va = ctrl::LDT_VA + self.ldt_frames.len() as u64 * PAGE_SIZE;
-                match self.space.map(va, frame, Prot::rw(), true, &mut fa, &self.phys) {
-                    Ok(old) => {
-                        if let Some(old) = old {
-                            fa.free(old);
-                        }
-                        self.ldt_frames.push(frame);
-                    }
-                    Err(_) => {
-                        fa.free(frame);
-                        break;
-                    }
+                let Ok(old) = self.space.map(va, frame, Prot::rw(), true, &mut fa, &self.phys)
+                else {
+                    fa.free(frame);
+                    break;
+                };
+                if let Some(old) = old {
+                    fa.free(old);
                 }
+                self.ldt_frames.push(frame);
             }
         }
         for (i, d) in ldt.iter().enumerate() {
@@ -536,7 +534,7 @@ impl GuestMemory {
         self.ldt = ldt;
     }
 
-    /// How many LDT descriptors the CPU can read at [`ctrl::LDT_VA`].
+    /// How many LDT descriptors the CPU can read at `ctrl::LDT_VA`.
     #[must_use]
     pub fn ldt_backed(&self) -> usize {
         self.ldt.len().min(self.ldt_frames.len() * (PAGE_SIZE as usize / 8))

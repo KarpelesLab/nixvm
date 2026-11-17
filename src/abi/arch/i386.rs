@@ -1352,23 +1352,25 @@ impl Layout {
                 (1u64 << (s64 * 8)) - 1
             };
             let w = match fl.kind {
-                Kind::S | Kind::U => v,
-                Kind::C if v > all => return Err(Overflow),
                 Kind::CAll if v == in_all => all,
-                Kind::CAll if v > all => return Err(Overflow),
-                Kind::C | Kind::CAll => v,
                 Kind::Rlim => v.min(all),
                 Kind::RlimOld => v.min(0x7fff_ffff),
                 Kind::Id16 if v > 0xffff => 65534,
-                Kind::Id16 => v,
-                Kind::Lfs if v > 0x7fff_ffff => return Err(Overflow),
-                Kind::Lfs => v,
-                // `old_valid_dev`: major and minor below 256, in the new
-                // encoding (`minor & 0xff | major << 8 | ...`).
-                Kind::OldDev if v > 0xffff => return Err(Overflow),
-                Kind::OldDev => v,
                 Kind::Hi => v >> 32,
+                _ => v,
             };
+            // The most a checked field may hold: `old_valid_dev` is a major
+            // and minor below 256 in the new encoding (`minor & 0xff |
+            // major << 8 | ...`).
+            let max = match fl.kind {
+                Kind::C | Kind::CAll => all,
+                Kind::Lfs => 0x7fff_ffff,
+                Kind::OldDev => 0xffff,
+                _ => u64::MAX,
+            };
+            if w > max {
+                return Err(Overflow);
+            }
             put(&mut out, o32, s32, w);
         }
         Ok(out)

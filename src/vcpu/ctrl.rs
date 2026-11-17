@@ -228,6 +228,7 @@ pub fn default_gdt() -> [u64; GDT_ENTRIES] {
 /// running task's TLS entries into it. The SMP workers are at most 256, so
 /// this never runs out, however many guest threads have TLS entries. Each
 /// is [`GDT_ENTRIES`] × 8 = 128 bytes, 32 to a page.
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const GDT_POOL_SLOTS: usize = GDT_POOL_FRAMES as usize * GDT_SLOTS_PER_FRAME;
 #[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 const GDT_SLOTS_PER_FRAME: usize = PAGE_SIZE as usize / (GDT_ENTRIES * 8);
