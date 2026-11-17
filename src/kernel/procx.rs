@@ -308,7 +308,7 @@ impl Kernel {
             return err(Errno::ESRCH);
         };
         let Ok(mut other) = space.try_lock() else {
-            cx.block = true;
+            cx.retry_busy();
             return 0;
         };
         copy_streams(mem, Some(&mut other), &local, &remote, write)
@@ -549,7 +549,7 @@ impl Kernel {
         // Memory is the outermost lock and the caller holds its own: only try
         // the target's, and come back if it's busy on another CPU.
         let Ok(mut other) = space.try_lock() else {
-            cx.block = true;
+            cx.retry_busy();
             return 0;
         };
         mem_copy(mem, Some(&mut other), at, buf, count, write)

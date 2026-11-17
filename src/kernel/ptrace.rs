@@ -641,7 +641,7 @@ impl Kernel {
                     Some(true) => {}
                     Some(false) => return err(Errno::EIO),
                     None => {
-                        cx.block = true;
+                        cx.retry_busy();
                         return 0;
                     }
                 }
@@ -656,7 +656,7 @@ impl Kernel {
                     Some(true) => 0,
                     Some(false) => err(Errno::EIO),
                     None => {
-                        cx.block = true;
+                        cx.retry_busy();
                         0
                     }
                 }

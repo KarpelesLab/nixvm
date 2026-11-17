@@ -1702,6 +1702,19 @@ pub(super) struct ServiceCtx {
     slice_syscalls: u32,
 }
 
+impl ServiceCtx {
+    /// The call needs another task's address space, and another CPU holds
+    /// it now (its memory lock, the outermost, can only be tried): re-run
+    /// the call as soon as this CPU is free again, rather than wait for
+    /// progress elsewhere. Nothing will report that lock coming free — the
+    /// task holding it may itself be blocked, re-checking its own wait — so
+    /// a plain block could wait forever on a lock held a moment.
+    pub(super) fn retry_busy(&mut self) {
+        self.block = true;
+        self.yield_now = true;
+    }
+}
+
 #[cfg(test)]
 impl ServiceCtx {
     /// A minimal context for unit tests that exercise a single handler directly
@@ -4384,6 +4397,9 @@ impl Kernel {
             // Stopped for its tracer: off the CPU, but as progress (the tracer
             // has something to see), so it's looked at again once let go.
             Serviced::Blocked if traced => SliceStep::Yielded,
+            // Blocked on another CPU's lock ([`ServiceCtx::retry_busy`]):
+            // still runnable.
+            Serviced::Blocked if cx.yield_now => SliceStep::Yielded,
             Serviced::Blocked => SliceStep::Blocked,
             Serviced::Ended => SliceStep::Ended,
         }
