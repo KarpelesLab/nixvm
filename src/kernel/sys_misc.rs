@@ -432,6 +432,27 @@ impl Kernel {
         vcpu: &mut dyn crate::vcpu::Vcpu,
         mem: &mut GuestMemory,
     ) -> i64 {
+        Self::do_set_thread_area(u_info, true, vcpu, mem)
+    }
+
+    /// The TLS of an i386 `clone`'s child (`CLONE_SETTLS`): the GDT entry
+    /// `u_info` describes, which it must name (`set_new_tls`).
+    pub(super) fn clone_thread_area(
+        u_info: u64,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        Self::do_set_thread_area(u_info, false, vcpu, mem)
+    }
+
+    /// Linux's `do_set_thread_area`: entry -1 picks a free one only when
+    /// `can_allocate`.
+    fn do_set_thread_area(
+        u_info: u64,
+        can_allocate: bool,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         let mut raw = [0u8; 16];
         if mem.read(u_info, &mut raw).is_err() {
             return err(Errno::EFAULT);
@@ -441,7 +462,7 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         let mut idx = info.entry_number;
-        if idx == u32::MAX {
+        if idx == u32::MAX && can_allocate {
             let Some(free) = (0..TLS_ENTRIES).find(|&i| vcpu.tls_desc(i) == 0) else {
                 return err(Errno::ESRCH);
             };

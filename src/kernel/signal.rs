@@ -338,6 +338,9 @@ impl super::ProcInfo {
 /// Bit-mask of the four stop signals' pending bits.
 pub(super) const STOP_SIG_BITS: u64 =
     (1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)) | (1 << (SIGTTIN - 1)) | (1 << (SIGTTOU - 1));
+/// `SA_IA32_ABI`: the kernel's mark on a handler installed by an ia32
+/// `rt_sigaction`/`sigaction`, which then gets an ia32 signal frame.
+pub(super) const SA_IA32_ABI: u64 = 0x0200_0000;
 /// The SIGCONT pending bit.
 pub(super) const CONT_SIG_BIT: u64 = 1 << (SIGCONT - 1);
 
@@ -363,10 +366,11 @@ impl Kernel {
         let idx = sig as usize;
         if oldact != 0 {
             // struct sigaction: handler u64, flags u64, restorer u64, mask u64.
+            // The kernel's own `SA_IA32_ABI` doesn't show (`sigaction_compat_abi`).
             let old = cx.cur.handlers.get(idx);
             let mut buf = [0u8; 32];
             buf[0..8].copy_from_slice(&old.handler.to_le_bytes());
-            buf[8..16].copy_from_slice(&old.flags.to_le_bytes());
+            buf[8..16].copy_from_slice(&(old.flags & !SA_IA32_ABI).to_le_bytes());
             buf[16..24].copy_from_slice(&old.restorer.to_le_bytes());
             buf[24..32].copy_from_slice(&old.mask.to_le_bytes());
             if mem.write(oldact, &buf).is_err() {
@@ -379,11 +383,13 @@ impl Kernel {
                 return err(Errno::EFAULT);
             }
             let word = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+            // A handler installed through the i386 entry gets ia32 frames.
+            let abi = if cx.ia32 { SA_IA32_ABI } else { 0 };
             cx.cur.handlers.set(
                 idx,
                 super::SigAction {
                     handler: word(0),
-                    flags: word(8),
+                    flags: (word(8) & !SA_IA32_ABI) | abi,
                     restorer: word(16),
                     mask: word(24),
                 },
@@ -1156,6 +1162,10 @@ impl Kernel {
         let si_code = si.code;
         let si_addr = si.addr;
         let act = cx.cur.handlers.get(sig as usize);
+        // A handler installed through the i386 entry gets an ia32 frame.
+        if act.flags & SA_IA32_ABI != 0 {
+            return Self::push_sigframe_ia32(cx, sig, &si, restore_mask, vcpu, mem);
+        }
         // Choose the stack: the alternate stack if the handler asked for it and
         // one is configured, else just below the current rsp (with the ABI red
         // zone skipped).
@@ -1694,4 +1704,333 @@ fn sigqueue_full(sh: &Shared, cx: &ServiceCtx, pid: i32) -> bool {
         .map(super::ProcInfo::queued_signals)
         .sum();
     queued as u64 >= limit
+}
+
+// ---- ia32 signal frames ----------------------------------------------------
+//
+// A handler installed through the i386 entry (`SA_IA32_ABI`) gets Linux's ia32
+// frame (`arch/x86/kernel/signal_32.c`), in 32-bit mode: a `sigframe_ia32`
+// `{ pretcode, sig, sigcontext_32 sc, _fpstate_32 (unused), extramask,
+// retcode[8] }`, or with `SA_SIGINFO` an `rt_sigframe_ia32` `{ pretcode, sig,
+// pinfo, puc, compat_siginfo info, ucontext_ia32 uc, retcode[8] }`. The FPU
+// state goes above the frame: the `fsave`-format header (`struct
+// fregs_state`, 112 bytes) the `sigcontext`'s `fpstate` points at, then the
+// `fxsave`/XSAVE area, 64-byte aligned, as `copy_fpstate_to_sigframe` writes
+// it for an ia32 frame.
+
+/// `sizeof(struct sigcontext_32)`.
+const SC32_SIZE: u64 = 88;
+/// `sizeof(struct fregs_state)`, the `fsave` header ahead of the `fxsave`
+/// area.
+const FREGS_SIZE: u64 = 112;
+/// `sizeof(struct sigframe_ia32)` and `sizeof(struct rt_sigframe_ia32)`.
+const SIGFRAME32_SIZE: u64 = 8 + SC32_SIZE + 624 + 4 + 8;
+const RT_SIGFRAME32_SIZE: u64 = 16 + 128 + UCONTEXT32_SIZE + 8;
+/// `sizeof(struct ucontext_ia32)`: flags, link, stack (12), mcontext,
+/// sigmask (8).
+const UCONTEXT32_SIZE: u64 = 20 + SC32_SIZE + 8;
+/// `SA_SIGINFO`.
+const SA_SIGINFO: u64 = 4;
+/// The flags a `sigreturn` takes back from the frame (`FIX_EFLAGS`): AC,
+/// OF, DF, TF, SF, ZF, AF, PF, CF, RF.
+const FIX_EFLAGS: u64 =
+    0x4_0000 | 0x800 | 0x400 | 0x100 | 0x80 | 0x40 | 0x10 | 0x4 | 0x1 | 0x1_0000;
+/// `__USER32_CS`.
+const USER32_CS: u16 = 0x23;
+
+/// The `i387` tag word (two bits a register) from an `fxsave` image's
+/// abridged one (`twd_fxsr_to_i387`).
+fn twd_fxsr_to_i387(fx: &[u8]) -> u32 {
+    let swd = u16::from_le_bytes([fx[2], fx[3]]);
+    let tos = usize::from((swd >> 11) & 7);
+    let abridged = fx[4];
+    let mut ret = 0xffff_0000u32;
+    for i in 0..8 {
+        let tag = if abridged & (1 << i) != 0 {
+            let st = (i + 8 - tos) & 7;
+            let r = &fx[32 + st * 16..32 + st * 16 + 10];
+            let exp = u16::from_le_bytes([r[8], r[9]]) & 0x7fff;
+            let mant = u64::from_le_bytes(r[..8].try_into().unwrap());
+            match exp {
+                0 if mant == 0 => 1,
+                0 | 0x7fff => 2,
+                _ if mant >> 63 == 0 => 2,
+                _ => 0,
+            }
+        } else {
+            3
+        };
+        ret |= tag << (2 * i);
+    }
+    ret
+}
+
+/// The `fsave` header (`struct fregs_state`, 112 bytes) for an `fxsave`
+/// image, as `convert_from_fxsr` and `save_fsave_header` write it: control,
+/// status and tag words, the last instruction and operand, the eight
+/// registers in their 10-byte form, the status again and the `fxsr` magic
+/// (0: an `fxsave` image follows).
+fn fsave_header(fx: &[u8], cs: u16, ds: u16) -> [u8; 112] {
+    let mut h = [0u8; 112];
+    let w32 = |h: &mut [u8; 112], o: usize, v: u32| h[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    let cwd = u32::from(u16::from_le_bytes([fx[0], fx[1]]));
+    let swd = u32::from(u16::from_le_bytes([fx[2], fx[3]]));
+    let fop = u32::from(u16::from_le_bytes([fx[6], fx[7]]));
+    w32(&mut h, 0, cwd | 0xffff_0000);
+    w32(&mut h, 4, swd | 0xffff_0000);
+    w32(&mut h, 8, twd_fxsr_to_i387(fx));
+    w32(&mut h, 12, u32::from_le_bytes(fx[8..12].try_into().unwrap())); // fip
+    w32(&mut h, 16, u32::from(cs) | fop << 16); // fcs
+    w32(&mut h, 20, u32::from_le_bytes(fx[16..20].try_into().unwrap())); // foo
+    w32(&mut h, 24, 0xffff_0000 | u32::from(ds)); // fos
+    for i in 0..8 {
+        h[28 + i * 10..38 + i * 10].copy_from_slice(&fx[32 + i * 16..42 + i * 16]);
+    }
+    h[108..110].copy_from_slice(&fx[2..4]); // status
+    h
+}
+
+impl Kernel {
+    /// Build an ia32 signal frame for `sig` (see above) and enter the
+    /// handler in 32-bit mode with `%eax` = the signal (and, for an
+    /// `rt_sigframe`, `%edx` = `&info`, `%ecx` = `&uc`), `%esp` at the frame,
+    /// `%cs`/`%ss`/`%ds`/`%es` the 32-bit user ones.
+    #[allow(clippy::too_many_lines)]
+    fn push_sigframe_ia32(
+        cx: &mut ServiceCtx,
+        sig: u64,
+        si: &SiFields,
+        restore_mask: u64,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &mut GuestMemory,
+    ) -> bool {
+        let act = cx.cur.handlers.get(sig as usize);
+        let rt = act.flags & SA_SIGINFO != 0;
+        let cur_sp = vcpu.sp() & 0xffff_ffff;
+        let (user_cs, user_ss) = vcpu.user_segments();
+        let (alt_sp, alt_size, alt_flags) = cx.cur.altstack;
+        let on_alt = cur_sp.wrapping_sub(alt_sp) < alt_size;
+        let mut sp = if act.flags & SA_ONSTACK != 0
+            && alt_flags & SS_DISABLE == 0
+            && alt_size != 0
+            && !on_alt
+        {
+            alt_sp + alt_size
+        } else {
+            cur_sp
+        };
+        // The FPU state: the XSAVE (or fxsave) area, 64-byte aligned, with
+        // the `fsave` header below it.
+        let simd = vcpu.simd_state();
+        let mut fpstate = 0;
+        let mut xstate = false;
+        if simd.len() >= FXSAVE_SIZE as usize {
+            let full = simd.len() >= crate::vcpu::X86_XSAVE_SIZE;
+            let size = if full {
+                crate::vcpu::X86_XSAVE_SIZE as u64
+            } else {
+                FXSAVE_SIZE
+            };
+            let mut img = simd[..size as usize].to_vec();
+            if full {
+                let xfeatures = u64::from_le_bytes(img[512..520].try_into().unwrap());
+                img[464..468].copy_from_slice(&FP_XSTATE_MAGIC1.to_le_bytes());
+                img[468..472].copy_from_slice(&((size + 4) as u32).to_le_bytes());
+                img[472..480].copy_from_slice(&xfeatures.to_le_bytes());
+                img[480..484].copy_from_slice(&(size as u32).to_le_bytes());
+                img.extend_from_slice(&FP_XSTATE_MAGIC2.to_le_bytes());
+            }
+            let buf_fx = (sp - img.len() as u64) & !63;
+            fpstate = buf_fx - FREGS_SIZE;
+            let header = fsave_header(&img, user_cs, vcpu.segment_selector(3));
+            if mem.write(buf_fx, &img).is_err() || mem.write(fpstate, &header).is_err() {
+                return false;
+            }
+            xstate = full;
+            sp = fpstate;
+        }
+        let size = if rt {
+            RT_SIGFRAME32_SIZE
+        } else {
+            SIGFRAME32_SIZE
+        };
+        // `align_sigframe`: `(sp + 4)` 16-byte aligned, as after a `call`.
+        let frame = ((sp - size + 4) & !15) - 4;
+        // The sigcontext.
+        let mut sc = [0u8; SC32_SIZE as usize];
+        {
+            let mut w = |o: usize, v: u64, n: usize| {
+                sc[o..o + n].copy_from_slice(&v.to_le_bytes()[..n]);
+            };
+            w(0, u64::from(vcpu.segment_selector(5)), 2); // gs
+            w(4, u64::from(vcpu.segment_selector(4)), 2); // fs
+            w(8, u64::from(vcpu.segment_selector(0)), 2); // es
+            w(12, u64::from(vcpu.segment_selector(3)), 2); // ds
+            // di, si, bp, sp, bx, dx, cx, ax.
+            for (i, r) in [7, 6, 5, 4, 3, 2, 1, 0].into_iter().enumerate() {
+                let v = if r == 4 { cur_sp } else { vcpu.reg(r) };
+                w(16 + i * 4, v, 4);
+            }
+            w(48, si.trapno, 4);
+            w(52, si.err, 4);
+            w(56, vcpu.pc(), 4);
+            w(60, u64::from(user_cs), 2);
+            w(64, vcpu.rflags(), 4);
+            w(68, cur_sp, 4); // sp_at_signal
+            w(72, u64::from(user_ss), 2);
+            w(76, fpstate, 4);
+            w(80, restore_mask, 4); // oldmask
+            w(84, if si.fault { si.addr } else { 0 }, 4); // cr2
+        }
+        // Where the handler returns: its restorer, or the vDSO's
+        // `__kernel_(rt_)sigreturn`, or the frame's own `retcode`.
+        let restorer = if act.flags & SA_RESTORER != 0 {
+            act.restorer
+        } else if let Some(v) = mem.vdso32() {
+            v + if rt {
+                crate::vcpu::vdso32::RT_SIGRETURN
+            } else {
+                crate::vcpu::vdso32::SIGRETURN
+            }
+        } else {
+            frame + size - 8
+        };
+        let mut f = vec![0u8; size as usize];
+        let put = |f: &mut Vec<u8>, o: u64, b: &[u8]| {
+            f[o as usize..o as usize + b.len()].copy_from_slice(b);
+        };
+        put(&mut f, 0, &(restorer as u32).to_le_bytes());
+        put(&mut f, 4, &(sig as u32).to_le_bytes());
+        let (info, uc) = if rt { (frame + 16, frame + 144) } else { (0, 0) };
+        if rt {
+            put(&mut f, 8, &(info as u32).to_le_bytes());
+            put(&mut f, 12, &(uc as u32).to_le_bytes());
+            let si32 = super::compat::siginfo_narrow(&Self::siginfo64(sig, si));
+            put(&mut f, 16, &si32);
+            put(&mut f, 144, &u32::from(xstate).to_le_bytes()); // uc_flags: UC_FP_XSTATE
+            put(&mut f, 152, &(alt_sp as u32).to_le_bytes());
+            put(&mut f, 156, &(alt_flags as u32).to_le_bytes());
+            put(&mut f, 160, &(alt_size as u32).to_le_bytes());
+            put(&mut f, 164, &sc);
+            put(&mut f, 252, &restore_mask.to_le_bytes());
+            // movl $__NR_ia32_rt_sigreturn, %eax; int $0x80
+            put(&mut f, size - 8, &[0xb8, 0xad, 0, 0, 0, 0xcd, 0x80, 0]);
+        } else {
+            put(&mut f, 8, &sc);
+            let hi = ((restore_mask >> 32) as u32).to_le_bytes();
+            put(&mut f, 8 + SC32_SIZE + 624, &hi); // extramask
+            // popl %eax; movl $__NR_ia32_sigreturn, %eax; int $0x80
+            put(&mut f, size - 8, &[0x58, 0xb8, 0x77, 0, 0, 0, 0xcd, 0x80]);
+        }
+        if mem.write(frame, &f).is_err() {
+            return false;
+        }
+        vcpu.set_reg(0, sig);
+        vcpu.set_reg(2, info);
+        vcpu.set_reg(1, uc);
+        const DF_RF_TF: u64 = (1 << 10) | (1 << 16) | (1 << 8);
+        vcpu.set_rflags(vcpu.rflags() & !DF_RF_TF);
+        vcpu.set_user_segments(USER32_CS, USER_DS);
+        vcpu.load_data_segment(3, USER_DS);
+        vcpu.load_data_segment(0, USER_DS);
+        vcpu.set_sp(frame);
+        vcpu.set_pc(act.handler & 0xffff_ffff);
+        Self::enter_handler_mask(cx, sig);
+        true
+    }
+
+    /// The x86-64 `siginfo_t` a frame for `sig` carries.
+    fn siginfo64(sig: u64, si: &SiFields) -> [u8; 128] {
+        let mut b = [0u8; 128];
+        b[0..4].copy_from_slice(&(sig as u32).to_le_bytes());
+        b[8..12].copy_from_slice(&(si.code as u32).to_le_bytes());
+        if si.fault {
+            b[16..24].copy_from_slice(&si.addr.to_le_bytes());
+        } else {
+            b[16..20].copy_from_slice(&(si.pid as u32).to_le_bytes());
+            b[20..24].copy_from_slice(&(si.uid as u32).to_le_bytes());
+            b[24..32].copy_from_slice(&si.value.to_le_bytes());
+        }
+        b
+    }
+
+    /// i386 `sigreturn` (`rt` false: the handler returned through
+    /// `__kernel_sigreturn`, which popped `pretcode` and the signal number)
+    /// and `rt_sigreturn`: restore the context in the frame, its signal mask
+    /// and (for `rt`) alternate stack, and resume where the signal came, in
+    /// the mode it was in. A frame that can't be read is a `SIGSEGV`.
+    pub(super) fn sys_sigreturn_ia32(
+        cx: &mut ServiceCtx,
+        rt: bool,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        vcpu.settle_syscall_return();
+        // The return value is the restored `%eax`, already in the vcpu.
+        cx.exec_ok = true;
+        let sp = vcpu.sp() & 0xffff_ffff;
+        let frame = sp.wrapping_sub(if rt { 4 } else { 8 });
+        let sc_at = if rt { frame + 164 } else { frame + 8 };
+        let mask = if rt {
+            mem.read_u64(frame + 252).ok()
+        } else {
+            let lo = mem.read_u32(frame + 8 + 80).ok();
+            let hi = mem.read_u32(frame + 8 + SC32_SIZE + 624).ok();
+            lo.zip(hi).map(|(lo, hi)| u64::from(lo) | u64::from(hi) << 32)
+        };
+        let (Ok(sc), Some(mask)) = (mem.read_vec(sc_at, SC32_SIZE as usize), mask) else {
+            cx.cur.pending |= 1 << (SIGSEGV - 1);
+            cx.cur.blocked &= !(1 << (SIGSEGV - 1));
+            return 0;
+        };
+        // SIGKILL and SIGSTOP can't be blocked.
+        cx.cur.blocked = mask & !((1 << 8) | (1 << 18));
+        let w = |o: usize| u64::from(u32::from_le_bytes(sc[o..o + 4].try_into().unwrap()));
+        let h = |o: usize| u16::from_le_bytes([sc[o], sc[o + 1]]);
+        // The data segments, if the handler changed them (`reload_segments`).
+        for (seg, o) in [(5, 0), (4, 4), (3, 12), (0, 8)] {
+            let sel = h(o) | 3;
+            if sel != vcpu.segment_selector(seg) | 3 {
+                vcpu.load_data_segment(seg, sel);
+            }
+        }
+        for (i, r) in [7, 6, 5, 4, 3, 2, 1, 0].into_iter().enumerate() {
+            if r != 4 {
+                vcpu.set_reg(r, w(16 + i * 4));
+            }
+        }
+        vcpu.set_sp(w(28));
+        vcpu.set_pc(w(56));
+        vcpu.set_rflags((vcpu.rflags() & !FIX_EFLAGS) | (w(64) & FIX_EFLAGS));
+        let (cs, ss) = (h(60) | 3, h(72) | 3);
+        if !vcpu.set_user_segments(cs, ss) {
+            vcpu.set_user_segments(USER32_CS, USER_DS);
+        }
+        // The FPU image past the `fsave` header.
+        let fpstate = w(76);
+        if fpstate != 0 {
+            let buf_fx = fpstate + FREGS_SIZE;
+            if let Ok(legacy) = mem.read_vec(buf_fx, FXSAVE_SIZE as usize) {
+                let word = |o: usize| u32::from_le_bytes(legacy[o..o + 4].try_into().unwrap());
+                let xsize = u64::from(word(480));
+                let full = word(464) == FP_XSTATE_MAGIC1
+                    && xsize >= crate::vcpu::X86_XSAVE_SIZE as u64
+                    && u64::from(word(468)) == xsize + 4
+                    && mem.read_u32(buf_fx + xsize).ok() == Some(FP_XSTATE_MAGIC2);
+                match mem.read_vec(buf_fx, crate::vcpu::X86_XSAVE_SIZE) {
+                    Ok(area) if full => vcpu.set_simd_state(&area),
+                    _ => vcpu.set_simd_state(&legacy),
+                }
+            }
+        }
+        if rt && let Ok(st) = mem.read_vec(frame + 152, 12) {
+            // `compat_restore_altstack`, unless running on it.
+            let v = |o: usize| u64::from(u32::from_le_bytes(st[o..o + 4].try_into().unwrap()));
+            let (cur_sp, cur_size, _) = cx.cur.altstack;
+            if (vcpu.sp() & 0xffff_ffff).wrapping_sub(cur_sp) >= cur_size {
+                cx.cur.altstack = (v(0), v(8), v(4));
+            }
+        }
+        0
+    }
 }

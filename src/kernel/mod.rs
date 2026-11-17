@@ -31,6 +31,7 @@ use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 mod attrs;
 mod caps;
 mod cgroup;
+mod compat;
 #[cfg(feature = "gpu")]
 mod drm;
 pub mod egress;
@@ -2856,6 +2857,8 @@ impl Kernel {
         mem.heap = self.seed_heap;
         let ncpus = self.ncpus;
         let mut info = std::mem::take(&mut self.seed);
+        let mut vcpu = vcpu;
+        info.auxv = Self::start_first(vcpu.as_mut(), &mut mem);
         {
             let sh = self.shared.get_mut().unwrap();
             info.pid = 1;
@@ -3185,7 +3188,8 @@ impl Kernel {
         info.tgid = 1;
         info.mm = sh.spaces.len();
         info.run = RunState::Running;
-        info.auxv = crate::loader::read_auxv(&mem, vcpu.sp());
+        let mut vcpu = vcpu;
+        info.auxv = Self::start_first(vcpu.as_mut(), &mut mem);
         // Check the initial fd table (the standard streams) into slot 0; the
         // scheduler checks it out into `cur.fds` for each slice.
         info.files = sh.file_tables.len();
@@ -3454,15 +3458,32 @@ impl Kernel {
                 // and left a different syscall number, or a result to return
                 // instead of running the call (again).
                 let (mut raw, mut done) = (vcpu.syscall_nr(), None);
-                // `int $0x80`: the i386 table, in a 64-bit task too.
+                // `int $0x80` (or a fast 32-bit entry): the i386 table, in a
+                // 64-bit task too. The policy, seccomp and a tracer see the
+                // x86-64 call it amounts to.
                 cx.ia32 = vcpu.syscall_ia32();
-                let mut ia32_signed = 0;
+                let mut ia32 = None;
+                let mut regs32 = [0u64; 6];
                 if cx.ia32 {
-                    if let Some((nr, signed)) = crate::abi::arch::i386::to_x86_64(raw) {
-                        (raw, ia32_signed) = (nr, signed);
-                    } else {
-                        self.note_unsupported("i386 syscall", raw);
-                        done = Some(err(Errno::ENOSYS));
+                    let entry = crate::abi::arch::i386::entry(raw);
+                    regs32 = vcpu.syscall_args();
+                    // The vDSO left a fast entry's sixth argument on the
+                    // stack (`__do_fast_syscall_32`).
+                    if vcpu.syscall_fast32() {
+                        match mem.read_u32(vcpu.sp()) {
+                            Ok(v) => regs32[5] = u64::from(v),
+                            Err(_) => done = Some(err(Errno::EFAULT)),
+                        }
+                    }
+                    match entry.nr64() {
+                        Some(nr) => {
+                            ia32 = Some((raw, entry));
+                            raw = nr;
+                        }
+                        None => {
+                            self.note_unsupported("i386 syscall", raw);
+                            done = Some(err(Errno::ENOSYS));
+                        }
                     }
                 }
                 if cx.cur.ptrace.is_some() {
@@ -3476,8 +3497,10 @@ impl Kernel {
                 }
                 let sys = arch::decode(self.arch, raw);
                 let mut args = vcpu.syscall_args();
-                if cx.ia32 {
-                    args = crate::abi::arch::i386::widen_args(ia32_signed, args);
+                if let Some((_, crate::abi::arch::i386::Entry::Call { signed, args: how, .. })) =
+                    ia32
+                {
+                    args = crate::abi::arch::i386::widen(signed, how, regs32);
                 }
                 cx.cur.last_syscall = (raw, args, vcpu.sp(), vcpu.syscall_ip());
                 cx.slice_syscalls = cx.slice_syscalls.saturating_add(1);
@@ -3503,9 +3526,14 @@ impl Kernel {
                 } else {
                     None
                 };
-                let mut ret = match verdict {
-                    Some(r) => r,
-                    None => self.dispatch(cx, sys, raw, &args, vcpu, mem),
+                let mut ret = match (verdict, ia32) {
+                    (Some(r), _) => r,
+                    // A tracer may have changed the call: then it's that
+                    // x86-64 one.
+                    (None, Some((_, entry))) if entry.nr64() == Some(raw) => {
+                        self.ia32_call(cx, entry, regs32, false, vcpu, mem)
+                    }
+                    (None, _) => self.dispatch(cx, sys, raw, &args, vcpu, mem),
                 };
                 // A syscall that wants to block but has a signal with a real
                 // handler pending must not park — POSIX requires it to either
@@ -4488,7 +4516,7 @@ impl Kernel {
     /// demand, and a runtime that measures its stack sees a fresh-looking size.
     #[allow(clippy::unused_self)]
     fn grow_stack(&self, cx: &mut ServiceCtx, addr: u64, mem: &mut GuestMemory) -> bool {
-        let stack_top = mem.base() + mem.size();
+        let stack_top = mem.stack_top();
         if addr < cx.cur.stack_limit || addr >= stack_top {
             return false;
         }
@@ -6317,8 +6345,14 @@ impl Kernel {
             child_vcpu.set_sp(stack);
         }
         if flags & CLONE_SETTLS != 0 {
-            child_vcpu.set_tls(tls);
-            info.fs_base = tls;
+            if cx.ia32 {
+                // An i386 clone's TLS is a `struct user_desc` for a GDT entry
+                // of the child's (`set_new_tls` → `do_set_thread_area`).
+                let _ = Self::clone_thread_area(tls, child_vcpu.as_mut(), mem);
+            } else {
+                child_vcpu.set_tls(tls);
+                info.fs_base = tls;
+            }
         }
         child_vcpu.set_syscall_ret(0); // child returns 0 and advances past the svc
         // A traced caller's child may start traced, in a stop of its own; the
@@ -6397,8 +6431,10 @@ impl Kernel {
         let Some(abs) = self.resolve_exec(&mut vfs, cx, &rel) else {
             return err(Errno::ENOENT);
         };
-        let argv = read_string_array(mem, argv_ptr);
-        let envp = read_string_array(mem, envp_ptr);
+        // An i386 caller's arrays hold 32-bit pointers (`compat_sys_execve`).
+        let w = if cx.ia32 { 4 } else { 8 };
+        let argv = read_string_array(mem, argv_ptr, w);
+        let envp = read_string_array(mem, envp_ptr, w);
         if self.trace {
             self.trace_line(format!("[exec] pid={} {abs:?} {argv:?}", cx.cur.pid));
         }
@@ -6435,8 +6471,10 @@ impl Kernel {
         } else {
             self.resolve_path(cx, dirfd, &rel)
         };
-        let argv = read_string_array(mem, argv_ptr);
-        let envp = read_string_array(mem, envp_ptr);
+        // An i386 caller's arrays hold 32-bit pointers (`compat_sys_execve`).
+        let w = if cx.ia32 { 4 } else { 8 };
+        let argv = read_string_array(mem, argv_ptr, w);
+        let envp = read_string_array(mem, envp_ptr, w);
         // sh held (dispatch_shared) → acquire vfs in the mandated order.
         let mut vfs = self.vfs_for(cx);
         let r = self.exec_image(sh, &mut vfs, cx, &abs, argv, envp, vcpu, mem);
@@ -6652,6 +6690,8 @@ impl Kernel {
         // the one KVM memslot stays valid and the process just gets a new cr3.
         mem.exec_reset();
         self.pc_gc(mem);
+        // An i386 program's vDSO enters the kernel as this CPU does best.
+        mem.set_fast32(vcpu.fast_syscall32());
         let loaded = match &interp_elf {
             Some(interp_elf) => load_dynamic(mem, &elf, interp_elf, &spec),
             None => load_static(mem, &elf, &spec),
@@ -6662,7 +6702,10 @@ impl Kernel {
             return None;
         };
         vcpu.reset(img.entry, img.stack_pointer);
-        cx.cur.auxv = crate::loader::read_auxv(mem, img.stack_pointer);
+        if img.compat32 {
+            compat::start_thread_ia32(vcpu);
+        }
+        cx.cur.auxv = Self::saved_auxv(mem, img.stack_pointer);
         cx.cur.sigtramp = 0;
         let mid = page_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
         mem.heap = crate::vcpu::mem::Heap::new(img.program_break, mid);
@@ -6679,6 +6722,24 @@ impl Kernel {
             t.execed = Some(old_tid);
         }
         Some(0)
+    }
+
+    /// Ready the first program's vcpu (an i386 one runs in compatibility
+    /// mode, with the vDSO entry this CPU has), and its auxiliary vector.
+    fn start_first(vcpu: &mut dyn Vcpu, mem: &mut GuestMemory) -> Vec<u8> {
+        if mem.ia32() {
+            mem.set_fast32(vcpu.fast_syscall32());
+            compat::remap_vdso32(mem);
+            compat::start_thread_ia32(vcpu);
+        }
+        Self::saved_auxv(mem, vcpu.sp())
+    }
+
+    /// The auxiliary vector a program was started with (`/proc/self/auxv`):
+    /// 32-bit pairs for an i386 one.
+    fn saved_auxv(mem: &GuestMemory, sp: u64) -> Vec<u8> {
+        let w = if mem.ia32() { 4 } else { 8 };
+        crate::loader::read_auxv_words(mem, sp, w)
     }
 
     /// `execve` from a multithreaded process: every other thread of the group
@@ -12238,13 +12299,18 @@ fn read_path(mem: &GuestMemory, ptr: u64) -> Option<String> {
 }
 
 /// Read a NULL-terminated array of C-string pointers (argv/envp).
-fn read_string_array(mem: &GuestMemory, mut ptr: u64) -> Vec<String> {
+fn read_string_array(mem: &GuestMemory, mut ptr: u64, w: u64) -> Vec<String> {
     let mut out = Vec::new();
     if ptr == 0 {
         return out;
     }
     while out.len() < 4096 {
-        let Ok(p) = mem.read_u64(ptr) else { break };
+        let p = if w == 4 {
+            mem.read_u32(ptr).map(u64::from)
+        } else {
+            mem.read_u64(ptr)
+        };
+        let Ok(p) = p else { break };
         if p == 0 {
             break;
         }
@@ -12252,7 +12318,7 @@ fn read_string_array(mem: &GuestMemory, mut ptr: u64) -> Vec<String> {
             break;
         };
         out.push(String::from_utf8_lossy(&bytes).into_owned());
-        ptr += 8;
+        ptr += w;
     }
     out
 }
