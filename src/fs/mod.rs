@@ -30,7 +30,7 @@ pub mod overlay;
 #[cfg(any(unix, nixvm_linux))]
 pub mod passthrough;
 pub mod procfs;
-#[cfg(unix)]
+#[cfg(any(unix, nixvm_linux))]
 pub mod protect;
 pub mod sysfs;
 pub mod tar;

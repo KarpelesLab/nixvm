@@ -15052,7 +15052,7 @@ mod tests {
     /// A protected path in a host directory (`Passthrough::protect`) as the
     /// guest's syscalls meet it: refused at open for writing, at a shared
     /// writable mapping, and around the rename-a-parent attack.
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     #[test]
     fn protected_host_paths_refuse_the_guest_writing_them() {
         use crate::fs::Passthrough;

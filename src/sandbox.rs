@@ -1042,7 +1042,7 @@ impl Sandbox {
     fn build_mounts(&self, lower: Option<Box<dyn MountFs>>) -> MountTable {
         let mut mounts = MountTable::new();
         match lower {
-            #[cfg(unix)]
+            #[cfg(any(unix, nixvm_linux))]
             Some(lower) if matches!(self.config.root, RootSource::DirWritable(_)) => {
                 mounts.mount("/", lower);
             }
@@ -1094,11 +1094,11 @@ impl Sandbox {
         match &self.config.root {
             RootSource::Empty => Ok(None),
             RootSource::DirWritable(dir) => {
-                #[cfg(unix)]
+                #[cfg(any(unix, nixvm_linux))]
                 {
                     Ok(Some(Box::new(Passthrough::new(dir.clone()))))
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(any(unix, nixvm_linux)))]
                 {
                     let _ = dir;
                     Err(Error::Config("a host-directory root requires unix".into()))
