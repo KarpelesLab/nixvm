@@ -333,6 +333,17 @@ pub trait Vcpu: Send {
     /// Thread pointer (arm64 `TPIDR_EL0` / x86-64 `FS.base`), set by TLS syscalls.
     fn set_tls(&mut self, value: u64);
 
+    /// x86-64 `GS.base` (`arch_prctl(ARCH_SET_GS)`; Wine keeps its TEB there).
+    /// Whether the backend has it: the others ignore it and answer `false`.
+    fn set_gs_base(&mut self, _value: u64) -> bool {
+        false
+    }
+
+    /// The x86-64 `GS.base` (`ARCH_GET_GS`, the ptrace `gs_base`); 0 elsewhere.
+    fn gs_base(&self) -> u64 {
+        0
+    }
+
     /// Duplicate this vcpu's full register state (for `fork`/`clone`). The copy
     /// resumes at the same point; the kernel then sets the child's syscall
     /// return value and advances its PC.

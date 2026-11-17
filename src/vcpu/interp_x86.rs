@@ -3328,6 +3328,15 @@ impl Vcpu for X86Interp {
         self.fs_base = value;
     }
 
+    fn set_gs_base(&mut self, value: u64) -> bool {
+        self.gs_base = value;
+        true
+    }
+
+    fn gs_base(&self) -> u64 {
+        self.gs_base
+    }
+
     fn set_single_step(&mut self, on: bool) {
         self.single_step = on;
     }

@@ -1098,6 +1098,16 @@ impl Vcpu for KvmVcpu {
         self.sregs_dirty = true;
     }
 
+    fn set_gs_base(&mut self, value: u64) -> bool {
+        self.sregs.gs.base = value;
+        self.sregs_dirty = true;
+        true
+    }
+
+    fn gs_base(&self) -> u64 {
+        self.sregs.gs.base
+    }
+
     /// The `XSAVE` image KVM keeps for the vcpu, cut to the components the
     /// guest has (x87, SSE, AVX: `XCR0` = 7).
     fn fp_state(&self) -> Vec<u8> {

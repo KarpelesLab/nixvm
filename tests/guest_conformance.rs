@@ -47,6 +47,7 @@ const PROGRAMS: &[&str] = &[
     "threadwait",
     "connect_again",
     "pty",
+    "wine_abi",
 ];
 
 /// A directory of binaries, also used as the guest's root, so that a program can

@@ -408,6 +408,7 @@ fn snapshot(arch: Arch, vcpu: &mut dyn Vcpu, phase: Phase, fs_base: u64) -> [u64
             r[17] = 0x33; // cs
             r[20] = 0x2b; // ss
             r[21] = fs_base;
+            r[22] = vcpu.gs_base();
         }
         Arch::Aarch64 => {
             for (i, slot) in r.iter_mut().enumerate().take(31) {

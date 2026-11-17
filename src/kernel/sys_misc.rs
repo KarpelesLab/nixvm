@@ -351,9 +351,9 @@ impl Kernel {
     }
 
     /// x86-64 `arch_prctl(code, addr)`: the FS/GS bases and the CPUID and
-    /// XSAVE-component controls. `ARCH_SET_FS` installs the TLS register; the
-    /// user GS base isn't modeled by the CPU, so `ARCH_SET_GS` is refused
-    /// (`EINVAL`) rather than silently ignored; CPUID faulting isn't
+    /// XSAVE-component controls. `ARCH_SET_FS` installs the TLS register and
+    /// `ARCH_SET_GS` the GS base (Wine's TEB pointer; refused with `EINVAL`
+    /// on a backend without one); CPUID faulting isn't
     /// available (`ENODEV` to enable it); the XSAVE queries report x87+SSE.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_arch_prctl(
@@ -388,7 +388,7 @@ impl Kernel {
                 0
             }
             ARCH_GET_FS => put(mem, cx.cur.fs_base),
-            ARCH_GET_GS => put(mem, 0),
+            ARCH_GET_GS => put(mem, vcpu.gs_base()),
             ARCH_GET_CPUID => 1,
             ARCH_SET_CPUID => {
                 if addr == 1 {
@@ -405,7 +405,15 @@ impl Kernel {
                     err(Errno::EOPNOTSUPP)
                 }
             }
-            ARCH_SET_GS => err(Errno::EINVAL),
+            // A canonical user address, as Linux checks (`TASK_SIZE_MAX`).
+            ARCH_SET_GS if addr >= 0x7FFF_FFFF_F000 => err(Errno::EPERM),
+            ARCH_SET_GS => {
+                if vcpu.set_gs_base(addr) {
+                    0
+                } else {
+                    err(Errno::EINVAL)
+                }
+            }
             other => {
                 self.note_unsupported("arch_prctl", other);
                 err(Errno::EINVAL)
