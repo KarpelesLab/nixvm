@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <ucontext.h>
@@ -358,6 +359,26 @@ static void ldt_checks(void) {
   CHECK(int80(123, 0, (long)buf, sizeof buf) == sizeof buf, "int $0x80 modify_ldt");
 }
 
+/* An i386 mmap2 from a 64-bit task goes below 4 GiB (in_32bit_syscall). */
+static void mmap32_checks(void) {
+  long r;
+  __asm__ volatile("push %%rbp\n\t"
+                   "xor %%ebp, %%ebp\n\t"
+                   "int $0x80\n\t"
+                   "pop %%rbp"
+                   : "=a"(r)
+                   : "a"(192L), "b"(0L), "c"(1L << 20), "d"(3L), "S"(0x22L),
+                     "D"(-1L)
+                   : "memory");
+  CHECK(r > 0 && (unsigned long)r < 0x100000000ul && r % 4096 == 0,
+        "int $0x80 mmap2 from 64-bit code: %#lx", r);
+  if (r > 0 && (unsigned long)r < 0x100000000ul) {
+    *(volatile char *)r = 1;
+    munmap((void *)r, 1 << 20);
+  }
+}
+
+
 static void mode_checks(void) {
   cs32 = 0;
   uint32_t r = via_lretq(6);
@@ -438,6 +459,7 @@ int main(void) {
   tls_checks();
   mode_checks();
   ldt_checks();
+  mmap32_checks();
   many_tls_checks();
   exec_ia32();
   if (!failures)

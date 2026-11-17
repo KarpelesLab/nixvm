@@ -477,7 +477,7 @@ static void on_info(int sig, siginfo_t *si, void *ctx)
     __asm__("mov %%cs, %0" : "=r"(cs));
     if (cs != 0x23)
         got_sig = -1;
-    if (sig == SIGSEGV)
+    if (sig == SIGSEGV || sig == SIGILL)
         siglongjmp(jb, 1);
 }
 
@@ -648,6 +648,40 @@ static void test_ldt(void)
     sigaction(SIGSEGV, &old, NULL);
 }
 
+/* The fast system-call instructions, as Linux runs them on this CPU's
+ * vendor: on AMD `syscall` enters the kernel from 32-bit code and `sysenter`
+ * is #UD; on Intel it's the other way round. The vDSO uses the one that
+ * works (test_auxv_vdso); the other raises SIGILL. */
+static void test_fast_entries(void)
+{
+    unsigned int b, c, d, a = 0;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+    int amd = b == 0x68747541; /* "Auth" */
+    struct sigaction sa = {0}, old;
+    sa.sa_sigaction = on_info;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGILL, &sa, &old);
+    got_sig = 0;
+    if (sigsetjmp(jb, 1) == 0) {
+        if (amd)
+            __asm__ volatile("sysenter" ::: "memory");
+        else
+            __asm__ volatile("syscall" ::: "memory", "ecx");
+    }
+    CHECK(got_sig == SIGILL, "%s from 32-bit code is #UD on %s: %d", amd ? "sysenter" : "syscall",
+          amd ? "AMD" : "Intel", got_sig);
+    sigaction(SIGILL, &old, NULL);
+    /* glibc's calls went through __kernel_vsyscall with the other one;
+     * check it is the one the vDSO has. */
+    const unsigned char *v = (const unsigned char *)getauxval(AT_SYSINFO);
+    int has_syscall = 0, has_sysenter = 0;
+    for (int i = 0; v && i < 16; i++) {
+        has_syscall |= v[i] == 0x0f && v[i + 1] == 0x05;
+        has_sysenter |= v[i] == 0x0f && v[i + 1] == 0x34;
+    }
+    CHECK(amd ? has_syscall : has_sysenter, "the vDSO enters with %s", amd ? "syscall" : "sysenter");
+}
+
 static void test_processes(char *self)
 {
     pid_t c = fork();
@@ -733,6 +767,7 @@ int main(int argc, char **argv)
     test_mmap();
     test_signals();
     test_ldt();
+    test_fast_entries();
     test_processes(argv[0]);
     test_threads();
     if (failures == 0)
