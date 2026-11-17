@@ -117,6 +117,8 @@ const RFLAGS_TF: u32 = 1 << 8;
 /// `DS`/`ES`/`FS`/`GS` hold the null selector (their bases come from MSRs).
 const USER_CS: u16 = 0x33;
 const USER_SS: u16 = 0x2b;
+/// `__USER32_CS`: the 32-bit (compatibility mode) code segment.
+const USER32_CS: u16 = 0x23;
 
 /// Segment register numbers, in the ModRM `Sreg` order.
 const SEG_ES: usize = 0;
@@ -3240,6 +3242,43 @@ impl X86Interp {
         }
     }
 
+    /// `SYSENTER`, as Linux's `entry_SYSENTER_compat` takes it (an Intel
+    /// CPU's 32-bit fast system call, from the vDSO's `__kernel_vsyscall`):
+    /// the user stack pointer is `%ebp` and the sixth argument the dword
+    /// there; it returns to the vDSO's `int $0x80` landing pad in
+    /// compatibility mode (`%cs` 0x23, `%ss` 0x2b) whatever mode it came
+    /// from. It is serviced as that `int $0x80` would be: `rip` is left on
+    /// it (the landing pad − 2), so the return lands on the pad and a restart
+    /// reruns the `int $0x80`. When the sixth argument can't be read the
+    /// call fails with `-EFAULT` without running. Without a 32-bit vDSO,
+    /// `#GP`.
+    fn sysenter(&mut self, mem: &GuestMemory) -> Step {
+        let Some(landing) = mem.vdso32_landing() else {
+            return Step::Trap(Trap::Protection);
+        };
+        let Ok(code) = self.code_desc(USER32_CS, false) else {
+            return Step::Trap(Trap::Protection);
+        };
+        let sp = self.gpr[RBP] & 0xffff_ffff;
+        let mut b = [0u8; 4];
+        let arg6 = mem.read(sp, &mut b).ok().map(|()| u32::from_le_bytes(b));
+        self.enter_code(code);
+        let _ = self.load_seg(SEG_SS, USER_SS);
+        self.gpr[RSP] = sp;
+        match arg6 {
+            Some(v) => {
+                self.gpr[RBP] = u64::from(v);
+                self.rip = landing.wrapping_sub(2);
+                self.syscall32 = true;
+                Step::Syscall
+            }
+            None => {
+                self.gpr[RAX] = u64::from(-14i32 as u32); // -EFAULT
+                self.jump(landing)
+            }
+        }
+    }
+
     /// The one-byte opcodes that mean something else in compatibility mode,
     /// or exist only there: `INC`/`DEC r` (`40-4F`, REX prefixes in 64-bit
     /// mode), `PUSH`/`POP` of `%es`/`%cs`/`%ss`/`%ds`, `PUSHA`/`POPA`, `82`
@@ -3349,8 +3388,9 @@ impl X86Interp {
             // (UMIP blocks the stores at CPL 3).
             0x00 => Step::Trap(Trap::Protection),
             0x01 => self.group7(mem, pc, p),
+            0x34 => self.sysenter(mem),
             // LAR/LSL, CLTS, INVD, WBINVD, MOV CR/DR, WRMSR, RDMSR, RDPMC,
-            // SYSENTER/SYSEXIT, SYSRET: privileged/descriptor-table access.
+            // SYSEXIT, SYSRET: privileged/descriptor-table access.
             0x02 | 0x03 | 0x06 | 0x07 | 0x08 | 0x09 | 0x20..=0x23 | 0x30 | 0x32..=0x35 => {
                 Step::Trap(Trap::Protection)
             }
@@ -7251,6 +7291,57 @@ mod tests {
         );
         assert!(!c.mode32 && !c.segmented && c.ldt.is_empty());
         assert_eq!((c.fs_base, c.gs_base, c.tls), (0, 0, [0; 3]));
+    }
+
+    /// `sysenter` (an Intel CPU's fast 32-bit system call from the vDSO):
+    /// the stack pointer comes from `%ebp`, the sixth argument from the
+    /// stack; it is serviced as the vDSO's `int $0x80`, returning to the
+    /// landing pad in compatibility mode. A bad `%ebp` is `-EFAULT`; no vDSO
+    /// is a #GP.
+    #[test]
+    fn sysenter_enters_as_the_vdso_int80() {
+        let mut m = mem();
+        let (_, s) = run32_with(&mut m, &[0x0F, 0x34], |_| {});
+        assert!(matches!(s, Step::Trap(Trap::Protection)), "no 32-bit vDSO");
+        m.set_vdso32(0x1_2000);
+        let landing = 0x1_2000 + crate::vcpu::vdso32::INT80_LANDING_PAD;
+        m.write_init(0x1_7000, &0x6666_6666u32.to_le_bytes())
+            .unwrap();
+        // From 64-bit code too: it returns to compatibility mode.
+        for mode32 in [true, false] {
+            let setup = |c: &mut X86Interp| {
+                c.gpr[RAX] = 20;
+                c.gpr[RBX] = 1;
+                c.gpr[RCX] = 2;
+                c.gpr[RBP] = 0x1_7000;
+                c.gpr[RSP] = 0x1_6000;
+                c.flags.cf = true;
+            };
+            let (mut c, s) = if mode32 {
+                run32_with(&mut m, &[0x0F, 0x34], setup)
+            } else {
+                run_with(&mut m, &[0x0F, 0x34], setup)
+            };
+            assert!(matches!(s, Step::Syscall), "{s:?}");
+            assert!(c.mode32 && c.user_segments() == (0x23, 0x2b));
+            assert!(c.syscall_ia32() && c.syscall_nr() == 20);
+            assert_eq!(c.syscall_args(), [1, 2, 0, 0, 0, 0x6666_6666]);
+            assert_eq!((c.gpr[RSP], c.rip), (0x1_7000, landing - 2));
+            assert!(c.flags.cf, "flags kept");
+            c.set_syscall_ret(7);
+            assert_eq!((c.rip, c.gpr[RAX]), (landing, 7));
+        }
+        // %ebp unmapped: -EFAULT at the landing pad, no syscall.
+        let (c, s) = run32_with(&mut m, &[0x0F, 0x34], |c| {
+            c.gpr[RAX] = 20;
+            c.gpr[RBP] = 0x9_0000;
+        });
+        assert!(matches!(s, Step::Branched));
+        assert_eq!(
+            (c.gpr[RAX], c.gpr[RSP], c.rip),
+            (0xffff_fff2, 0x9_0000, landing)
+        );
+        assert!(!c.syscall_ia32());
     }
 
     #[test]
