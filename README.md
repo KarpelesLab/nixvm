@@ -242,6 +242,40 @@ for the browser (wasm) too, where the embedder draws the frames on a
 `<canvas>` — or, with the GPU on, `present()` blits them onto the WebGL2
 canvas the GPU renders with, and no pixels leave the GPU.
 
+## Embedding: run one command
+
+`Sandbox::execute()` runs a command for a program embedding nixvm: the guest
+gets the stdio, working directory, binds, network and limits it is given and
+nothing else, nothing is printed, and the result says how the run went.
+
+```rust
+use nixvm::sandbox::{Capture, Network, Sandbox};
+
+let out = Capture::new();
+let outcome = Sandbox::builder()
+    .root_dir("/srv/alpine")                  // an extracted rootfs, read-only under a tmpfs
+    .no_work_dir()                            // no implicit /work
+    .bind("/home/me/project", "/home/me/project")
+    .cwd("/home/me/project")
+    .network(Network::None)                   // or Network::Host, or an Egress of your own
+    .wall_time(std::time::Duration::from_secs(60))
+    .stdout(out.writer())                     // any Write; stdin/stderr likewise
+    .shell("echo hi; pwd")
+    .execute()?;
+// outcome.exit_code, .signal, .limit (wall/CPU time, memory), .unsupported
+// (syscalls nixvm lacks), .notices (faults, limits, policy denials), .backend
+```
+
+`SandboxBuilder::mount` puts a filesystem of your own at a guest path,
+`on_notice` sees the kernel's notices as they happen, and
+`GuestMemory::with_default_layout`, `GuestMemory::calibrate_vdso` and
+`vcpu::select_or_interpreter` are there for assembling a guest by hand.
+
+The library reads no environment variables: the `NIXVM_*` switches below are
+honoured by the `nixvm` binaries, which install them with
+`nixvm::env::Env::from_process().install()`. An embedder gets the defaults
+unless it installs settings of its own (`Env::new().with("NIXVM_TRACE", "1")`).
+
 ## Default sandbox layout
 
 ```

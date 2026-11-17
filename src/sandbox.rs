@@ -1,6 +1,44 @@
 //! The public entry point: build a sandbox, then run a command in it.
 //!
-//! [`Sandbox::run`] wires the pipeline end to end:
+//! Two ways to run:
+//!
+//! * [`Sandbox::run`] is the `nixvm run` command line's: the guest gets the
+//!   host's terminal as its stdio, the host's working directory at `/work`,
+//!   starts in `/root`, kernel notices go to stderr, and the result is the
+//!   exit code.
+//! * [`Sandbox::execute`] is for embedding: the guest's stdio is what the
+//!   builder was given ([`SandboxBuilder::stdin`], [`SandboxBuilder::stdout`],
+//!   [`SandboxBuilder::stderr`]; nothing in, output discarded otherwise),
+//!   nothing is printed, and the result is a [`RunOutcome`] — exit status,
+//!   the limit that ended the run if one did, unsupported syscalls, the
+//!   kernel's notices.
+//!
+//! Both honour the same configuration: the working directory
+//! ([`SandboxBuilder::cwd`]), binds and filesystems at arbitrary guest paths
+//! ([`SandboxBuilder::bind`], [`SandboxBuilder::mount`]) with or without the
+//! implicit `/work` ([`SandboxBuilder::no_work_dir`]), the network
+//! ([`SandboxBuilder::network`]), limits, the CPU backend.
+//!
+//! ```no_run
+//! use nixvm::sandbox::{Capture, Network, Sandbox};
+//!
+//! let out = Capture::new();
+//! let outcome = Sandbox::builder()
+//!     .root_dir("/srv/alpine")
+//!     .no_work_dir()
+//!     .bind("/home/me/project", "/project")
+//!     .cwd("/project")
+//!     .network(Network::None)
+//!     .wall_time(std::time::Duration::from_secs(30))
+//!     .stdout(out.writer())
+//!     .shell("echo hi; pwd")
+//!     .execute()?;
+//! assert_eq!(out.text(), "hi\n/project\n");
+//! assert!(outcome.success());
+//! # Ok::<(), nixvm::Error>(())
+//! ```
+//!
+//! Either wires the pipeline end to end:
 //!
 //! 1. resolve + open the guest root image ([`crate::image`]),
 //! 2. assemble the [`MountTable`]: overlay(squashfs root) + `/work` passthrough
@@ -9,11 +47,18 @@
 //! 4. select an execution backend and create the first vcpu ([`crate::vcpu`]),
 //! 5. hand the vcpu to the [`Kernel`] run/serve loop ([`crate::kernel`]).
 //!
-//! Most steps are stubs today; the loop is what later phases fill in. Calling
-//! `run()` now walks the pipeline and returns the first not-yet-implemented
-//! frontier, which is exactly the next thing the ROADMAP asks us to build.
+//! Nothing here reads the process environment: the `NIXVM_*` switches come
+//! from the settings installed in [`crate::env`] (none, unless the embedder
+//! installs some), and everything else from the builder.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+mod embed;
+pub use embed::{
+    Capture, EgressFactory, FsFactory, LimitHit, Mount, Network, RunOutcome, Unsupported,
+};
+use embed::{FromShared, Io, ToShared};
 
 use crate::Error;
 use crate::abi::Arch;
@@ -22,8 +67,8 @@ use crate::fs::Passthrough;
 use crate::fs::{DevFs, MountFs, MountTable, Overlay, ProcFs, SysFs, TmpFs};
 use crate::image::{ImageRef, ImageStore};
 use crate::kernel::Kernel;
+use crate::kernel::notice::{Notice, NoticeSink};
 use crate::loader::{ProcessSpec, interp_path, load_dynamic, load_static};
-use crate::vcpu::interp::InterpBackend;
 use crate::vcpu::mem::PAGE_SIZE;
 use crate::vcpu::{self, Backend, GuestMemory};
 
@@ -52,6 +97,9 @@ pub enum RootSource {
     /// A host directory used read-only as the lower layer (works without the
     /// `fstool` feature; the realistic "point me at an extracted rootfs" path).
     Dir(PathBuf),
+    /// A host directory used directly as `/`, read-write: what the guest
+    /// changes is changed on the host (to install packages into a root).
+    DirWritable(PathBuf),
     /// A squashfs image file used read-only as the lower layer (needs `fstool`).
     Squashfs(PathBuf),
     /// A named image resolved through the [`ImageStore`] (squashfs; needs
@@ -66,28 +114,23 @@ pub enum RootSource {
 }
 
 /// Default guest RAM ceiling: 8 GiB, reduced on a host without that much to spare
-/// (see [`crate::limits::guest_memory_ceiling`]).
+/// (see [`crate::limits::guest_memory_ceiling`]). The address space's layout is
+/// [`GuestMemory::with_default_layout`]'s.
 const DEFAULT_MEM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-/// Guest base address for the flat process address space (Phase 2 refines this).
-const GUEST_BASE: u64 = 0x1_0000;
-/// Virtual extent of the guest address space, decoupled from the physical RAM
-/// pool (`mem_bytes`). A JS engine (JSC/V8, i.e. Bun/Node) reserves tens of GiB
-/// of `MAP_NORESERVE` virtual address space at startup but commits only a small
-/// working set; if the virtual arena is too small a plain `mmap` fails with
-/// `ENOMEM` and the engine traps. V8's caged heaps alone (Oilpan's, in Deno)
-/// reserve 32-48 GiB at a time; 1 TiB fits them. The per-page metadata is
-/// sparse (only touched 16 MiB chunks cost anything, plus ~2 MiB of chunk
-/// tables), and the pool (physical RAM, demand-paged, lazily host-committed)
-/// bounds the actual footprint.
-const GUEST_VSIZE: u64 = 1 << 40;
 
 /// A fully-specified sandbox run.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// argv of the command to run inside the sandbox.
     pub command: Vec<String>,
-    /// Host directory mounted at `/work` (defaults to the current dir).
+    /// Host directory mounted at `/work` (defaults to the current dir), unless
+    /// [`Config::mount_work`] is off.
     pub work_dir: PathBuf,
+    /// Whether [`Config::work_dir`] is mounted at `/work` (the default).
+    pub mount_work: bool,
+    /// The guest working directory of the first process; `None` is `/root`
+    /// (`/` when booted, the image's own for an image). Made if missing.
+    pub cwd: Option<String>,
     /// The guest root image (used when `root` is [`RootSource::Image`]).
     pub image: ImageRef,
     /// Where the read-only root filesystem comes from.
@@ -116,6 +159,12 @@ pub struct Config {
     /// Extra host directories shared into the sandbox ("holes"): specific,
     /// chosen paths — never the whole home.
     pub binds: Vec<Bind>,
+    /// Filesystems of the embedder's, at guest paths (after the binds).
+    pub mounts: Vec<Mount>,
+    /// What the guest's sockets can reach; `None` leaves it to the installed
+    /// `NIXVM_NET` setting ([`crate::env`]), which is loopback only unless
+    /// set.
+    pub network: Option<Network>,
     /// Extra `KEY=VALUE` entries appended to the guest environment, overriding
     /// the preconfigured defaults on a key collision.
     pub env: Vec<String>,
@@ -134,6 +183,8 @@ pub struct Config {
     /// leaves it to `NIXVM_GPU`.
     #[cfg(feature = "gpu")]
     pub gpu: Option<crate::gpu::GpuDevice>,
+    /// Stdio and the notice sink (see [`SandboxBuilder::stdout`] and co).
+    pub(crate) io: Io,
 }
 
 /// A host directory shared into the sandbox at a guest mount point.
@@ -163,6 +214,8 @@ impl Default for SandboxBuilder {
             config: Config {
                 command: Vec::new(),
                 work_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                mount_work: true,
+                cwd: None,
                 image: ImageRef::default_for(arch),
                 root: RootSource::Empty,
                 mode: RunMode::Nude,
@@ -170,8 +223,7 @@ impl Default for SandboxBuilder {
                 // NIXVM_CPUS=N runs guest compute on N host worker threads (the
                 // SMP scheduler); unset or unparseable means 1 (serial). An
                 // explicit `.ncpus()` on the builder still overrides this.
-                ncpus: std::env::var("NIXVM_CPUS")
-                    .ok()
+                ncpus: crate::env::var("NIXVM_CPUS")
                     .and_then(|s| s.trim().parse::<usize>().ok())
                     .map_or(1, |n| n.max(1)),
                 mem_bytes: DEFAULT_MEM_BYTES,
@@ -180,6 +232,8 @@ impl Default for SandboxBuilder {
                 arch_explicit: false,
                 prefer_interp: false,
                 binds: Vec::new(),
+                mounts: Vec::new(),
+                network: None,
                 env: Vec::new(),
                 syscall_policy: None,
                 entrypoint: None,
@@ -187,6 +241,7 @@ impl Default for SandboxBuilder {
                 display: None,
                 #[cfg(feature = "gpu")]
                 gpu: None,
+                io: Io::default(),
             },
         }
     }
@@ -204,10 +259,105 @@ impl SandboxBuilder {
         self
     }
 
+    /// Run `script` with `/bin/sh -c` (sets the [command](Self::command)).
+    #[must_use]
+    pub fn shell(self, script: impl Into<String>) -> Self {
+        self.command(["/bin/sh".to_string(), "-c".to_string(), script.into()])
+    }
+
     /// Set the host directory exposed as `/work`.
     #[must_use]
     pub fn work_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config.work_dir = dir.into();
+        self.config.mount_work = true;
+        self
+    }
+
+    /// Don't mount anything at `/work`: the guest sees only the root and what
+    /// is bound or mounted explicitly.
+    #[must_use]
+    pub fn no_work_dir(mut self) -> Self {
+        self.config.mount_work = false;
+        self
+    }
+
+    /// Start the first process in guest directory `dir` (absolute; made, with
+    /// its parents, if the root lacks it). `PWD` follows unless set with
+    /// [`env`](Self::env).
+    #[must_use]
+    pub fn cwd(mut self, dir: impl Into<String>) -> Self {
+        self.config.cwd = Some(dir.into());
+        self
+    }
+
+    /// Mount a filesystem of one's own at guest path `guest` (made, with its
+    /// parents, if missing), e.g. a host directory behind a policy layer.
+    /// `make` is called once per run.
+    #[must_use]
+    pub fn mount<F>(mut self, guest: impl Into<String>, make: F) -> Self
+    where
+        F: Fn() -> Box<dyn MountFs> + Send + Sync + 'static,
+    {
+        self.config.mounts.push(Mount {
+            guest: guest.into(),
+            fs: Arc::new(make),
+        });
+        self
+    }
+
+    /// What the guest's sockets can reach: [`Network::None`] (loopback only),
+    /// [`Network::Host`], or an egress backend of one's own. Without this, the
+    /// installed `NIXVM_NET` setting decides ([`crate::env`]; loopback only
+    /// unless the embedder installed `NIXVM_NET=host`).
+    #[must_use]
+    pub fn network(mut self, network: Network) -> Self {
+        self.config.network = Some(network);
+        self
+    }
+
+    /// Feed the guest's stdin (fd 0) from `r`. Without this
+    /// [`Sandbox::execute`] gives it an empty stdin, and [`Sandbox::run`]
+    /// the host's. Clones of the builder share `r`.
+    #[must_use]
+    pub fn stdin(mut self, r: impl std::io::Read + Send + 'static) -> Self {
+        self.config.io.stdin = Some(Arc::new(Mutex::new(r)));
+        self
+    }
+
+    /// Send the guest's stdout (fd 1) to `w`. Without this
+    /// [`Sandbox::execute`] discards it, and [`Sandbox::run`] writes it to the
+    /// host's. Clones of the builder share `w`.
+    #[must_use]
+    pub fn stdout(mut self, w: impl std::io::Write + Send + 'static) -> Self {
+        self.config.io.stdout = Some(Arc::new(Mutex::new(w)));
+        self
+    }
+
+    /// Send the guest's stderr (fd 2) to `w` (see [`stdout`](Self::stdout)).
+    #[must_use]
+    pub fn stderr(mut self, w: impl std::io::Write + Send + 'static) -> Self {
+        self.config.io.stderr = Some(Arc::new(Mutex::new(w)));
+        self
+    }
+
+    /// Call `f` with each [notice](Notice) the kernel makes, as it's made —
+    /// faults, limits, policy denials, traces. Without this
+    /// [`Sandbox::execute`] prints nothing (the notices are in its
+    /// [`RunOutcome`]), and [`Sandbox::run`] prints them on stderr.
+    #[must_use]
+    pub fn on_notice<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&Notice) + Send + Sync + 'static,
+    {
+        self.config.io.notices = Some(Arc::new(f));
+        self
+    }
+
+    /// Kill the guest once it has run for `limit` of wall-clock time (sets
+    /// [`Limits::wall_time`](crate::limits::Limits::wall_time)).
+    #[must_use]
+    pub fn wall_time(mut self, limit: std::time::Duration) -> Self {
+        self.config.limits.wall_time = Some(limit);
         self
     }
 
@@ -275,6 +425,14 @@ impl SandboxBuilder {
     #[must_use]
     pub fn root_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.config.root = RootSource::Dir(dir.into());
+        self
+    }
+
+    /// Use a host directory as the guest root, read-write: the guest's
+    /// changes land on the host ([`RootSource::DirWritable`]).
+    #[must_use]
+    pub fn root_dir_writable(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.config.root = RootSource::DirWritable(dir.into());
         self
     }
 
@@ -377,9 +535,15 @@ impl SandboxBuilder {
         }
     }
 
-    /// Build and run in one step; returns the guest exit code.
+    /// Build and run in one step; returns the guest exit code (see
+    /// [`Sandbox::run`]).
     pub fn run(self) -> Result<i32, Error> {
         self.build().run()
+    }
+
+    /// Build and run in one step for an embedder (see [`Sandbox::execute`]).
+    pub fn execute(self) -> Result<RunOutcome, Error> {
+        self.build().execute()
     }
 }
 
@@ -408,7 +572,13 @@ impl Sandbox {
         self.config.display.clone()
     }
 
-    /// Boot the container and run PID 1, returning its exit code.
+    /// Boot the container and run PID 1 on the host's terminal, returning its
+    /// exit code: what `nixvm run` does.
+    ///
+    /// Stdio not set on the builder is the host process's own (with terminal
+    /// ioctls forwarded to the host tty when none is set), and kernel notices
+    /// go to stderr unless [`SandboxBuilder::on_notice`] takes them. See
+    /// [`Sandbox::execute`] for embedding.
     ///
     /// Assembles the root (overlay of the read-only image over a writable
     /// tmpfs), preconfigures `/etc` + the environment host-side, then loads and
@@ -419,6 +589,24 @@ impl Sandbox {
     /// `root_squashfs`). The binary must be a static ELF today — dynamic linking
     /// is not yet wired.
     pub fn run(&self) -> Result<i32, Error> {
+        Ok(self.launch(true)?.exit_code)
+    }
+
+    /// Boot the container and run PID 1 for an embedder, returning how it
+    /// went.
+    ///
+    /// Nothing is printed and nothing of the host process is used that the
+    /// builder wasn't given: stdin is empty and stdout/stderr discarded
+    /// unless set ([`SandboxBuilder::stdin`], [`SandboxBuilder::stdout`],
+    /// [`SandboxBuilder::stderr`]), and the kernel's notices are collected in
+    /// the [`RunOutcome`] (and passed to [`SandboxBuilder::on_notice`]'s
+    /// callback). Otherwise as [`Sandbox::run`].
+    pub fn execute(&self) -> Result<RunOutcome, Error> {
+        self.launch(false)
+    }
+
+    /// [`Sandbox::run`] (`terminal`) or [`Sandbox::execute`].
+    fn launch(&self, terminal: bool) -> Result<RunOutcome, Error> {
         #[cfg(feature = "oci")]
         let image = match &self.config.root {
             RootSource::Oci(name) => Some(self.load_image(name)?),
@@ -437,17 +625,13 @@ impl Sandbox {
         #[cfg(not(feature = "oci"))]
         let lower = self.resolve_lower()?;
         let mut mounts = self.build_mounts(lower);
-        preconfigure(&mut mounts);
+        preconfigure(&mut mounts, self.network_enabled());
 
         let (_, argv) = self.pid1_program(&mut mounts);
         #[cfg_attr(not(feature = "oci"), allow(unused_mut))]
         let mut start = Pid1 {
             env: self.env(),
-            cwd: if self.config.mode == RunMode::Booted {
-                "/".into()
-            } else {
-                "/root".into()
-            },
+            cwd: self.cwd(),
             argv,
             uid: 0,
             gid: 0,
@@ -471,7 +655,7 @@ impl Sandbox {
                 cmd: self.config.command.clone(),
                 env: self.config.env.clone(),
                 user: self.config.user.clone(),
-                working_dir: None,
+                working_dir: self.config.cwd.clone(),
             };
             let l = img.launch(&opts, &mut mounts)?;
             start = Pid1 {
@@ -491,6 +675,9 @@ impl Sandbox {
             gid,
             groups,
         } = start;
+        if mounts.stat(&cwd).is_none() {
+            mkdir_all(&mut mounts, &cwd);
+        }
         if self.config.display.is_some() {
             display_env(&mut mounts, &mut env, uid, gid);
         }
@@ -503,11 +690,7 @@ impl Sandbox {
         })?;
 
         let arch = self.guest_arch(&elf, &path)?;
-        let mut mem = GuestMemory::new_split(
-            GUEST_BASE,
-            GUEST_VSIZE,
-            round_up_page(self.config.mem_bytes),
-        );
+        let mut mem = GuestMemory::with_default_layout(self.config.mem_bytes);
         // Page tables in the guest's own format, for its hardware MMU.
         mem.set_guest_arch(arch)
             .map_err(|e| Error::Config(format!("guest memory: {e:?}")))?;
@@ -539,7 +722,7 @@ impl Sandbox {
             kernel.set_syscall_policy(policy);
         }
         kernel.set_ncpus(self.config.ncpus);
-        kernel.set_host_tty(true);
+        let notices = self.install_io(&mut kernel, terminal);
         kernel.set_cwd(cwd);
         kernel.set_creds(uid, gid, &groups);
         kernel.set_exe(&path); // /proc/self/exe for pid 1
@@ -551,13 +734,122 @@ impl Sandbox {
                 .attach(&kernel, crate::display::DEFAULT_SOCKET)
                 .map_err(|e| Error::Config(format!("the display's socket: errno {}", -e)))?;
         }
-        // Bridge guest sockets to the real internet when `NIXVM_NET=host`
-        // (otherwise the VM is loopback-only and routable connects get
-        // ENETUNREACH). No-op unless the env var is set.
-        crate::vm::install_egress(&mut kernel);
+        self.install_network(&mut kernel);
         self.install_gpu(&kernel);
-        calibrate_vdso(vcpu.as_ref(), &mem);
-        Ok(kernel.run(vcpu, mem)?)
+        mem.calibrate_vdso(vcpu.as_ref());
+        let exit_code = kernel.run(vcpu, mem)?;
+        Ok(self.outcome(&kernel, exit_code, &notices, backend.name()))
+    }
+
+    /// Give `kernel` the builder's stdio and a notice sink that keeps what it
+    /// sees (but traces) in the returned list and forwards it to the
+    /// builder's callback — else, on the `terminal`, to stderr.
+    fn install_io(&self, kernel: &mut Kernel, terminal: bool) -> Arc<Mutex<Vec<Notice>>> {
+        let io = &self.config.io;
+        match &io.stdin {
+            Some(r) => kernel.set_stdin(Box::new(FromShared(Arc::clone(r)))),
+            None if !terminal => kernel.set_stdin(Box::new(std::io::empty())),
+            None => {}
+        }
+        match &io.stdout {
+            Some(w) => kernel.set_stdout(Box::new(ToShared(Arc::clone(w)))),
+            None if !terminal => kernel.set_stdout(Box::new(std::io::sink())),
+            None => {}
+        }
+        match &io.stderr {
+            Some(w) => kernel.set_stderr(Box::new(ToShared(Arc::clone(w)))),
+            None if !terminal => kernel.set_stderr(Box::new(std::io::sink())),
+            None => {}
+        }
+        // Terminal ioctls reach the host tty only when the guest's stdio is
+        // the host's own.
+        kernel.set_host_tty(
+            terminal && io.stdin.is_none() && io.stdout.is_none() && io.stderr.is_none(),
+        );
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let forward: Option<NoticeSink> = io
+            .notices
+            .clone()
+            .or_else(|| terminal.then(crate::kernel::notice::stderr_sink));
+        let keep = Arc::clone(&kept);
+        kernel.set_notice_sink(Arc::new(move |n: &Notice| {
+            if !matches!(n, Notice::Trace(_)) {
+                keep.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(n.clone());
+            }
+            if let Some(f) = &forward {
+                f(n);
+            }
+        }));
+        kept
+    }
+
+    /// How the run went, once [`Kernel::run`] returned `exit_code`.
+    fn outcome(
+        &self,
+        kernel: &Kernel,
+        exit_code: i32,
+        notices: &Mutex<Vec<Notice>>,
+        backend: &'static str,
+    ) -> RunOutcome {
+        for w in [&self.config.io.stdout, &self.config.io.stderr]
+            .into_iter()
+            .flatten()
+        {
+            let _ = w
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .flush();
+        }
+        let notices = std::mem::take(
+            &mut *notices
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let signal = kernel.pid1_signal();
+        let mut unsupported: Vec<Unsupported> = kernel
+            .unsupported()
+            .into_iter()
+            .map(|(nr, count)| Unsupported::Syscall { nr, count })
+            .collect();
+        unsupported.extend(kernel.unsupported_subcommands().into_iter().map(
+            |((syscall, sub), count)| Unsupported::Subcommand {
+                syscall,
+                sub,
+                count,
+            },
+        ));
+        RunOutcome {
+            exit_code,
+            signal,
+            limit: RunOutcome::limit_from_notices(&notices, signal),
+            unsupported,
+            notices,
+            backend,
+        }
+    }
+
+    /// Whether the guest gets more than its loopback.
+    fn network_enabled(&self) -> bool {
+        match &self.config.network {
+            Some(n) => n.is_enabled() && egress_possible(n),
+            None => crate::vm::egress_enabled(),
+        }
+    }
+
+    /// Give `kernel` the network the builder asked for, else the one the
+    /// installed `NIXVM_NET` names.
+    fn install_network(&self, kernel: &mut Kernel) {
+        match &self.config.network {
+            None => crate::vm::install_egress(kernel),
+            Some(Network::None) => {}
+            Some(Network::Host) => {
+                #[cfg(not(target_arch = "wasm32"))]
+                kernel.set_egress(Box::new(crate::kernel::egress::HostEgress));
+            }
+            Some(Network::Egress(make)) => kernel.set_egress(make()),
+        }
     }
 
     /// Load the image a [`RootSource::Oci`] names: an archive or layout on
@@ -623,6 +915,16 @@ impl Sandbox {
         (argv[0].clone(), argv)
     }
 
+    /// PID 1's working directory: the configured one, else `/` when booted
+    /// and `/root` otherwise.
+    fn cwd(&self) -> String {
+        match &self.config.cwd {
+            Some(dir) => dir.clone(),
+            None if self.config.mode == RunMode::Booted => "/".into(),
+            None => "/root".into(),
+        }
+    }
+
     /// The guest environment. Preconfigured so the shell is usable immediately
     /// in either mode (network is a virtual loopback that is always up).
     fn env(&self) -> Vec<String> {
@@ -632,14 +934,7 @@ impl Sandbox {
             "TERM=xterm".to_string(),
             "HOSTNAME=nixvm".to_string(),
             "PS1=nixvm:\\w\\$ ".to_string(),
-            format!(
-                "PWD={}",
-                if self.config.mode == RunMode::Booted {
-                    "/"
-                } else {
-                    "/root"
-                }
-            ),
+            format!("PWD={}", self.cwd()),
         ];
         if self.config.mode == RunMode::Booted {
             env.push("RUNLEVEL=3".to_string());
@@ -662,11 +957,7 @@ impl Sandbox {
     /// and embeddable ahead of that.
     pub fn exec_elf(&self, elf: &[u8]) -> Result<i32, Error> {
         let arch = self.guest_arch(elf, "ELF image")?;
-        let mut mem = GuestMemory::new_split(
-            GUEST_BASE,
-            GUEST_VSIZE,
-            round_up_page(self.config.mem_bytes),
-        );
+        let mut mem = GuestMemory::with_default_layout(self.config.mem_bytes);
         // Page tables in the guest's own format, for its hardware MMU.
         mem.set_guest_arch(arch)
             .map_err(|e| Error::Config(format!("guest memory: {e:?}")))?;
@@ -692,14 +983,14 @@ impl Sandbox {
 
         let mut kernel = Kernel::new(arch, self.build_mounts(self.resolve_lower()?));
         kernel.set_ncpus(self.config.ncpus);
-        kernel.set_host_tty(true);
-        kernel.set_cwd("/work");
+        let _ = self.install_io(&mut kernel, true);
+        kernel.set_cwd(self.config.cwd.as_deref().unwrap_or("/work"));
         kernel.set_cmdline(argv);
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
-        crate::vm::install_egress(&mut kernel);
+        self.install_network(&mut kernel);
         self.install_gpu(&kernel);
-        calibrate_vdso(vcpu.as_ref(), &mem);
+        mem.calibrate_vdso(vcpu.as_ref());
         Ok(kernel.run(vcpu, mem)?)
     }
 
@@ -717,15 +1008,10 @@ impl Sandbox {
     /// Select the execution backend per config: the interpreter when forced,
     /// otherwise the best hardware backend for the host.
     fn backend(&self, arch: Arch) -> Result<Box<dyn Backend>, Error> {
-        if self.config.prefer_interp {
-            // x86-64 guests have an interpreter of their own.
-            if arch == Arch::X86_64 {
-                return Ok(Box::new(vcpu::interp_x86::X86Backend::new(arch)?));
-            }
-            Ok(Box::new(InterpBackend::new(arch)?))
-        } else {
-            Ok(vcpu::select(arch)?)
-        }
+        Ok(vcpu::select_or_interpreter(
+            arch,
+            self.config.prefer_interp,
+        )?)
     }
 
     /// The guest architecture for PID 1's `elf`: its ELF machine, unless the
@@ -756,6 +1042,10 @@ impl Sandbox {
     fn build_mounts(&self, lower: Option<Box<dyn MountFs>>) -> MountTable {
         let mut mounts = MountTable::new();
         match lower {
+            #[cfg(unix)]
+            Some(lower) if matches!(self.config.root, RootSource::DirWritable(_)) => {
+                mounts.mount("/", lower);
+            }
             Some(lower) => {
                 mounts.mount("/", Box::new(Overlay::new(lower, Box::new(TmpFs::new()))));
             }
@@ -775,18 +1065,25 @@ impl Sandbox {
 
         #[cfg(unix)]
         {
-            mounts.mount(
-                "/work",
-                Box::new(Passthrough::new(self.config.work_dir.clone())),
-            );
+            if self.config.mount_work {
+                mounts.mount(
+                    "/work",
+                    Box::new(Passthrough::new(self.config.work_dir.clone())),
+                );
+            }
             for b in &self.config.binds {
                 let pt = if b.read_only {
                     Passthrough::read_only(b.host.clone())
                 } else {
                     Passthrough::new(b.host.clone())
                 };
+                mkdir_all(&mut mounts, &b.guest);
                 mounts.mount(b.guest.clone(), Box::new(pt));
             }
+        }
+        for m in &self.config.mounts {
+            mkdir_all(&mut mounts, &m.guest);
+            mounts.mount(m.guest.clone(), (m.fs)());
         }
         mounts
     }
@@ -796,6 +1093,17 @@ impl Sandbox {
     fn resolve_lower(&self) -> Result<Option<Box<dyn MountFs>>, Error> {
         match &self.config.root {
             RootSource::Empty => Ok(None),
+            RootSource::DirWritable(dir) => {
+                #[cfg(unix)]
+                {
+                    Ok(Some(Box::new(Passthrough::new(dir.clone()))))
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = dir;
+                    Err(Error::Config("a host-directory root requires unix".into()))
+                }
+            }
             RootSource::Dir(dir) => {
                 #[cfg(unix)]
                 {
@@ -920,21 +1228,22 @@ fn open_squashfs(path: &Path) -> Result<Option<Box<dyn MountFs>>, Error> {
 /// expects, and create `/root`. Existing files (from a real root image) are
 /// never clobbered — this only fills gaps. This is the host-side stand-in for
 /// boot-time service configuration until in-guest init can run.
-/// Calibrate the guest's clock vDSO (TSC → nanoseconds) once, before the guest
-/// runs, and write it to the shared vvar page. A no-op for backends that can't
-/// calibrate (the interpreter) or when the TSC is unavailable — the vDSO then
-/// stays disabled and the guest uses the `clock_gettime` syscall.
-pub(crate) fn calibrate_vdso(vcpu: &dyn crate::vcpu::Vcpu, mem: &GuestMemory) {
-    if let Some(c) = vcpu.vdso_calibration() {
-        crate::vcpu::ctrl::write_vvar(
-            &mem.phys_arc(),
-            c.mult,
-            c.shift,
-            c.base_tsc,
-            c.base_mono_ns,
-            c.base_wall_ns,
-        );
+/// Make directory `path` and its missing parents (best effort: what can't be
+/// made shows up as an error when it's used).
+fn mkdir_all(mounts: &mut MountTable, path: &str) {
+    let mut at = String::new();
+    for part in path.split('/').filter(|p| !p.is_empty()) {
+        at.push('/');
+        at.push_str(part);
+        if mounts.stat(&at).is_none() {
+            let _ = mounts.mkdir(&at, 0o755);
+        }
     }
+}
+
+/// Whether `network` can be had in this build (no host sockets on wasm).
+fn egress_possible(network: &Network) -> bool {
+    !(cfg!(target_arch = "wasm32") && matches!(network, Network::Host))
 }
 
 /// What a guest with a display needs: `WAYLAND_DISPLAY` naming its socket,
@@ -959,13 +1268,13 @@ fn display_env(mounts: &mut MountTable, env: &mut Vec<String>, uid: u32, gid: u3
     }
 }
 
-fn preconfigure(mounts: &mut MountTable) {
+fn preconfigure(mounts: &mut MountTable, network: bool) {
     let _ = mounts.mkdir("/etc", 0o755);
     let _ = mounts.mkdir("/root", 0o700);
     // With host egress the guest resolver must reach a real (routable)
     // nameserver; the loopback-only default (Docker's embedded 127.0.0.11) would
     // get ENETUNREACH. A root that ships its own resolv.conf is never clobbered.
-    let resolv = if crate::vm::egress_enabled() {
+    let resolv = if network {
         "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
     } else {
         "nameserver 127.0.0.11\n"
@@ -989,10 +1298,6 @@ fn preconfigure(mounts: &mut MountTable) {
             let _ = mounts.write_at(path, 0, content.as_bytes());
         }
     }
-}
-
-fn round_up_page(v: u64) -> u64 {
-    v.div_ceil(PAGE_SIZE) * PAGE_SIZE
 }
 
 fn page_align_down(v: u64) -> u64 {
@@ -1230,7 +1535,7 @@ mod tests {
     fn preconfigure_seeds_etc_and_defaults_to_shell() {
         let sb = Sandbox::builder().build();
         let mut mounts = sb.build_mounts(sb.resolve_lower().unwrap());
-        preconfigure(&mut mounts);
+        preconfigure(&mut mounts, false);
         assert!(
             mounts.stat("/etc/hostname").is_some(),
             "/etc/hostname seeded"

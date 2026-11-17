@@ -55,7 +55,7 @@ pub mod vm;
 pub mod wasm;
 
 pub use abi::Arch;
-pub use sandbox::{Config, Sandbox};
+pub use sandbox::{Capture, Config, Network, RunOutcome, Sandbox};
 
 /// The crate's top-level error.
 #[derive(Debug)]
