@@ -73,6 +73,7 @@ impl Drop for TempDir {
 #[cfg(feature = "images")]
 #[test]
 fn a_root_image_boots() {
+    nixvm::env::Env::from_process().install();
     use nixvm::image::{ImageRef, fetch, parse_hex};
     use std::fmt::Write as _;
     let (Ok(source), Ok(sha)) = (
@@ -113,9 +114,10 @@ fn a_root_image_boots() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, nixvm_linux))]
 #[test]
 fn the_persistent_upper_outlives_the_guest() {
+    nixvm::env::Env::from_process().install();
     let Ok(tar_path) = std::env::var("NIXVM_ALPINE_TAR") else {
         eprintln!("NIXVM_ALPINE_TAR not set; skipping persistent upper test");
         return;

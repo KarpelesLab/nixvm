@@ -136,7 +136,7 @@ impl Overlay {
     ///
     /// # Errors
     /// The directory can't be made, or another overlay holds it (`EBUSY`).
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     pub fn persistent(
         lower: Box<dyn MountFs>,
         upper_dir: impl AsRef<std::path::Path>,
@@ -1188,10 +1188,10 @@ mod tests {
         assert_eq!(names(&mut o, ""), vec!["d", "n"]);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     struct TempDir(std::path::PathBuf);
 
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     impl TempDir {
         fn new(tag: &str) -> Self {
             use std::sync::atomic::{AtomicU32, Ordering};
@@ -1206,14 +1206,14 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, nixvm_linux))]
     #[test]
     fn a_host_directory_upper_persists_across_overlays() {
         let dir = TempDir::new("persist");
