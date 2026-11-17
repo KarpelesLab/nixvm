@@ -220,6 +220,9 @@ fn cstr(component: &str) -> io::Result<CString> {
 /// the value the host syscall actually reports.
 const LINUX_ELOOP: i32 = 40;
 
+/// `ENOTDIR`, numbered the same on every supported host.
+const ENOTDIR: i32 = 20;
+
 fn eloop() -> io::Error {
     io::Error::from_raw_os_error(LINUX_ELOOP)
 }
@@ -835,8 +838,19 @@ impl Passthrough {
                     let parent = stack.pop().expect("root frame always present");
                     return Ok((parent, name));
                 }
-                Err(e) if e.raw_os_error() == Some(sys::ELOOP) => {
-                    let target = raw_readlinkat(parent_raw, &cname)?.ok_or_else(eloop)?;
+                // A symlink: ELOOP from `O_NOFOLLOW` — or, for a directory
+                // component, ENOTDIR, which Linux reports for `O_DIRECTORY`
+                // on a symlink before it looks at `O_NOFOLLOW`. (A real
+                // non-directory there is still ENOTDIR: readlink says so.)
+                Err(e)
+                    if e.raw_os_error() == Some(sys::ELOOP)
+                        || (!is_last && e.raw_os_error() == Some(ENOTDIR)) =>
+                {
+                    let target = match raw_readlinkat(parent_raw, &cname)? {
+                        Some(t) => t,
+                        None if e.raw_os_error() == Some(ENOTDIR) => return Err(e),
+                        None => return Err(eloop()),
+                    };
                     budget = budget.checked_sub(1).ok_or_else(eloop)?;
                     let (absolute, mut target_comps) = Self::split_target(&target);
                     if absolute {
@@ -1394,6 +1408,39 @@ mod tests {
         // `readlink` returns the stored target text.
         assert_eq!(pt.stat("link.txt").unwrap().kind, NodeKind::Symlink);
         assert_eq!(pt.readlink("link.txt").unwrap(), "target.txt");
+    }
+
+    #[test]
+    fn a_symlink_mid_path_is_followed_and_kept_confined() {
+        let tmp = TempDir::new("mid-path");
+        fs::create_dir(tmp.0.join("real")).unwrap();
+        fs::write(tmp.0.join("real/f"), b"in tree").unwrap();
+        fs::write(tmp.0.join("plain"), b"").unwrap();
+        std::os::unix::fs::symlink("real", tmp.0.join("rel")).unwrap();
+        std::os::unix::fs::symlink("/real", tmp.0.join("abs")).unwrap();
+        std::os::unix::fs::symlink("/usr", tmp.0.join("sys")).unwrap();
+
+        let mut pt = Passthrough::new(tmp.0.clone());
+        let mut buf = [0u8; 7];
+        assert_eq!(pt.read_at("rel/f", 0, &mut buf).unwrap(), 7);
+        assert_eq!(&buf, b"in tree");
+        pt.write_at("abs/f", 0, b"IN").unwrap();
+        assert_eq!(fs::read(tmp.0.join("real/f")).unwrap(), b"IN tree");
+        assert_eq!(pt.readdir("rel").unwrap().len(), 1);
+        // Re-rooted under the mount: no `usr/bin/env` there (only `sys`).
+        assert_eq!(
+            pt.read_at("sys/bin/env", 0, &mut buf)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(2)
+        );
+        // A real non-directory mid-path is still ENOTDIR.
+        assert_eq!(
+            pt.read_at("plain/x", 0, &mut buf)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(20)
+        );
     }
 
     #[test]
