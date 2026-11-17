@@ -115,6 +115,16 @@ const RFLAGS_TF: u32 = 1 << 8;
 /// `DS`/`ES`/`FS`/`GS` hold the null selector (their bases come from MSRs).
 const USER_CS: u16 = 0x33;
 const USER_SS: u16 = 0x2b;
+/// `__USER32_CS`: the 32-bit (compatibility mode) code segment.
+const USER32_CS: u16 = 0x23;
+
+/// Segment register numbers, in the ModRM `Sreg` order.
+const SEG_ES: usize = 0;
+const SEG_CS: usize = 1;
+const SEG_SS: usize = 2;
+const SEG_DS: usize = 3;
+const SEG_FS: usize = 4;
+const SEG_GS: usize = 5;
 
 /// The x86-64-v3 extensions. Each switch gates both execution (`#UD` while
 /// off, as on a CPU without the feature) and the `CPUID` bit advertising it.
@@ -324,6 +334,9 @@ struct Pfx {
     rep: u8,
     /// `0xF0`.
     lock: bool,
+    /// The code runs in compatibility mode (`%cs` = 0x23): stack operations
+    /// and near branches default to 32 bits.
+    mode32: bool,
 }
 
 impl Pfx {
@@ -340,9 +353,15 @@ impl Pfx {
     }
 
     /// The operand size of a default-64 operation (stack ops, near branches):
-    /// 16 under `0x66` (without `REX.W`), else 64.
+    /// 16 under `0x66` (without `REX.W`), else 64 (32 in compatibility mode).
     const fn stack_width(self) -> u32 {
-        if self.opsize && !self.rex.w { 16 } else { 64 }
+        if self.opsize && !self.rex.w {
+            16
+        } else if self.mode32 {
+            32
+        } else {
+            64
+        }
     }
 }
 
@@ -536,6 +555,19 @@ struct X86Interp {
     fs_base: u64,
     /// GS.base (`arch_prctl(ARCH_SET_GS)`); zero unless the kernel sets it.
     gs_base: u64,
+    /// Running 32-bit code: `%cs` is `__USER32_CS` (0x23), not `__USER_CS`.
+    /// No REX prefixes, 32-bit addresses (no RIP-relative form), 32-bit stack
+    /// operations and branch targets.
+    mode32: bool,
+    /// The selectors in `%es`, `%cs`, `%ss`, `%ds`, `%fs`, `%gs` (indexed by
+    /// `SEG_*`). Only the `%fs` and `%gs` bases are modeled ([`Self::fs_base`],
+    /// [`Self::gs_base`]); the others are flat, as every user segment but a
+    /// TLS one is.
+    segs: [u16; 6],
+    /// The thread's GDT TLS descriptors (entries 12-14, `set_thread_area`).
+    tls: [u64; 3],
+    /// The syscall being serviced came through `int $0x80`.
+    syscall32: bool,
     /// The `0x67` address-size prefix on the instruction being executed:
     /// effective addresses truncate to 32 bits (and string ops/`LOOP` use
     /// `ECX`/`ESI`/`EDI`). Transient — reset at each `exec`.
@@ -635,6 +667,10 @@ impl X86Interp {
             rflags_sys: 0,
             fs_base: 0,
             gs_base: 0,
+            mode32: false,
+            segs: [0, USER_CS, USER_SS, 0, 0, 0],
+            tls: [0; 3],
+            syscall32: false,
             addr32: false,
             seg_base: 0,
             ibuf: [0; 16],
@@ -709,8 +745,80 @@ impl X86Interp {
     }
 
     fn jump(&mut self, target: u64) -> Step {
-        self.rip = target;
+        self.rip = if self.mode32 {
+            target & 0xffff_ffff
+        } else {
+            target
+        };
         Step::Branched
+    }
+
+    // ---- segments ----------------------------------------------------------
+
+    /// GDT entry `idx` as this thread sees it: Linux's layout (see
+    /// [`crate::vcpu::ctrl::default_gdt`]) with its TLS entries.
+    fn gdt_entry(&self, idx: usize) -> u64 {
+        use crate::vcpu::ctrl::{GDT_ENTRY_TLS_MIN, GDT_TLS_ENTRIES, default_gdt};
+        if (GDT_ENTRY_TLS_MIN..GDT_ENTRY_TLS_MIN + GDT_TLS_ENTRIES).contains(&idx) {
+            return self.tls[idx - GDT_ENTRY_TLS_MIN];
+        }
+        default_gdt().get(idx).copied().unwrap_or(0)
+    }
+
+    /// The descriptor a CPL-3 load of `sel` into a data segment register
+    /// (`seg`) reads: `None` (a `#GP`) when it can't be loaded there. The null
+    /// selector loads into anything but `%ss`, as `Some(0)`.
+    fn data_desc(&self, seg: usize, sel: u16) -> Option<u64> {
+        if sel & !3 == 0 {
+            return (seg != SEG_SS).then_some(0);
+        }
+        let idx = usize::from(sel >> 3);
+        if sel & 4 != 0 || idx >= crate::vcpu::ctrl::GDT_ENTRIES {
+            return None;
+        }
+        let d = self.gdt_entry(idx);
+        let (present, system, dpl) = ((d >> 47) & 1 == 1, (d >> 44) & 1 == 0, (d >> 45) & 3);
+        let ty = (d >> 40) & 0xF;
+        let code = ty & 8 != 0;
+        let ok = if seg == SEG_SS {
+            !code && ty & 2 != 0 && sel & 3 == 3 && dpl == 3
+        } else {
+            // Data, or readable code; DPL >= max(CPL, RPL) unless conforming.
+            (!code || ty & 2 != 0) && (dpl == 3 || (code && ty & 4 != 0))
+        };
+        (present && !system && ok).then_some(d)
+    }
+
+    /// `MOV Sreg`/`POP Sreg`: load `sel` into data segment register `seg`
+    /// (its base too, for `%fs` and `%gs`).
+    fn load_seg(&mut self, seg: usize, sel: u16) -> Result<(), Step> {
+        let Some(d) = self.data_desc(seg, sel) else {
+            return Err(Step::Trap(Trap::Protection));
+        };
+        let base = ((d >> 16) & 0xFF_FFFF) | ((d >> 56) << 24);
+        match seg {
+            SEG_FS => self.fs_base = base,
+            SEG_GS => self.gs_base = base,
+            _ => {}
+        }
+        self.segs[seg] = sel;
+        Ok(())
+    }
+
+    /// Switch to code segment `sel` (a far jump, call or return): 64-bit
+    /// mode for `__USER_CS`, compatibility mode for `__USER32_CS`, a `#GP`
+    /// for anything else. `ret` is a return, which may not lower the
+    /// privilege (RPL must be 3); a jump or call takes CPL as the RPL.
+    fn far_target(&mut self, sel: u16, ret: bool) -> Result<(), Step> {
+        let sel = if ret { sel } else { sel | 3 };
+        let mode32 = match sel {
+            USER_CS => false,
+            USER32_CS => true,
+            _ => return Err(Step::Trap(Trap::Protection)),
+        };
+        self.mode32 = mode32;
+        self.segs[SEG_CS] = sel;
+        Ok(())
     }
 
     // ---- instruction fetch -------------------------------------------------
@@ -889,6 +997,10 @@ impl X86Interp {
                 base_val.wrapping_add(index_val).wrapping_add(disp as u64),
                 pc,
             )
+        } else if rm_field == 0b101 && md == 0b00 && self.mode32 {
+            // No RIP-relative form outside 64-bit mode: an absolute disp32.
+            let (disp, pc) = self.fetch32(pc)?;
+            (u64::from(disp), pc)
         } else if rm_field == 0b101 && md == 0b00 {
             let (disp, pc) = self.fetch_i32(pc)?;
             return Ok((
@@ -1053,51 +1165,106 @@ impl X86Interp {
         };
     }
 
-    /// Push a `width`-bit value (16 or 64).
+    /// The stack pointer after moving it by `delta`: `%esp` wraps at 32 bits
+    /// in compatibility mode.
+    fn sp_plus(&self, delta: u64) -> u64 {
+        let sp = self.gpr[RSP].wrapping_add(delta);
+        if self.mode32 { sp & 0xffff_ffff } else { sp }
+    }
+
+    /// Push a `width`-bit value (16, 32 or 64).
     fn push_w(&mut self, mem: &mut GuestMemory, val: u64, width: u32) -> Result<(), Step> {
-        let sp = self.gpr[RSP].wrapping_sub(u64::from(width / 8));
+        let sp = self.sp_plus(u64::from(width / 8).wrapping_neg());
         self.write_mem(mem, sp, val, width)?;
         self.gpr[RSP] = sp;
         Ok(())
     }
 
-    /// Pop a `width`-bit value (16 or 64).
+    /// Pop a `width`-bit value (16, 32 or 64).
     fn pop_w(&mut self, mem: &GuestMemory, width: u32) -> Result<u64, Step> {
         let sp = self.gpr[RSP];
         let v = Self::read_mem(mem, sp, width)?;
-        self.gpr[RSP] = sp.wrapping_add(u64::from(width / 8));
+        self.gpr[RSP] = self.sp_plus(u64::from(width / 8));
         Ok(v)
     }
 
-    fn push(&mut self, mem: &mut GuestMemory, val: u64) -> Result<(), Step> {
-        self.push_w(mem, val, 64)
-    }
-
-    /// `IRETQ` (`iret`) or `RETFQ`: pop `rip` and `cs`, and for `IRETQ`
-    /// `rflags`, `rsp` and `ss` too, all 64-bit. A user task can only stay at
-    /// CPL3 in the 64-bit code segment ([`USER_CS`], with [`USER_SS`]); any
-    /// other selector is a `#GP` with nothing changed, like a frame that
-    /// faults while being read.
-    fn far_return(&mut self, mem: &GuestMemory, iret: bool) -> Step {
+    /// `IRET` or far `RET [imm16]` at operand size `width`: pop the offset
+    /// and `cs`, and for `IRET` the flags, the stack pointer and `ss` too (in
+    /// IA-32e mode an `IRET` always pops `ss:rsp`, from compatibility mode
+    /// too). A user task can return to the 64-bit code segment
+    /// ([`USER_CS`]) or the 32-bit one ([`USER32_CS`]), at CPL 3; any other
+    /// selector, or an `ss` that can't be loaded, is a `#GP` with nothing
+    /// changed, like a frame that faults while being read.
+    fn far_return(&mut self, mem: &GuestMemory, iret: bool, width: u32, imm: u16) -> Step {
         let n = if iret { 5 } else { 2 };
+        let step = u64::from(width / 8);
         let sp = self.gpr[RSP];
         let mut v = [0u64; 5];
         for (i, slot) in v.iter_mut().take(n).enumerate() {
-            match Self::read_mem(mem, sp.wrapping_add(8 * i as u64), 64) {
+            let a = sp.wrapping_add(step * i as u64);
+            let a = if self.mode32 { a & 0xffff_ffff } else { a };
+            match Self::read_mem(mem, a, width) {
                 Ok(x) => *slot = x,
                 Err(step) => return step,
             }
         }
-        if v[1] & 0xffff != u64::from(USER_CS) || (iret && v[4] & 0xffff != u64::from(USER_SS)) {
+        let cs = v[1] as u16;
+        if cs != USER_CS && cs != USER32_CS {
+            return Step::Trap(Trap::Protection);
+        }
+        if iret && self.data_desc(SEG_SS, v[4] as u16).is_none() {
+            return Step::Trap(Trap::Protection);
+        }
+        if self.far_target(cs, true).is_err() {
             return Step::Trap(Trap::Protection);
         }
         if iret {
-            self.set_rflags_user(v[2]);
+            let flags = if width == 16 {
+                (self.rflags_word() & !0xffff) | v[2]
+            } else {
+                v[2]
+            };
+            self.set_rflags_user(flags);
             self.gpr[RSP] = v[3];
+            self.segs[SEG_SS] = v[4] as u16;
         } else {
-            self.gpr[RSP] = sp.wrapping_add(16);
+            self.gpr[RSP] = self.sp_plus(2 * step + u64::from(imm));
         }
-        self.jump(v[0])
+        let target = if width == 16 { v[0] & 0xffff } else { v[0] };
+        self.jump(target)
+    }
+
+    /// A far `JMP` or `CALL` to `sel:off`; `call` pushes the return `cs`
+    /// and offset first, at operand size `width`. `end` is the address past
+    /// the instruction.
+    fn far_branch(
+        &mut self,
+        mem: &mut GuestMemory,
+        sel: u16,
+        off: u64,
+        call: bool,
+        width: u32,
+        end: u64,
+    ) -> Step {
+        let sel = sel | 3;
+        if sel != USER_CS && sel != USER32_CS {
+            return Step::Trap(Trap::Protection);
+        }
+        if call {
+            let saved = self.gpr[RSP];
+            let cs = u64::from(self.segs[SEG_CS]);
+            if let Err(s) = self.push_w(mem, cs, width) {
+                return s;
+            }
+            if let Err(s) = self.push_w(mem, end, width) {
+                self.gpr[RSP] = saved;
+                return s;
+            }
+        }
+        if self.far_target(sel, false).is_err() {
+            return Step::Trap(Trap::Protection);
+        }
+        self.jump(off)
     }
 
     // ---- flags ----------------------------------------------------------------
@@ -1496,9 +1663,10 @@ impl X86Interp {
     }
 
     /// Group 5: `0xFF /r` — `INC`/`DEC r/m` (/0, /1), `CALL`/`JMP r/m` (/2,
-    /// /4, near indirect, always a 64-bit target in long mode), `CALL`/`JMP
-    /// m16:64` (/3, /5, far — `#GP` here: no far code segments for a user
-    /// task) and `PUSH r/m` (/6).
+    /// /4, near indirect, always a 64-bit target in long mode, 32-bit in
+    /// compatibility mode), `CALL`/`JMP m16:32` (/3, /5, far: `m16:64` under
+    /// `REX.W`, to the 64-bit or 32-bit user code segment) and `PUSH r/m`
+    /// (/6).
     fn group5(&mut self, mem: &mut GuestMemory, pc: u64, p: Pfx) -> Step {
         let (m, end) = fetch!(self.modrm(pc, p.rex));
         let width = p.width();
@@ -1511,16 +1679,30 @@ impl X86Interp {
                 self.next(end)
             }
             2 | 4 => {
+                let w = if p.mode32 { p.stack_width() } else { 64 };
                 let rm = self.op_of(m.kind, end);
-                let target = fetch!(self.read_operand(mem, rm, 64));
+                let target = fetch!(self.read_operand(mem, rm, w));
                 if m.ext() == 2 {
-                    fetch!(self.push(mem, end));
+                    fetch!(self.push_w(mem, end, w));
                 }
                 self.jump(target)
             }
             3 | 5 => match m.kind {
                 RmKind::Reg(_) => Step::Illegal,
-                _ => Step::Trap(Trap::Protection),
+                _ => {
+                    // The offset at the operand size, then the selector.
+                    let Some(ea) = self.ea_of(m.kind, end) else {
+                        return Step::Illegal;
+                    };
+                    let a = self.lin(ea);
+                    let off = fetch!(Self::read_mem(mem, a, width));
+                    let sel = fetch!(Self::read_mem(
+                        mem,
+                        a.wrapping_add(u64::from(width / 8)),
+                        16
+                    ));
+                    self.far_branch(mem, sel as u16, off, m.ext() == 3, width, end)
+                }
             },
             6 => {
                 let w = p.stack_width();
@@ -2287,9 +2469,13 @@ impl X86Interp {
         if let Err(s) = self.fill_ibuf(mem) {
             return s;
         }
-        self.addr32 = false;
+        // Compatibility mode addresses with 32 bits throughout.
+        self.addr32 = self.mode32;
         self.seg_base = 0;
-        let mut p = Pfx::default();
+        let mut p = Pfx {
+            mode32: self.mode32,
+            ..Pfx::default()
+        };
         let mut pc = self.rip;
         // Legacy prefixes in any order, then an optional REX immediately
         // before the opcode (a REX followed by another prefix is ignored).
@@ -2297,12 +2483,14 @@ impl X86Interp {
             let (b, next) = fetch!(self.fetch8(pc));
             pc = next;
             match b {
-                0x40..=0x4F => {
+                0x40..=0x4F if !self.mode32 => {
                     p.rex = Rex::from_byte(b);
                     p.has_rex = true;
                     continue;
                 }
                 0x66 => p.opsize = true,
+                // 16-bit addressing (0x67 in compatibility mode) isn't here.
+                0x67 if self.mode32 => return Step::Illegal,
                 0x67 => self.addr32 = true,
                 0xF0 => p.lock = true,
                 0xF2 => p.rep = 2,
@@ -2319,6 +2507,9 @@ impl X86Interp {
             return Step::Illegal;
         }
         let width = p.width();
+        if self.mode32 && self.is_legacy32(op, pc) {
+            return self.exec_legacy32(mem, pc, p, op);
+        }
         match op {
             // ---- ALU: 00-3D ----
             0x00..=0x3F if op & 7 < 6 => {
@@ -2395,9 +2586,7 @@ impl X86Interp {
                 // operand size (zero-extended); memory always gets 16 bits.
                 let (m, end) = fetch!(self.modrm(pc, p.rex));
                 let sel = match m.ext() {
-                    1 => USER_CS,
-                    2 => USER_SS,
-                    0 | 3..=5 => 0,
+                    s @ 0..=5 => self.segs[s],
                     _ => return Step::Illegal,
                 };
                 match m.kind {
@@ -2423,15 +2612,16 @@ impl X86Interp {
                 self.next(end)
             }
             0x8E => {
-                // MOV Sreg, r/m: only null selectors (DS/ES/FS/GS) and the
-                // user data selector are loadable; CS is #UD.
+                // MOV Sreg, r/m: a selector of the GDT (a TLS entry sets the
+                // `%fs`/`%gs` base); CS is #UD.
                 let (m, end) = fetch!(self.modrm(pc, p.rex));
                 let v = fetch!(self.read_operand(mem, self.op_of(m.kind, end), 16)) as u16;
                 match m.ext() {
                     1 | 6 | 7 => Step::Illegal,
-                    2 if v != USER_SS => Step::Trap(Trap::Protection),
-                    _ if v != 0 && v != USER_SS => Step::Trap(Trap::Protection),
-                    _ => self.next(end),
+                    s => {
+                        fetch!(self.load_seg(s, v));
+                        self.next(end)
+                    }
                 }
             }
             // POP r/m (8F /0). A memory destination that uses RSP as a base is
@@ -2574,21 +2764,33 @@ impl X86Interp {
                     0
                 };
                 let target = fetch!(self.pop_w(mem, p.stack_width()));
-                self.gpr[RSP] = self.gpr[RSP].wrapping_add(u64::from(imm));
+                self.gpr[RSP] = self.sp_plus(u64::from(imm));
                 self.jump(target)
             }
             0xC6 => self.mov_imm(mem, pc, p, 8),
             0xC7 => self.mov_imm(mem, pc, p, width),
             0xC8 => self.enter(mem, pc, p),
             0xC9 => self.leave(mem, pc, p),
-            // IRETQ / far RETQ back to the 64-bit user code segment: a
-            // same-privilege return, as Wine's syscall dispatcher makes to
-            // resume PE code (it `iretq`s with the `%cs`/`%ss` it read).
-            0xCB | 0xCF if p.rex.w => self.far_return(mem, op == 0xCF),
-            // Other far returns (to a 32-bit segment), interrupt returns and
-            // software interrupts: no compatibility-mode code segment or IDT
-            // gate is reachable from a user task.
-            0xCA | 0xCB | 0xCD | 0xCF => Step::Trap(Trap::Protection),
+            // IRET and far RET to a user code segment: same-privilege
+            // returns, as Wine's syscall dispatcher makes to resume PE code
+            // (it `iretq`s with the `%cs`/`%ss` it read), 64-bit or 32-bit.
+            0xCA => {
+                let (imm, _) = fetch!(self.fetch16(pc));
+                self.far_return(mem, false, width, imm)
+            }
+            0xCB | 0xCF => self.far_return(mem, op == 0xCF, width, 0),
+            // `int $0x80`: the i386 system call, from either mode. Like
+            // `syscall`, `rip` stays on the instruction until the kernel
+            // writes the result.
+            0xCD => {
+                let (vector, _) = fetch!(self.fetch8(pc));
+                if vector != 0x80 {
+                    // No other gate is reachable from CPL 3.
+                    return Step::Trap(Trap::Protection);
+                }
+                self.syscall32 = true;
+                Step::Syscall
+            }
             // INT3/INT1 are traps: the saved `rip` is the next instruction.
             0xCC => {
                 self.rip = pc;
@@ -2632,7 +2834,7 @@ impl X86Interp {
             0xE4..=0xE7 | 0xEC..=0xEF => Step::Trap(Trap::Protection),
             0xE8 => {
                 let (rel, end) = fetch!(self.fetch_i32(pc));
-                fetch!(self.push(mem, end));
+                fetch!(self.push_w(mem, end, p.stack_width()));
                 self.jump(end.wrapping_add(i64::from(rel) as u64))
             }
             0xE9 => {
@@ -2674,6 +2876,101 @@ impl X86Interp {
         }
     }
 
+    /// The one-byte opcodes that mean something else in compatibility mode,
+    /// or exist only there: `INC`/`DEC r` (`40-4F`, REX prefixes in 64-bit
+    /// mode), `PUSH`/`POP` of `%es`/`%cs`/`%ss`/`%ds`, `PUSHA`/`POPA`, `82`
+    /// (an alias of `80`), the direct far `CALL`/`JMP ptr16:32`, `INTO`, and
+    /// the `LES`/`LDS` forms of `C4`/`C5` (a VEX prefix when the ModRM is a
+    /// register form, as in 64-bit mode); [`Self::is_legacy32`] says which.
+    /// The BCD adjustments (`DAA`/`DAS`/`AAA`/`AAS`/`AAM`/`AAD`),
+    /// `BOUND`, `ARPL`, `SALC` and the segment loads `LES`/`LDS` aren't here
+    /// (`#UD`).
+    fn exec_legacy32(&mut self, mem: &mut GuestMemory, pc: u64, p: Pfx, op: u8) -> Step {
+        let width = p.width();
+        let w = p.stack_width();
+        let step = u64::from(w / 8);
+        match op {
+            0x40..=0x4F => {
+                let r = usize::from(op & 7);
+                let a = mask_w(self.gpr[r], width);
+                let v = self.inc_dec_flags(a, op >= 0x48, width);
+                self.set_reg(r, v, width);
+                self.next(pc)
+            }
+            0x06 | 0x0E | 0x16 | 0x1E => {
+                let v = u64::from(self.segs[usize::from(op >> 3)]);
+                fetch!(self.push_w(mem, v, w));
+                self.next(pc)
+            }
+            0x07 | 0x17 | 0x1F => {
+                let v = fetch!(Self::read_mem(mem, self.gpr[RSP], w));
+                fetch!(self.load_seg(usize::from(op >> 3), v as u16));
+                self.gpr[RSP] = self.sp_plus(step);
+                self.next(pc)
+            }
+            0x60 => {
+                // PUSHA: eAX, eCX, eDX, eBX, the original eSP, eBP, eSI, eDI.
+                let mut sp = self.gpr[RSP];
+                for r in [RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI] {
+                    sp = sp.wrapping_sub(step) & 0xffff_ffff;
+                    fetch!(self.write_mem(mem, sp, self.gpr[r], w));
+                }
+                self.gpr[RSP] = sp;
+                self.next(pc)
+            }
+            0x61 => {
+                // POPA: the reverse, skipping the saved eSP.
+                let sp = self.gpr[RSP];
+                let mut v = [0u64; 8];
+                for (i, slot) in v.iter_mut().enumerate() {
+                    let a = sp.wrapping_add(step * i as u64) & 0xffff_ffff;
+                    *slot = fetch!(Self::read_mem(mem, a, w));
+                }
+                for (r, val) in [RDI, RSI, RBP, RSP, RBX, RDX, RCX, RAX].into_iter().zip(v) {
+                    if r != RSP {
+                        self.set_reg(r, val, w);
+                    }
+                }
+                self.gpr[RSP] = self.sp_plus(8 * step);
+                self.next(pc)
+            }
+            0x82 => self.group1(mem, pc, p, 8, true),
+            0x9A | 0xEA => {
+                let (off, pc2) = if width == 16 {
+                    let (v, e) = fetch!(self.fetch16(pc));
+                    (u64::from(v), e)
+                } else {
+                    let (v, e) = fetch!(self.fetch32(pc));
+                    (u64::from(v), e)
+                };
+                let (sel, end) = fetch!(self.fetch16(pc2));
+                self.far_branch(mem, sel, off, op == 0x9A, width, end)
+            }
+            0xCE => {
+                // INTO: the overflow trap, `SIGSEGV` on Linux.
+                if self.flags.of {
+                    self.rip = pc;
+                    Step::Trap(Trap::Protection)
+                } else {
+                    self.next(pc)
+                }
+            }
+            _ => Step::Illegal,
+        }
+    }
+
+    /// Whether `op` (its ModRM, if any, at `pc`) is one of the opcodes
+    /// [`Self::exec_legacy32`] runs in compatibility mode.
+    fn is_legacy32(&self, op: u8, pc: u64) -> bool {
+        match op {
+            0x06 | 0x07 | 0x0E | 0x16 | 0x17 | 0x1E | 0x1F | 0x27 | 0x2F | 0x37 | 0x3F => true,
+            0x40..=0x4F | 0x60..=0x63 | 0x82 | 0x9A | 0xCE | 0xD4..=0xD6 | 0xEA => true,
+            // LES/LDS unless the "ModRM" is a register form: then VEX.
+            0xC4 | 0xC5 => self.fetch8(pc).is_ok_and(|(b, _)| b >> 6 != 3),
+            _ => false,
+        }
+    }
+
     /// The two-byte (`0F xx`) opcode map: general-purpose and system
     /// instructions here; SIMD opcodes go to [`X86Interp::exec_simd`].
     #[allow(clippy::too_many_lines)]
@@ -2693,6 +2990,9 @@ impl X86Interp {
             0x02 | 0x03 | 0x06 | 0x07 | 0x08 | 0x09 | 0x20..=0x23 | 0x30 | 0x32..=0x35 => {
                 Step::Trap(Trap::Protection)
             }
+            // No `syscall` from compatibility mode (an Intel CPU's `#UD`; an
+            // AMD one's goes to the 32-bit entry, which isn't here either).
+            0x05 if p.mode32 => Step::Illegal,
             0x05 => {
                 // `syscall` copies RIP→RCX and RFLAGS→R11 before entering the
                 // kernel, exactly as hardware does; `rip` stays on the opcode —
@@ -2744,19 +3044,21 @@ impl X86Interp {
                 self.next(end)
             }
             0xA0 | 0xA8 => {
-                // PUSH FS/GS: the (null) selector.
-                fetch!(self.push_w(mem, 0, p.stack_width()));
+                // PUSH FS/GS: the selector.
+                let s = if op == 0xA0 { SEG_FS } else { SEG_GS };
+                let v = u64::from(self.segs[s]);
+                fetch!(self.push_w(mem, v, p.stack_width()));
                 self.next(pc)
             }
             0xA1 | 0xA9 => {
-                // POP FS/GS: only the null selector loads (base unchanged).
+                // POP FS/GS: load the selector (and the base) first, then
+                // move the stack.
+                let s = if op == 0xA1 { SEG_FS } else { SEG_GS };
                 let w = p.stack_width();
                 let sp = self.gpr[RSP];
                 let v = fetch!(Self::read_mem(mem, sp, w));
-                if v & 0xffff != 0 {
-                    return Step::Trap(Trap::Protection);
-                }
-                self.gpr[RSP] = sp.wrapping_add(u64::from(w / 8));
+                fetch!(self.load_seg(s, v as u16));
+                self.gpr[RSP] = self.sp_plus(u64::from(w / 8));
                 self.next(pc)
             }
             0xA2 => {
@@ -3257,10 +3559,21 @@ impl Vcpu for X86Interp {
     }
 
     fn syscall_nr(&self) -> u64 {
+        if self.syscall32 {
+            return self.gpr[RAX] & 0xffff_ffff;
+        }
         self.gpr[RAX]
     }
 
+    fn syscall_ia32(&self) -> bool {
+        self.syscall32
+    }
+
     fn syscall_args(&self) -> [u64; 6] {
+        if self.syscall32 {
+            let g = &self.gpr;
+            return [g[RBX], g[RCX], g[RDX], g[RSI], g[RDI], g[RBP]].map(|v| v & 0xffff_ffff);
+        }
         [
             self.gpr[RDI],
             self.gpr[RSI],
@@ -3273,7 +3586,9 @@ impl Vcpu for X86Interp {
 
     fn set_syscall_ret(&mut self, value: u64) {
         self.gpr[RAX] = value;
-        self.rip = self.rip.wrapping_add(2); // `syscall` is always the 2-byte 0F 05
+        // `syscall` is always the 2-byte 0F 05, and `int $0x80` is CD 80.
+        self.rip = self.rip.wrapping_add(2);
+        self.syscall32 = false;
     }
 
     fn reg(&self, idx: usize) -> u64 {
@@ -3364,11 +3679,50 @@ impl Vcpu for X86Interp {
     }
 
     fn set_tls(&mut self, value: u64) {
+        // `ARCH_SET_FS` loads the null selector, then the base.
+        self.segs[SEG_FS] = 0;
         self.fs_base = value;
     }
 
     fn set_gs_base(&mut self, value: u64) -> bool {
+        self.segs[SEG_GS] = 0;
         self.gs_base = value;
+        true
+    }
+
+    fn user_segments(&self) -> (u16, u16) {
+        (self.segs[SEG_CS], self.segs[SEG_SS])
+    }
+
+    fn set_user_segments(&mut self, cs: u16, ss: u16) -> bool {
+        if (cs != USER_CS && cs != USER32_CS) || self.data_desc(SEG_SS, ss).is_none() {
+            return false;
+        }
+        self.mode32 = cs == USER32_CS;
+        self.segs[SEG_CS] = cs;
+        self.segs[SEG_SS] = ss;
+        // A syscall interrupted by the switch (a signal handler) is over.
+        self.syscall32 = false;
+        true
+    }
+
+    fn tls_desc(&self, i: usize) -> u64 {
+        self.tls.get(i).copied().unwrap_or(0)
+    }
+
+    fn set_tls_desc(&mut self, i: usize, desc: u64) -> bool {
+        if i >= self.tls.len() {
+            return false;
+        }
+        self.tls[i] = desc;
+        // A data segment register holding the selector is reloaded from the
+        // new descriptor (or nulled, if it is gone).
+        let sel = ((crate::vcpu::ctrl::GDT_ENTRY_TLS_MIN + i) << 3) as u16 | 3;
+        for s in [SEG_DS, SEG_ES, SEG_FS, SEG_GS] {
+            if self.segs[s] == sel && self.load_seg(s, sel).is_err() {
+                let _ = self.load_seg(s, 0);
+            }
+        }
         true
     }
 
@@ -3409,6 +3763,11 @@ impl Vcpu for X86Interp {
         self.rflags_sys = 0;
         self.fs_base = 0;
         self.gs_base = 0;
+        // 64-bit mode, Linux's selectors, no TLS entries (`flush_thread`).
+        self.mode32 = false;
+        self.segs = [0, USER_CS, USER_SS, 0, 0, 0];
+        self.tls = [0; 3];
+        self.syscall32 = false;
         self.mxcsr = 0x1f80;
         self.fpu_init();
     }
@@ -5881,7 +6240,7 @@ mod tests {
             (&[0xCC][..], 5),        // int3 -> SIGTRAP
             (&[0xF4][..], 11),       // hlt -> SIGSEGV
             (&[0xFA][..], 11),       // cli
-            (&[0xCD, 0x80][..], 11), // int 0x80
+            (&[0xCD, 0x21][..], 11), // int 0x21 (0x80 is the i386 syscall)
             (&[0xE4, 0x60][..], 11), // in al, 0x60
         ] {
             let (_, s) = run_with(&mut m, code, |_| {});
@@ -6006,13 +6365,109 @@ mod tests {
         assert!(matches!(s, Step::Branched));
         assert_eq!((c.rip, c.gpr[RSP]), (0x1_1234, 0x1_3010));
 
-        // cs = 0x23: a 32-bit (compatibility mode) segment isn't reachable.
+        // cs = 0x23 is the 32-bit code segment: compatibility mode.
         m.write_init(0x1_3008, &0x23u64.to_le_bytes()).unwrap();
+        let (c, s) = run_with(&mut m, &[0x48, 0xCF], |c| c.gpr[RSP] = 0x1_3000);
+        assert!(matches!(s, Step::Branched));
+        assert!(c.mode32 && c.user_segments() == (0x23, 0x2b));
+        // Any other code selector (here the data one) is a #GP that leaves
+        // everything as it was.
+        m.write_init(0x1_3008, &0x2bu64.to_le_bytes()).unwrap();
         for code in [&[0x48, 0xCF][..], &[0x48, 0xCB][..]] {
             let (c, s) = run_with(&mut m, code, |c| c.gpr[RSP] = 0x1_3000);
             assert!(matches!(s, Step::Trap(Trap::Protection)));
             assert_eq!(c.gpr[RSP], 0x1_3000);
+            assert!(!c.mode32);
         }
+    }
+
+    /// Run `code` in compatibility mode from `CODE` until it leaves it or
+    /// `n` instructions have run.
+    fn run32(m: &mut GuestMemory, code: &[u8], n: usize) -> (X86Interp, Step) {
+        m.write_init(CODE, code).unwrap();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        assert!(cpu.set_user_segments(0x23, 0x2b));
+        let mut s = Step::Next;
+        for _ in 0..n {
+            s = cpu.exec(m);
+            if !matches!(s, Step::Next | Step::Branched) || !cpu.mode32 {
+                break;
+            }
+        }
+        (cpu, s)
+    }
+
+    /// 32-bit code decodes as 32-bit code: 40-4F are INC/DEC (not REX),
+    /// pushes and calls are 4 bytes, mod=00 rm=101 is an absolute address
+    /// (not RIP-relative), and branch targets wrap at 32 bits.
+    #[test]
+    fn compatibility_mode_decodes_32_bit_code() {
+        let mut m = mem();
+        m.write_init(0x1_4000, &0x1234_5678u32.to_le_bytes())
+            .unwrap();
+        // inc eax; dec ecx; push eax; pop edx; mov ebx, [0x14000]; call +0
+        let code = [
+            0x40, 0x49, 0x50, 0x5A, 0x8B, 0x1D, 0x00, 0x40, 0x01, 0x00, 0xE8, 0, 0, 0, 0,
+        ];
+        let (c, _) = run32(&mut m, &code, 5);
+        assert_eq!(c.gpr[RAX], 1);
+        assert_eq!(c.gpr[RCX], 0xffff_ffff);
+        assert_eq!(c.gpr[RDX], 1);
+        assert_eq!(c.gpr[RBX], 0x1234_5678);
+        assert_eq!(c.gpr[RSP], STACK, "push/pop of 4 bytes each");
+        let (c, _) = run32(&mut m, &code, 6);
+        assert_eq!(c.gpr[RSP], STACK - 4, "a 32-bit call pushes 4 bytes");
+        assert_eq!(u64::from(m.read_u32(STACK - 4).unwrap()), CODE + 15);
+        // jmp -0x20000 from 0x11000 wraps to 0xffff_1xxx, not a 64-bit address.
+        let (c, _) = run32(&mut m, &[0xE9, 0x00, 0x00, 0xFE, 0xFF], 1);
+        assert_eq!(c.rip, (CODE + 5).wrapping_sub(0x2_0000) & 0xffff_ffff);
+        // pushad / popad round-trip, skipping the saved esp.
+        let (c, _) = run32(&mut m, &[0x60, 0x31, 0xC0, 0x61], 3);
+        assert_eq!(c.gpr[RSP], STACK);
+    }
+
+    /// The far transfers between the two modes Wine makes: `ljmp *m16:32`
+    /// from 32-bit to 64-bit code, a far call and `lret` back, `int $0x80`
+    /// as the i386 syscall, and the `%fs` load from a TLS entry.
+    #[test]
+    fn far_transfers_between_the_modes_and_int80() {
+        let mut m = mem();
+        // m16:32 at 0x14000: 0x33:0x12000.
+        m.write_init(0x1_4000, &[0x00, 0x20, 0x01, 0x00, 0x33, 0x00])
+            .unwrap();
+        // ljmp *[0x14000]
+        let (c, s) = run32(&mut m, &[0xFF, 0x2D, 0x00, 0x40, 0x01, 0x00], 1);
+        assert!(matches!(s, Step::Branched));
+        assert!(!c.mode32 && c.rip == 0x1_2000 && c.user_segments().0 == 0x33);
+        // lcall 0x33:0x12000 (9A), then (64-bit) retf back: pops eip, cs.
+        m.write_init(0x1_2000, &[0xCB]).unwrap();
+        let (c, _) = run32(&mut m, &[0x9A, 0x00, 0x20, 0x01, 0x00, 0x33, 0x00], 1);
+        assert!(!c.mode32 && c.gpr[RSP] == STACK - 8);
+        let mut c = c;
+        assert!(matches!(c.exec(&mut m), Step::Branched));
+        assert!(c.mode32 && c.rip == CODE + 7 && c.gpr[RSP] == STACK);
+        // int $0x80 from 32-bit code: an i386 syscall, numbered from eax.
+        let (mut c, s) = run_with(&mut m, &[0xCD, 0x80], |c| {
+            c.gpr[RAX] = 0x1_0000_0014;
+            c.gpr[RBX] = 0xffff_ffff_0000_0007;
+        });
+        assert!(matches!(s, Step::Syscall));
+        assert!(c.syscall_ia32() && c.syscall_nr() == 20 && c.syscall_args()[0] == 7);
+        c.set_syscall_ret(5);
+        assert!(!c.syscall_ia32() && c.rip == CODE + 2);
+        // Any other vector is a #GP.
+        let (_, s) = run_with(&mut m, &[0xCD, 0x81], |_| {});
+        assert!(matches!(s, Step::Trap(Trap::Protection)));
+        // mov fs, ax with a TLS selector: the base is the descriptor's.
+        let (c, s) = run_with(&mut m, &[0x8E, 0xE0], |c| {
+            c.set_tls_desc(0, 0x1240_f334_5678_0fff);
+            c.gpr[RAX] = 0x63;
+        });
+        assert!(matches!(s, Step::Next));
+        assert_eq!((c.segs[SEG_FS], c.fs_base), (0x63, 0x1234_5678));
+        // An empty entry, or the data selector loaded into %cs's slot, faults.
+        let (_, s) = run_with(&mut m, &[0x8E, 0xE0], |c| c.gpr[RAX] = 0x6b);
+        assert!(matches!(s, Step::Trap(Trap::Protection)));
     }
 
     #[test]

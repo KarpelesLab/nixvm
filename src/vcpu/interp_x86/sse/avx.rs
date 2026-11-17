@@ -488,7 +488,8 @@ impl X86Interp {
             pp,
             l: b2 & 4 != 0,
             w: rex.w,
-            v: usize::from((!b2 >> 3) & 15),
+            // VEX.vvvv's top bit is ignored outside 64-bit mode.
+            v: usize::from((!b2 >> 3) & if p.mode32 { 7 } else { 15 }),
         };
         let vp = Pfx {
             rex,
@@ -500,6 +501,7 @@ impl X86Interp {
                 _ => 0,
             },
             lock: false,
+            mode32: p.mode32,
         };
         let (op, pc) = fetch!(self.fetch8(pc));
         if matches!((map, op), (2, 0xF2 | 0xF3 | 0xF5..=0xF7) | (3, 0xF0)) {
