@@ -215,7 +215,9 @@ pub fn default_gdt() -> [u64; GDT_ENTRIES] {
 /// Number of private GDTs: one for each thread that has a TLS entry in use
 /// (a thread with none runs on the shared one at [`GDT_BASE`]). Each is
 /// [`GDT_ENTRIES`] × 8 = 128 bytes, 32 to a page.
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const GDT_POOL_SLOTS: usize = GDT_POOL_FRAMES as usize * GDT_SLOTS_PER_FRAME;
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 const GDT_SLOTS_PER_FRAME: usize = PAGE_SIZE as usize / (GDT_ENTRIES * 8);
 const GDT_POOL_FRAMES: u64 = 16;
 /// Virtual base of the private GDTs.
@@ -223,11 +225,13 @@ const GDT_POOL_OFF: u64 = 0x60000;
 
 /// Linear address of private GDT `slot` (`0..GDT_POOL_SLOTS`).
 #[must_use]
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const fn gdt_slot_va(slot: usize) -> u64 {
     CTRL_GPA + GDT_POOL_OFF + (slot * GDT_ENTRIES * 8) as u64
 }
 
 /// Write `gdt` into private GDT `slot`.
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub fn write_gdt_slot(phys: &PhysMem, slot: usize, gdt: &[u64; GDT_ENTRIES]) {
     let mut bytes = [0u8; GDT_ENTRIES * 8];
     for (i, d) in gdt.iter().enumerate() {
