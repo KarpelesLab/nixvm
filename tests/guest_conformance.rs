@@ -50,6 +50,7 @@ const PROGRAMS: &[&str] = &[
     "wine_abi",
     "compat32",
     "exit_race",
+    "compat32_insn",
 ];
 
 /// A directory of binaries, also used as the guest's root, so that a program can
