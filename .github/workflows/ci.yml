@@ -68,6 +68,16 @@ jobs:
       - name: Test (tunnel networking)
         run: cargo test --features tunnel --lib tunnel
 
+      # `linux-raw` makes a glibc build take the libc-free path (src/linux_raw.rs)
+      # everywhere, the clock included, as the fullrust job below does for real.
+      - name: Clippy (libc-free path forced, warnings denied)
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets --features linux-raw -- -D warnings
+
+      - name: Test (libc-free path forced)
+        if: runner.os == 'Linux'
+        run: cargo test --lib --features linux-raw
+
   # Boots a real Alpine root image on each execution path. tests/alpine_boot.rs
   # skips itself without an image, so nothing else in CI runs these tests. KVM
   # and the interpreter behave differently enough to need separate runs: guests
@@ -234,6 +244,24 @@ jobs:
       # What pages.yml deploys: the demo with the WebGL2 GPU backend.
       - name: Build wasm demo library with the GPU
         run: cargo build --lib --target wasm32-unknown-unknown --features wasm,gpu --no-default-features
+
+  # The libc-free `x86_64-unknown-linux-fullrust` target (atelier's release
+  # binaries): neither `cfg(unix)` nor `target_os = "linux"`, and any libc
+  # symbol fails the link. The image's cargo builds for it by default, with the
+  # getrandom patch fstool's uuid needs. Passthrough mounts, KVM, egress and
+  # the clock must all be compiled in, on raw system calls.
+  fullrust:
+    name: libc-free Linux (fullrust)
+    runs-on: ubuntu-latest
+    container: ghcr.io/karpeleslab/fullrust:latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the library with the sandbox features
+        run: cargo build --lib --features fstool,targz,tunnel
+
+      - name: Test the library
+        run: cargo test --lib --features fstool,targz,tunnel
 
   docs:
     name: Docs build (warnings denied)
