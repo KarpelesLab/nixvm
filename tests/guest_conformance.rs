@@ -128,8 +128,14 @@ fn build_with(cc: &str, dir_name: &str, extra: &[&str]) -> Option<PathBuf> {
                 .arg(dir.join(name))
                 .arg(Path::new("tests/guest").join(format!("{name}.c")))
                 .output();
-            if !built.is_ok_and(|o| o.status.success()) {
-                eprintln!("can't build {name} with {cc} -m32 (no 32-bit libc?), skipping it");
+            if !built.as_ref().is_ok_and(|o| o.status.success()) {
+                let why = match &built {
+                    Ok(o) => String::from_utf8_lossy(&o.stderr).into_owned(),
+                    Err(e) => e.to_string(),
+                };
+                eprintln!(
+                    "can't build {name} with {cc} -m32 (no 32-bit libc?), skipping it:\n{why}"
+                );
                 let _ = std::fs::remove_file(dir.join(name));
             }
         }
