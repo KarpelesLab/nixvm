@@ -1385,6 +1385,18 @@ fn rt_priority(p: &ProcInfo) -> Option<u32> {
 /// long enough that the idle poll isn't a busy spin.
 const HOST_IO_POLL_NS: u128 = 1_000_000; // 1 ms
 
+/// A slice the SMP scheduler has handed to a worker, until it comes back.
+struct Dispatched {
+    /// The task it runs, by [`ProcInfo::serial`].
+    serial: u64,
+    /// The worker running it.
+    worker: usize,
+    /// The progress epoch when it was dispatched.
+    epoch: u64,
+    /// [`Shared::wakes`] when it was dispatched.
+    wakes: u64,
+}
+
 /// What the SMP scheduler does when every task is blocked and nothing is in
 /// flight — mirrors the serial scheduler's stall handling.
 enum StallAction {
@@ -1960,6 +1972,12 @@ pub(super) struct Shared {
     /// When the serial scheduler last had every parked task re-check its
     /// wait (see [`Shared::pick_serial_runnable`]).
     rechecked_at: u128,
+    /// How many times [`Shared::unpark_all`] has been called: a wake the SMP
+    /// scheduler, which goes by progress epochs rather than `parked`, counts
+    /// as progress. A syscall that wakes others may itself go on blocking (a
+    /// seccomp target installing its supervisor's `ADDFD`s, then waiting for
+    /// the answer), and that wake is the only sign its waiter may go on.
+    wakes: u64,
     /// [`Kernel::io_events`] when the serial scheduler last unparked its
     /// waiters for it. A socket event wakes the tasks parked on one right
     /// away, as Linux's wakeups do, instead of at the next periodic re-check:
@@ -2228,6 +2246,7 @@ impl Shared {
     /// became a zombie). Returns whether anything was parked (i.e. worth a
     /// re-sweep).
     fn unpark_all(&mut self) -> bool {
+        self.wakes = self.wakes.wrapping_add(1);
         let mut any = false;
         for p in self.procs.iter_mut().flatten() {
             if p.info.parked {
@@ -2573,6 +2592,7 @@ impl Kernel {
                 free_cwd_slots: Vec::new(),
                 min_vruntime: 0,
                 rechecked_at: 0,
+                wakes: 0,
                 io_seen: 0,
                 rt_tail: 0,
                 rt_head: 0,
@@ -3889,11 +3909,14 @@ impl Kernel {
             // a genuinely deadlocked machine is detected after exactly one
             // fruitless retry instead of spinning or erroring prematurely.
             let mut blocked_at: BTreeMap<usize, u64> = BTreeMap::new();
-            // The task (by serial) each in-flight run of a slot is for, and its
-            // worker. A slot has one run in flight at most (a reaped task's slot
-            // waits for its last run to come back before a new task's goes).
-            let mut dispatched: BTreeMap<usize, (u64, usize)> = BTreeMap::new();
+            // The task (by serial) each in-flight run of a slot is for, its
+            // worker, and the epoch and wake count it was dispatched at. A
+            // slot has one run in flight at most (a reaped task's slot waits
+            // for its last run to come back before a new task's goes).
+            let mut dispatched: BTreeMap<usize, Dispatched> = BTreeMap::new();
             let mut epoch: u64 = 0;
+            // [`Shared::wakes`] as last counted toward `epoch`.
+            let mut wakes_seen: u64 = 0;
             let mut inflight = 0usize;
             let mut stalled = false;
             let outcome = loop {
@@ -3918,11 +3941,20 @@ impl Kernel {
                         };
                         let mm = sh.procs[i].as_ref().unwrap().info.mm;
                         let space = Arc::clone(&sh.spaces[mm]);
+                        let wakes = sh.wakes;
                         let p = sh.procs[i].as_mut().unwrap();
                         let w = p.info.home_cpu(i, nworkers);
                         p.info.cpu = w as u16;
                         busy[w] = true;
-                        dispatched.insert(i, (p.info.serial, w));
+                        dispatched.insert(
+                            i,
+                            Dispatched {
+                                serial: p.info.serial,
+                                worker: w,
+                                epoch,
+                                wakes,
+                            },
+                        );
                         let vcpu = p.vcpu.take().unwrap();
                         p.info.kick = Kicker(vcpu.kicker());
                         batch.push((w, i, vcpu, space));
@@ -3995,10 +4027,18 @@ impl Kernel {
                 let (i, vcpu, out) = done_rx.recv().expect("workers outlive the scheduler");
                 inflight -= 1;
                 let mut sh = self.shared.lock().unwrap();
-                let ran = dispatched.remove(&i).map(|(serial, w)| {
-                    busy[w] = false;
-                    serial
-                });
+                let run = dispatched.remove(&i);
+                if let Some(d) = &run {
+                    busy[d.worker] = false;
+                }
+                let ran = run.as_ref().map(|d| d.serial);
+                // A wake (`unpark_all`) from any task since the last result
+                // is progress, even if the task that woke blocked again.
+                if sh.wakes != wakes_seen {
+                    wakes_seen = sh.wakes;
+                    epoch += 1;
+                    stalled = false;
+                }
                 // The task this ran for exited and was reaped while the result was
                 // on its way, and the slot may already hold a new task (a fork
                 // takes the lowest free slot). That one has a vcpu of its own: this
@@ -4037,13 +4077,25 @@ impl Kernel {
                     }
                     SliceOutcome::Blocked(made_progress) => {
                         reattach(&mut sh, vcpu);
+                        // Its last look at what it waits for was taken while
+                        // it ran, so only progress made before it was
+                        // dispatched is known to have been seen. If any other
+                        // came while it was in flight — another slice's
+                        // result, or a wake by a task on another CPU — it
+                        // parks at its dispatch epoch, which is already past,
+                        // and looks again; parked at the current one, a wake
+                        // landing after its look was lost, and with the
+                        // waker blocked too the machine was taken for
+                        // deadlocked.
+                        let d = run.expect("a dispatched run");
+                        let quiet = epoch == d.epoch && sh.wakes == d.wakes;
                         if made_progress {
                             epoch += 1;
                             stalled = false;
                         }
                         // Parked at the (post-progress) epoch: it won't re-run
                         // until some *later* progress advances the epoch.
-                        blocked_at.insert(i, epoch);
+                        blocked_at.insert(i, if quiet { epoch } else { d.epoch });
                     }
                     SliceOutcome::Ended => {
                         reattach(&mut sh, vcpu);
@@ -4067,7 +4119,7 @@ impl Kernel {
             // `None` slot.
             while inflight > 0 {
                 if let Ok((i, vcpu, _)) = done_rx.recv() {
-                    let ran = dispatched.remove(&i).map(|(serial, _)| serial);
+                    let ran = dispatched.remove(&i).map(|d| d.serial);
                     if let Some(p) = self.shared.lock().unwrap().procs[i].as_mut()
                         && Some(p.info.serial) == ran
                         && p.vcpu.is_none()
