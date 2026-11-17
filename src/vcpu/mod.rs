@@ -352,6 +352,22 @@ pub trait Vcpu: Send {
         false
     }
 
+    /// The syscall this exit reports came in through a fast 32-bit entry
+    /// (`syscall` from compatibility mode on AMD, `sysenter` on Intel), which
+    /// the vcpu has turned into an `int $0x80` returning to the vDSO's landing
+    /// pad — except for the sixth argument, which the vDSO left on the user
+    /// stack at `%esp`, for the kernel to read (`EFAULT` if it can't).
+    fn syscall_fast32(&self) -> bool {
+        false
+    }
+
+    /// How 32-bit code on this CPU enters the kernel fastest, as Linux picks
+    /// for the vDSO's `__kernel_vsyscall`: `syscall` on AMD, `sysenter` on
+    /// Intel; `int $0x80` where neither is handled.
+    fn fast_syscall32(&self) -> vdso32::FastEntry {
+        vdso32::FastEntry::Int80
+    }
+
     /// The x86 user code and stack selectors (`%cs`, `%ss`): `__USER_CS`
     /// (0x33) and `__USER_DS` (0x2b) in 64-bit mode, `__USER32_CS` (0x23) in
     /// compatibility mode.

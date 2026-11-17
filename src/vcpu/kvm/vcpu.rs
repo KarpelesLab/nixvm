@@ -28,7 +28,7 @@ use super::vm::{
     FAULT_TRAMP_VA, GDT_BASE, GDT_LIMIT, LSTAR_VA, SEL_UCODE, SEL_UDATA, STAR_VALUE, Vm, check,
 };
 use crate::vcpu::ctrl::{
-    CSTAR_VA, EXC_VECTORS, GDT_ENTRIES, GDT_ENTRY_TLS_MIN, GDT_TLS_ENTRIES, INT80_VECTOR,
+    CSTAR_VA, KSTACK_TOP, SEL_KCODE, SYSENTER_VA, EXC_VECTORS, GDT_ENTRIES, GDT_ENTRY_TLS_MIN, GDT_TLS_ENTRIES, INT80_VECTOR,
     SEL_UCODE32, default_gdt, exc_tramp_va, gdt_slot_va, write_gdt_slot,
 };
 use crate::vcpu::mem::PAGE_SIZE;
@@ -176,6 +176,7 @@ mod preempt {
 /// `RFLAGS.TF` (single-step) and `RFLAGS.RF` (resume: no instruction
 /// breakpoint on the next instruction).
 const RFLAGS_TF: u64 = 1 << 8;
+const RFLAGS_IF: u64 = 1 << 9;
 const RFLAGS_RF: u64 = 1 << 16;
 /// `DR6` with no event recorded (its reserved bits read as one).
 const DR6_CLEAR: u64 = 0xFFFF_0FF0;
@@ -281,6 +282,12 @@ pub struct KvmVcpu {
     /// The private GDT holding them, once one is non-empty; until then the
     /// thread runs on the shared GDT.
     gdt_slot: Option<usize>,
+    /// The syscall came through a fast 32-bit entry: its sixth argument is
+    /// on the user stack (see [`Vcpu::syscall_fast32`]).
+    fast32: bool,
+    /// Where a fast 32-bit syscall returns (the process's vDSO landing pad),
+    /// cached from the memory before each run.
+    landing32: Option<u64>,
 }
 
 // The register caches and run page are noise in a debug dump; the fd
@@ -342,6 +349,10 @@ impl KvmVcpu {
             (sys::MSR_IA32_STAR, STAR_VALUE),
             (sys::MSR_IA32_LSTAR, LSTAR_VA),
             (sys::MSR_IA32_CSTAR, CSTAR_VA),
+            // `sysenter` (Intel): a `hlt` of its own, on the kernel stack.
+            (sys::MSR_IA32_SYSENTER_CS, u64::from(SEL_KCODE)),
+            (sys::MSR_IA32_SYSENTER_ESP, KSTACK_TOP),
+            (sys::MSR_IA32_SYSENTER_EIP, SYSENTER_VA),
             (sys::MSR_IA32_FMASK, FMASK_VALUE),
             (sys::MSR_KERNEL_GS_BASE, 0),
         ];
@@ -472,6 +483,8 @@ impl KvmVcpu {
             syscall32: false,
             tls: [0; GDT_TLS_ENTRIES],
             gdt_slot: None,
+            fast32: false,
+            landing32: None,
         })
     }
 
@@ -676,6 +689,7 @@ impl KvmVcpu {
             self.phys = Some(mem.phys_arc());
         }
         self.kstack_pa = mem.kstack_pa();
+        self.landing32 = mem.vdso32_landing();
     }
 
     /// Flush dirty caches to the vcpu, run it once, and refresh the caches.
@@ -889,18 +903,47 @@ impl KvmVcpu {
                 self.syscall32 = true;
                 Ok(Exit::Syscall)
             }
-            // `syscall` in compatibility mode (an AMD CPU takes it to
-            // `IA32_CSTAR`; an Intel one raises `#UD`): there is no 32-bit
-            // `syscall` entry, so it is the `#UD` on both. `rcx` and `r11`
-            // hold the user `rip` (past the 2-byte instruction) and flags.
+            // `syscall` in compatibility mode: an AMD CPU takes it to
+            // `IA32_CSTAR` (an Intel one raises `#UD` itself), and Linux runs
+            // it as `entry_SYSCALL_compat`: the second argument is in `%ebp`
+            // (`syscall` took `%ecx`), the sixth on the user stack, and it
+            // returns to the vDSO's landing pad, just past an `int $0x80`
+            // (`do_fast_syscall_32`). `rcx` and `r11` hold the user `rip`
+            // and flags.
             sys::KVM_EXIT_HLT if self.regs.rip == CSTAR_VA + 1 => {
-                self.regs.rip = self.regs.rcx.wrapping_sub(2);
+                let after = self.regs.rcx;
+                self.regs.rip = self.landing32.unwrap_or(after);
                 self.regs.rflags = self.regs.r11;
+                self.regs.rcx = self.regs.rbp;
                 self.regs_dirty = true;
                 self.sregs.cs = self.segment(SEL_UCODE32).unwrap_or_else(user_cs);
                 self.sregs.ss = user_ss();
                 self.sregs_dirty = true;
-                Ok(Exit::IllegalInstruction { pc: self.regs.rip })
+                self.syscall32 = true;
+                self.fast32 = true;
+                Ok(Exit::Syscall)
+            }
+            // `sysenter` (an Intel CPU; AMD's raise `#UD` in long mode), as
+            // `entry_SYSENTER_compat`: the vDSO put the user stack pointer in
+            // `%ebp` and the sixth argument at it, and nothing saved where it
+            // came from — it returns to the vDSO's landing pad, in 32-bit
+            // mode, with interrupts on.
+            sys::KVM_EXIT_HLT if self.regs.rip == SYSENTER_VA + 1 => {
+                // With no vDSO there is nowhere to return to: a SIGSEGV at 0.
+                let landing = self.landing32.unwrap_or(0);
+                self.regs.rip = landing;
+                self.regs.rsp = self.regs.rbp & 0xFFFF_FFFF;
+                self.regs.rflags = (self.regs.rflags | RFLAGS_IF) & !RFLAGS_TF;
+                self.regs_dirty = true;
+                self.sregs.cs = self.segment(SEL_UCODE32).unwrap_or_else(user_cs);
+                self.sregs.ss = user_ss();
+                self.sregs_dirty = true;
+                if self.landing32.is_none() {
+                    return Ok(Exit::ProtectionFault { pc: 0 });
+                }
+                self.syscall32 = true;
+                self.fast32 = true;
+                Ok(Exit::Syscall)
             }
             // Another exception's own trampoline.
             sys::KVM_EXIT_HLT if exception_vector(self.regs.rip).is_some() => {
@@ -1189,6 +1232,18 @@ impl Vcpu for KvmVcpu {
         self.syscall32
     }
 
+    fn syscall_fast32(&self) -> bool {
+        self.fast32
+    }
+
+    fn fast_syscall32(&self) -> crate::vcpu::vdso32::FastEntry {
+        if self.vm.vendor_amd() {
+            crate::vcpu::vdso32::FastEntry::Syscall
+        } else {
+            crate::vcpu::vdso32::FastEntry::Sysenter
+        }
+    }
+
     fn syscall_args(&self) -> [u64; 6] {
         if self.syscall32 {
             let r = &self.regs;
@@ -1212,6 +1267,7 @@ impl Vcpu for KvmVcpu {
         self.regs_dirty = true;
         self.in_syscall = false;
         self.syscall32 = false;
+        self.fast32 = false;
     }
 
     fn reg(&self, idx: usize) -> u64 {
@@ -1290,6 +1346,46 @@ impl Vcpu for KvmVcpu {
         }
         self.sregs.cs = code;
         self.sregs.ss = stack;
+        self.sregs_dirty = true;
+        true
+    }
+
+    fn segment_selector(&self, seg: usize) -> u16 {
+        let s = &self.sregs;
+        match seg {
+            0 => s.es.selector,
+            1 | 2 => {
+                let (cs, ss) = self.user_segments();
+                if seg == 1 { cs } else { ss }
+            }
+            3 => s.ds.selector,
+            4 => s.fs.selector,
+            5 => s.gs.selector,
+            _ => 0,
+        }
+    }
+
+    fn load_data_segment(&mut self, seg: usize, sel: u16) -> bool {
+        let new = if sel & !3 == 0 {
+            sys::kvm_segment {
+                selector: sel,
+                ..null_data()
+            }
+        } else {
+            // A data segment, or a readable code one.
+            match self.segment(sel) {
+                Some(d) if d.s == 1 && (d.type_ & 8 == 0 || d.type_ & 2 != 0) => d,
+                _ => return false,
+            }
+        };
+        let reg = match seg {
+            0 => &mut self.sregs.es,
+            3 => &mut self.sregs.ds,
+            4 => &mut self.sregs.fs,
+            5 => &mut self.sregs.gs,
+            _ => return false,
+        };
+        *reg = new;
         self.sregs_dirty = true;
         true
     }
@@ -1435,6 +1531,8 @@ impl Vcpu for KvmVcpu {
         child.sregs_dirty = true;
         child.in_syscall = self.in_syscall;
         child.syscall32 = self.syscall32;
+        child.fast32 = self.fast32;
+        child.landing32 = self.landing32;
         // The TLS entries are the child's own copy (Linux's `tls_array` is
         // part of the thread), in a private GDT of its own.
         child.tls = self.tls;
@@ -1471,6 +1569,7 @@ impl Vcpu for KvmVcpu {
         self.sregs_dirty = true;
         self.in_syscall = false;
         self.syscall32 = false;
+        self.fast32 = false;
         // execve empties the TLS entries (`flush_thread`).
         self.tls = [0; GDT_TLS_ENTRIES];
         self.load_gdt();
@@ -1533,6 +1632,7 @@ impl Vcpu for KvmVcpu {
             // is left to finish.
             if std::mem::take(&mut self.syscall32) {
                 self.in_syscall = false;
+                self.fast32 = false;
             }
             return;
         }

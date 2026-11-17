@@ -329,6 +329,9 @@ pub const KVM_EXIT_INTERNAL_ERROR: u32 = 17;
 pub const KVM_EXIT_DEBUG: u32 = 4;
 
 // MSR indices the trampoline setup writes.
+pub const MSR_IA32_SYSENTER_CS: u32 = 0x174;
+pub const MSR_IA32_SYSENTER_ESP: u32 = 0x175;
+pub const MSR_IA32_SYSENTER_EIP: u32 = 0x176;
 pub const MSR_IA32_STAR: u32 = 0xC000_0081;
 pub const MSR_IA32_LSTAR: u32 = 0xC000_0082;
 pub const MSR_IA32_CSTAR: u32 = 0xC000_0083;

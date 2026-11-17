@@ -182,6 +182,10 @@ pub const INT80_VECTOR: u64 = 0x80;
 /// a `hlt` of its own here, just past the 64-bit one.
 #[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
 pub const CSTAR_VA: u64 = LSTAR_VA + 0x10;
+/// Where `IA32_SYSENTER_EIP` points: `sysenter` (from 32-bit code on an
+/// Intel CPU) lands on a `hlt` of its own here.
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
+pub const SYSENTER_VA: u64 = LSTAR_VA + 0x20;
 
 /// The GDT every thread starts with (no TLS entries in use): Linux's
 /// `gdt_page`, minus the per-CPU details. The TSS descriptor's base is the
@@ -351,6 +355,7 @@ pub fn reserve_and_build(fa: &mut FrameAllocator, phys: &PhysMem) {
     // Trampolines: the syscall one (`IA32_LSTAR`) and the #PF one.
     phys.write(tramp_pa, &[0xF4, 0x48, 0x0F, 0x07]); // hlt ; sysretq
     phys.write(tramp_pa + (CSTAR_VA - LSTAR_VA), &[0xF4]); // hlt
+    phys.write(tramp_pa + (SYSENTER_VA - LSTAR_VA), &[0xF4]); // hlt
     phys.write(fault_pa, &[0xF4]); // hlt
 
     // vDSO ELF image (its clock code reads the vvar page at VVAR_VA). The vvar

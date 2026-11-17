@@ -277,6 +277,20 @@ impl Vm {
         self.pool.lock().unwrap().clone()
     }
 
+    /// Whether the guest sees an AMD (or Hygon) CPU, by its CPUID vendor:
+    /// there `syscall` works from compatibility mode and `sysenter` doesn't;
+    /// on Intel it's the other way round.
+    pub fn vendor_amd(&self) -> bool {
+        let c = &self.cpuid;
+        c.entries[..(c.nent as usize).min(c.entries.len())]
+            .iter()
+            .find(|e| e.function == 0)
+            .is_some_and(|e| {
+                // "AuthenticAMD" / "HygonGenuine": EBX "Auth" / "Hygo".
+                e.ebx == u32::from_le_bytes(*b"Auth") || e.ebx == u32::from_le_bytes(*b"Hygo")
+            })
+    }
+
     pub fn cpuid(&self) -> &sys::kvm_cpuid2 {
         &self.cpuid
     }
