@@ -77,6 +77,8 @@ pub struct Vm {
     /// ever create a few thousand tasks, however few were alive at a time. The
     /// pointer is the `kvm_run` mapping, stored as an address so this stays `Send`.
     idle_vcpus: Mutex<Vec<(Fd, usize)>>,
+    /// Which private GDTs (`ctrl::gdt_slot_va`) a thread holds: one bit each.
+    gdt_slots: Mutex<Vec<u64>>,
 }
 
 impl Drop for Vm {
@@ -151,6 +153,7 @@ impl Vm {
             pool: Mutex::new(None),
             next_vcpu_id: AtomicU32::new(0),
             idle_vcpus: Mutex::new(Vec::new()),
+            gdt_slots: Mutex::new(vec![0; crate::vcpu::ctrl::GDT_POOL_SLOTS.div_ceil(64)]),
         })
     }
 
@@ -249,6 +252,29 @@ impl Vm {
             )));
         }
         Ok((fd, run.cast()))
+    }
+
+    /// Take a free private GDT slot, if there is one.
+    pub fn alloc_gdt_slot(&self) -> Option<usize> {
+        let mut bits = self.gdt_slots.lock().unwrap();
+        let (word, w) = bits.iter_mut().enumerate().find(|(_, w)| **w != u64::MAX)?;
+        let bit = w.trailing_ones() as usize;
+        let slot = word * 64 + bit;
+        if slot >= crate::vcpu::ctrl::GDT_POOL_SLOTS {
+            return None;
+        }
+        *w |= 1 << bit;
+        Some(slot)
+    }
+
+    /// Give back a slot from [`Self::alloc_gdt_slot`].
+    pub fn free_gdt_slot(&self, slot: usize) {
+        self.gdt_slots.lock().unwrap()[slot / 64] &= !(1 << (slot % 64));
+    }
+
+    /// The shared physical pool, once a vcpu has run.
+    pub fn pool(&self) -> Option<std::sync::Arc<PhysMem>> {
+        self.pool.lock().unwrap().clone()
     }
 
     pub fn cpuid(&self) -> &sys::kvm_cpuid2 {

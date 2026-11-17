@@ -344,6 +344,40 @@ pub trait Vcpu: Send {
         0
     }
 
+    /// Whether the syscall this exit reports came through the i386 entry
+    /// (`int $0x80`): its number and arguments are `eax`, `ebx`, `ecx`, `edx`,
+    /// `esi`, `edi`, `ebp`, and it uses the i386 table, even in a 64-bit task.
+    fn syscall_ia32(&self) -> bool {
+        false
+    }
+
+    /// The x86 user code and stack selectors (`%cs`, `%ss`): `__USER_CS`
+    /// (0x33) and `__USER_DS` (0x2b) in 64-bit mode, `__USER32_CS` (0x23) in
+    /// compatibility mode.
+    fn user_segments(&self) -> (u16, u16) {
+        (0x33, 0x2b)
+    }
+
+    /// Return to user mode with these `%cs` and `%ss` (as `iretq` would, from
+    /// `rt_sigreturn` or into a signal handler). Whether they are a code and a
+    /// stack segment the task can use; nothing changes when they are not.
+    fn set_user_segments(&mut self, cs: u16, ss: u16) -> bool {
+        (cs, ss) == (0x33, 0x2b)
+    }
+
+    /// x86 TLS descriptor `i` (GDT entry 12 + `i`, `set_thread_area`), in the
+    /// CPU's 8-byte descriptor format; 0 for an empty one.
+    fn tls_desc(&self, _i: usize) -> u64 {
+        0
+    }
+
+    /// Install TLS descriptor `i`, reloading any of `%ds`, `%es`, `%fs` or
+    /// `%gs` that holds its selector, as Linux does. Whether the backend has
+    /// GDT TLS entries (and room for this thread's).
+    fn set_tls_desc(&mut self, _i: usize, _desc: u64) -> bool {
+        false
+    }
+
     /// Duplicate this vcpu's full register state (for `fork`/`clone`). The copy
     /// resumes at the same point; the kernel then sets the child's syscall
     /// return value and advances its PC.

@@ -27,7 +27,10 @@ use super::sys;
 use super::vm::{
     FAULT_TRAMP_VA, GDT_BASE, GDT_LIMIT, LSTAR_VA, SEL_UCODE, SEL_UDATA, STAR_VALUE, Vm, check,
 };
-use crate::vcpu::ctrl::{EXC_VECTORS, exc_tramp_va};
+use crate::vcpu::ctrl::{
+    CSTAR_VA, EXC_VECTORS, GDT_ENTRIES, GDT_ENTRY_TLS_MIN, GDT_TLS_ENTRIES, INT80_VECTOR,
+    SEL_UCODE32, default_gdt, exc_tramp_va, gdt_slot_va, write_gdt_slot,
+};
 use crate::vcpu::mem::PAGE_SIZE;
 use crate::vcpu::phys::PhysMem;
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
@@ -269,6 +272,15 @@ pub struct KvmVcpu {
     /// [`Vcpu::set_single_step`] set `TF` in the user flags; the next `#DB`
     /// (or a `syscall`) takes it out again.
     step_armed: bool,
+    /// The syscall being serviced came in through `int $0x80` (the i386
+    /// entry). The vcpu is back in user mode already: the gate's frame was
+    /// taken off the kernel stack at the exit.
+    syscall32: bool,
+    /// This thread's TLS descriptors (GDT entries 12-14).
+    tls: [u64; GDT_TLS_ENTRIES],
+    /// The private GDT holding them, once one is non-empty; until then the
+    /// thread runs on the shared GDT.
+    gdt_slot: Option<usize>,
 }
 
 // The register caches and run page are noise in a debug dump; the fd
@@ -329,7 +341,7 @@ impl KvmVcpu {
         let entries = [
             (sys::MSR_IA32_STAR, STAR_VALUE),
             (sys::MSR_IA32_LSTAR, LSTAR_VA),
-            (sys::MSR_IA32_CSTAR, 0),
+            (sys::MSR_IA32_CSTAR, CSTAR_VA),
             (sys::MSR_IA32_FMASK, FMASK_VALUE),
             (sys::MSR_KERNEL_GS_BASE, 0),
         ];
@@ -457,6 +469,9 @@ impl KvmVcpu {
             phys: None,
             kstack_pa: 0,
             step_armed: false,
+            syscall32: false,
+            tls: [0; GDT_TLS_ENTRIES],
+            gdt_slot: None,
         })
     }
 
@@ -506,20 +521,10 @@ impl KvmVcpu {
         let has_code = matches!(vector, 11 | 12 | 13 | 17);
         let ksp = self.regs.rsp + if has_code { 8 } else { 0 };
         // [error code,] rip, cs, rflags, rsp, ss.
-        let frame = self.phys.as_ref().map(|ph| {
-            let at = |va: u64| ph.read_u64(self.kstack_pa + (va & (PAGE_SIZE - 1)));
-            (at(ksp), at(ksp + 16), at(ksp + 24))
-        });
-        let Some((rip, rflags, rsp)) = frame else {
+        let Some(rip) = self.take_user_frame(ksp) else {
             return Exit::IllegalInstruction { pc: self.regs.rip };
         };
-        self.regs.rip = rip;
-        self.regs.rsp = rsp;
-        self.regs.rflags = rflags;
-        self.regs_dirty = true;
-        self.sregs.cs = user_cs();
-        self.sregs.ss = user_ss();
-        self.sregs_dirty = true;
+        let rflags = self.regs.rflags;
         match vector {
             0 => Exit::ArithmeticFault {
                 pc: rip,
@@ -573,6 +578,80 @@ impl KvmVcpu {
             },
             _ => Exit::ProtectionFault { pc: rip },
         }
+    }
+
+    /// Back to the user state a gate or exception saved in the frame at `ksp`
+    /// on the kernel stack (`rip`, `cs`, `rflags`, `rsp`, `ss`), as its
+    /// `iretq` would return: the user `rip`, or `None` when there's no frame.
+    fn take_user_frame(&mut self, ksp: u64) -> Option<u64> {
+        let ph = self.phys.as_ref()?;
+        let at = |va: u64| ph.read_u64(self.kstack_pa + (va & (PAGE_SIZE - 1)));
+        let (rip, cs, rflags, rsp, ss) = (
+            at(ksp),
+            at(ksp + 8),
+            at(ksp + 16),
+            at(ksp + 24),
+            at(ksp + 32),
+        );
+        self.regs.rip = rip;
+        self.regs.rsp = rsp;
+        self.regs.rflags = rflags;
+        self.regs_dirty = true;
+        // Only a user code segment can be in a frame from CPL3; anything else
+        // goes back to flat 64-bit user mode.
+        self.sregs.cs = self
+            .segment(cs as u16)
+            .filter(|c| c.s == 1 && c.type_ & 8 != 0)
+            .unwrap_or_else(user_cs);
+        self.sregs.ss = self.segment(ss as u16).unwrap_or_else(user_ss);
+        self.sregs_dirty = true;
+        Some(rip)
+    }
+
+    /// The GDT this thread runs on: the shared one plus its TLS entries.
+    fn gdt(&self) -> [u64; GDT_ENTRIES] {
+        let mut g = default_gdt();
+        g[GDT_ENTRY_TLS_MIN..GDT_ENTRY_TLS_MIN + GDT_TLS_ENTRIES].copy_from_slice(&self.tls);
+        g
+    }
+
+    /// The segment register a user load of `sel` would give: `None` for a
+    /// selector that would fault (outside the GDT, in the LDT, not present,
+    /// or not DPL 3), the null selector included.
+    fn segment(&self, sel: u16) -> Option<sys::kvm_segment> {
+        let idx = usize::from(sel >> 3);
+        if sel & 4 != 0 || sel & 3 != 3 || idx == 0 || idx >= GDT_ENTRIES {
+            return None;
+        }
+        segment_from_desc(sel, self.gdt()[idx]).filter(|s| s.dpl == 3)
+    }
+
+    /// Point `sregs.gdt` at this thread's GDT, copying its TLS entries into a
+    /// private one first when it has any. False when every private GDT is
+    /// taken.
+    fn load_gdt(&mut self) -> bool {
+        if self.tls.iter().all(|&d| d == 0) {
+            if let Some(slot) = self.gdt_slot.take() {
+                self.vm.free_gdt_slot(slot);
+            }
+            self.sregs.gdt.base = GDT_BASE;
+        } else {
+            let Some(phys) = self.phys.clone().or_else(|| self.vm.pool()) else {
+                return false;
+            };
+            let slot = match self.gdt_slot {
+                Some(s) => s,
+                None => match self.vm.alloc_gdt_slot() {
+                    Some(s) => s,
+                    None => return false,
+                },
+            };
+            self.gdt_slot = Some(slot);
+            write_gdt_slot(&phys, slot, &self.gdt());
+            self.sregs.gdt.base = gdt_slot_va(slot);
+        }
+        self.sregs_dirty = true;
+        true
     }
 
     /// Point the vcpu's `sregs.cr3` at `mem`'s address space if it isn't already —
@@ -746,8 +825,13 @@ impl KvmVcpu {
                 self.in_syscall = true;
                 // A step over a `syscall` is the kernel's to report (at its
                 // return); the user flags `sysretq` restores lose the `TF`.
+                // (After `int $0x80` the flags are back in `rflags`.)
                 if std::mem::take(&mut self.step_armed) {
-                    self.regs.r11 &= !RFLAGS_TF;
+                    if self.syscall32 {
+                        self.regs.rflags &= !RFLAGS_TF;
+                    } else {
+                        self.regs.r11 &= !RFLAGS_TF;
+                    }
                     self.regs_dirty = true;
                 }
             }
@@ -770,21 +854,17 @@ impl KvmVcpu {
                 // The frame sits in this address space's private kstack page; read
                 // it from that frame's pool physical address (cached in `sync_cr3`)
                 // so concurrent sibling faults never read one another's frame.
-                let frame = self.phys.as_ref().map(|ph| {
-                    let at = |va: u64| ph.read_u64(self.kstack_pa + (va & (PAGE_SIZE - 1)));
-                    (at(ksp), at(ksp + 8), at(ksp + 24), at(ksp + 32))
-                });
-                if let Some((err, fault_rip, fault_rflags, fault_rsp)) = frame {
-                    self.regs.rip = fault_rip;
-                    self.regs.rsp = fault_rsp;
-                    self.regs.rflags = fault_rflags;
-                    self.regs_dirty = true; // resume re-runs the faulting instruction
-                    // The exception entered CPL0; restore the user segments so
-                    // the resumed guest runs at CPL3, not with kernel privilege
-                    // (and so its next fault switches to RSP0 again).
-                    self.sregs.cs = user_cs();
-                    self.sregs.ss = user_ss();
-                    self.sregs_dirty = true;
+                let err = self
+                    .phys
+                    .as_ref()
+                    .map(|ph| ph.read_u64(self.kstack_pa + (ksp & (PAGE_SIZE - 1))));
+                // The exception entered CPL0; restore the user state (in the
+                // mode it was in), so the resumed guest re-runs the faulting
+                // instruction at CPL3, not with kernel privilege (and its next
+                // fault switches to RSP0 again).
+                if let Some(err) = err
+                    && self.take_user_frame(ksp + 8).is_some()
+                {
                     Ok(Exit::MemFault {
                         addr: self.sregs.cr2,
                         write: err & 0x2 != 0, // #PF error-code bit 1 = write
@@ -797,6 +877,30 @@ impl KvmVcpu {
                         write: false,
                     })
                 }
+            }
+            // `int $0x80`: an i386 system call. Back to user mode straight
+            // away (the frame is on a kernel stack the task's other threads
+            // share), with the syscall to service.
+            sys::KVM_EXIT_HLT if self.regs.rip == exc_tramp_va(INT80_VECTOR) + 1 => {
+                let ksp = self.regs.rsp;
+                if self.take_user_frame(ksp).is_none() {
+                    return Ok(Exit::IllegalInstruction { pc: self.regs.rip });
+                }
+                self.syscall32 = true;
+                Ok(Exit::Syscall)
+            }
+            // `syscall` in compatibility mode (an AMD CPU takes it to
+            // `IA32_CSTAR`; an Intel one raises `#UD`): there is no 32-bit
+            // `syscall` entry, so it is the `#UD` on both. `rcx` and `r11`
+            // hold the user `rip` (past the 2-byte instruction) and flags.
+            sys::KVM_EXIT_HLT if self.regs.rip == CSTAR_VA + 1 => {
+                self.regs.rip = self.regs.rcx.wrapping_sub(2);
+                self.regs.rflags = self.regs.r11;
+                self.regs_dirty = true;
+                self.sregs.cs = self.segment(SEL_UCODE32).unwrap_or_else(user_cs);
+                self.sregs.ss = user_ss();
+                self.sregs_dirty = true;
+                Ok(Exit::IllegalInstruction { pc: self.regs.rip })
             }
             // Another exception's own trampoline.
             sys::KVM_EXIT_HLT if exception_vector(self.regs.rip).is_some() => {
@@ -936,6 +1040,45 @@ fn user_ss() -> sys::kvm_segment {
     }
 }
 
+/// The segment register `sel` loads from descriptor `desc`; `None` when it
+/// isn't present.
+fn segment_from_desc(sel: u16, desc: u64) -> Option<sys::kvm_segment> {
+    if (desc >> 47) & 1 == 0 {
+        return None;
+    }
+    let g = ((desc >> 55) & 1) as u8;
+    let raw_limit = ((desc & 0xFFFF) | ((desc >> 32) & 0xF_0000)) as u32;
+    Some(sys::kvm_segment {
+        base: ((desc >> 16) & 0xFF_FFFF) | (((desc >> 56) & 0xFF) << 24),
+        limit: if g == 1 {
+            (raw_limit << 12) | 0xFFF
+        } else {
+            raw_limit
+        },
+        selector: sel,
+        type_: ((desc >> 40) & 0xF) as u8,
+        present: 1,
+        dpl: ((desc >> 45) & 3) as u8,
+        db: ((desc >> 54) & 1) as u8,
+        s: ((desc >> 44) & 1) as u8,
+        l: ((desc >> 53) & 1) as u8,
+        g,
+        avl: ((desc >> 52) & 1) as u8,
+        unusable: 0,
+        padding: 0,
+    })
+}
+
+/// A data segment register holding the null selector, as a 64-bit Linux task
+/// starts with in `%ds`, `%es`, `%fs` and `%gs` (only their bases count in
+/// 64-bit mode). It keeps flat attributes so the bases still apply.
+fn null_data() -> sys::kvm_segment {
+    sys::kvm_segment {
+        selector: 0,
+        ..user_ss()
+    }
+}
+
 /// Switch `sregs` into flat 64-bit user mode: the control block's GDT and
 /// page tables, user code/data segments, long mode enabled. Everything not
 /// set here (apic_base, interrupt_bitmap) keeps its current value.
@@ -944,10 +1087,10 @@ fn init_user_sregs(sregs: &mut sys::kvm_sregs) {
     let data = user_ss();
     sregs.cs = code;
     sregs.ss = data;
-    sregs.ds = data;
-    sregs.es = data;
-    sregs.fs = data;
-    sregs.gs = data;
+    sregs.ds = null_data();
+    sregs.es = null_data();
+    sregs.fs = null_data();
+    sregs.gs = null_data();
     // The real TSS (base = TSS_BASE, RSP0 set): the CPU switches to RSP0 on a
     // CPL3→CPL0 exception (a #PF vectoring through the IDT), where it pushes the
     // exception frame the host reads back.
@@ -1036,10 +1179,21 @@ impl Vcpu for KvmVcpu {
     }
 
     fn syscall_nr(&self) -> u64 {
+        if self.syscall32 {
+            return self.regs.rax & 0xFFFF_FFFF;
+        }
         self.regs.rax
     }
 
+    fn syscall_ia32(&self) -> bool {
+        self.syscall32
+    }
+
     fn syscall_args(&self) -> [u64; 6] {
+        if self.syscall32 {
+            let r = &self.regs;
+            return [r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rbp].map(|v| v & 0xFFFF_FFFF);
+        }
         [
             self.regs.rdi,
             self.regs.rsi,
@@ -1052,10 +1206,12 @@ impl Vcpu for KvmVcpu {
 
     fn set_syscall_ret(&mut self, value: u64) {
         // rip already points past the trampoline's `hlt`, at the `sysretq`
-        // that returns to user code — only the return register needs writing.
+        // that returns to user code (or, for `int $0x80`, at the user code
+        // itself) — only the return register needs writing.
         self.regs.rax = value;
         self.regs_dirty = true;
         self.in_syscall = false;
+        self.syscall32 = false;
     }
 
     fn reg(&self, idx: usize) -> u64 {
@@ -1069,6 +1225,10 @@ impl Vcpu for KvmVcpu {
         self.regs.rip
     }
     fn syscall_ip(&self) -> u64 {
+        // `int $0x80` returned to user mode at the exit already.
+        if self.syscall32 {
+            return self.regs.rip;
+        }
         // Parked on the trampoline: `syscall` left the user return in rcx.
         self.regs.rcx
     }
@@ -1094,12 +1254,74 @@ impl Vcpu for KvmVcpu {
     }
 
     fn set_tls(&mut self, value: u64) {
-        self.sregs.fs.base = value;
+        // `ARCH_SET_FS` loads the null selector, then the base.
+        self.sregs.fs = sys::kvm_segment {
+            base: value,
+            ..null_data()
+        };
         self.sregs_dirty = true;
     }
 
     fn set_gs_base(&mut self, value: u64) -> bool {
-        self.sregs.gs.base = value;
+        self.sregs.gs = sys::kvm_segment {
+            base: value,
+            ..null_data()
+        };
+        self.sregs_dirty = true;
+        true
+    }
+
+    fn user_segments(&self) -> (u16, u16) {
+        // Parked on the syscall trampoline (CPL0), the user mode is 64-bit:
+        // only it has the `syscall` entry.
+        if self.sregs.cs.selector & 3 != 3 {
+            return (SEL_UCODE, SEL_UDATA);
+        }
+        (self.sregs.cs.selector, self.sregs.ss.selector)
+    }
+
+    fn set_user_segments(&mut self, cs: u16, ss: u16) -> bool {
+        let (Some(code), Some(stack)) = (self.segment(cs), self.segment(ss)) else {
+            return false;
+        };
+        // A code segment, and a writable data one for the stack.
+        if code.s == 0 || code.type_ & 8 == 0 || stack.s == 0 || stack.type_ & 0xA != 2 {
+            return false;
+        }
+        self.sregs.cs = code;
+        self.sregs.ss = stack;
+        self.sregs_dirty = true;
+        true
+    }
+
+    fn tls_desc(&self, i: usize) -> u64 {
+        self.tls.get(i).copied().unwrap_or(0)
+    }
+
+    fn set_tls_desc(&mut self, i: usize, desc: u64) -> bool {
+        if i >= GDT_TLS_ENTRIES {
+            return false;
+        }
+        let old = self.tls[i];
+        self.tls[i] = desc;
+        if !self.load_gdt() {
+            self.tls[i] = old;
+            return false;
+        }
+        // A data segment register holding the selector is reloaded from the
+        // new descriptor (or nulled, if it is gone).
+        let sel = ((GDT_ENTRY_TLS_MIN + i) << 3) as u16 | 3;
+        let seg = self.segment(sel).unwrap_or_else(null_data);
+        for reg in [
+            &mut self.sregs.ds,
+            &mut self.sregs.es,
+            &mut self.sregs.fs,
+            &mut self.sregs.gs,
+        ] {
+            if reg.selector == sel {
+                *reg = seg;
+            }
+        }
         self.sregs_dirty = true;
         true
     }
@@ -1212,6 +1434,14 @@ impl Vcpu for KvmVcpu {
         child.sregs = self.sregs;
         child.sregs_dirty = true;
         child.in_syscall = self.in_syscall;
+        child.syscall32 = self.syscall32;
+        // The TLS entries are the child's own copy (Linux's `tls_array` is
+        // part of the thread), in a private GDT of its own.
+        child.tls = self.tls;
+        child.phys.clone_from(&self.phys);
+        if !child.load_gdt() {
+            return Err(VcpuError::Backend("no free GDT for the new thread".into()));
+        }
         // The child runs the *child's* address space (a different cr3); force a
         // re-sync on its first run rather than inheriting the parent's cached one.
         child.cur_cr3 = None;
@@ -1240,6 +1470,10 @@ impl Vcpu for KvmVcpu {
         self.sregs.fs.base = 0;
         self.sregs_dirty = true;
         self.in_syscall = false;
+        self.syscall32 = false;
+        // execve empties the TLS entries (`flush_thread`).
+        self.tls = [0; GDT_TLS_ENTRIES];
+        self.load_gdt();
         // execve installed fresh page tables in the same GuestMemory: its `cr3()`
         // changed, so drop the cached value and re-sync on the next run.
         self.cur_cr3 = None;
@@ -1295,15 +1529,19 @@ impl Vcpu for KvmVcpu {
         // of its own instructions. There's no `sysretq` pending then, and `rcx`
         // and `r11` are just whatever the program had in them.
         if self.sregs.cs.selector & 3 == 3 {
+            // `int $0x80` returned to user mode at the exit: only the syscall
+            // is left to finish.
+            if std::mem::take(&mut self.syscall32) {
+                self.in_syscall = false;
+            }
             return;
         }
         self.regs.rip = self.regs.rcx;
         self.regs.rflags = self.regs.r11;
         self.regs_dirty = true;
+        // `sysretq` loads just these two; `%ds` and `%es` are the user's own.
         self.sregs.cs = user_cs();
         self.sregs.ss = user_ss();
-        self.sregs.ds = user_ss();
-        self.sregs.es = user_ss();
         self.sregs_dirty = true;
         // The trampoline `sysretq` will not run; the syscall is logically done.
         self.in_syscall = false;
@@ -1338,6 +1576,9 @@ impl Drop for KvmVcpu {
     fn drop(&mut self) {
         // The fd and the `kvm_run` mapping go together to the VM's idle list. A
         // placeholder fd is left behind, whose close is a harmless EBADF.
+        if let Some(slot) = self.gdt_slot.take() {
+            self.vm.free_gdt_slot(slot);
+        }
         let fd = std::mem::replace(&mut self.fd, super::vm::Fd(-1));
         self.vm.recycle_vcpu(fd, self.run);
     }

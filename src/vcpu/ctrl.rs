@@ -139,22 +139,106 @@ pub mod vectors {
     pub const LOWER_SYNC: u16 = 8;
 }
 
-/// GDT selector of the TSS descriptor (a 16-byte descriptor at slots 5–6).
+// The GDT is Linux's x86-64 one (`arch/x86/include/asm/segment.h`): user
+// selectors are what a Linux task sees (`__USER32_CS` = 0x23, `__USER_DS` =
+// 0x2b, `__USER_CS` = 0x33), the TSS at entries 8-9, the LDT slot at 10-11,
+// the three TLS entries `set_thread_area` fills at 12-14 and the CPU/node
+// segment at 15. `sysretq` needs the user data selector between the two user
+// code selectors, which is why it is laid out this way.
+
+/// GDT selector of the TSS descriptor (a 16-byte descriptor at entries 8-9).
 #[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
-pub const SEL_TSS: u16 = 0x28;
-pub const SEL_KCODE: u16 = 0x08;
+pub const SEL_TSS: u16 = 0x40;
+/// `__KERNEL_CS`: the 64-bit kernel code segment the trampolines run in.
+pub const SEL_KCODE: u16 = 0x10;
+/// `__KERNEL_DS`.
 #[allow(dead_code)]
-pub const SEL_KDATA: u16 = 0x10;
+pub const SEL_KDATA: u16 = 0x18;
+/// `__USER32_CS`: the 32-bit (compatibility mode) user code segment.
 #[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
-pub const SEL_UDATA: u16 = 0x18 | 3;
+pub const SEL_UCODE32: u16 = 0x20 | 3;
+/// `__USER_DS`: the user data (and stack) segment.
 #[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
-pub const SEL_UCODE: u16 = 0x20 | 3;
-/// `IA32_STAR`: `sysretq` base selector in [63:48], `syscall` CS in [47:32].
+pub const SEL_UDATA: u16 = 0x28 | 3;
+/// `__USER_CS`: the 64-bit user code segment.
 #[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
-pub const STAR_VALUE: u64 = (((SEL_UDATA as u64 & !3) - 8) | 3) << 48 | (SEL_KCODE as u64) << 32;
-/// GDTR limit: 5 segment descriptors + a 16-byte TSS descriptor.
+pub const SEL_UCODE: u16 = 0x30 | 3;
+/// `IA32_STAR`: `sysret` base selector in [63:48] (`__USER32_CS`, so a
+/// `sysretq` lands on `__USER_CS` with `__USER_DS`), `syscall` CS in [47:32].
 #[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
-pub const GDT_LIMIT: u16 = 7 * 8 - 1;
+pub const STAR_VALUE: u64 = (SEL_UCODE32 as u64) << 48 | (SEL_KCODE as u64) << 32;
+/// Number of GDT entries (`GDT_ENTRIES`).
+pub const GDT_ENTRIES: usize = 16;
+/// The first of the three TLS entries (`GDT_ENTRY_TLS_MIN`).
+pub const GDT_ENTRY_TLS_MIN: usize = 12;
+/// How many TLS entries a thread has (`GDT_ENTRY_TLS_ENTRIES`).
+pub const GDT_TLS_ENTRIES: usize = 3;
+/// GDTR limit: the whole 16-entry table.
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
+pub const GDT_LIMIT: u16 = (GDT_ENTRIES * 8 - 1) as u16;
+/// The vector of the i386 system-call gate (`int $0x80`).
+pub const INT80_VECTOR: u64 = 0x80;
+/// Where `IA32_CSTAR` points: a `syscall` made in compatibility mode lands on
+/// a `hlt` of its own here, just past the 64-bit one.
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
+pub const CSTAR_VA: u64 = LSTAR_VA + 0x10;
+
+/// The GDT every thread starts with (no TLS entries in use): Linux's
+/// `gdt_page`, minus the per-CPU details. The TSS descriptor's base is the
+/// shared [`TSS_BASE`].
+#[must_use]
+pub fn default_gdt() -> [u64; GDT_ENTRIES] {
+    let base = TSS_BASE;
+    let limit = 0x67u64;
+    let tss_lo = (limit & 0xFFFF)
+        | ((base & 0xFFFF) << 16)
+        | (((base >> 16) & 0xFF) << 32)
+        | (0x8Bu64 << 40)
+        | (((limit >> 16) & 0xF) << 48)
+        | (((base >> 24) & 0xFF) << 56);
+    let tss_hi = (base >> 32) & 0xFFFF_FFFF;
+    let mut g = [0u64; GDT_ENTRIES];
+    g[1] = 0x00CF_9A00_0000_FFFF; // 0x08 __KERNEL32_CS
+    g[2] = 0x00AF_9A00_0000_FFFF; // 0x10 __KERNEL_CS (L=1)
+    g[3] = 0x00CF_9200_0000_FFFF; // 0x18 __KERNEL_DS
+    g[4] = 0x00CF_FA00_0000_FFFF; // 0x23 __USER32_CS (D=1, DPL3)
+    g[5] = 0x00CF_F200_0000_FFFF; // 0x2b __USER_DS (DPL3)
+    g[6] = 0x00AF_FA00_0000_FFFF; // 0x33 __USER_CS (L=1, DPL3)
+    g[8] = tss_lo;
+    g[9] = tss_hi;
+    // 0x7b __CPUNODE_SEG: a read-only, expand-down, 32-bit DPL3 data segment
+    // whose limit holds the CPU and node number (`lsl` reads it): CPU 0.
+    g[15] = 0x0040_F500_0000_0000;
+    g
+}
+
+/// Number of private GDTs: one for each thread that has a TLS entry in use
+/// (a thread with none runs on the shared one at [`GDT_BASE`]). Each is
+/// [`GDT_ENTRIES`] × 8 = 128 bytes, 32 to a page.
+pub const GDT_POOL_SLOTS: usize = GDT_POOL_FRAMES as usize * GDT_SLOTS_PER_FRAME;
+const GDT_SLOTS_PER_FRAME: usize = PAGE_SIZE as usize / (GDT_ENTRIES * 8);
+const GDT_POOL_FRAMES: u64 = 16;
+/// Virtual base of the private GDTs.
+const GDT_POOL_OFF: u64 = 0x60000;
+
+/// Linear address of private GDT `slot` (`0..GDT_POOL_SLOTS`).
+#[must_use]
+pub const fn gdt_slot_va(slot: usize) -> u64 {
+    CTRL_GPA + GDT_POOL_OFF + (slot * GDT_ENTRIES * 8) as u64
+}
+
+/// Write `gdt` into private GDT `slot`.
+pub fn write_gdt_slot(phys: &PhysMem, slot: usize, gdt: &[u64; GDT_ENTRIES]) {
+    let mut bytes = [0u8; GDT_ENTRIES * 8];
+    for (i, d) in gdt.iter().enumerate() {
+        bytes[i * 8..i * 8 + 8].copy_from_slice(&d.to_le_bytes());
+    }
+    let frame = frame_pa(GDT_POOL_FIDX + slot / GDT_SLOTS_PER_FRAME);
+    phys.write(
+        frame + ((slot % GDT_SLOTS_PER_FRAME) * GDT_ENTRIES * 8) as u64,
+        &bytes,
+    );
+}
 
 /// Physical base of the control block's frames in the pool — the first
 /// allocatable frame after the pinned null frame. Held out of circulation by
@@ -162,16 +246,19 @@ pub const GDT_LIMIT: u16 = 7 * 8 - 1;
 pub const CTRL_PHYS_BASE: u64 = PAGE_SIZE;
 /// Number of *shared* control-block pages: GDT, syscall trampoline, `#PF`
 /// trampoline, IDT, TSS, then the vDSO code page, its vvar data page, the
-/// arm64 vector page and the three arm64 upper-half tables that map it. The
+/// arm64 vector page and the three arm64 upper-half tables that map it, and
+/// the private GDTs (see [`gdt_slot_va`]). The
 /// kernel stack is **not** here — it is per address space (see
 /// [`KSTACK_PAGE_VA`] / [`map_kstack`]).
-pub const CTRL_FRAMES: u64 = 11;
+pub const CTRL_FRAMES: u64 = 11 + GDT_POOL_FRAMES;
 /// Physical-run index of the vDSO code frame, the vvar frame, the arm64 vector
 /// frame and the first of its three upper-half tables (levels 1, 2, 3).
 const VDSO_FIDX: usize = 5;
 const VVAR_FIDX: usize = 6;
 const VECTORS_FIDX: usize = 7;
 const ARM_KTABLE_FIDX: usize = 8;
+/// Physical-run index of the first private-GDT frame.
+const GDT_POOL_FIDX: usize = 11;
 /// Bytes the control block reserves in the pool.
 pub const CTRL_SIZE: u64 = CTRL_FRAMES * PAGE_SIZE;
 
@@ -223,30 +310,9 @@ pub fn reserve_and_build(fa: &mut FrameAllocator, phys: &PhysMem) {
     let idt_pa = frame_pa(3);
     let tss_pa = frame_pa(4);
 
-    // GDT: null, kernel code64, kernel data, user data, user code64.
-    let gdt: [u64; 5] = [
-        0,
-        0x00AF_9A00_0000_FFFF, // 0x08 kernel code (L=1, DPL0)
-        0x00CF_9200_0000_FFFF, // 0x10 kernel data
-        0x00CF_F200_0000_FFFF, // 0x18 user data  (DPL3)
-        0x00AF_FA00_0000_FFFF, // 0x20 user code  (L=1, DPL3)
-    ];
-    for (i, d) in gdt.iter().enumerate() {
+    for (i, d) in default_gdt().iter().enumerate() {
         phys.write(gdt_pa + i as u64 * 8, &d.to_le_bytes());
     }
-    // TSS descriptor (16 bytes, GDT slots 5–6): a 64-bit available TSS at
-    // TSS_BASE, limit 0x67.
-    let base = TSS_BASE;
-    let limit = 0x67u64;
-    let lo = (limit & 0xFFFF)
-        | ((base & 0xFFFF) << 16)
-        | (((base >> 16) & 0xFF) << 32)
-        | (0x8Bu64 << 40)
-        | (((limit >> 16) & 0xF) << 48)
-        | (((base >> 24) & 0xFF) << 56);
-    let hi = (base >> 32) & 0xFFFF_FFFF;
-    phys.write(gdt_pa + 5 * 8, &lo.to_le_bytes());
-    phys.write(gdt_pa + 6 * 8, &hi.to_le_bytes());
 
     // The 64-bit TSS: only RSP0 (offset 4) matters.
     phys.write(tss_pa + 4, &KSTACK_TOP.to_le_bytes());
@@ -270,9 +336,17 @@ pub fn reserve_and_build(fa: &mut FrameAllocator, phys: &PhysMem) {
         gate(v, exc_tramp_va(v), if matches!(v, 3 | 4) { 3 } else { 0 });
         phys.write(fault_pa + (exc_tramp_va(v) - FAULT_TRAMP_VA), &[0xF4]); // hlt
     }
+    // `int $0x80`, the i386 system call, which a 64-bit task may make too
+    // (DPL 3, like Linux's `entry_INT80_compat` gate).
+    gate(INT80_VECTOR, exc_tramp_va(INT80_VECTOR), 3);
+    phys.write(
+        fault_pa + (exc_tramp_va(INT80_VECTOR) - FAULT_TRAMP_VA),
+        &[0xF4],
+    );
 
     // Trampolines: the syscall one (`IA32_LSTAR`) and the #PF one.
     phys.write(tramp_pa, &[0xF4, 0x48, 0x0F, 0x07]); // hlt ; sysretq
+    phys.write(tramp_pa + (CSTAR_VA - LSTAR_VA), &[0xF4]); // hlt
     phys.write(fault_pa, &[0xF4]); // hlt
 
     // vDSO ELF image (its clock code reads the vvar page at VVAR_VA). The vvar
@@ -336,6 +410,11 @@ pub fn map_into(space: &mut AddrSpace, fa: &mut FrameAllocator, phys: &PhysMem) 
     // These are the only user-accessible control-block pages.
     let _ = space.map(VDSO_VA, frame_pa(VDSO_FIDX), Prot::rx(), false, fa, phys);
     let _ = space.map(VVAR_VA, frame_pa(VVAR_FIDX), Prot::READ, false, fa, phys);
+    for i in 0..GDT_POOL_FRAMES {
+        let va = CTRL_GPA + GDT_POOL_OFF + i * PAGE_SIZE;
+        let pa = frame_pa(GDT_POOL_FIDX + i as usize);
+        let _ = space.map(va, pa, Prot::rw(), true, fa, phys);
+    }
 }
 
 /// Make the control block match `phys`'s page-table format: the vDSO for that
