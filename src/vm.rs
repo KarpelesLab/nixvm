@@ -115,6 +115,24 @@ impl Vm {
         Self::finish(mounts, Start::shell(argv), mem_bytes, None)
     }
 
+    /// Boot `argv[0]` from `root`, any filesystem, mounted at `/` — e.g. an
+    /// [`Overlay`](crate::fs::Overlay) of a released image
+    /// (`nixvm::image::fetch`, the `images` feature) under a host-directory upper
+    /// ([`Overlay::persistent`](crate::fs::Overlay::persistent)), so that what
+    /// the guest installs is there the next time. Otherwise as [`Vm::boot`].
+    ///
+    /// # Errors
+    /// As [`Vm::boot`].
+    pub fn boot_root(
+        root: Box<dyn crate::fs::MountFs>,
+        argv: Vec<String>,
+        mem_bytes: u64,
+    ) -> Result<Self, String> {
+        let mut mounts = MountTable::new();
+        mounts.mount("/", root);
+        Self::finish(mounts, Start::shell(argv), mem_bytes, None)
+    }
+
     /// Boot from a `.tar` root image mounted as a **read-only squashfs lower**
     /// under a writable tmpfs upper (copy-on-write) — the real overlay layout.
     /// The tar is repacked into an in-memory squashfs via `fstool`, so the guest
