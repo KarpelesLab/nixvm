@@ -1073,6 +1073,33 @@ impl X86Interp {
         self.push_w(mem, val, 64)
     }
 
+    /// `IRETQ` (`iret`) or `RETFQ`: pop `rip` and `cs`, and for `IRETQ`
+    /// `rflags`, `rsp` and `ss` too, all 64-bit. A user task can only stay at
+    /// CPL3 in the 64-bit code segment ([`USER_CS`], with [`USER_SS`]); any
+    /// other selector is a `#GP` with nothing changed, like a frame that
+    /// faults while being read.
+    fn far_return(&mut self, mem: &GuestMemory, iret: bool) -> Step {
+        let n = if iret { 5 } else { 2 };
+        let sp = self.gpr[RSP];
+        let mut v = [0u64; 5];
+        for (i, slot) in v.iter_mut().take(n).enumerate() {
+            match Self::read_mem(mem, sp.wrapping_add(8 * i as u64), 64) {
+                Ok(x) => *slot = x,
+                Err(step) => return step,
+            }
+        }
+        if v[1] & 0xffff != u64::from(USER_CS) || (iret && v[4] & 0xffff != u64::from(USER_SS)) {
+            return Step::Trap(Trap::Protection);
+        }
+        if iret {
+            self.set_rflags_user(v[2]);
+            self.gpr[RSP] = v[3];
+        } else {
+            self.gpr[RSP] = sp.wrapping_add(16);
+        }
+        self.jump(v[0])
+    }
+
     // ---- flags ----------------------------------------------------------------
 
     /// `ADD` (and, with `carry_in`, `ADC`): result masked to `width`, all
@@ -2554,8 +2581,13 @@ impl X86Interp {
             0xC7 => self.mov_imm(mem, pc, p, width),
             0xC8 => self.enter(mem, pc, p),
             0xC9 => self.leave(mem, pc, p),
-            // Far returns/interrupt returns and software interrupts: no far
-            // code segments or IDT gates are reachable from a user task.
+            // IRETQ / far RETQ back to the 64-bit user code segment: a
+            // same-privilege return, as Wine's syscall dispatcher makes to
+            // resume PE code (it `iretq`s with the `%cs`/`%ss` it read).
+            0xCB | 0xCF if p.rex.w => self.far_return(mem, op == 0xCF),
+            // Other far returns (to a 32-bit segment), interrupt returns and
+            // software interrupts: no compatibility-mode code segment or IDT
+            // gate is reachable from a user task.
             0xCA | 0xCB | 0xCD | 0xCF => Step::Trap(Trap::Protection),
             // INT3/INT1 are traps: the saved `rip` is the next instruction.
             0xCC => {
@@ -5950,6 +5982,37 @@ mod tests {
         assert_ne!(w & (1 << 18), 0, "AC toggles");
         assert_eq!(w & 0x3000, 0, "IOPL is not user-writable");
         assert_ne!(w & 0x200, 0, "IF stays set");
+    }
+
+    /// `iretq` and `retfq` to the 64-bit user code segment return like a near
+    /// branch plus the popped flags and stack (Wine resumes PE code with
+    /// `iretq`); to any other code segment they're a `#GP` that leaves the
+    /// registers alone.
+    #[test]
+    fn iretq_and_retfq_to_the_user_code_segment() {
+        let mut m = mem();
+        let frame = [0x1_1234u64, 0x33, 0x246, 0x1_5008, 0x2b];
+        for (i, v) in frame.iter().enumerate() {
+            m.write_init(0x1_3000 + 8 * i as u64, &v.to_le_bytes())
+                .unwrap();
+        }
+        let (c, s) = run_with(&mut m, &[0x48, 0xCF], |c| c.gpr[RSP] = 0x1_3000);
+        assert!(matches!(s, Step::Branched));
+        assert_eq!(c.rip, 0x1_1234);
+        assert_eq!(c.gpr[RSP], 0x1_5008);
+        assert!(c.flags.zf && c.flags.pf && !c.flags.cf);
+
+        let (c, s) = run_with(&mut m, &[0x48, 0xCB], |c| c.gpr[RSP] = 0x1_3000);
+        assert!(matches!(s, Step::Branched));
+        assert_eq!((c.rip, c.gpr[RSP]), (0x1_1234, 0x1_3010));
+
+        // cs = 0x23: a 32-bit (compatibility mode) segment isn't reachable.
+        m.write_init(0x1_3008, &0x23u64.to_le_bytes()).unwrap();
+        for code in [&[0x48, 0xCF][..], &[0x48, 0xCB][..]] {
+            let (c, s) = run_with(&mut m, code, |c| c.gpr[RSP] = 0x1_3000);
+            assert!(matches!(s, Step::Trap(Trap::Protection)));
+            assert_eq!(c.gpr[RSP], 0x1_3000);
+        }
     }
 
     #[test]
