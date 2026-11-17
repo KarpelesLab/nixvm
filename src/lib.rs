@@ -17,8 +17,10 @@
 //! * `oci`      — Docker/OCI images: pull, flatten, run (`oci` feature).
 //! * [`sandbox`]— the public [`Sandbox`] builder that wires it all together.
 //!
-//! `unsafe` is confined to the hardware backends (`vcpu::hvf`, `vcpu::kvm`);
-//! everything else is safe Rust.
+//! `unsafe` is confined to the hardware backends (`vcpu::hvf`, `vcpu::kvm`)
+//! and the host OS layer: on a Linux-ABI host (glibc, musl, or the libc-free
+//! `x86_64-unknown-linux-fullrust`), the system calls `std` doesn't wrap are
+//! made directly by `linux_raw`, never through libc.
 //!
 //! ```no_run
 //! use nixvm::Sandbox;
@@ -42,6 +44,8 @@ pub mod gpu;
 pub mod image;
 pub mod kernel;
 pub mod limits;
+#[cfg(nixvm_linux)]
+pub(crate) mod linux_raw;
 pub mod loader;
 #[cfg(feature = "oci")]
 pub mod oci;

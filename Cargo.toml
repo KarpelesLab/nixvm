@@ -3,9 +3,10 @@
 # One crate. Internal structure (abi / vcpu / kernel / fs / loader / image /
 # sandbox) lives as modules, and heavy or platform-specific dependencies are
 # feature-gated rather than split into separate crates. `unsafe` is confined to
-# four documented sites: `vcpu::hvf` (Hypervisor.framework FFI), `vcpu::kvm`
-# (/dev/kvm ioctl FFI), `vcpu::region` (page-aligned guest-RAM allocation), and
-# `fs::passthrough` (*at(2) FFI). See ROADMAP.md for the plan.
+# a few documented sites: `vcpu::hvf` (Hypervisor.framework FFI), `vcpu::kvm`
+# (/dev/kvm ioctls), `vcpu::region` (page-aligned guest-RAM allocation),
+# `fs::passthrough` (*at(2) calls), and `linux_raw` (raw Linux system calls,
+# which every Linux build uses instead of libc). See ROADMAP.md for the plan.
 
 [package]
 name = "nixvm"
@@ -42,6 +43,14 @@ cli = []
 # so existing `--features` invocations still build.
 hvf = []    # Hypervisor.framework, macOS/arm64
 kvm = []    # KVM, Linux/x86-64 (x86-64 guests); arm64 KVM is Phase 10
+# Treat the host as Linux with no libc (src/linux_raw.rs, build.rs): what
+# `std` doesn't wrap goes through raw system calls — which a Linux host does
+# anyway — and so does `clock_gettime`, which glibc would serve from the vDSO.
+# The libc-free `x86_64-unknown-linux-fullrust` target (`target_os =
+# "fullrust"`, not `cfg(unix)`) is detected without this; the feature is for
+# another libc-free x86-64/arm64 Linux target whose std still provides
+# `std::os::{fd, unix}`, and for testing that path on a normal Linux build.
+linux-raw = []
 # Software CPU interpreter — the no-acceleration fallback (Phase 10).
 interp = []
 # Real on-disk filesystem images (ext2/3/4) via our `fstool` crate, for the
