@@ -322,6 +322,35 @@ static void mode_checks(void) {
   CHECK(r == spins32 && r > 0, "the 32-bit loop resumed and finished: %u", r);
 }
 
+/* An i386 program exec'd from this 64-bit one, when it's next to it (the
+ * guest tests build `ia32` with `gcc -m32`): it runs as an ELFCLASS32
+ * process, with its arguments and environment. */
+static void exec_ia32(void) {
+  char self[512], path[600];
+  ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+  if (n <= 0)
+    return;
+  self[n] = 0;
+  char *slash = strrchr(self, '/');
+  if (!slash)
+    return;
+  *slash = 0;
+  snprintf(path, sizeof path, "%s/ia32", self);
+  if (access(path, X_OK) != 0)
+    return;
+  pid_t c = fork();
+  if (c == 0) {
+    char *argv[] = {path, "exec-check", "second", NULL};
+    char *envp[] = {"IA32_ENV=yes", NULL};
+    execve(path, argv, envp);
+    _exit(99);
+  }
+  int status = 0;
+  CHECK(waitpid(c, &status, 0) == c && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 77,
+        "exec of the i386 program: status %#x", status);
+}
+
 int main(void) {
   setvbuf(stdout, 0, _IONBF, 0);
   CHECK(sel(0) == 0x33, "%%cs is %#x", sel(0));
@@ -332,6 +361,7 @@ int main(void) {
         "built as non-PIE, below 2 GiB");
   tls_checks();
   mode_checks();
+  exec_ia32();
   if (!failures)
     printf("PASS\n");
   return failures != 0;

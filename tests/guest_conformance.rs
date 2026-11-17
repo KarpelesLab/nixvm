@@ -53,6 +53,11 @@ const PROGRAMS: &[&str] = &[
     "compat32_insn",
 ];
 
+/// i386 programs (`gcc -m32 -static`), which the VM runs as ELFCLASS32
+/// processes in compatibility mode. Skipped, with a note, without a 32-bit
+/// C library to build them with.
+const PROGRAMS32: &[&str] = &["ia32"];
+
 /// A directory of binaries, also used as the guest's root, so that a program can
 /// `exec` itself there. `None` if there's no compiler to build them with.
 fn built() -> Option<&'static Path> {
@@ -115,6 +120,20 @@ fn build_with(cc: &str, dir_name: &str, extra: &[&str]) -> Option<PathBuf> {
     }
     // ns_user execs itself by this name.
     std::fs::copy(dir.join("ns_user"), dir.join("ns5")).expect("copy");
+    // The i386 programs, for an x86-64 guest.
+    if extra.contains(&"attacks") {
+        for name in PROGRAMS32 {
+            let built = Command::new(cc)
+                .args(["-m32", "-static", "-O1", "-w", "-pthread", "-o"])
+                .arg(dir.join(name))
+                .arg(Path::new("tests/guest").join(format!("{name}.c")))
+                .output();
+            if !built.is_ok_and(|o| o.status.success()) {
+                eprintln!("can't build {name} with {cc} -m32 (no 32-bit libc?), skipping it");
+                let _ = std::fs::remove_file(dir.join(name));
+            }
+        }
+    }
     Some(dir)
 }
 
@@ -172,7 +191,8 @@ fn conformance(env: &[(&str, &str)], seconds: &str) {
 
 fn conformance_of(runner: &str, root: &Path, env: &[(&str, &str)], seconds: &str) {
     let mut failed = Vec::new();
-    for name in PROGRAMS {
+    let built32 = PROGRAMS32.iter().filter(|p| root.join(p).exists());
+    for name in PROGRAMS.iter().chain(built32) {
         let out = run_on(runner, root, name, &[], env, seconds);
         let text = text(&out);
         let passed = text.lines().any(|l| l == "PASS");
