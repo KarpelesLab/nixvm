@@ -66,7 +66,7 @@ jobs:
         run: cargo clippy --all-targets --features images -- -D warnings
 
       - name: Test (released root images, overlay)
-        run: cargo test --features images --lib -- image:: fs::overlay
+        run: 'cargo test --features images --lib -- image:: fs::overlay'
 
       - name: Clippy (tunnel networking, warnings denied)
         run: cargo clippy --all-targets --features tunnel -- -D warnings
