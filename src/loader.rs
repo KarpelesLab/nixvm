@@ -19,8 +19,12 @@ use crate::vcpu::{GuestMemory, MemError};
 // ---- ELF constants -------------------------------------------------------
 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const ELFCLASS32: u8 = 1;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
+/// `EM_386`: an i386 program, which an x86-64 kernel runs in compatibility
+/// mode (`CONFIG_IA32_EMULATION`).
+const EM_386: u16 = 3;
 const EM_X86_64: u16 = 62;
 const EM_AARCH64: u16 = 183;
 
@@ -42,6 +46,8 @@ const PF_R: u32 = 4;
 
 const EHDR_LEN: usize = 64;
 const PHDR_LEN: usize = 56;
+/// `Elf32_Phdr`'s size.
+const PHDR32_LEN: usize = 32;
 /// Size of one `Elf64_Dyn` entry: `{ d_tag: u64, d_val/d_ptr: u64 }`.
 const DYN_LEN: usize = 16;
 /// Size of one `Elf64_Rela` entry: `{ r_offset, r_info, r_addend }`, all `u64`.
@@ -174,6 +180,21 @@ const INITIAL_STACK_MAP: u64 = 256 * 1024;
 
 // ---- public API ----------------------------------------------------------
 
+/// The top of an i386 process's address space and its stack
+/// (`IA32_PAGE_OFFSET`, `STACK_TOP` for a compat task): just under 4 GiB.
+pub const IA32_STACK_TOP: u64 = 0xFFFF_E000;
+
+/// Where the stack of the program `ehdr` describes starts: the top of the
+/// address space, or under 4 GiB for an i386 one.
+fn stack_top(mem: &GuestMemory, ehdr: &Ehdr) -> u64 {
+    let top = mem.base() + mem.size();
+    if ehdr.class32 {
+        top.min(IA32_STACK_TOP)
+    } else {
+        top
+    }
+}
+
 /// Where to start executing and how the stack was laid out.
 #[derive(Debug, Clone)]
 pub struct LoadedImage {
@@ -186,6 +207,11 @@ pub struct LoadedImage {
     /// Lowest address of the initial stack region (top of the address space
     /// minus the reserved stack). The mmap arena lives below this.
     pub stack_bottom: u64,
+    /// The top of the stack (and of the address space the program uses).
+    pub stack_top: u64,
+    /// An i386 program: it starts in compatibility mode (`__USER32_CS`), and
+    /// its system calls are the i386 ones.
+    pub compat32: bool,
 }
 
 /// What the guest should be started with.
@@ -266,7 +292,8 @@ pub fn load_static(
 
     let mapped = map_image(mem, elf, &ehdr, bias)?;
 
-    if ehdr.e_type == ET_DYN {
+    // An i386 static PIE relocates itself, as Linux expects of every program.
+    if ehdr.e_type == ET_DYN && !ehdr.class32 {
         apply_relative_relocations(mem, elf, &mapped.phdrs, bias, ehdr.machine)?;
     }
 
@@ -278,11 +305,14 @@ pub fn load_static(
     // No separate interpreter: AT_BASE is 0.
     let stack_pointer = build_stack(mem, spec, &ehdr, entry, mapped.phdr_vaddr, 0)?;
 
+    let top = stack_top(mem, &ehdr);
     Ok(LoadedImage {
         entry,
         stack_pointer,
         program_break: mapped.program_break,
-        stack_bottom: (mem.base() + mem.size()) - stack_size(mem.size()),
+        stack_bottom: top - stack_size(mem.size()),
+        stack_top: top,
+        compat32: ehdr.class32,
     })
 }
 
@@ -296,19 +326,18 @@ fn loader_bias(mem: &GuestMemory, elf: &[u8], ehdr: &Ehdr) -> Result<u64, LoadEr
     let mut span = 0u64;
     let mut align = PAGE_SIZE;
     for i in 0..ehdr.phnum {
-        let off = ehdr.phoff as usize + i as usize * PHDR_LEN;
-        let ph = Phdr::parse(elf, off)?;
+        let ph = ehdr.phdr(elf, i)?;
         if ph.p_type != PT_LOAD {
             continue;
         }
         span = span.max(ph.vaddr.saturating_add(ph.memsz));
-        let a = read_u64(elf, off + 48)?;
+        let a = ph.align;
         if a.is_power_of_two() && a <= 1 << 30 {
             align = align.max(a);
         }
     }
     let base = mem.base();
-    let top = base + mem.size() - stack_size(mem.size());
+    let top = stack_top(mem, ehdr) - stack_size(mem.size());
     let bias = round_up(base + (top - base) / 2, align);
     // Room for the image plus as much again for its brk, or the old place.
     if bias.saturating_add(span.saturating_mul(2)) < top {
@@ -339,8 +368,7 @@ fn map_image(
 ) -> Result<MappedImage, LoadError> {
     let mut phdrs = Vec::with_capacity(ehdr.phnum as usize);
     for i in 0..ehdr.phnum {
-        let off = ehdr.phoff as usize + i as usize * PHDR_LEN;
-        phdrs.push(Phdr::parse(elf, off)?);
+        phdrs.push(ehdr.phdr(elf, i)?);
     }
 
     let mut program_break = 0u64;
@@ -424,19 +452,17 @@ fn map_image(
 /// What loading `elf` would fail with, short of running out of memory.
 pub fn check(elf: &[u8], arch: crate::abi::Arch) -> Result<(), LoadError> {
     let ehdr = Ehdr::parse(elf)?;
-    let want = match arch {
-        crate::abi::Arch::Aarch64 => EM_AARCH64,
-        crate::abi::Arch::X86_64 => EM_X86_64,
+    let ok = match arch {
+        crate::abi::Arch::Aarch64 => ehdr.machine == EM_AARCH64,
+        // An x86-64 kernel runs i386 programs too.
+        crate::abi::Arch::X86_64 => matches!(ehdr.machine, EM_X86_64 | EM_386),
     };
-    if ehdr.machine != want {
+    if !ok {
         return Err(LoadError::UnsupportedArch);
     }
     let mut loads = false;
     for i in 0..ehdr.phnum {
-        let off = (ehdr.phoff as usize)
-            .checked_add(i as usize * PHDR_LEN)
-            .ok_or(LoadError::Truncated)?;
-        let ph = Phdr::parse(elf, off)?;
+        let ph = ehdr.phdr(elf, i)?;
         if ph.p_type != PT_LOAD || ph.memsz == 0 {
             continue;
         }
@@ -467,8 +493,7 @@ pub fn check(elf: &[u8], arch: crate::abi::Arch) -> Result<(), LoadError> {
 pub fn interp_path(elf: &[u8]) -> Option<String> {
     let ehdr = Ehdr::parse(elf).ok()?;
     for i in 0..ehdr.phnum {
-        let off = ehdr.phoff as usize + i as usize * PHDR_LEN;
-        let ph = Phdr::parse(elf, off).ok()?;
+        let ph = ehdr.phdr(elf, i).ok()?;
         if ph.p_type == PT_INTERP {
             let start = ph.offset as usize;
             let end = start + ph.filesz as usize;
@@ -495,13 +520,15 @@ pub fn load_dynamic(
     spec: &ProcessSpec,
 ) -> Result<LoadedImage, LoadError> {
     let exe_hdr = Ehdr::parse(exe)?;
-    let exe_bias = if exe_hdr.e_type == ET_DYN {
-        mem.base()
-    } else {
-        0
+    // An i386 PIE goes at `ELF_ET_DYN_BASE` for a compat task (4 MiB).
+    let exe_bias = match exe_hdr.e_type {
+        ET_DYN if exe_hdr.class32 => mem.base().max(0x40_0000),
+        ET_DYN => mem.base(),
+        _ => 0,
     };
     let exe_map = map_image(mem, exe, &exe_hdr, exe_bias)?;
-    if exe_hdr.e_type == ET_DYN {
+    // The dynamic linker relocates an i386 program (and itself), as on Linux.
+    if exe_hdr.e_type == ET_DYN && !exe_hdr.class32 {
         apply_relative_relocations(mem, exe, &exe_map.phdrs, exe_bias, exe_hdr.machine)?;
     }
     let exe_entry = exe_hdr
@@ -512,13 +539,16 @@ pub fn load_dynamic(
     // Load the interpreter above the executable image, page-group aligned so it
     // never overlaps the executable's segments.
     let interp_hdr = Ehdr::parse(interp)?;
+    if interp_hdr.class32 != exe_hdr.class32 {
+        return Err(LoadError::UnsupportedArch);
+    }
     let interp_base = if interp_hdr.e_type == ET_DYN {
         round_up(exe_map.program_break, 0x1_0000)
     } else {
         0
     };
     let interp_map = map_image(mem, interp, &interp_hdr, interp_base)?;
-    if interp_hdr.e_type == ET_DYN {
+    if interp_hdr.e_type == ET_DYN && !interp_hdr.class32 {
         apply_relative_relocations(
             mem,
             interp,
@@ -543,11 +573,14 @@ pub fn load_dynamic(
         interp_base,
     )?;
 
+    let top = stack_top(mem, &exe_hdr);
     Ok(LoadedImage {
         entry: interp_entry,
         stack_pointer,
         program_break: interp_map.program_break.max(exe_map.program_break),
-        stack_bottom: (mem.base() + mem.size()) - stack_size(mem.size()),
+        stack_bottom: top - stack_size(mem.size()),
+        stack_top: top,
+        compat32: exe_hdr.class32,
     })
 }
 
@@ -712,26 +745,55 @@ struct Ehdr {
     entry: u64,
     phoff: u64,
     phnum: u16,
+    /// An ELFCLASS32 (i386) image: 32-bit headers, and a process that runs
+    /// in compatibility mode below 4 GiB.
+    class32: bool,
 }
 
 impl Ehdr {
     fn parse(elf: &[u8]) -> Result<Self, LoadError> {
-        if elf.len() < EHDR_LEN {
+        if elf.len() < 52 {
             return Err(LoadError::Truncated);
         }
         if elf[0..4] != ELF_MAGIC {
             return Err(LoadError::NotElf);
         }
-        if elf[4] != ELFCLASS64 || elf[5] != ELFDATA2LSB {
+        if elf[5] != ELFDATA2LSB {
             return Err(LoadError::UnsupportedArch);
+        }
+        let class32 = match elf[4] {
+            ELFCLASS64 => false,
+            ELFCLASS32 => true,
+            _ => return Err(LoadError::UnsupportedArch),
+        };
+        if !class32 && elf.len() < EHDR_LEN {
+            return Err(LoadError::Truncated);
         }
         let e_type = read_u16(elf, 16)?;
         if e_type != ET_EXEC && e_type != ET_DYN {
             return Err(LoadError::Malformed("unsupported e_type"));
         }
         let machine = read_u16(elf, 18)?;
-        if machine != EM_AARCH64 && machine != EM_X86_64 {
+        let known = if class32 {
+            machine == EM_386
+        } else {
+            machine == EM_AARCH64 || machine == EM_X86_64
+        };
+        if !known {
             return Err(LoadError::UnsupportedArch);
+        }
+        if class32 {
+            if read_u16(elf, 42)? as usize != PHDR32_LEN {
+                return Err(LoadError::Malformed("unexpected e_phentsize"));
+            }
+            return Ok(Self {
+                e_type,
+                machine,
+                entry: u64::from(read_u32(elf, 24)?),
+                phoff: u64::from(read_u32(elf, 28)?),
+                phnum: read_u16(elf, 44)?,
+                class32,
+            });
         }
         let phentsize = read_u16(elf, 54)?;
         if phentsize as usize != PHDR_LEN {
@@ -743,7 +805,25 @@ impl Ehdr {
             entry: read_u64(elf, 24)?,
             phoff: read_u64(elf, 32)?,
             phnum: read_u16(elf, 56)?,
+            class32,
         })
+    }
+
+    /// The size of one program header.
+    const fn phent(&self) -> usize {
+        if self.class32 { PHDR32_LEN } else { PHDR_LEN }
+    }
+
+    /// Program header `i`.
+    fn phdr(&self, elf: &[u8], i: u16) -> Result<Phdr, LoadError> {
+        let off = (self.phoff as usize)
+            .checked_add(usize::from(i) * self.phent())
+            .ok_or(LoadError::Truncated)?;
+        if self.class32 {
+            Phdr::parse32(elf, off)
+        } else {
+            Phdr::parse(elf, off)
+        }
     }
 }
 
@@ -754,11 +834,12 @@ struct Phdr {
     vaddr: u64,
     filesz: u64,
     memsz: u64,
+    align: u64,
 }
 
 impl Phdr {
     fn parse(elf: &[u8], off: usize) -> Result<Self, LoadError> {
-        if off + PHDR_LEN > elf.len() {
+        if off.checked_add(PHDR_LEN).is_none_or(|end| end > elf.len()) {
             return Err(LoadError::Truncated);
         }
         Ok(Self {
@@ -768,6 +849,24 @@ impl Phdr {
             vaddr: read_u64(elf, off + 16)?,
             filesz: read_u64(elf, off + 32)?,
             memsz: read_u64(elf, off + 40)?,
+            align: read_u64(elf, off + 48)?,
+        })
+    }
+
+    /// An `Elf32_Phdr`.
+    fn parse32(elf: &[u8], off: usize) -> Result<Self, LoadError> {
+        if off.checked_add(PHDR32_LEN).is_none_or(|end| end > elf.len()) {
+            return Err(LoadError::Truncated);
+        }
+        let w = |o: usize| read_u32(elf, off + o).map(u64::from);
+        Ok(Self {
+            p_type: read_u32(elf, off)?,
+            offset: w(4)?,
+            vaddr: w(8)?,
+            filesz: w(16)?,
+            memsz: w(20)?,
+            flags: read_u32(elf, off + 24)?,
+            align: w(28)?,
         })
     }
 }
@@ -805,31 +904,44 @@ pub fn hwcaps(arch: crate::abi::Arch) -> (u64, u64) {
 /// Empty if the stack can't be walked.
 #[must_use]
 pub fn read_auxv(mem: &GuestMemory, sp: u64) -> Vec<u8> {
-    let word = |a: u64| mem.read_u64(a).ok();
+    read_auxv_words(mem, sp, 8)
+}
+
+/// [`read_auxv`] for a stack of `w`-byte words: 4 for an i386 program, whose
+/// `/proc/self/auxv` holds 32-bit pairs.
+#[must_use]
+pub fn read_auxv_words(mem: &GuestMemory, sp: u64, w: u64) -> Vec<u8> {
+    let word = |a: u64| {
+        if w == 4 {
+            mem.read_u32(a).ok().map(u64::from)
+        } else {
+            mem.read_u64(a).ok()
+        }
+    };
     let Some(argc) = word(sp) else {
         return Vec::new();
     };
     // Skip argc, argv[argc], its NULL, then envp through its NULL.
-    let mut p = sp + 8 * (argc.min(1 << 20) + 2);
+    let mut p = sp + w * (argc.min(1 << 20) + 2);
     for _ in 0..(1 << 20) {
         match word(p) {
             Some(0) => break,
-            Some(_) => p += 8,
+            Some(_) => p += w,
             None => return Vec::new(),
         }
     }
-    p += 8;
+    p += w;
     let mut out = Vec::new();
     for _ in 0..256 {
-        let (Some(tag), Some(val)) = (word(p), word(p + 8)) else {
+        let (Some(tag), Some(val)) = (word(p), word(p + w)) else {
             return Vec::new();
         };
-        out.extend_from_slice(&tag.to_le_bytes());
-        out.extend_from_slice(&val.to_le_bytes());
+        out.extend_from_slice(&tag.to_le_bytes()[..w as usize]);
+        out.extend_from_slice(&val.to_le_bytes()[..w as usize]);
         if tag == AT_NULL {
             break;
         }
-        p += 16;
+        p += 2 * w;
     }
     out
 }
@@ -840,6 +952,9 @@ pub fn read_auxv(mem: &GuestMemory, sp: u64) -> Vec<u8> {
 fn arch_hints(machine: u16) -> (u64, u64, &'static str) {
     if machine == EM_X86_64 {
         (HWCAP_X86_64, HWCAP2_NONE, "x86_64")
+    } else if machine == EM_386 {
+        // `COMPAT_ELF_PLATFORM`; the same CPUID word as `AT_HWCAP`.
+        (HWCAP_X86_64, HWCAP2_NONE, "i686")
     } else {
         (HWCAP_AARCH64, HWCAP2_AARCH64, "aarch64")
     }
@@ -853,8 +968,11 @@ fn build_stack(
     phdr_vaddr: Option<u64>,
     interp_base: u64,
 ) -> Result<u64, LoadError> {
-    let top = mem.base() + mem.size();
+    mem.set_ia32(ehdr.class32);
+    let top = stack_top(mem, ehdr);
     let size = stack_size(mem.size());
+    // An i386 program's words are 4 bytes.
+    let w: u64 = if ehdr.class32 { 4 } else { 8 };
     // `stack_bottom` is the growth *limit* (the lowest the stack may reach); the
     // stack grows down to it on demand (see the kernel's stack-fault handler).
     // Only a small initial window is mapped up front — a fully-mapped stack
@@ -911,10 +1029,25 @@ fn build_stack(
     } else {
         (AT_IGNORE, 0)
     };
-    let auxv: [(u64, u64); 20] = [
+    // An i386 program gets the 32-bit vDSO, mapped under its stack, and
+    // `AT_SYSINFO`, its `__kernel_vsyscall` (`ARCH_DLINFO_IA32`).
+    const AT_SYSINFO: u64 = 32;
+    let (sysinfo_tag, sysinfo_val, vsys_tag, vsys_val) = if ehdr.class32 {
+        let base = map_vdso32(mem, stack_bottom)?;
+        (
+            AT_SYSINFO_EHDR,
+            base,
+            AT_SYSINFO,
+            base + crate::vcpu::vdso32::VSYSCALL,
+        )
+    } else {
+        (sysinfo_tag, sysinfo_val, AT_IGNORE, 0)
+    };
+    let auxv: [(u64, u64); 21] = [
+        (vsys_tag, vsys_val),
         (sysinfo_tag, sysinfo_val),
         (AT_PHDR, phdr_vaddr.unwrap_or(0)),
-        (AT_PHENT, PHDR_LEN as u64),
+        (AT_PHENT, ehdr.phent() as u64),
         (AT_PHNUM, u64::from(ehdr.phnum)),
         (AT_PAGESZ, PAGE_SIZE),
         // The dynamic linker's load base (0 when there is no interpreter, i.e.
@@ -940,7 +1073,7 @@ fn build_stack(
         + spec.argv.len() + 1            // argv + NULL
         + spec.envp.len() + 1            // envp + NULL
         + auxv.len() * 2; // auxv pairs (incl. AT_NULL)
-    let vec_bytes = nwords as u64 * 8;
+    let vec_bytes = nwords as u64 * w;
     // Rounding down to 16 bytes here is what makes `sp` land 16-byte aligned
     // regardless of `vec_bytes`'s parity (the SysV ABI requires
     // `sp % 16 == 0` at process entry, with argc at `[sp]`); any slack
@@ -957,8 +1090,8 @@ fn build_stack(
 
     let mut cur = sp;
     let mut push = |val: u64, mem: &mut GuestMemory| -> Result<(), LoadError> {
-        mem.write_init(cur, &val.to_le_bytes())?;
-        cur += 8;
+        mem.write_init(cur, &val.to_le_bytes()[..w as usize])?;
+        cur += w;
         Ok(())
     };
 
@@ -977,6 +1110,20 @@ fn build_stack(
     }
 
     Ok(sp)
+}
+
+/// Map the 32-bit vDSO for an i386 program, two pages under the stack's
+/// reservation `stack_bottom` (between it and the `mmap` arena's guard gap),
+/// and record it: its base. `__kernel_vsyscall` enters the kernel the way
+/// the memory says the CPU does ([`GuestMemory::fast32`]).
+fn map_vdso32(mem: &mut GuestMemory, stack_bottom: u64) -> Result<u64, LoadError> {
+    let base = stack_bottom - 2 * PAGE_SIZE;
+    let image = crate::vcpu::vdso32::build_image(mem.fast32());
+    mem.map(base, PAGE_SIZE, Prot::rx())?;
+    mem.write_init(base, &image)?;
+    mem.mark_file_backed(base, PAGE_SIZE);
+    mem.set_vdso32(base);
+    Ok(base)
 }
 
 // ---- little-endian readers ----------------------------------------------

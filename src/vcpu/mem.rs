@@ -269,6 +269,15 @@ pub struct GuestMemory {
     /// Where this process's 32-bit vDSO is mapped (0: it has none), whose
     /// `int $0x80` landing pad a fast 32-bit system call returns to.
     vdso32: u64,
+    /// How the CPU the guest runs on enters the kernel from 32-bit code, so
+    /// how the 32-bit vDSO's `__kernel_vsyscall` does (set by the kernel from
+    /// its vcpu; kept by `fork` and `execve`).
+    fast32: crate::vcpu::vdso32::FastEntry,
+    /// The program is an i386 one (ELFCLASS32): it runs in compatibility
+    /// mode, its stack tops out under 4 GiB and its mappings go below there,
+    /// as for a Linux compat task (`TIF_ADDR32`). Kept by `fork`, cleared by
+    /// `execve`.
+    ia32: bool,
 }
 
 /// What [`GuestMemory::file_fault`] made of a fault.
@@ -449,6 +458,8 @@ impl GuestMemory {
             shrink_seen: SHRINK_EPOCH.load(std::sync::atomic::Ordering::Acquire),
             ldt: Arc::from([]),
             vdso32: 0,
+            fast32: crate::vcpu::vdso32::FastEntry::Int80,
+            ia32: false,
         }
     }
 
@@ -500,6 +511,42 @@ impl GuestMemory {
     /// Record where the 32-bit vDSO is mapped.
     pub fn set_vdso32(&mut self, base: u64) {
         self.vdso32 = base;
+    }
+
+    /// Whether the program is an i386 one (see the field).
+    #[must_use]
+    pub fn ia32(&self) -> bool {
+        self.ia32
+    }
+
+    /// Mark the program as an i386 one.
+    pub fn set_ia32(&mut self, on: bool) {
+        self.ia32 = on;
+    }
+
+    /// The top of the user address space the program has: where its stack
+    /// starts. The end of the region, or just under 4 GiB for an i386
+    /// program ([`crate::loader::IA32_STACK_TOP`]).
+    #[must_use]
+    pub fn stack_top(&self) -> u64 {
+        let top = self.base + self.size;
+        if self.ia32 {
+            top.min(crate::loader::IA32_STACK_TOP)
+        } else {
+            top
+        }
+    }
+
+    /// How the 32-bit vDSO enters the kernel.
+    #[must_use]
+    pub fn fast32(&self) -> crate::vcpu::vdso32::FastEntry {
+        self.fast32
+    }
+
+    /// Set how the 32-bit vDSO enters the kernel, for the CPU the guest
+    /// runs on (from the next program loaded on).
+    pub fn set_fast32(&mut self, entry: crate::vcpu::vdso32::FastEntry) {
+        self.fast32 = entry;
     }
 
     /// Where a fast 32-bit system call (`sysenter`, or `syscall` from
@@ -2290,6 +2337,8 @@ impl GuestMemory {
             shrink_seen: self.shrink_seen,
             ldt: Arc::clone(&self.ldt),
             vdso32: self.vdso32,
+            fast32: self.fast32,
+            ia32: self.ia32,
         })
     }
 
@@ -2301,6 +2350,7 @@ impl GuestMemory {
         self.reset_space();
         self.ldt = Arc::from([]);
         self.vdso32 = 0;
+        self.ia32 = false;
         self.exec_gen = self.exec_gen.wrapping_add(1);
     }
 

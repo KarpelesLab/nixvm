@@ -40,9 +40,11 @@ impl Arch {
     pub fn from_elf(elf: &[u8]) -> Option<Self> {
         const EM_X86_64: u16 = 62;
         const EM_AARCH64: u16 = 183;
+        const EM_386: u16 = 3;
         match u16::from_le_bytes([*elf.get(18)?, *elf.get(19)?]) {
             EM_AARCH64 => Some(Self::Aarch64),
-            EM_X86_64 => Some(Self::X86_64),
+            // An i386 program runs on an x86-64 kernel, in compatibility mode.
+            EM_X86_64 | EM_386 => Some(Self::X86_64),
             _ => None,
         }
     }

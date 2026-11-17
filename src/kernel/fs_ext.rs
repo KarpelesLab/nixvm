@@ -706,7 +706,7 @@ impl Kernel {
     /// what it is (`[heap]`, `[stack]`, `[vvar]`, `[vdso]`).
     pub(super) fn render_maps(cx: &ServiceCtx, mem: &GuestMemory) -> String {
         use std::fmt::Write as _;
-        let stack_top = mem.base() + mem.size();
+        let stack_top = mem.stack_top();
         let heap = mem.heap;
         let mut lines: Vec<(u64, String)> = Vec::new();
         let vdso = crate::vcpu::ctrl::VDSO_VA;
@@ -716,7 +716,10 @@ impl Kernel {
             (vvar, vvar + page, "r--p", "[vvar]"),
             (vdso, vdso + page, "r-xp", "[vdso]"),
         ];
-        for (start, end, perms, name) in fixed {
+        // An i386 program's vDSO is its 32-bit one, an ordinary mapping.
+        let fixed = if mem.ia32() { &fixed[..0] } else { &fixed[..] };
+        let vdso32 = mem.vdso32();
+        for &(start, end, perms, name) in fixed {
             let mut l = format!("{start:08x}-{end:08x} {perms} 00000000 00:00 0");
             pad_maps_line(&mut l);
             l.push_str(name);
@@ -763,6 +766,8 @@ impl Kernel {
                 "[heap]"
             } else if r.end == stack_top {
                 "[stack]"
+            } else if vdso32 == Some(r.start) {
+                "[vdso]"
             } else {
                 ""
             };
