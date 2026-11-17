@@ -250,7 +250,19 @@ pub fn load_static(
     // biased addresses in the same place an `ET_EXEC` image with `p_vaddr`
     // starting at 0 would land, regardless of how large the caller's region
     // is. `ET_EXEC` images keep their existing, unbiased behavior.
-    let bias: u64 = if ehdr.e_type == ET_DYN { mem.base() } else { 0 };
+    //
+    // Linux treats an `ET_DYN` with no `PT_INTERP` as a *loader* (ld.so run
+    // directly, or Wine's preloader) and maps it away from where programs go
+    // (in the mmap region rather than at `ELF_ET_DYN_BASE`), so the program it
+    // then loads, and the low fixed ranges it may reserve, don't land on it.
+    // Wine's preloader reserves `0x10000..0x68000000` with `MAP_FIXED` first
+    // thing: loaded at the region base it unmapped its own code. So a loader
+    // goes halfway up the address space, when it fits there.
+    let bias: u64 = if ehdr.e_type == ET_DYN {
+        loader_bias(mem, elf, &ehdr)?
+    } else {
+        0
+    };
 
     let mapped = map_image(mem, elf, &ehdr, bias)?;
 
@@ -272,6 +284,38 @@ pub fn load_static(
         program_break: mapped.program_break,
         stack_bottom: (mem.base() + mem.size()) - stack_size(mem.size()),
     })
+}
+
+/// Where a static PIE (a loader, to Linux) is mapped: halfway between the
+/// region base and the stack reservation, aligned to its segments' largest
+/// `p_align`, or at the region base when the region is too small for that.
+/// The brk follows the image, and the kernel's mmap arena takes the upper half
+/// of what's left, so the low part of the address space stays free for a
+/// program's fixed mappings.
+fn loader_bias(mem: &GuestMemory, elf: &[u8], ehdr: &Ehdr) -> Result<u64, LoadError> {
+    let mut span = 0u64;
+    let mut align = PAGE_SIZE;
+    for i in 0..ehdr.phnum {
+        let off = ehdr.phoff as usize + i as usize * PHDR_LEN;
+        let ph = Phdr::parse(elf, off)?;
+        if ph.p_type != PT_LOAD {
+            continue;
+        }
+        span = span.max(ph.vaddr.saturating_add(ph.memsz));
+        let a = read_u64(elf, off + 48)?;
+        if a.is_power_of_two() && a <= 1 << 30 {
+            align = align.max(a);
+        }
+    }
+    let base = mem.base();
+    let top = base + mem.size() - stack_size(mem.size());
+    let bias = round_up(base + (top - base) / 2, align);
+    // Room for the image plus as much again for its brk, or the old place.
+    if bias.saturating_add(span.saturating_mul(2)) < top {
+        Ok(bias)
+    } else {
+        Ok(base)
+    }
 }
 
 /// The result of mapping one ELF image's `PT_LOAD` segments.
@@ -1301,6 +1345,13 @@ mod tests {
         assert_eq!(hwcap, hwcaps(crate::abi::Arch::Aarch64).0);
     }
 
+    /// Where `load_static` puts a small static PIE in a region: halfway
+    /// between its base and the stack reservation.
+    fn loader_place(base: u64, size: u64) -> u64 {
+        let top = base + size - stack_size(size);
+        base + (top - base) / 2
+    }
+
     #[test]
     fn static_pie_loads_relocates_and_biases_entry() {
         let code = 0xD400_0001u32.to_le_bytes(); // svc #0, content is irrelevant
@@ -1314,8 +1365,10 @@ mod tests {
         // (1) it loads without error.
         let img = load_static(&mut mem, &elf, &spec()).unwrap();
 
-        // load_static anchors a static PIE's bias at the guest region's base.
-        let bias = region_base;
+        // A static PIE is a loader to Linux: it goes halfway up the region
+        // (between its base and the stack reservation), not at the base.
+        let bias = loader_place(region_base, 128 * PAGE_SIZE);
+        assert!(bias > region_base && bias.is_multiple_of(PAGE_SIZE));
 
         // (3) entry equals the biased entry.
         assert_eq!(img.entry, bias + entry_unbiased);
@@ -1363,7 +1416,7 @@ mod tests {
         let mut mem = GuestMemory::new(region_base, 128 * PAGE_SIZE);
 
         let img = load_static(&mut mem, &elf, &spec()).unwrap();
-        let bias = region_base;
+        let bias = loader_place(region_base, 128 * PAGE_SIZE);
 
         assert_eq!(img.entry, bias + entry_unbiased);
         let relocated = mem.read_u64(bias + reloc_target_off).unwrap();
