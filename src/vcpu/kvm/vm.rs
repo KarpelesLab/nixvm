@@ -77,7 +77,8 @@ pub struct Vm {
     /// ever create a few thousand tasks, however few were alive at a time. The
     /// pointer is the `kvm_run` mapping, stored as an address so this stays `Send`.
     idle_vcpus: Mutex<Vec<(Fd, usize)>>,
-    /// Which private GDTs (`ctrl::gdt_slot_va`) a thread holds: one bit each.
+    /// Which private GDTs (`ctrl::gdt_slot_va`) a host thread holds: one bit
+    /// each.
     gdt_slots: Mutex<Vec<u64>>,
 }
 
@@ -254,7 +255,7 @@ impl Vm {
         Ok((fd, run.cast()))
     }
 
-    /// Take a free private GDT slot, if there is one.
+    /// Take a free private GDT slot for a host thread, if there is one.
     pub fn alloc_gdt_slot(&self) -> Option<usize> {
         let mut bits = self.gdt_slots.lock().unwrap();
         let (word, w) = bits.iter_mut().enumerate().find(|(_, w)| **w != u64::MAX)?;

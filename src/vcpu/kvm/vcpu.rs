@@ -34,8 +34,51 @@ use crate::vcpu::ctrl::{
 use crate::vcpu::mem::PAGE_SIZE;
 use crate::vcpu::phys::PhysMem;
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
+
+/// Tags for a vcpu's TLS entries (see `KvmVcpu::tls_tag`); 0 is "none".
+static NEXT_TLS_TAG: AtomicU64 = AtomicU64::new(1);
+
+/// The private GDT a host thread runs vcpus of one VM on, and whose TLS
+/// entries it holds now.
+struct ThreadGdt {
+    owner: Weak<Vm>,
+    slot: usize,
+    tag: u64,
+}
+
+/// A host thread's private GDTs, given back when it ends.
+struct ThreadGdts(Vec<ThreadGdt>);
+
+impl std::ops::Deref for ThreadGdts {
+    type Target = Vec<ThreadGdt>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ThreadGdts {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ThreadGdts {
+    fn drop(&mut self) {
+        for s in &self.0 {
+            if let Some(vm) = s.owner.upgrade() {
+                vm.free_gdt_slot(s.slot);
+            }
+        }
+    }
+}
+
+thread_local! {
+    static THREAD_GDT: RefCell<ThreadGdts> = const { RefCell::new(ThreadGdts(Vec::new())) };
+}
 
 /// Per-thread wall-clock preemption for `KVM_RUN`.
 ///
@@ -279,9 +322,15 @@ pub struct KvmVcpu {
     syscall32: bool,
     /// This thread's TLS descriptors (GDT entries 12-14).
     tls: [u64; GDT_TLS_ENTRIES],
-    /// The private GDT holding them, once one is non-empty; until then the
-    /// thread runs on the shared GDT.
-    gdt_slot: Option<usize>,
+    /// What these TLS entries are, as a tag unique to them (0: all empty, and
+    /// the thread runs on the shared GDT). With any in use it runs on the
+    /// private GDT of the host thread running it, rewritten from these when
+    /// that GDT last held another tag (see [`Self::bind_gdt`]).
+    tls_tag: u64,
+    /// The process's LDT as last loaded into `LDTR`, and how many of its
+    /// descriptors the address space backs at `ctrl::LDT_VA`.
+    ldt: Arc<[u64]>,
+    ldt_backed: usize,
     /// The syscall came through a fast 32-bit entry: its sixth argument is
     /// on the user stack (see [`Vcpu::syscall_fast32`]).
     fast32: bool,
@@ -482,7 +531,9 @@ impl KvmVcpu {
             step_armed: false,
             syscall32: false,
             tls: [0; GDT_TLS_ENTRIES],
-            gdt_slot: None,
+            tls_tag: 0,
+            ldt: Arc::from([]),
+            ldt_backed: 0,
             fast32: false,
             landing32: None,
         })
@@ -633,38 +684,110 @@ impl KvmVcpu {
     /// or not DPL 3), the null selector included.
     fn segment(&self, sel: u16) -> Option<sys::kvm_segment> {
         let idx = usize::from(sel >> 3);
-        if sel & 4 != 0 || sel & 3 != 3 || idx == 0 || idx >= GDT_ENTRIES {
+        if sel & 3 != 3 {
             return None;
         }
-        segment_from_desc(sel, self.gdt()[idx]).filter(|s| s.dpl == 3)
+        let desc = if sel & 4 != 0 {
+            // The process's LDT, as far as the CPU can see it.
+            *self.ldt.get(idx).filter(|_| idx < self.ldt_backed)?
+        } else {
+            if idx == 0 || idx >= GDT_ENTRIES {
+                return None;
+            }
+            self.gdt()[idx]
+        };
+        segment_from_desc(sel, desc).filter(|s| s.dpl == 3)
     }
 
-    /// Point `sregs.gdt` at this thread's GDT, copying its TLS entries into a
-    /// private one first when it has any. False when every private GDT is
-    /// taken.
-    fn load_gdt(&mut self) -> bool {
+    /// Note that the TLS entries changed: with none in use the thread runs on
+    /// the shared GDT; otherwise it gets a new tag, and the next run loads
+    /// its entries into the host thread's GDT.
+    fn load_gdt(&mut self) {
         if self.tls.iter().all(|&d| d == 0) {
-            if let Some(slot) = self.gdt_slot.take() {
-                self.vm.free_gdt_slot(slot);
+            self.tls_tag = 0;
+            if self.sregs.gdt.base != GDT_BASE {
+                self.sregs.gdt.base = GDT_BASE;
+                self.sregs_dirty = true;
             }
-            self.sregs.gdt.base = GDT_BASE;
         } else {
-            let Some(phys) = self.phys.clone().or_else(|| self.vm.pool()) else {
-                return false;
-            };
-            let slot = match self.gdt_slot {
-                Some(s) => s,
-                None => match self.vm.alloc_gdt_slot() {
-                    Some(s) => s,
-                    None => return false,
-                },
-            };
-            self.gdt_slot = Some(slot);
-            write_gdt_slot(&phys, slot, &self.gdt());
-            self.sregs.gdt.base = gdt_slot_va(slot);
+            self.tls_tag = NEXT_TLS_TAG.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Before a run with TLS entries in use: run on the private GDT of the
+    /// host thread running this vcpu, as Linux runs a task on its CPU's GDT
+    /// and loads the task's TLS entries into it on a switch (`load_TLS`).
+    /// There are only as many as host threads that run vcpus (the SMP
+    /// workers), however many guest threads have TLS entries; the entries
+    /// are written again only when another thread's ran there since.
+    fn bind_gdt(&mut self) -> Result<(), VcpuError> {
+        if self.tls_tag == 0 {
+            return Ok(());
+        }
+        let Some(phys) = self.phys.clone().or_else(|| self.vm.pool()) else {
+            return Ok(());
+        };
+        let gdt = self.gdt();
+        let slot = THREAD_GDT.with(|t| {
+            let mut t = t.borrow_mut();
+            // (A VM gone since can't share an address with this one while
+            // its `Weak` is kept: drop those now.)
+            t.retain(|s| s.owner.strong_count() > 0);
+            let me = Arc::downgrade(&self.vm);
+            let i = match t.iter().position(|s| Weak::ptr_eq(&s.owner, &me)) {
+                Some(i) => i,
+                None => {
+                    let slot = self.vm.alloc_gdt_slot().ok_or_else(|| {
+                        VcpuError::Backend("more host threads than private GDTs".into())
+                    })?;
+                    t.push(ThreadGdt {
+                        owner: me,
+                        slot,
+                        tag: 0,
+                    });
+                    t.len() - 1
+                }
+            };
+            let s = &mut t[i];
+            if s.tag != self.tls_tag {
+                write_gdt_slot(&phys, s.slot, &gdt);
+                s.tag = self.tls_tag;
+            }
+            Ok::<usize, VcpuError>(s.slot)
+        })?;
+        if self.sregs.gdt.base != gdt_slot_va(slot) {
+            self.sregs.gdt.base = gdt_slot_va(slot);
+            self.sregs_dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Load the process's LDT into `LDTR` if it changed: its descriptors are
+    /// at `ctrl::LDT_VA` in the address space; with none, `LDTR` is unusable.
+    fn sync_ldt(&mut self, mem: &GuestMemory) {
+        let backed = mem.ldt_backed();
+        if Arc::ptr_eq(&self.ldt, mem.ldt()) && self.ldt_backed == backed {
+            return;
+        }
+        self.ldt = Arc::clone(mem.ldt());
+        self.ldt_backed = backed;
+        self.sregs.ldt = if backed == 0 {
+            sys::kvm_segment {
+                unusable: 1,
+                ..sys::kvm_segment::default()
+            }
+        } else {
+            sys::kvm_segment {
+                base: crate::vcpu::ctrl::LDT_VA,
+                limit: (backed * 8 - 1) as u32,
+                // Linux's GDT_ENTRY_LDT.
+                selector: 10 << 3,
+                type_: 2,
+                present: 1,
+                ..sys::kvm_segment::default()
+            }
+        };
         self.sregs_dirty = true;
-        true
     }
 
     /// Point the vcpu's `sregs.cr3` at `mem`'s address space if it isn't already —
@@ -690,10 +813,12 @@ impl KvmVcpu {
         }
         self.kstack_pa = mem.kstack_pa();
         self.landing32 = mem.vdso32_landing();
+        self.sync_ldt(mem);
     }
 
     /// Flush dirty caches to the vcpu, run it once, and refresh the caches.
     fn run_once(&mut self) -> Result<u32, VcpuError> {
+        self.bind_gdt()?;
         if self.regs_dirty {
             // SAFETY: valid struct pointer; the fd is live.
             let ret =
@@ -1398,12 +1523,8 @@ impl Vcpu for KvmVcpu {
         if i >= GDT_TLS_ENTRIES {
             return false;
         }
-        let old = self.tls[i];
         self.tls[i] = desc;
-        if !self.load_gdt() {
-            self.tls[i] = old;
-            return false;
-        }
+        self.load_gdt();
         // A data segment register holding the selector is reloaded from the
         // new descriptor (or nulled, if it is gone).
         let sel = ((GDT_ENTRY_TLS_MIN + i) << 3) as u16 | 3;
@@ -1534,12 +1655,12 @@ impl Vcpu for KvmVcpu {
         child.fast32 = self.fast32;
         child.landing32 = self.landing32;
         // The TLS entries are the child's own copy (Linux's `tls_array` is
-        // part of the thread), in a private GDT of its own.
+        // part of the thread).
         child.tls = self.tls;
         child.phys.clone_from(&self.phys);
-        if !child.load_gdt() {
-            return Err(VcpuError::Backend("no free GDT for the new thread".into()));
-        }
+        child.load_gdt();
+        child.ldt = Arc::clone(&self.ldt);
+        child.ldt_backed = self.ldt_backed;
         // The child runs the *child's* address space (a different cr3); force a
         // re-sync on its first run rather than inheriting the parent's cached one.
         child.cur_cr3 = None;
@@ -1573,6 +1694,9 @@ impl Vcpu for KvmVcpu {
         // execve empties the TLS entries (`flush_thread`).
         self.tls = [0; GDT_TLS_ENTRIES];
         self.load_gdt();
+        // ... and the LDT (`init_user_sregs` left `LDTR` unusable).
+        self.ldt = Arc::from([]);
+        self.ldt_backed = 0;
         // execve installed fresh page tables in the same GuestMemory: its `cr3()`
         // changed, so drop the cached value and re-sync on the next run.
         self.cur_cr3 = None;
@@ -1676,9 +1800,6 @@ impl Drop for KvmVcpu {
     fn drop(&mut self) {
         // The fd and the `kvm_run` mapping go together to the VM's idle list. A
         // placeholder fd is left behind, whose close is a harmless EBADF.
-        if let Some(slot) = self.gdt_slot.take() {
-            self.vm.free_gdt_slot(slot);
-        }
         let fd = std::mem::replace(&mut self.fd, super::vm::Fd(-1));
         self.vm.recycle_vcpu(fd, self.run);
     }
