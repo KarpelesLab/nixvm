@@ -1779,9 +1779,17 @@ fn fsave_header(fx: &[u8], cs: u16, ds: u16) -> [u8; 112] {
     w32(&mut h, 0, cwd | 0xffff_0000);
     w32(&mut h, 4, swd | 0xffff_0000);
     w32(&mut h, 8, twd_fxsr_to_i387(fx));
-    w32(&mut h, 12, u32::from_le_bytes(fx[8..12].try_into().unwrap())); // fip
+    w32(
+        &mut h,
+        12,
+        u32::from_le_bytes(fx[8..12].try_into().unwrap()),
+    ); // fip
     w32(&mut h, 16, u32::from(cs) | fop << 16); // fcs
-    w32(&mut h, 20, u32::from_le_bytes(fx[16..20].try_into().unwrap())); // foo
+    w32(
+        &mut h,
+        20,
+        u32::from_le_bytes(fx[16..20].try_into().unwrap()),
+    ); // foo
     w32(&mut h, 24, 0xffff_0000 | u32::from(ds)); // fos
     for i in 0..8 {
         h[28 + i * 10..38 + i * 10].copy_from_slice(&fx[32 + i * 16..42 + i * 16]);
@@ -1901,7 +1909,11 @@ impl Kernel {
         };
         put(&mut f, 0, &(restorer as u32).to_le_bytes());
         put(&mut f, 4, &(sig as u32).to_le_bytes());
-        let (info, uc) = if rt { (frame + 16, frame + 144) } else { (0, 0) };
+        let (info, uc) = if rt {
+            (frame + 16, frame + 144)
+        } else {
+            (0, 0)
+        };
         if rt {
             put(&mut f, 8, &(info as u32).to_le_bytes());
             put(&mut f, 12, &(uc as u32).to_le_bytes());
@@ -1976,7 +1988,8 @@ impl Kernel {
         } else {
             let lo = mem.read_u32(frame + 8 + 80).ok();
             let hi = mem.read_u32(frame + 8 + SC32_SIZE + 624).ok();
-            lo.zip(hi).map(|(lo, hi)| u64::from(lo) | u64::from(hi) << 32)
+            lo.zip(hi)
+                .map(|(lo, hi)| u64::from(lo) | u64::from(hi) << 32)
         };
         let (Ok(sc), Some(mask)) = (mem.read_vec(sc_at, SC32_SIZE as usize), mask) else {
             cx.cur.pending |= 1 << (SIGSEGV - 1);

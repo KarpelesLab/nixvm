@@ -28,8 +28,9 @@ use super::vm::{
     FAULT_TRAMP_VA, GDT_BASE, GDT_LIMIT, LSTAR_VA, SEL_UCODE, SEL_UDATA, STAR_VALUE, Vm, check,
 };
 use crate::vcpu::ctrl::{
-    CSTAR_VA, KSTACK_TOP, SEL_KCODE, SYSENTER_VA, EXC_VECTORS, GDT_ENTRIES, GDT_ENTRY_TLS_MIN, GDT_TLS_ENTRIES, INT80_VECTOR,
-    SEL_UCODE32, default_gdt, exc_tramp_va, gdt_slot_va, write_gdt_slot,
+    CSTAR_VA, EXC_VECTORS, GDT_ENTRIES, GDT_ENTRY_TLS_MIN, GDT_TLS_ENTRIES, INT80_VECTOR,
+    KSTACK_TOP, SEL_KCODE, SEL_UCODE32, SYSENTER_VA, default_gdt, exc_tramp_va, gdt_slot_va,
+    write_gdt_slot,
 };
 use crate::vcpu::mem::PAGE_SIZE;
 use crate::vcpu::phys::PhysMem;

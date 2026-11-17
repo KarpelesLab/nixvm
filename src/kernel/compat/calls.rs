@@ -705,7 +705,9 @@ impl Kernel {
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
     ) -> R {
-        const NARGS: [u8; 21] = [0, 3, 3, 3, 2, 3, 3, 3, 4, 4, 4, 6, 6, 2, 5, 5, 3, 3, 4, 5, 4];
+        const NARGS: [u8; 21] = [
+            0, 3, 3, 3, 2, 3, 3, 3, 4, 4, 4, 6, 6, 2, 5, 5, 3, 3, 4, 5, 4,
+        ];
         let call = a[0];
         if !(1..=20).contains(&call) {
             return Ok(err(Errno::EINVAL));
@@ -756,7 +758,14 @@ impl Kernel {
         Ok(match call {
             // semop: semtimedop without a timeout.
             1 => self.native(cx, 65, [sx(first), ptr, second, 0, 0, 0], true, vcpu, mem),
-            2 => self.native(cx, 64, [sx(first), sx(second), sx(third), 0, 0, 0], true, vcpu, mem),
+            2 => self.native(
+                cx,
+                64,
+                [sx(first), sx(second), sx(third), 0, 0, 0],
+                true,
+                vcpu,
+                mem,
+            ),
             3 => {
                 let arg = if ptr == 0 {
                     0
@@ -770,10 +779,24 @@ impl Kernel {
                     nr: 220,
                     signed: 0b1,
                     args: None,
-                    ptrs: const { &[i386::Ptr { arg: 3, dir: i386::Dir::In, layout: &l::TIMESPEC, count: 1 }] },
+                    ptrs: const {
+                        &[i386::Ptr {
+                            arg: 3,
+                            dir: i386::Dir::In,
+                            layout: &l::TIMESPEC,
+                            count: 1,
+                        }]
+                    },
                     ret: i386::Ret::Plain,
                 };
-                self.ia32_call(cx, e, regs([first, ptr, second, fifth, 0, 0]), true, vcpu, mem)
+                self.ia32_call(
+                    cx,
+                    e,
+                    regs([first, ptr, second, fifth, 0, 0]),
+                    true,
+                    vcpu,
+                    mem,
+                )
             }
             11 => return self.c_msgsnd(cx, [first, ptr, second, third, 0, 0], vcpu, mem),
             12 => {
@@ -791,15 +814,30 @@ impl Kernel {
                 if version == 1 {
                     return Ok(err(Errno::EINVAL));
                 }
-                let r = self.ia32_call(cx, ent(397), regs([first, ptr, second, 0, 0, 0]), true, vcpu, mem);
+                let r = self.ia32_call(
+                    cx,
+                    ent(397),
+                    regs([first, ptr, second, 0, 0, 0]),
+                    true,
+                    vcpu,
+                    mem,
+                );
                 if r < 0 {
                     return Ok(r);
                 }
-                mem.write(third, &(r as u32).to_le_bytes()).map_err(efault)?;
+                mem.write(third, &(r as u32).to_le_bytes())
+                    .map_err(efault)?;
                 0
             }
             22 => self.native(cx, 67, [ptr, 0, 0, 0, 0, 0], true, vcpu, mem),
-            23 => self.native(cx, 29, [sx(first), second, sx(third), 0, 0, 0], true, vcpu, mem),
+            23 => self.native(
+                cx,
+                29,
+                [sx(first), second, sx(third), 0, 0, 0],
+                true,
+                vcpu,
+                mem,
+            ),
             24 => return self.c_shmctl(cx, [first, second, ptr, 0, 0, 0], vcpu, mem),
             _ => err(Errno::ENOSYS),
         })
@@ -928,7 +966,14 @@ impl Kernel {
         m[8..].copy_from_slice(&raw[4..]);
         let mut sc = Scratch::new(vcpu.sp());
         let p = self.scratch_with(cx, &mut sc, &m, mem)?;
-        Ok(self.native(cx, 69, [sx(a[0]), p, size as u64, sx(a[3]), 0, 0], true, vcpu, mem))
+        Ok(self.native(
+            cx,
+            69,
+            [sx(a[0]), p, size as u64, sx(a[3]), 0, 0],
+            true,
+            vcpu,
+            mem,
+        ))
     }
 
     /// `msgrcv(id, msgp, size, type, flags)`.
@@ -1086,7 +1131,8 @@ impl Kernel {
             return Ok(r);
         }
         let head = mem.read_u64(p).map_err(efault)?;
-        mem.write(a[1], &(head as u32).to_le_bytes()).map_err(efault)?;
+        mem.write(a[1], &(head as u32).to_le_bytes())
+            .map_err(efault)?;
         mem.write(a[2], &12u32.to_le_bytes()).map_err(efault)?;
         Ok(r)
     }

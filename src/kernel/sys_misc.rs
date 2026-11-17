@@ -489,7 +489,12 @@ impl Kernel {
     /// table is the process's: its threads share it, a fork copies it and
     /// `execve` drops it. Like Linux, the result is a 32-bit `int` in a
     /// zero-extended register (`(unsigned int)ret`), errors included.
-    pub(super) fn sys_modify_ldt(func: u64, ptr: u64, bytecount: u64, mem: &mut GuestMemory) -> i64 {
+    pub(super) fn sys_modify_ldt(
+        func: u64,
+        ptr: u64,
+        bytecount: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
         /// `LDT_ENTRIES`.
         const LDT_ENTRIES: usize = 8192;
         let r = match func as u32 as i32 {

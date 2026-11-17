@@ -855,7 +855,10 @@ impl Phdr {
 
     /// An `Elf32_Phdr`.
     fn parse32(elf: &[u8], off: usize) -> Result<Self, LoadError> {
-        if off.checked_add(PHDR32_LEN).is_none_or(|end| end > elf.len()) {
+        if off
+            .checked_add(PHDR32_LEN)
+            .is_none_or(|end| end > elf.len())
+        {
             return Err(LoadError::Truncated);
         }
         let w = |o: usize| read_u32(elf, off + o).map(u64::from);

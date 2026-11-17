@@ -17,11 +17,11 @@ use super::{Kernel, ServiceCtx, err};
 use crate::abi::Arch;
 use crate::abi::arch::i386::{self, Compat, Dir, Entry, Layout, Ret};
 
-pub(in crate::kernel) use calls::siginfo_narrow;
 use crate::abi::arch::{self};
 use crate::abi::errno::Errno;
 use crate::vcpu::mem::PAGE_SIZE;
 use crate::vcpu::{GuestMemory, Vcpu};
+pub(in crate::kernel) use calls::siginfo_narrow;
 
 /// `__USER32_CS` and `__USER_DS`.
 const USER32_CS: u16 = 0x23;
@@ -215,9 +215,7 @@ impl Kernel {
             let n = usize::from(p.count);
             let size64 = p.layout.size64 * n;
             let native = if matches!(p.dir, Dir::In | Dir::InOut | Dir::Rem) {
-                let raw = mem
-                    .read_vec(user[i], p.layout.size32 * n)
-                    .map_err(efault)?;
+                let raw = mem.read_vec(user[i], p.layout.size32 * n).map_err(efault)?;
                 let mut out = Vec::with_capacity(size64);
                 for k in 0..n {
                     let s = p.layout.size32;
@@ -394,7 +392,9 @@ impl Kernel {
             Compat::Setsockopt => self.c_setsockopt(cx, a, vcpu, mem),
             Compat::Semctl => self.c_semctl(cx, a, vcpu, mem),
             Compat::Shmctl => self.c_shmctl(cx, a, vcpu, mem),
-            Compat::Shmat => Ok(self.native(cx, 30, [a[0], a[1], sx(a[2]), 0, 0, 0], false, vcpu, mem)),
+            Compat::Shmat => {
+                Ok(self.native(cx, 30, [a[0], a[1], sx(a[2]), 0, 0, 0], false, vcpu, mem))
+            }
             Compat::Msgsnd => self.c_msgsnd(cx, a, vcpu, mem),
             Compat::Msgrcv => self.c_msgrcv(cx, a, vcpu, mem),
             Compat::Msgctl => self.c_msgctl(cx, a, vcpu, mem),

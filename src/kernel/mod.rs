@@ -3500,8 +3500,12 @@ impl Kernel {
                 }
                 let sys = arch::decode(self.arch, raw);
                 let mut args = vcpu.syscall_args();
-                if let Some((_, crate::abi::arch::i386::Entry::Call { signed, args: how, .. })) =
-                    ia32
+                if let Some((
+                    _,
+                    crate::abi::arch::i386::Entry::Call {
+                        signed, args: how, ..
+                    },
+                )) = ia32
                 {
                     args = crate::abi::arch::i386::widen(signed, how, regs32);
                 }
@@ -11828,11 +11832,12 @@ impl Kernel {
         // `PER_LINUX32` (`linux32`, `setarch i686`) reports an i686 machine
         // (`override_architecture`, `COMPAT_UTS_MACHINE`).
         const PER_LINUX32: u32 = 0x0008;
-        let machine: &[u8] = if self.arch == Arch::X86_64 && cx.cur.personality & 0xff == PER_LINUX32 {
-            b"i686"
-        } else {
-            self.arch.as_str().as_bytes()
-        };
+        let machine: &[u8] =
+            if self.arch == Arch::X86_64 && cx.cur.personality & 0xff == PER_LINUX32 {
+                b"i686"
+            } else {
+                self.arch.as_str().as_bytes()
+            };
         let fields: [&[u8]; 6] = [
             b"Linux",
             names.hostname.as_bytes(),

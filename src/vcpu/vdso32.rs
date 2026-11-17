@@ -217,9 +217,10 @@ mod tests {
         assert_eq!(&img[pad - 2..pad], &[0xcd, 0x80]);
         assert_eq!(&img[pad - 4..pad - 2], &[0x0f, 0x05]);
         assert_eq!(img[SIGRETURN as usize], 0x58);
-        assert_eq!(&img[RT_SIGRETURN as usize..RT_SIGRETURN as usize + 5], &[
-            0xb8, 0xad, 0, 0, 0
-        ]);
+        assert_eq!(
+            &img[RT_SIGRETURN as usize..RT_SIGRETURN as usize + 5],
+            &[0xb8, 0xad, 0, 0, 0]
+        );
     }
 
     #[test]

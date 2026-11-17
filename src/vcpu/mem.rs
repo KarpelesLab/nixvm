@@ -513,7 +513,9 @@ impl GuestMemory {
                     break;
                 };
                 let va = ctrl::LDT_VA + self.ldt_frames.len() as u64 * PAGE_SIZE;
-                let Ok(old) = self.space.map(va, frame, Prot::rw(), true, &mut fa, &self.phys)
+                let Ok(old) = self
+                    .space
+                    .map(va, frame, Prot::rw(), true, &mut fa, &self.phys)
                 else {
                     fa.free(frame);
                     break;
@@ -537,7 +539,9 @@ impl GuestMemory {
     /// How many LDT descriptors the CPU can read at `ctrl::LDT_VA`.
     #[must_use]
     pub fn ldt_backed(&self) -> usize {
-        self.ldt.len().min(self.ldt_frames.len() * (PAGE_SIZE as usize / 8))
+        self.ldt
+            .len()
+            .min(self.ldt_frames.len() * (PAGE_SIZE as usize / 8))
     }
 
     /// Where the 32-bit vDSO is mapped, if the process has one.
