@@ -736,6 +736,46 @@ static void test_threads(void)
     CHECK(syscall(SYS_futex, &word, FUTEX_WAIT, 0, &to, NULL, 0) == -1 && errno == ETIMEDOUT, "futex timeout");
 }
 
+/* A six-argument call restarted after a SA_RESTART handler: the fast entry
+ * kept its sixth argument (a FUTEX_WAIT_BITSET's bitset) in %ebp for the
+ * vDSO's int $0x80 to find on the restart. */
+static int restart_word;
+static volatile int alarms;
+static void on_alarm(int sig)
+{
+    (void)sig;
+    alarms++;
+}
+static void *restart_waker(void *arg)
+{
+    (void)arg;
+    struct timespec d = {0, 150000000};
+    nanosleep(&d, NULL);
+    __atomic_store_n(&restart_word, 1, __ATOMIC_SEQ_CST);
+    syscall(SYS_futex, &restart_word, FUTEX_WAKE_BITSET, 1, NULL, NULL, 0xffffffff);
+    return NULL;
+}
+
+static void test_restart(void)
+{
+    struct sigaction sa = {0}, old;
+    sa.sa_handler = on_alarm;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGALRM, &sa, &old);
+    pthread_t t;
+    pthread_create(&t, NULL, restart_waker, NULL);
+    struct itimerval it = {{0, 0}, {0, 30000}};
+    setitimer(ITIMER_REAL, &it, NULL);
+    long r;
+    do
+        r = syscall(SYS_futex, &restart_word, FUTEX_WAIT_BITSET, 0, NULL, NULL, 0xffffffff);
+    while (r == -1 && errno == EAGAIN && restart_word == 0);
+    pthread_join(t, NULL);
+    CHECK(r == 0 || (r == -1 && errno == EAGAIN), "restarted futex wait: %ld", r);
+    CHECK(alarms >= 1, "the alarm interrupted it: %d", alarms);
+    sigaction(SIGALRM, &old, NULL);
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 3 && strcmp(argv[1], "exec-check") == 0) {
@@ -768,8 +808,12 @@ int main(int argc, char **argv)
     test_signals();
     test_ldt();
     test_fast_entries();
-    test_processes(argv[0]);
+    /* Itself, wherever argv[0] says it was run from. */
+    static char self[512];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    test_processes(n > 0 ? self : argv[0]);
     test_threads();
+    test_restart();
     if (failures == 0)
         printf("PASS\n");
     return failures != 0;

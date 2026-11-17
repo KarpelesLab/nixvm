@@ -298,7 +298,7 @@ impl Kernel {
     ) -> R {
         let mut sc = Scratch::new(vcpu.sp());
         let buf = self.scratch(cx, &mut sc, 4096, mem)?;
-        let r = self.native(cx, 217, [a[0], buf, 4096, 0, 0, 0], false, vcpu, mem);
+        let r = self.native(cx, 217, [a[0], buf, 4096, 0, 0, 0], true, vcpu, mem);
         if r <= 0 {
             return Ok(r);
         }

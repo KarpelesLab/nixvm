@@ -248,6 +248,21 @@ fn threads_of_an_exiting_process_stay_dead_on_several_cpus() {
     }
 }
 
+/// More guest threads with a TLS entry in use at once than the KVM backend
+/// once had private GDTs for (512): `compat32 many`, on its own because it
+/// is slow on a debug build.
+#[test]
+fn many_threads_keep_their_tls_entries() {
+    let Some(root) = built() else { return };
+    for env in [&[][..], &[("NIXVM_CPUS", "4")][..]] {
+        let out = text(&run(root, "compat32", &["many"], env, "600"));
+        assert!(
+            out.lines().any(|l| l == "PASS") && !out.contains("FAIL"),
+            "{env:?}:\n{out}"
+        );
+    }
+}
+
 /// On an aarch64 guest, which runs on the interpreter on this host.
 #[test]
 fn programs_pass_on_an_aarch64_guest() {

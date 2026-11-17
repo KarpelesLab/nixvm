@@ -3470,8 +3470,14 @@ impl Kernel {
                     // The vDSO left a fast entry's sixth argument on the
                     // stack (`__do_fast_syscall_32`).
                     if vcpu.syscall_fast32() {
+                        // And `%ebp` holds it from here on, as Linux's
+                        // `regs->bp`: a restart through the vDSO's `int $0x80`
+                        // finds it there.
                         match mem.read_u32(vcpu.sp()) {
-                            Ok(v) => regs32[5] = u64::from(v),
+                            Ok(v) => {
+                                regs32[5] = u64::from(v);
+                                vcpu.set_reg(5, u64::from(v));
+                            }
                             Err(_) => done = Some(err(Errno::EFAULT)),
                         }
                     }
@@ -11819,12 +11825,20 @@ impl Kernel {
         const FIELD: usize = 65;
         let mut data = [0u8; FIELD * 6];
         let names = sh.uts(cx.cur.ns.uts).clone();
+        // `PER_LINUX32` (`linux32`, `setarch i686`) reports an i686 machine
+        // (`override_architecture`, `COMPAT_UTS_MACHINE`).
+        const PER_LINUX32: u32 = 0x0008;
+        let machine: &[u8] = if self.arch == Arch::X86_64 && cx.cur.personality & 0xff == PER_LINUX32 {
+            b"i686"
+        } else {
+            self.arch.as_str().as_bytes()
+        };
         let fields: [&[u8]; 6] = [
             b"Linux",
             names.hostname.as_bytes(),
             b"6.1.0-nixvm",
             b"#1 nixvm",
-            self.arch.as_str().as_bytes(),
+            machine,
             names.domainname.as_bytes(),
         ];
         for (i, f) in fields.iter().enumerate() {

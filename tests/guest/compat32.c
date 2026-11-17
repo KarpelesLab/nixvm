@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <ucontext.h>
@@ -286,9 +287,9 @@ static void *signaller(void *arg) {
 /* More threads with a TLS entry in use, all alive at once, than a GDT a
  * thread would allow (the KVM backend once kept 512): each has its own
  * %gs base. */
-#define MANY_TLS 600
+#define MANY_TLS 520
 static uint32_t many_words[MANY_TLS];
-static pthread_barrier_t many_barrier;
+static int many_ready;
 static void *many_tls(void *arg) {
   int i = (int)(uintptr_t)arg;
   /* Its own user_desc, below 4 GiB (a static array: non-PIE). */
@@ -300,7 +301,11 @@ static void *many_tls(void *arg) {
   d->limit = 3;
   d->seg_32bit = 1;
   long r = int80(243, (long)d, 0, 0);
-  pthread_barrier_wait(&many_barrier);
+  /* All alive at once (polled: a 520-thread barrier is a futex storm). */
+  __atomic_add_fetch(&many_ready, 1, __ATOMIC_SEQ_CST);
+  struct timespec ms = {0, 20000000};
+  while (__atomic_load_n(&many_ready, __ATOMIC_SEQ_CST) < MANY_TLS)
+    nanosleep(&ms, NULL);
   if (r != 0)
     return (void *)1;
   load_gs((unsigned short)(d->entry_number << 3 | 3));
@@ -315,7 +320,6 @@ static void many_tls_checks(void) {
   pthread_attr_t attr;
   pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, 64 * 1024);
-  pthread_barrier_init(&many_barrier, NULL, MANY_TLS);
   int made = 0;
   for (int i = 0; i < MANY_TLS; i++) {
     many_words[i] = 0x5000 + i;
@@ -325,7 +329,10 @@ static void many_tls_checks(void) {
   }
   CHECK(made == MANY_TLS, "made %d threads", made);
   if (made != MANY_TLS) {
-    /* The barrier would never open: nothing more to check. */
+    /* The others would wait forever: let them go. */
+    __atomic_add_fetch(&many_ready, MANY_TLS, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < made; i++)
+      pthread_join(t[i], NULL);
     return;
   }
   int bad = 0;
@@ -448,8 +455,15 @@ static void exec_ia32(void) {
         "exec of the i386 program: status %#x", status);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
   setvbuf(stdout, 0, _IONBF, 0);
+  /* `compat32 many`: only the many-threads check (slow on a debug VM). */
+  if (argc > 1 && strcmp(argv[1], "many") == 0) {
+    many_tls_checks();
+    if (!failures)
+      printf("PASS\n");
+    return failures != 0;
+  }
   CHECK(sel(0) == 0x33, "%%cs is %#x", sel(0));
   CHECK(sel(1) == 0x2b, "%%ss is %#x", sel(1));
   CHECK(sel(2) == 0 && sel(3) == 0 && sel(4) == 0 && sel(5) == 0,
@@ -460,7 +474,6 @@ int main(void) {
   mode_checks();
   ldt_checks();
   mmap32_checks();
-  many_tls_checks();
   exec_ia32();
   if (!failures)
     printf("PASS\n");
