@@ -424,17 +424,26 @@ impl Kernel {
     /// once the syscall finally completes.
     #[allow(clippy::unused_self)]
     fn block_or_timeout(&self, cx: &mut ServiceCtx, timeout_ms: i64) -> bool {
-        if timeout_ms == 0 {
+        let timeout_ns = u128::try_from(timeout_ms).ok().map(|ms| ms * 1_000_000);
+        self.block_or_timeout_ns(cx, timeout_ns)
+    }
+
+    /// [`Kernel::block_or_timeout`] to the nanosecond (`select`'s timeval and
+    /// `pselect6`'s timespec are finer than poll's milliseconds); `None`
+    /// waits forever.
+    #[allow(clippy::unused_self)]
+    fn block_or_timeout_ns(&self, cx: &mut ServiceCtx, timeout_ns: Option<u128>) -> bool {
+        if timeout_ns == Some(0) {
             return true;
         }
         // poll/ppoll/epoll_wait are never restarted after a signal (Linux returns
         // EINTR regardless of SA_RESTART) — a restart would silently reset the
         // remaining timeout.
         cx.restartable = false;
-        if timeout_ms < 0 {
+        let Some(timeout_ns) = timeout_ns else {
             cx.block = true;
             return false;
-        }
+        };
         let now = now_ns();
         match cx.cur.wake_deadline {
             Some(dl) if now >= dl => {
@@ -446,7 +455,7 @@ impl Kernel {
                 false
             }
             None => {
-                cx.cur.wake_deadline = Some(now + (timeout_ms as u128) * 1_000_000);
+                cx.cur.wake_deadline = Some(now + timeout_ns);
                 cx.block = true;
                 false
             }
@@ -540,7 +549,10 @@ impl Kernel {
 
     /// Shared `select`/`pselect6` body: compute readiness for every fd named
     /// in `r`/`w`/`e`, write the ready subsets back, and return the total
-    /// count set across all three sets. `immediate` is the zero-timeout case.
+    /// count set across all three sets. With none ready it waits up to
+    /// `timeout_ns` (`None`: forever), and at the deadline returns 0 with the
+    /// sets cleared. Either way, like Linux, it tells `remaining` (the
+    /// caller's timeout, written back by it) how much of the wait is left.
     #[allow(clippy::too_many_arguments)]
     fn sys_select_core(
         &self,
@@ -549,7 +561,8 @@ impl Kernel {
         r: u64,
         w: u64,
         e: u64,
-        immediate: bool,
+        timeout_ns: Option<u128>,
+        remaining: &mut u128,
         mem: &mut GuestMemory,
     ) -> i64 {
         // A negative count is EINVAL; beyond the highest possible fd, Linux just
@@ -598,17 +611,21 @@ impl Kernel {
             }
         }
 
-        if total > 0 || immediate {
+        // select(2), like poll, always fails with EINTR after a handler.
+        if total > 0 || self.block_or_timeout_ns(cx, timeout_ns) {
             if !write_fdset(mem, r, nfds, &rout)
                 || !write_fdset(mem, w, nfds, &wout)
                 || !write_fdset(mem, e, nfds, &eout)
             {
                 return err(Errno::EFAULT);
             }
+            *remaining = match (timeout_ns, cx.cur.wake_deadline) {
+                (Some(_), Some(dl)) => dl.saturating_sub(now_ns()),
+                (Some(t), None) if total > 0 => t,
+                _ => 0,
+            };
             return total;
         }
-        cx.block = true;
-        cx.restartable = false; // select(2), like poll, always fails with EINTR
         0
     }
 
@@ -628,13 +645,16 @@ impl Kernel {
         sigmask: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        let immediate = if timeout_ts == 0 {
-            false
+        let timeout_ns = if timeout_ts == 0 {
+            None
         } else {
             let Some((sec, nsec)) = read_timespec(mem, timeout_ts) else {
                 return err(Errno::EFAULT);
             };
-            sec == 0 && nsec == 0
+            if (sec as i64) < 0 || nsec >= 1_000_000_000 {
+                return err(Errno::EINVAL);
+            }
+            Some(u128::from(sec) * 1_000_000_000 + u128::from(nsec))
         };
         // Deref the argpack: `ss` is the sigset pointer at offset 0.
         if sigmask != 0
@@ -642,7 +662,15 @@ impl Kernel {
         {
             install_poll_sigmask(cx, ss, mem);
         }
-        self.sys_select_core(cx, nfds, r, w, e, immediate, mem)
+        let mut left = 0;
+        let ret = self.sys_select_core(cx, nfds, r, w, e, timeout_ns, &mut left, mem);
+        if timeout_ns.is_some() && !cx.block && ret >= 0 {
+            let (sec, nsec) = ((left / 1_000_000_000) as u64, (left % 1_000_000_000) as u64);
+            if !write_timespec(mem, timeout_ts, sec, nsec) {
+                return err(Errno::EFAULT);
+            }
+        }
+        ret
     }
 
     /// The legacy `select(nfds, readfds, writefds, exceptfds, timeout)`
@@ -658,16 +686,31 @@ impl Kernel {
         timeout_tv: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        let immediate = if timeout_tv == 0 {
-            false
+        let timeout_ns = if timeout_tv == 0 {
+            None
         } else {
             let (Ok(sec), Ok(usec)) = (mem.read_u64(timeout_tv), mem.read_u64(timeout_tv + 8))
             else {
                 return err(Errno::EFAULT);
             };
-            sec == 0 && usec == 0
+            // Linux folds whole seconds out of `tv_usec`; only a negative
+            // field is invalid.
+            if (sec as i64) < 0 || (usec as i64) < 0 {
+                return err(Errno::EINVAL);
+            }
+            Some(u128::from(sec) * 1_000_000_000 + u128::from(usec) * 1000)
         };
-        self.sys_select_core(cx, nfds, r, w, e, immediate, mem)
+        let mut left = 0;
+        let ret = self.sys_select_core(cx, nfds, r, w, e, timeout_ns, &mut left, mem);
+        // Linux's select writes back how much of the timeout is left.
+        if timeout_ns.is_some() && !cx.block && ret >= 0 {
+            let usec = left.div_ceil(1000);
+            let (sec, usec) = ((usec / 1_000_000) as u64, (usec % 1_000_000) as u64);
+            if !write_timespec(mem, timeout_tv, sec, usec) {
+                return err(Errno::EFAULT);
+            }
+        }
+        ret
     }
 
     // ---- epoll ------------------------------------------------------------
