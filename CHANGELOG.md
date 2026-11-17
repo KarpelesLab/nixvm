@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/KarpelesLab/nixvm/compare/v0.0.8...v0.0.9) - 2026-11-17
+
+### Other
+
+- Sandbox::execute, an embedding API to run one command ([#14](https://github.com/KarpelesLab/nixvm/pull/14))
+- read no environment, print nothing — NIXVM_* via nixvm::env, kernel notices to a sink
+- protect(paths) keeps paths read-only by identity ([#15](https://github.com/KarpelesLab/nixvm/pull/15))
+- a symlink mid-path is followed, not ENOTDIR
+- pin wasm-pack — "latest" resolved to v0.9.1 and broke the Pages build
+- a thread killed by a sibling's execve never runs or is serviced in the new image
+
 ## [0.0.8](https://github.com/KarpelesLab/nixvm/compare/v0.0.7...v0.0.8) - 2026-11-16
 
 ### Other
