@@ -454,7 +454,7 @@ impl X86Interp {
                     Ok(a) => a,
                     Err(s) => return Some(s),
                 };
-                return Some(match Self::mem_read(mem, a, 16, 1) {
+                return Some(match self.mem_read(mem, a, 16, 1) {
                     Ok(v) => {
                         self.xmm[m.reg] = v;
                         self.next(end)
@@ -570,7 +570,7 @@ impl X86Interp {
             0x2A => {
                 // MOVNTDQA xmm, m128 (aligned load; memory only)
                 let addr = fetch!(self.mem_only(m.kind, end));
-                fetch!(Self::mem_read(mem, addr, 16, 16))
+                fetch!(self.mem_read(mem, addr, 16, 16))
             }
             0x41 => phminposuw(b),
             _ => return Step::Illegal,
@@ -646,7 +646,7 @@ impl X86Interp {
                     RmKind::Reg(r) => self.gpr[r],
                     _ => {
                         let a = self.lin(self.ea_of(m.kind, end).unwrap_or(0));
-                        fetch!(Self::read_mem(mem, a, w))
+                        fetch!(self.read_mem(mem, a, w))
                     }
                 };
                 let bits = w as usize;
@@ -666,7 +666,7 @@ impl X86Interp {
                     RmKind::Reg(r) => lane(self.xmm[r], 4, usize::from(imm >> 6)),
                     _ => {
                         let a = self.lin(self.ea_of(m.kind, end).unwrap_or(0));
-                        fetch!(Self::read_mem(mem, a, 32))
+                        fetch!(self.read_mem(mem, a, 32))
                     }
                 };
                 let d = usize::from((imm >> 4) & 3);

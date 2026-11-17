@@ -450,7 +450,10 @@ impl X86Interp {
     /// Load a memory operand as an `F80`, with the exceptions a load raises:
     /// `f32`/`f64` SNaNs are quieted with `IE`, their denormals raise `DE`;
     /// integers and `m80` load exactly and silently.
-    fn x87_load(mem: &GuestMemory, addr: u64, fmt: MemFmt) -> Result<(F80, u32), Step> {
+    fn x87_load(&self, mem: &GuestMemory, addr: u64, fmt: MemFmt) -> Result<(F80, u32), Step> {
+        if self.segmented {
+            self.seg_check(addr, Self::mem_len(fmt) as u64, false)?;
+        }
         let rd = |n: usize| -> Result<u128, Step> {
             let mut b = [0u8; 16];
             mem.read(addr, &mut b[..n]).map_err(|_| rd_fault(addr))?;
@@ -591,7 +594,7 @@ impl X86Interp {
     fn fpu_arith_mem(&mut self, mem: &GuestMemory, addr: u64, op: FpuOp, fmt: MemFmt) -> Step {
         // The memory operand in its own format, so an m32/m64 SNaN signals and
         // its denormals raise DE.
-        let Some(ub) = Self::mem_operand_fp(mem, addr, fmt) else {
+        let Some(ub) = self.mem_operand_fp(mem, addr, fmt) else {
             return rd_fault(addr);
         };
         match op {
@@ -642,9 +645,12 @@ impl X86Interp {
 
     /// The unpacked value of a memory operand in its own format (for the
     /// arithmetic forms, which see SNaN/denormal operands as such).
-    fn mem_operand_fp(mem: &GuestMemory, addr: u64, fmt: MemFmt) -> Option<Fp> {
+    fn mem_operand_fp(&self, mem: &GuestMemory, addr: u64, fmt: MemFmt) -> Option<Fp> {
         let mut b = [0u8; 16];
         let n = Self::mem_len(fmt);
+        if self.segmented {
+            self.seg_check(addr, n as u64, false).ok()?;
+        }
         mem.read(addr, &mut b[..n]).ok()?;
         let v = u128::from_le_bytes(b);
         Some(match fmt {
@@ -734,7 +740,7 @@ impl X86Interp {
     fn x87_mem(&mut self, mem: &mut GuestMemory, esc: u8, m: ModRm, addr: u64, p: Pfx) -> Step {
         let ext = m.ext();
         let load = |s: &mut Self, mem: &GuestMemory, fmt: MemFmt| -> Step {
-            let (v, f) = match Self::x87_load(mem, addr, fmt) {
+            let (v, f) = match s.x87_load(mem, addr, fmt) {
                 Ok(x) => x,
                 Err(e) => return e,
             };
@@ -764,6 +770,11 @@ impl X86Interp {
                 .map_or_else(|e| e, |()| Step::Next),
             (0xD9, 5) => {
                 let mut b = [0u8; 2];
+                if self.segmented
+                    && let Err(s) = self.seg_check(addr, 2, false)
+                {
+                    return s;
+                }
                 if mem.read(addr, &mut b).is_err() {
                     return rd_fault(addr);
                 }
@@ -1121,6 +1132,9 @@ impl X86Interp {
     fn fldenv(&mut self, mem: &GuestMemory, addr: u64, small: bool) -> Result<(), Step> {
         let n = if small { 14 } else { 28 };
         let mut b = [0u8; 28];
+        if self.segmented {
+            self.seg_check(addr, n as u64, false)?;
+        }
         mem.read(addr, &mut b[..n]).map_err(|_| rd_fault(addr))?;
         self.load_env(&b, small);
         Ok(())
@@ -1138,6 +1152,9 @@ impl X86Interp {
     fn frstor(&mut self, mem: &GuestMemory, addr: u64, small: bool) -> Result<(), Step> {
         let env = if small { 14 } else { 28 };
         let mut b = [0u8; 108];
+        if self.segmented {
+            self.seg_check(addr, env as u64 + 80, false)?;
+        }
         mem.read(addr, &mut b[..env + 80])
             .map_err(|_| rd_fault(addr))?;
         self.load_env(&b, small);
@@ -1156,6 +1173,11 @@ impl X86Interp {
     /// `FBLD m80bcd`: push an 18-digit packed-BCD integer.
     fn fbld(&mut self, mem: &GuestMemory, addr: u64) -> Step {
         let mut b = [0u8; 10];
+        if self.segmented
+            && let Err(s) = self.seg_check(addr, 10, false)
+        {
+            return s;
+        }
         if mem.read(addr, &mut b).is_err() {
             return rd_fault(addr);
         }

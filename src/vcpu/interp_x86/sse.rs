@@ -690,9 +690,12 @@ impl X86Interp {
 
     /// Read `n` bytes (≤ 16) of a memory operand, `#GP` if `align` and the
     /// address isn't `align`-aligned.
-    fn mem_read(mem: &GuestMemory, addr: u64, n: usize, align: u64) -> Result<u128, Step> {
+    fn mem_read(&self, mem: &GuestMemory, addr: u64, n: usize, align: u64) -> Result<u128, Step> {
         if align > 1 && addr & (align - 1) != 0 {
             return Err(Step::Trap(Trap::Protection));
+        }
+        if self.segmented {
+            self.seg_check(addr, n as u64, false)?;
         }
         let mut b = [0u8; 16];
         mem.read(addr, &mut b[..n]).map_err(|_| rd_fault(addr))?;
@@ -728,7 +731,7 @@ impl X86Interp {
             _ => {
                 let a = self.lin(self.ea_of(m.kind, end).unwrap_or(0));
                 let al = if align && n == 16 { 16 } else { 1 };
-                Self::mem_read(mem, a, n, al)
+                self.mem_read(mem, a, n, al)
             }
         }
     }
@@ -739,7 +742,7 @@ impl X86Interp {
             RmKind::Reg(r) => Ok(self.mm_get(r)),
             _ => {
                 let a = self.lin(self.ea_of(m.kind, end).unwrap_or(0));
-                Self::mem_read(mem, a, 8, 1).map(|v| v as u64)
+                self.mem_read(mem, a, 8, 1).map(|v| v as u64)
             }
         }
     }
@@ -1057,7 +1060,7 @@ impl X86Interp {
             (RmKind::Reg(r), true) => self.xmm[r] = self.xmm[m.reg],
             (_, false) => {
                 let a = self.lin(self.ea_of(m.kind, end).unwrap_or(0));
-                self.xmm[m.reg] = fetch!(Self::mem_read(mem, a, 16, al));
+                self.xmm[m.reg] = fetch!(self.mem_read(mem, a, 16, al));
             }
             (_, true) => {
                 let a = self.lin(self.ea_of(m.kind, end).unwrap_or(0));
@@ -1089,7 +1092,7 @@ impl X86Interp {
             }
             (_, false) => {
                 let a = self.lin(self.ea_of(m.kind, end).unwrap_or(0));
-                self.xmm[m.reg] = fetch!(Self::mem_read(mem, a, n, 1));
+                self.xmm[m.reg] = fetch!(self.mem_read(mem, a, n, 1));
             }
             (_, true) => {
                 let a = self.lin(self.ea_of(m.kind, end).unwrap_or(0));
@@ -1110,7 +1113,7 @@ impl X86Interp {
         match (mp, op & 1 == 1, addr) {
             (Mp::None | Mp::P66, false, Some(a)) => {
                 // MOVLPS/MOVLPD/MOVHPS/MOVHPD xmm, m64.
-                let v = fetch!(Self::mem_read(mem, a, 8, 1));
+                let v = fetch!(self.mem_read(mem, a, 8, 1));
                 let x = &mut self.xmm[m.reg];
                 *x = if high {
                     (*x & LO) | (v << 64)

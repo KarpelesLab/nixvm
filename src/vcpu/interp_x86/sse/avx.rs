@@ -67,9 +67,12 @@ impl X86Interp {
         self.ymm_hi[r] = if l { v[1] } else { 0 };
     }
 
-    fn yread(mem: &GuestMemory, a: u64, n: usize, align: u64) -> Result<Y, Step> {
+    fn yread(&self, mem: &GuestMemory, a: u64, n: usize, align: u64) -> Result<Y, Step> {
         if align > 1 && a & (align - 1) != 0 {
             return Err(Step::Trap(Trap::Protection));
+        }
+        if self.segmented {
+            self.seg_check(a, n as u64, false)?;
         }
         let mut b = [0u8; 32];
         mem.read(a, &mut b[..n]).map_err(|_| rd_fault(a))?;
@@ -106,7 +109,7 @@ impl X86Interp {
     fn ysrc(&self, mem: &GuestMemory, m: &ModRm, end: u64, n: usize) -> Result<Y, Step> {
         match m.kind {
             RmKind::Reg(r) => Ok(self.yget(r)),
-            _ => Self::yread(mem, self.yaddr(m, end).unwrap_or(0), n, 1),
+            _ => self.yread(mem, self.yaddr(m, end).unwrap_or(0), n, 1),
         }
     }
 
@@ -660,12 +663,7 @@ impl X86Interp {
                 if matches!(op, 0x28 | 0x6F) {
                     let v = match m.kind {
                         RmKind::Reg(r) => self.yget(r),
-                        _ => fetch!(Self::yread(
-                            mem,
-                            self.yaddr(&m, end).unwrap_or(0),
-                            nb,
-                            align
-                        )),
+                        _ => fetch!(self.yread(mem, self.yaddr(&m, end).unwrap_or(0), nb, align)),
                     };
                     self.yset(m.reg, v, l);
                     self.next(end)
@@ -825,7 +823,7 @@ impl X86Interp {
                 }
                 let a = self.yaddr(&m, end).unwrap_or(0);
                 if m.ext() == 2 {
-                    let v = fetch!(Self::read_mem(mem, a, 32)) as u32;
+                    let v = fetch!(self.read_mem(mem, a, 32)) as u32;
                     if v & !MXCSR_MASK != 0 {
                         return Step::Trap(Trap::Protection);
                     }
@@ -1128,7 +1126,7 @@ impl X86Interp {
                     return Step::Illegal;
                 }
                 let a = self.yaddr(&m, end).unwrap_or(0);
-                let v = fetch!(Self::yread(mem, a, nb, nb as u64));
+                let v = fetch!(self.yread(mem, a, nb, nb as u64));
                 self.yset(m.reg, v, l);
                 self.next(end)
             }
@@ -1149,7 +1147,7 @@ impl X86Interp {
                 for (i, o) in out.iter_mut().enumerate().take(nb / w) {
                     if ylane(mask, w, i) >> (8 * w - 1) != 0 {
                         let ea = a.wrapping_add((i * w) as u64);
-                        *o = fetch!(Self::read_mem(mem, ea, 8 * w as u32));
+                        *o = fetch!(self.read_mem(mem, ea, 8 * w as u32));
                     }
                 }
                 self.yset(m.reg, ypack(&out[..nb / w], w), l);
@@ -1306,8 +1304,8 @@ impl X86Interp {
                 i64::from(ylane(index, 4, i) as u32 as i32) as u64
             };
             let ea = base.wrapping_add(ix << scale).wrapping_add(disp as u64);
-            let ea = if self.addr32 { ea & 0xffff_ffff } else { ea };
-            let v = fetch!(Self::read_mem(mem, self.lin(ea), 8 * ew as u32));
+            let ea = self.amask(ea);
+            let v = fetch!(self.read_mem(mem, self.lin(ea), 8 * ew as u32));
             let mut d = self.yget(dst);
             let per = 16 / ew;
             d[i / per] = set_lane(d[i / per], ew, i % per, v);
@@ -1485,7 +1483,7 @@ impl X86Interp {
                 };
                 let v = match m.kind {
                     RmKind::Reg(r) => self.gpr[r],
-                    _ => fetch!(Self::read_mem(mem, self.yaddr(&m, end).unwrap_or(0), w)),
+                    _ => fetch!(self.read_mem(mem, self.yaddr(&m, end).unwrap_or(0), w)),
                 };
                 let r = set_lane(self.xmm[vx.v], (w / 8) as usize, idx, v);
                 self.yset(m.reg, [r, 0], false);
@@ -1498,7 +1496,7 @@ impl X86Interp {
                 }
                 let src = match m.kind {
                     RmKind::Reg(r) => lane(self.xmm[r], 4, usize::from(imm >> 6)),
-                    _ => fetch!(Self::read_mem(mem, self.yaddr(&m, end).unwrap_or(0), 32)),
+                    _ => fetch!(self.read_mem(mem, self.yaddr(&m, end).unwrap_or(0), 32)),
                 };
                 let mut x = set_lane(self.xmm[vx.v], 4, usize::from((imm >> 4) & 3), src);
                 for i in 0..4 {
