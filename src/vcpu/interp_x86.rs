@@ -4150,6 +4150,11 @@ impl Vcpu for X86Interp {
         self.syscall32
     }
 
+    fn fast_syscall32(&self) -> crate::vcpu::vdso32::FastEntry {
+        // The CPUID vendor is Intel's: 32-bit code enters with `sysenter`.
+        crate::vcpu::vdso32::FastEntry::Sysenter
+    }
+
     fn syscall_args(&self) -> [u64; 6] {
         if self.syscall32 {
             let g = &self.gpr;
