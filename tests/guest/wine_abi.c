@@ -4,6 +4,11 @@
  *    base is per thread, read back by ARCH_GET_GS, kept across a signal
  *    handler, inherited by a new thread and a fork child, and cleared by
  *    exec (checked by re-executing ourselves).
+ *  - A fault handler gets the FPU state in its ucontext (uc_mcontext.fpregs)
+ *    on every backend, and what it writes there (an XMM register) is what the
+ *    program resumes with: Wine turns it into the exception CONTEXT.
+ *  - A handler runs with TF clear: a program single-stepping itself (Wine's
+ *    EXCEPTION_SINGLE_STEP) gets one SIGTRAP per step, not a kill.
  *  - The top of the address space is a power of two: Wine finds it by mapping
  *    a page at 2^63, 2^62, ... with MAP_FIXED_NOREPLACE and takes twice the
  *    first address that maps as the end, then maps just below that end.
@@ -71,6 +76,60 @@ static void *thread_main(void *arg) {
   static uint64_t own[2] = {0, 0x7777};
   syscall(SYS_arch_prctl, ARCH_SET_GS, own);
   return (void *)(uintptr_t)(inherited == (uintptr_t)teb && gs_read8() == 0x7777);
+}
+
+#include <ucontext.h>
+
+static volatile int fpregs_seen;
+static void on_segv_xmm(int sig, siginfo_t *si, void *ucv) {
+  (void)sig;
+  (void)si;
+  ucontext_t *uc = ucv;
+  fpregs_seen = uc->uc_mcontext.fpregs != 0;
+  if (uc->uc_mcontext.fpregs) {
+    double v = 42.0;
+    memcpy(&uc->uc_mcontext.fpregs->_xmm[6], &v, sizeof v);
+  }
+  uc->uc_mcontext.gregs[REG_RIP] += 3; /* mov 0(%rax),%eax */
+}
+
+static void fpregs_in_frame(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = on_segv_xmm;
+  sa.sa_flags = SA_SIGINFO;
+  sigaction(SIGSEGV, &sa, 0);
+  double out = 0;
+  /* xorpd; then a 3-byte load from NULL (mov 0(%rax),%eax), then read xmm6. */
+  __asm__ volatile("xorpd %%xmm6,%%xmm6\n\txor %%eax,%%eax\n\t.byte 0x8b,0x40,0x00\n\t"
+                   "movsd %%xmm6,%0"
+                   : "=m"(out)
+                   :
+                   : "rax", "xmm6", "memory");
+  signal(SIGSEGV, SIG_DFL);
+  CHECK(fpregs_seen, "a SIGSEGV handler's uc_mcontext.fpregs is NULL");
+  CHECK(out == 42.0, "xmm6 written in the frame came back as %g", out);
+}
+
+static volatile int traps;
+static void on_trap(int sig, siginfo_t *si, void *ucv) {
+  (void)sig;
+  (void)si;
+  ucontext_t *uc = ucv;
+  if (++traps >= 3)
+    uc->uc_mcontext.gregs[REG_EFL] &= ~0x100l; /* stop stepping */
+}
+
+static void self_single_step(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = on_trap;
+  sa.sa_flags = SA_SIGINFO;
+  sigaction(SIGTRAP, &sa, 0);
+  __asm__ volatile("pushfq\n\torl $0x100,(%%rsp)\n\tpopfq\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop"
+                   ::: "memory", "cc");
+  signal(SIGTRAP, SIG_DFL);
+  CHECK(traps == 3, "self single-step: %d SIGTRAPs, not 3", traps);
 }
 
 static void gs_base(const char *self) {
@@ -224,6 +283,8 @@ int main(int argc, char **argv) {
     return get_gs() == 0 ? 0 : 1;
   /* In the VM the program is /wine_abi, which /proc/self/exe may not name. */
   gs_base(access("/wine_abi", X_OK) == 0 ? "/wine_abi" : "/proc/self/exe");
+  fpregs_in_frame();
+  self_single_step();
 #else
   (void)argc;
   (void)argv;

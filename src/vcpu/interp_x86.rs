@@ -102,9 +102,13 @@ const R11: usize = 11;
 /// set bit outside it (`LDMXCSR`/`FXRSTOR`) is a `#GP`.
 const MXCSR_MASK: u32 = 0xffff;
 
-/// The `RFLAGS` system bits user code may toggle with `POPF`: `NT` (14), `AC`
-/// (18) and `ID` (21 — the classic "CPUID supported" probe).
-const RFLAGS_SYS_MASK: u32 = (1 << 14) | (1 << 18) | (1 << 21);
+/// The `RFLAGS` system bits user code may toggle with `POPF`: `TF` (8, the
+/// trap flag: a debug trap after each instruction), `NT` (14), `AC` (18) and
+/// `ID` (21 — the classic "CPUID supported" probe).
+const RFLAGS_SYS_MASK: u32 = RFLAGS_TF | (1 << 14) | (1 << 18) | (1 << 21);
+
+/// `RFLAGS.TF`.
+const RFLAGS_TF: u32 = 1 << 8;
 
 /// Segment selectors a Linux x86-64 user task observes (`MOV r/m, Sreg`,
 /// `PUSH FS/GS`): the flat 64-bit user code segment and user data segment;
@@ -3168,6 +3172,9 @@ impl Vcpu for X86Interp {
                     });
                 }
             }
+            // TF as the instruction starts: it traps once that one completes
+            // (so a `popf` that sets TF traps after the instruction after it).
+            let tf = self.rflags_sys & RFLAGS_TF != 0;
             let step = self.step(mem);
             if matches!(step, Step::Next | Step::Branched | Step::Syscall) {
                 self.bp_skip = None;
@@ -3180,8 +3187,8 @@ impl Vcpu for X86Interp {
                     // A completed instruction: a step or a data watchpoint
                     // traps now, with `rip` on the next one.
                     let hits = std::mem::take(&mut self.dr_hits);
-                    if hits != 0 || self.single_step {
-                        let bs = if std::mem::take(&mut self.single_step) {
+                    if hits != 0 || self.single_step || tf {
+                        let bs = if std::mem::take(&mut self.single_step) || tf {
                             DR6_BS
                         } else {
                             0
