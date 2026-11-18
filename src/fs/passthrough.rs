@@ -378,6 +378,11 @@ pub struct Passthrough {
     dev: Option<u64>,
     /// Paths kept read-only inside the tree (see [`Self::protect`]).
     protected: Protected,
+    /// What each file's data is charged, by (device, inode): a release never
+    /// gives back more than its file was charged, however the host reports
+    /// its holes (APFS can report a file's late-allocated data as more than
+    /// was written), and a file that was there before the VM gives nothing.
+    charged: std::collections::HashMap<(u64, u64), u64>,
 }
 
 /// What a new directory entry is charged, since it takes host disk too.
@@ -394,6 +399,7 @@ impl Passthrough {
             read_only: false,
             disk: Quota::unlimited(),
             since_host_check: None,
+            charged: std::collections::HashMap::new(),
             dev: None,
             protected: Protected::default(),
         }
@@ -407,6 +413,7 @@ impl Passthrough {
             read_only: true,
             disk: Quota::unlimited(),
             since_host_check: None,
+            charged: std::collections::HashMap::new(),
             dev: None,
             protected: Protected::default(),
         }
@@ -489,6 +496,26 @@ impl Passthrough {
             return Err(enospc());
         }
         Ok(())
+    }
+
+    /// Record `bytes` more charged to the file `m` describes.
+    fn note_charge(&mut self, m: &fs::Metadata, bytes: u64) {
+        if bytes > 0 {
+            *self.charged.entry((m.dev(), m.ino())).or_default() += bytes;
+        }
+    }
+
+    /// Give back up to `bytes` of what the file `m` describes was charged.
+    fn refund(&mut self, m: &fs::Metadata, bytes: u64) {
+        let key = (m.dev(), m.ino());
+        if let Some(held) = self.charged.get_mut(&key) {
+            let back = bytes.min(*held);
+            *held -= back;
+            self.disk.release(back);
+            if *held == 0 {
+                self.charged.remove(&key);
+            }
+        }
     }
 
     /// Hold the charge for a new directory entry while `make` creates it.
@@ -967,6 +994,7 @@ impl MountFs for Passthrough {
         } else {
             self.disk.release(most - used);
         }
+        self.note_charge(&meta, used);
         Ok(written)
     }
 
@@ -1051,24 +1079,24 @@ impl MountFs for Passthrough {
             return Err(io::Error::from_raw_os_error(21)); // EISDIR
         }
         // Only the last name frees the file's data.
-        let freed = if let Ok(fd) = raw_openat(
+        let last = if let Ok(fd) = raw_openat(
             parent.as_raw_fd(),
             &cname,
             sys::O_RDONLY | sys::O_NOFOLLOW | sys::O_NONBLOCK,
             0,
         ) {
-            let f = fs::File::from(fd);
-            match f.metadata() {
-                Ok(m) if m.nlink() == 1 && m.is_file() => {
-                    data_in(&f, m.len(), 0, up(m.len(), BLOCK))
-                }
-                _ => 0,
+            match fs::File::from(fd).metadata() {
+                Ok(m) if m.nlink() == 1 && m.is_file() => Some(m),
+                _ => None,
             }
         } else {
-            0
+            None
         };
         raw_unlinkat(parent.as_raw_fd(), &cname, 0)?;
-        self.disk.release(freed + ENTRY_COST);
+        if let Some(m) = last {
+            self.refund(&m, u64::MAX);
+        }
+        self.disk.release(ENTRY_COST);
         Ok(())
     }
 
@@ -1118,7 +1146,7 @@ impl MountFs for Passthrough {
         if len < size {
             let freed = data_in(&file, size, up(len, BLOCK), up(size, BLOCK));
             file.set_len(len)?;
-            self.disk.release(freed);
+            self.refund(&meta, if len == 0 { u64::MAX } else { freed });
         } else if len > size {
             let (from, to) = (down(size, BLOCK), up(len, BLOCK));
             let before = data_in(&file, size, from, to);
@@ -1128,6 +1156,7 @@ impl MountFs for Passthrough {
                 let _ = file.set_len(size);
                 return Err(enospc());
             }
+            self.note_charge(&meta, grew);
         }
         Ok(())
     }
