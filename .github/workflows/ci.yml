@@ -168,7 +168,12 @@ jobs:
       # and on an aarch64 guest (the interpreter), built with a cross compiler.
       - name: Install an aarch64 cross compiler and a 32-bit libc (for ia32)
         if: matrix.backend == 'kvm'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-i386 "lib32gcc-$(gcc -dumpversion | cut -d. -f1)-dev"
+        # gcc-multilib (which conflicts with the cross compiler) would also add
+        # the /usr/include/asm link that -m32 builds find the x86 headers by.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-i386 "lib32gcc-$(gcc -dumpversion | cut -d. -f1)-dev"
+          [ -e /usr/include/asm ] || sudo ln -s x86_64-linux-gnu/asm /usr/include/asm
 
       - name: Run the guest conformance programs on KVM and on aarch64
         if: matrix.backend == 'kvm'
