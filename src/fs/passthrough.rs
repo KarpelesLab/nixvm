@@ -99,6 +99,10 @@ mod sys {
     pub const AT_REMOVEDIR: c_int = 0x200;
     pub const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
     pub const ELOOP: i32 = 40;
+    pub const ENXIO: i32 = 6;
+    /// `lseek` whences (`<unistd.h>`): the next data, the next hole.
+    pub const SEEK_DATA: c_int = 3;
+    pub const SEEK_HOLE: c_int = 4;
     /// `utimensat` `tv_nsec` sentinels (Linux `<bits/stat.h>`): use the current
     /// time / leave this field unchanged.
     pub const UTIME_NOW: i64 = 0x3fff_ffff;
@@ -124,6 +128,11 @@ mod sys {
     pub const AT_REMOVEDIR: c_int = 0x0080;
     pub const AT_SYMLINK_NOFOLLOW: c_int = 0x0020;
     pub const ELOOP: i32 = 62;
+    pub const ENXIO: i32 = 6;
+    /// `lseek` whences (`<sys/unistd.h>`): the next data, the next hole —
+    /// the other way round from Linux's.
+    pub const SEEK_DATA: c_int = 4;
+    pub const SEEK_HOLE: c_int = 3;
     /// `utimensat` `tv_nsec` sentinels (macOS `<sys/stat.h>`).
     pub const UTIME_NOW: i64 = -1;
     pub const UTIME_OMIT: i64 = -2;
@@ -793,7 +802,7 @@ fn attrs_of(m: &fs::Metadata) -> Attrs {
         nlink: m.nlink() as u32,
         rdev: m.rdev(),
         dev: 0,
-        blocks: None,
+        blocks: Some(m.blocks()),
     }
 }
 
@@ -867,6 +876,25 @@ impl MountFs for Passthrough {
         f.read(buf)
     }
 
+    fn seek_data(&mut self, rel: &str, off: u64, size: u64, hole: bool) -> io::Result<u64> {
+        let (parent, name) = self.resolve(rel, true, false)?;
+        let cname = cstr(&name)?;
+        let fd = raw_openat(
+            parent.as_raw_fd(),
+            &cname,
+            sys::O_RDONLY | sys::O_NOFOLLOW | sys::O_NONBLOCK,
+            0,
+        )
+        .map_err(normalize_errno)?;
+        let whence = if hole { sys::SEEK_HOLE } else { sys::SEEK_DATA };
+        match host::lseek(fd.as_raw_fd(), off, whence) {
+            Ok(pos) => Ok(pos),
+            Err(e) if e.raw_os_error() == Some(sys::ENXIO) => Err(io::Error::from_raw_os_error(6)),
+            // A host filesystem that doesn't say: everything is data.
+            Err(_) => Ok(if hole { size } else { off }),
+        }
+    }
+
     fn readdir(&mut self, rel: &str) -> io::Result<Vec<DirEntry>> {
         let fd = if rel.is_empty() || rel == "." {
             self.root_fd()?
@@ -898,21 +926,43 @@ impl MountFs for Passthrough {
         )
         .map_err(normalize_errno)?;
         let mut f = fs::File::from(fd);
-        // Disk use is the blocks a file has, as `du` counts it, not its size:
-        // a sparse file costs only what's written. Charge the most the write
-        // could allocate, then give back what it didn't.
-        let before = allocated(&f.metadata()?);
-        let most =
-            (buf.len() as u64).div_ceil(BLOCK) * BLOCK + if buf.is_empty() { 0 } else { BLOCK };
+        if buf.is_empty() {
+            return f.seek(SeekFrom::Start(off)).and_then(|_| f.write(buf));
+        }
+        // Disk use is the data a file holds, by whole blocks, not its size: a
+        // hole costs nothing, so a sparse file costs only what's written.
+        // Where the data is comes from the host (`SEEK_DATA`/`SEEK_HOLE`), not
+        // from `st_blocks`, which a filesystem allocating late (APFS) leaves
+        // short for a while after a write.
+        let meta = f.metadata()?;
+        let size = meta.len();
+        let end = off.saturating_add(buf.len() as u64);
+        // The holes in the blocks the write touches are what it costs; it's
+        // the span around them (a block, or a record of a filesystem that
+        // allocates bigger units) that's watched for what the host allocated.
+        let (first, last) = (down(off, BLOCK), up(end, BLOCK));
+        let g = granule(&meta);
+        let (from, to) = (down(off, g), up(end, g));
+        let before = data_in(&f, size, from, to);
+        let most = (last - first) - data_in(&f, size, first, last);
         self.charge_disk(most)?;
         let written = f
             .seek(SeekFrom::Start(off))
             .and_then(|_| f.write(buf))
             .inspect_err(|_| self.disk.release(most))?;
-        let after = f.metadata().map_or(before + most, |m| allocated(&m));
-        let used = after.saturating_sub(before);
+        let size = f.metadata().map_or(size, |m| m.len());
+        let grew = data_in(&f, size, from, to).saturating_sub(before);
+        // The holes it wrote into are data now, whether or not the host says
+        // so yet (with delayed allocation it may not): charging them keeps
+        // every later release, which counts data the same way, within what
+        // was charged.
+        let used = if written == buf.len() {
+            grew.max(most)
+        } else {
+            grew
+        };
         if used > most {
-            // Filesystem metadata (indirect blocks) beyond the estimate.
+            // A host allocating more than the blocks written (a whole record).
             self.disk.force_charge(used - most);
         } else {
             self.disk.release(most - used);
@@ -1007,8 +1057,13 @@ impl MountFs for Passthrough {
             sys::O_RDONLY | sys::O_NOFOLLOW | sys::O_NONBLOCK,
             0,
         ) {
-            let meta = fs::File::from(fd).metadata();
-            meta.map_or(0, |m| if m.nlink() == 1 { allocated(&m) } else { 0 })
+            let f = fs::File::from(fd);
+            match f.metadata() {
+                Ok(m) if m.nlink() == 1 && m.is_file() => {
+                    data_in(&f, m.len(), 0, up(m.len(), BLOCK))
+                }
+                _ => 0,
+            }
         } else {
             0
         };
@@ -1055,11 +1110,25 @@ impl MountFs for Passthrough {
         if !meta.file_type().is_file() {
             return Err(io::Error::from_raw_os_error(22)); // EINVAL: ftruncate is only meaningful on a regular file
         }
-        // Growing leaves a hole, which uses no disk; shrinking frees blocks.
-        let before = allocated(&meta);
-        file.set_len(len)?;
-        let after = file.metadata().map_or(before, |m| allocated(&m));
-        self.disk.release(before.saturating_sub(after));
+        // Shrinking frees the data past the new end (in the blocks wholly past
+        // it); growing leaves a hole, which uses no disk — on a host that
+        // can't say where its holes are, the growth counts as data, as it
+        // will when it's shrunk or removed.
+        let size = meta.len();
+        if len < size {
+            let freed = data_in(&file, size, up(len, BLOCK), up(size, BLOCK));
+            file.set_len(len)?;
+            self.disk.release(freed);
+        } else if len > size {
+            let (from, to) = (down(size, BLOCK), up(len, BLOCK));
+            let before = data_in(&file, size, from, to);
+            file.set_len(len)?;
+            let grew = data_in(&file, len, from, to).saturating_sub(before);
+            if grew > 0 && self.charge_disk(grew).is_err() {
+                let _ = file.set_len(size);
+                return Err(enospc());
+            }
+        }
         Ok(())
     }
 
@@ -1099,10 +1168,59 @@ impl MountFs for Passthrough {
 /// The unit disk use is counted in: a filesystem block.
 const BLOCK: u64 = 4096;
 
-/// The disk a file uses: its allocated blocks (`st_blocks` is in 512-byte
-/// units whatever the filesystem's block size).
-fn allocated(m: &fs::Metadata) -> u64 {
-    m.blocks().saturating_mul(512)
+/// `x` rounded down to a multiple of `unit`.
+fn down(x: u64, unit: u64) -> u64 {
+    x / unit * unit
+}
+
+/// `x` rounded up to a multiple of `unit`.
+fn up(x: u64, unit: u64) -> u64 {
+    x.div_ceil(unit).saturating_mul(unit)
+}
+
+/// The span a write into a hole of the file `m` describes may make the host
+/// allocate: a block, or the file's preferred I/O size where that's bigger (a
+/// ZFS record), up to 1 MiB.
+fn granule(m: &fs::Metadata) -> u64 {
+    m.blksize().clamp(BLOCK, 1 << 20).next_power_of_two()
+}
+
+/// How much of `[start, end)` (whole blocks) of the open file `f`, `size`
+/// bytes long, holds data, as the host's `SEEK_DATA`/`SEEK_HOLE` say: each
+/// stretch of data counts in whole blocks, and a hole costs nothing. A host
+/// filesystem that can't say where its holes are has everything before the
+/// end as data, which makes this the file's size in blocks.
+///
+/// Every charge and release of a file's disk is counted with this, so they
+/// agree: what a write is charged for, a truncate or unlink gives back.
+fn data_in(f: &fs::File, size: u64, start: u64, end: u64) -> u64 {
+    let fd = f.as_raw_fd();
+    let limit = end.min(up(size, BLOCK));
+    let mut total = 0;
+    // Counted up to here (blocks are counted once however many stretches
+    // share them); where to look for the next stretch.
+    let mut counted = start;
+    let mut at = start;
+    while at < limit {
+        let data = match host::lseek(fd, at, sys::SEEK_DATA) {
+            Ok(data) => data,
+            Err(e) if e.raw_os_error() == Some(sys::ENXIO) => break,
+            Err(_) => return total + limit.saturating_sub(counted),
+        };
+        if data >= limit {
+            break;
+        }
+        let hole = host::lseek(fd, data, sys::SEEK_HOLE)
+            .unwrap_or(size)
+            .max(data + 1);
+        let (from, to) = (down(data, BLOCK).max(counted), up(hole, BLOCK).min(limit));
+        if to > from {
+            total += to - from;
+            counted = to;
+        }
+        at = hole;
+    }
+    total
 }
 
 /// `ENOSPC`.
@@ -1195,12 +1313,28 @@ mod tests {
         assert_eq!(pt.stat("f").unwrap().size, 1024);
         let held = quota.used();
         assert!(
-            (ENTRY_COST + 1..=ENTRY_COST + 2 * BLOCK).contains(&held),
+            (ENTRY_COST + BLOCK..=ENTRY_COST + 2 * BLOCK).contains(&held),
             "{held}"
         );
-        // Overwriting in place uses no more disk.
+        // Overwriting in place uses no more disk, where the host reports the
+        // data it hasn't allocated yet (Linux does; another may not until it
+        // allocates, and then the rewrite is charged again: never less).
         pt.write_at("f", 0, &vec![1; 1024]).unwrap();
-        assert_eq!(quota.used(), held);
+        assert_settled(quota.used(), held, held + BLOCK);
+    }
+
+    /// `used` is `exact` on Linux, whose filesystems report delayed-allocated
+    /// data as data, and between `exact` and `most` on a host that may report
+    /// such data as a hole for a while (APFS): never below what's held.
+    fn assert_settled(used: u64, exact: u64, most: u64) {
+        if cfg!(any(target_os = "linux", nixvm_linux)) {
+            assert_eq!(used, exact);
+        } else {
+            assert!(
+                (exact..=most).contains(&used),
+                "{used} not in {exact}..={most}"
+            );
+        }
     }
 
     #[test]
@@ -1211,15 +1345,52 @@ mod tests {
         pt.truncate("f", 1 << 33).unwrap();
         assert_eq!(pt.stat("f").unwrap().size, 1 << 33);
         assert_eq!(quota.used(), ENTRY_COST);
-        pt.write_at("f", 1 << 32, &[7; 8192]).unwrap();
+        // Two blocks' worth, starting mid-block: three blocks (a filesystem
+        // allocating bigger records may take more).
+        pt.write_at("f", (1 << 32) + 100, &[7; 8192]).unwrap();
         let held = quota.used();
         assert!(
-            (ENTRY_COST + 8192..=ENTRY_COST + 32 * 1024).contains(&held),
+            (ENTRY_COST + 3 * BLOCK..=ENTRY_COST + 64 * 1024).contains(&held),
             "{held}"
         );
-        // Shrinking frees the written blocks.
+        let mut buf = [1u8; 8];
+        pt.read_at("f", 1 << 31, &mut buf).unwrap();
+        assert_eq!(buf, [0; 8]);
+        // Shrinking frees the written blocks, but never more than was charged.
         pt.truncate("f", 0).unwrap();
-        assert_eq!(quota.used(), ENTRY_COST);
+        assert_settled(quota.used(), ENTRY_COST, held);
+        // Growing a file with data is charged nothing for the hole either.
+        pt.write_at("f", 0, &[7; 100]).unwrap();
+        let held = quota.used();
+        pt.truncate("f", 1 << 33).unwrap();
+        assert_eq!(quota.used(), held);
+        pt.unlink("f").unwrap();
+        assert!(quota.used() <= held - ENTRY_COST, "{}", quota.used());
+    }
+
+    #[test]
+    fn seek_data_and_hole_come_from_the_host() {
+        let (_tmp, mut pt, _quota) = with_quota("seek-data", 1 << 30);
+        pt.create("f", 0o644).unwrap();
+        let size = 1 << 30;
+        pt.truncate("f", size).unwrap();
+        pt.write_at("f", 1 << 29, &[1; 4096]).unwrap();
+        let data = match pt.seek_data("f", 0, size, false) {
+            Ok(data) => data,
+            // A host reporting data it hasn't allocated yet as a hole.
+            Err(e) if !cfg!(any(target_os = "linux", nixvm_linux)) => {
+                assert_eq!(e.raw_os_error(), Some(6));
+                return;
+            }
+            Err(e) => panic!("{e}"),
+        };
+        let hole = pt.seek_data("f", data, size, true).unwrap();
+        // Where the data is, unless the host can't say (all data, then).
+        assert!(data == 0 || data == 1 << 29, "{data}");
+        assert!(hole > 1 << 29 && hole <= size, "{hole}");
+        let mut buf = [0u8; 1];
+        pt.read_at("f", data.max(1 << 29), &mut buf).unwrap();
+        assert_eq!(buf, [1]);
     }
 
     #[test]
@@ -1232,7 +1403,7 @@ mod tests {
         pt.unlink("f").unwrap();
         assert_eq!(quota.used(), held - ENTRY_COST, "the data is still there");
         pt.unlink("g").unwrap();
-        assert_eq!(quota.used(), 0);
+        assert_settled(quota.used(), 0, held - 2 * ENTRY_COST);
     }
 
     #[test]

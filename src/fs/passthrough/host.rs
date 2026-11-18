@@ -1,5 +1,6 @@
 //! The host calls behind [`super`]'s confined resolution: the dirfd-relative
-//! `*at(2)` family, directory listing by fd, and `statvfs`.
+//! `*at(2)` family, directory listing by fd, `lseek` (for finding holes), and
+//! `statvfs`.
 //!
 //! `std` exposes none of these. On a Linux-ABI host (`cfg(nixvm_linux)`:
 //! glibc, musl, or the libc-free fullrust target) they are raw system calls
@@ -38,6 +39,9 @@ mod imp {
     }
     pub fn unlinkat(dirfd: RawFd, path: &CStr, flags: c_int) -> io::Result<()> {
         raw::unlinkat(dirfd, path, flags)
+    }
+    pub fn lseek(fd: RawFd, offset: u64, whence: c_int) -> io::Result<u64> {
+        raw::lseek(fd, offset, whence)
     }
     pub fn mkdirat(dirfd: RawFd, path: &CStr, mode: u32) -> io::Result<()> {
         raw::mkdirat(dirfd, path, mode)
@@ -118,6 +122,7 @@ mod imp {
         unsafe extern "C" {
             pub fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: u32) -> c_int;
             pub fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int;
+            pub fn lseek(fd: c_int, offset: i64, whence: c_int) -> i64;
             pub fn statvfs(path: *const c_char, buf: *mut c_void) -> c_int;
             pub fn mkdirat(dirfd: c_int, path: *const c_char, mode: u32) -> c_int;
             pub fn symlinkat(target: *const c_char, dirfd: c_int, linkpath: *const c_char)
@@ -188,6 +193,15 @@ mod imp {
     }
     pub fn unlinkat(dirfd: RawFd, path: &CStr, flags: c_int) -> io::Result<()> {
         check(unsafe { c::unlinkat(dirfd, path.as_ptr(), flags) })
+    }
+    pub fn lseek(fd: RawFd, offset: u64, whence: c_int) -> io::Result<u64> {
+        let off = i64::try_from(offset).map_err(|_| io::Error::from_raw_os_error(22))?;
+        let r = unsafe { c::lseek(fd, off, whence) };
+        if r < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(r as u64)
+        }
     }
     pub fn mkdirat(dirfd: RawFd, path: &CStr, mode: u32) -> io::Result<()> {
         check(unsafe { c::mkdirat(dirfd, path.as_ptr(), mode) })

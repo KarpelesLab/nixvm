@@ -31,6 +31,7 @@ use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 pub mod nr {
     pub const READ: usize = 0;
     pub const CLOSE: usize = 3;
+    pub const LSEEK: usize = 8;
     pub const MMAP: usize = 9;
     pub const MUNMAP: usize = 11;
     pub const RT_SIGACTION: usize = 13;
@@ -75,6 +76,7 @@ pub mod nr {
     pub const OPENAT: usize = 56;
     pub const CLOSE: usize = 57;
     pub const GETDENTS64: usize = 61;
+    pub const LSEEK: usize = 62;
     pub const READ: usize = 63;
     pub const READLINKAT: usize = 78;
     pub const UTIMENSAT: usize = 88;
@@ -191,6 +193,12 @@ pub fn openat(dirfd: RawFd, path: &CStr, flags: c_int, mode: u32) -> io::Result<
 pub fn close(fd: RawFd) -> io::Result<()> {
     // SAFETY: no pointers.
     unsafe { call(nr::CLOSE, &[fd_arg(fd)]) }.map(drop)
+}
+
+/// `lseek(fd, offset, whence)`: the new offset.
+pub fn lseek(fd: RawFd, offset: u64, whence: c_int) -> io::Result<u64> {
+    // SAFETY: no pointers.
+    unsafe { call(nr::LSEEK, &[fd_arg(fd), offset as usize, whence as usize]) }.map(|r| r as u64)
 }
 
 pub fn unlinkat(dirfd: RawFd, path: &CStr, flags: c_int) -> io::Result<()> {
