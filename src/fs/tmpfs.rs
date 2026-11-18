@@ -45,21 +45,233 @@ struct Meta {
 #[derive(Debug)]
 struct FileData {
     meta: Meta,
-    data: Vec<u8>,
+    data: Contents,
     /// Where the contents are instead, for a shared-memory filesystem's file:
     /// its id in the page store, which holds them in guest memory.
     paged: Option<(u64, Arc<dyn PageStore>)>,
     mode: u32,
     /// How many path entries name this inode (`st_nlink`).
     links: u32,
-    /// Charged for `data`'s capacity and `meta`'s attributes until dropped.
+    /// Charged for `data`'s pages and `meta`'s attributes until dropped.
     quota: Arc<Quota>,
 }
 
 impl FileData {
     /// What this inode holds charged against its quota.
     fn cost(&self) -> u64 {
-        self.data.capacity() as u64 + xattr_cost(&self.meta)
+        self.data.held() + xattr_cost(&self.meta)
+    }
+}
+
+/// The unit a regular file's contents are held in, as Linux tmpfs holds them:
+/// a page.
+const PAGE: u64 = 4096;
+
+/// One page of a file's contents.
+type Page = Box<[u8; PAGE as usize]>;
+
+/// A regular file's contents: its size and the pages written so far. A page
+/// never written (a hole, as `ftruncate` past the end or a write beyond it
+/// leaves) holds no memory and reads as zeros, so a sparse file costs only
+/// what's in it, as on Linux. Bytes of a held page past `len` are always zero,
+/// so growing the file again shows zeros there.
+#[derive(Debug, Default)]
+struct Contents {
+    len: u64,
+    pages: BTreeMap<u64, Page>,
+}
+
+/// A new page holding `fill` (a whole page), or zeros; `None` if there's no
+/// memory for it.
+fn new_page(fill: Option<&[u8]>) -> Option<Page> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(PAGE as usize).ok()?;
+    match fill {
+        Some(bytes) => v.extend_from_slice(bytes),
+        None => v.resize(PAGE as usize, 0),
+    }
+    v.into_boxed_slice().try_into().ok()
+}
+
+impl Contents {
+    /// The memory the pages hold, which is what the file is charged.
+    fn held(&self) -> u64 {
+        self.pages.len() as u64 * PAGE
+    }
+
+    /// The pages covering `[off, end)` that aren't held yet.
+    fn missing(&self, off: u64, end: u64) -> u64 {
+        let (first, last) = (off / PAGE, end.div_ceil(PAGE));
+        (last - first) - self.pages.range(first..last).count() as u64
+    }
+
+    /// Read from `off` into `buf`: how many bytes, up to the end of the file.
+    fn read(&self, off: u64, buf: &mut [u8]) -> usize {
+        if off >= self.len {
+            return 0;
+        }
+        let n = (buf.len() as u64).min(self.len - off) as usize;
+        let end = off + n as u64;
+        // One walk over the held pages in range; the gaps between are holes.
+        let mut done = 0;
+        for (&idx, page) in self.pages.range(off / PAGE..end.div_ceil(PAGE)) {
+            let start = (idx * PAGE).max(off);
+            let hole = (start - off) as usize;
+            buf[done..hole].fill(0);
+            let at = (start % PAGE) as usize;
+            let chunk = (PAGE as usize - at).min(n - hole);
+            buf[hole..hole + chunk].copy_from_slice(&page[at..at + chunk]);
+            done = hole + chunk;
+        }
+        buf[done..n].fill(0);
+        n
+    }
+
+    /// Write `buf` at `off` (`off + buf.len()` already checked), charging the
+    /// pages it adds to `quota`: all of it, or (`ENOSPC`) none of it.
+    fn write(&mut self, off: u64, buf: &[u8], quota: &Quota) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let end = off + buf.len() as u64;
+        let missing = self.missing(off, end);
+        if !quota.try_charge(missing * PAGE) {
+            return Err(enospc());
+        }
+        // Allocate every new page first, so a failure changes nothing.
+        let mut fresh = Vec::new();
+        if missing > 0 {
+            if fresh.try_reserve_exact(missing as usize).is_err() {
+                quota.release(missing * PAGE);
+                return Err(enospc());
+            }
+            for idx in off / PAGE..end.div_ceil(PAGE) {
+                if self.pages.contains_key(&idx) {
+                    continue;
+                }
+                // A page the write covers whole is made from it directly.
+                let start = idx * PAGE;
+                let whole = (start >= off && start + PAGE <= end).then(|| {
+                    let at = (start - off) as usize;
+                    &buf[at..at + PAGE as usize]
+                });
+                let Some(page) = new_page(whole) else {
+                    quota.release(missing * PAGE);
+                    return Err(enospc());
+                };
+                fresh.push((idx, page, whole.is_some()));
+            }
+        }
+        // The pages made from the write already hold their part of it.
+        let mut filled = Vec::new();
+        for (idx, page, whole) in fresh {
+            if whole {
+                filled.push(idx);
+            }
+            self.pages.insert(idx, page);
+        }
+        let mut filled = filled.into_iter().peekable();
+        for (&idx, page) in self.pages.range_mut(off / PAGE..end.div_ceil(PAGE)) {
+            if filled.next_if_eq(&idx).is_some() {
+                continue;
+            }
+            let start = (idx * PAGE).max(off);
+            let at = (start % PAGE) as usize;
+            let from = (start - off) as usize;
+            let chunk = (PAGE as usize - at).min(buf.len() - from);
+            page[at..at + chunk].copy_from_slice(&buf[from..from + chunk]);
+        }
+        self.len = self.len.max(end);
+        Ok(())
+    }
+
+    /// Give `[off, end)` pages now (`fallocate`), charged to `quota`: all of
+    /// them, or (`ENOSPC`) none. The size stays; pages past it read as zeros
+    /// when the file grows over them.
+    fn allocate(&mut self, off: u64, end: u64, quota: &Quota) -> io::Result<()> {
+        let missing = self.missing(off, end);
+        let bytes = missing.checked_mul(PAGE).ok_or_else(enospc)?;
+        if !quota.try_charge(bytes) {
+            return Err(enospc());
+        }
+        let mut fresh = Vec::new();
+        if fresh.try_reserve_exact(missing as usize).is_err() {
+            quota.release(bytes);
+            return Err(enospc());
+        }
+        for idx in off / PAGE..end.div_ceil(PAGE) {
+            if self.pages.contains_key(&idx) {
+                continue;
+            }
+            let Some(page) = new_page(None) else {
+                quota.release(bytes);
+                return Err(enospc());
+            };
+            fresh.push((idx, page));
+        }
+        self.pages.extend(fresh);
+        Ok(())
+    }
+
+    /// Make `[off, end)` within the file a hole (`FALLOC_FL_PUNCH_HOLE`): the
+    /// pages wholly inside it are freed (released from `quota`), and the
+    /// parts of the pages at its edges zeroed.
+    fn punch(&mut self, off: u64, end: u64, quota: &Quota) {
+        let end = end.min(self.len);
+        if end <= off {
+            return;
+        }
+        let (first_whole, end_whole) = (off.div_ceil(PAGE), end / PAGE);
+        if first_whole < end_whole {
+            let mut tail = self.pages.split_off(&end_whole);
+            let gone = self.pages.split_off(&first_whole);
+            quota.release(gone.len() as u64 * PAGE);
+            self.pages.append(&mut tail);
+        }
+        for (&idx, page) in self.pages.range_mut(off / PAGE..end.div_ceil(PAGE)) {
+            let (lo, hi) = (off.max(idx * PAGE), end.min((idx + 1) * PAGE));
+            if lo < hi {
+                page[(lo % PAGE) as usize..][..(hi - lo) as usize].fill(0);
+            }
+        }
+    }
+
+    /// Make the file `len` bytes long. Growing adds a hole, holding nothing;
+    /// shrinking frees the pages wholly past the end (released from `quota`)
+    /// and zeroes the rest of the last one.
+    fn set_len(&mut self, len: u64, quota: &Quota) {
+        if len < self.len {
+            let gone = self.pages.split_off(&len.div_ceil(PAGE));
+            quota.release(gone.len() as u64 * PAGE);
+            let at = (len % PAGE) as usize;
+            if at != 0
+                && let Some(page) = self.pages.get_mut(&(len / PAGE))
+            {
+                page[at..].fill(0);
+            }
+        }
+        self.len = len;
+    }
+
+    /// `lseek`'s `SEEK_DATA` (`hole == false`) or `SEEK_HOLE` from `off`, which
+    /// is below the size: where the next data or hole starts, page by page
+    /// (the end of the file counts as a hole); `None` with no data after `off`.
+    fn seek(&self, off: u64, hole: bool) -> Option<u64> {
+        let idx = off / PAGE;
+        let found = if hole {
+            let mut next = idx;
+            for &held in self.pages.range(idx..).map(|(i, _)| i) {
+                if held != next {
+                    break;
+                }
+                next += 1;
+            }
+            (next * PAGE).max(off).min(self.len)
+        } else {
+            let (&held, _) = self.pages.range(idx..).next()?;
+            (held * PAGE).max(off)
+        };
+        (found < self.len || hole).then_some(found)
     }
 }
 
@@ -200,7 +412,7 @@ impl TmpFs {
             ino,
             FileData {
                 meta,
-                data: Vec::new(),
+                data: Contents::default(),
                 paged,
                 mode,
                 links: 1,
@@ -254,32 +466,6 @@ impl TmpFs {
             return Err(enospc());
         }
         self.nodes.insert(rel.to_string(), node);
-        Ok(())
-    }
-
-    /// Make room for a regular file of `end` bytes. Capacity grows geometrically
-    /// so appends stay linear, falling back to an exact fit near the quota; a
-    /// failure leaves the file as it was.
-    fn grow_file(f: &mut FileData, end: usize) -> io::Result<()> {
-        let capacity = f.data.capacity();
-        if end <= capacity {
-            return Ok(());
-        }
-        let quota = f.quota.clone();
-        let target = if quota.try_charge((end.max(capacity * 2) - capacity) as u64) {
-            end.max(capacity * 2)
-        } else if quota.try_charge((end - capacity) as u64) {
-            end
-        } else {
-            return Err(enospc());
-        };
-        let extra = target - f.data.len();
-        if f.data.try_reserve_exact(extra).is_err() {
-            quota.release((target - capacity) as u64);
-            return Err(enospc());
-        }
-        // The allocator may round up: stay charged for what is really held.
-        quota.force_charge((f.data.capacity() - target) as u64);
         Ok(())
     }
 
@@ -377,6 +563,12 @@ fn einval() -> io::Error {
 fn enotempty() -> io::Error {
     io::Error::from_raw_os_error(39)
 }
+fn eopnotsupp() -> io::Error {
+    io::Error::from_raw_os_error(95)
+}
+fn enxio() -> io::Error {
+    io::Error::from_raw_os_error(6)
+}
 fn enodata() -> io::Error {
     io::Error::from_raw_os_error(61)
 }
@@ -419,6 +611,7 @@ impl MountFs for TmpFs {
 
     fn stat(&mut self, rel: &str) -> Option<Attrs> {
         let node = self.nodes.get(rel)?;
+        let mut blocks = None;
         let (kind, mode, size, nlink) = match node {
             Node::Dir { mode, .. } => {
                 // Directory hard-link count: "." plus ".." plus one ".." per
@@ -439,10 +632,11 @@ impl MountFs for TmpFs {
             }
             Node::File { ino } => {
                 let f = self.files.get(ino)?;
-                let size = match &f.paged {
-                    Some((id, store)) => store.len(*id),
-                    None => f.data.len() as u64,
+                let (size, pages) = match &f.paged {
+                    Some((id, store)) => (store.len(*id), store.resident(*id)),
+                    None => (f.data.len, f.data.pages.len() as u64),
                 };
+                blocks = Some(pages * (PAGE / 512));
                 (NodeKind::File, S_IFREG | (f.mode & 0o7777), size, f.links)
             }
             Node::Fifo {
@@ -466,7 +660,22 @@ impl MountFs for TmpFs {
             nlink,
             rdev: 0,
             dev: 0,
+            blocks,
         })
+    }
+
+    fn seek_data(&mut self, rel: &str, off: u64, size: u64, hole: bool) -> io::Result<u64> {
+        let f = match self.nodes.get(rel) {
+            Some(Node::File { ino }) => self.files.get(ino).ok_or_else(enoent)?,
+            Some(_) => return Err(einval()),
+            None => return Err(enoent()),
+        };
+        if f.paged.is_some() {
+            // Shared memory: its pages are the store's, which keeps no map
+            // of its holes to ask; everything is data.
+            return Ok(if hole { size } else { off });
+        }
+        f.data.seek(off, hole).ok_or_else(enxio)
     }
 
     fn read_at(&mut self, rel: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {
@@ -476,14 +685,7 @@ impl MountFs for TmpFs {
                 if let Some((id, store)) = &f.paged {
                     return Ok(store.read(*id, off, buf));
                 }
-                let data = &f.data;
-                let off = off as usize;
-                if off >= data.len() {
-                    return Ok(0);
-                }
-                let n = buf.len().min(data.len() - off);
-                buf[..n].copy_from_slice(&data[off..off + n]);
-                Ok(n)
+                Ok(f.data.read(off, buf))
             }
             Some(_) => Err(io::Error::from_raw_os_error(21)), // EISDIR
             None => Err(enoent()),
@@ -531,16 +733,10 @@ impl MountFs for TmpFs {
                     f.meta.mtime = now_ts();
                     return Ok(buf.len());
                 }
-                let end = off
-                    .checked_add(buf.len() as u64)
+                off.checked_add(buf.len() as u64)
                     .filter(|&end| end <= MAX_FILE_SIZE)
-                    .and_then(|end| usize::try_from(end).ok())
                     .ok_or_else(efbig)?;
-                if f.data.len() < end {
-                    Self::grow_file(f, end)?;
-                    f.data.resize(end, 0);
-                }
-                f.data[end - buf.len()..end].copy_from_slice(buf);
+                f.data.write(off, buf, &f.quota)?;
                 f.meta.mtime = now_ts();
                 Ok(buf.len())
             }
@@ -653,19 +849,10 @@ impl MountFs for TmpFs {
                     f.meta.mtime = now_ts();
                     return Ok(());
                 }
-                let len = usize::try_from(len)
-                    .ok()
-                    .filter(|&len| len as u64 <= MAX_FILE_SIZE)
-                    .ok_or_else(efbig)?;
-                if len > f.data.capacity() {
-                    Self::grow_file(f, len)?;
+                if len > MAX_FILE_SIZE {
+                    return Err(efbig());
                 }
-                f.data.resize(len, 0);
-                if len < f.data.capacity() / 2 {
-                    let before = f.data.capacity();
-                    f.data.shrink_to(len);
-                    f.quota.release((before - f.data.capacity()) as u64);
-                }
+                f.data.set_len(len, &f.quota);
                 f.meta.mtime = now_ts();
                 Ok(())
             }
@@ -673,6 +860,28 @@ impl MountFs for TmpFs {
             Some(_) => Err(einval()),
             None => Err(enoent()),
         }
+    }
+
+    fn allocate(&mut self, rel: &str, off: u64, len: u64) -> io::Result<()> {
+        let f = self.file_mut(rel).ok_or_else(enoent)?;
+        if f.paged.is_some() {
+            return Err(eopnotsupp());
+        }
+        let end = off
+            .checked_add(len)
+            .filter(|&end| end <= MAX_FILE_SIZE)
+            .ok_or_else(efbig)?;
+        f.data.allocate(off, end, &f.quota)
+    }
+
+    fn punch_hole(&mut self, rel: &str, off: u64, len: u64) -> io::Result<()> {
+        let f = self.file_mut(rel).ok_or_else(enoent)?;
+        if f.paged.is_some() {
+            return Err(eopnotsupp());
+        }
+        f.data.punch(off, off.saturating_add(len), &f.quota);
+        f.meta.mtime = now_ts();
+        Ok(())
     }
 
     fn set_mode(&mut self, rel: &str, mode: u32) -> io::Result<()> {
@@ -889,21 +1098,6 @@ mod tests {
     }
 
     #[test]
-    fn extending_to_absurd_sizes_fails_cleanly() {
-        let (mut fs, _quota) = limited(1024 * 1024);
-        fs.create("f", 0o644).unwrap();
-        assert_eq!(errno(&fs.truncate("f", 1 << 62).unwrap_err()), 28);
-        assert_eq!(errno(&fs.truncate("f", u64::MAX).unwrap_err()), 27);
-        assert_eq!(errno(&fs.write_at("f", u64::MAX, b"x").unwrap_err()), 27);
-        assert_eq!(
-            errno(&fs.write_at("f", i64::MAX as u64, b"x").unwrap_err()),
-            27
-        );
-        assert_eq!(errno(&fs.write_at("f", 1 << 62, b"x").unwrap_err()), 28);
-        assert_eq!(fs.stat("f").unwrap().size, 0);
-    }
-
-    #[test]
     fn freeing_a_file_returns_its_quota() {
         let (mut fs, quota) = limited(u64::MAX);
         let baseline = quota.used();
@@ -919,13 +1113,133 @@ mod tests {
     }
 
     #[test]
-    fn truncating_down_returns_quota() {
+    fn extending_past_the_largest_offset_is_efbig() {
+        let (mut fs, _quota) = limited(1024 * 1024);
+        fs.create("f", 0o644).unwrap();
+        assert_eq!(errno(&fs.truncate("f", u64::MAX).unwrap_err()), 27);
+        assert_eq!(errno(&fs.write_at("f", u64::MAX, b"x").unwrap_err()), 27);
+        assert_eq!(
+            errno(&fs.write_at("f", i64::MAX as u64, b"x").unwrap_err()),
+            27
+        );
+        assert_eq!(fs.stat("f").unwrap().size, 0);
+        // Up to it, a byte far out is one page.
+        fs.write_at("f", 1 << 62, b"x").unwrap();
+        assert_eq!(fs.stat("f").unwrap().size, (1 << 62) + 1);
+        assert_eq!(fs.stat("f").unwrap().blocks, Some(8));
+    }
+
+    #[test]
+    fn a_sparse_file_costs_only_the_pages_written() {
+        let (mut fs, quota) = limited(64 * 1024);
+        fs.create("f", 0o644).unwrap();
+        let start = quota.used();
+        // Far past the quota, as a hole: nothing held, as on Linux.
+        fs.truncate("f", 8 << 30).unwrap();
+        assert_eq!(quota.used(), start);
+        let a = fs.stat("f").unwrap();
+        assert_eq!((a.size, a.blocks), (8 << 30, Some(0)));
+        // Four bytes in the middle: one page; across a page boundary, two.
+        fs.write_at("f", 4 << 30, b"abcd").unwrap();
+        assert_eq!(quota.used(), start + PAGE);
+        fs.write_at("f", (5 << 30) - 2, b"abcd").unwrap();
+        assert_eq!(quota.used(), start + 3 * PAGE);
+        assert_eq!(fs.stat("f").unwrap().blocks, Some(3 * 8));
+        // A hole reads as zeros, around and between what was written.
+        let mut buf = [0xffu8; 12];
+        assert_eq!(fs.read_at("f", (4 << 30) - 4, &mut buf).unwrap(), 12);
+        assert_eq!(&buf, b"\0\0\0\0abcd\0\0\0\0");
+        let mut buf = vec![0xffu8; 3 * PAGE as usize];
+        fs.read_at("f", 6 << 30, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0));
+        // Rewriting in place holds nothing more.
+        fs.write_at("f", 4 << 30, b"ABCD").unwrap();
+        assert_eq!(quota.used(), start + 3 * PAGE);
+    }
+
+    #[test]
+    fn truncating_down_frees_pages_and_zeroes_the_tail() {
         let (mut fs, quota) = limited(u64::MAX);
         fs.create("f", 0o644).unwrap();
-        fs.truncate("f", 1_000_000).unwrap();
-        let full = quota.used();
+        let start = quota.used();
+        fs.write_at("f", 0, &vec![7; 1_000_000]).unwrap();
+        assert_eq!(quota.used(), start + 1_000_000u64.div_ceil(PAGE) * PAGE);
         fs.truncate("f", 10).unwrap();
-        assert!(quota.used() + 900_000 < full);
+        assert_eq!(quota.used(), start + PAGE);
+        // Growing again shows zeros past the old end, not the old bytes.
+        fs.truncate("f", 100).unwrap();
+        assert_eq!(quota.used(), start + PAGE);
+        let mut buf = [0xffu8; 100];
+        assert_eq!(fs.read_at("f", 0, &mut buf).unwrap(), 100);
+        assert_eq!(&buf[..10], &[7; 10]);
+        assert!(buf[10..].iter().all(|&b| b == 0));
+        fs.truncate("f", 0).unwrap();
+        assert_eq!(quota.used(), start);
+    }
+
+    #[test]
+    fn seek_data_and_hole_find_the_written_pages() {
+        let mut fs = TmpFs::new();
+        fs.create("f", 0o644).unwrap();
+        let size = 10 * PAGE + 100;
+        fs.truncate("f", size).unwrap();
+        let seek = |fs: &mut TmpFs, off, hole| fs.seek_data("f", off, size, hole);
+        // All hole: no data, and the hole is where we are.
+        assert_eq!(errno(&seek(&mut fs, 0, false).unwrap_err()), 6);
+        assert_eq!(seek(&mut fs, 5, true).unwrap(), 5);
+        fs.write_at("f", 3 * PAGE + 1, &[1; 2 * PAGE as usize])
+            .unwrap(); // pages 3..=5
+        assert_eq!(seek(&mut fs, 0, false).unwrap(), 3 * PAGE);
+        assert_eq!(seek(&mut fs, 4 * PAGE + 9, false).unwrap(), 4 * PAGE + 9);
+        assert_eq!(seek(&mut fs, 3 * PAGE, true).unwrap(), 6 * PAGE);
+        assert_eq!(errno(&seek(&mut fs, 6 * PAGE, false).unwrap_err()), 6);
+        // Data in the last page: the next hole is the end of the file.
+        fs.write_at("f", size - 1, b"z").unwrap();
+        assert_eq!(seek(&mut fs, 6 * PAGE, false).unwrap(), 10 * PAGE);
+        assert_eq!(seek(&mut fs, 10 * PAGE, true).unwrap(), size);
+    }
+
+    #[test]
+    fn a_write_with_room_for_only_part_of_it_changes_nothing() {
+        let (mut fs, quota) = limited(64 * 1024);
+        fs.create("f", 0o644).unwrap();
+        fs.write_at("f", 0, &[1; 100]).unwrap();
+        let held = quota.used();
+        assert_eq!(
+            errno(&fs.write_at("f", 50, &vec![2; 128 * 1024]).unwrap_err()),
+            28
+        );
+        assert_eq!(quota.used(), held);
+        let mut buf = [0u8; 101];
+        assert_eq!(fs.read_at("f", 0, &mut buf).unwrap(), 100);
+        assert!(buf[..100].iter().all(|&b| b == 1));
+    }
+
+    #[test]
+    fn fallocate_holds_pages_and_punching_frees_them() {
+        let (mut fs, quota) = limited(64 * 1024);
+        fs.create("f", 0o644).unwrap();
+        let start = quota.used();
+        // Allocating holds the pages, without changing the size.
+        fs.allocate("f", 100, 3 * PAGE).unwrap();
+        assert_eq!(quota.used(), start + 4 * PAGE);
+        assert_eq!(fs.stat("f").unwrap().size, 0);
+        // More than there's room for is ENOSPC, holding nothing more.
+        assert_eq!(errno(&fs.allocate("f", 0, 1 << 62).unwrap_err()), 28);
+        assert_eq!(errno(&fs.allocate("f", 0, 1 << 63).unwrap_err()), 27);
+        assert_eq!(quota.used(), start + 4 * PAGE);
+        // A hole punched in written data frees the pages wholly inside it
+        // and zeroes the edges of the others.
+        fs.write_at("f", 0, &[9; 4 * PAGE as usize]).unwrap();
+        fs.punch_hole("f", 10, 2 * PAGE + 20).unwrap();
+        assert_eq!(quota.used(), start + 3 * PAGE);
+        let mut buf = vec![0u8; 4 * PAGE as usize];
+        fs.read_at("f", 0, &mut buf).unwrap();
+        let hole = 10..(2 * PAGE + 30) as usize;
+        for (i, &b) in buf.iter().enumerate() {
+            assert_eq!(b, if hole.contains(&i) { 0 } else { 9 }, "byte {i}");
+        }
+        assert_eq!(fs.stat("f").unwrap().size, 4 * PAGE);
     }
 
     #[test]

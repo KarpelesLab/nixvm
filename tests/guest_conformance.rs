@@ -306,7 +306,8 @@ fn contained(args: &[&str], env: &[(&str, &str)], seconds: &str) -> String {
 #[test]
 fn absurd_sizes_are_errors_not_crashes() {
     for (attack, expect) in [
-        ("ftruncate", "errno 28"),
+        // A hole, as on Linux's tmpfs: it holds nothing, so it succeeds.
+        ("ftruncate", "-> 0 "),
         ("pwrite", "errno 27"),
         ("fallocate", "errno 28"),
         ("poll", "errno 22"),

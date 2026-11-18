@@ -542,6 +542,28 @@ impl MountFs for Overlay {
         }
     }
 
+    fn allocate(&mut self, rel: &str, off: u64, len: u64) -> io::Result<()> {
+        match self.layer(rel) {
+            Some(Layer::Upper) => self.upper.allocate(rel, off, len),
+            _ => Err(io::Error::from_raw_os_error(95)), // EOPNOTSUPP
+        }
+    }
+
+    fn punch_hole(&mut self, rel: &str, off: u64, len: u64) -> io::Result<()> {
+        match self.layer(rel) {
+            Some(Layer::Upper) => self.upper.punch_hole(rel, off, len),
+            _ => Err(io::Error::from_raw_os_error(95)), // EOPNOTSUPP
+        }
+    }
+
+    fn seek_data(&mut self, rel: &str, off: u64, size: u64, hole: bool) -> io::Result<u64> {
+        match self.layer(rel) {
+            Some(Layer::Upper) => self.upper.seek_data(rel, off, size, hole),
+            Some(Layer::Lower) => self.lower.seek_data(rel, off, size, hole),
+            None => Err(enoent()),
+        }
+    }
+
     fn readdir(&mut self, rel: &str) -> io::Result<Vec<DirEntry>> {
         let Some(layer) = self.layer(rel) else {
             return Err(enoent());

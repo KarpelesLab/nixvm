@@ -1164,6 +1164,32 @@ impl MountTable {
         fs.readdir(&rel)
     }
 
+    /// Give the file at `abs_path` its memory or disk for a range now (see
+    /// [`MountFs::allocate`]).
+    pub fn allocate(&mut self, abs_path: &str, off: u64, len: u64) -> io::Result<()> {
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
+        fs.allocate(&rel, off, len)
+    }
+
+    /// Punch a hole in the file at `abs_path` (see [`MountFs::punch_hole`]).
+    pub fn punch_hole(&mut self, abs_path: &str, off: u64, len: u64) -> io::Result<()> {
+        let (mut fs, rel) = self.resolve_for_write(abs_path)?;
+        fs.punch_hole(&rel, off, len)
+    }
+
+    /// `lseek`'s `SEEK_DATA`/`SEEK_HOLE` on the regular file at `abs_path`
+    /// (see [`MountFs::seek_data`]).
+    pub fn seek_data(
+        &mut self,
+        abs_path: &str,
+        off: u64,
+        size: u64,
+        hole: bool,
+    ) -> io::Result<u64> {
+        let (mut fs, rel) = self.resolve(abs_path).ok_or_else(enoent)?;
+        fs.seek_data(&rel, off, size, hole)
+    }
+
     /// Whether the file at `abs_path` (which may not exist yet) may be opened
     /// for writing, or mapped shared and writable (see
     /// [`MountFs::check_write`]).
@@ -1732,6 +1758,7 @@ mod tests {
                 nlink: 1,
                 rdev: 0,
                 dev: 0,
+                blocks: None,
             })
         }
 

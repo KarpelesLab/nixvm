@@ -98,6 +98,7 @@ impl MountFs for Tree {
             nlink: 1,
             rdev,
             dev: 0,
+            blocks: None,
         })
     }
 

@@ -8812,18 +8812,39 @@ impl Kernel {
                 if let Some(obj) = vfs.page_id(&path).and_then(|id| self.shm.obj(id)) {
                     obj.punch(offset, zero_end - offset);
                 } else {
-                    let zeros = vec![0u8; (zero_end - offset) as usize];
-                    if let Err(e) = self.vfs_write(vfs, &path, offset, &zeros) {
-                        return io_errno(&e);
+                    // A hole where the backend can make one (a mapped file's
+                    // cached pages are kept in step by writing the zeros).
+                    let punched = if self.pc_is_cached(vfs, &path) {
+                        Err(io::Error::from_raw_os_error(95)) // EOPNOTSUPP
+                    } else {
+                        vfs.punch_hole(&path, offset, zero_end - offset)
+                    };
+                    match punched {
+                        Ok(()) => {}
+                        Err(e) if e.raw_os_error() == Some(95) => {
+                            let zeros = vec![0u8; (zero_end - offset) as usize];
+                            if let Err(e) = self.vfs_write(vfs, &path, offset, &zeros) {
+                                return io_errno(&e);
+                            }
+                        }
+                        Err(e) => return io_errno(&e),
                     }
                 }
             }
             if mode & FALLOC_FL_PUNCH_HOLE != 0 || mode & FALLOC_FL_KEEP_SIZE != 0 || end <= cur {
                 return 0;
             }
-        } else if mode & FALLOC_FL_KEEP_SIZE != 0 || end <= cur {
-            // Space past the end, or within it, is already "allocated".
-            return 0;
+        } else {
+            // The backend's memory or disk for the range, where it gives it
+            // now (Linux's tmpfs does); elsewhere the size is all there is.
+            match vfs.allocate(&path, offset, len) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(95) => {} // EOPNOTSUPP
+                Err(e) => return io_errno(&e),
+            }
+            if mode & FALLOC_FL_KEEP_SIZE != 0 || end <= cur {
+                return 0;
+            }
         }
         // Grow the file to cover the range.
         match self.vfs_truncate(vfs, &path, end) {
@@ -10697,18 +10718,26 @@ impl Kernel {
             _ => return err(Errno::ESPIPE),
         };
         let size = vfs.stat(&path).map_or(0, |a| a.size);
-        // SEEK_DATA(3)/SEEK_HOLE(4): files here are non-sparse, so all data lies
-        // in `[0, size)` with a single hole at EOF. `offset >= size` is ENXIO.
+        // SEEK_DATA(3)/SEEK_HOLE(4): where the backend says the next data or
+        // hole is (a sparse file's holes; the end of the file is one).
+        // `offset >= size` is ENXIO.
         const SEEK_DATA: u64 = 3;
         const SEEK_HOLE: u64 = 4;
         if whence == SEEK_DATA || whence == SEEK_HOLE {
             if offset < 0 || offset as u64 >= size {
                 return err(Errno::ENXIO);
             }
-            let pos = if whence == SEEK_DATA {
-                offset as u64
+            let (off, hole) = (offset as u64, whence == SEEK_HOLE);
+            // A mapped file's pages may hold stores the backend hasn't seen
+            // yet, in what it thinks is a hole: everything is data then.
+            let pos = if self.pc_is_cached(vfs, &path) {
+                Ok(if hole { size } else { off })
             } else {
-                size
+                vfs.seek_data(&path, off, size, hole)
+            };
+            let pos = match pos {
+                Ok(pos) => pos,
+                Err(e) => return io_errno(&e),
             };
             if let Some(Fd::File { offset, .. }) = cx.cur.fds.get_mut(fd as i32) {
                 offset.set(pos);
@@ -10810,6 +10839,7 @@ impl Kernel {
                 nlink: 1,
                 rdev: 0,
                 dev: 0,
+                blocks: None,
             },
             // The render node: a character device, 226:128.
             #[cfg(feature = "gpu")]
@@ -10833,6 +10863,7 @@ impl Kernel {
                 nlink: 1,
                 rdev: 0,
                 dev: 0xd,
+                blocks: None,
             },
             // A fence: an anonymous inode, as Linux's sync files are.
             #[cfg(feature = "gpu")]
@@ -10848,6 +10879,7 @@ impl Kernel {
                 nlink: 1,
                 rdev: 0,
                 dev: 0xe,
+                blocks: None,
             },
             // A message queue is a regular file on the mqueue filesystem.
             Some(Fd::Mqueue { q, .. }) => Attrs {
@@ -10862,6 +10894,7 @@ impl Kernel {
                 nlink: 1,
                 rdev: 0,
                 dev: 0,
+                blocks: None,
             },
             None => return Err(err(Errno::EBADF)),
         })

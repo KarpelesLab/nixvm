@@ -378,6 +378,7 @@ impl MountFs for FsToolMount {
             nlink: a.nlink,
             rdev: u64::from(a.rdev),
             dev: 0,
+            blocks: None,
         })
     }
 

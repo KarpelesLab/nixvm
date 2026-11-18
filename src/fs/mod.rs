@@ -81,6 +81,19 @@ pub struct Attrs {
     /// the [`MountTable`] from the mount it was found through; `0` from a
     /// backend.
     pub dev: u64,
+    /// The 512-byte blocks the node's contents use (`st_blocks`), for a
+    /// backend that knows (a sparse file uses fewer than its size); `None`
+    /// counts its size in whole pages.
+    pub blocks: Option<u64>,
+}
+
+impl Attrs {
+    /// `st_blocks`: what the backend says, or the size rounded up to a 4 KiB
+    /// page (8 blocks), as a page-granular filesystem holds it.
+    #[must_use]
+    pub fn st_blocks(&self) -> u64 {
+        self.blocks.unwrap_or(self.size.div_ceil(4096) * 8)
+    }
 }
 
 /// One field of a `utimensat`/`futimens` request (`atime` or `mtime`).
@@ -129,6 +142,8 @@ pub trait PageStore: Send + Sync + std::fmt::Debug {
     /// # Errors
     /// None so far: growing is sparse.
     fn set_len(&self, id: u64, len: u64) -> io::Result<()>;
+    /// How many pages the file holds (a hole holds none).
+    fn resident(&self, id: u64) -> u64;
 }
 
 /// A filesystem backend mounted at some point in the [`MountTable`].
@@ -251,6 +266,30 @@ pub trait MountFs: std::fmt::Debug + Send {
     /// so `st_nlink`, the shared inode, and write-through all behave.
     fn link(&mut self, _old_rel: &str, _new_rel: &str) -> io::Result<()> {
         Err(io::Error::from_raw_os_error(95)) // EOPNOTSUPP
+    }
+
+    /// Give the regular file `rel` its memory or disk for `[off, off + len)`
+    /// now (`fallocate`), leaving its size alone; `ENOSPC` if there's no room
+    /// for all of it. The default (`EOPNOTSUPP`) has the kernel only grow the
+    /// file over the range.
+    fn allocate(&mut self, _rel: &str, _off: u64, _len: u64) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(95)) // EOPNOTSUPP
+    }
+
+    /// Make `[off, off + len)` of the regular file `rel` (the part within its
+    /// size) a hole that holds nothing (`FALLOC_FL_PUNCH_HOLE`). The default
+    /// (`EOPNOTSUPP`) has the kernel write zeros there instead.
+    fn punch_hole(&mut self, _rel: &str, _off: u64, _len: u64) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(95)) // EOPNOTSUPP
+    }
+
+    /// `lseek`'s `SEEK_DATA` (`hole == false`) or `SEEK_HOLE` on the regular
+    /// file `rel` from `off`, which is below its size `size`: where the next
+    /// data or hole starts (the end of the file is a hole), or `ENXIO` with no
+    /// data after `off`. The default knows of no holes: everything up to the
+    /// end is data, as Linux answers for a filesystem that doesn't track them.
+    fn seek_data(&mut self, _rel: &str, off: u64, size: u64, hole: bool) -> io::Result<u64> {
+        Ok(if hole { size } else { off })
     }
 
     /// Whether `rel`'s contents may be written: asked when it's opened for

@@ -1962,6 +1962,7 @@ impl MountFs for CgroupFs {
                 nlink: 2 + n.children.len() as u32,
                 rdev: 0,
                 dev: 0,
+                blocks: None,
             },
             Some(f) => {
                 let writable = tree.files(node).iter().any(|(x, w)| *x == f && *w);
@@ -1988,6 +1989,7 @@ impl MountFs for CgroupFs {
                     nlink: 1,
                     rdev: 0,
                     dev: 0,
+                    blocks: None,
                 }
             }
         })

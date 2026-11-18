@@ -293,6 +293,11 @@ impl Kernel {
         self.page_cache.lock().unwrap().files.get(&key).cloned()
     }
 
+    /// Whether the page cache holds pages of the file at `path`.
+    pub(super) fn pc_is_cached(&self, vfs: &mut MountTable, path: &str) -> bool {
+        self.cached(vfs, path).is_some()
+    }
+
     /// After `read` of `buf.len()` bytes at `off` from `path`: lay any cached
     /// (possibly newer, mapped-and-stored) pages over the bytes read.
     pub(super) fn pc_after_read(&self, vfs: &mut MountTable, path: &str, off: u64, buf: &mut [u8]) {
@@ -429,6 +434,10 @@ impl PageStore for ShmStore {
     fn set_len(&self, id: u64, len: u64) -> std::io::Result<()> {
         self.with(id, |o| o.set_size(len))
             .ok_or_else(|| std::io::Error::from_raw_os_error(2))
+    }
+
+    fn resident(&self, id: u64) -> u64 {
+        self.with(id, FileObj::resident).unwrap_or(0)
     }
 }
 

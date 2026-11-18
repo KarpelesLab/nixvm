@@ -1033,6 +1033,7 @@ impl ProcFs {
             nlink: 1,
             rdev: 0,
             dev: 0,
+            blocks: None,
         })
     }
 
@@ -1771,6 +1772,7 @@ impl MountFs for ProcFs {
                 nlink: 1,
                 rdev: 0,
                 dev: 0,
+                blocks: None,
             });
         }
 
@@ -1792,6 +1794,7 @@ impl MountFs for ProcFs {
                 nlink: 1,
                 rdev: 0,
                 dev: 0,
+                blocks: None,
             });
         }
 
@@ -1849,6 +1852,7 @@ impl MountFs for ProcFs {
             nlink,
             rdev: 0,
             dev: 0,
+            blocks: None,
         })
     }
 

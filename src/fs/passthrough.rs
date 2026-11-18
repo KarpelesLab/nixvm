@@ -793,6 +793,7 @@ fn attrs_of(m: &fs::Metadata) -> Attrs {
         nlink: m.nlink() as u32,
         rdev: m.rdev(),
         dev: 0,
+        blocks: None,
     }
 }
 

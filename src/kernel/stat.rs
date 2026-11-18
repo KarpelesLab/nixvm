@@ -65,9 +65,9 @@ pub fn encode_stat(attrs: &Attrs, arch: Arch) -> Vec<u8> {
     }
     put64(&mut b, 48, attrs.size); // st_size
     put32(&mut b, 56, 4096); // st_blksize
-    // st_blocks (512-byte units). Like tmpfs, storage is page-granular, so round
-    // the size up to a 4 KiB page (= 8 × 512-byte blocks) — what `du`/`ls -s` see.
-    put64(&mut b, 64, attrs.size.div_ceil(4096) * 8);
+    // st_blocks (512-byte units): what the backend holds, or the size in whole
+    // 4 KiB pages (= 8 × 512-byte blocks) — what `du`/`ls -s` see.
+    put64(&mut b, 64, attrs.st_blocks());
     put64(&mut b, 72, attrs.atime as u64); // st_atime
     put64(&mut b, 88, attrs.mtime as u64); // st_mtime
     put64(&mut b, 104, attrs.mtime as u64); // st_ctime (tracks mtime here)
@@ -99,7 +99,7 @@ pub fn encode_statx(attrs: &Attrs) -> [u8; 256] {
     put16(&mut b, 28, attrs.mode as u16); // stx_mode (type + perms)
     put64(&mut b, 32, attrs.inode); // stx_ino
     put64(&mut b, 40, attrs.size); // stx_size
-    put64(&mut b, 48, attrs.size.div_ceil(4096) * 8); // stx_blocks (page-rounded)
+    put64(&mut b, 48, attrs.st_blocks()); // stx_blocks
     // stx_attributes_mask @56 = 0
     put_ts(&mut b, 64, attrs.atime); // stx_atime
     put_ts(&mut b, 80, attrs.mtime); // stx_btime
@@ -172,6 +172,7 @@ pub fn char_device_attrs() -> Attrs {
         nlink: 1,
         rdev: 0,
         dev: 0,
+        blocks: None,
     }
 }
 
@@ -189,6 +190,7 @@ pub fn fifo_attrs() -> Attrs {
         nlink: 1,
         rdev: 0,
         dev: 0,
+        blocks: None,
     }
 }
 
@@ -206,6 +208,7 @@ pub fn socket_attrs() -> Attrs {
         nlink: 1,
         rdev: 0,
         dev: 0,
+        blocks: None,
     }
 }
 
@@ -310,6 +313,7 @@ mod tests {
             nlink: 1,
             rdev: 0,
             dev: 0,
+            blocks: None,
         };
         let b = encode_stat(&attrs, Arch::Aarch64);
         assert_eq!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 42); // st_ino
@@ -331,6 +335,7 @@ mod tests {
             nlink: 1,
             rdev: makedev(1, 3), // /dev/null
             dev: 0,
+            blocks: None,
         };
         let b = encode_stat(&attrs, Arch::Aarch64);
         // st_rdev sits at offset 32 and must round-trip the attrs value.
@@ -355,6 +360,7 @@ mod tests {
             nlink: 2,
             rdev: 0,
             dev: 0,
+            blocks: None,
         };
         let b = encode_stat(&attrs, Arch::X86_64);
         assert_eq!(b.len(), 144, "x86-64 struct stat is 144 bytes");

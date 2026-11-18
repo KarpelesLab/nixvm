@@ -442,6 +442,7 @@ impl MountFs for SysFs {
                 nlink: 1,
                 rdev: 0,
                 dev: 0,
+                blocks: None,
             });
         }
         let node = Self::tree().get(rel)?;
@@ -461,6 +462,7 @@ impl MountFs for SysFs {
             nlink: 1,
             rdev: 0,
             dev: 0,
+            blocks: None,
         })
     }
 
