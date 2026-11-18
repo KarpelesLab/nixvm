@@ -897,17 +897,25 @@ impl MountFs for Passthrough {
         )
         .map_err(normalize_errno)?;
         let mut f = fs::File::from(fd);
-        let size = f.metadata()?.len();
-        let end = off.saturating_add(buf.len() as u64);
-        let growth = end.saturating_sub(size);
-        self.charge_disk(growth)?;
+        // Disk use is the blocks a file has, as `du` counts it, not its size:
+        // a sparse file costs only what's written. Charge the most the write
+        // could allocate, then give back what it didn't.
+        let before = allocated(&f.metadata()?);
+        let most =
+            (buf.len() as u64).div_ceil(BLOCK) * BLOCK + if buf.is_empty() { 0 } else { BLOCK };
+        self.charge_disk(most)?;
         let written = f
             .seek(SeekFrom::Start(off))
             .and_then(|_| f.write(buf))
-            .inspect_err(|_| self.disk.release(growth))?;
-        // A short write grew the file by less than was charged.
-        self.disk
-            .release(end - (off + written as u64).max(size).min(end));
+            .inspect_err(|_| self.disk.release(most))?;
+        let after = f.metadata().map_or(before + most, |m| allocated(&m));
+        let used = after.saturating_sub(before);
+        if used > most {
+            // Filesystem metadata (indirect blocks) beyond the estimate.
+            self.disk.force_charge(used - most);
+        } else {
+            self.disk.release(most - used);
+        }
         Ok(written)
     }
 
@@ -999,7 +1007,7 @@ impl MountFs for Passthrough {
             0,
         ) {
             let meta = fs::File::from(fd).metadata();
-            meta.map_or(0, |m| if m.nlink() == 1 { m.len() } else { 0 })
+            meta.map_or(0, |m| if m.nlink() == 1 { allocated(&m) } else { 0 })
         } else {
             0
         };
@@ -1046,11 +1054,11 @@ impl MountFs for Passthrough {
         if !meta.file_type().is_file() {
             return Err(io::Error::from_raw_os_error(22)); // EINVAL: ftruncate is only meaningful on a regular file
         }
-        let size = meta.len();
-        self.charge_disk(len.saturating_sub(size))?;
-        file.set_len(len)
-            .inspect_err(|_| self.disk.release(len.saturating_sub(size)))?;
-        self.disk.release(size.saturating_sub(len));
+        // Growing leaves a hole, which uses no disk; shrinking frees blocks.
+        let before = allocated(&meta);
+        file.set_len(len)?;
+        let after = file.metadata().map_or(before, |m| allocated(&m));
+        self.disk.release(before.saturating_sub(after));
         Ok(())
     }
 
@@ -1085,6 +1093,15 @@ impl MountFs for Passthrough {
         let cto = cstr(&to_name)?;
         raw_renameat(from_parent.as_raw_fd(), &cfrom, to_parent.as_raw_fd(), &cto)
     }
+}
+
+/// The unit disk use is counted in: a filesystem block.
+const BLOCK: u64 = 4096;
+
+/// The disk a file uses: its allocated blocks (`st_blocks` is in 512-byte
+/// units whatever the filesystem's block size).
+fn allocated(m: &fs::Metadata) -> u64 {
+    m.blocks().saturating_mul(512)
 }
 
 /// `ENOSPC`.
@@ -1175,23 +1192,31 @@ mod tests {
         let err = pt.write_at("f", 1024, &vec![0; 1 << 20]).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(28));
         assert_eq!(pt.stat("f").unwrap().size, 1024);
-        assert_eq!(quota.used(), 1024 + ENTRY_COST);
+        let held = quota.used();
+        assert!(
+            (ENTRY_COST + 1..=ENTRY_COST + 2 * BLOCK).contains(&held),
+            "{held}"
+        );
         // Overwriting in place uses no more disk.
         pt.write_at("f", 0, &vec![1; 1024]).unwrap();
-        assert_eq!(quota.used(), 1024 + ENTRY_COST);
+        assert_eq!(quota.used(), held);
     }
 
     #[test]
-    fn truncate_is_charged_and_refunded() {
+    fn a_sparse_file_costs_only_what_is_written() {
         let (_tmp, mut pt, quota) = with_quota("quota-truncate", 64 * 1024);
         pt.create("f", 0o644).unwrap();
-        pt.truncate("f", 8192).unwrap();
-        assert_eq!(quota.used(), 8192 + ENTRY_COST);
-        assert_eq!(
-            pt.truncate("f", 1 << 40).unwrap_err().raw_os_error(),
-            Some(28)
+        // Far past the quota, as a hole: no disk used, as on Linux.
+        pt.truncate("f", 1 << 33).unwrap();
+        assert_eq!(pt.stat("f").unwrap().size, 1 << 33);
+        assert_eq!(quota.used(), ENTRY_COST);
+        pt.write_at("f", 1 << 32, &[7; 8192]).unwrap();
+        let held = quota.used();
+        assert!(
+            (ENTRY_COST + 8192..=ENTRY_COST + 32 * 1024).contains(&held),
+            "{held}"
         );
-        assert_eq!(pt.stat("f").unwrap().size, 8192);
+        // Shrinking frees the written blocks.
         pt.truncate("f", 0).unwrap();
         assert_eq!(quota.used(), ENTRY_COST);
     }
