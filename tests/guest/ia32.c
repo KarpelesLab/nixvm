@@ -622,6 +622,61 @@ static volatile int got_sig, got_code;
 static volatile unsigned long got_eip, got_addr, got_value;
 static sigjmp_buf jb;
 
+/* Nothing an i386 program maps reaches past TASK_SIZE (0xffffe000): fixed
+ * places there are refused as Linux refuses them, hints are taken where
+ * they fit and moved where they don't. */
+static void test_below_4g(void)
+{
+    const uintptr_t task_size = 0xffffe000u;
+    void *r = mmap((void *)task_size, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    CHECK(r == MAP_FAILED && errno == ENOMEM, "MAP_FIXED at TASK_SIZE: %p", r);
+    r = mmap((void *)0xfffff000u, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    CHECK(r == MAP_FAILED && errno == ENOMEM, "MAP_FIXED_NOREPLACE past TASK_SIZE: %p", r);
+    /* A hint where there's room is where the mapping goes. */
+    char *a = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(a != MAP_FAILED, "mmap");
+    munmap(a, 3 * 4096);
+    char *h = mmap(a + 4096, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(h == a + 4096, "the hint %p gave %p", a + 4096, h);
+    /* One that doesn't fit (past TASK_SIZE, or on the stack) goes elsewhere. */
+    char *f = mmap((void *)0xfffff000u, 8192, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(f != MAP_FAILED && (uintptr_t)f + 8192 <= task_size, "a hint past TASK_SIZE gave %p", f);
+    int local;
+    uintptr_t st = (uintptr_t)&local & ~4095u;
+    char *g = mmap((void *)st, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(g != MAP_FAILED && (uintptr_t)g != st, "a hint on the stack gave %p", g);
+    munmap(f, 8192);
+    munmap(g, 4096);
+    /* mremap: a fixed move past TASK_SIZE is EINVAL; a moving grow stays below. */
+    r = mremap(h, 4096, 8192, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)0xffffd000u);
+    CHECK(r == MAP_FAILED && errno == EINVAL, "mremap MREMAP_FIXED past TASK_SIZE: %p", r);
+    char *blk = mmap(h + 4096, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    h[0] = 42;
+    char *m = mremap(h, 4096, 64 << 20, MREMAP_MAYMOVE);
+    CHECK(m != MAP_FAILED && m != h && (uintptr_t)m + (64 << 20) <= task_size && m[0] == 42, "mremap moved to %p", m);
+    r = mremap(m, 64 << 20, 0xfffff000u, MREMAP_MAYMOVE);
+    CHECK(r == MAP_FAILED && errno == EINVAL, "mremap to more than TASK_SIZE: %p", r);
+    munmap(m, 64 << 20);
+    munmap(blk, 4096);
+    /* shmat: past TASK_SIZE is ENOMEM; anywhere is below it. */
+    int shm = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+    r = shmat(shm, (void *)0xfffff000u, 0);
+    CHECK(r == (void *)-1 && errno == ENOMEM, "shmat past TASK_SIZE: %p", r);
+    r = shmat(shm, NULL, 0);
+    CHECK(r != (void *)-1 && (uintptr_t)r + 4096 <= task_size, "shmat %p", r);
+    shmdt(r);
+    shmctl(shm, IPC_RMID, NULL);
+    /* brk won't go past TASK_SIZE, nor over a mapping. */
+    char *cur = sbrk(0);
+    CHECK(syscall(SYS_brk, 0xfffff000u) == (long)cur, "brk past TASK_SIZE");
+    char *over = mmap((void *)(((uintptr_t)cur + 3 * 4096) & ~4095u), 4096, PROT_READ,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (over != MAP_FAILED) {
+        CHECK(syscall(SYS_brk, over + 4096) == (long)cur, "brk over a mapping");
+        munmap(over, 4096);
+    }
+}
+
 static void on_info(int sig, siginfo_t *si, void *ctx)
 {
     ucontext_t *uc = ctx;
@@ -952,6 +1007,8 @@ int main(int argc, char **argv)
             test_ldt();
         if (strcmp(argv[2], "vdso") == 0)
             test_vdso_clocks();
+        if (strcmp(argv[2], "4g") == 0)
+            test_below_4g();
         printf(failures ? "FAILED\n" : "PASS\n");
         return failures != 0;
     }
@@ -965,6 +1022,7 @@ int main(int argc, char **argv)
     test_sockets();
     test_ipc();
     test_mmap();
+    test_below_4g();
     test_signals();
     test_ldt();
     test_fast_entries();

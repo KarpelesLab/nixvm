@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/shm.h>
 #include <time.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -386,6 +387,56 @@ static void mmap32_checks(void) {
 }
 
 
+/* An int $0x80 with all six arguments, the sixth in %ebp. */
+static long int80_6(long nr, long a, long b, long c, long d, long e, long f) {
+  long ret;
+  __asm__ volatile("push %%rbp\n\t"
+                   "mov %7, %%rbp\n\t"
+                   "int $0x80\n\t"
+                   "pop %%rbp"
+                   : "=a"(ret)
+                   : "a"(nr), "b"(a), "c"(b), "d"(c), "S"(d), "D"(e), "r"(f)
+                   : "memory");
+  return ret;
+}
+
+static unsigned int shm_raddr; /* below 4 GiB: ipc(SHMAT) writes it */
+
+/* i386 calls from a 64-bit task place what they map below 4 GiB, as
+ * in_32bit_syscall() has Linux's get_unmapped_area do, and take a hint
+ * that fits. */
+static void int80_mm_checks(void) {
+  const long low = 0x100000000L;
+  long a = int80_6(192, 0, 3 * 4096, 3, 0x22, -1, 0);
+  CHECK(a > 0 && a < low, "int $0x80 mmap2: %#lx", a);
+  if (a <= 0 || a >= low)
+    return;
+  CHECK(int80(91, a, 3 * 4096, 0) == 0, "int $0x80 munmap");
+  long h = int80_6(192, a + 4096, 4096, 3, 0x22, -1, 0);
+  CHECK(h == a + 4096, "int $0x80 mmap2 hint %#lx gave %#lx", a + 4096, h);
+  long blk = int80_6(192, h + 4096, 4096, 1, 0x22 | MAP_FIXED_NOREPLACE, -1, 0);
+  CHECK(blk == h + 4096, "int $0x80 mmap2 MAP_FIXED_NOREPLACE: %#lx", blk);
+  *(volatile char *)h = 42;
+  long m = int80_6(163, h, 4096, 1 << 20, MREMAP_MAYMOVE, 0, 0);
+  CHECK(m > 0 && m < low && m != h && *(volatile char *)m == 42,
+        "int $0x80 mremap MREMAP_MAYMOVE moved to %#lx", m);
+  if (m > 0 && m < low)
+    munmap((void *)m, 1 << 20);
+  munmap((void *)blk, 4096);
+  /* ipc(SHMAT) through the i386 multiplexer. */
+  int id = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+  long r = int80_6(117, 21, id, 0, (long)&shm_raddr, 0, 0);
+  CHECK(r == 0 && shm_raddr != 0, "int $0x80 shmat: %ld at %#x", r, shm_raddr);
+  char *mine = shmat(id, NULL, 0);
+  if (r == 0 && shm_raddr && mine != (void *)-1) {
+    mine[0] = 7;
+    CHECK(*(volatile char *)(uintptr_t)shm_raddr == 7, "the i386 attach is the segment");
+    CHECK(int80_6(117, 22, 0, 0, 0, shm_raddr, 0) == 0, "int $0x80 shmdt");
+  }
+  shmdt(mine);
+  shmctl(id, IPC_RMID, NULL);
+}
+
 static void mode_checks(void) {
   cs32 = 0;
   uint32_t r = via_lretq(6);
@@ -474,6 +525,7 @@ int main(int argc, char **argv) {
   mode_checks();
   ldt_checks();
   mmap32_checks();
+  int80_mm_checks();
   exec_ia32();
   if (!failures)
     printf("PASS\n");
