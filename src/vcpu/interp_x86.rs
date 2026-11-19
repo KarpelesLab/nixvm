@@ -766,12 +766,13 @@ struct X86Interp {
     /// `DR0..DR3` and `DR7`; `dr_on` is whether `DR7` enables any slot.
     dr: [u64; 8],
     dr_on: bool,
-    /// The data watchpoints the current instruction's stores matched
+    /// The data watchpoints the current instruction's accesses matched
     /// (`DR6`'s `B0..B3`), reported once it completes.
-    dr_hits: u64,
-    /// An execute breakpoint already reported at this address: the resumed
-    /// instruction runs once without trapping again (the `RF` flag).
-    bp_skip: Option<u64>,
+    dr_hits: Cell<u64>,
+    /// `RFLAGS.RF`: an execute breakpoint was reported, and the next
+    /// instruction runs without trapping on one (the CPU clears it as an
+    /// instruction completes; `POPF` doesn't load it, a `sigreturn` does).
+    rf: bool,
 }
 
 /// `DR6.BS`: the debug trap is a single step.
@@ -831,8 +832,8 @@ impl X86Interp {
             single_step: false,
             dr: [0; 8],
             dr_on: false,
-            dr_hits: 0,
-            bp_skip: None,
+            dr_hits: Cell::new(0),
+            rf: false,
         }
     }
 
@@ -856,16 +857,18 @@ impl X86Interp {
         })
     }
 
-    /// Note the data watchpoints a store of `len` bytes at `a` matches.
-    fn watch_store(&mut self, a: u64, len: u64) {
+    /// Note the data watchpoints an access of `len` bytes at `a` matches: a
+    /// store any write (R/W 01) or read/write (11) one, a load (`write`
+    /// false) a read/write one.
+    fn watch_access(&self, a: u64, len: u64, write: bool) {
         let mut hits = 0;
-        for (i, addr, wlen) in self.dr_slots(|rw| rw == 1 || rw == 3) {
+        for (i, addr, wlen) in self.dr_slots(|rw| rw == 3 || (write && rw == 1)) {
             let start = addr & !(wlen - 1);
             if a < start + wlen && start < a.wrapping_add(len.max(1)) {
                 hits |= 1 << i;
             }
         }
-        self.dr_hits |= hits;
+        self.dr_hits.set(self.dr_hits.get() | hits);
     }
 
     /// The execute breakpoints set at `pc`, as `DR6` bits.
@@ -1489,6 +1492,9 @@ impl X86Interp {
         }
         let mut b = [0u8; 8];
         mem.read(a, &mut b[..n]).map_err(|_| rd_fault(a))?;
+        if self.dr_on {
+            self.watch_access(a, n as u64, false);
+        }
         Ok(u64::from_le_bytes(b))
     }
 
@@ -1515,7 +1521,7 @@ impl X86Interp {
         }
         mem.write_trap(a, bytes).map_err(|e| wr_fault(&e))?;
         if self.dr_on {
-            self.watch_store(a, bytes.len() as u64);
+            self.watch_access(a, bytes.len() as u64, true);
         }
         Ok(())
     }
@@ -4134,10 +4140,11 @@ impl Vcpu for X86Interp {
         self.sync_ldt(mem);
         for i in 0..MAX_STEPS {
             // A hardware execute breakpoint fires before its instruction runs.
-            if self.dr_on && self.bp_skip != Some(self.rip) {
+            if self.dr_on && !self.rf {
                 let hits = self.exec_breakpoints(self.rip);
                 if hits != 0 {
-                    self.bp_skip = Some(self.rip);
+                    // A fault: it sets `RF` for the instruction to run.
+                    self.rf = true;
                     return Ok(Exit::DebugTrap {
                         pc: self.rip,
                         dr6: hits,
@@ -4149,16 +4156,16 @@ impl Vcpu for X86Interp {
             let tf = self.rflags_sys & RFLAGS_TF != 0;
             let step = self.step(mem);
             if matches!(step, Step::Next | Step::Branched | Step::Syscall) {
-                self.bp_skip = None;
+                self.rf = false;
             } else {
-                // It didn't complete (or trapped): its stores don't count.
-                self.dr_hits = 0;
+                // It didn't complete (or trapped): its accesses don't count.
+                self.dr_hits.set(0);
             }
             match step {
                 Step::Next | Step::Branched => {
                     // A completed instruction: a step or a data watchpoint
                     // traps now, with `rip` on the next one.
-                    let hits = std::mem::take(&mut self.dr_hits);
+                    let hits = self.dr_hits.take();
                     if hits != 0 || self.single_step || tf {
                         let bs = if std::mem::take(&mut self.single_step) || tf {
                             DR6_BS
@@ -4265,11 +4272,12 @@ impl Vcpu for X86Interp {
     }
 
     fn rflags(&self) -> u64 {
-        self.rflags_word()
+        self.rflags_word() | (u64::from(self.rf) << 16)
     }
 
     fn set_rflags(&mut self, v: u64) {
         self.set_rflags_user(v);
+        self.rf = v & (1 << 16) != 0;
     }
 
     /// The standard-format `XSAVE` area of every `XCR0` component (64-bit
@@ -4395,7 +4403,7 @@ impl Vcpu for X86Interp {
         self.dr = *dr;
         let on = self.dr_slots(|_| true).next().is_some();
         self.dr_on = on;
-        self.dr_hits = 0;
+        self.dr_hits.set(0);
         true
     }
 
@@ -4405,7 +4413,7 @@ impl Vcpu for X86Interp {
         let mut child = self.clone();
         child.single_step = false;
         child.set_debug_regs(&[0; 8]);
-        child.bp_skip = None;
+        child.rf = false;
         Ok(Box::new(child))
     }
 
@@ -4418,6 +4426,7 @@ impl Vcpu for X86Interp {
         self.flags = Flags::default();
         self.df = false;
         self.rflags_sys = 0;
+        self.rf = false;
         self.fs_base = 0;
         self.gs_base = 0;
         // 64-bit mode, Linux's selectors, no TLS entries (`flush_thread`).
