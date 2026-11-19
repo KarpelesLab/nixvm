@@ -240,6 +240,20 @@ static void test_vdso_clocks(void)
     long k2 = raw_int80(SYS_clock_getres, 100, (long)&v, 0);
     CHECK(bad[0] == k0 && bad[1] == k1 && bad[2] == k2, "clock 100: vDSO %d %d %d, system calls %ld %ld %ld", bad[0],
           bad[1], bad[2], k0, k1, k2);
+    /* So do the clocks it doesn't compute: boot time, the alarm clocks,
+     * TAI, the removed 10, and the CPU clocks by pid (negative ids: the
+     * process's and the thread's own, a PROF clock, one past SCHED, and the
+     * process's by its pid), each as the system call has it. */
+    const int others[] = {7, 8, 9, 10, 11, 12, -6, -2, -8, -1, (int)((~(unsigned)getpid()) << 3) | 2};
+    for (unsigned i = 0; i < sizeof others / sizeof others[0]; i++) {
+        int c = others[i];
+        struct ts64 a64;
+        int r = cgt(c, &v), r64 = cgt64(c, &a64), rr = getres(c, &v);
+        long s = raw_int80(SYS_clock_gettime, c, (long)&v, 0), s64 = raw_int80(403, c, (long)&a64, 0);
+        long sr = raw_int80(SYS_clock_getres, c, (long)&v, 0);
+        CHECK(r == s && r64 == s64 && rr == sr, "clock %d: vDSO %d %d %d, system calls %ld %ld %ld", c, r, r64, rr, s,
+              s64, sr);
+    }
     struct tv32 tv, k;
     struct timezone tz = {77, 77}, ktz = {78, 78};
     CHECK(syscall(SYS_gettimeofday, &k, &ktz) == 0, "gettimeofday");

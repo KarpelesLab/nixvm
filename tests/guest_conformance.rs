@@ -54,6 +54,7 @@ const PROGRAMS: &[&str] = &[
     "unix_scm",
     "ptrace_ia32",
     "ptrace_regs",
+    "clocks",
 ];
 
 /// i386 programs (`gcc -m32 -static`), which the VM runs as ELFCLASS32
