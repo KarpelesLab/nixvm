@@ -216,12 +216,16 @@ pub(super) struct PtraceState {
     apply_gprs: bool,
     /// Take them before running user code again.
     apply_user: bool,
+    /// x86: the `rip`, `eflags`, `rcx` and `r11` the tracer left at a stop
+    /// inside a syscall, which the call returns with (Linux returns through
+    /// `iret` to whatever `pt_regs` hold then, not where `syscall` came
+    /// from).
+    ret_regs: Option<[u64; 4]>,
     event_msg: u64,
     /// The signal of a signal-delivery stop, as `PTRACE_GETSIGINFO` shows it.
     siginfo: [u8; 128],
     /// The FP/SIMD registers at the stop, in the vcpu's own layout (see
-    /// [`Vcpu::fp_state`]); empty at a syscall-entry/exit stop, which
-    /// doesn't capture them.
+    /// [`Vcpu::fp_state`]).
     fp: Vec<u8>,
     /// The tracer changed them: put them back before user code runs again.
     apply_fp: bool,
@@ -282,6 +286,7 @@ impl PtraceState {
             regs_dirty: false,
             apply_gprs: false,
             apply_user: false,
+            ret_regs: None,
             event_msg: 0,
             siginfo: [0; 128],
             fp: Vec::new(),
@@ -345,6 +350,19 @@ impl PtraceState {
         }
     }
 
+    /// The syscall's result is in the vcpu: return where the tracer said,
+    /// with the flags, `rcx` and `r11` it left, if it changed them at a stop
+    /// in the call.
+    pub(super) fn return_to(&mut self, vcpu: &mut dyn Vcpu) {
+        if let Some([rip, flags, rcx, r11]) = self.ret_regs.take() {
+            vcpu.settle_syscall_return();
+            vcpu.set_reg(1, rcx);
+            vcpu.set_reg(11, r11);
+            vcpu.set_rflags(flags);
+            vcpu.set_pc(rip);
+        }
+    }
+
     /// Whether to arm a single step now that the syscall has returned.
     pub(super) fn take_step_at_return(&mut self) -> bool {
         std::mem::take(&mut self.step_at_return)
@@ -369,6 +387,7 @@ impl PtraceState {
             && self.stop.is_none()
             && self.inject.is_none()
             && !self.apply_user
+            && self.ret_regs.is_none()
             && !self.apply_fp
             && !self.apply_tls
             && !self.step
@@ -1291,6 +1310,10 @@ impl Kernel {
             }
             Phase::User => t.apply_user = t.regs_dirty,
         }
+        if stop.phase != Phase::User && t.regs_dirty && arch == Arch::X86_64 {
+            let r = &t.regs;
+            t.ret_regs = Some([r[X86_RIP], r[X86_EFLAGS], r[X86_RCX], r[X86_R11]]);
+        }
         t.regs_dirty = false;
         let mut raise = None;
         if sig != 0 {
@@ -1577,11 +1600,17 @@ impl Kernel {
             t.tls = std::array::from_fn(|i| vcpu.tls_desc(i));
             t.apply_tls = false;
         }
-        t.fp = if matches!(kind, StopKind::Entry | StopKind::Exit) {
-            Vec::new()
-        } else {
-            vcpu.fp_state()
-        };
+        t.fp = vcpu.fp_state();
+        // A return the tracer redirected at an earlier stop of this call
+        // shows as it will happen.
+        if phase != Phase::User
+            && let Some([rip, flags, rcx, r11]) = t.ret_regs
+        {
+            t.regs[X86_RIP] = rip;
+            t.regs[X86_EFLAGS] = flags;
+            t.regs[X86_RCX] = rcx;
+            t.regs[X86_R11] = r11;
+        }
         t.stop = Some(Stop {
             kind,
             sig,
@@ -1898,6 +1927,7 @@ impl Kernel {
             // in user mode now, so these stops just resume it.
             let execed = t.execed.take();
             t.end_syscall();
+            t.ret_regs = None;
             let traced = t.tracer != 0;
             let exit_stop = traced && t.syscall_trace;
             let (options, seized) = (t.options, t.seized);
@@ -1962,6 +1992,7 @@ impl Kernel {
         if cx.restart_syscall {
             // It will run again from the start.
             t.end_syscall();
+            t.ret_regs = None;
             return None;
         }
         t.sc_result = Some(*ret);

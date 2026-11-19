@@ -3605,6 +3605,10 @@ impl Kernel {
                 // new image (resumes at its entry, no return value).
                 if !cx.block && !cx.exec_ok && !cx.restart_syscall {
                     vcpu.set_syscall_ret(ret as u64);
+                    // A tracer moved where it returns to.
+                    if let Some(t) = cx.cur.ptrace.as_mut() {
+                        t.return_to(vcpu);
+                    }
                 }
                 let delivered = if cx.block && cx.cur.seccomp.killable_wait() {
                     self.deliver_fatal_signals(cx, vcpu, mem)
