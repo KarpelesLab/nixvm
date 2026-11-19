@@ -368,6 +368,11 @@ struct ProcInfo {
     /// reported again on a later wait. Reset each time the task stops afresh (or
     /// is continued). Irrelevant across fork.
     stop_reported: bool,
+    /// It stopped in signal delivery on its way back to user mode: once
+    /// continued, delivery carries on before it runs any more user code, as
+    /// Linux's `get_signal` loops on after `do_signal_stop` (a tracer sees
+    /// the `SIGCONT` there, not at some later syscall).
+    signal_resume: bool,
     /// Per-signal disposition (handler address / `SIG_DFL` / `SIG_IGN`, plus the
     /// flags, restorer, and mask from `rt_sigaction`). Indexed by signal number
     /// (1..=64); index 0 is unused.
@@ -682,6 +687,7 @@ impl Default for ProcInfo {
             run: RunState::Running,
             continued: false,
             stop_reported: false,
+            signal_resume: false,
             handlers: SigHand::default(),
             rlimits: RLimits::default(),
             ns: ns::NsProxy::default(),
@@ -1461,7 +1467,9 @@ fn run_slice_smp(
     };
     // A task killed while it waited for this worker (another thread's `execve`
     // or `exit_group` took its process): it never runs again.
-    {
+    // Continued out of a stop in signal delivery, delivery goes on before
+    // any user code runs (see `ProcInfo::signal_resume`).
+    let mut resumed = {
         let mut sh = kernel.shared.lock().unwrap();
         if is_zombie(&sh, i) {
             return (i, vcpu, SliceOutcome::Ended);
@@ -1470,7 +1478,8 @@ fn run_slice_smp(
         if let Some(t) = sh.procs[i].as_mut().and_then(|p| p.info.ptrace.as_mut()) {
             t.resume_user(kernel.arch, vcpu.as_mut());
         }
-    }
+        sh.procs[i].as_ref().is_some_and(|p| p.info.signal_resume)
+    };
     loop {
         // Step start, for CPU-time accounting (charged in `smp_service_step`).
         let step_start = crate::clock::now_monotonic().as_nanos();
@@ -1488,7 +1497,10 @@ fn run_slice_smp(
         // distinct spaces (and locks), so this never serializes across processes.
         // The lock is dropped at the end of this block — before the service phase
         // re-acquires it — so a locked run never self-deadlocks.
-        let exit = {
+        let synthetic = std::mem::take(&mut resumed);
+        let exit = if synthetic {
+            Ok(Exit::Interrupted)
+        } else {
             let mut mem = space.lock().unwrap();
             if mem.exec_gen != image {
                 return (i, vcpu, SliceOutcome::Ended);
@@ -1523,7 +1535,7 @@ fn run_slice_smp(
         // worker would run that one task forever — never yielding its home
         // siblings a turn, and never letting the scheduler observe pid-1 exit or
         // drain the pool at shutdown.
-        let is_interrupt = matches!(exit, Exit::Interrupted);
+        let is_interrupt = matches!(exit, Exit::Interrupted) && !synthetic;
         // ---- service phase: hold the memory lock across the step (it is
         // outermost, and it serializes same-address-space siblings' service
         // phases). `smp_service_step` takes the kernel lock only briefly, for
@@ -3287,12 +3299,19 @@ impl Kernel {
             // stops accruing, so this tracks CPU rather than wall time.
             let step_start = crate::clock::now_monotonic().as_nanos();
             let io_before = cx.cur.io_progress;
-            let exit = vcpu.run(mem)?;
+            // Continued out of a stop in signal delivery: delivery goes on
+            // before any user code runs (see `ProcInfo::signal_resume`).
+            let resumed = cx.cur.signal_resume;
+            let exit = if resumed {
+                Exit::Interrupted
+            } else {
+                vcpu.run(mem)?
+            };
             // A time-quantum interrupt (mid-compute preemption) ends the slice,
             // as on the SMP path: otherwise a syscall-free hot loop keeps the
             // single CPU forever and its siblings — Go's sysmon, the thread a
             // `kill` woke, a timer's sleeper — never run.
-            let is_interrupt = matches!(exit, Exit::Interrupted);
+            let is_interrupt = matches!(exit, Exit::Interrupted) && !resumed;
             // Fire a due ITIMER_REAL / POSIX timer before servicing, so a
             // blocking syscall this step sees its signal pending and is
             // interrupted.
@@ -3671,8 +3690,11 @@ impl Kernel {
                 // a loop that makes no syscalls (an `alarm()`-bounded
                 // benchmark, Go's SIGURG preemption). Nothing is restarted
                 // here — clear the flag a previous syscall may have left.
+                // (Or the task was just continued out of a stop in signal
+                // delivery: its vcpu is still where that delivery was.)
+                let resumed = std::mem::take(&mut cx.cur.signal_resume);
                 if (cx.cur.pending & !cx.cur.blocked != 0 || Self::ptrace_wants_boundary(&cx.cur))
-                    && vcpu.async_signal_boundary()
+                    && (resumed || vcpu.async_signal_boundary())
                 {
                     cx.restart_syscall = false;
                     cx.block = false;
@@ -6088,6 +6110,7 @@ impl Kernel {
         info.pending = 0;
         info.queued_siginfo = [None; NSIG_SLOTS];
         info.rt_queue = BTreeMap::new();
+        info.signal_resume = false;
         info.sigsuspend_prev = None;
         info.wake_deadline = None;
         info.alarm_deadline = None;

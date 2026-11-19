@@ -936,6 +936,9 @@ impl Kernel {
         {
             cx.cur.run = RunState::Stopped(sig as i32);
             cx.cur.stop_reported = false;
+            // Out of a blocked or restarting call, the call itself comes
+            // back and delivers what is pending as it ends.
+            cx.cur.signal_resume = !cx.block && !cx.restart_syscall;
             // A pending SIGCONT is cancelled by an actual stop.
             cx.cur.pending &= !CONT_SIG_BIT;
             self.notify_parent_of_child_event(cx.cur.ppid);
@@ -1689,6 +1692,7 @@ fn is_default_ignored(sig: u64) -> bool {
 fn apply_stop_cont(info: &mut super::ProcInfo, sig: u64) -> Option<i32> {
     if sig == SIGCONT {
         info.pending &= !STOP_SIG_BITS; // a pending stop is cancelled by SIGCONT
+        Kernel::ptrace_trap_notify(info);
         if matches!(info.run, RunState::Stopped(_)) {
             info.run = RunState::Running;
             info.continued = true;

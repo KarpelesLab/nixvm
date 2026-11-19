@@ -56,6 +56,7 @@ const PTRACE_GETREGSET: u64 = 0x4204;
 const PTRACE_SETREGSET: u64 = 0x4205;
 const PTRACE_SEIZE: u64 = 0x4206;
 const PTRACE_INTERRUPT: u64 = 0x4207;
+const PTRACE_LISTEN: u64 = 0x4208;
 const PTRACE_GETSIGMASK: u64 = 0x420a;
 const PTRACE_SETSIGMASK: u64 = 0x420b;
 const PTRACE_GET_SYSCALL_INFO: u64 = 0x420e;
@@ -245,6 +246,15 @@ pub(super) struct PtraceState {
     step_at_return: bool,
     /// `PTRACE_INTERRUPT` asked for a stop.
     interrupt: bool,
+    /// Seized in a job-control stop: the stop signal, which the first
+    /// `PTRACE_EVENT_STOP` reports instead of `SIGTRAP` (`do_jobctl_trap`
+    /// in a group stop); 0 otherwise.
+    group_stop: u32,
+    /// A `SIGCONT` reached the seized tracee (`JOBCTL_TRAP_NOTIFY`): it
+    /// traps once more, with `PTRACE_EVENT_STOP`.
+    notify: bool,
+    /// Its tracer `PTRACE_LISTEN`s: stopped, until a notify wakes it.
+    listening: bool,
     /// A signal the tracer passed on, delivered without stopping again.
     pub(super) inject: Option<(u64, QueuedSig)>,
     // ---- how far the current syscall got ----
@@ -297,6 +307,9 @@ impl PtraceState {
             step: false,
             step_at_return: false,
             interrupt: false,
+            group_stop: 0,
+            notify: false,
+            listening: false,
             inject: None,
             sc_entered: false,
             sc_nr: None,
@@ -314,12 +327,45 @@ impl PtraceState {
 
     /// What the tracer side owns: changed by the tracer while the task may be
     /// out running on another CPU (see `smp_service_step`'s fold).
-    pub(super) fn link(&self) -> (i32, u32, bool, bool) {
-        (self.tracer, self.options, self.seized, self.interrupt)
+    pub(super) fn link(&self) -> (i32, u32, bool, bool, u32, bool) {
+        (
+            self.tracer,
+            self.options,
+            self.seized,
+            self.interrupt,
+            self.group_stop,
+            self.notify,
+        )
     }
 
-    pub(super) fn set_link(&mut self, link: (i32, u32, bool, bool)) {
-        (self.tracer, self.options, self.seized, self.interrupt) = link;
+    pub(super) fn set_link(&mut self, link: (i32, u32, bool, bool, u32, bool)) {
+        (
+            self.tracer,
+            self.options,
+            self.seized,
+            self.interrupt,
+            self.group_stop,
+            self.notify,
+        ) = link;
+    }
+
+    /// A `PTRACE_EVENT_STOP` trap is due (`JOBCTL_TRAP_MASK`).
+    fn trap_due(&self) -> bool {
+        self.tracer != 0 && (self.interrupt || self.notify)
+    }
+
+    /// Take the trap that is due: the signal it reports, the job-control
+    /// stop it was seized in or `SIGTRAP`. The trap for a seize in a group
+    /// stop was due before anything since, so a notify stays for the next.
+    fn take_trap(&mut self) -> u32 {
+        self.interrupt = false;
+        match std::mem::take(&mut self.group_stop) {
+            0 => {
+                self.notify = false;
+                SIGTRAP
+            }
+            sig => sig,
+        }
     }
 
     /// Before the task runs user code again: what its tracer changed while
@@ -859,15 +905,35 @@ impl Kernel {
                 t.interrupt = true;
                 p.parked = false;
                 p.kick.kick();
+            } else if t.listening {
+                // Out of `PTRACE_LISTEN` into a new trap.
+                t.interrupt = true;
+                Self::ptrace_wake_listener(p);
             }
             return 0;
         }
-        // Everything else needs the tracee stopped.
-        let stopped = sh.procs[idx]
-            .as_ref()
-            .is_some_and(|p| p.info.run == RunState::Traced && !p.info.in_flight);
+        // Everything else needs the tracee stopped (and not listening).
+        let stopped = sh.procs[idx].as_ref().is_some_and(|p| {
+            p.info.run == RunState::Traced
+                && !p.info.in_flight
+                && !p.info.ptrace.as_ref().is_some_and(|t| t.listening)
+        });
         if !stopped {
             return err(Errno::ESRCH);
+        }
+        if req == PTRACE_LISTEN {
+            // Only from a `PTRACE_EVENT_STOP` of a seized tracee: it stays
+            // stopped until a notify, which may have come already.
+            let p = &mut sh.procs[idx].as_mut().unwrap().info;
+            let t = p.ptrace.as_mut().unwrap();
+            if !t.seized || !t.stop.is_some_and(|s| s.event == EVENT_STOP) {
+                return err(Errno::EIO);
+            }
+            t.listening = true;
+            if t.notify {
+                Self::ptrace_wake_listener(p);
+            }
+            return 0;
         }
         let arch = self.arch;
         // Through the i386 entry (`compat_sys_ptrace`): words and the
@@ -1248,6 +1314,14 @@ impl Kernel {
         if req == PTRACE_SEIZE {
             t.seized = true;
             t.options = data as u32;
+            // Seized in a job-control stop: it traps at once, reporting the
+            // stop (`ptrace_attach` sets `JOBCTL_TRAP_STOP` and kicks it).
+            if let RunState::Stopped(sig) = p.run {
+                t.interrupt = true;
+                t.group_stop = sig as u32;
+                p.run = RunState::Running;
+                p.parked = false;
+            }
         }
         p.ptrace = Some(t);
         if req == PTRACE_ATTACH {
@@ -1274,6 +1348,39 @@ impl Kernel {
             && [t.egid, t.sgid, t.rgid].iter().all(|&g| g == c.rgid);
         let capable = self.ns_capable(cx, target.ns.user, CAP_SYS_PTRACE);
         capable || (same_user && target.dumpable == 1)
+    }
+
+    /// `SIGCONT` reached `p`: a seized tracee traps again
+    /// (`ptrace_trap_notify`), at once if its tracer listens.
+    pub(super) fn ptrace_trap_notify(p: &mut ProcInfo) {
+        let Some(t) = p.ptrace.as_mut() else {
+            return;
+        };
+        if t.tracer == 0 || !t.seized {
+            return;
+        }
+        t.notify = true;
+        if t.listening && p.run == RunState::Traced {
+            Self::ptrace_wake_listener(p);
+        } else {
+            p.parked = false;
+            p.kick.kick();
+        }
+    }
+
+    /// A listening tracee goes on into the trap that is due, its stop
+    /// otherwise left as `PTRACE_LISTEN` found it (still tracing syscalls,
+    /// say).
+    fn ptrace_wake_listener(p: &mut ProcInfo) {
+        let t = p.ptrace.as_mut().unwrap();
+        t.listening = false;
+        let syscall_trace = t.syscall_trace;
+        // (A `PTRACE_EVENT_STOP` is never inside a call whose number or
+        // result the arch would say where to find.)
+        Self::ptrace_resume(Arch::X86_64, p, 0, Resume::Cont);
+        if let Some(t) = p.ptrace.as_mut() {
+            t.syscall_trace = syscall_trace;
+        }
     }
 
     /// Let tracee `p` go from its stop, passing `sig` on (0: none).
@@ -1346,6 +1453,9 @@ impl Kernel {
             t.syscall_trace = false;
             t.queued = None;
             t.interrupt = false;
+            t.group_stop = 0;
+            t.notify = false;
+            t.listening = false;
         } else if let Some(q) = t.queued.take()
             && (q.kind != StopKind::Exit || mode == Resume::Syscall)
         {
@@ -1748,6 +1858,9 @@ impl Kernel {
             Phase::User
         };
         self.ptrace_stop(cx, vcpu, StopKind::Signal, sig as u32, 0, phase, None);
+        // On the way to user mode, delivery goes on from here once resumed:
+        // the signal the tracer passes on, then the others pending.
+        cx.cur.signal_resume = phase == Phase::User;
         Err(())
     }
 
@@ -1799,12 +1912,13 @@ impl Kernel {
             cx.restart_syscall = false;
         }
         let t = cx.cur.ptrace.as_mut().unwrap();
-        if t.tracer != 0 && std::mem::take(&mut t.interrupt) {
+        if t.trap_due() {
+            let sig = t.take_trap();
             self.ptrace_stop(
                 cx,
                 vcpu,
                 StopKind::Event,
-                SIGTRAP,
+                sig,
                 EVENT_STOP,
                 Phase::Before,
                 None,
@@ -2062,18 +2176,22 @@ impl Kernel {
         let Some(t) = cx.cur.ptrace.as_mut() else {
             return false;
         };
-        if t.tracer == 0 || !std::mem::take(&mut t.interrupt) {
+        if !t.trap_due() {
             return false;
         }
+        let sig = t.take_trap();
         self.ptrace_stop(
             cx,
             vcpu,
             StopKind::Event,
-            SIGTRAP,
+            sig,
             EVENT_STOP,
             Phase::User,
             None,
         );
+        // Signals pending are delivered once resumed, before user code (the
+        // trap is taken in `get_signal`, which goes on dequeuing).
+        cx.cur.signal_resume = true;
         true
     }
 
@@ -2081,7 +2199,7 @@ impl Kernel {
     pub(super) fn ptrace_wants_boundary(p: &ProcInfo) -> bool {
         p.ptrace
             .as_ref()
-            .is_some_and(|t| t.interrupt || t.inject.is_some())
+            .is_some_and(|t| t.trap_due() || t.inject.is_some())
     }
 
     /// Ptrace state for a new task made by `parent` (traced) with `flags`:
@@ -2276,6 +2394,9 @@ impl Kernel {
             t.seized = false;
             t.syscall_trace = false;
             t.interrupt = false;
+            t.group_stop = 0;
+            t.notify = false;
+            t.listening = false;
             t.queued = None;
             if let Some(stop) = t.stop.take() {
                 // Let it go as a plain resume would.
