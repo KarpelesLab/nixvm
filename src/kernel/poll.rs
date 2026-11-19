@@ -91,6 +91,9 @@ pub(super) struct EventFdInst {
 /// disarmed; `expirations` accumulates until drained by `read`.
 #[derive(Debug, Default)]
 pub(super) struct TimerFdInst {
+    /// The clock `timerfd_create` was given: what an absolute expiry
+    /// (`TFD_TIMER_ABSTIME`) is a time on.
+    clock: Option<super::time::Clock>,
     expiry_ns: Option<u128>,
     interval_ns: u128,
     expirations: u64,
@@ -1189,19 +1192,42 @@ impl Kernel {
 
     // ---- timerfd ------------------------------------------------------------
 
-    /// `timerfd_create(clockid, flags)` — `clockid` is accepted but ignored
-    /// (there is only the one host wall clock).
+    /// `timerfd_create(clockid, flags)`: on `CLOCK_REALTIME`,
+    /// `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` or their `*_ALARM` twins (with
+    /// `CAP_WAKE_ALARM`, `EPERM` without), as Linux allows; any other clock or
+    /// flag is `EINVAL`. The timer counts down on the host wall clock; the
+    /// clock says what an absolute expiry is a time on.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_timerfd_create(
         &self,
         pf: &mut PollFds,
         cx: &mut ServiceCtx,
-        _clockid: u64,
+        clockid: u64,
         flags: u64,
     ) -> i64 {
+        use super::time::Clock;
         const TFD_NONBLOCK: u64 = 0o4000;
+        const TFD_CLOEXEC: u64 = 0o2000000;
+        let clock = Clock::decode(clockid);
+        let allowed = matches!(
+            clock,
+            Some(
+                Clock::Realtime
+                    | Clock::Monotonic
+                    | Clock::Boottime
+                    | Clock::RealtimeAlarm
+                    | Clock::BoottimeAlarm
+            )
+        );
+        if flags as u32 & !((TFD_NONBLOCK | TFD_CLOEXEC) as u32) != 0 || !allowed {
+            return err(Errno::EINVAL);
+        }
+        if clock.is_some_and(Clock::is_alarm) && !Self::may_wake_alarm(cx) {
+            return err(Errno::EPERM);
+        }
         let idx = pf.timerfds.len();
         pf.timerfds.push(TimerFdInst {
+            clock,
             expiry_ns: None,
             interval_ns: 0,
             expirations: 0,
@@ -1269,7 +1295,11 @@ impl Kernel {
         mem: &mut GuestMemory,
     ) -> i64 {
         const TFD_TIMER_ABSTIME: u64 = 1;
+        const TFD_TIMER_CANCEL_ON_SET: u64 = 2;
 
+        if flags as u32 & !((TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) as u32) != 0 {
+            return err(Errno::EINVAL);
+        }
         let Some(Fd::Timerfd(i)) = cx.cur.fds.get(fd as i32).cloned() else {
             return err(Errno::EBADF);
         };
@@ -1279,7 +1309,11 @@ impl Kernel {
         let Some((val_sec, val_nsec)) = read_timespec(mem, new_value + 16) else {
             return err(Errno::EFAULT);
         };
-        if int_nsec >= 1_000_000_000 || val_nsec >= 1_000_000_000 {
+        if int_nsec >= 1_000_000_000
+            || val_nsec >= 1_000_000_000
+            || (int_sec as i64) < 0
+            || (val_sec as i64) < 0
+        {
             return err(Errno::EINVAL);
         }
 
@@ -1302,7 +1336,14 @@ impl Kernel {
         pf.timerfds[i].expiry_ns = if value_ns == 0 {
             None
         } else if flags & TFD_TIMER_ABSTIME != 0 {
-            Some(value_ns)
+            // A time on the timer's clock, as a wall-clock deadline: a past
+            // one expires at once.
+            let now = now_ns();
+            let clock_now = pf.timerfds[i]
+                .clock
+                .and_then(|c| c.now(self.time_offsets_for(cx)))
+                .map_or(now, |d| d.as_nanos());
+            Some(now + value_ns.saturating_sub(clock_now))
         } else {
             Some(now_ns() + value_ns)
         };
@@ -1356,6 +1397,8 @@ impl Kernel {
             if pf.timerfds[i].nonblock {
                 return err(Errno::EAGAIN);
             }
+            // Asleep until the next expiration (for ever while disarmed).
+            cx.cur.wake_deadline = pf.timerfds[i].expiry_ns;
             cx.block = true;
             return 0;
         }
