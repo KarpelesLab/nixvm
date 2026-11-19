@@ -315,6 +315,28 @@ static void sigcont_checks(void) {
   ptrace(PTRACE_DETACH, c, 0, 0);
   st = wait_for(c);
   CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "exit %#x", st);
+
+  /* An old-style tracer's exec SIGTRAP comes right after the execve's exit
+   * stop, before the new image makes a call. */
+  c = fork();
+  if (c == 0) {
+    ptrace(PTRACE_TRACEME, 0, 0, 0);
+    raise(SIGSTOP);
+    char *argv[] = {"ptrace_regs", "idle", 0};
+    execv("/proc/self/exe", argv);
+    _exit(98);
+  }
+  st = wait_for(c);
+  ptrace(PTRACE_SETOPTIONS, c, 0, PTRACE_O_TRACESYSGOOD | PTRACE_O_EXITKILL);
+  CHECK(to_entry(c, __NR_execve), "no execve entry stop");
+  CHECK(to_exit(c), "no execve exit stop");
+  ptrace(PTRACE_GETREGS, c, 0, &r);
+  CHECK(r.orig_rax == __NR_execve && r.rax == 0, "execve exit: %lld %lld",
+        (long long)r.orig_rax, (long long)r.rax);
+  ptrace(PTRACE_SYSCALL, c, 0, 0);
+  st = wait_for(c);
+  CHECK(WIFSTOPPED(st) && WSTOPSIG(st) == SIGTRAP, "after execve: %#x", st);
+  CHECK(finish(c) == 0, "exec run");
 }
 
 /* ---- FP state at syscall stops -------------------------------------------- */
@@ -660,7 +682,9 @@ static void dr_hits(void) {
         "after a detach, the breakpoint: %#x", st);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+  if (argc > 1 && strcmp(argv[1], "idle") == 0)
+    return 0;
   setvbuf(stdout, 0, _IONBF, 0);
   errno_checks();
   sigcont_checks();
