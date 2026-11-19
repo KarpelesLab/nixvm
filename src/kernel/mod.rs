@@ -5680,8 +5680,9 @@ impl Kernel {
             Sysno::RtSigtimedwait => self.sys_rt_sigtimedwait(cx, args[0], args[1], args[2], mem),
             // `pid`/`tid` is a 32-bit int: `as i32 as i64` recovers a negative
             // `kill(-pgrp)` the guest passed zero-extended as `0xFFFF_FFFF`.
-            Sysno::Kill | Sysno::Tkill => self.sys_kill(sh, cx, i64::from(args[0] as i32), args[1]),
-            Sysno::Tgkill => self.sys_kill(sh, cx, i64::from(args[1] as i32), args[2]),
+            Sysno::Kill => self.sys_kill(sh, cx, i64::from(args[0] as i32), args[1]),
+            Sysno::Tkill => self.sys_tkill(sh, cx, i64::from(args[0] as i32), args[1]),
+            Sysno::Tgkill => self.sys_tkill(sh, cx, i64::from(args[1] as i32), args[2]),
             // sigqueue/pthread_sigqueue: deliver the signal and carry its
             // siginfo (si_code/si_value) so an SA_SIGINFO handler sees the real
             // payload. tgsigqueueinfo targets a tid (args: tgid, tid, sig, uinfo).

@@ -599,12 +599,38 @@ impl Kernel {
     /// `pid > 0` a single process, `pid == 0` the caller's process group,
     /// `pid == -1` every process (sparing init), `pid < -1` process group `-pid`.
     /// `sig == 0` sends nothing but still reports `ESRCH` when no target exists.
-    /// (`tkill`/`tgkill` reach here too — they always pass a positive tid, so only
-    /// the single-target branch fires.)
     pub(super) fn sys_kill(&self, sh: &mut Shared, cx: &mut ServiceCtx, pid: i64, sig: u64) -> i64 {
+        self.kill_with_code(sh, cx, pid, sig, 0)
+    }
+
+    /// `tkill`/`tgkill`: as `kill` of one thread (a positive tid, or
+    /// `EINVAL`), but the info says `SI_TKILL`.
+    pub(super) fn sys_tkill(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        tid: i64,
+        sig: u64,
+    ) -> i64 {
+        const SI_TKILL: i32 = -6;
+        if tid <= 0 {
+            return err(Errno::EINVAL);
+        }
+        self.kill_with_code(sh, cx, tid, sig, SI_TKILL)
+    }
+
+    /// `kill` with `code` as the info's `si_code`.
+    fn kill_with_code(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        pid: i64,
+        sig: u64,
+        code: i32,
+    ) -> i64 {
         // A bare kill carries SI_USER (code 0) with the sender's pid.
         let sender = super::QueuedSig {
-            code: 0,
+            code,
             pid: cx.cur.tgid,
             uid: cx.cur.creds.ruid,
             value: 0,
