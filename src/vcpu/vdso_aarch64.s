@@ -16,11 +16,11 @@
 // ---- __kernel_clock_gettime(clockid_t id in x0, struct timespec *ts in x1) ----
 .globl __kernel_clock_gettime
 __kernel_clock_gettime:
-    cmp     x0, #6
+    cmp     w0, #6
     b.hi    1f
-    cmp     x0, #2
+    cmp     w0, #2
     b.eq    1f
-    cmp     x0, #3
+    cmp     w0, #3
     b.eq    1f
     ldr     x9, vvar
     ldr     x10, [x9, #8]          // mult; 0 = uncalibrated
@@ -36,8 +36,8 @@ __kernel_clock_gettime:
     neg     x15, x15
     lsl     x14, x14, x15          // hi << (64 - shift)
     orr     x13, x13, x14          // ns since the base
-    cmp     x0, #0                 // REALTIME
-    ccmp    x0, #5, #4, ne         // or REALTIME_COARSE
+    cmp     w0, #0                 // REALTIME
+    ccmp    w0, #5, #4, ne         // or REALTIME_COARSE
     ldr     x12, [x9, #32]         // base monotonic ns
     ldr     x14, [x9, #40]         // base wall ns
     csel    x12, x14, x12, eq

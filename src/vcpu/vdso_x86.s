@@ -19,15 +19,18 @@
 # ---- __vdso_clock_gettime(clockid_t id in rdi, struct timespec *ts in rsi) ----
 # Fast-path only the wall/monotonic clocks the vvar calibration covers:
 #   0 REALTIME, 1 MONOTONIC, 4 MONOTONIC_RAW, 5 REALTIME_COARSE, 6 MONOTONIC_COARSE.
-# CPU-time clocks (2,3), BOOTTIME/TAI/etc (>6), and an uncalibrated vvar fall
-# through to the real syscall — exactly what the kernel vDSO does.
+# CPU-time clocks (2,3), BOOTTIME/TAI/etc (>6), the negative ids of the
+# dynamic CPU clocks, and an uncalibrated vvar fall through to the real
+# syscall, which checks the id — exactly what the kernel vDSO does. The id is
+# a 32-bit clockid_t (edi; the upper half of rdi is garbage), compared
+# unsigned as the kernel's `(u32)clock < MAX_CLOCKS` does.
 .globl __vdso_clock_gettime
 __vdso_clock_gettime:
-    cmp    rdi, 6
+    cmp    edi, 6
     ja     .Lcg_sys
-    cmp    rdi, 2
+    cmp    edi, 2
     je     .Lcg_sys
-    cmp    rdi, 3
+    cmp    edi, 3
     je     .Lcg_sys
     movabs r8, VVAR_SENTINEL
     cmp    qword ptr [r8+8], 0        # mult == 0 -> uncalibrated
@@ -39,9 +42,9 @@ __vdso_clock_gettime:
     mul    qword ptr [r8+8]           # * mult -> rdx:rax
     mov    cl, [r8+16]                # shift
     shrd   rax, rdx, cl               # >> shift  (ns since base_tsc)
-    cmp    rdi, 0                      # REALTIME
+    cmp    edi, 0                      # REALTIME
     je     .Lcg_wall
-    cmp    rdi, 5                      # REALTIME_COARSE
+    cmp    edi, 5                      # REALTIME_COARSE
     je     .Lcg_wall
     add    rax, [r8+32]               # + base_mono_ns
     jmp    .Lcg_split
@@ -103,11 +106,11 @@ __vdso_gettimeofday:
 # clocks fall through to the syscall.
 .globl __vdso_clock_getres
 __vdso_clock_getres:
-    cmp    rdi, 6
+    cmp    edi, 6
     ja     .Lcgr_sys
-    cmp    rdi, 2
+    cmp    edi, 2
     je     .Lcgr_sys
-    cmp    rdi, 3
+    cmp    edi, 3
     je     .Lcgr_sys
     test   rsi, rsi                   # res may be NULL
     je     .Lcgr_ok
