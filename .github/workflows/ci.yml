@@ -196,13 +196,16 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           # ptrace_ia32 traces the i386 ptrace32 when it's next to it.
           gcc -m32 -static -O2 -pthread -o "$RUNNER_TEMP/ptrace32" tests/guest/ptrace32.c
-          for p in cgroups rlimits sched exec fifo devfd threads_mm dualstack madvise execthread epoll_et epoll_order userns_caps sandbox_fs ptrace seccomp_notify cpu_traps creation memfd sysv_shm ptrace_debug threadwait connect_again pty exit_race unix_scm ptrace_ia32; do
+          gcc -m32 -static -O2 -pthread -o "$RUNNER_TEMP/ptrace_regs32" tests/guest/ptrace_regs32.c
+          for p in cgroups rlimits sched exec fifo devfd threads_mm dualstack madvise execthread epoll_et epoll_order userns_caps sandbox_fs ptrace seccomp_notify cpu_traps creation memfd sysv_shm ptrace_debug threadwait connect_again pty exit_race unix_scm ptrace_ia32 ptrace_regs; do
             gcc -static -O2 -pthread -o "$RUNNER_TEMP/$p" "tests/guest/$p.c"
             echo "== $p"
             sudo "$RUNNER_TEMP/$p"
           done
           echo "== ptrace32"
           sudo "$RUNNER_TEMP/ptrace32"
+          echo "== ptrace_regs32"
+          sudo "$RUNNER_TEMP/ptrace_regs32"
 
       # Pull real images from Docker Hub and run them as `docker run` would.
       - name: Pull and run Docker images
