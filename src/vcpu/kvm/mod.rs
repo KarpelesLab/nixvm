@@ -82,9 +82,9 @@ mod tests {
     /// run on a loaded host before the guest gets anywhere, which is fine.
     fn run_past_preemption(v: &mut Box<dyn crate::vcpu::Vcpu>, mem: &mut GuestMemory) -> Exit {
         loop {
-            match v.run(mem).unwrap() {
-                Exit::Interrupted => continue,
-                exit => return exit,
+            let exit = v.run(mem).unwrap();
+            if exit != Exit::Interrupted {
+                return exit;
             }
         }
     }
