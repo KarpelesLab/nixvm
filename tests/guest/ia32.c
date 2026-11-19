@@ -500,6 +500,52 @@ static void test_sockets(void)
         CHECK(read(p[0], &z, 1) == 1 && z == 'z', "passed fd is the pipe");
         close(nfd);
     }
+    /* Three descriptors and room for two: the third is closed, not
+     * installed, and the message says MSG_CTRUNC (scm_detach_fds_compat). */
+    {
+        uint64_t open_before = 0, open_after = 0;
+        for (int fd = 0; fd < 64; fd++)
+            if (fcntl(fd, F_GETFD) != -1)
+                open_before |= 1ull << fd;
+        union { char buf[CMSG_SPACE(3 * sizeof(int))]; struct cmsghdr align; } su;
+        struct msghdr sm = {0};
+        struct iovec sio = {data, 2};
+        sm.msg_iov = &sio;
+        sm.msg_iovlen = 1;
+        sm.msg_control = su.buf;
+        sm.msg_controllen = sizeof su.buf;
+        struct cmsghdr *sc = CMSG_FIRSTHDR(&sm);
+        sc->cmsg_level = SOL_SOCKET;
+        sc->cmsg_type = SCM_RIGHTS;
+        sc->cmsg_len = CMSG_LEN(3 * sizeof(int));
+        int three[3] = {p[0], p[1], p[0]};
+        memcpy(CMSG_DATA(sc), three, sizeof three);
+        CHECK(sendmsg(dg[0], &sm, 0) == 2, "sendmsg of three fds");
+        union { char buf[CMSG_SPACE(2 * sizeof(int))]; struct cmsghdr align; } tu;
+        struct msghdr tm = {0};
+        struct iovec tio = {got, sizeof got};
+        tm.msg_iov = &tio;
+        tm.msg_iovlen = 1;
+        tm.msg_control = tu.buf;
+        tm.msg_controllen = sizeof tu.buf;
+        CHECK(recvmsg(dg[1], &tm, 0) == 2, "recvmsg of three fds");
+        CHECK(tm.msg_flags & MSG_CTRUNC, "MSG_CTRUNC: flags %#x", tm.msg_flags);
+        struct cmsghdr *tc = CMSG_FIRSTHDR(&tm);
+        CHECK(tc && tc->cmsg_type == SCM_RIGHTS &&
+                  tc->cmsg_len == CMSG_LEN(2 * sizeof(int)),
+              "truncated cmsg len %u", tc ? (unsigned)tc->cmsg_len : 0);
+        if (tc) {
+            int two[2];
+            memcpy(two, CMSG_DATA(tc), sizeof two);
+            close(two[0]);
+            close(two[1]);
+        }
+        for (int fd = 0; fd < 64; fd++)
+            if (fcntl(fd, F_GETFD) != -1)
+                open_after |= 1ull << fd;
+        CHECK(open_after == open_before, "descriptors leaked: %#llx",
+              (unsigned long long)(open_after & ~open_before));
+    }
     /* sendmmsg/recvmmsg: 32-byte mmsghdrs. */
     struct mmsghdr mm[3];
     struct iovec mio[3];

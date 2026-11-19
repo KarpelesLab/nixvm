@@ -12,6 +12,7 @@ type R = Result<i64, i64>;
 /// `MSG_CTRUNC`, `MSG_DONTWAIT`.
 const MSG_CTRUNC: u64 = 0x8;
 const SOL_SOCKET: u64 = 1;
+const SCM_RIGHTS: u64 = 1;
 /// `IPC_64`: the caller uses the `*64_ds` structures.
 const IPC_64: u64 = 0x100;
 
@@ -1224,7 +1225,15 @@ impl Kernel {
     /// Back to the caller's `msghdr` after a receive: the name's length, the
     /// control messages (narrowed, `MSG_CTRUNC` if they don't fit) and the
     /// flags.
-    fn msg_out(mem: &mut GuestMemory, m: &Msg) -> Result<(), i64> {
+    ///
+    /// The descriptors of an `SCM_RIGHTS` that didn't fit are closed.
+    fn msg_out(
+        &self,
+        cx: &mut ServiceCtx,
+        vcpu: &mut dyn Vcpu,
+        mem: &mut GuestMemory,
+        m: &Msg,
+    ) -> Result<(), i64> {
         let n = mem.read_vec(m.native, 56).map_err(efault)?;
         let mut flags = r32(&n, 48);
         mem.write(m.user + 4, &n[8..12]).map_err(efault)?;
@@ -1232,9 +1241,12 @@ impl Kernel {
         if m.control64 != 0 {
             let len = r64(&n, 40).min(1 << 17);
             let raw = mem.read_vec(m.control64, len as usize).map_err(efault)?;
-            let (c, trunc) = cmsgs_narrow(&raw, m.controllen32 as usize);
+            let (c, trunc, lost) = cmsgs_narrow(&raw, m.controllen32 as usize);
             if trunc {
                 flags |= MSG_CTRUNC;
+            }
+            for fd in lost {
+                self.native(cx, 3, [fd as u64, 0, 0, 0, 0, 0], false, vcpu, mem);
             }
             mem.write(m.control32, &c).map_err(efault)?;
             used = c.len() as u64;
@@ -1269,7 +1281,7 @@ impl Kernel {
         let m = self.msg_in(cx, &mut sc, a[1], false, mem)?;
         let r = self.native(cx, 47, [sx(a[0]), m.native, a[2], 0, 0, 0], true, vcpu, mem);
         if r >= 0 && !cx.block {
-            Self::msg_out(mem, &m)?;
+            self.msg_out(cx, vcpu, mem, &m)?;
         }
         Ok(r)
     }
@@ -1316,7 +1328,7 @@ impl Kernel {
         let r = self.native(cx, 299, [sx(a[0]), vec, n, a[3], ts, 0], true, vcpu, mem);
         if r > 0 && !cx.block {
             for (i, m) in msgs.iter().enumerate().take(r as usize) {
-                Self::msg_out(mem, m)?;
+                self.msg_out(cx, vcpu, mem, m)?;
                 let len = mem.read_u32(vec + i as u64 * 64 + 56).map_err(efault)?;
                 mem.write(m.user + 28, &len.to_le_bytes()).map_err(efault)?;
             }
@@ -1465,10 +1477,16 @@ fn cmsgs_widen(c: &[u8]) -> Result<Vec<u8>, i64> {
 }
 
 /// The caller's control messages for x86-64's, as many as fit in `room`
-/// bytes (and whether some didn't), with the old timestamps' `timeval`s and
-/// `timespec`s narrowed (`put_cmsg_compat`).
-fn cmsgs_narrow(n: &[u8], room: usize) -> (Vec<u8>, bool) {
+/// bytes (and whether some didn't: `MSG_CTRUNC`), with the old timestamps'
+/// `timeval`s and `timespec`s narrowed (`put_cmsg_compat`). An
+/// `SCM_RIGHTS` that doesn't fit keeps the descriptors that do
+/// (`scm_detach_fds_compat`); the others, which the x86-64 receive
+/// installed, are returned for the caller to close: Linux never installs
+/// them.
+fn cmsgs_narrow(n: &[u8], room: usize) -> (Vec<u8>, bool, Vec<i32>) {
     let mut out = Vec::new();
+    let mut lost = Vec::new();
+    let mut trunc = false;
     let mut off = 0;
     while off + 16 <= n.len() {
         let len = r64(n, off) as usize;
@@ -1476,10 +1494,23 @@ fn cmsgs_narrow(n: &[u8], room: usize) -> (Vec<u8>, bool) {
             break;
         }
         let (level, ty) = (r32(n, off + 8), r32(n, off + 12));
-        let raw = &n[off + 16..off + len];
+        let (at, raw) = (off, &n[off + 16..off + len]);
+        off += len.next_multiple_of(8);
+        let rights = level == SOL_SOCKET && ty == SCM_RIGHTS;
+        if trunc {
+            if rights {
+                lost.extend(
+                    raw.as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|f| i32::from_le_bytes(*f)),
+                );
+            }
+            continue;
+        }
         // SO_TIMESTAMP_OLD (a timeval), SO_TIMESTAMPNS_OLD (a timespec),
         // SO_TIMESTAMPING_OLD (three timespecs).
-        let data: Vec<u8> = if level == SOL_SOCKET && matches!(ty, 29 | 35 | 37) {
+        let mut data: Vec<u8> = if level == SOL_SOCKET && matches!(ty, 29 | 35 | 37) {
             raw.chunks(16)
                 .filter(|t| t.len() == 16)
                 .flat_map(|t| l::TIMESPEC.narrow(t).unwrap_or_default())
@@ -1487,21 +1518,37 @@ fn cmsgs_narrow(n: &[u8], room: usize) -> (Vec<u8>, bool) {
         } else {
             raw.to_vec()
         };
-        let clen = 12 + data.len();
-        if out.len() + clen > room {
-            return (out, true);
+        if out.len() + 12 + data.len() > room {
+            trunc = true;
+            if !rights {
+                continue;
+            }
+            // The descriptors that fit after the header.
+            let fit = room.saturating_sub(out.len() + 12) / 4;
+            let fit = fit.min(data.len() / 4);
+            lost.extend(
+                data[fit * 4..]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|f| i32::from_le_bytes(*f)),
+            );
+            if fit == 0 {
+                continue;
+            }
+            data.truncate(fit * 4);
         }
+        let clen = 12 + data.len();
         let start = out.len();
         out.resize(start + 12, 0);
         w32(&mut out, start, clen as u64);
-        out[start + 4..start + 12].copy_from_slice(&n[off + 8..off + 16]);
+        out[start + 4..start + 12].copy_from_slice(&n[at + 8..at + 16]);
         out.extend_from_slice(&data);
         if out.len().next_multiple_of(4) <= room {
             out.resize(out.len().next_multiple_of(4), 0);
         }
-        off += len.next_multiple_of(8);
     }
-    (out, false)
+    (out, trunc, lost)
 }
 
 #[cfg(test)]
@@ -1520,11 +1567,29 @@ mod tests {
         assert_eq!(n.len(), 24);
         assert_eq!(r64(&n, 0), 20);
         assert_eq!(r32(&n, 16), 7);
-        let (back, trunc) = cmsgs_narrow(&n, 64);
+        let (back, trunc, _) = cmsgs_narrow(&n, 64);
         assert!(!trunc);
         assert_eq!(back, c);
-        let (none, trunc) = cmsgs_narrow(&n, 8);
+        let (none, trunc, lost) = cmsgs_narrow(&n, 8);
         assert!(trunc && none.is_empty());
+        assert_eq!(lost, [7]);
+    }
+
+    #[test]
+    fn descriptors_that_dont_fit_are_given_back() {
+        // SCM_RIGHTS with fds 5, 6, 7 (28 bytes there) and room for two.
+        let mut n = vec![0u8; 32];
+        w64(&mut n, 0, 28);
+        w32(&mut n, 8, SOL_SOCKET);
+        w32(&mut n, 12, SCM_RIGHTS);
+        for (i, fd) in [5, 6, 7].into_iter().enumerate() {
+            w32(&mut n, 16 + i * 4, fd);
+        }
+        let (c, trunc, lost) = cmsgs_narrow(&n, 20);
+        assert!(trunc);
+        assert_eq!(lost, [7]);
+        assert_eq!((r32(&c, 0), c.len()), (20, 20));
+        assert_eq!((r32(&c, 12), r32(&c, 16)), (5, 6));
     }
 
     #[test]
