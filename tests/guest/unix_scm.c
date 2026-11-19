@@ -5,7 +5,9 @@
  * SO_PASSCRED; MSG_CTRUNC closing what doesn't fit; MSG_CMSG_CLOEXEC; the
  * SCM_MAX_FD limit; EBADF; empty datagrams that carry descriptors; in-flight
  * descriptors living until received or their queue goes away, a socket sent
- * over itself included; and sendmmsg/recvmmsg with control data. */
+ * over itself included; sendmmsg/recvmmsg with control data; and SCM_PIDFD
+ * with SO_PASSPIDFD (after the other messages, whole or not at all, for a
+ * sender alive or gone) and SO_PEERPIDFD. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -15,9 +17,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef SO_PASSPIDFD
+#define SO_PASSPIDFD 76
+#endif
+#ifndef SO_PEERPIDFD
+#define SO_PEERPIDFD 77
+#endif
+#ifndef SCM_PIDFD
+#define SCM_PIDFD 0x04
+#endif
+#ifndef P_PIDFD
+#define P_PIDFD 3
+#endif
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL: %s (line %d, errno %d)\n", #c, __LINE__, errno); exit(1); } } while (0)
 
@@ -55,6 +74,11 @@ struct got {
   size_t controllen;
   int has_cred;
   struct ucred cred;
+  /* SCM_PIDFD's descriptor, or -1000 for none. */
+  int pidfd;
+  /* The control messages' types, in order. */
+  int types[8];
+  int ntypes;
   struct sockaddr_un from;
   socklen_t fromlen;
 };
@@ -66,6 +90,7 @@ static struct got recv_fds(int s, void *buf, size_t len, ssize_t clen, int flags
   static char cbuf[CMSG_SPACE(MAXFD * sizeof(int)) + 64] __attribute__((aligned(8)));
   struct got g;
   memset(&g, 0, sizeof g);
+  g.pidfd = -1000;
   struct iovec io = {buf, len};
   struct msghdr m = {.msg_iov = &io, .msg_iovlen = 1};
   m.msg_name = &g.from;
@@ -84,7 +109,11 @@ static struct got recv_fds(int s, void *buf, size_t len, ssize_t clen, int flags
   for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c)) {
     if (c->cmsg_level != SOL_SOCKET)
       continue;
-    if (c->cmsg_type == SCM_RIGHTS && c->cmsg_len >= CMSG_LEN(0)) {
+    if (g.ntypes < 8)
+      g.types[g.ntypes++] = c->cmsg_type;
+    if (c->cmsg_type == SCM_PIDFD && c->cmsg_len == CMSG_LEN(sizeof(int)))
+      memcpy(&g.pidfd, CMSG_DATA(c), sizeof(int));
+    else if (c->cmsg_type == SCM_RIGHTS && c->cmsg_len >= CMSG_LEN(0)) {
       int k = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
       memcpy(g.fds + g.nfds, CMSG_DATA(c), k * sizeof(int));
       g.nfds += k;
@@ -537,6 +566,204 @@ static void test_creds(void)
   printf("SCM_CREDENTIALS with SO_PASSCRED, and autobind\n");
 }
 
+/* Whether pidfd `fd` is for a live process (pidfd_send_signal of 0). */
+static int pidfd_alive(int fd)
+{
+  return syscall(424, fd, 0, NULL, 0) == 0;
+}
+
+/* Whether pidfd `fd` reads as exited (POLLIN). */
+static int pidfd_exited(int fd)
+{
+  struct pollfd p = {fd, POLLIN, 0};
+  return poll(&p, 1, 0) == 1 && (p.revents & POLLIN);
+}
+
+/* The lowest free descriptor number, to see nothing was left installed. */
+static int next_fd(void)
+{
+  int fd = dup(0);
+  close(fd);
+  return fd;
+}
+
+static void test_pidfd(void)
+{
+  char buf[16];
+  int sv[2], p[2], on = 1, v = -1;
+  socklen_t vl = sizeof v;
+  CHECK(pipe(p) == 0);
+  CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+  CHECK(getsockopt(sv[1], SOL_SOCKET, SO_PASSPIDFD, &v, &vl) == 0 && v == 0 && vl == sizeof v);
+  CHECK(setsockopt(sv[1], SOL_SOCKET, SO_PASSPIDFD, &on, sizeof on) == 0);
+  CHECK(getsockopt(sv[1], SOL_SOCKET, SO_PASSPIDFD, &v, &vl) == 0 && v == 1);
+  /* SO_PASSPIDFD alone: an SCM_PIDFD for the sender, and no credentials. */
+  CHECK(send(sv[0], "p", 1, 0) == 1);
+  struct got g = recv_fds(sv[1], buf, sizeof buf, 256, 0);
+  CHECK(g.n == 1 && !g.has_cred && g.nfds == 0 && g.ntypes == 1 && g.pidfd >= 0);
+  CHECK(g.controllen == CMSG_SPACE(sizeof(int)) && !(g.flags & MSG_CTRUNC));
+  CHECK(pidfd_alive(g.pidfd) && !pidfd_exited(g.pidfd));
+  CHECK(fcntl(g.pidfd, F_GETFD) == FD_CLOEXEC);
+  close(g.pidfd);
+  /* With SO_PASSCRED and descriptors: credentials, descriptors, pidfd. */
+  CHECK(setsockopt(sv[1], SOL_SOCKET, SO_PASSCRED, &on, sizeof on) == 0);
+  CHECK(send_fds(sv[0], "q", 1, &p[1], 1, NULL, 0) == 1);
+  g = recv_fds(sv[1], buf, sizeof buf, 256, 0);
+  CHECK(g.n == 1 && g.has_cred && g.nfds == 1 && g.pidfd >= 0 && g.ntypes == 3);
+  CHECK(g.types[0] == SCM_CREDENTIALS && g.types[1] == SCM_RIGHTS && g.types[2] == SCM_PIDFD);
+  CHECK(g.controllen == CMSG_SPACE(sizeof(struct ucred)) + 2 * CMSG_SPACE(sizeof(int)));
+  close(g.fds[0]);
+  close(g.pidfd);
+  /* Room for the credentials and a pidfd's header but not its int: none
+   * made, and MSG_CTRUNC. */
+  int before = next_fd();
+  CHECK(send(sv[0], "r", 1, 0) == 1);
+  g = recv_fds(sv[1], buf, sizeof buf, CMSG_SPACE(sizeof(struct ucred)) + CMSG_LEN(0) + 3, 0);
+  CHECK(g.n == 1 && g.has_cred && g.pidfd == -1000 && (g.flags & MSG_CTRUNC));
+  CHECK(g.controllen == CMSG_SPACE(sizeof(struct ucred)));
+  CHECK(next_fd() == before);
+  /* Exactly the room it needs. */
+  CHECK(send(sv[0], "s", 1, 0) == 1);
+  g = recv_fds(sv[1], buf, sizeof buf, CMSG_SPACE(sizeof(struct ucred)) + CMSG_LEN(sizeof(int)), 0);
+  CHECK(g.n == 1 && g.has_cred && g.pidfd >= 0 && !(g.flags & MSG_CTRUNC));
+  close(g.pidfd);
+  /* No control buffer: MSG_CTRUNC, nothing made. */
+  int off = 0;
+  CHECK(setsockopt(sv[1], SOL_SOCKET, SO_PASSCRED, &off, sizeof off) == 0);
+  CHECK(send(sv[0], "t", 1, 0) == 1);
+  g = recv_fds(sv[1], buf, sizeof buf, -1, 0);
+  CHECK(g.n == 1 && (g.flags & MSG_CTRUNC));
+  CHECK(next_fd() == before);
+  /* A datagram another process sent: its pidfd follows it, alive, then
+   * exited; and one whose sender has gone (and been reaped) before it was
+   * received is for an exited process (older kernels: -ESRCH instead). */
+  int go[2];
+  CHECK(pipe(go) == 0);
+  pid_t child = fork();
+  if (child == 0) {
+    close(go[1]);
+    send(sv[0], "c", 1, 0);
+    char c;
+    read(go[0], &c, 1);
+    _exit(0);
+  }
+  g = recv_fds(sv[1], buf, sizeof buf, 256, 0);
+  CHECK(g.n == 1 && g.pidfd >= 0);
+  CHECK(pidfd_alive(g.pidfd) && !pidfd_exited(g.pidfd));
+  close(go[1]);
+  struct pollfd pp = {g.pidfd, POLLIN, 0};
+  CHECK(poll(&pp, 1, 5000) == 1);
+  siginfo_t si;
+  memset(&si, 0, sizeof si);
+  CHECK(waitid(P_PIDFD, g.pidfd, &si, WEXITED) == 0 && si.si_pid == child);
+  close(g.pidfd);
+  close(go[0]);
+  child = fork();
+  if (child == 0) {
+    send(sv[0], "d", 1, 0);
+    _exit(0);
+  }
+  CHECK(waitpid(child, NULL, 0) == child);
+  g = recv_fds(sv[1], buf, sizeof buf, 256, 0);
+  CHECK(g.n == 1 && (g.pidfd >= 0 || g.pidfd == -ESRCH));
+  if (g.pidfd >= 0) {
+    CHECK(pidfd_exited(g.pidfd) && !pidfd_alive(g.pidfd));
+    close(g.pidfd);
+  }
+  close(sv[0]);
+  close(sv[1]);
+
+  /* A stream socketpair, and SO_PEERPIDFD on it: the pair's maker. */
+  CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+  CHECK(setsockopt(sv[0], SOL_SOCKET, SO_PASSPIDFD, &on, sizeof on) == 0);
+  CHECK(send(sv[1], "u", 1, 0) == 1);
+  g = recv_fds(sv[0], buf, sizeof buf, 256, 0);
+  CHECK(g.n == 1 && g.pidfd >= 0 && pidfd_alive(g.pidfd));
+  close(g.pidfd);
+  int pfd = -1;
+  socklen_t pl = sizeof pfd;
+  CHECK(getsockopt(sv[0], SOL_SOCKET, SO_PEERPIDFD, &pfd, &pl) == 0 && pfd >= 0 && pl == sizeof pfd);
+  CHECK(pidfd_alive(pfd) && fcntl(pfd, F_GETFD) == FD_CLOEXEC);
+  close(pfd);
+  errno = 0;
+  CHECK(setsockopt(sv[0], SOL_SOCKET, SO_PEERPIDFD, &on, sizeof on) == -1 && errno == ENOPROTOOPT);
+  close(sv[0]);
+  close(sv[1]);
+  /* A datagram socketpair has a peer too; a connected datagram socket
+   * doesn't, nor does one never connected. */
+  CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+  pl = sizeof pfd;
+  CHECK(getsockopt(sv[1], SOL_SOCKET, SO_PEERPIDFD, &pfd, &pl) == 0 && pfd >= 0);
+  close(pfd);
+  struct ucred uc;
+  socklen_t ul = sizeof uc;
+  CHECK(getsockopt(sv[1], SOL_SOCKET, SO_PEERCRED, &uc, &ul) == 0 && uc.pid == getpid());
+  close(sv[0]);
+  close(sv[1]);
+  int u = socket(AF_UNIX, SOCK_STREAM, 0);
+  errno = 0;
+  pl = sizeof pfd;
+  CHECK(getsockopt(u, SOL_SOCKET, SO_PEERPIDFD, &pfd, &pl) == -1 && errno == ENODATA);
+  close(u);
+
+  /* Over a named socket: the connecting side's peer is whoever listened. */
+  struct sockaddr_un sa;
+  socklen_t salen = abstract(&sa, "peerpidfd");
+  int ready[2], done[2];
+  CHECK(pipe(ready) == 0 && pipe(done) == 0);
+  child = fork();
+  if (child == 0) {
+    close(done[1]);
+    int l = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (bind(l, (struct sockaddr *)&sa, salen) != 0 || listen(l, 4) != 0)
+      _exit(1);
+    /* A listening socket's peer is its own listen() caller. */
+    int self = -1;
+    socklen_t sl = sizeof self;
+    if (getsockopt(l, SOL_SOCKET, SO_PEERPIDFD, &self, &sl) != 0 || !pidfd_alive(self))
+      _exit(2);
+    char c = 1;
+    write(ready[1], &c, 1);
+    int a = accept(l, NULL, NULL);
+    /* The accepting side's peer is the connector (the parent). */
+    int peer = -1;
+    sl = sizeof peer;
+    if (a < 0 || getsockopt(a, SOL_SOCKET, SO_PEERPIDFD, &peer, &sl) != 0 || !pidfd_alive(peer))
+      _exit(3);
+    read(done[0], &c, 1);
+    _exit(0);
+  }
+  char c;
+  CHECK(read(ready[0], &c, 1) == 1);
+  int cl = socket(AF_UNIX, SOCK_STREAM, 0);
+  CHECK(connect(cl, (struct sockaddr *)&sa, salen) == 0);
+  pl = sizeof pfd;
+  CHECK(getsockopt(cl, SOL_SOCKET, SO_PEERPIDFD, &pfd, &pl) == 0 && pfd >= 0 && pidfd_alive(pfd));
+  close(done[1]);
+  int st = -1;
+  CHECK(waitpid(child, &st, 0) == child && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+  /* The peer has gone since: its pidfd says so. */
+  CHECK(pidfd_exited(pfd));
+  close(pfd);
+  close(cl);
+  close(ready[0]), close(ready[1]), close(done[0]);
+
+  /* SO_PASSPIDFD is AF_UNIX's alone. */
+  int t = socket(AF_INET, SOCK_STREAM, 0);
+  errno = 0;
+  CHECK(setsockopt(t, SOL_SOCKET, SO_PASSPIDFD, &on, sizeof on) == -1 && errno == EOPNOTSUPP);
+  errno = 0;
+  vl = sizeof v;
+  CHECK(getsockopt(t, SOL_SOCKET, SO_PASSPIDFD, &v, &vl) == -1 && errno == EOPNOTSUPP);
+  errno = 0;
+  pl = sizeof pfd;
+  CHECK(getsockopt(t, SOL_SOCKET, SO_PEERPIDFD, &pfd, &pl) == -1 && errno == ENODATA);
+  close(t);
+  close(p[0]);
+  close(p[1]);
+  printf("SCM_PIDFD with SO_PASSPIDFD, and SO_PEERPIDFD\n");
+}
+
 static void test_lifetime(void)
 {
   char buf[16];
@@ -700,6 +927,7 @@ int main(void)
   test_creds();
   test_lifetime();
   test_mmsg();
+  test_pidfd();
   rmdir(dir);
   puts("PASS");
   return 0;

@@ -6,7 +6,7 @@
  * entry, syscall or sysenter, is used too). It checks the calls whose
  * structures or arguments the compat layer translates: stat64, statfs64,
  * the time structures, rlimits, rusage, 64-bit offsets split across two
- * registers, fcntl64 locks, getdents, select, msghdr with SCM_RIGHTS,
+ * registers, fcntl64 locks, getdents, select, msghdr with SCM_RIGHTS and SCM_PIDFD,
  * sendmmsg/recvmmsg, socketcall, the SysV ipc calls, mmap2 offsets, ia32
  * signal frames (rt and not), sigaltstack, sigprocmask, fork/wait4/waitid,
  * execve, threads with GDT TLS (clone's user_desc), and the vDSO.
@@ -602,6 +602,39 @@ static void test_sockets(void)
     CHECK(getsockopt(sp2[0], SOL_SOCKET, SO_RCVTIMEO, &tg, &len) == 0 && len == 8 && tg.tv_sec == 2 &&
               tg.tv_usec >= 400000 && tg.tv_usec < 600000,
           "SO_RCVTIMEO get %ld.%06ld len %u", (long)tg.tv_sec, (long)tg.tv_usec, (unsigned)len);
+    /* SCM_PIDFD with SO_PASSPIDFD: a 16-byte message after a 12-byte
+     * header, or nothing (MSG_CTRUNC, no descriptor) without the room. */
+    int on = 1;
+    CHECK(setsockopt(dg[1], SOL_SOCKET, 76 /* SO_PASSPIDFD */, &on, sizeof on) == 0, "SO_PASSPIDFD");
+    const int rooms[2] = {CMSG_SPACE(sizeof(int)), CMSG_LEN(sizeof(int)) - 1};
+    for (int ri = 0; ri < 2; ri++) {
+        int room = rooms[ri];
+        CHECK(send(dg[0], "p", 1, 0) == 1, "send");
+        char pc[64] __attribute__((aligned(4)));
+        char b;
+        struct iovec pio = {&b, 1};
+        struct msghdr pm = {.msg_iov = &pio, .msg_iovlen = 1, .msg_control = pc, .msg_controllen = room};
+        int next = dup(0);
+        close(next);
+        CHECK(recvmsg(dg[1], &pm, 0) == 1, "recvmsg");
+        struct cmsghdr *pcm = CMSG_FIRSTHDR(&pm);
+        if (room >= CMSG_LEN(sizeof(int))) {
+            int pfd = -1;
+            if (pcm)
+                memcpy(&pfd, CMSG_DATA(pcm), sizeof pfd);
+            CHECK(pcm && pcm->cmsg_type == 4 && pcm->cmsg_len == CMSG_LEN(sizeof(int)) && pfd == next &&
+                      pm.msg_controllen == CMSG_SPACE(sizeof(int)) && !(pm.msg_flags & MSG_CTRUNC) &&
+                      syscall(424, pfd, 0, NULL, 0) == 0,
+                  "SCM_PIDFD %p fd %d (next %d) controllen %u", (void *)pcm, pfd, next, (unsigned)pm.msg_controllen);
+            close(pfd);
+        } else {
+            int again = dup(0);
+            close(again);
+            CHECK(pm.msg_controllen == 0 && (pm.msg_flags & MSG_CTRUNC) && again == next,
+                  "SCM_PIDFD without room: controllen %u flags %#x, fd %d (next %d)", (unsigned)pm.msg_controllen,
+                  pm.msg_flags, again, next);
+        }
+    }
     close(sp2[0]);
     close(sp2[1]);
     close(sv[0]);
