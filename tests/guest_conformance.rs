@@ -51,6 +51,7 @@ const PROGRAMS: &[&str] = &[
     "compat32",
     "exit_race",
     "compat32_insn",
+    "unix_scm",
 ];
 
 /// i386 programs (`gcc -m32 -static`), which the VM runs as ELFCLASS32
