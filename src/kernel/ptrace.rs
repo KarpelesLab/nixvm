@@ -744,6 +744,7 @@ fn siginfo_bytes(sig: u64, q: Option<QueuedSig>) -> [u8; 128] {
     let mut si = [0u8; 128];
     si[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
     if let Some(q) = q {
+        si[4..8].copy_from_slice(&q.errno.to_le_bytes());
         si[8..12].copy_from_slice(&q.code.to_le_bytes());
         si[16..20].copy_from_slice(&q.pid.to_le_bytes());
         si[20..24].copy_from_slice(&q.uid.to_le_bytes());
@@ -756,6 +757,7 @@ fn siginfo_queued(si: &[u8; 128]) -> QueuedSig {
     let word = |o: usize| u32::from_le_bytes(si[o..o + 4].try_into().unwrap());
     QueuedSig {
         code: word(8) as i32,
+        errno: word(4) as i32,
         pid: word(16) as i32,
         uid: word(20),
         value: u64::from_le_bytes(si[24..32].try_into().unwrap()),
@@ -950,6 +952,7 @@ impl Kernel {
                     let code = (stop.status() >> 8) as i32;
                     let q = QueuedSig {
                         code,
+                        errno: 0,
                         pid: p.tgid,
                         uid: p.creds.ruid,
                         value: 0,
@@ -1231,6 +1234,7 @@ impl Kernel {
         if req == PTRACE_ATTACH {
             let qs = QueuedSig {
                 code: 0,
+                errno: 0,
                 pid: cx.cur.tgid,
                 uid: cx.cur.creds.ruid,
                 value: 0,
@@ -1299,6 +1303,7 @@ impl Kernel {
                         // A different signal: from the tracer, as `kill` would.
                         qs = QueuedSig {
                             code: 0,
+                            errno: 0,
                             pid: t.tracer,
                             uid: 0,
                             value: 0,
@@ -1649,6 +1654,7 @@ impl Kernel {
     ) {
         let qs = QueuedSig {
             code,
+            errno: 0,
             pid: tracee.tgid,
             uid: tracee.creds.ruid,
             value: u64::from(status as u32),
@@ -1923,6 +1929,7 @@ impl Kernel {
                         // The old-style exec trap: a plain SIGTRAP.
                         let qs = QueuedSig {
                             code: 0,
+                            errno: 0,
                             pid: cx.cur.tgid,
                             uid: cx.cur.creds.ruid,
                             value: 0,
@@ -2095,6 +2102,7 @@ impl Kernel {
         if kind == StopKind::Signal {
             let qs = QueuedSig {
                 code: 0,
+                errno: 0,
                 pid: parent.tgid,
                 uid: parent.creds.ruid,
                 value: 0,
@@ -2201,6 +2209,7 @@ impl Kernel {
         };
         let qs = QueuedSig {
             code,
+            errno: 0,
             pid: z.info.tgid,
             uid: z.info.creds.ruid,
             value: u64::from(status as u32),

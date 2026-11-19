@@ -601,6 +601,10 @@ struct ProcInfo {
 struct QueuedSig {
     /// `si_code`: `SI_USER` (0, from `kill`), `SI_QUEUE` (-1, from `sigqueue`), …
     code: i32,
+    /// `si_errno`: 0 but for seccomp's `SECCOMP_RET_TRAP`, whose `SIGSYS`
+    /// carries the filter's `SECCOMP_RET_DATA` there, and what a
+    /// `rt_sigqueueinfo` caller put there.
+    errno: i32,
     /// `si_pid`: the sending process.
     pid: i32,
     /// `si_uid`: the sending user (always 0 — the VM is single-user root).
@@ -7629,6 +7633,7 @@ impl Kernel {
         };
         let chld_info = QueuedSig {
             code: cld_code,
+            errno: 0,
             pid: cx.cur.tgid,
             uid: cx.cur.creds.ruid,
             value: u64::from(cld_status as u32),

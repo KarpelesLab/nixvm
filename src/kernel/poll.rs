@@ -1061,7 +1061,17 @@ impl Kernel {
             let mut si = [0u8; 128];
             si[0..4].copy_from_slice(&sig.to_le_bytes()); // ssi_signo
             if let Some(q) = info {
+                si[4..8].copy_from_slice(&q.errno.to_le_bytes()); // ssi_errno
                 si[8..12].copy_from_slice(&q.code.to_le_bytes()); // ssi_code
+            }
+            // seccomp's SIGSYS (`SIL_SYS`): the call address, syscall and
+            // arch, which ride in the pid/uid/value slots.
+            if let Some(q) = info.filter(|q| sig == 31 && q.code == 1) {
+                let call_addr = u64::from(q.pid as u32) | u64::from(q.uid) << 32;
+                si[84..88].copy_from_slice(&(q.value as u32).to_le_bytes()); // ssi_syscall
+                si[88..96].copy_from_slice(&call_addr.to_le_bytes()); // ssi_call_addr
+                si[96..100].copy_from_slice(&((q.value >> 32) as u32).to_le_bytes()); // ssi_arch
+            } else if let Some(q) = info {
                 si[12..16].copy_from_slice(&q.pid.to_le_bytes()); // ssi_pid
                 si[16..20].copy_from_slice(&q.uid.to_le_bytes()); // ssi_uid
                 si[44..48].copy_from_slice(&(q.value as u32).to_le_bytes()); // ssi_int

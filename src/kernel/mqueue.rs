@@ -356,6 +356,7 @@ impl Kernel {
         {
             let info = QueuedSig {
                 code: SI_MESGQ,
+                errno: 0,
                 pid: cx.cur.tgid,
                 uid: cx.cur.creds.ruid,
                 value,

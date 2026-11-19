@@ -886,12 +886,14 @@ impl Kernel {
             SECCOMP_RET_ALLOW | SECCOMP_RET_LOG => None,
             SECCOMP_RET_ERRNO => Some(-i64::from(value.min(4095))),
             SECCOMP_RET_TRAP => {
-                // A forced SIGSYS with si_code SYS_SECCOMP; the _sigsys fields
+                // A forced SIGSYS with si_code SYS_SECCOMP and the filter's
+                // data as si_errno (`force_sig_seccomp`); the _sigsys fields
                 // (call address, syscall, arch) ride in the pid/uid/value
                 // slots. Blocked or ignored, it's unblocked and defaulted,
                 // so it kills.
                 let info = QueuedSig {
                     code: SYS_SECCOMP,
+                    errno: value as i32,
                     pid: pc as u32 as i32,
                     uid: (pc >> 32) as u32,
                     value: u64::from(raw as u32) | u64::from(arch) << 32,

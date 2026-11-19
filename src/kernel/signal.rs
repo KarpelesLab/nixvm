@@ -37,6 +37,8 @@ const SA_RESTORER: u64 = 0x0400_0000;
 struct SiFields {
     /// `si_code` (SI_USER=0, SI_QUEUE=-1, SEGV_MAPERR=1, …); low 32 bits used.
     code: u64,
+    /// `si_errno` (a seccomp `SIGSYS`'s `SECCOMP_RET_DATA`).
+    errno: i32,
     /// `si_addr` for a fault (SIGSEGV/SIGILL).
     addr: u64,
     /// `si_pid` — the sending process (async signals).
@@ -557,6 +559,7 @@ impl Kernel {
                 let mut si = [0u8; 128];
                 si[0..4].copy_from_slice(&(sig as i32).to_le_bytes()); // si_signo
                 if let Some(q) = q {
+                    si[4..8].copy_from_slice(&q.errno.to_le_bytes()); // si_errno
                     si[8..12].copy_from_slice(&q.code.to_le_bytes()); // si_code
                     si[16..20].copy_from_slice(&q.pid.to_le_bytes()); // si_pid
                     si[20..24].copy_from_slice(&q.uid.to_le_bytes()); // si_uid
@@ -631,6 +634,7 @@ impl Kernel {
         // A bare kill carries SI_USER (code 0) with the sender's pid.
         let sender = super::QueuedSig {
             code,
+            errno: 0,
             pid: cx.cur.tgid,
             uid: cx.cur.creds.ruid,
             value: 0,
@@ -802,12 +806,15 @@ impl Kernel {
         uinfo: u64,
         mem: &GuestMemory,
     ) -> i64 {
-        // Read the guest's siginfo: si_code (offset 8) and the sigqueue value
-        // (offset 24, the 8-byte `_rt` union). si_pid/si_uid are the sender's.
+        // Read the guest's siginfo: si_errno (offset 4), si_code (offset 8)
+        // and the sigqueue value (offset 24, the 8-byte `_rt` union).
+        // si_pid/si_uid are the sender's.
+        let errno = mem.read_u32(uinfo + 4).map_or(0, |v| v as i32);
         let code = mem.read_u32(uinfo + 8).map_or(-1, |v| v as i32);
         let value = mem.read_u64(uinfo + 24).unwrap_or(0);
         let info = QueuedSig {
             code,
+            errno,
             pid: cx.cur.tgid,
             uid: cx.cur.creds.ruid,
             value,
@@ -1152,6 +1159,7 @@ impl Kernel {
         }
         let si = info.map_or(SiFields::default(), |q| SiFields {
             code: u64::from(q.code as u32),
+            errno: q.errno,
             addr: 0,
             pid: u64::from(q.pid as u32),
             uid: u64::from(q.uid),
@@ -1280,7 +1288,10 @@ impl Kernel {
         // instead (the `_sigfault` and `_rt` arms of the `_sifields` union
         // overlap).
         let si_base = frame + UC_OFF + UCONTEXT_SIZE;
-        put(si_base - frame, sig & 0xffff_ffff); // si_signo (si_errno = 0)
+        put(
+            si_base - frame,
+            (sig & 0xffff_ffff) | u64::from(si.errno as u32) << 32,
+        ); // si_signo, si_errno
         put(si_base - frame + 8, si_code & 0xffff_ffff); // si_code
         if si.fault {
             put(si_base - frame + 16, si_addr); // _sigfault: si_addr
@@ -1473,7 +1484,10 @@ impl Kernel {
         };
         // siginfo_t: si_signo@0, si_errno@4, si_code@8, then the union at @16.
         // A fault carries si_addr; an async signal carries si_pid/si_uid/si_value.
-        put(frame, sig & 0xffff_ffff); // si_signo (si_errno = high 32 = 0)
+        put(
+            frame,
+            (sig & 0xffff_ffff) | u64::from(si.errno as u32) << 32,
+        ); // si_signo, si_errno
         put(frame + 8, si.code & 0xffff_ffff); // si_code
         if si.fault {
             put(frame + 16, si.addr); // _sigfault: si_addr
@@ -1982,6 +1996,7 @@ impl Kernel {
     fn siginfo64(sig: u64, si: &SiFields) -> [u8; 128] {
         let mut b = [0u8; 128];
         b[0..4].copy_from_slice(&(sig as u32).to_le_bytes());
+        b[4..8].copy_from_slice(&si.errno.to_le_bytes());
         b[8..12].copy_from_slice(&(si.code as u32).to_le_bytes());
         if si.fault {
             b[16..24].copy_from_slice(&si.addr.to_le_bytes());

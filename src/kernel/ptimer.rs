@@ -115,6 +115,7 @@ pub(super) fn fire_ptimers(info: &mut ProcInfo, now: u128) {
             u64::from(t.signo),
             QueuedSig {
                 code: SI_TIMER,
+                errno: 0,
                 pid: t.id,
                 uid: overrun as u32,
                 value: t.value,
