@@ -39,6 +39,7 @@ mod fcntl;
 mod fd;
 mod fs_ext;
 mod futex;
+mod hwbp;
 mod ipc;
 mod mem_syscalls;
 mod mqueue;
@@ -598,6 +599,9 @@ struct ProcInfo {
     /// Who traces this task and the stop it's in (see [`ptrace`]); `None` for
     /// a task that isn't traced.
     ptrace: Option<Box<ptrace::PtraceState>>,
+    /// x86: the debug registers a debugger set (see [`hwbp`]); `None` until
+    /// it does (or a debug trap sets the virtual `DR6`).
+    debugregs: Option<Box<hwbp::DebugRegs>>,
 }
 
 /// The subset of `siginfo_t` a queued/sent signal carries beyond its number,
@@ -742,6 +746,7 @@ impl Default for ProcInfo {
             pr: prctl::PrctlState::default(),
             seccomp: seccomp::SeccompState::default(),
             ptrace: None,
+            debugregs: None,
             creds: Creds::default(),
             sched_policy: 0, // SCHED_OTHER
             sched_priority: 0,
@@ -1475,8 +1480,8 @@ fn run_slice_smp(
             return (i, vcpu, SliceOutcome::Ended);
         }
         // A tracer changed its registers while it was stopped in user mode.
-        if let Some(t) = sh.procs[i].as_mut().and_then(|p| p.info.ptrace.as_mut()) {
-            t.resume_user(kernel.arch, vcpu.as_mut());
+        if let Some(p) = sh.procs[i].as_mut() {
+            p.info.resume_user(kernel.arch, vcpu.as_mut());
         }
         sh.procs[i].as_ref().is_some_and(|p| p.info.signal_resume)
     };
@@ -3061,9 +3066,7 @@ impl Kernel {
                 return Ok(progressed);
             };
             // A tracer changed its registers while it was stopped in user mode.
-            if let Some(t) = cx.cur.ptrace.as_mut() {
-                t.resume_user(self.arch, vcpu.as_mut());
-            }
+            cx.cur.resume_user(self.arch, vcpu.as_mut());
             let mut guard = space_arc.lock().unwrap();
             cx.cur.cpu = 0;
             let cpu_before = cx.cur.cpu_ns;
@@ -3882,7 +3885,9 @@ impl Kernel {
                 Serviced::Ended
             }
             Exit::DebugTrap { pc, dr6 } => {
-                // A single step or a debug-register hit: SIGTRAP, as above.
+                // A single step or a debug-register hit: SIGTRAP, as above,
+                // and a debugger sees why in the virtual `DR6`.
+                let dr6 = cx.cur.debugregs.get_or_insert_with(Default::default).trap(dr6);
                 let fault = signal::Fault::debug_trap(pc, dr6);
                 if let Some(s) = self.ptrace_fault(cx, &fault, vcpu, mem) {
                     return s;
@@ -6111,6 +6116,8 @@ impl Kernel {
         info.queued_siginfo = [None; NSIG_SLOTS];
         info.rt_queue = BTreeMap::new();
         info.signal_resume = false;
+        // Nor a debugger's breakpoints (`copy_thread`).
+        info.debugregs = None;
         info.sigsuspend_prev = None;
         info.wake_deadline = None;
         info.alarm_deadline = None;
@@ -6747,6 +6754,10 @@ impl Kernel {
             return None;
         };
         vcpu.reset(img.entry, img.stack_pointer);
+        // The debug registers go with the old image (`flush_thread`).
+        if cx.cur.debugregs.take().is_some_and(|d| d.armed()) {
+            vcpu.set_debug_regs(&[0; 8]);
+        }
         if img.compat32 {
             compat::start_thread_ia32(vcpu);
         }

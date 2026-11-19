@@ -188,10 +188,13 @@ impl Fault {
     pub(super) fn debug_trap(pc: u64, dr6: u64) -> Self {
         Self {
             sig: SIGTRAP,
-            code: if dr6 & 0xf != 0 {
+            // `get_si_code`: a step first.
+            code: if dr6 & super::hwbp::DR_STEP != 0 {
+                TRAP_TRACE
+            } else if dr6 & 0xf != 0 {
                 TRAP_HWBKPT
             } else {
-                TRAP_TRACE
+                TRAP_BRKPT
             },
             addr: pc,
             trapno: 1,

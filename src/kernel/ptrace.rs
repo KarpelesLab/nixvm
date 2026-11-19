@@ -143,6 +143,11 @@ const X86_32_SLOTS: [usize; 17] = [
 const X86_32_REGS_SIZE: usize = 17 * 4;
 /// `sizeof(struct user32)`, the `PEEKUSR` area of a 32-bit tracer.
 const USER32_SIZE: u64 = 284;
+/// `offsetof(struct user32, u_debugreg)`.
+const USER32_DEBUGREG: u64 = 252;
+/// `sizeof(struct user)` and `offsetof(struct user, u_debugreg)` (x86-64).
+const USER_SIZE: u64 = 928;
+const USER_DEBUGREG: u64 = 848;
 /// `sizeof(struct user_i387_ia32_struct)`, the `fsave` image.
 const I387_IA32_SIZE: usize = 108;
 const AUDIT_ARCH_I386: u32 = 0x4000_0003;
@@ -467,6 +472,20 @@ impl PtraceState {
 }
 
 impl ProcInfo {
+    /// Before the task runs again: what its tracer changed while it was
+    /// stopped goes into its vcpu (see [`PtraceState::resume_user`]), and so
+    /// do the debug registers it set.
+    pub(super) fn resume_user(&mut self, arch: Arch, vcpu: &mut dyn Vcpu) {
+        if let Some(t) = self.ptrace.as_mut() {
+            t.resume_user(arch, vcpu);
+        }
+        if let Some(d) = self.debugregs.as_mut()
+            && std::mem::take(&mut d.dirty)
+        {
+            vcpu.set_debug_regs(&d.hw());
+        }
+    }
+
     /// The task tracing this one, or 0.
     pub(super) fn tracer(&self) -> i32 {
         self.ptrace.as_ref().map_or(0, |t| t.tracer)
@@ -1110,7 +1129,6 @@ impl Kernel {
         mem: &mut GuestMemory,
     ) -> Option<i64> {
         let arch = Arch::X86_64;
-        let t = Self::tracee_state(sh, idx);
         let put = |mem: &mut GuestMemory, bytes: &[u8]| {
             if mem.write(data, bytes).is_ok() {
                 0
@@ -1118,6 +1136,37 @@ impl Kernel {
                 err(Errno::EFAULT)
             }
         };
+        // `u_debugreg[0..8]` (`ptrace_get_debugreg`/`ptrace_set_debugreg`).
+        let (base, word) = if compat {
+            (USER32_DEBUGREG, 4)
+        } else {
+            (USER_DEBUGREG, 8)
+        };
+        if matches!(req, PTRACE_PEEKUSER | PTRACE_POKEUSER)
+            && (base..base + 8 * word).contains(&addr)
+            && addr.is_multiple_of(word)
+        {
+            let n = (addr - base) / word;
+            let p = &mut sh.procs[idx].as_mut().unwrap().info;
+            if req == PTRACE_PEEKUSER {
+                let v = p.debugregs.as_ref().map_or_else(
+                    || super::hwbp::DebugRegs::default().get(n),
+                    |d| d.get(n),
+                );
+                return Some(put(mem, &v.to_le_bytes()[..word as usize]));
+            }
+            let v = if compat {
+                u64::from(data as u32)
+            } else {
+                data
+            };
+            let d = p.debugregs.get_or_insert_with(Default::default);
+            return Some(match d.set(n, v) {
+                Ok(()) => 0,
+                Err(e) => e,
+            });
+        }
+        let t = Self::tracee_state(sh, idx);
         Some(match req {
             PTRACE_PEEKUSER if compat => {
                 if addr & 3 != 0 || addr > USER32_SIZE {
@@ -1135,7 +1184,7 @@ impl Kernel {
                 }
             }
             PTRACE_PEEKUSER => {
-                if !addr.is_multiple_of(8) || addr >= 1024 {
+                if !addr.is_multiple_of(8) || addr >= USER_SIZE {
                     return Some(err(Errno::EIO));
                 }
                 let v = if (addr as usize) < X86_REGS_SIZE {
@@ -1146,13 +1195,13 @@ impl Kernel {
                 put(mem, &v.to_le_bytes())
             }
             PTRACE_POKEUSER => {
-                if !addr.is_multiple_of(8) || addr >= 1024 {
+                // Only the registers (and `u_debugreg`, above) can be
+                // written; the rest of `struct user` is `EIO`.
+                if !addr.is_multiple_of(8) || addr as usize >= X86_REGS_SIZE {
                     return Some(err(Errno::EIO));
                 }
-                if (addr as usize) < X86_REGS_SIZE {
-                    t.regs[addr as usize / 8] = data;
-                    t.regs_dirty = true;
-                }
+                t.regs[addr as usize / 8] = data;
+                t.regs_dirty = true;
                 0
             }
             PTRACE_GETREGS if compat => put(mem, &t.regs32()),
