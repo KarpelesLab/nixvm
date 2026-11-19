@@ -48,7 +48,7 @@ fn mp(p: Pfx) -> Mp {
     match p.rep {
         1 => Mp::F3,
         2 => Mp::F2,
-        _ if p.opsize => Mp::P66,
+        _ if p.pfx66 => Mp::P66,
         _ => Mp::None,
     }
 }

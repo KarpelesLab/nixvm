@@ -398,8 +398,12 @@ struct Pfx {
     /// A REX prefix immediately precedes the opcode (changes the 8-bit
     /// register names `SPL`/`BPL`/`SIL`/`DIL` vs `AH`/`CH`/`DH`/`BH`).
     has_rex: bool,
-    /// `0x66`: operand size 16 (or the `66` SIMD mandatory prefix).
+    /// The operand size is 16: a `0x66` prefix, or none in 16-bit code
+    /// (where `0x66` makes it 32).
     opsize: bool,
+    /// A `0x66` prefix is on the instruction (the `66` SIMD mandatory
+    /// prefix, whatever the code segment's default).
+    pfx66: bool,
     /// `0` none, `1` = `0xF3` (`REP`/`REPE`), `2` = `0xF2` (`REPNE`); the last
     /// one wins.
     rep: u8,
@@ -631,6 +635,20 @@ struct X86Interp {
     /// addresses (no RIP-relative form), 32-bit stack operations and branch
     /// targets; `rip` is the offset in the code segment.
     mode32: bool,
+    /// In compatibility mode, a 16-bit code segment (`%cs`'s `D` clear, as
+    /// Win16 code has): the default operand and address size are 16 bits
+    /// (`0x66` and `0x67` make them 32), and a near branch at operand size
+    /// 16 keeps `%ip` to 16 bits.
+    code16: bool,
+    /// In compatibility mode, a 16-bit stack segment (`%ss`'s `B` clear):
+    /// pushes, pops and the other implicit stack references move and
+    /// address with `%sp`, leaving the top of `%esp` alone.
+    stack16: bool,
+    /// The instruction being executed in compatibility mode has a 16-bit
+    /// operand size, so a branch it makes truncates `%eip` to 16 bits.
+    /// Transient; set for each compatibility-mode instruction and by the far
+    /// transfers from either mode.
+    ip16: bool,
     /// The selectors in `%es`, `%cs`, `%ss`, `%ds`, `%fs`, `%gs` (indexed by
     /// `SEG_*`); what they loaded is in [`Self::seg_cache`].
     segs: [u16; 6],
@@ -774,6 +792,9 @@ impl X86Interp {
             fs_base: 0,
             gs_base: 0,
             mode32: false,
+            code16: false,
+            stack16: false,
+            ip16: false,
             segs: [0, USER_CS, USER_SS, 0, 0, 0],
             tls: [0; 3],
             syscall32: false,
@@ -861,7 +882,7 @@ impl X86Interp {
 
     fn jump(&mut self, target: u64) -> Step {
         self.rip = if self.mode32 {
-            target & 0xffff_ffff
+            target & if self.ip16 { 0xffff } else { 0xffff_ffff }
         } else {
             target
         };
@@ -934,8 +955,12 @@ impl X86Interp {
     /// Recompute [`Self::segmented`] after a mode or segment change.
     fn update_segmented(&mut self) {
         let c = &self.seg_cache;
+        self.stack16 = self.mode32 && !c[SEG_SS].big;
+        // 16-bit code and stacks take the slow paths, which know them.
         self.segmented = self.mode32
             && !(c[SEG_CS].is_flat(false)
+                && !self.code16
+                && !self.stack16
                 && [SEG_ES, SEG_SS, SEG_DS].iter().all(|&s| c[s].is_flat(true))
                 && [SEG_FS, SEG_GS].iter().all(|&s| {
                     let f = c[s];
@@ -947,10 +972,10 @@ impl X86Interp {
 
     /// The code segment a far jump, call or return to `sel` would enter: a
     /// DPL-3 code segment of the GDT or the LDT (conforming ones at any DPL),
-    /// a 64-bit one (`L`) for 64-bit mode or a 32-bit one (`D`) for
-    /// compatibility mode, with its base and limit — as `(selector,
-    /// descriptor, compatibility mode)`. A 16-bit code segment (neither)
-    /// isn't run here: a `#GP`, as is anything else. `ret` is a return, which
+    /// a 64-bit one (`L`) for 64-bit mode or a 32-bit (`D`) or 16-bit one
+    /// (neither) for compatibility mode, with its base and limit — as
+    /// `(selector, descriptor, compatibility mode)`; anything else (`L` and
+    /// `D` both set, too) is a `#GP`. `ret` is a return, which
     /// may not raise the privilege (RPL must be 3); a jump or call takes CPL
     /// as the RPL.
     fn code_desc(&self, sel: u16, ret: bool) -> Result<(u16, u64, bool), Step> {
@@ -973,14 +998,15 @@ impl X86Interp {
         }
         match ((d >> 53) & 1 == 1, (d >> 54) & 1 == 1) {
             (true, false) => Ok((sel, d, false)),
-            (false, true) => Ok((sel, d, true)),
-            _ => gp,
+            (false, _) => Ok((sel, d, true)),
+            (true, true) => gp,
         }
     }
 
     /// Switch to the code segment [`Self::code_desc`] found.
     fn enter_code(&mut self, (sel, d, mode32): (u16, u64, bool)) {
         self.mode32 = mode32;
+        self.code16 = mode32 && d & (1 << 54) == 0;
         self.segs[SEG_CS] = sel;
         self.seg_cache[SEG_CS] = SegCache::from_desc(d);
         self.update_segmented();
@@ -1015,7 +1041,7 @@ impl X86Interp {
     #[inline]
     fn stk(&self, sp: u64) -> u64 {
         if self.segmented {
-            self.seg_lin(SEG_SS, sp)
+            self.seg_lin(SEG_SS, if self.stack16 { sp & 0xffff } else { sp })
         } else {
             sp
         }
@@ -1090,7 +1116,7 @@ impl X86Interp {
     /// it).
     #[cold]
     fn fill_ibuf_slow(&mut self, mem: &GuestMemory) -> Result<(), Step> {
-        self.addr16 = false;
+        self.addr16 = self.code16;
         self.seg_ovr = SEG_NONE;
         self.ea_seg.set(SEG_DS as u8);
         self.fetch_slow = self.segmented;
@@ -1195,6 +1221,19 @@ impl X86Interp {
     fn fetch32(&self, pc: u64) -> Result<(u32, u64), Step> {
         let (b, p) = self.fetch_n::<4>(pc)?;
         Ok((u32::from_le_bytes(b), p))
+    }
+
+    /// A near branch's `rel16`/`rel32`: 16 bits at operand size 16 in
+    /// compatibility mode (64-bit mode ignores `0x66` here, as Intel's CPUs
+    /// do).
+    fn fetch_rel(&self, pc: u64, p: Pfx) -> Result<(i64, u64), Step> {
+        if p.mode32 && p.opsize {
+            let (v, end) = self.fetch16(pc)?;
+            Ok((i64::from(v as i16), end))
+        } else {
+            let (v, end) = self.fetch_i32(pc)?;
+            Ok((i64::from(v), end))
+        }
     }
 
     fn fetch_i32(&self, pc: u64) -> Result<(i32, u64), Step> {
@@ -1526,15 +1565,21 @@ impl X86Interp {
     }
 
     /// The stack pointer after moving it by `delta`: `%esp` wraps at 32 bits
-    /// in compatibility mode.
+    /// in compatibility mode, and only `%sp` moves on a 16-bit stack.
     fn sp_plus(&self, delta: u64) -> u64 {
-        let sp = self.gpr[RSP].wrapping_add(delta);
-        if self.mode32 { sp & 0xffff_ffff } else { sp }
+        self.wrap_sp(self.gpr[RSP].wrapping_add(delta))
     }
 
-    /// A stack pointer value wrapped as `%esp` is in compatibility mode.
+    /// A stack pointer value wrapped as `%esp` is in compatibility mode (as
+    /// `%sp`, in the current `%esp`, on a 16-bit stack).
     fn wrap_sp(&self, sp: u64) -> u64 {
-        if self.mode32 { sp & 0xffff_ffff } else { sp }
+        if !self.mode32 {
+            sp
+        } else if self.stack16 {
+            (self.gpr[RSP] & 0xffff_0000) | (sp & 0xffff)
+        } else {
+            sp & 0xffff_ffff
+        }
     }
 
     /// Push a `width`-bit value (16, 32 or 64).
@@ -1578,6 +1623,7 @@ impl X86Interp {
             return Step::Trap(Trap::Protection);
         }
         self.enter_code(code);
+        self.ip16 = width == 16;
         if iret {
             let flags = if width == 16 {
                 (self.rflags_word() & !0xffff) | v[2]
@@ -1619,6 +1665,7 @@ impl X86Interp {
             }
         }
         self.enter_code(code);
+        self.ip16 = width == 16;
         self.jump(off)
     }
 
@@ -2854,6 +2901,7 @@ impl X86Interp {
         self.seg_base = 0;
         let mut p = Pfx {
             mode32: self.mode32,
+            opsize: self.code16,
             ..Pfx::default()
         };
         let mut pc = self.rip;
@@ -2868,10 +2916,15 @@ impl X86Interp {
                     p.has_rex = true;
                     continue;
                 }
-                0x66 => p.opsize = true,
-                // 16-bit addressing in compatibility mode.
+                // The other operand size: 16 bits, or 32 in 16-bit code.
+                0x66 => {
+                    p.opsize = !self.code16;
+                    p.pfx66 = true;
+                }
+                // The other address size in compatibility mode: 16 bits, or
+                // 32 in 16-bit code.
                 0x67 if self.mode32 => {
-                    self.addr16 = true;
+                    self.addr16 = !self.code16;
                     self.fetch_slow = true;
                 }
                 0x67 => self.addr32 = true,
@@ -2905,8 +2958,11 @@ impl X86Interp {
             return Step::Illegal;
         }
         let width = p.width();
-        if self.mode32 && self.is_legacy32(op, pc) {
-            return self.exec_legacy32(mem, pc, p, op);
+        if self.mode32 {
+            self.ip16 = p.opsize;
+            if self.is_legacy32(op, pc) {
+                return self.exec_legacy32(mem, pc, p, op);
+            }
         }
         match op {
             // ---- ALU: 00-3D ----
@@ -3233,13 +3289,13 @@ impl X86Interp {
             // IN/OUT.
             0xE4..=0xE7 | 0xEC..=0xEF => Step::Trap(Trap::Protection),
             0xE8 => {
-                let (rel, end) = fetch!(self.fetch_i32(pc));
+                let (rel, end) = fetch!(self.fetch_rel(pc, p));
                 fetch!(self.push_w(mem, end, p.stack_width()));
-                self.jump(end.wrapping_add(i64::from(rel) as u64))
+                self.jump(end.wrapping_add(rel as u64))
             }
             0xE9 => {
-                let (rel, end) = fetch!(self.fetch_i32(pc));
-                self.jump(end.wrapping_add(i64::from(rel) as u64))
+                let (rel, end) = fetch!(self.fetch_rel(pc, p));
+                self.jump(end.wrapping_add(rel as u64))
             }
             0xEB => {
                 let (rel, end) = fetch!(self.fetch_i8(pc));
@@ -3297,6 +3353,7 @@ impl X86Interp {
         let mut b = [0u8; 4];
         let arg6 = mem.read(sp, &mut b).ok().map(|()| u32::from_le_bytes(b));
         self.enter_code(code);
+        self.ip16 = false;
         let _ = self.load_seg(SEG_SS, USER_SS);
         self.gpr[RSP] = sp;
         match arg6 {
@@ -3351,7 +3408,7 @@ impl X86Interp {
                     sp = sp.wrapping_sub(step) & 0xffff_ffff;
                     fetch!(self.write_mem(mem, self.stk(sp), self.gpr[r], w));
                 }
-                self.gpr[RSP] = sp;
+                self.gpr[RSP] = self.wrap_sp(sp);
                 self.next(pc)
             }
             0x61 => {
@@ -3614,9 +3671,9 @@ impl X86Interp {
                 self.next(end)
             }
             0x80..=0x8F => {
-                let (rel, end) = fetch!(self.fetch_i32(pc));
+                let (rel, end) = fetch!(self.fetch_rel(pc, p));
                 if self.cond_holds(op) {
-                    self.jump(end.wrapping_add(i64::from(rel) as u64))
+                    self.jump(end.wrapping_add(rel as u64))
                 } else {
                     self.next(end)
                 }
@@ -4365,6 +4422,9 @@ impl Vcpu for X86Interp {
         self.gs_base = 0;
         // 64-bit mode, Linux's selectors, no TLS entries (`flush_thread`).
         self.mode32 = false;
+        self.code16 = false;
+        self.stack16 = false;
+        self.ip16 = false;
         self.segs = [0, USER_CS, USER_SS, 0, 0, 0];
         self.seg_cache = [SegCache::FLAT; 6];
         self.segmented = false;
@@ -7554,9 +7614,9 @@ mod tests {
         assert!(!c.segmented && c.user_segments() == (0x33, 0x2b));
     }
 
-    /// Far transfers to an LDT code segment: a 32-bit one runs in
+    /// Far transfers to an LDT code segment: a 32-bit or 16-bit one runs in
     /// compatibility mode with its base (`rip` is the offset in it) and
-    /// limit; a 16-bit one, or one at DPL 0, is a #GP with nothing changed.
+    /// limit; one at DPL 0 is a #GP with nothing changed.
     #[test]
     fn far_transfers_to_ldt_code_segments() {
         let mut m = mem();
@@ -7609,8 +7669,11 @@ mod tests {
         let (c, s) = run_with(&mut m, &ljmp, |_| {});
         assert!(matches!(s, Step::Branched));
         assert!(c.mode32 && c.rip == 0x10 && c.segs[SEG_CS] == ldt_sel(0));
-        // 16-bit code, DPL 0: #GP, still in the flat 32-bit segment.
-        for sel in [ldt_sel(1), ldt_sel(2), ldt_sel(7)] {
+        // 16-bit code is compatibility mode too.
+        let (c, s) = run32_with(&mut m, &far(ldt_sel(1)), |_| {});
+        assert!(matches!(s, Step::Branched) && c.mode32 && c.code16 && c.rip == 0x10);
+        // DPL 0, or past the LDT: #GP, still in the flat 32-bit segment.
+        for sel in [ldt_sel(2), ldt_sel(7)] {
             let (c, s) = run32_with(&mut m, &far(sel), |_| {});
             assert!(matches!(s, Step::Trap(Trap::Protection)), "{sel:#x}");
             assert_eq!((c.rip, c.segs[SEG_CS]), (CODE, 0x23));
@@ -7623,6 +7686,69 @@ mod tests {
         assert!(matches!(s, Step::Branched) && c.segs[SEG_CS] == ldt_sel(0));
         assert_eq!(m.read_u32(STACK - 4).unwrap(), 0x23);
         assert_eq!(u64::from(m.read_u32(STACK - 8).unwrap()), CODE + 7);
+    }
+
+    /// 16-bit code (an LDT code segment with `D` clear) on a 16-bit stack
+    /// (`B` clear): 16-bit operands and addresses by default (`0x66`/`0x67`
+    /// for 32), pushes that move `%sp` only, a near jump that wraps `%ip` at
+    /// 64 KiB, and `o32 lret` back to 32-bit code.
+    #[test]
+    fn sixteen_bit_code_and_stack_segments() {
+        let mut m = mem();
+        m.set_ldt(Arc::from(
+            [
+                seg_desc(0x1_0000, 0xffff, 0xA, 0), // 0: 16-bit code
+                seg_desc(0x1_0000, 0xffff, 0x2, 0), // 1: 16-bit data
+            ]
+            .as_slice(),
+        ));
+        // At offset 0xfff0: mov ax, 0x1234; mov ebx, 0x11223344 (66); push
+        // ax; jmp rel16 to 0x0010 (wrapping); there: mov [bx+si], ax;
+        // push dword 0x23 (66 6A 23); push dword 0x11100 (66 68 ...);
+        // o32 lret (66 CB).
+        let mut hi = vec![
+            0xB8, 0x34, 0x12, 0x66, 0xBB, 0x44, 0x33, 0x22, 0x11, 0x50, 0xE9,
+        ];
+        hi.extend_from_slice(&0x0010u16.wrapping_sub(0xfffd).to_le_bytes());
+        m.write_init(0x1_fff0, &hi).unwrap();
+        let mut lo = vec![0x89, 0x00, 0x66, 0x6A, 0x23, 0x66, 0x68];
+        lo.extend_from_slice(&0x1_1100u32.to_le_bytes());
+        lo.extend_from_slice(&[0x66, 0xCB]);
+        m.write_init(0x1_0010, &lo).unwrap();
+        let mut ljmp = vec![0xEA];
+        ljmp.extend_from_slice(&0xfff0u32.to_le_bytes());
+        ljmp.extend_from_slice(&ldt_sel(0).to_le_bytes());
+        let (mut c, s) = run32_with(&mut m, &ljmp, |c| {
+            c.gpr[RAX] = 0xdead_0000;
+            c.gpr[RSI] = 0x100;
+        });
+        assert!(matches!(s, Step::Branched) && c.code16 && c.rip == 0xfff0);
+        c.load_seg(SEG_SS, ldt_sel(1)).unwrap();
+        c.load_seg(SEG_DS, ldt_sel(1)).unwrap();
+        assert!(c.stack16 && c.segmented);
+        c.gpr[RSP] = 0xaaaa_8000;
+        for _ in 0..3 {
+            assert!(matches!(c.exec(&mut m), Step::Next));
+        }
+        assert_eq!((c.gpr[RAX], c.gpr[RBX]), (0xdead_1234, 0x1122_3344));
+        assert_eq!(c.gpr[RSP], 0xaaaa_7ffe);
+        assert_eq!(m.read_vec(0x1_7ffe, 2).unwrap(), [0x34, 0x12]);
+        // The jump wraps to the start of the segment.
+        assert!(matches!(c.exec(&mut m), Step::Branched));
+        assert_eq!(c.rip, 0x10);
+        // [bx+si] = 0x3344 + 0x100, 16-bit.
+        assert!(matches!(c.exec(&mut m), Step::Next));
+        assert_eq!(m.read_vec(0x1_3444, 2).unwrap(), [0x34, 0x12]);
+        for _ in 0..2 {
+            assert!(matches!(c.exec(&mut m), Step::Next));
+        }
+        assert_eq!(c.gpr[RSP], 0xaaaa_7ff6);
+        assert_eq!(m.read_u32(0x1_7ffa).unwrap(), 0x23);
+        // o32 lret: EIP and CS from %ss:%sp, back to the flat 32-bit code.
+        assert!(matches!(c.exec(&mut m), Step::Branched));
+        assert_eq!((c.rip, c.segs[SEG_CS]), (0x1_1100, 0x23));
+        assert!(!c.code16 && c.mode32);
+        assert_eq!(c.gpr[RSP], 0xaaaa_7ffe);
     }
 
     /// Compatibility mode wraps linear addresses at 32 bits after adding the

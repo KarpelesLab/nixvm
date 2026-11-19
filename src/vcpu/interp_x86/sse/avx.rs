@@ -460,7 +460,7 @@ impl X86Interp {
         p: Pfx,
         c: u8,
     ) -> Step {
-        if p.opsize || p.rep != 0 || p.lock || p.has_rex {
+        if p.pfx66 || p.rep != 0 || p.lock || p.has_rex {
             return Step::Illegal;
         }
         let (b1, pc) = fetch!(self.fetch8(pc));
@@ -498,6 +498,7 @@ impl X86Interp {
             rex,
             has_rex: true,
             opsize: pp == Mp::P66,
+            pfx66: pp == Mp::P66,
             rep: match pp {
                 Mp::F3 => 1,
                 Mp::F2 => 2,
