@@ -13,6 +13,14 @@
  *    64 KiB, a store through [di], [bp+di] in %ss by default (here a fault
  *    near address 0) and in %ds with an override, rep movsb on CX/SI/DI, and
  *    loop on CX.
+ *  - 16-bit code, as Wine's Win16 thunks run it: a far call from 32-bit code
+ *    to a 16-bit LDT code segment (modify_ldt), whose default operand and
+ *    address size are 16 bits (0x66 and 0x67 make them 32); a 16-bit LDT
+ *    stack segment, where pushes, pops, near calls and far calls (out to
+ *    32-bit code and back) move %sp only; loop and rep stos on CX/DI; a near
+ *    jump past 0xffff wrapping %ip to the start of the segment; a fault
+ *    (int $0x21) whose 64-bit handler resumes the 16-bit code; and a far
+ *    return to 32-bit code.
  * Non-PIE (gcc -static), so the code and data are below 4 GiB.
  */
 #define _GNU_SOURCE
@@ -20,6 +28,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -47,7 +57,7 @@ uint32_t r_1, r_2, r_cx, r_si, r_di, r_loops, r_cx2, r_bpds, r_lim;
 struct {
   uint32_t off;
   uint16_t sel;
-} __attribute__((packed)) far32, farp;
+} __attribute__((packed)) far32, farp, far16;
 int32_t bnds[2];
 
 void call32(void *fn);
@@ -140,13 +150,63 @@ __asm__(".text\n"
         ".globl limit_insn\nlimit_insn: mov 0xffd,%ecx\n"
         ".globl limit_end\nlimit_end:\n\t"
         "mov $0x2b,%eax\n\tmov %eax,%ds\n\tmov %edx,r_lim\n\tlret\n"
+        /* ---- 16-bit code: f_to16 far-calls c16 (copied to code16, the
+         * base of LDT code segment 0, selector 7), whose data and stack
+         * segment is LDT entry 1 (selector 0xf, based at area16). */
+        ".globl f_to16\nf_to16:\n\t"
+        "push %ebp\n\tpush %ebx\n\tpush %esi\n\tpush %edi\n\t"
+        "lcall *far16\n\t"
+        "pop %edi\n\tpop %esi\n\tpop %ebx\n\tpop %ebp\n\tlret\n"
+        /* Called from 16-bit code, on the 16-bit stack. */
+        ".globl c32_helper\nc32_helper:\n\t"
+        "mov $0x77,%ecx\n\tpush %ecx\n\tpop %edx\n\tlret\n"
+        ".code16\n"
+        ".globl c16_start\nc16_start:\n"
+        /* int $0x21, as Win16 code makes: a #GP (SIGSEGV) whose handler
+         * resumes the 16-bit code past it. */
+        ".globl c16_int21\nc16_int21: int $0x21\n\t"
+        "mov $0xf,%ax\n\tmov %ax,%ds\n\tmov %ax,%es\n\t"
+        "movl %esp,(0)\n\tmov %ss,(4)\n\t"
+        "mov %ax,%ss\n\tmovl $0x55558000,%esp\n\t"
+        /* The default operand size is 16: inc %ax leaves the top of %eax. */
+        "movl $0xaaaaffff,%eax\n\tinc %ax\n\tmovl %eax,(0x10)\n\t"
+        /* A 16-bit stack: pushes and pops move %sp. */
+        "mov $0x1234,%ax\n\tpush %ax\n\tpushl $0x11223344\n\t"
+        "movl %esp,(0x14)\n\tpopl %ebx\n\tpop %cx\n\t"
+        "movl %ebx,(0x18)\n\tmov %cx,(0x1c)\n\tmovl %esp,(0x20)\n\t"
+        /* 16-bit addressing by default, 32-bit under 0x67. */
+        "mov $0x40,%bx\n\tmov $2,%si\n\tmovw $0xbeef,(%bx,%si)\n\t"
+        "movl $0x48,%ebx\n\taddr32 movw $0xcafe,(%ebx)\n\t"
+        /* A near call and return, on %ip and %sp. */
+        "call 1f\n\tjmp 2f\n"
+        "1:\tmovl %esp,(0x24)\n\tret\n"
+        /* loop and rep stos count in %cx and move %di. */
+        "2:\tmovl $0x10003,%ecx\n\txor %dx,%dx\n"
+        "3:\tinc %dx\n\tloop 3b\n\t"
+        "movl %ecx,(0x28)\n\tmov %dx,(0x2c)\n\t"
+        "movl $0x12340004,%ecx\n\tmovl $0x56780050,%edi\n\tmov $0x5a,%al\n\t"
+        "cld\n\trep stosb\n\tmovl %ecx,(0x30)\n\tmovl %edi,(0x34)\n\t"
+        /* Out to 32-bit code and back, on the 16-bit stack. */
+        "lcalll $0x23,$c32_helper\n\t"
+        "movl %ecx,(0x38)\n\tmovl %edx,(0x44)\n\tmovl %esp,(0x3c)\n\t"
+        /* To 0xfff0, whose jmp (written there by wrap_stub) wraps to c16_back. */
+        ".byte 0xe9\n\t.word 0xfff0 - (. + 2 - c16_start)\n"
+        ".globl c16_back\nc16_back:\n\t"
+        "movw $0x600d,(0x60)\n\t"
+        "mov (4),%ss\n\tmovl (0),%esp\n\t"
+        "mov $0x2b,%ax\n\tmov %ax,%ds\n\tmov %ax,%es\n\t"
+        "lretl\n"
+        ".globl c16_end\nc16_end:\n"
         ".code64\n");
+
 
 extern char f_daa[], f_das[], f_aaa[], f_aas[], f_aam10[], f_aad10[], f_aam7[],
     f_aad7[], f_salc[], f_aam0[], f_bound[], f_arpl[], f_les[], f_addr16[],
     f_bpss[], f_limit[];
 extern char aam0_insn[], aam0_end[], bound_insn[], bound_end[], bpss_insn[],
     bpss_end[], limit_insn[], limit_end[];
+extern char f_to16[], c16_start[], c16_int21[], c16_back[], c16_end[];
+static volatile int int21_hits;
 
 /* ---- faults: resume past the instruction, counting --------------------- */
 static struct {
@@ -165,6 +225,13 @@ static void on_fault(int sig, siginfo_t *si, void *ctx) {
   (void)si;
   ucontext_t *uc = ctx;
   greg_t *rip = &uc->uc_mcontext.gregs[REG_RIP];
+  /* int $0x21 in the 16-bit code segment (LDT entry 0): %ip is the offset. */
+  if (sig == SIGSEGV && (uc->uc_mcontext.gregs[REG_CSGSFS] & 0xffff) == 7 &&
+      *rip == c16_int21 - c16_start) {
+    int21_hits++;
+    *rip += 2;
+    return;
+  }
   for (unsigned i = 0; i < sizeof resume / sizeof resume[0]; i++)
     if (resume[i].sig == sig && *rip == (greg_t)(uintptr_t)resume[i].insn &&
         (uc->uc_mcontext.gregs[REG_CSGSFS] & 0xffff) == 0x23) {
@@ -390,6 +457,65 @@ static void segment_checks(void) {
         resume[R_LIMIT].hits);
 }
 
+/* ---- 16-bit code --------------------------------------------------------- */
+static uint8_t code16[65536] __attribute__((aligned(4096)));
+static uint8_t area16[65536] __attribute__((aligned(4096)));
+
+static uint32_t at16(unsigned off) {
+  uint32_t v;
+  memcpy(&v, area16 + off, 4);
+  return v;
+}
+
+static void code16_checks(void) {
+  memcpy(code16, c16_start, c16_end - c16_start);
+  /* At 0xfff0: jmp rel16, to c16_back once %ip wraps at 64 KiB. */
+  uint16_t back = c16_back - c16_start, rel = back - 0xfff3;
+  code16[0xfff0] = 0xe9;
+  memcpy(code16 + 0xfff1, &rel, 2);
+  CHECK(mprotect(code16, sizeof code16, PROT_READ | PROT_WRITE | PROT_EXEC) == 0,
+        "mprotect the 16-bit code");
+  struct user_desc d;
+  memset(&d, 0, sizeof d);
+  d.entry_number = 0;
+  d.base_addr = (uint32_t)(uintptr_t)code16;
+  d.limit = 0xffff;
+  d.contents = 2; /* code */
+  long r = syscall(SYS_modify_ldt, 1, &d, sizeof d);
+  CHECK(r == 0, "modify_ldt: the 16-bit code segment: %ld", r);
+  memset(&d, 0, sizeof d);
+  d.entry_number = 1;
+  d.base_addr = (uint32_t)(uintptr_t)area16;
+  d.limit = 0xffff;
+  r |= syscall(SYS_modify_ldt, 1, &d, sizeof d);
+  CHECK(r == 0, "modify_ldt: the 16-bit data and stack segment");
+  if (r)
+    return;
+  far16.off = 0;
+  far16.sel = 7;
+  call32(f_to16);
+  CHECK(int21_hits == 1, "int $0x21 in 16-bit code: %d SIGSEGVs", int21_hits);
+  CHECK(at16(0x60) == 0x600d, "the 16-bit code ran to its end: %#x", at16(0x60));
+  CHECK(at16(0x10) == 0xaaaa0000, "inc %%ax at operand size 16: %#x", at16(0x10));
+  CHECK(at16(0x14) == 0x55557ffa, "pushes on a 16-bit stack: %%esp %#x", at16(0x14));
+  CHECK(at16(0x18) == 0x11223344 && (at16(0x1c) & 0xffff) == 0x1234,
+        "popl %#x, pop %#x", at16(0x18), at16(0x1c) & 0xffff);
+  CHECK(at16(0x20) == 0x55558000, "%%esp after the pops: %#x", at16(0x20));
+  CHECK((at16(0x42) & 0xffff) == 0xbeef, "[bx+si]: %#x", at16(0x42) & 0xffff);
+  CHECK((at16(0x48) & 0xffff) == 0xcafe, "addr32 [ebx]: %#x", at16(0x48) & 0xffff);
+  CHECK(at16(0x24) == 0x55557ffe, "a near call pushes 2 bytes: %%esp %#x",
+        at16(0x24));
+  CHECK(at16(0x28) == 0x10000 && (at16(0x2c) & 0xffff) == 3,
+        "loop on cx: ecx %#x, %u loops", at16(0x28), at16(0x2c) & 0xffff);
+  CHECK(at16(0x30) == 0x12340000 && at16(0x34) == 0x56780054 &&
+            at16(0x50) == 0x5a5a5a5a,
+        "rep stosb on cx/di: ecx %#x edi %#x, %#x", at16(0x30), at16(0x34),
+        at16(0x50));
+  CHECK(at16(0x38) == 0x77 && at16(0x44) == 0x77 && at16(0x3c) == 0x55558000,
+        "a far call to 32-bit code on the 16-bit stack: ecx %#x edx %#x esp %#x",
+        at16(0x38), at16(0x44), at16(0x3c));
+}
+
 int main(void) {
   setvbuf(stdout, 0, _IONBF, 0);
   CHECK((uintptr_t)&main < 0x80000000u && (uintptr_t)stack32 < 0x80000000u,
@@ -402,6 +528,7 @@ int main(void) {
   bcd_checks();
   misc_checks();
   segment_checks();
+  code16_checks();
   if (!failures)
     printf("PASS\n");
   return failures != 0;
