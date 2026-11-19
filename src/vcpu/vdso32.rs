@@ -51,6 +51,15 @@ const TEXT: u32 = 0x400;
 /// Where the clock code ([`CLOCK_CODE`]) starts: `vdso32_x86.s` reaches
 /// `__kernel_vsyscall` and the vvar page relative to it.
 const CLOCK: u32 = TEXT + 0x40;
+const _: () = assert!(VERDEF + 3 * 28 <= DYNSTR, "verdef overlaps dynstr");
+const _: () = assert!(
+    DYNSYM + (SYMS.len() as u32 + 1) * 16 <= VERSYM,
+    "dynsym overlaps versym"
+);
+const _: () = assert!(
+    CLOCK as usize + CLOCK_CODE.len() <= PAGE,
+    "the clock code runs off the page"
+);
 
 /// `__kernel_vsyscall`, within the image.
 pub const VSYSCALL: u64 = TEXT as u64;
@@ -253,7 +262,6 @@ pub fn build_image(entry: FastEntry) -> [u8; PAGE] {
     debug_assert!(HASH + 12 + nchain * 4 <= DYNSYM);
     debug_assert!(DYNSYM + nchain * 16 <= VERSYM);
     debug_assert!(VERSYM + nchain * 2 <= VERDEF);
-    debug_assert!(VERDEF + 3 * 28 <= DYNSTR);
 
     let t = TEXT as usize;
     b[t..t + CODE.len()].copy_from_slice(&CODE);
