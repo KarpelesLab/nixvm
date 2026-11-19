@@ -13,6 +13,8 @@ type R = Result<i64, i64>;
 const MSG_CTRUNC: u64 = 0x8;
 const SOL_SOCKET: u64 = 1;
 const SCM_RIGHTS: u64 = 1;
+/// `SCM_PIDFD`: one descriptor, the sender's pidfd (`SO_PASSPIDFD`).
+const SCM_PIDFD: u64 = 4;
 /// `IPC_64`: the caller uses the `*64_ds` structures.
 const IPC_64: u64 = 0x100;
 
@@ -1482,7 +1484,9 @@ fn cmsgs_widen(c: &[u8]) -> Result<Vec<u8>, i64> {
 /// `SCM_RIGHTS` that doesn't fit keeps the descriptors that do
 /// (`scm_detach_fds_compat`); the others, which the x86-64 receive
 /// installed, are returned for the caller to close: Linux never installs
-/// them.
+/// them. An `SCM_PIDFD` is whole or not at all (`scm_pidfd_recv`, which
+/// wants room for a compat header and the `int`), its pidfd likewise
+/// returned when it isn't.
 fn cmsgs_narrow(n: &[u8], room: usize) -> (Vec<u8>, bool, Vec<i32>) {
     let mut out = Vec::new();
     let mut lost = Vec::new();
@@ -1497,8 +1501,9 @@ fn cmsgs_narrow(n: &[u8], room: usize) -> (Vec<u8>, bool, Vec<i32>) {
         let (at, raw) = (off, &n[off + 16..off + len]);
         off += len.next_multiple_of(8);
         let rights = level == SOL_SOCKET && ty == SCM_RIGHTS;
+        let pidfd = level == SOL_SOCKET && ty == SCM_PIDFD && raw.len() == 4;
         if trunc {
-            if rights {
+            if rights || pidfd {
                 lost.extend(
                     raw.as_chunks::<4>()
                         .0
@@ -1520,6 +1525,9 @@ fn cmsgs_narrow(n: &[u8], room: usize) -> (Vec<u8>, bool, Vec<i32>) {
         };
         if out.len() + 12 + data.len() > room {
             trunc = true;
+            if pidfd {
+                lost.push(i32::from_le_bytes(data[..4].try_into().unwrap()));
+            }
             if !rights {
                 continue;
             }
@@ -1590,6 +1598,26 @@ mod tests {
         assert_eq!(lost, [7]);
         assert_eq!((r32(&c, 0), c.len()), (20, 20));
         assert_eq!((r32(&c, 12), r32(&c, 16)), (5, 6));
+    }
+
+    #[test]
+    fn a_pidfd_that_doesnt_fit_is_given_back() {
+        // SCM_RIGHTS with fd 5, then SCM_PIDFD 9: 16 + 16 bytes there.
+        let mut n = vec![0u8; 48];
+        w64(&mut n, 0, 20);
+        w32(&mut n, 8, SOL_SOCKET);
+        w32(&mut n, 12, SCM_RIGHTS);
+        w32(&mut n, 16, 5);
+        w64(&mut n, 24, 20);
+        w32(&mut n, 32, SOL_SOCKET);
+        w32(&mut n, 36, SCM_PIDFD);
+        w32(&mut n, 40, 9);
+        let (c, trunc, lost) = cmsgs_narrow(&n, 32);
+        assert!(!trunc && lost.is_empty());
+        assert_eq!((c.len(), r32(&c, 24), r32(&c, 28)), (32, SCM_PIDFD, 9));
+        let (c, trunc, lost) = cmsgs_narrow(&n, 31);
+        assert!(trunc);
+        assert_eq!((c.len(), lost.as_slice()), (16, &[9][..]));
     }
 
     #[test]

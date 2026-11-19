@@ -12,7 +12,7 @@
 //! these calls make on Linux always pass; what remains are the existence and
 //! argument checks, which are kept faithful.
 
-use super::{Fd, Kernel, ProcInfo, RunState, ServiceCtx, Shared, err};
+use super::{Fd, GroupLife, Kernel, ProcInfo, RunState, ServiceCtx, Shared, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 use poll::PidfdInst;
@@ -69,6 +69,31 @@ impl Kernel {
             }
             _ => Err(err(Errno::EBADF)),
         }
+    }
+
+    /// A new close-on-exec pidfd in the caller's table for thread group
+    /// `tgid` (a global id), already readable if `life` says it has exited.
+    /// `None` is a group nothing recorded the life of: taken as alive.
+    pub(super) fn new_pidfd(
+        &self,
+        cx: &mut ServiceCtx,
+        tgid: i32,
+        life: Option<&GroupLife>,
+    ) -> i32 {
+        let idx = {
+            let mut pf = self.pollfds.lock().unwrap();
+            // Read under the lock the exit marks pidfds under (see GroupLife).
+            let exited = life.is_some_and(|l| !l.alive());
+            pf.pidfds.push(PidfdInst {
+                target_pid: tgid,
+                exited,
+                nonblock: false,
+            });
+            pf.pidfds.len() - 1
+        };
+        let fd = cx.cur.fds.alloc(Fd::Pidfd(idx));
+        cx.cur.fds.set_cloexec(fd, true);
+        fd
     }
 
     /// `pidfd_open(pid, flags)`: a close-on-exec pidfd for process `pid`

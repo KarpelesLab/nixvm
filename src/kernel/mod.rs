@@ -228,6 +228,34 @@ impl RLimits {
     }
 }
 
+/// Whether a thread group is still alive (not yet a zombie). Its threads
+/// share the flag, and so do the records of it the kernel keeps for later
+/// (the sender of a queued `AF_UNIX` message, a socket's peer), so that a
+/// pidfd made for it afterwards (`SCM_PIDFD`, `SO_PEERPIDFD`) knows whether
+/// it has exited. It turns false as the group exits, just before its pidfds
+/// are marked under the `pollfds` lock; a pidfd made under that lock reads
+/// it there, so it is either marked or made already readable.
+#[derive(Clone, Debug)]
+pub(super) struct GroupLife(Arc<std::sync::atomic::AtomicBool>);
+
+impl Default for GroupLife {
+    fn default() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(true)))
+    }
+}
+
+impl GroupLife {
+    /// Whether the group hasn't exited.
+    pub(super) fn alive(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The group has exited.
+    fn end(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Count `ns` of CPU time against `RLIMIT_RTTIME` (microseconds a real-time
 /// task may run without blocking) and say which signal it calls for, as
 /// Linux's RT watchdog does: `SIGKILL` at the hard limit; at the soft limit
@@ -380,6 +408,8 @@ struct ProcInfo {
     handlers: SigHand,
     /// Resource limits (see [`RLimits`]).
     rlimits: RLimits,
+    /// Whether the thread group is alive (see [`GroupLife`]).
+    life: GroupLife,
     /// The namespaces this task is in.
     ns: ns::NsProxy,
     /// This task's root directory (`chroot`), in its mount namespace's terms.
@@ -698,6 +728,7 @@ impl Default for ProcInfo {
             signal_resume: false,
             handlers: SigHand::default(),
             rlimits: RLimits::default(),
+            life: GroupLife::default(),
             ns: ns::NsProxy::default(),
             root: "/".to_string(),
             altstack: (0, 0, SS_DISABLE),
@@ -6237,6 +6268,7 @@ impl Kernel {
         // Limits belong to the thread group, so only a new process gets its own.
         if !is_thread {
             info.rlimits = info.rlimits.private_copy();
+            info.life = GroupLife::default();
         }
         // `cx.cur.clone()` above shares the handler table, which is what
         // CLONE_SIGHAND asks for. Anything else gets its own copy.
@@ -7754,6 +7786,7 @@ impl Kernel {
                 .find(|p| p.info.pid == cx.cur.tgid)
                 .is_none_or(|p| matches!(p.info.run, RunState::Zombie(_)));
         if group_gone {
+            cx.cur.life.end();
             let mut pf = self.pollfds.lock().unwrap();
             for pfd in &mut pf.pidfds {
                 if pfd.target_pid == me || pfd.target_pid == cx.cur.tgid {

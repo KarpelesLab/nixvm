@@ -61,6 +61,21 @@ impl RecvMsg {
 }
 
 impl Net {
+    /// Who `SO_PEERCRED` and `SO_PEERPIDFD` say is on the other end of
+    /// socket `sock` (end `end`): the connected peer as it was when the
+    /// connection was made, a datagram socketpair's maker, or a listening
+    /// socket's own `listen()` caller (Linux's `init_peercred` at `listen`);
+    /// `None` for a socket with no peer.
+    fn peer_cred(&self, sock: usize, end: usize) -> Option<Ucred> {
+        match &self.socks[sock].kind {
+            Kind::Pair(p) => Some(p.cred[1 - end].clone()),
+            Kind::Dgram(d) => d.peer_cred.clone(),
+            Kind::Listener { cred, .. } if self.socks[sock].domain == AF_UNIX => Some(cred.clone()),
+            _ => None,
+        }
+        .filter(|c| c.pid != 0)
+    }
+
     pub(super) fn set_egress(&mut self, egress: Box<dyn Egress>) {
         self.egress = Some(egress);
     }
@@ -372,7 +387,11 @@ const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
 /// `cmsg_level`/`cmsg_type` for file-descriptor passing (SOL_SOCKET/SCM_RIGHTS).
 const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
+/// A pidfd for the sender (`SO_PASSPIDFD`), after the other control messages.
+const SCM_PIDFD: i32 = 4;
 const SO_PASSCRED: u64 = 16;
+const SO_PASSPIDFD: u64 = 76;
+const SO_PEERPIDFD: u64 = 77;
 /// Size of a 64-bit `struct cmsghdr`: `cmsg_len`(size_t,8) + `cmsg_level`(int,4)
 /// + `cmsg_type`(int,4). `CMSG_DATA` follows immediately (already 8-aligned).
 const CMSG_HDR_LEN: usize = 16;
@@ -587,6 +606,17 @@ impl Sock {
     fn passcred(&self) -> bool {
         self.opts.int_opt((SOL_SOCKET, SO_PASSCRED)).unwrap_or(0) != 0
     }
+
+    /// Whether `SO_PASSPIDFD` is on.
+    fn passpidfd(&self) -> bool {
+        self.opts.int_opt((SOL_SOCKET, SO_PASSPIDFD)).unwrap_or(0) != 0
+    }
+
+    /// Whether either of them is (`unix_may_passcred`): what makes a message
+    /// carry its sender, and an unnamed sender autobind.
+    fn may_passcred(&self) -> bool {
+        self.passcred() || self.passpidfd()
+    }
 }
 
 /// The mutable `setsockopt`-controlled state of a socket, plus `SO_ERROR`.
@@ -773,12 +803,14 @@ struct Pair {
 }
 
 /// `struct ucred`: a process's global pid, uid and gid when it set up a
-/// connection.
-#[derive(Debug, Clone, Copy, Default)]
+/// connection or sent a message, and whether that process is still alive
+/// (for a pidfd made for it later, as Linux's `struct pid` it holds knows).
+#[derive(Debug, Clone, Default)]
 struct Ucred {
     pid: i32,
     uid: u32,
     gid: u32,
+    life: Option<super::GroupLife>,
 }
 
 impl Ucred {
@@ -788,6 +820,7 @@ impl Ucred {
             pid: cx.cur.tgid,
             uid: cx.cur.creds.euid,
             gid: cx.cur.creds.egid,
+            life: Some(cx.cur.life.clone()),
         }
     }
 
@@ -798,6 +831,7 @@ impl Ucred {
             pid: cx.cur.tgid,
             uid: cx.cur.creds.ruid,
             gid: cx.cur.creds.rgid,
+            life: Some(cx.cur.life.clone()),
         }
     }
 
@@ -808,6 +842,7 @@ impl Ucred {
             pid: 0,
             uid: 65534,
             gid: 65534,
+            life: None,
         }
     }
 }
@@ -825,8 +860,8 @@ impl Pair {
             v6_view: [false, false],
             scm: [VecDeque::new(), VecDeque::new()],
             connect_pending: [false; 2],
-            cred: [Ucred::default(); 2],
-            sender: [Ucred::default(); 2],
+            cred: [Ucred::default(), Ucred::default()],
+            sender: [Ucred::default(), Ucred::default()],
             msgs: None,
         }
     }
@@ -966,6 +1001,9 @@ struct Dgram {
     /// The multicast groups joined (`IP_ADD_MEMBERSHIP`, `IPV6_JOIN_GROUP`,
     /// `MCAST_JOIN_GROUP`), as addresses with port 0.
     groups: Vec<InetAddr>,
+    /// `SO_PEERCRED`'s: who made a `socketpair(AF_UNIX, SOCK_DGRAM)`, for
+    /// either end. A `connect`ed datagram socket has none, as on Linux.
+    peer_cred: Option<Ucred>,
 }
 
 /// One queued datagram: who sent it, what it says, and (`AF_UNIX`) the
@@ -1878,15 +1916,22 @@ impl Kernel {
         if !allowed {
             return Err(err(Errno::EPERM));
         }
-        let pid = if pid == own {
-            cx.cur.tgid
+        // One's own pid carries one's own life; another's (a privileged
+        // sender's) isn't known here, so its pidfd takes it as alive.
+        let (pid, life) = if pid == own {
+            (cx.cur.tgid, Some(cx.cur.life.clone()))
         } else {
             match self.global_pid(cx, pid) {
-                Some(g) if pid > 0 => g,
+                Some(g) if pid > 0 => (g, None),
                 _ => return Err(err(Errno::ESRCH)),
             }
         };
-        Ok(Ucred { pid, uid, gid })
+        Ok(Ucred {
+            pid,
+            uid,
+            gid,
+            life,
+        })
     }
 
     /// Send one datagram on `AF_UNIX` datagram socket `sock`, as Linux's
@@ -1908,7 +1953,7 @@ impl Kernel {
         if data.len() + 32 > net.socks[sock].opts.sndbuf.saturating_mul(2) as usize {
             return err(Errno::EMSGSIZE);
         }
-        if net.socks[sock].passcred() && net.socks[sock].unix_name.is_none() {
+        if net.socks[sock].may_passcred() && net.socks[sock].unix_name.is_none() {
             net.unix_autobind(sock);
         }
         let peer = match &net.socks[sock].kind {
@@ -1949,7 +1994,8 @@ impl Kernel {
         // Without credentials of its own, a datagram carries the sender's when
         // either end wants them.
         let cred = cred.or_else(|| {
-            (net.socks[sock].passcred() || net.socks[tgt].passcred()).then(|| Ucred::scm_of(cx))
+            (net.socks[sock].may_passcred() || net.socks[tgt].may_passcred())
+                .then(|| Ucred::scm_of(cx))
         });
         for f in fds {
             self.scm_ref(net, f, true);
@@ -2132,6 +2178,7 @@ impl Kernel {
                     AF_UNIX,
                     Kind::Dgram(Dgram {
                         pair_peer: Some(peer),
+                        peer_cred: Some(Ucred::of(cx)),
                         ..Dgram::default()
                     }),
                     nonblock,
@@ -2141,7 +2188,7 @@ impl Kernel {
         } else {
             let mut pair = Pair::new();
             pair.nonblock = [nonblock, nonblock];
-            pair.cred = [Ucred::of(cx); 2];
+            pair.cred = [Ucred::of(cx), Ucred::of(cx)];
             if base_type == SOCK_SEQPACKET {
                 pair.msgs = Some([VecDeque::new(), VecDeque::new()]);
             }
@@ -2516,7 +2563,7 @@ impl Kernel {
             return err(Errno::EAGAIN);
         }
         let (listener_addr, listener_cred) = match &net.socks[lidx].kind {
-            Kind::Listener { addr, cred, .. } => (addr.clone(), *cred),
+            Kind::Listener { addr, cred, .. } => (addr.clone(), cred.clone()),
             _ => return err(Errno::ECONNREFUSED),
         };
         // Repurpose the client's idle slot as the connected pair, then queue its
@@ -2925,6 +2972,10 @@ impl Kernel {
         if let Some(errno) = super::sockopt::refused(level, optname) {
             return err(errno);
         }
+        // SO_PASSPIDFD is AF_UNIX's alone.
+        if (level, optname) == (SOL_SOCKET, SO_PASSPIDFD) && net.socks[sock].domain != AF_UNIX {
+            return err(Errno::EOPNOTSUPP);
+        }
         // Linux takes a single byte for an IP-level integer option too.
         let int_len = if level == IPPROTO_IP { 1 } else { 4 };
         if super::sockopt::is_int(level, optname) && optlen < int_len {
@@ -3148,14 +3199,7 @@ impl Kernel {
                 // on the other end when the connection was made. A socket that
                 // isn't connected has no peer: pid 0 and the overflow ids.
                 17 => {
-                    let peer = match &net.socks[sock].kind {
-                        Kind::Pair(p) => p.cred[1 - end],
-                        _ => Ucred {
-                            pid: 0,
-                            uid: 65534,
-                            gid: 65534,
-                        },
-                    };
+                    let peer = net.peer_cred(sock, end).unwrap_or_else(Ucred::nobody);
                     let mut b = [0u8; 12];
                     let pid = self.sender_pid_seen(cx, peer.pid);
                     b[0..4].copy_from_slice(&pid.to_le_bytes());
@@ -3165,6 +3209,14 @@ impl Kernel {
                 }
                 // SO_PEERSEC: no LSM labels.
                 31 => return err(Errno::ENOPROTOOPT),
+                // SO_PASSPIDFD is AF_UNIX's alone.
+                SO_PASSPIDFD if net.socks[sock].domain != AF_UNIX => {
+                    return err(Errno::EOPNOTSUPP);
+                }
+                // SO_PEERPIDFD: a pidfd for the process SO_PEERCRED names.
+                SO_PEERPIDFD => {
+                    return self.peer_pidfd(net, cx, sock, end, optval, optlen_ptr, mem);
+                }
                 // SO_COOKIE: a stable 64-bit id for the socket.
                 57 => {
                     return write_optval(mem, optval, optlen_ptr, &(sock as u64 + 1).to_le_bytes());
@@ -3184,6 +3236,41 @@ impl Kernel {
             return self.getsockopt_generic(net, sock, level, optname, optval, optlen_ptr, mem);
         };
         write_optval(mem, optval, optlen_ptr, &value.to_le_bytes())
+    }
+
+    /// `getsockopt(SO_PEERPIDFD)`: a new pidfd (close-on-exec) for the
+    /// process [`Net::peer_cred`] names, its number written as an `int` cut to
+    /// `*optlen`, as Linux's `sk_getsockopt` does; `ENODATA` with no peer.
+    /// The peer may have exited since: its pidfd is then readable at once
+    /// (`PIDFD_STALE`).
+    #[allow(clippy::too_many_arguments)]
+    fn peer_pidfd(
+        &self,
+        net: &Net,
+        cx: &mut ServiceCtx,
+        sock: usize,
+        end: usize,
+        optval: u64,
+        optlen_ptr: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        let len = match mem.read_u32(optlen_ptr) {
+            Ok(n) if (n as i32) < 0 => return err(Errno::EINVAL),
+            Ok(n) => (n as usize).min(4),
+            Err(_) => return err(Errno::EFAULT),
+        };
+        let Some(peer) = net.peer_cred(sock, end) else {
+            return err(Errno::ENODATA);
+        };
+        let fd = self.new_pidfd(cx, peer.pid, peer.life.as_ref());
+        if mem.write(optval, &fd.to_le_bytes()[..len]).is_err()
+            || mem.write(optlen_ptr, &(len as u32).to_le_bytes()).is_err()
+        {
+            // Taken back, as Linux's `put_unused_fd`.
+            cx.cur.fds.close(fd);
+            return err(Errno::EFAULT);
+        }
+        0
     }
 
     /// `getsockopt` of an option without dedicated handling: the value the
@@ -3935,21 +4022,24 @@ impl Kernel {
         // Emit any SCM_RIGHTS ancillary data into msg_control (offset 40 =
         // msg_controllen), setting msg_flags (offset 48).
         // With SO_PASSCRED, a message on an AF_UNIX socket says who sent it:
-        // a datagram what it carried (nobody, if it carried nothing).
-        let creds = self.sock_of(cx, fd).and_then(|(s, end)| {
-            let s = &net.socks[s];
-            if s.domain != AF_UNIX || !s.passcred() {
-                return None;
+        // a datagram what it carried (nobody, if it carried nothing); with
+        // SO_PASSPIDFD, a pidfd for that sender too.
+        let (passcred, passpidfd, sender) = match self.sock_of(cx, fd) {
+            Some((s, end)) if net.socks[s].domain == AF_UNIX => {
+                let so = &net.socks[s];
+                let sender = match &so.kind {
+                    Kind::Pair(p) if whole > 0 || !scm_fds.is_empty() || p.msgs.is_some() => {
+                        Some(Some(p.sender[end].clone()))
+                    }
+                    Kind::Dgram(_) => Some(cred),
+                    _ => None,
+                };
+                (so.passcred(), so.passpidfd(), sender)
             }
-            match &s.kind {
-                Kind::Pair(p) if whole > 0 || !scm_fds.is_empty() || p.msgs.is_some() => {
-                    Some(p.sender[end])
-                }
-                Kind::Dgram(_) => Some(cred.unwrap_or_else(Ucred::nobody)),
-                _ => None,
-            }
-        });
-        let creds = creds.map(|c| {
+            _ => (false, false, None),
+        };
+        let creds = sender.as_ref().filter(|_| passcred).map(|c| {
+            let c = c.clone().unwrap_or_else(Ucred::nobody);
             let pid = if c.pid == 0 {
                 0
             } else {
@@ -3957,6 +4047,9 @@ impl Kernel {
             };
             (pid, c.uid, c.gid)
         });
+        let pidfd = sender
+            .filter(|_| passpidfd)
+            .map(|c| c.filter(|c| c.pid != 0));
         self.emit_scm_rights(
             net,
             cx,
@@ -3965,6 +4058,7 @@ impl Kernel {
             flags,
             scm_fds,
             creds,
+            pidfd,
             &mut msg_flags,
             mem,
         );
@@ -3978,11 +4072,14 @@ impl Kernel {
 
     /// Materialize `scm_fds` (in-flight SCM_RIGHTS fds delivered with this
     /// `recvmsg`) into fresh guest fds and write the control messages into
-    /// the caller's `msg_control` buffer as Linux's `scm_recv` does:
+    /// the caller's `msg_control` buffer as Linux's `scm_recv_unix` does:
     /// `SCM_CREDENTIALS` first (cut short if it doesn't fit), then as many
     /// descriptors as fit; the rest are closed and `MSG_CTRUNC` is set, as it
-    /// is for anything that came with no control buffer to take it. Always
-    /// writes `msg_controllen` (offset 40), the room used.
+    /// is for anything that came with no control buffer to take it. Then,
+    /// with `SO_PASSPIDFD` (`pidfd` is `Some`), an `SCM_PIDFD` for the
+    /// sender, if the message has one: whole or not at all (`MSG_CTRUNC`
+    /// and no descriptor when there's no room for it). Always writes
+    /// `msg_controllen` (offset 40), the room used.
     #[allow(clippy::too_many_arguments)]
     fn emit_scm_rights(
         &self,
@@ -3993,11 +4090,12 @@ impl Kernel {
         flags: u64,
         scm_fds: Vec<Fd>,
         creds: Option<(i32, u32, u32)>,
+        pidfd: Option<Option<Ucred>>,
         msg_flags: &mut u64,
         mem: &mut GuestMemory,
     ) {
         if hdr.control == 0 {
-            if creds.is_some() || !scm_fds.is_empty() {
+            if creds.is_some() || pidfd.is_some() || !scm_fds.is_empty() {
                 *msg_flags |= MSG_CTRUNC;
             }
             for fd in &scm_fds {
@@ -4034,10 +4132,44 @@ impl Kernel {
                 used += cmsg_align(CMSG_HDR_LEN + data.len()).min(room);
             }
         }
-        if scm_fds.is_empty() {
-            let _ = mem.write(msg + 40, &(used as u64).to_le_bytes());
-            return;
+        if !scm_fds.is_empty() {
+            used = self.emit_rights(net, cx, hdr, flags, scm_fds, used, msg_flags, mem);
         }
+        // SCM_PIDFD last: `scm_pidfd_recv` wants room for all of it.
+        if let Some(sender) = pidfd {
+            let room = total - used;
+            if room < CMSG_HDR_LEN + 4 {
+                *msg_flags |= MSG_CTRUNC;
+            } else if let Some(c) = sender {
+                let fd = self.new_pidfd(cx, c.pid, c.life.as_ref());
+                let mut cbuf = Vec::with_capacity(CMSG_HDR_LEN + 4);
+                cbuf.extend_from_slice(&((CMSG_HDR_LEN + 4) as u64).to_le_bytes());
+                cbuf.extend_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
+                cbuf.extend_from_slice(&SCM_PIDFD.to_le_bytes());
+                cbuf.extend_from_slice(&fd.to_le_bytes());
+                let _ = mem.write(hdr.control + used as u64, &cbuf);
+                used += cmsg_align(CMSG_HDR_LEN + 4).min(room);
+            }
+        }
+        let _ = mem.write(msg + 40, &(used as u64).to_le_bytes());
+    }
+
+    /// The `SCM_RIGHTS` part of [`Self::emit_scm_rights`], after `used`
+    /// bytes of control buffer: as many of `scm_fds` as fit become the
+    /// caller's, the rest are closed. Returns the room used now.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_rights(
+        &self,
+        net: &mut Net,
+        cx: &mut ServiceCtx,
+        hdr: &MsgHdr,
+        flags: u64,
+        scm_fds: Vec<Fd>,
+        used: usize,
+        msg_flags: &mut u64,
+        mem: &mut GuestMemory,
+    ) -> usize {
+        let total = usize::try_from(hdr.controllen).unwrap_or(usize::MAX);
         // How many fds fit in the caller's control buffer.
         let room = total - used;
         let capacity = if room > CMSG_HDR_LEN {
@@ -4064,8 +4196,7 @@ impl Kernel {
             guest_fds.push(g);
         }
         if deliver == 0 {
-            let _ = mem.write(msg + 40, &(used as u64).to_le_bytes());
-            return;
+            return used;
         }
         let cmsg_len = CMSG_HDR_LEN + 4 * deliver;
         let mut cbuf = Vec::with_capacity(cmsg_len);
@@ -4077,8 +4208,7 @@ impl Kernel {
         }
         let _ = mem.write(hdr.control + used as u64, &cbuf);
         // The room it takes: CMSG_SPACE, or what's left.
-        used += cmsg_align(cmsg_len).min(room);
-        let _ = mem.write(msg + 40, &(used as u64).to_le_bytes());
+        used + cmsg_align(cmsg_len).min(room)
     }
 
     /// Receive up to `cap` bytes from socket `fd` into a host `Vec` — the
