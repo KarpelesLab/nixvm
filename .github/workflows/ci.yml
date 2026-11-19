@@ -194,11 +194,15 @@ jobs:
           # Ubuntu keeps capabilities out of unprivileged user namespaces
           # (AppArmor); userns_caps and sandbox_fs check what Linux does without that.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          for p in cgroups rlimits sched exec fifo devfd threads_mm dualstack madvise execthread epoll_et epoll_order userns_caps sandbox_fs ptrace seccomp_notify cpu_traps creation memfd sysv_shm ptrace_debug threadwait connect_again pty exit_race unix_scm; do
+          # ptrace_ia32 traces the i386 ptrace32 when it's next to it.
+          gcc -m32 -static -O2 -pthread -o "$RUNNER_TEMP/ptrace32" tests/guest/ptrace32.c
+          for p in cgroups rlimits sched exec fifo devfd threads_mm dualstack madvise execthread epoll_et epoll_order userns_caps sandbox_fs ptrace seccomp_notify cpu_traps creation memfd sysv_shm ptrace_debug threadwait connect_again pty exit_race unix_scm ptrace_ia32; do
             gcc -static -O2 -pthread -o "$RUNNER_TEMP/$p" "tests/guest/$p.c"
             echo "== $p"
             sudo "$RUNNER_TEMP/$p"
           done
+          echo "== ptrace32"
+          sudo "$RUNNER_TEMP/ptrace32"
 
       # Pull real images from Docker Hub and run them as `docker run` would.
       - name: Pull and run Docker images

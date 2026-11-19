@@ -52,12 +52,13 @@ const PROGRAMS: &[&str] = &[
     "exit_race",
     "compat32_insn",
     "unix_scm",
+    "ptrace_ia32",
 ];
 
 /// i386 programs (`gcc -m32 -static`), which the VM runs as ELFCLASS32
 /// processes in compatibility mode. Skipped, with a note, without a 32-bit
 /// C library to build them with.
-const PROGRAMS32: &[&str] = &["ia32"];
+const PROGRAMS32: &[&str] = &["ia32", "ptrace32"];
 
 /// A directory of binaries, also used as the guest's root, so that a program can
 /// `exec` itself there. `None` if there's no compiler to build them with.
