@@ -35,9 +35,30 @@ use super::{Fd, Kernel, ServiceCtx, err};
 mod served;
 pub use served::{ServedFd, ServedRecv};
 
-/// One received message: `(source address, payload, out `msg_flags`,
-/// `SCM_RIGHTS` fds delivered with it)`. Returned by [`Kernel::recv_message`].
-type RecvMsg = (Option<Addr>, Vec<u8>, u64, Vec<Fd>);
+/// One received message. Returned by [`Kernel::recv_message`].
+struct RecvMsg {
+    /// The source address.
+    from: Option<Addr>,
+    data: Vec<u8>,
+    /// Out `msg_flags`.
+    flags: u64,
+    /// `SCM_RIGHTS` fds delivered with it (their references now the caller's).
+    fds: Vec<Fd>,
+    /// The credentials an `AF_UNIX` datagram carried.
+    cred: Option<Ucred>,
+}
+
+impl RecvMsg {
+    fn new(from: Option<Addr>, data: Vec<u8>, flags: u64) -> Self {
+        Self {
+            from,
+            data,
+            flags,
+            fds: Vec::new(),
+            cred: None,
+        }
+    }
+}
 
 impl Net {
     pub(super) fn set_egress(&mut self, egress: Box<dyn Egress>) {
@@ -462,6 +483,18 @@ pub(super) struct Net {
     /// Counts socket events for the scheduler, readable without this lock
     /// (see [`Kernel::io_events`](super::Kernel)).
     io_events: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// In-flight descriptors whose queue went away (its socket closed, or
+    /// the cycle collector found it unreachable), still to be released.
+    pending_put: Vec<Fd>,
+    /// Released in-flight descriptors that aren't sockets: their references
+    /// live outside `net` (pipes, ptys), so the kernel drops them
+    /// ([`Net::take_orphans`]).
+    orphans: Vec<Fd>,
+    /// A socket end was left with only in-flight references: time for
+    /// [`Net::collect_cycles`].
+    gc_wanted: bool,
+    /// The next `AF_UNIX` autobind name to try (`unix_autobind`'s 5 hex digits).
+    autobind_next: u32,
 }
 
 impl std::fmt::Debug for Net {
@@ -477,6 +510,10 @@ impl std::fmt::Debug for Net {
             .field("lo_state", &self.lo_state)
             .field("event_clock", &self.event_clock)
             .field("io_events", &self.io_events)
+            .field("pending_put", &self.pending_put)
+            .field("orphans", &self.orphans)
+            .field("gc_wanted", &self.gc_wanted)
+            .field("autobind_next", &self.autobind_next)
             .finish()
     }
 }
@@ -514,6 +551,42 @@ struct Sock {
     /// order — handed a new connection before an older client's hangup in
     /// the same batch, it closed the new client along with the old one.
     last_event: u64,
+    /// How many of each end's references are `SCM_RIGHTS` descriptors queued
+    /// on some socket rather than held by a descriptor table: an end whose
+    /// every reference is in flight can only be reached through those queues,
+    /// which is what the cycle collector ([`Net::collect_cycles`]) works from.
+    inflight: [usize; 2],
+    /// A `SOCK_SEQPACKET` socket (connections it makes or accepts keep
+    /// message boundaries).
+    seqpacket: bool,
+    /// The `AF_UNIX` name this socket is bound to, as it was given (an
+    /// abstract one with its leading NUL): what its datagrams come from.
+    unix_name: Option<String>,
+}
+
+impl Sock {
+    /// A fresh socket with one open reference.
+    fn new(netns: u32, domain: u16, kind: Kind, nonblock: bool) -> Self {
+        Self {
+            netns,
+            unix_bound_key: None,
+            domain,
+            kind,
+            nonblock,
+            opts: SockOpts::default(),
+            refs: 1,
+            edge_seq: 0,
+            last_event: 0,
+            inflight: [0; 2],
+            seqpacket: false,
+            unix_name: None,
+        }
+    }
+
+    /// Whether `SO_PASSCRED` is on.
+    fn passcred(&self) -> bool {
+        self.opts.int_opt((SOL_SOCKET, SO_PASSCRED)).unwrap_or(0) != 0
+    }
 }
 
 /// The mutable `setsockopt`-controlled state of a socket, plus `SO_ERROR`.
@@ -688,10 +761,13 @@ struct Pair {
     /// `socketpair`, or the connecting process (end 0) and the listener's
     /// `listen()` caller (end 1), as Linux records them.
     cred: [Ucred; 2],
-    /// A `SOCK_SEQPACKET` pair: the lengths of the messages queued in each
-    /// `to[e]`, oldest first. Each send is one message, delivered whole or
-    /// not at all; a read takes at most one, the rest of it discarded.
-    msgs: Option<[VecDeque<usize>; 2]>,
+    /// A `SOCK_SEQPACKET` pair: the messages queued in each `to[e]`, oldest
+    /// first, as their length and whether they carry the next `scm[e]` group
+    /// (a seqpacket message's descriptors are its own, empty ones included,
+    /// so they are matched by message rather than by stream position). Each
+    /// send is one message, delivered whole or not at all; a read takes at
+    /// most one, the rest of it discarded.
+    msgs: Option<[VecDeque<(usize, bool)>; 2]>,
     /// Who last sent toward each end, for `SCM_CREDENTIALS` (`SO_PASSCRED`).
     sender: [Ucred; 2],
 }
@@ -706,11 +782,32 @@ struct Ucred {
 }
 
 impl Ucred {
+    /// Who the current task is, for `SO_PEERCRED`: its effective ids.
     fn of(cx: &ServiceCtx) -> Self {
         Self {
             pid: cx.cur.tgid,
             uid: cx.cur.creds.euid,
             gid: cx.cur.creds.egid,
+        }
+    }
+
+    /// Who the current task is, for `SCM_CREDENTIALS`: its real ids, as
+    /// Linux's `current_uid_gid` gives them.
+    fn scm_of(cx: &ServiceCtx) -> Self {
+        Self {
+            pid: cx.cur.tgid,
+            uid: cx.cur.creds.ruid,
+            gid: cx.cur.creds.rgid,
+        }
+    }
+
+    /// The credentials of a datagram sent with none: no pid, and the
+    /// overflow ids an invalid uid and gid read as.
+    fn nobody() -> Self {
+        Self {
+            pid: 0,
+            uid: 65534,
+            gid: 65534,
         }
     }
 }
@@ -738,9 +835,42 @@ impl Pair {
     /// `SOCK_SEQPACKET` pair, no more than the next message.
     fn msg_read_len(&self, e: usize, want: usize) -> usize {
         match &self.msgs {
-            Some(m) => want.min(m[e].front().copied().unwrap_or(0)),
+            Some(m) => want.min(m[e].front().map_or(0, |&(len, _)| len)),
             None => want,
         }
+    }
+
+    /// Whether a read on end `e` has something to take: bytes, or (with no
+    /// bytes) a message or descriptors.
+    fn readable(&self, e: usize) -> bool {
+        !self.to[e].is_empty()
+            || matches!(self.scm[e].front(), Some(&(0, _)))
+            || self.msgs.as_ref().is_some_and(|m| !m[e].is_empty())
+    }
+
+    /// Queue `fds`, sent with the message just written toward end `e`.
+    fn attach_fds(&mut self, e: usize, written: usize, fds: Vec<Fd>) {
+        if let Some(m) = &mut self.msgs {
+            if let Some(last) = m[e].back_mut() {
+                last.1 = true;
+            }
+            self.scm[e].push_back((0, fds));
+        } else {
+            // Bytes already queued ahead of this message (this write appended
+            // `written` bytes to the tail).
+            let pos = self.to[e].len().saturating_sub(written);
+            self.scm[e].push_back((pos, fds));
+        }
+    }
+
+    /// Every descriptor queued toward end `e`, taken off the queue.
+    fn take_all_fds(&mut self, e: usize) -> Vec<Fd> {
+        if let Some(m) = &mut self.msgs {
+            for msg in &mut m[e] {
+                msg.1 = false;
+            }
+        }
+        self.scm[e].drain(..).flat_map(|(_, fds)| fds).collect()
     }
 
     /// After a read drained `n` bytes from `to[e]`: a `SOCK_SEQPACKET`
@@ -751,11 +881,18 @@ impl Pair {
         let Some(m) = &mut self.msgs else {
             return (self.scm_take(e, n), false);
         };
-        let len = m[e].pop_front().unwrap_or(n).max(n);
+        let (len, has_fds) = m[e].pop_front().unwrap_or((n, false));
+        let len = len.max(n);
         let rest = (len - n).min(self.to[e].len());
         self.to[e].drain(..rest);
-        // Its descriptors ride the message's first byte.
-        let fds = self.scm_take(e, n + rest);
+        let fds = if has_fds {
+            self.scm[e]
+                .pop_front()
+                .map(|(_, fds)| fds)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         (fds, rest > 0)
     }
 
@@ -804,17 +941,17 @@ impl Pair {
 
 /// A `SOCK_DGRAM` endpoint: `local` is the bound (or lazily ephemeral-assigned)
 /// address, `peer` is the `connect()`-ed destination (if any), and `queue`
-/// holds inbound `(source address, payload)` datagrams awaiting `recv`.
+/// holds inbound datagrams awaiting `recv`.
 #[derive(Default)]
 struct Dgram {
     local: Option<InetAddr>,
     peer: Option<InetAddr>,
-    /// The slot index of the connected peer for a `socketpair(AF_UNIX,
-    /// SOCK_DGRAM)` pair: a `write`/`send` on this socket delivers a datagram
-    /// straight into that slot's `queue`, with no address namespace involved.
-    /// `None` for a standalone (named/INET) datagram socket.
+    /// The slot index of an `AF_UNIX` datagram socket's peer: the other end
+    /// of a `socketpair(AF_UNIX, SOCK_DGRAM)`, or the socket it `connect`ed
+    /// to. A `write`/`send` on this socket delivers a datagram straight into
+    /// that slot's `queue`. `None` for an unconnected (or INET) socket.
     pair_peer: Option<usize>,
-    queue: VecDeque<(InetAddr, Vec<u8>)>,
+    queue: VecDeque<Datagram>,
     /// What [`Self::queue`] holds, by [`datagram_cost`].
     queued_bytes: usize,
     /// A host UDP socket, opened lazily the first time this datagram socket
@@ -831,22 +968,49 @@ struct Dgram {
     groups: Vec<InetAddr>,
 }
 
+/// One queued datagram: who sent it, what it says, and (`AF_UNIX`) the
+/// ancillary data riding it, which belongs to this datagram alone.
+#[derive(Debug, Clone)]
+struct Datagram {
+    /// The sender's address: an `AF_INET`/`AF_INET6` one, or an `AF_UNIX`
+    /// name (empty for a sender bound to none).
+    from: Addr,
+    payload: Vec<u8>,
+    /// `SCM_RIGHTS` descriptors in flight, each holding a backing reference
+    /// (counted in its socket's [`Sock::inflight`] when it is one).
+    fds: Vec<Fd>,
+    /// `SCM_CREDENTIALS`: who sent it, when the sender gave them or either
+    /// end had `SO_PASSCRED` on at the time.
+    cred: Option<Ucred>,
+}
+
 /// What a queued datagram costs against a socket's receive buffer. The overhead
 /// keeps empty datagrams from filling memory unnoticed.
-fn datagram_cost(payload: &[u8]) -> usize {
-    payload.len() + 256
+fn datagram_cost(len: usize) -> usize {
+    len + 256
 }
+
+/// Linux's default `net.core.rmem_max`, doubled as it does: how much a
+/// datagram socket's queue holds.
+const DGRAM_CAPACITY: usize = 2 * 212_992;
+
+/// `net.unix.max_dgram_qlen`: how many datagrams an `AF_UNIX` socket queues
+/// (one more, as Linux counts) from senders it isn't connected to.
+const UNIX_MAX_DGRAM_QLEN: usize = 10;
 
 impl Dgram {
     /// Queue an arriving datagram, or drop it if the receive buffer is full:
     /// what UDP does on Linux, where a sender never finds out either.
     fn enqueue(&mut self, from: InetAddr, payload: Vec<u8>) {
-        /// Linux's default `net.core.rmem_max`, doubled as it does.
-        const CAPACITY: usize = 2 * 212_992;
-        let cost = datagram_cost(&payload);
-        if self.queued_bytes + cost <= CAPACITY {
+        let cost = datagram_cost(payload.len());
+        if self.queued_bytes + cost <= DGRAM_CAPACITY {
             self.queued_bytes += cost;
-            self.queue.push_back((from, payload));
+            self.queue.push_back(Datagram {
+                from: Addr::Inet(from),
+                payload,
+                fds: Vec::new(),
+                cred: None,
+            });
         }
     }
 }
@@ -1071,28 +1235,226 @@ impl Net {
 
     /// Adjust the open-fd refcount of the socket end `fd` refers to (a no-op for
     /// non-socket fds or unconnected sockets). Mirrors `Kernel::bump_pipe`.
+    /// Dropping the last reference to a socket releases the descriptors
+    /// queued on it, which may drop further sockets in turn: the ones that
+    /// aren't sockets are left in [`Net::take_orphans`] for the kernel.
     pub(super) fn bump(&mut self, fd: &Fd, inc: bool) {
+        self.bump_one(fd, inc);
+        if !inc {
+            self.settle();
+        }
+    }
+
+    /// [`Self::bump`] of just this one reference, leaving whatever it lets
+    /// go of in [`Net::pending_put`].
+    fn bump_one(&mut self, fd: &Fd, inc: bool) {
         let Fd::Socket { sock, end } = *fd else {
             return;
         };
+        let end = end.min(1);
         let Some(s) = self.socks.get_mut(sock) else {
             return;
         };
+        let inflight = s.inflight[end];
         let n = match &mut s.kind {
             Kind::Pair(p) => &mut p.refs[end],
             _ => &mut s.refs,
         };
         if inc {
             *n += 1;
-        } else {
-            *n = n.saturating_sub(1);
-            let gone = *n == 0;
-            if s.refs == 0 && !matches!(s.kind, Kind::Pair(_)) {
-                self.release(sock);
-            } else if gone {
-                // The peer of a closed pair end now sees a hangup.
+            return;
+        }
+        *n = n.saturating_sub(1);
+        let left = *n;
+        if left > 0 && left == inflight {
+            // Only queues hold it now: it may be garbage.
+            self.gc_wanted = true;
+        }
+        if let Kind::Pair(p) = &mut s.kind {
+            if left == 0 {
+                // Nobody can read this end any more: what was queued for it
+                // goes, and the peer now sees a hangup.
+                let fds = p.take_all_fds(end);
+                self.put_queued(fds);
                 self.note_event(sock);
             }
+        } else if left == 0 {
+            self.release(sock);
+        }
+    }
+
+    /// Release what dropping references let go of: the descriptors queued on
+    /// sockets that went away, which may be sockets with queues of their own,
+    /// and then any cycle of sockets only their own queues reach.
+    fn settle(&mut self) {
+        loop {
+            while let Some(fd) = self.pending_put.pop() {
+                if matches!(fd, Fd::Socket { .. }) {
+                    self.bump_one(&fd, false);
+                } else {
+                    self.orphans.push(fd);
+                }
+            }
+            if !std::mem::take(&mut self.gc_wanted) {
+                return;
+            }
+            self.collect_cycles();
+        }
+    }
+
+    /// Released in-flight descriptors that hold references outside `net`
+    /// (pipes, ptys), for the kernel to drop.
+    pub(super) fn take_orphans(&mut self) -> Vec<Fd> {
+        std::mem::take(&mut self.orphans)
+    }
+
+    /// Unpark every waiter, to look again: a full queue has room now.
+    fn wake(&self) {
+        self.io_events
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether `AF_UNIX` datagram socket `tgt`'s queue has no room for a
+    /// `len`-byte datagram from `sender`: its buffer is full, or it holds more
+    /// than `max_dgram_qlen` from a sender it isn't connected to (Linux's
+    /// `unix_recvq_full`, which a socket's own peer isn't held to).
+    fn unix_dgram_full(&self, sender: usize, tgt: usize, len: usize) -> bool {
+        let Some(Kind::Dgram(d)) = self.socks.get(tgt).map(|s| &s.kind) else {
+            return false;
+        };
+        !d.queue.is_empty()
+            && (d.queued_bytes + datagram_cost(len) > DGRAM_CAPACITY
+                || (tgt != sender
+                    && d.pair_peer != Some(sender)
+                    && d.queue.len() > UNIX_MAX_DGRAM_QLEN))
+    }
+
+    /// Bind `AF_UNIX` datagram socket `sock` to an abstract name of its own,
+    /// five hex digits as Linux's `unix_autobind` makes them: what an unbound
+    /// socket gets from `bind` with no name, or when it sends or connects
+    /// with `SO_PASSCRED` on.
+    fn unix_autobind(&mut self, sock: usize) {
+        let netns = self.socks[sock].netns;
+        for _ in 0..=0xfffff {
+            let n = self.autobind_next & 0xfffff;
+            self.autobind_next = self.autobind_next.wrapping_add(1);
+            let name = format!("\0{n:05x}");
+            let key = unix_key(netns, &name, None);
+            if self.dgram_paths.contains_key(&key) {
+                continue;
+            }
+            self.dgram_paths.insert(key.clone(), sock);
+            self.socks[sock].unix_bound_key = Some(key);
+            self.socks[sock].unix_name = Some(name);
+            return;
+        }
+    }
+
+    /// `fds` (their references already taken) were queued on a socket.
+    fn hold_inflight(&mut self, fds: &[Fd]) {
+        for fd in fds {
+            if let Fd::Socket { sock, end } = *fd
+                && let Some(s) = self.socks.get_mut(sock)
+            {
+                s.inflight[end.min(1)] += 1;
+            }
+        }
+    }
+
+    /// `fds` left the queue they were on: received, or about to be released.
+    fn dequeued(&mut self, fds: &[Fd]) {
+        for fd in fds {
+            if let Fd::Socket { sock, end } = *fd
+                && let Some(s) = self.socks.get_mut(sock)
+            {
+                let n = &mut s.inflight[end.min(1)];
+                *n = n.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Release `fds`, taken off a queue that went away.
+    fn put_queued(&mut self, fds: Vec<Fd>) {
+        self.dequeued(&fds);
+        self.pending_put.extend(fds);
+    }
+
+    /// The socket ends among the descriptors queued for end `end` of `sock`.
+    fn queued_socks(&self, sock: usize, end: usize) -> Vec<(usize, usize)> {
+        let ends = |fds: &[Fd]| {
+            fds.iter()
+                .filter_map(|f| match *f {
+                    Fd::Socket { sock, end } => Some((sock, end.min(1))),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        match &self.socks[sock].kind {
+            Kind::Pair(p) => p.scm[end].iter().flat_map(|(_, fds)| ends(fds)).collect(),
+            Kind::Dgram(d) if end == 0 => d.queue.iter().flat_map(|dg| ends(&dg.fds)).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Linux's unix garbage collector: a socket end whose every reference is
+    /// a descriptor queued on some socket is alive only if a queue someone
+    /// can still read reaches it. Ends reached only from queues of other such
+    /// ends — a socket sent over itself, two sent over each other — can never
+    /// be received again, so their queues are emptied, which drops them.
+    fn collect_cycles(&mut self) {
+        use std::collections::BTreeSet;
+        // Each candidate with its references from outside the candidates.
+        let mut outside: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+        for (i, s) in self.socks.iter().enumerate() {
+            for e in 0..2 {
+                let refs = match &s.kind {
+                    Kind::Pair(p) => p.refs[e],
+                    _ if e == 0 => s.refs,
+                    _ => continue,
+                };
+                if s.inflight[e] > 0 && refs == s.inflight[e] {
+                    outside.insert((i, e), refs);
+                }
+            }
+        }
+        if outside.is_empty() {
+            return;
+        }
+        let candidates: Vec<(usize, usize)> = outside.keys().copied().collect();
+        for &(i, e) in &candidates {
+            for held in self.queued_socks(i, e) {
+                if let Some(n) = outside.get_mut(&held) {
+                    *n = n.saturating_sub(1);
+                }
+            }
+        }
+        // Held from outside, or reachable from what is.
+        let mut live: BTreeSet<(usize, usize)> = outside
+            .iter()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(&k, _)| k)
+            .collect();
+        let mut todo: Vec<(usize, usize)> = live.iter().copied().collect();
+        while let Some((i, e)) = todo.pop() {
+            for held in self.queued_socks(i, e) {
+                if outside.contains_key(&held) && live.insert(held) {
+                    todo.push(held);
+                }
+            }
+        }
+        for (i, e) in candidates {
+            if live.contains(&(i, e)) {
+                continue;
+            }
+            let fds = match &mut self.socks[i].kind {
+                Kind::Pair(p) => p.take_all_fds(e),
+                Kind::Dgram(d) => {
+                    d.queued_bytes = 0;
+                    d.queue.drain(..).flat_map(|dg| dg.fds).collect()
+                }
+                _ => Vec::new(),
+            };
+            self.put_queued(fds);
         }
     }
 
@@ -1143,6 +1505,9 @@ impl Net {
                 for pending in backlog {
                     if let Some(Kind::Pair(p)) = self.socks.get_mut(pending).map(|s| &mut s.kind) {
                         p.refs[1] = 0;
+                        // What the client sent before it was accepted goes too.
+                        let fds = p.take_all_fds(1);
+                        self.put_queued(fds);
                     }
                 }
             }
@@ -1154,10 +1519,16 @@ impl Net {
                     h.conn.shutdown_write();
                 }
             }
-            Kind::Dgram(_) => self.dgram_ports.retain(|_, group| {
-                group.retain(|&i| i != sock);
-                !group.is_empty()
-            }),
+            Kind::Dgram(d) => {
+                self.dgram_ports.retain(|_, group| {
+                    group.retain(|&i| i != sock);
+                    !group.is_empty()
+                });
+                self.dgram_paths.retain(|_, &mut i| i != sock);
+                // Nobody will receive what was queued: its descriptors go.
+                let fds = d.queue.into_iter().flat_map(|dg| dg.fds).collect();
+                self.put_queued(fds);
+            }
             _ => {}
         }
     }
@@ -1345,8 +1716,29 @@ impl Kernel {
     /// only takes `pipes` — legal after `net` in the lock order.
     fn scm_ref(&self, net: &mut Net, fd: &Fd, inc: bool) {
         match fd {
-            Fd::Socket { .. } => net.bump(fd, inc),
+            Fd::Socket { .. } => {
+                net.bump(fd, inc);
+                self.release_orphans(net);
+            }
             other => self.bump_pipe(other, inc),
+        }
+    }
+
+    /// Drop the in-flight descriptors closing sockets let go of that hold
+    /// references outside `net` ([`Net::take_orphans`]): pipes and ptys,
+    /// whose locks come after `net`'s.
+    pub(super) fn release_orphans(&self, net: &mut Net) {
+        for fd in net.take_orphans() {
+            self.bump_pipe(&fd, false);
+        }
+    }
+
+    /// Release `fds`, just taken off a socket's queue without being received
+    /// (a plain `read`, say).
+    fn release_queued(&self, net: &mut Net, fds: &[Fd]) {
+        net.dequeued(fds);
+        for fd in fds {
+            self.scm_ref(net, fd, false);
         }
     }
 
@@ -1442,6 +1834,141 @@ impl Kernel {
         })
     }
 
+    /// The `AF_UNIX` datagram socket bound to `name`, as `sock` finds it — or
+    /// what Linux says when there is none: `ECONNREFUSED` (an abstract name,
+    /// or a file no socket is bound to), `ENOENT` (no file),
+    /// `EPROTOTYPE` (a stream socket's).
+    #[allow(clippy::unused_self)]
+    fn find_unix_dgram(
+        &self,
+        net: &Net,
+        cx: &ServiceCtx,
+        sock: usize,
+        name: &str,
+    ) -> Result<usize, i64> {
+        let key = unix_key(net.socks[sock].netns, name, cx.unix_identity.as_ref());
+        if let Some(&tgt) = net.dgram_paths.get(&key) {
+            return Ok(tgt);
+        }
+        Err(err(if name.starts_with('\0') {
+            Errno::ECONNREFUSED
+        } else if net.listeners.contains_key(&key) {
+            Errno::EPROTOTYPE
+        } else if cx.unix_path_missing {
+            Errno::ENOENT
+        } else {
+            Errno::ECONNREFUSED
+        }))
+    }
+
+    /// The credentials a `SCM_CREDENTIALS` message gives, checked as Linux's
+    /// `scm_check_creds` does: one's own pid, and ids one could `setuid` and
+    /// `setgid` to, unless privileged.
+    fn scm_creds(&self, cx: &ServiceCtx, (pid, uid, gid): (i32, u32, u32)) -> Result<Ucred, i64> {
+        use super::caps::{CAP_SETGID, CAP_SETUID, CAP_SYS_ADMIN};
+        if uid == u32::MAX || gid == u32::MAX {
+            return Err(err(Errno::EINVAL));
+        }
+        let c = &cx.cur.creds;
+        let caps = &cx.cur.caps;
+        let own = self.visible_pid(cx, cx.cur.tgid);
+        let allowed = (pid == own || caps.has(CAP_SYS_ADMIN))
+            && ([c.ruid, c.euid, c.suid].contains(&uid) || caps.has(CAP_SETUID))
+            && ([c.rgid, c.egid, c.sgid].contains(&gid) || caps.has(CAP_SETGID));
+        if !allowed {
+            return Err(err(Errno::EPERM));
+        }
+        let pid = if pid == own {
+            cx.cur.tgid
+        } else {
+            match self.global_pid(cx, pid) {
+                Some(g) if pid > 0 => g,
+                _ => return Err(err(Errno::ESRCH)),
+            }
+        };
+        Ok(Ucred { pid, uid, gid })
+    }
+
+    /// Send one datagram on `AF_UNIX` datagram socket `sock`, as Linux's
+    /// `unix_dgram_sendmsg`: to the socket bound to `dest`, or without one to
+    /// its peer, carrying `fds` (whose references this takes) and `cred`. The
+    /// descriptors and credentials are this datagram's alone. A full queue
+    /// parks a blocking sender (`EAGAIN` for a nonblocking one), unlike UDP.
+    #[allow(clippy::too_many_arguments)]
+    fn unix_dgram_send(
+        &self,
+        net: &mut Net,
+        cx: &mut ServiceCtx,
+        sock: usize,
+        data: &[u8],
+        dest: Option<&str>,
+        fds: &[Fd],
+        cred: Option<Ucred>,
+    ) -> i64 {
+        if data.len() + 32 > net.socks[sock].opts.sndbuf.saturating_mul(2) as usize {
+            return err(Errno::EMSGSIZE);
+        }
+        if net.socks[sock].passcred() && net.socks[sock].unix_name.is_none() {
+            net.unix_autobind(sock);
+        }
+        let peer = match &net.socks[sock].kind {
+            Kind::Dgram(d) => d.pair_peer,
+            _ => return err(Errno::EINVAL),
+        };
+        let tgt = match dest {
+            Some(name) => match self.find_unix_dgram(net, cx, sock, name) {
+                Ok(t) => t,
+                Err(e) => return e,
+            },
+            None => match peer {
+                Some(p) => p,
+                None => return err(Errno::ENOTCONN),
+            },
+        };
+        let Some(Kind::Dgram(td)) = net.socks.get(tgt).map(|s| &s.kind) else {
+            // The peer has closed: it's refused, once, and then not connected.
+            if let Kind::Dgram(d) = &mut net.socks[sock].kind
+                && d.pair_peer == Some(tgt)
+            {
+                d.pair_peer = None;
+            }
+            return err(Errno::ECONNREFUSED);
+        };
+        // A socket connected elsewhere hears only from its peer.
+        if td.pair_peer.is_some_and(|p| p != sock) {
+            return err(Errno::EPERM);
+        }
+        if net.unix_dgram_full(sock, tgt, data.len()) {
+            if net.socks[sock].nonblock || cx.dontwait {
+                return err(Errno::EAGAIN);
+            }
+            cx.block = true;
+            return 0;
+        }
+        let from = Addr::Unix(net.socks[sock].unix_name.clone().unwrap_or_default());
+        // Without credentials of its own, a datagram carries the sender's when
+        // either end wants them.
+        let cred = cred.or_else(|| {
+            (net.socks[sock].passcred() || net.socks[tgt].passcred()).then(|| Ucred::scm_of(cx))
+        });
+        for f in fds {
+            self.scm_ref(net, f, true);
+        }
+        net.hold_inflight(fds);
+        if let Kind::Dgram(td) = &mut net.socks[tgt].kind {
+            td.queued_bytes += datagram_cost(data.len());
+            td.queue.push_back(Datagram {
+                from,
+                payload: data.to_vec(),
+                fds: fds.to_vec(),
+                cred,
+            });
+        }
+        net.socks[tgt].edge_seq += 1;
+        net.note_event(tgt);
+        data.len() as i64
+    }
+
     /// Ensure `SOCK_DGRAM` socket `sock` has a local address, lazily
     /// auto-assigning (and registering in the port table) an ephemeral
     /// loopback one if it was never `bind`-ed — mirroring the implicit local
@@ -1496,17 +2023,8 @@ impl Kernel {
                 ..Netlink::default()
             });
             let idx = net.socks.len();
-            net.socks.push(Sock {
-                netns: cx.cur.ns.net,
-                unix_bound_key: None,
-                domain,
-                kind,
-                nonblock,
-                opts: SockOpts::default(),
-                refs: 1,
-                edge_seq: 0,
-                last_event: 0,
-            });
+            net.socks
+                .push(Sock::new(cx.cur.ns.net, domain, kind, nonblock));
             let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
             cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
             return i64::from(fd);
@@ -1544,28 +2062,25 @@ impl Kernel {
                 .filter(|_| cx.cur.ns.net == 0)
                 .and_then(|e| e.open_icmp(domain == AF_INET6).ok());
             let idx = net.socks.len();
-            net.socks.push(Sock {
-                netns: cx.cur.ns.net,
-                unix_bound_key: None,
+            net.socks.push(Sock::new(
+                cx.cur.ns.net,
                 domain,
-                kind: Kind::Dgram(Dgram {
+                Kind::Dgram(Dgram {
                     icmp: Some(icmp),
                     host,
                     ..Dgram::default()
                 }),
                 nonblock,
-                opts: SockOpts::default(),
-                refs: 1,
-                edge_seq: 0,
-                last_event: 0,
-            });
+            ));
             let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
             cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
             return i64::from(fd);
         }
         // Stream and datagram are supported for every domain (including AF_UNIX
-        // datagram, which syslog's /dev/log uses); other types aren't.
-        if base_type != SOCK_STREAM && base_type != SOCK_DGRAM {
+        // datagram, which syslog's /dev/log uses), and AF_UNIX seqpacket;
+        // other types aren't.
+        let seqpacket = domain == AF_UNIX && base_type == SOCK_SEQPACKET;
+        if base_type != SOCK_STREAM && base_type != SOCK_DGRAM && !seqpacket {
             return err(Errno::EOPNOTSUPP);
         }
         let kind = if base_type == SOCK_DGRAM {
@@ -1574,17 +2089,9 @@ impl Kernel {
             Kind::Idle { bound: None }
         };
         let idx = net.socks.len();
-        net.socks.push(Sock {
-            netns: cx.cur.ns.net,
-            unix_bound_key: None,
-            domain,
-            kind,
-            nonblock,
-            opts: SockOpts::default(),
-            refs: 1,
-            edge_seq: 0,
-            last_event: 0,
-        });
+        let mut s = Sock::new(cx.cur.ns.net, domain, kind, nonblock);
+        s.seqpacket = seqpacket;
+        net.socks.push(s);
         let fd = cx.cur.fds.alloc(Fd::Socket { sock: idx, end: 0 });
         cx.cur.fds.set_cloexec(fd, sotype & SOCK_CLOEXEC != 0);
         i64::from(fd)
@@ -1620,20 +2127,15 @@ impl Kernel {
             let a = net.socks.len();
             let b = a + 1;
             for peer in [b, a] {
-                net.socks.push(Sock {
-                    netns: cx.cur.ns.net,
-                    unix_bound_key: None,
-                    domain: AF_UNIX,
-                    kind: Kind::Dgram(Dgram {
+                net.socks.push(Sock::new(
+                    cx.cur.ns.net,
+                    AF_UNIX,
+                    Kind::Dgram(Dgram {
                         pair_peer: Some(peer),
                         ..Dgram::default()
                     }),
                     nonblock,
-                    opts: SockOpts::default(),
-                    refs: 1,
-                    edge_seq: 0,
-                    last_event: 0,
-                });
+                ));
             }
             (a, b, 0, 0)
         } else {
@@ -1644,17 +2146,12 @@ impl Kernel {
                 pair.msgs = Some([VecDeque::new(), VecDeque::new()]);
             }
             let idx = net.socks.len();
-            net.socks.push(Sock {
-                netns: cx.cur.ns.net,
-                unix_bound_key: None,
-                domain: AF_UNIX,
-                kind: Kind::Pair(pair),
+            net.socks.push(Sock::new(
+                cx.cur.ns.net,
+                AF_UNIX,
+                Kind::Pair(pair),
                 nonblock,
-                opts: SockOpts::default(),
-                refs: 1,
-                edge_seq: 0,
-                last_event: 0,
-            });
+            ));
             (idx, idx, 0, 1)
         };
         let fd0 = cx.cur.fds.alloc(Fd::Socket {
@@ -1705,23 +2202,30 @@ impl Kernel {
                     return err(Errno::EINVAL);
                 }
                 let path = path.clone();
-                net.socks[sock].unix_bound_key = Some(unix_key(
-                    net.socks[sock].netns,
-                    &path,
-                    cx.unix_identity.as_ref(),
-                ));
+                let key = unix_key(net.socks[sock].netns, &path, cx.unix_identity.as_ref());
                 match &mut net.socks[sock].kind {
                     Kind::Idle { bound } => {
                         *bound = Some(parsed);
+                        net.socks[sock].unix_bound_key = Some(key);
                         0
                     }
-                    // A datagram socket bound to a path receives datagrams sent to
+                    // A datagram socket bound to a name receives datagrams sent to
                     // it (syslog's /dev/log, and unix-dgram IPC generally).
                     Kind::Dgram(_) => {
-                        net.dgram_paths.insert(
-                            unix_key(net.socks[sock].netns, &path, cx.unix_identity.as_ref()),
-                            sock,
-                        );
+                        if net.socks[sock].unix_name.is_some() {
+                            return err(Errno::EINVAL);
+                        }
+                        // No name at all: one of its own.
+                        if path.is_empty() {
+                            net.unix_autobind(sock);
+                            return 0;
+                        }
+                        if path.starts_with('\0') && net.dgram_paths.contains_key(&key) {
+                            return err(Errno::EADDRINUSE);
+                        }
+                        net.dgram_paths.insert(key.clone(), sock);
+                        net.socks[sock].unix_bound_key = Some(key);
+                        net.socks[sock].unix_name = Some(path);
                         0
                     }
                     _ => err(Errno::EINVAL),
@@ -1855,10 +2359,19 @@ impl Kernel {
                 }
             };
         }
+        let domain = net.socks[sock].domain;
+        // `AF_UNSPEC` takes a datagram socket's peer away.
+        if domain == AF_UNIX
+            && addrlen >= 2
+            && mem.read_vec(addr, 2).is_ok_and(|f| f == [0, 0])
+            && let Kind::Dgram(d) = &mut net.socks[sock].kind
+        {
+            d.pair_peer = None;
+            return 0;
+        }
         let Some(target) = read_sockaddr(mem, addr, addrlen) else {
             return err(Errno::EINVAL);
         };
-        let domain = net.socks[sock].domain;
         let mismatched = match (&target, domain) {
             (Addr::Unix(_), AF_UNIX) => false,
             (Addr::Inet(a), AF_INET) => a.v6,
@@ -1867,6 +2380,27 @@ impl Kernel {
         };
         if mismatched {
             return err(Errno::EINVAL);
+        }
+        // An `AF_UNIX` datagram socket's peer: the socket bound to that name,
+        // which `send` then reaches and which alone may send to it if it is
+        // connected back.
+        if let Addr::Unix(name) = &target
+            && matches!(net.socks[sock].kind, Kind::Dgram(_))
+        {
+            if name.is_empty() {
+                return err(Errno::EINVAL);
+            }
+            let tgt = match self.find_unix_dgram(net, cx, sock, name) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            if net.socks[sock].passcred() && net.socks[sock].unix_name.is_none() {
+                net.unix_autobind(sock);
+            }
+            if let Kind::Dgram(d) = &mut net.socks[sock].kind {
+                d.pair_peer = Some(tgt);
+            }
+            return 0;
         }
         // A stream `AF_INET6` socket connecting to an IPv4-mapped address
         // (`::ffff:127.0.0.1`) makes an IPv4 connection, as on Linux.
@@ -1917,11 +2451,8 @@ impl Kernel {
         }
 
         if matches!(net.socks[sock].kind, Kind::Dgram(_)) {
-            // An `AF_UNIX` datagram socket connecting to a path (syslog's
-            // `/dev/log`) isn't modeled — `sendto` with the path is — so it's
-            // what Linux says when no socket is there.
             let Addr::Inet(peer) = target else {
-                return err(Errno::ENOENT);
+                unreachable!("AF_UNIX datagram connects are done above")
             };
             self.ensure_dgram_bound(net, sock);
             if let Kind::Dgram(d) = &mut net.socks[sock].kind {
@@ -1954,9 +2485,30 @@ impl Kernel {
             Addr::Inet(a) if !a.v6 => net.pick_dual_listener(netns, *a),
             _ => None,
         });
+        // A name of another type of socket: refused for an abstract name
+        // (those are per type), the wrong type for a file.
+        let wrong_type = |abstract_name: bool| {
+            err(if abstract_name {
+                Errno::ECONNREFUSED
+            } else {
+                Errno::EPROTOTYPE
+            })
+        };
+        let abstract_name = matches!(&target, Addr::Unix(p) if p.starts_with('\0'));
         let Some(lidx) = picked else {
+            if let Addr::Unix(_) = &target {
+                if net.dgram_paths.contains_key(&key) {
+                    return wrong_type(abstract_name);
+                }
+                if !abstract_name && cx.unix_path_missing {
+                    return err(Errno::ENOENT);
+                }
+            }
             return err(Errno::ECONNREFUSED);
         };
+        if net.socks[lidx].seqpacket != net.socks[sock].seqpacket {
+            return wrong_type(abstract_name);
+        }
         // A full accept queue: nobody is taking connections (Linux's SOMAXCONN).
         if let Kind::Listener { backlog, .. } = &net.socks[lidx].kind
             && backlog.len() >= 4096
@@ -1972,6 +2524,9 @@ impl Kernel {
         let mut pair = Pair::new();
         pair.cred = [Ucred::of(cx), listener_cred];
         pair.nonblock[0] = net.socks[sock].nonblock;
+        if net.socks[sock].seqpacket {
+            pair.msgs = Some([VecDeque::new(), VecDeque::new()]);
+        }
         if domain != AF_UNIX {
             // The connection's family is the target's (an IPv4-mapped one was
             // made plain IPv4 above); an `AF_INET6` end of an IPv4 connection
@@ -2187,6 +2742,9 @@ impl Kernel {
             Kind::Idle { bound } => bound.clone(),
             Kind::Listener { addr, .. } => addr.clone(),
             Kind::Pair(p) => p.addr_seen_by(end, end).map(Addr::Inet),
+            Kind::Dgram(_) if domain == AF_UNIX => Some(Addr::Unix(
+                net.socks[sock].unix_name.clone().unwrap_or_default(),
+            )),
             Kind::Dgram(d) => d.local.map(Addr::Inet),
             // A host-bridged socket has an ephemeral local address the guest
             // never bound and doesn't inspect; report the wildcard.
@@ -2217,6 +2775,12 @@ impl Kernel {
                 domain,
                 p.addr_seen_by(1 - end, end).map(Addr::Inet).as_ref(),
             ),
+            Kind::Dgram(Dgram {
+                pair_peer: Some(p), ..
+            }) if domain == AF_UNIX => {
+                let name = net.socks[*p].unix_name.clone().unwrap_or_default();
+                write_sockaddr(mem, addr, addrlen, domain, Some(&Addr::Unix(name)))
+            }
             Kind::Dgram(d) if d.peer.is_some() => {
                 write_sockaddr(mem, addr, addrlen, domain, d.peer.map(Addr::Inet).as_ref())
             }
@@ -2541,6 +3105,7 @@ impl Kernel {
                     Kind::Dgram(_) => SOCK_DGRAM as u32,
                     Kind::Netlink(nl) => nl.sotype as u32,
                     Kind::Pair(Pair { msgs: Some(_), .. }) => SOCK_SEQPACKET as u32,
+                    _ if net.socks[sock].seqpacket => SOCK_SEQPACKET as u32,
                     _ => SOCK_STREAM as u32,
                 },
                 SO_ERROR => {
@@ -2714,27 +3279,15 @@ impl Kernel {
         }
         let dest = match read_sockaddr(mem, dest_addr, dest_addrlen) {
             Some(Addr::Inet(d)) => d,
-            // A unix datagram to a bound path: deliver to that socket's queue.
-            // (An unbound/nonexistent path is silently dropped, as Linux does for
-            // a datagram to a since-removed socket — no deadlock on the sender.)
+            // A unix datagram to a bound name: deliver to that socket's queue.
             Some(Addr::Unix(path)) => {
-                if !matches!(net.socks[sock].kind, Kind::Dgram(_)) {
+                if !matches!(net.socks[sock].kind, Kind::Dgram(_))
+                    || net.socks[sock].domain != AF_UNIX
+                    || path.is_empty()
+                {
                     return err(Errno::EINVAL);
                 }
-                let key = unix_key(net.socks[sock].netns, &path, cx.unix_identity.as_ref());
-                if let Some(&tgt) = net.dgram_paths.get(&key)
-                    && let Kind::Dgram(td) = &mut net.socks[tgt].kind
-                {
-                    // Unix datagrams carry no INET src; a zeroed placeholder (the
-                    // recvfrom src is a unix path, usually ignored by the caller).
-                    let src = InetAddr {
-                        v6: false,
-                        port: 0,
-                        ip: [0; 16],
-                    };
-                    td.enqueue(src, data.to_vec());
-                }
-                return data.len() as i64;
+                return self.unix_dgram_send(net, cx, sock, data, Some(&path), &[], None);
             }
             _ => return err(Errno::EINVAL),
         };
@@ -2786,10 +3339,7 @@ impl Kernel {
         match net.socks.get_mut(sock).map(|s| &mut s.kind) {
             Some(Kind::Host(h)) => h.conn.readable_len() as u64,
             Some(Kind::Pair(p)) => p.to[end.min(1)].len() as u64,
-            Some(Kind::Dgram(d)) => d
-                .queue
-                .front()
-                .map_or(0, |(_, payload)| payload.len() as u64),
+            Some(Kind::Dgram(d)) => d.queue.front().map_or(0, |dg| dg.payload.len() as u64),
             _ => 0,
         }
     }
@@ -2816,7 +3366,7 @@ impl Kernel {
                 // drained and the peer is gone / shut its write / we shut our read.
                 let eof = p.to[e].is_empty() && (peer_closed || p.shut_wr[1 - e] || p.shut_rd[e]);
                 let mut m = 0;
-                if !p.to[e].is_empty() || eof {
+                if p.readable(e) || eof {
                     m |= POLLIN;
                 }
                 let capacity = net.socks[sock].opts.sndbuf.saturating_mul(2) as usize;
@@ -2836,8 +3386,12 @@ impl Kernel {
                     POLLIN
                 }
             }
-            // A datagram socket is readable when a datagram is queued.
-            Some(Kind::Dgram(d)) => POLLOUT | if d.queue.is_empty() { 0 } else { POLLIN },
+            // A datagram socket is readable when a datagram is queued, and an
+            // `AF_UNIX` one writable while its peer has room.
+            Some(Kind::Dgram(d)) => {
+                let full = matches!(d.pair_peer, Some(t) if net.unix_dgram_full(sock, t, 0));
+                (if full { 0 } else { POLLOUT }) | if d.queue.is_empty() { 0 } else { POLLIN }
+            }
             // Netlink replies are queued synchronously by the request: readable
             // only with one waiting (a uevent socket never is), always writable.
             Some(Kind::Netlink(nl)) => POLLOUT | if nl.queue.is_empty() { 0 } else { POLLIN },
@@ -3065,15 +3619,25 @@ impl Kernel {
             return n;
         }
         let nonblock = net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
-        let Some((from, data)) = self.recv_dgram_msg(net, sock, flags) else {
+        let Some(Datagram {
+            from,
+            payload: data,
+            fds,
+            ..
+        }) = self.recv_dgram_msg(net, sock, flags)
+        else {
             if nonblock {
                 return err(Errno::EAGAIN);
             }
             cx.block = true;
             return 0;
         };
+        // No control buffer to take them: they're closed.
+        for f in &fds {
+            self.scm_ref(net, f, false);
+        }
         let domain = net.socks[sock].domain;
-        write_sockaddr(mem, src_addr, src_addrlen, domain, Some(&Addr::Inet(from)));
+        write_source(mem, src_addr, src_addrlen, domain, Some(&from));
         let n = (len as usize).min(data.len());
         if mem.write(buf, &data[..n]).is_err() {
             return err(Errno::EFAULT);
@@ -3119,11 +3683,23 @@ impl Kernel {
                 Err(_) => return err(Errno::EFAULT),
             }
         }
-        // Parse any SCM_RIGHTS ancillary data and translate each passed guest fd
-        // to a duplicated kernel-side `Fd` (validated up front: an unknown fd
-        // fails the whole sendmsg with EBADF, before anything is queued).
-        let Some(guest_fds) = parse_scm_rights(mem, hdr.control, hdr.controllen) else {
-            return err(Errno::EFAULT);
+        // Parse the ancillary data and translate each passed guest fd to a
+        // duplicated kernel-side `Fd` (validated up front: an unknown fd fails
+        // the whole sendmsg with EBADF, before anything is queued). Only
+        // AF_UNIX passes descriptors and credentials.
+        let target = self.sock_of(cx, fd);
+        let unix = target.is_some_and(|(s, _)| net.socks[s].domain == AF_UNIX);
+        let (guest_fds, cred) = if unix {
+            match parse_unix_control(mem, hdr.control, hdr.controllen) {
+                Ok(c) => (c.fds, c.cred),
+                Err(e) => return e,
+            }
+        } else {
+            match parse_scm_rights(mem, hdr.control, hdr.controllen) {
+                Some(f) if f.is_empty() => (f, None),
+                Some(_) => return err(Errno::EINVAL),
+                None => return err(Errno::EFAULT),
+            }
         };
         let mut passed: Vec<Fd> = Vec::with_capacity(guest_fds.len());
         for g in &guest_fds {
@@ -3132,8 +3708,29 @@ impl Kernel {
                 None => return err(Errno::EBADF),
             }
         }
+        let cred = match cred {
+            Some(c) => match self.scm_creds(cx, c) {
+                Ok(c) => Some(c),
+                Err(e) => return e,
+            },
+            None => None,
+        };
         const MSG_NOSIGNAL: u64 = 0x4000;
         cx.dontwait = flags & MSG_DONTWAIT != 0;
+        if let Some((sock, _)) = target
+            && unix
+            && matches!(net.socks[sock].kind, Kind::Dgram(_))
+        {
+            let dest = if hdr.name != 0 && hdr.namelen > 0 {
+                match read_sockaddr(mem, hdr.name, u64::from(hdr.namelen)) {
+                    Some(Addr::Unix(name)) if !name.is_empty() => Some(name),
+                    _ => return err(Errno::EINVAL),
+                }
+            } else {
+                None
+            };
+            return self.unix_dgram_send(net, cx, sock, &data, dest.as_deref(), &passed, cred);
+        }
         let r = self.send_bytes(
             net,
             cx,
@@ -3152,7 +3749,6 @@ impl Kernel {
         // re-run that completes it.
         if r >= 0
             && !cx.block
-            && !passed.is_empty()
             && let Some((sock, end)) = self.sock_of(cx, fd)
             && matches!(net.socks[sock].kind, Kind::Pair(_))
         {
@@ -3161,11 +3757,14 @@ impl Kernel {
             }
             if let Kind::Pair(p) = &mut net.socks[sock].kind {
                 let reader = 1 - end;
-                // Bytes already queued ahead of this message (this write appended
-                // `r` bytes to the tail).
-                let pos = p.to[reader].len().saturating_sub(r as usize);
-                p.scm[reader].push_back((pos, passed));
+                if let Some(c) = cred {
+                    p.sender[reader] = c;
+                }
+                if !passed.is_empty() {
+                    p.attach_fds(reader, r as usize, passed.clone());
+                }
             }
+            net.hold_inflight(&passed);
         }
         r
     }
@@ -3173,6 +3772,9 @@ impl Kernel {
     /// `sendmmsg(fd, msgvec, vlen, flags)` — send an array of `struct mmsghdr`
     /// `{ msghdr msg_hdr; u32 msg_len }` (64 bytes each), writing each sent
     /// byte count back into `msg_len`. Returns the number of messages sent.
+    /// A send that would park after the first message ends the call there
+    /// instead, as re-running it would send the first ones again.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn sys_sendmmsg(
         &self,
         net: &mut Net,
@@ -3180,14 +3782,28 @@ impl Kernel {
         fd: u64,
         msgvec: u64,
         vlen: u64,
+        flags: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
+        let targets = std::mem::take(&mut cx.unix_mmsg);
         let mut sent = 0i64;
-        for i in 0..vlen {
+        for i in 0..vlen.min(UIO_MAXIOV) {
             let ent = msgvec + i * 64;
-            let r = self.sys_sendmsg(net, cx, fd, ent, 0, mem);
+            // Each message's own destination path (see `unix_path_identity`).
+            if let Some((identity, missing)) = targets.get(i as usize) {
+                cx.unix_identity.clone_from(identity);
+                cx.unix_path_missing = *missing;
+            }
+            let r = self.sys_sendmsg(net, cx, fd, ent, flags, mem);
+            if sent > 0 && cx.block {
+                cx.block = false;
+                return sent;
+            }
             if r < 0 {
                 return if sent > 0 { sent } else { r };
+            }
+            if cx.block {
+                return 0;
             }
             let _ = mem.write(ent + 56, &(r as u32).to_le_bytes());
             sent += 1;
@@ -3211,8 +3827,11 @@ impl Kernel {
         mem: &mut GuestMemory,
     ) -> i64 {
         let mut got = 0i64;
-        for i in 0..vlen {
+        for i in 0..vlen.min(UIO_MAXIOV) {
             let ent = msgvec + i * 64;
+            // Only the first receive waits; the rest take what is there (a
+            // re-run after parking would lose the ones already taken).
+            let flags = if got > 0 { flags | MSG_DONTWAIT } else { flags };
             let r = self.sys_recvmsg(net, cx, fd, ent, flags, mem);
             if r < 0 {
                 // EAGAIN after at least one message is a normal stop, not an error.
@@ -3221,9 +3840,11 @@ impl Kernel {
                 }
                 return r;
             }
+            if cx.block {
+                return 0;
+            }
             let _ = mem.write(ent + 56, &(r as u32).to_le_bytes());
             got += 1;
-            // Only force the first recv to block; the rest are best-effort.
         }
         got
     }
@@ -3269,11 +3890,16 @@ impl Kernel {
         // Instead gather into a host Vec by receiving into the largest single
         // iovec repeatedly is also wrong for datagrams. So: receive once into
         // a host buffer via a dedicated helper.
-        let (src, mut got, mut msg_flags, scm_fds) =
-            match self.recv_message(net, cx, fd, total, flags) {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
+        let RecvMsg {
+            from: src,
+            data: mut got,
+            flags: mut msg_flags,
+            fds: scm_fds,
+            cred,
+        } = match self.recv_message(net, cx, fd, total, flags) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
         // Nothing yet: the call waits (re-traps) with the caller's `msghdr`
         // untouched — writing back `msg_controllen = 0` now would leave the
         // re-run no room for the descriptors it is waiting for.
@@ -3304,26 +3930,25 @@ impl Kernel {
             let domain = self
                 .sock_of(cx, fd)
                 .map_or(AF_INET, |(s, _)| net.socks[s].domain);
-            write_sockaddr(mem, hdr.name, msg + 8, domain, src.as_ref());
+            write_source(mem, hdr.name, msg + 8, domain, src.as_ref());
         }
         // Emit any SCM_RIGHTS ancillary data into msg_control (offset 40 =
         // msg_controllen), setting msg_flags (offset 48).
-        // With SO_PASSCRED, a message on a connected AF_UNIX socket says who sent it.
-        let creds = self
-            .sock_of(cx, fd)
-            .and_then(|(s, end)| match &net.socks[s].kind {
-                Kind::Pair(p)
-                    if net.socks[s]
-                        .opts
-                        .int_opt((SOL_SOCKET, SO_PASSCRED))
-                        .unwrap_or(0)
-                        != 0
-                        && (whole > 0 || !scm_fds.is_empty()) =>
-                {
+        // With SO_PASSCRED, a message on an AF_UNIX socket says who sent it:
+        // a datagram what it carried (nobody, if it carried nothing).
+        let creds = self.sock_of(cx, fd).and_then(|(s, end)| {
+            let s = &net.socks[s];
+            if s.domain != AF_UNIX || !s.passcred() {
+                return None;
+            }
+            match &s.kind {
+                Kind::Pair(p) if whole > 0 || !scm_fds.is_empty() || p.msgs.is_some() => {
                     Some(p.sender[end])
                 }
+                Kind::Dgram(_) => Some(cred.unwrap_or_else(Ucred::nobody)),
                 _ => None,
-            });
+            }
+        });
         let creds = creds.map(|c| {
             let pid = if c.pid == 0 {
                 0
@@ -3352,10 +3977,12 @@ impl Kernel {
     }
 
     /// Materialize `scm_fds` (in-flight SCM_RIGHTS fds delivered with this
-    /// `recvmsg`) into fresh guest fds and write the `SCM_RIGHTS` cmsg into the
-    /// caller's `msg_control` buffer. Fds that don't fit the buffer are dropped
-    /// (their backing ref released) and `MSG_CTRUNC` is set. Always writes
-    /// `msg_controllen` (offset 40); may set bits in `msg_flags`.
+    /// `recvmsg`) into fresh guest fds and write the control messages into
+    /// the caller's `msg_control` buffer as Linux's `scm_recv` does:
+    /// `SCM_CREDENTIALS` first (cut short if it doesn't fit), then as many
+    /// descriptors as fit; the rest are closed and `MSG_CTRUNC` is set, as it
+    /// is for anything that came with no control buffer to take it. Always
+    /// writes `msg_controllen` (offset 40), the room used.
     #[allow(clippy::too_many_arguments)]
     fn emit_scm_rights(
         &self,
@@ -3369,24 +3996,42 @@ impl Kernel {
         msg_flags: &mut u64,
         mem: &mut GuestMemory,
     ) {
-        // SCM_CREDENTIALS first, as Linux puts it: `struct ucred` in a
-        // CMSG_SPACE(12) = 32-byte message.
+        if hdr.control == 0 {
+            if creds.is_some() || !scm_fds.is_empty() {
+                *msg_flags |= MSG_CTRUNC;
+            }
+            for fd in &scm_fds {
+                self.scm_ref(net, fd, false);
+            }
+            let _ = mem.write(msg + 40, &0u64.to_le_bytes());
+            return;
+        }
+        let total = usize::try_from(hdr.controllen).unwrap_or(usize::MAX);
+        // SCM_CREDENTIALS first, as Linux's `put_cmsg` puts it: a
+        // `struct ucred` in a CMSG_SPACE(12) = 32-byte message, cut to the
+        // room there is (with `MSG_CTRUNC`).
         let mut used = 0usize;
         if let Some((pid, uid, gid)) = creds {
-            const CRED_SPACE: usize = CMSG_HDR_LEN + 16;
-            if hdr.control != 0 && hdr.controllen >= CRED_SPACE as u64 {
-                let mut c = Vec::with_capacity(CRED_SPACE);
-                c.extend_from_slice(&((CMSG_HDR_LEN + 12) as u64).to_le_bytes());
+            let room = total - used;
+            if room < CMSG_HDR_LEN {
+                *msg_flags |= MSG_CTRUNC;
+            } else {
+                let mut data = Vec::with_capacity(12);
+                data.extend_from_slice(&pid.to_le_bytes());
+                data.extend_from_slice(&uid.to_le_bytes());
+                data.extend_from_slice(&gid.to_le_bytes());
+                let mut cmlen = CMSG_HDR_LEN + data.len();
+                if room < cmlen {
+                    *msg_flags |= MSG_CTRUNC;
+                    cmlen = room;
+                }
+                let mut c = Vec::with_capacity(cmlen);
+                c.extend_from_slice(&(cmlen as u64).to_le_bytes());
                 c.extend_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
                 c.extend_from_slice(&SCM_CREDENTIALS.to_le_bytes());
-                c.extend_from_slice(&pid.to_le_bytes());
-                c.extend_from_slice(&uid.to_le_bytes());
-                c.extend_from_slice(&gid.to_le_bytes());
-                c.extend_from_slice(&[0; 4]);
+                c.extend_from_slice(&data[..cmlen - CMSG_HDR_LEN]);
                 let _ = mem.write(hdr.control, &c);
-                used = CRED_SPACE;
-            } else {
-                *msg_flags |= MSG_CTRUNC;
+                used += cmsg_align(CMSG_HDR_LEN + data.len()).min(room);
             }
         }
         if scm_fds.is_empty() {
@@ -3394,8 +4039,8 @@ impl Kernel {
             return;
         }
         // How many fds fit in the caller's control buffer.
-        let room = (hdr.controllen as usize).saturating_sub(used);
-        let capacity = if hdr.control != 0 && room >= CMSG_HDR_LEN {
+        let room = total - used;
+        let capacity = if room > CMSG_HDR_LEN {
             (room - CMSG_HDR_LEN) / 4
         } else {
             0
@@ -3431,7 +4076,9 @@ impl Kernel {
             cbuf.extend_from_slice(&g.to_le_bytes());
         }
         let _ = mem.write(hdr.control + used as u64, &cbuf);
-        let _ = mem.write(msg + 40, &((used + cmsg_len) as u64).to_le_bytes());
+        // The room it takes: CMSG_SPACE, or what's left.
+        used += cmsg_align(cmsg_len).min(room);
+        let _ = mem.write(msg + 40, &(used as u64).to_le_bytes());
     }
 
     /// Receive up to `cap` bytes from socket `fd` into a host `Vec` — the
@@ -3447,7 +4094,7 @@ impl Kernel {
         cap: u64,
         flags: u64,
     ) -> Result<Vec<u8>, i64> {
-        let (_, mut data, _, fds) = self.recv_message(net, cx, fd, cap, flags)?;
+        let RecvMsg { mut data, fds, .. } = self.recv_message(net, cx, fd, cap, flags)?;
         for f in &fds {
             self.scm_ref(net, f, false);
         }
@@ -3480,14 +4127,14 @@ impl Kernel {
                         } else {
                             0
                         };
-                        Ok((None, data, mf, Vec::new()))
+                        Ok(RecvMsg::new(None, data, mf))
                     }
                     None => {
                         if nonblock {
                             Err(err(Errno::EAGAIN))
                         } else {
                             cx.block = true;
-                            Ok((None, Vec::new(), 0, Vec::new()))
+                            Ok(RecvMsg::new(None, Vec::new(), 0))
                         }
                     }
                 }
@@ -3495,20 +4142,26 @@ impl Kernel {
             Kind::Dgram(_) => {
                 let nonblock = net.socks[sock].nonblock || flags & MSG_DONTWAIT != 0;
                 match self.recv_dgram_msg(net, sock, flags) {
-                    Some((from, data)) => {
-                        let mf = if data.len() as u64 > cap {
+                    Some(dg) => {
+                        let mf = if dg.payload.len() as u64 > cap {
                             MSG_TRUNC
                         } else {
                             0
                         };
-                        Ok((Some(Addr::Inet(from)), data, mf, Vec::new()))
+                        Ok(RecvMsg {
+                            from: Some(dg.from),
+                            data: dg.payload,
+                            flags: mf,
+                            fds: dg.fds,
+                            cred: dg.cred,
+                        })
                     }
                     None => {
                         if nonblock {
                             Err(err(Errno::EAGAIN))
                         } else {
                             cx.block = true;
-                            Ok((None, Vec::new(), 0, Vec::new()))
+                            Ok(RecvMsg::new(None, Vec::new(), 0))
                         }
                     }
                 }
@@ -3520,7 +4173,7 @@ impl Kernel {
                     Kind::Host(h) => Some(Addr::Inet(h.peer)),
                     _ => None,
                 };
-                Ok((peer, bytes, 0, Vec::new()))
+                Ok(RecvMsg::new(peer, bytes, 0))
             }
             _ => {
                 // Stream: pull bytes directly out of the inbound queue (the
@@ -3532,35 +4185,43 @@ impl Kernel {
                     Kind::Pair(p) => p.addr_seen_by(1 - end, end).map(Addr::Inet),
                     _ => None,
                 };
-                Ok((peer, bytes, if cut { MSG_TRUNC } else { 0 }, fds))
+                let mut got = RecvMsg::new(peer, bytes, if cut { MSG_TRUNC } else { 0 });
+                got.fds = fds;
+                Ok(got)
             }
         }
     }
 
     /// Pop (or, for `MSG_PEEK`, peek at) datagram socket `sock`'s next queued
-    /// inbound `(source, payload)`. A pure query: the caller decides the
-    /// block/`EAGAIN` behavior when this returns `None` (an empty queue).
-    fn recv_dgram_msg(
-        &self,
-        net: &mut Net,
-        sock: usize,
-        flags: u64,
-    ) -> Option<(InetAddr, Vec<u8>)> {
+    /// inbound datagram. A pure query: the caller decides the block/`EAGAIN`
+    /// behavior when this returns `None` (an empty queue). The descriptors
+    /// returned are the caller's to install or release: a popped datagram's
+    /// own, or for a peek copies of them, as Linux's `unix_peek_fds` makes.
+    fn recv_dgram_msg(&self, net: &mut Net, sock: usize, flags: u64) -> Option<Datagram> {
         // Pull any host-arrived datagrams (egress replies, e.g. DNS) into the
         // queue first, so they're visible to this dequeue.
         self.host_udp_drain(net, sock);
-        let peek = flags & MSG_PEEK != 0;
-        match &mut net.socks[sock].kind {
-            Kind::Dgram(d) if peek => d.queue.front().cloned(),
-            Kind::Dgram(d) => {
-                let next = d.queue.pop_front();
-                if let Some((_, payload)) = &next {
-                    d.queued_bytes -= datagram_cost(payload);
-                }
-                next
+        let Kind::Dgram(d) = &mut net.socks[sock].kind else {
+            unreachable!("checked by caller")
+        };
+        if flags & MSG_PEEK != 0 {
+            let dg = d.queue.front().cloned()?;
+            for f in &dg.fds {
+                self.scm_ref(net, f, true);
             }
-            _ => unreachable!("checked by caller"),
+            return Some(dg);
         }
+        let (was_len, was_bytes) = (d.queue.len(), d.queued_bytes);
+        let dg = d.queue.pop_front()?;
+        d.queued_bytes -= datagram_cost(dg.payload.len());
+        net.dequeued(&dg.fds);
+        // An AF_UNIX sender may be parked waiting for room.
+        if net.socks[sock].domain == AF_UNIX
+            && (was_len > UNIX_MAX_DGRAM_QLEN || was_bytes > DGRAM_CAPACITY / 4)
+        {
+            net.wake();
+        }
+        Some(dg)
     }
 
     /// Read from socket `sock`'s inbound queue for `end`. For a stream pair:
@@ -3584,13 +4245,20 @@ impl Kernel {
     ) -> i64 {
         if matches!(net.socks[sock].kind, Kind::Dgram(_)) {
             let nonblock = net.socks[sock].nonblock;
-            let Some((_, data)) = self.recv_dgram_msg(net, sock, 0) else {
+            let Some(Datagram {
+                payload: data, fds, ..
+            }) = self.recv_dgram_msg(net, sock, 0)
+            else {
                 if nonblock {
                     return err(Errno::EAGAIN);
                 }
                 cx.block = true;
                 return 0;
             };
+            // A plain read takes no descriptors: they're closed.
+            for f in &fds {
+                self.scm_ref(net, f, false);
+            }
             let n = (count as usize).min(data.len());
             if mem.write(buf, &data[..n]).is_err() {
                 return err(Errno::EFAULT);
@@ -3739,12 +4407,14 @@ impl Kernel {
                 Err(e) => e,
             };
         }
-        let (shut_rd, avail, peer_open, nonblock) = match &net.socks[sock].kind {
+        let (shut_rd, avail, peer_open, nonblock, msg_queued) = match &net.socks[sock].kind {
             Kind::Pair(p) => (
                 p.shut_rd[end],
                 p.to[end].len(),
                 p.refs[1 - end] > 0 && !p.shut_wr[1 - end],
                 p.nonblock[end] || flags & MSG_DONTWAIT != 0,
+                // An empty seqpacket message is one to read, too.
+                p.msgs.as_ref().is_some_and(|m| !m[end].is_empty()),
             ),
             _ => return err(Errno::EINVAL),
         };
@@ -3756,7 +4426,7 @@ impl Kernel {
             && avail > 0
             && avail < count as usize
             && peer_open;
-        if avail == 0 || short {
+        if (avail == 0 && !msg_queued) || short {
             if peer_open {
                 if nonblock {
                     return err(Errno::EAGAIN);
@@ -3769,7 +4439,7 @@ impl Kernel {
         // With MSG_TRUNC, a SOCK_SEQPACKET receive says how long the message was.
         let whole = match &net.socks[sock].kind {
             Kind::Pair(Pair { msgs: Some(m), .. }) if flags & MSG_TRUNC != 0 => {
-                m[end].front().copied()
+                m[end].front().map(|&(len, _)| len)
             }
             _ => None,
         };
@@ -3792,9 +4462,7 @@ impl Kernel {
                 Kind::Pair(p) => p.finish_read(end, data.len()).0,
                 _ => Vec::new(),
             };
-            for fd in &dropped {
-                self.scm_ref(net, fd, false);
-            }
+            self.release_queued(net, &dropped);
         }
         if mem.write(buf, &data).is_err() {
             return err(Errno::EFAULT);
@@ -3815,13 +4483,12 @@ impl Kernel {
         count: u64,
         flags: u64,
     ) -> Result<(Vec<u8>, Vec<Fd>, bool), i64> {
-        let (shut_rd, avail, peer_open, nonblock, scm_ready) = match &net.socks[sock].kind {
+        let (shut_rd, peer_open, nonblock, ready) = match &net.socks[sock].kind {
             Kind::Pair(p) => (
                 p.shut_rd[end],
-                p.to[end].len(),
                 p.refs[1 - end] > 0 && !p.shut_wr[1 - end],
                 p.nonblock[end] || flags & MSG_DONTWAIT != 0,
-                matches!(p.scm[end].front(), Some(&(0, _))),
+                p.readable(end),
             ),
             _ => return Err(err(Errno::EINVAL)),
         };
@@ -3829,9 +4496,9 @@ impl Kernel {
             return Ok((Vec::new(), Vec::new(), false));
         }
         // A pending zero-offset SCM group (fds sent with a zero-length message,
-        // or whose preceding bytes are already drained) is deliverable even with
-        // no data bytes queued.
-        if avail == 0 && !scm_ready {
+        // or whose preceding bytes are already drained), or an empty seqpacket
+        // message, is deliverable even with no data bytes queued.
+        if !ready {
             if peer_open {
                 if nonblock {
                     return Err(err(Errno::EAGAIN));
@@ -3844,7 +4511,11 @@ impl Kernel {
         match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
                 let want = (count as usize).min(p.to[end].len());
-                let n = p.msg_read_len(end, p.scm_read_len(end, want));
+                let n = if p.msgs.is_some() {
+                    p.msg_read_len(end, want)
+                } else {
+                    p.scm_read_len(end, want)
+                };
                 let data: Vec<u8> = if peek {
                     p.to[end].iter().take(n).copied().collect()
                 } else {
@@ -3854,10 +4525,11 @@ impl Kernel {
                 // recv still gets the fds); a real read transfers them out.
                 let (fds, cut) = if peek {
                     let whole = p.msgs.as_ref().and_then(|m| m[end].front());
-                    (Vec::new(), whole.is_some_and(|&len| len > n))
+                    (Vec::new(), whole.is_some_and(|&(len, _)| len > n))
                 } else {
                     p.finish_read(end, n)
                 };
+                net.dequeued(&fds);
                 Ok((data, fds, cut))
             }
             _ => Err(err(Errno::EINVAL)),
@@ -3906,23 +4578,10 @@ impl Kernel {
             return self.handle_netlink_request(net, sock, data, privileged);
         }
         if matches!(net.socks[sock].kind, Kind::Dgram(_)) {
-            // A connected `socketpair(AF_UNIX, SOCK_DGRAM)` end: deliver the
-            // datagram straight into the peer slot's queue (no addresses).
-            if let Kind::Dgram(Dgram {
-                pair_peer: Some(tgt),
-                ..
-            }) = &net.socks[sock].kind
-            {
-                let tgt = *tgt;
-                let src = InetAddr {
-                    v6: false,
-                    port: 0,
-                    ip: [0; 16],
-                };
-                if let Kind::Dgram(td) = &mut net.socks[tgt].kind {
-                    td.enqueue(src, data.to_vec());
-                }
-                return data.len() as i64;
+            // An `AF_UNIX` datagram socket: to its peer, a socketpair's other
+            // end or the socket it connected to.
+            if net.socks[sock].domain == AF_UNIX {
+                return self.unix_dgram_send(net, cx, sock, data, None, &[], None);
             }
             let peer = match &net.socks[sock].kind {
                 Kind::Dgram(d) => d.peer,
@@ -3979,7 +4638,7 @@ impl Kernel {
         let capacity = net.socks[sock].opts.sndbuf.saturating_mul(2) as usize;
         match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
-                p.sender[1 - end] = Ucred::of(cx);
+                p.sender[1 - end] = Ucred::scm_of(cx);
                 if p.shut_wr[end] || p.refs[1 - end] == 0 {
                     cx.cur.io_progress = 0;
                     if !nosignal {
@@ -4000,10 +4659,9 @@ impl Kernel {
                         cx.block = true;
                         return 0;
                     }
-                    if !data.is_empty() {
-                        m[1 - end].push_back(data.len());
-                        p.to[1 - end].extend(data.iter().copied());
-                    }
+                    // An empty message is a message too.
+                    m[1 - end].push_back((data.len(), false));
+                    p.to[1 - end].extend(data.iter().copied());
                     return data.len() as i64;
                 }
                 // As with pipes: what fits goes in, and a blocking send parks to
@@ -4299,6 +4957,97 @@ fn encode_inet_sockaddr(a: InetAddr) -> Vec<u8> {
     }
 }
 
+/// What Linux's `parse_unix_control` takes from a `sendmsg` on an `AF_UNIX`
+/// socket.
+#[derive(Debug, Default)]
+struct SendControl {
+    /// The `SCM_RIGHTS` descriptor numbers, every message's in order.
+    fds: Vec<i32>,
+    /// The `struct ucred` an `SCM_CREDENTIALS` message gives.
+    cred: Option<(i32, u32, u32)>,
+}
+
+/// Parse the control messages of a `sendmsg` on an `AF_UNIX` socket as Linux's
+/// `__scm_send` does: a malformed message (`cmsg_len` shorter than its header
+/// or past the buffer), a `SOL_SOCKET` one it doesn't know, or more than
+/// `SCM_MAX_FD` (253) descriptors in all is `EINVAL`; other levels are skipped.
+/// Several `SCM_RIGHTS` messages make one list.
+fn parse_unix_control(
+    mem: &GuestMemory,
+    control: u64,
+    controllen: u64,
+) -> Result<SendControl, i64> {
+    const SCM_MAX_FD: usize = 253;
+    /// `net.core.optmem_max`: what the kernel copies a control buffer into.
+    const OPTMEM_MAX: u64 = 131_072;
+    let mut out = SendControl::default();
+    if control == 0 || controllen < CMSG_HDR_LEN as u64 {
+        return Ok(out);
+    }
+    if controllen > OPTMEM_MAX {
+        return Err(err(Errno::ENOBUFS));
+    }
+    let buf = mem
+        .read_vec(control, controllen as usize)
+        .map_err(|_| err(Errno::EFAULT))?;
+    let mut off = 0usize;
+    while off + CMSG_HDR_LEN <= buf.len() {
+        let field = |at: usize| -> [u8; 4] { buf[off + at..off + at + 4].try_into().unwrap() };
+        let mut len = [0u8; 8];
+        len.copy_from_slice(&buf[off..off + 8]);
+        let len = u64::from_le_bytes(len);
+        if len < CMSG_HDR_LEN as u64 || len > (buf.len() - off) as u64 {
+            return Err(err(Errno::EINVAL));
+        }
+        let len = len as usize;
+        let (level, ctype) = (i32::from_le_bytes(field(8)), i32::from_le_bytes(field(12)));
+        if level == SOL_SOCKET as i32 {
+            let data = &buf[off + CMSG_HDR_LEN..off + len];
+            match ctype {
+                SCM_RIGHTS => {
+                    let n = data.len() / 4;
+                    if n > SCM_MAX_FD || out.fds.len() + n > SCM_MAX_FD {
+                        return Err(err(Errno::EINVAL));
+                    }
+                    for chunk in data.as_chunks::<4>().0.iter().take(n) {
+                        out.fds.push(i32::from_le_bytes(*chunk));
+                    }
+                }
+                SCM_CREDENTIALS if data.len() == 12 => {
+                    let word = |i: usize| -> [u8; 4] { data[i..i + 4].try_into().unwrap() };
+                    out.cred = Some((
+                        i32::from_le_bytes(word(0)),
+                        u32::from_le_bytes(word(4)),
+                        u32::from_le_bytes(word(8)),
+                    ));
+                }
+                _ => return Err(err(Errno::EINVAL)),
+            }
+        }
+        off += cmsg_align(len);
+    }
+    Ok(out)
+}
+
+/// [`write_sockaddr`] for where a received message came from: an `AF_UNIX`
+/// sender bound to no name has no address at all (length 0), as Linux's
+/// `unix_copy_addr` leaves it.
+fn write_source(
+    mem: &mut GuestMemory,
+    addr: u64,
+    addrlen_ptr: u64,
+    domain: u16,
+    from: Option<&Addr>,
+) {
+    if matches!(from, Some(Addr::Unix(name)) if name.is_empty()) {
+        if addrlen_ptr != 0 {
+            let _ = mem.write(addrlen_ptr, &0u32.to_le_bytes());
+        }
+        return;
+    }
+    write_sockaddr(mem, addr, addrlen_ptr, domain, from);
+}
+
 /// Write a best-effort `sockaddr` to `addr`, truncated to the caller's buffer,
 /// updating the `socklen_t` at `addrlen_ptr`. A no-op when `addrlen_ptr` is
 /// null. Always returns success (0).
@@ -4313,10 +5062,14 @@ fn write_sockaddr(
         return 0;
     }
     let buf = match resolved {
+        // A path ends in a NUL, as Linux counts its length; an abstract name
+        // is exactly as long as it was given; no name is the family alone.
         Some(Addr::Unix(name)) => {
             let mut b = domain.to_le_bytes().to_vec();
             b.extend_from_slice(name.as_bytes());
-            b.push(0);
+            if !name.is_empty() && !name.starts_with('\0') {
+                b.push(0);
+            }
             b
         }
         Some(Addr::Inet(a)) => encode_inet_sockaddr(*a),
@@ -5144,6 +5897,18 @@ mod tests {
             Sysno::Connect,
             [cli, addr, 8, 0, 0, 0],
         );
+        // Nothing at all at that path: ENOENT, as on Linux.
+        assert_eq!(ret, -i64::from(Errno::ENOENT.0));
+        // An abstract name nobody bound is refused.
+        mem.write_init(addr + 2, b"\0nope").unwrap();
+        let ret = call(
+            &k,
+            &mut cx,
+            &mut mem,
+            &mut v,
+            Sysno::Connect,
+            [cli, addr, 7, 0, 0, 0],
+        );
         assert_eq!(ret, -i64::from(Errno::ECONNREFUSED.0));
     }
 
@@ -5520,8 +6285,9 @@ mod tests {
             1
         );
         assert_eq!(mem.read_vec(rdat, 1).unwrap(), b"A");
-        // The cmsg is present: controllen == CMSG_LEN(4) == 20, level/type == 1.
-        assert_eq!(mem.read_u64(rm + 40).unwrap(), 20, "msg_controllen");
+        // The cmsg is present: cmsg_len == CMSG_LEN(4) == 20, the room it
+        // takes (controllen) CMSG_SPACE(4) == 24, level/type == 1.
+        assert_eq!(mem.read_u64(rm + 40).unwrap(), 24, "msg_controllen");
         assert_eq!(mem.read_u32(rm + 48).unwrap(), 0, "no MSG_CTRUNC");
         assert_eq!(mem.read_u64(rctl).unwrap(), 20, "cmsg_len");
         assert_eq!(mem.read_u32(rctl + 8).unwrap(), 1, "SOL_SOCKET");

@@ -1727,6 +1727,12 @@ pub(super) struct ServiceCtx {
     /// What the `AF_UNIX` path in the socket call being serviced refers to (see
     /// [`MountTable::identity`]). Worked out first, since `vfs` sorts before `net`.
     unix_identity: Option<String>,
+    /// That path names nothing (`ENOENT` rather than `ECONNREFUSED` when no
+    /// socket is bound there).
+    unix_path_missing: bool,
+    /// For `sendmmsg`, [`Self::unix_identity`] and [`Self::unix_path_missing`]
+    /// of each message's destination, in order.
+    unix_mmsg: Vec<(Option<String>, bool)>,
     /// Syscalls serviced in the current slice (preemption quantum counter). (Was
     /// `Kernel::slice_syscalls`.)
     slice_syscalls: u32,
@@ -1762,6 +1768,8 @@ impl ServiceCtx {
             restart_syscall: false,
             dontwait: false,
             unix_identity: None,
+            unix_path_missing: false,
+            unix_mmsg: Vec::new(),
             slice_syscalls: 0,
             ia32: false,
         }
@@ -4915,7 +4923,12 @@ impl Kernel {
             | Sysno::Recvmsg
             | Sysno::Sendmmsg
             | Sysno::Recvmmsg => {
-                cx.unix_identity = self.unix_path_identity(cx, sys, args, mem);
+                let target = self.unix_path_identity(cx, sys, args, mem);
+                cx.unix_path_missing = target.as_ref().is_some_and(|t| t.1);
+                cx.unix_identity = target.map(|t| t.0);
+                if sys == Sysno::Sendmmsg {
+                    cx.unix_mmsg = self.unix_mmsg_identities(cx, args, mem);
+                }
                 // Binding an `AF_UNIX` socket to a path makes the socket's
                 // name there first (`vfs` before `net`), and takes it back if
                 // the bind fails.
@@ -4935,6 +4948,8 @@ impl Kernel {
                 let ret = self.dispatch_net(&mut net, cx, sys, args, mem);
                 cx.dontwait = false;
                 cx.unix_identity = None;
+                cx.unix_path_missing = false;
+                cx.unix_mmsg = Vec::new();
                 if ret < 0
                     && let Some(name) = name
                 {
@@ -5054,7 +5069,7 @@ impl Kernel {
             ),
             Sysno::Sendmsg => self.sys_sendmsg(net, cx, args[0], args[1], args[2], mem),
             Sysno::Recvmsg => self.sys_recvmsg(net, cx, args[0], args[1], args[2], mem),
-            Sysno::Sendmmsg => self.sys_sendmmsg(net, cx, args[0], args[1], args[2], mem),
+            Sysno::Sendmmsg => self.sys_sendmmsg(net, cx, args[0], args[1], args[2], args[3], mem),
             Sysno::Recvmmsg => self.sys_recvmmsg(net, cx, args[0], args[1], args[2], args[3], mem),
             // Unreachable: `dispatch_impl` only routes the syscalls above here.
             _ => unreachable!("dispatch_net: {sys:?} is not a net-only syscall"),
@@ -10636,7 +10651,8 @@ impl Kernel {
     /// Adjust the reader/writer refcount of the pipe (or socket) a fd refers to.
     /// A pipe fd's refcount lives in `pipes`, a socket fd's in `net`. Called
     /// with `sh` held by every caller (close/dup/fcntl/clone/exit), so the one
-    /// lock this briefly takes — `pipes` or `net`, never both in a single call
+    /// lock this briefly takes — `pipes` or `net`, never both at once (a
+    /// socket's close may release in-flight pipes, after `net` is dropped)
     /// — is always acquired *after* `sh` (sh → net/pipes order) and released
     /// here; no other lock is taken under it, so the discipline holds.
     fn bump_pipe(&self, fd: &Fd, inc: bool) {
@@ -10657,7 +10673,18 @@ impl Kernel {
                     apply(&mut pipes[i].writers);
                 }
             }
-            Fd::Socket { .. } => self.net.lock().unwrap().bump(fd, inc),
+            Fd::Socket { .. } => {
+                // A socket's last close lets go of the descriptors queued on
+                // it; the pipes and ptys among them are released here.
+                let orphans = {
+                    let mut net = self.net.lock().unwrap();
+                    net.bump(fd, inc);
+                    net.take_orphans()
+                };
+                for o in &orphans {
+                    self.bump_pipe(o, false);
+                }
+            }
             Fd::PtyMaster(n) | Fd::PtySlave(n) => {
                 let master = matches!(fd, Fd::PtyMaster(_));
                 let mut ptys = self.ptys.lock().unwrap();
@@ -11145,15 +11172,14 @@ impl Kernel {
     /// task's view. A path is found through the filesystem, so the same file
     /// reached through a bind mount or from another mount namespace is the same
     /// socket, and the same path in different mounts is not.
+    /// With it, whether nothing is there.
     fn unix_path_identity(
         &self,
         cx: &ServiceCtx,
         sys: Sysno,
         args: &[u64; 6],
         mem: &GuestMemory,
-    ) -> Option<String> {
-        const AF_UNIX: u16 = 1;
-        const SUN_PATH_OFFSET: u64 = 2;
+    ) -> Option<(String, bool)> {
         const MSG_NAME: u64 = 0;
         let ptr = match sys {
             Sysno::Bind | Sysno::Connect => args[1],
@@ -11161,6 +11187,34 @@ impl Kernel {
             Sysno::Sendmsg => mem.read_u64(args[1] + MSG_NAME).ok()?,
             _ => return None,
         };
+        self.unix_path_at(cx, ptr, mem)
+    }
+
+    /// [`Self::unix_path_identity`] of each message of a `sendmmsg`.
+    fn unix_mmsg_identities(
+        &self,
+        cx: &ServiceCtx,
+        args: &[u64; 6],
+        mem: &GuestMemory,
+    ) -> Vec<(Option<String>, bool)> {
+        /// A 64-bit `struct mmsghdr`, its `msghdr` (name first) at the start.
+        const MMSGHDR: u64 = 64;
+        (0..args[2].min(1024))
+            .map(|i| {
+                let ptr = mem.read_u64(args[1] + i * MMSGHDR).unwrap_or(0);
+                match self.unix_path_at(cx, ptr, mem) {
+                    Some((id, missing)) => (Some(id), missing),
+                    None => (None, false),
+                }
+            })
+            .collect()
+    }
+
+    /// The file an `AF_UNIX` `sockaddr` at `ptr` names, and whether there is
+    /// none; `None` for an abstract name or another family.
+    fn unix_path_at(&self, cx: &ServiceCtx, ptr: u64, mem: &GuestMemory) -> Option<(String, bool)> {
+        const AF_UNIX: u16 = 1;
+        const SUN_PATH_OFFSET: u64 = 2;
         if ptr == 0 {
             return None;
         }
@@ -11174,7 +11228,9 @@ impl Kernel {
         }
         let path = read_path(mem, ptr + SUN_PATH_OFFSET)?;
         let abs = self.resolve_path(cx, AT_FDCWD, &path);
-        Some(self.vfs_for(cx).identity(&abs))
+        let mut vfs = self.vfs_for(cx);
+        let missing = vfs.stat(&abs).is_none();
+        Some((vfs.identity(&abs), missing))
     }
 
     /// For `bind` of an `AF_UNIX` socket to a path: create the socket's name

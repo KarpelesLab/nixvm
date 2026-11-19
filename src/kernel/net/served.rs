@@ -15,7 +15,7 @@
 
 use std::collections::VecDeque;
 
-use super::{Addr, Kind, Sock, SockOpts, Ucred, unix_key};
+use super::{Addr, Kind, Sock, Ucred, unix_key};
 use crate::abi::errno::Errno;
 use crate::kernel::fd::{Fd, FileOffset};
 use crate::kernel::{Kernel, err};
@@ -60,21 +60,18 @@ impl Kernel {
         };
         let mut net = self.net.lock().unwrap();
         let idx = net.socks.len();
-        net.socks.push(Sock {
-            netns: 0,
-            unix_bound_key: Some(key.clone()),
-            domain: super::AF_UNIX,
-            kind: Kind::Listener {
+        let mut listener = Sock::new(
+            0,
+            super::AF_UNIX,
+            Kind::Listener {
                 addr: Some(Addr::Unix(path.to_string())),
                 backlog: VecDeque::new(),
                 cred: Ucred::default(),
             },
-            nonblock: true,
-            opts: SockOpts::default(),
-            refs: 1,
-            edge_seq: 0,
-            last_event: 0,
-        });
+            true,
+        );
+        listener.unix_bound_key = Some(key.clone());
+        net.socks.push(listener);
         net.listeners.entry(key).or_default().push(idx);
         Ok(idx)
     }
@@ -102,12 +99,15 @@ impl Kernel {
             return ServedRecv::Closed;
         };
         let n = p.to[1].len();
+        let mut got = Vec::new();
         if n > 0 {
             out.extend(p.to[1].drain(..));
-            fds.extend(p.scm_take(1, n).into_iter().map(ServedFd));
+            got = p.scm_take(1, n);
         }
         let closed = p.refs[0] == 0 || p.shut_wr[0];
         let p_empty = p.to[1].is_empty();
+        net.dequeued(&got);
+        fds.extend(got.into_iter().map(ServedFd));
         if n > 0 {
             // The writer may have been waiting for room.
             net.note_event(conn);
@@ -137,11 +137,13 @@ impl Kernel {
             }
             return false;
         }
+        let fds: Vec<Fd> = fds.into_iter().map(|f| f.0).collect();
         if !fds.is_empty() {
             let pos = p.to[0].len();
-            p.scm[0].push_back((pos, fds.into_iter().map(|f| f.0).collect()));
+            p.scm[0].push_back((pos, fds.clone()));
         }
         p.to[0].extend(data);
+        net.hold_inflight(&fds);
         net.bump_edge(conn);
         true
     }
@@ -158,10 +160,9 @@ impl Kernel {
             }
             _ => Vec::new(),
         };
-        for fd in &dropped {
-            self.scm_ref(&mut net, fd, false);
-        }
+        self.release_queued(&mut net, &dropped);
         net.bump(&Fd::Socket { sock: conn, end: 1 }, false);
+        self.release_orphans(&mut net);
     }
 
     /// Release descriptor `fd` (what its holder's `close` would do).

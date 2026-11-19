@@ -84,6 +84,7 @@ errnos! {
     ELIBBAD = 80,
     ENOTSOCK = 88,
     EMSGSIZE = 90,
+    EPROTOTYPE = 91,
     ENOPROTOOPT = 92,
     EOPNOTSUPP = 95,
     EAFNOSUPPORT = 97,
