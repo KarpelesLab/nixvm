@@ -159,47 +159,17 @@ impl Kernel {
         Ok(0)
     }
 
-    /// `old_mmap` and `mmap2`, whose offset is in bytes here. A fixed mapping
-    /// past an i386 program's 4 GiB is `ENOMEM`; a 64-bit task's mapping
-    /// through the i386 entry goes below 4 GiB, as on Linux.
+    /// `old_mmap` and `mmap2`, whose offset is in bytes here. Where the
+    /// mapping goes is the x86-64 `mmap`'s business: below 4 GiB for an
+    /// i386 call ([`Kernel::place`]), never past an i386 program's 4 GiB.
     pub(super) fn c_mmap(
         &self,
         cx: &mut ServiceCtx,
-        mut a: [u64; 6],
+        a: [u64; 6],
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
     ) -> i64 {
-        const MAP_FIXED: u64 = 0x10;
-        const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
-        let top = crate::loader::IA32_STACK_TOP;
-        let fixed = a[3] & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
-        let len = a[1].next_multiple_of(PAGE_SIZE);
-        if fixed && a[0].saturating_add(len) > top {
-            return err(Errno::ENOMEM);
-        }
-        if !fixed && !mem.ia32() && len > 0 {
-            let Some(at) = Self::low_gap(mem, len, top) else {
-                return err(Errno::ENOMEM);
-            };
-            a[0] = at;
-            a[3] |= MAP_FIXED_NOREPLACE;
-        }
         self.native(cx, 9, a, false, vcpu, mem)
-    }
-
-    /// The highest free `len` bytes below `top` and above the first 64 KiB.
-    fn low_gap(mem: &GuestMemory, len: u64, top: u64) -> Option<u64> {
-        let mut end = top & !(PAGE_SIZE - 1);
-        for r in mem.regions().iter().rev() {
-            if r.start >= end {
-                continue;
-            }
-            if r.end < end && end - r.end >= len {
-                return Some(end - len);
-            }
-            end = end.min(r.start);
-        }
-        (end >= 0x1_0000 + len).then(|| end - len)
     }
 
     pub(super) fn c_fcntl(

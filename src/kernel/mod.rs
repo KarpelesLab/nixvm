@@ -11411,9 +11411,15 @@ impl Kernel {
             let from = heap.brk.div_ceil(PAGE_SIZE) * PAGE_SIZE;
             let to = addr.div_ceil(PAGE_SIZE) * PAGE_SIZE;
             let data_limit = cx.cur.rlimits.soft(sys_misc::RLIMIT_DATA);
-            if to > heap.limit
+            // Linux's `brk` won't grow into a mapping (`find_vma_intersection`)
+            // — one a 32-bit `mmap` hint or a `MAP_FIXED` put there — nor
+            // past TASK_SIZE (an i386 program's 4 GiB).
+            if to > heap.limit.min(Self::task_size(mem))
                 || to - heap.start > data_limit
                 || Self::address_space_exceeded(cx, mem, to.saturating_sub(from))
+                || (from..to)
+                    .step_by(PAGE_SIZE as usize)
+                    .any(|p| mem.page_prot(p).is_some())
                 || (to > from && mem.map(from, to - from, Prot::rw()).is_err())
             {
                 return heap.brk as i64;
@@ -11621,11 +11627,18 @@ impl Kernel {
                     p += PAGE_SIZE;
                 }
             }
+            // Nothing goes past TASK_SIZE (`get_unmapped_area`'s ENOMEM).
+            if base
+                .checked_add(len)
+                .is_none_or(|end| end > Self::task_size(mem))
+            {
+                return err(Errno::ENOMEM);
+            }
             // A fixed placement inside the arena is no longer free space.
             sh.arena(cx).claim(base, len);
             base
         } else {
-            let Some(base) = sh.arena(cx).alloc(len) else {
+            let Some(base) = self.place(sh, cx, addr, len, mem) else {
                 return err(Errno::ENOMEM);
             };
             base
@@ -11803,6 +11816,81 @@ impl Kernel {
     pub(super) fn alloc_mmap(&self, sh: &mut Shared, cx: &mut ServiceCtx, len: u64) -> Option<u64> {
         let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
         sh.arena(cx).alloc(len)
+    }
+
+    /// `TASK_SIZE`: where the task's address space ends, what no mapping
+    /// may reach past — just under 4 GiB for an i386 program
+    /// (`IA32_PAGE_OFFSET`, as `TIF_ADDR32` makes it), wherever its system
+    /// call came from; the whole space otherwise, even for an `int $0x80`.
+    pub(super) fn task_size(mem: &GuestMemory) -> u64 {
+        mem.stack_top()
+    }
+
+    /// Where a mapping of `len` bytes goes that wasn't given a fixed place
+    /// (`get_unmapped_area`): what the arena hands out — below 4 GiB, as
+    /// Linux's `mmap_is_ia32`/`in_32bit_syscall` have it, for an i386
+    /// program (its arena is down there) and for an i386 system call from a
+    /// 64-bit one (the highest gap under [`crate::loader::IA32_STACK_TOP`]).
+    /// A 32-bit call's `hint` is taken when the range there is free and
+    /// below [`Self::task_size`] (`mmap_address_hint_valid`), as Linux's
+    /// top-down search does; a 64-bit call's still goes to the arena.
+    pub(super) fn place(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        hint: u64,
+        len: u64,
+        mem: &GuestMemory,
+    ) -> Option<u64> {
+        let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        if cx.ia32
+            && hint != 0
+            && let Some(at) = Self::hint_fits(cx, mem, hint, len)
+        {
+            sh.arena(cx).claim(at, len);
+            return Some(at);
+        }
+        if cx.ia32 && !mem.ia32() {
+            let at = Self::low_gap(mem, len, crate::loader::IA32_STACK_TOP)?;
+            sh.arena(cx).claim(at, len);
+            return Some(at);
+        }
+        self.alloc_mmap(sh, cx, len)
+    }
+
+    /// `hint`, page-aligned and raised to the lowest address a mapping may
+    /// have (`round_hint_to_min`), if `len` bytes there are free, end by
+    /// [`Self::task_size`], and keep clear of the stack and its guard gap.
+    fn hint_fits(cx: &ServiceCtx, mem: &GuestMemory, hint: u64, len: u64) -> Option<u64> {
+        let at = page_down(hint).max(mem.base());
+        let end = at.checked_add(len)?;
+        let stack_gap = cx.cur.stack_limit.saturating_sub(STACK_GUARD_GAP);
+        if end > Self::task_size(mem) || (end > stack_gap && at < mem.stack_top()) {
+            return None;
+        }
+        let mut p = at;
+        while p < end {
+            if mem.page_prot(p).is_some() {
+                return None;
+            }
+            p += PAGE_SIZE;
+        }
+        Some(at)
+    }
+
+    /// The highest free `len` bytes below `top` and above the first 64 KiB.
+    fn low_gap(mem: &GuestMemory, len: u64, top: u64) -> Option<u64> {
+        let mut end = top & !(PAGE_SIZE - 1);
+        for r in mem.regions().iter().rev() {
+            if r.start >= end {
+                continue;
+            }
+            if r.end < end && end - r.end >= len {
+                return Some(end - len);
+            }
+            end = end.min(r.start);
+        }
+        (end >= 0x1_0000 + len).then(|| end - len)
     }
 
     /// `munmap(addr, len)`.

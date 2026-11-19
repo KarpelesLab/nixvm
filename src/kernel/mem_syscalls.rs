@@ -103,6 +103,11 @@ impl Kernel {
         if dontunmap && old_size != new_size {
             return err(Errno::EINVAL);
         }
+        // Nothing may reach past TASK_SIZE (an i386 program's 4 GiB).
+        let task_size = Self::task_size(mem);
+        if new_size > task_size || (flags & MREMAP_FIXED != 0 && new_addr > task_size - new_size) {
+            return err(Errno::EINVAL);
+        }
 
         // The source must actually be mapped; Linux answers EFAULT otherwise.
         // musl's `pthread_getattr_np` finds the main thread's stack extent by
@@ -152,6 +157,7 @@ impl Kernel {
         let extra_start = old_addr + old_size;
         let extra_len = new_size - old_size;
         if !dontunmap
+            && old_addr + new_size <= task_size
             && sh.arena(cx).is_free(extra_start, extra_len)
             && range_is_free(mem, extra_start, extra_start + extra_len)
         {
@@ -166,7 +172,10 @@ impl Kernel {
         if flags & MREMAP_MAYMOVE == 0 {
             return err(Errno::ENOMEM);
         }
-        let Some(base) = self.alloc_mmap(sh, cx, new_size) else {
+        // Placed as `mmap` would place it (below 4 GiB for an i386 call),
+        // `MREMAP_DONTUNMAP`'s address the hint.
+        let hint = if dontunmap { new_addr } else { 0 };
+        let Some(base) = self.place(sh, cx, hint, new_size, mem) else {
             return err(Errno::ENOMEM);
         };
         if let Err(e) =

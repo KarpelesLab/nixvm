@@ -1098,7 +1098,7 @@ impl Kernel {
             if flags & SHM_REMAP != 0 {
                 return err(Errno::EINVAL);
             }
-            match sh.arena(cx).alloc(len) {
+            match self.place(sh, cx, 0, len, mem) {
                 Some(b) => b,
                 None => return err(Errno::ENOMEM),
             }
@@ -1110,6 +1110,13 @@ impl Kernel {
             } else {
                 addr
             };
+            // Past TASK_SIZE (an i386 program's 4 GiB): `do_mmap`'s ENOMEM.
+            if base
+                .checked_add(len)
+                .is_none_or(|end| end > Self::task_size(mem))
+            {
+                return err(Errno::ENOMEM);
+            }
             if flags & SHM_REMAP == 0 {
                 let mut p = base;
                 while p < base + len {
