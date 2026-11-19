@@ -1066,20 +1066,17 @@ impl Kernel {
     /// discipline. The host owns the clock, so the VM reports a synchronized
     /// clock (`TIME_OK`) and refuses any adjustment (`EPERM`, like
     /// `settimeofday`). Only `CLOCK_REALTIME` is adjustable on Linux; the other
-    /// clocks are `EOPNOTSUPP`.
+    /// clocks are `EOPNOTSUPP`, once the `struct timex` has been read.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_adjtimex(&self, clk: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
         const ADJ_OFFSET_SS_READ: u32 = 0xa001;
-        if clk != 0 {
-            return if clk > 11 {
-                err(Errno::EINVAL)
-            } else {
-                err(Errno::EOPNOTSUPP)
-            };
-        }
-        let Ok(modes) = mem.read_u32(buf) else {
+        let Ok(timex) = mem.read_vec(buf, 208) else {
             return err(Errno::EFAULT);
         };
+        if let Err(e) = Self::adjtime_clock(clk) {
+            return err(e);
+        }
+        let modes = u32::from_le_bytes(timex[..4].try_into().unwrap());
         if modes != 0 && modes != ADJ_OFFSET_SS_READ {
             return err(Errno::EPERM);
         }
@@ -1093,7 +1090,7 @@ impl Kernel {
         put(72, now.as_secs() as i64); // time.tv_sec
         put(80, i64::from(now.subsec_micros())); // time.tv_usec
         put(88, 10_000); // tick (µs)
-        t[160..164].copy_from_slice(&37i32.to_le_bytes()); // tai offset
+        t[160..164].copy_from_slice(&(super::time::TAI_OFFSET_S as i32).to_le_bytes()); // tai offset
         if mem.write(buf, &t).is_err() {
             return err(Errno::EFAULT);
         }

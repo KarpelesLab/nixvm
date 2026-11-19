@@ -177,13 +177,22 @@ impl Kernel {
         out: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
+        // The sigevent is read first, then the clock checked: EINVAL for an
+        // id Linux doesn't have, EOPNOTSUPP for MONOTONIC_RAW, the COARSE
+        // clocks and a clock device, which have no timers.
+        let sev = if sevp == 0 {
+            None
+        } else {
+            match mem.read_vec(sevp, 20) {
+                Ok(raw) => Some(raw),
+                Err(_) => return err(Errno::EFAULT),
+            }
+        };
+        let kind = match Self::clock_for(clock, true) {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
         let clock = i64::from(clock as i32);
-        // REALTIME, MONOTONIC, the two CPU clocks, BOOTTIME, the *_ALARM
-        // clocks and TAI have timer support; MONOTONIC_RAW and the COARSE
-        // clocks don't. Negative ids are another task's CPU clock.
-        if clock >= 0 && !matches!(clock, 0..=3 | 7..=9 | 11) {
-            return err(Errno::EINVAL);
-        }
         let tgid = cx.cur.tgid;
         // Ids are per thread group: the lowest one not in use.
         let mut used: Vec<i32> = cx.cur.ptimers.iter().map(|t| t.id).collect();
@@ -197,13 +206,7 @@ impl Kernel {
         let id = (0..i32::MAX).find(|i| !used.contains(i)).unwrap_or(0);
         // struct sigevent: sigev_value@0 (8), sigev_signo@8, sigev_notify@12,
         // sigev_notify_thread_id@16.
-        let (value, signo, notify, tid) = if sevp == 0 {
-            // NULL sevp: SIGEV_SIGNAL with SIGALRM and the timer id as value.
-            (id as u64, SIGALRM, SIGEV_SIGNAL, 0)
-        } else {
-            let Ok(raw) = mem.read_vec(sevp, 20) else {
-                return err(Errno::EFAULT);
-            };
+        let (value, signo, notify, tid) = if let Some(raw) = sev {
             let w32 = |o: usize| u32::from_le_bytes(raw[o..o + 4].try_into().unwrap());
             (
                 u64::from_le_bytes(raw[0..8].try_into().unwrap()),
@@ -211,6 +214,9 @@ impl Kernel {
                 w32(12) as i32,
                 w32(16) as i32,
             )
+        } else {
+            // NULL sevp: SIGEV_SIGNAL with SIGALRM and the timer id as value.
+            (id as u64, SIGALRM, SIGEV_SIGNAL, 0)
         };
         match notify {
             SIGEV_NONE => {}
@@ -231,20 +237,39 @@ impl Kernel {
             overrun_last: 0,
             overrun_pending: 0,
         };
+        // SIGEV_THREAD_ID must name a thread of the caller's own group
+        // (`good_sigevent`); the timer lives on (and signals) that thread.
+        let elsewhere = notify == SIGEV_THREAD_ID && tid != cx.cur.pid;
+        if elsewhere
+            && !sh
+                .procs
+                .iter()
+                .flatten()
+                .any(|p| p.info.pid == tid && p.info.tgid == tgid)
+        {
+            return err(Errno::EINVAL);
+        }
         if mem.write(out, &id.to_le_bytes()).is_err() {
             return err(Errno::EFAULT);
         }
-        // SIGEV_THREAD_ID must name a thread of the caller's own group; the
-        // timer lives on (and signals) that thread.
-        if notify == SIGEV_THREAD_ID && tid != cx.cur.pid {
-            let Some(p) = sh
+        // The clock's own `timer_create`: an alarm clock wants
+        // CAP_WAKE_ALARM, a CPU clock someone to be the clock of. (A CPU
+        // clock's timer counts wall time, as the module says.)
+        if kind.is_alarm() && !Self::may_wake_alarm(cx) {
+            return err(Errno::EPERM);
+        }
+        if let Some(c) = kind.cpu()
+            && let Err(e) = self.cpu_clock_of(sh, cx, c, false)
+        {
+            return err(e);
+        }
+        if elsewhere
+            && let Some(p) = sh
                 .procs
                 .iter_mut()
                 .flatten()
                 .find(|p| p.info.pid == tid && p.info.tgid == tgid)
-            else {
-                return err(Errno::EINVAL);
-            };
+        {
             p.info.ptimers.push(timer);
         } else {
             cx.cur.ptimers.push(timer);
@@ -277,6 +302,13 @@ impl Kernel {
             Err(e) => return e,
         };
         let now = poll::now_ns();
+        // What the timer's clock reads, for an absolute expiry.
+        let Some(clock) = Self::ptimer_mut(sh, cx, id as i32).map(|t| t.clock) else {
+            return err(Errno::EINVAL);
+        };
+        let clock_now = super::time::Clock::decode(clock as u64)
+            .and_then(|c| self.clock_now_ns(sh, cx, c).ok())
+            .unwrap_or(now);
         let Some(t) = Self::ptimer_mut(sh, cx, id as i32) else {
             return err(Errno::EINVAL);
         };
@@ -295,11 +327,6 @@ impl Kernel {
         } else if flags & TIMER_ABSTIME != 0 {
             // An absolute expiry on the timer's clock, converted to the wall
             // deadline the scheduler tracks. A past time fires at once.
-            let clock_now = match t.clock {
-                0 | 8 | 11 => crate::clock::now_unix(),
-                _ => crate::clock::now_monotonic(),
-            }
-            .as_nanos();
             Some(now + value.saturating_sub(clock_now))
         } else {
             Some(now + value)
@@ -402,7 +429,7 @@ mod tests {
             0
         );
         let id = u64::from(mem.read_u32(idp).unwrap());
-        // Unsupported clock / bad notify are EINVAL.
+        // A clock with no timers (MONOTONIC_RAW) is EOPNOTSUPP; an unknown one EINVAL.
         assert_eq!(
             call(
                 &k,
@@ -412,7 +439,7 @@ mod tests {
                 Sysno::TimerCreate,
                 [4, sev, idp, 0, 0, 0]
             ),
-            e(Errno::EINVAL)
+            e(Errno::EOPNOTSUPP)
         );
         // Arm: 1 ms period, first expiry in 1 s.
         let mut t = [0u8; 32];

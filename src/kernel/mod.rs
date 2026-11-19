@@ -454,6 +454,10 @@ struct ProcInfo {
     /// of re-parking. This is what makes `setTimeout` fire — libuv sleeps in
     /// `epoll_pwait(timeout)` until the next timer is due.
     wake_deadline: Option<u128>,
+    /// A `clock_nanosleep` on a CPU clock in progress: the CPU time (ns) it
+    /// waits for, kept across re-traps as [`Self::wake_deadline`] keeps a
+    /// timed wait's (which then holds when to look again).
+    cpu_sleep: Option<u128>,
     /// Bytes a blocked pipe or socket write has already queued, so the re-run of
     /// the syscall continues rather than starting over. 0 outside such a write.
     io_progress: u64,
@@ -706,6 +710,7 @@ impl Default for ProcInfo {
             frozen: false,
             shared_maps: Vec::new(),
             wake_deadline: None,
+            cpu_sleep: None,
             io_progress: 0,
             last_syscall: (0, [0; 6], 0, 0),
             fifo_wait: None,
@@ -3657,6 +3662,7 @@ impl Kernel {
                 // a fresh one.
                 if !cx.block {
                     cx.cur.wake_deadline = None;
+                    cx.cur.cpu_sleep = None;
                     cx.cur.seccomp.syscall_done();
                 }
                 self.watch_code(vcpu, mem, sys);
@@ -5043,7 +5049,7 @@ impl Kernel {
             // needless cross-thread contention under SMP.
             Sysno::ClockGettime => self.sys_clock_gettime(cx, args[0], args[1], mem),
             Sysno::Gettimeofday => time::sys_gettimeofday(args[0], args[1], mem),
-            Sysno::ClockGetres => time::sys_clock_getres(args[1], mem),
+            Sysno::ClockGetres => self.sys_clock_getres(cx, args[0], args[1], mem),
             Sysno::Time => time::sys_time(args[0], mem),
             // everything else: a single `sh` lock, running the B1 syscall table.
             _ => {
@@ -5497,12 +5503,13 @@ impl Kernel {
             Sysno::ProcessMrelease => self.sys_process_mrelease(sh, cx, args[0], args[1]),
             Sysno::Setitimer => self.sys_setitimer(cx, args[0], args[1], args[2], mem),
             Sysno::Getitimer => self.sys_getitimer(cx, args[0], args[1], mem),
-            Sysno::Nanosleep => self.sys_nanosleep(cx, 0, 0, args[0], args[1], mem),
+            Sysno::Nanosleep => self.sys_nanosleep(sh, cx, 1, 0, args[0], args[1], mem),
             Sysno::ClockNanosleep => {
-                self.sys_nanosleep(cx, args[0], args[1], args[2], args[3], mem)
+                self.sys_nanosleep(sh, cx, args[0], args[1], args[2], args[3], mem)
             }
             // The guest does not own the host clock: refuse to set it.
-            Sysno::Settimeofday | Sysno::ClockSettime => err(Errno::EPERM),
+            Sysno::Settimeofday => err(Errno::EPERM),
+            Sysno::ClockSettime => self.sys_clock_settime(sh, cx, args[0], args[1], mem),
             Sysno::Ptrace => self.sys_ptrace(sh, cx, args, mem),
             // Closing the last descriptor of an unlinked file deletes it.
             // Closing a descriptor drops the locks it carried, and closing the
@@ -12174,55 +12181,6 @@ fn host_tty_ioctl(_host_fd: i32, _req: u32, _arg: u64, _mem: &mut GuestMemory) -
 }
 
 impl Kernel {
-    /// `clock_gettime(clk_id, timespec)`. Each Linux clock id is served from the
-    /// matching source so the guest sees genuine wall / monotonic / CPU time — not
-    /// wall time for all of them. `CLOCK_MONOTONIC` agrees with the vDSO fast path
-    /// (both use [`crate::clock::now_monotonic`]); the CPU-time clocks the vDSO
-    /// never fast-paths land here and read the scheduler's per-task accounting
-    /// ([`ProcInfo::cpu_ns`]) — `CLOCK_THREAD_CPUTIME_ID` is this task, and
-    /// `CLOCK_PROCESS_CPUTIME_ID` sums its whole thread group — so each guest
-    /// process sees only its own CPU, not the host's. An unrecognized id falls
-    /// back to the wall clock rather than failing.
-    fn sys_clock_gettime(
-        &self,
-        cx: &ServiceCtx,
-        clk_id: u64,
-        ts: u64,
-        mem: &mut GuestMemory,
-    ) -> i64 {
-        const MONOTONIC: u64 = 1;
-        const PROCESS_CPUTIME: u64 = 2;
-        const THREAD_CPUTIME: u64 = 3;
-        const MONOTONIC_RAW: u64 = 4;
-        const MONOTONIC_COARSE: u64 = 6;
-        const BOOTTIME: u64 = 7;
-        let cpu = |ns: u128| std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX));
-        let offsets = self.time_offsets_for(cx);
-        let now = match clk_id {
-            BOOTTIME if offsets.boottime != 0 => {
-                offset_clock(crate::clock::now_monotonic(), offsets.boottime)
-            }
-            MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE if offsets.monotonic != 0 => {
-                offset_clock(crate::clock::now_monotonic(), offsets.monotonic)
-            }
-            MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE | BOOTTIME => {
-                crate::clock::now_monotonic()
-            }
-            THREAD_CPUTIME => cpu(cx.cur.cpu_ns),
-            // Sum the thread group. No `sh` is held on this call path (the fast
-            // dispatch table reaches here without it), so lock it here.
-            PROCESS_CPUTIME => cpu(process_cpu_ns(&self.shared.lock().unwrap(), cx)),
-            _ => crate::clock::now_unix(), // REALTIME(0)/REALTIME_COARSE(5)/TAI(11)/…
-        };
-        let mut b = [0u8; 16];
-        b[0..8].copy_from_slice(&(now.as_secs()).to_le_bytes());
-        b[8..16].copy_from_slice(&u64::from(now.subsec_nanos()).to_le_bytes());
-        match mem.write(ts, &b) {
-            Ok(()) => 0,
-            Err(_) => err(Errno::EFAULT),
-        }
-    }
-
     /// `alarm(seconds)` — arm a one-shot `ITIMER_REAL` that posts `SIGALRM` after
     /// `seconds`, returning the whole seconds left on any previous alarm (0 if
     /// none). `alarm(0)` cancels.
@@ -12331,13 +12289,17 @@ impl Kernel {
     /// on the first entry and reused on every re-trap (the guest PC never advanced
     /// past the syscall), so a relative sleep converges instead of resetting.
     ///
-    /// `clock_id`/`flags` come from `clock_nanosleep`; plain `nanosleep` passes a
-    /// relative interval (`flags == 0`). `TIMER_ABSTIME` targets an absolute time
-    /// in `clock_id`'s domain. A caught signal interrupts the sleep with `-EINTR`,
-    /// writing the time remaining to `rem` (relative sleeps only), exactly as
-    /// Linux does.
+    /// `clock_id`/`flags` come from `clock_nanosleep`; plain `nanosleep` passes
+    /// `CLOCK_MONOTONIC` and a relative interval (`flags == 0`). `TIMER_ABSTIME`
+    /// targets an absolute time in `clock_id`'s domain. The clock is checked as
+    /// Linux checks it (see [`time::Clock`]), and a CPU clock's sleep waits for
+    /// its CPU time ([`Self::cpu_nanosleep`]). A caught signal interrupts the
+    /// sleep with `-EINTR`, writing the time remaining to `rem` (relative sleeps
+    /// only), exactly as Linux does.
+    #[allow(clippy::too_many_arguments)]
     fn sys_nanosleep(
         &self,
+        sh: &Shared,
         cx: &mut ServiceCtx,
         clock_id: u64,
         flags: u64,
@@ -12346,8 +12308,30 @@ impl Kernel {
         mem: &mut GuestMemory,
     ) -> i64 {
         const TIMER_ABSTIME: u64 = 1;
-        const CLOCK_REALTIME: u64 = 0;
         let abstime = flags & TIMER_ABSTIME != 0;
+        let clock = match Self::clock_for(clock_id, false) {
+            Ok(c) => c,
+            Err(e) => return err(e),
+        };
+        if cx.cur.wake_deadline.is_none() && cx.cur.cpu_sleep.is_none() {
+            let (Ok(sec), Ok(nsec)) = (mem.read_u64(req), mem.read_u64(req + 8)) else {
+                return err(Errno::EFAULT);
+            };
+            if nsec >= 1_000_000_000 || (sec as i64) < 0 {
+                return err(Errno::EINVAL);
+            }
+            if clock.is_alarm() {
+                if flags & !TIMER_ABSTIME != 0 {
+                    return err(Errno::EINVAL);
+                }
+                if !Self::may_wake_alarm(cx) {
+                    return err(Errno::EPERM);
+                }
+            }
+        }
+        if let Some(c) = clock.cpu() {
+            return self.cpu_nanosleep(sh, cx, c, abstime, req, rem, mem);
+        }
 
         // Seed the absolute wall-clock deadline once; re-traps reuse it.
         let deadline = if let Some(dl) = cx.cur.wake_deadline {
@@ -12364,12 +12348,10 @@ impl Kernel {
             let dl = if abstime {
                 // `want` is an absolute time on `clock_id`; convert to how long
                 // remains, then to a wall-clock deadline the scheduler tracks.
-                let clock_now = if clock_id == CLOCK_REALTIME {
-                    crate::clock::now_unix()
-                } else {
-                    crate::clock::now_monotonic()
-                }
-                .as_nanos();
+                let clock_now = clock
+                    .now(self.time_offsets_for(cx))
+                    .unwrap_or_default()
+                    .as_nanos();
                 if want <= clock_now {
                     return 0; // the absolute deadline already passed
                 }
@@ -12406,6 +12388,73 @@ impl Kernel {
         // Not there yet, no signal: park until the deadline (or an earlier wake).
         // Not auto-restarted on SA_RESTART — Linux uses a restart-block that
         // re-computes the remaining time; we report EINTR instead.
+        cx.block = true;
+        cx.restartable = false;
+        0
+    }
+
+    /// `clock_nanosleep` on CPU clock `c`, as Linux's `posix_cpu_nsleep`:
+    /// never on the caller's own thread clock (`EINVAL`), and only on a clock
+    /// of someone there is (`EINVAL`). It waits until that clock reaches the
+    /// time asked for, looking again at most every few milliseconds (CPU time
+    /// has no wake-up of its own here) — for ever, if nothing runs on it, as
+    /// on Linux. If the task goes, so does the timer, and the sleep ends.
+    #[allow(clippy::too_many_arguments)]
+    fn cpu_nanosleep(
+        &self,
+        sh: &Shared,
+        cx: &mut ServiceCtx,
+        c: time::CpuClock,
+        abstime: bool,
+        req: u64,
+        rem: u64,
+        mem: &mut GuestMemory,
+    ) -> i64 {
+        /// How often a CPU-clock sleep looks at the clock again.
+        const POLL_NS: u128 = 5_000_000;
+        if c.thread && (c.pid == 0 || c.pid == self.visible_pid(cx, cx.cur.pid)) {
+            return err(Errno::EINVAL);
+        }
+        let asleep = cx.cur.cpu_sleep.is_some();
+        let now = self
+            .cpu_clock_of(sh, cx, c, false)
+            .ok()
+            .and_then(|of| Self::cpu_time_of(sh, cx, of));
+        let Some(now) = now else {
+            // Gone while we slept: its timer went with it.
+            cx.cur.cpu_sleep = None;
+            cx.cur.wake_deadline = None;
+            return if asleep { 0 } else { err(Errno::EINVAL) };
+        };
+        let target = if let Some(t) = cx.cur.cpu_sleep {
+            t
+        } else {
+            let (Ok(sec), Ok(nsec)) = (mem.read_u64(req), mem.read_u64(req + 8)) else {
+                return err(Errno::EFAULT);
+            };
+            let want = u128::from(sec) * 1_000_000_000 + u128::from(nsec);
+            let t = if abstime { want } else { now + want };
+            cx.cur.cpu_sleep = Some(t);
+            t
+        };
+        if now >= target {
+            cx.cur.cpu_sleep = None;
+            cx.cur.wake_deadline = None;
+            return 0;
+        }
+        if self.first_handled_signal(cx).is_some() {
+            cx.cur.cpu_sleep = None;
+            cx.cur.wake_deadline = None;
+            if !abstime && rem != 0 {
+                let left = target - now;
+                let mut b = [0u8; 16];
+                b[0..8].copy_from_slice(&((left / 1_000_000_000) as u64).to_le_bytes());
+                b[8..16].copy_from_slice(&((left % 1_000_000_000) as u64).to_le_bytes());
+                let _ = mem.write(rem, &b);
+            }
+            return err(Errno::EINTR);
+        }
+        cx.cur.wake_deadline = Some(poll::now_ns() + (target - now).min(POLL_NS));
         cx.block = true;
         cx.restartable = false;
         0
