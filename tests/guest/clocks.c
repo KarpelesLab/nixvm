@@ -522,8 +522,13 @@ static void *vdso_sym(const char *ver, const char *name)
  * the id as the 32-bit clockid_t it is. */
 static void test_vdso(void)
 {
+#ifdef __aarch64__
+    int (*cgt)(long, struct timespec *) = vdso_sym("LINUX_2.6.39", "__kernel_clock_gettime");
+    int (*cgr)(long, struct timespec *) = vdso_sym("LINUX_2.6.39", "__kernel_clock_getres");
+#else
     int (*cgt)(long, struct timespec *) = vdso_sym("LINUX_2.6", "__vdso_clock_gettime");
     int (*cgr)(long, struct timespec *) = vdso_sym("LINUX_2.6", "__vdso_clock_getres");
+#endif
     CHECK(cgt && cgr, "the vDSO's clock functions %p %p", cgt, cgr);
     if (!cgt || !cgr)
         return;
