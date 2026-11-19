@@ -7,6 +7,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/KarpelesLab/nixvm/compare/v0.0.8...v0.0.9) - 2026-11-19
+
+### Other
+
+- kvm tests: clippy's needless_continue in the preemption retry
+- kvm tests: a run the preemption timer breaks before the guest's syscall is run again
+- ptrace_regs32's XMM check asks for SSE2, which Ubuntu's i386 gcc leaves off
+- the SCM_PIDFD emission's flags, Dgram's Debug, place_32bit
+- unix_scm checks SCM_PIDFD and SO_PEERPIDFD; ia32 an i386 SCM_PIDFD
+- SO_PASSPIDFD and SCM_PIDFD, and SO_PEERPIDFD, on AF_UNIX sockets
+- clocks finds the aarch64 vDSO's clock functions by their names
+- mmap_place, MAP_32BIT, mmap hints and the fixed mappings' checks
+- MAP_32BIT, and 64-bit mmap hints taken, as x86's get_unmapped_area
+- clocks, clock ids and what each call refuses; ia32's vDSO with them
+- the clock id is a 32-bit clockid_t, compared unsigned
+- its five clocks, an absolute expiry on its own clock, and a read that wakes
+- clock ids checked as Linux's clockid_to_kclock, and the CPU clocks by pid
+- rustfmt and clippy: the debug registers and PTRACE_LISTEN
+- ptrace_regs checks an execve's exit stop and the SIGTRAP after it
+- the stops at an execve's end show the call, and its SIGTRAP comes next
+- ptrace_regs and ptrace_regs32, si_errno, SIGCONT, syscall stops and debug registers
+- the debug registers, in struct user's u_debugreg
+- RF is a flag, and a read/write watchpoint fires on reads
+- a continued task takes its signals before it runs more of its code
+- syscall stops have the FP state, and a tracer's rip there is where the call returns
+- chdir of an empty path is ENOENT
+- a queued signal carries si_errno, and seccomp's SIGSYS the filter's data there
+- an i386 recvmsg closes the descriptors its control buffer has no room for
+- ptrace32 and ptrace_ia32, ptrace and seccomp of i386 calls
+- from and of i386 tasks, as Linux's compat paths
+- a call through the i386 entry is AUDIT_ARCH_I386, its i386 number and registers
+- tkill and tgkill send SI_TKILL, and refuse a tid that isn't positive
+- a siginfo's layout by Linux's per-signal code limits
+- check the fixed layout at compile time; the README's compat32_insn
+- compat32_insn runs 16-bit code from a modify_ldt code segment
+- 16-bit code and stack segments in compatibility mode
+- ia32 and compat32 check that 32-bit mappings stay below 4 GiB
+- 32-bit callers' mappings stay below 4 GiB, and their hints are taken
+- ia32 checks the 32-bit vDSO's clocks against the system calls
+- the clock functions, reading the 64-bit vDSO's vvar page
+- gettimeofday fills in the timezone, as the vDSOs do
+- ia32 passes its SCM_RIGHTS over SOCK_DGRAM again
+- unix_scm, ancillary data on AF_UNIX datagram and seqpacket sockets
+- AF_UNIX datagrams carry their own SCM_RIGHTS and SCM_CREDENTIALS
+- a release gives back at most what its file was charged
+- count disk by where the host says the data is, not st_blocks
+- files are sparse, so a hole holds no memory
+- the disk quota counts allocated blocks, so a sparse file costs only what's written
+- the /usr/include/asm link gcc-multilib would make, for the ia32 build
+- show why an i386 program didn't build
+- a 32-bit libc on the KVM runner so ia32 runs there; rustfmt
+- %ebp holds a fast entry's sixth argument; PER_LINUX32's uname
+- clippy and rustdoc: the compat layer's lints, and the GDT pool's KVM-only gate
+- the fast entry the CPU vendor has, and an i386 mmap2 from 64-bit code
+- modify_ldt and LDT segments, and 600 threads with TLS entries
+- LDT selectors, and a private GDT per host thread instead of per thread
+- modify_ldt, the process's LDT
+- ia32, an i386 program run as an ELFCLASS32 process
+- the 32-bit vDSO enters with sysenter (the CPUID vendor is Intel)
+- compatibility-mode linear addresses wrap at 4 GiB; keep the 64-bit path lean
+- compat32_insn, the instructions only 32-bit code has
+- BCD adjustments, BOUND, ARPL, SALC and far-pointer loads
+- sysenter enters as the 32-bit vDSO's int $0x80
+- segment bases and limits, LDT selectors and 16-bit addressing in compatibility mode
+- the whole i386 system-call table, with compat translation
+- syscall and sysenter from 32-bit code, as Linux on the CPU's vendor
+- ELFCLASS32 (i386) programs, with a 32-bit stack, auxv and vDSO
+- the 32-bit vDSO image, and per-process LDT and vDSO32 slots in GuestMemory
+- a thread killed by a sibling's exit_group never runs again on SMP
+- the private-GDT pool is KVM-only, so wasm and macOS builds don't warn
+- compat32, 32-bit code and int $0x80 in a 64-bit process
+- the i386 int $0x80 entry, set_thread_area, and signals in 32-bit code
+- compatibility mode — 32-bit code, far transfers, segment loads, int $0x80
+- Linux's GDT, 32-bit code in compatibility mode, and the int $0x80 gate
+- a call that finds another task's memory busy runs again soon
+- a wake landing while a task is in flight isn't lost
+- plain code spans for items behind the images feature, so docs build without it
+- iretq and retfq back to the 64-bit user code segment
+- NETLINK_KOBJECT_UEVENT sockets, which never see an event
+- TF set by popf single-steps the program
+- a handler starts with TF, DF and RF clear
+- signal frames carry the FPU state (the XSAVE area), as on Linux
+- a trailing slash follows the last symlink, even for lstat
+- select, pselect6: honor the timeout, and write back the time left
+- the address space ends at 1 TiB exactly, a power of two as on Linux
+- ARCH_SET_GS/ARCH_GET_GS set and read a real GS base
+- a static PIE is a loader, mapped halfway up the address space, not at its base
+- root images pulled from OCI registries by digest, over rsurl; no images of our own
+- quote a test filter YAML read as a mapping ("image:: fs::overlay")
+- overlay, tests: the persistent upper on the libc-free Linux; root image tests install their environment
+- released root images, fetched and verified in pure Rust, mounted without unpacking
+- an upper layer that outlives the guest — a host directory, whiteouts as .wh. files
+- fs, sandbox: protect and a writable root directory on the libc-free Linux too
+- build and test the libc-free path
+- passthrough, KVM, egress and the clock on a libc-free Linux
+- raw Linux system calls for a host with or without libc
+- Sandbox::execute, an embedding API to run one command ([#14](https://github.com/KarpelesLab/nixvm/pull/14))
+- read no environment, print nothing — NIXVM_* via nixvm::env, kernel notices to a sink
+- protect(paths) keeps paths read-only by identity ([#15](https://github.com/KarpelesLab/nixvm/pull/15))
+- a symlink mid-path is followed, not ENOTDIR
+- pin wasm-pack — "latest" resolved to v0.9.1 and broke the Pages build
+- a thread killed by a sibling's execve never runs or is serviced in the new image
+
 ## [0.0.8](https://github.com/KarpelesLab/nixvm/compare/v0.0.7...v0.0.8) - 2026-11-16
 
 ### Other
