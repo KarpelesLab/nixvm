@@ -768,6 +768,8 @@ impl Kernel {
                 "[stack]"
             } else if vdso32 == Some(r.start) {
                 "[vdso]"
+            } else if vdso32 == Some(r.end) && r.end - r.start == page {
+                "[vvar]"
             } else {
                 ""
             };

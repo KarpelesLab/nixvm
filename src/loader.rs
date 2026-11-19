@@ -1117,11 +1117,13 @@ fn build_stack(
 
 /// Map the 32-bit vDSO for an i386 program, two pages under the stack's
 /// reservation `stack_bottom` (between it and the `mmap` arena's guard gap),
-/// and record it: its base. `__kernel_vsyscall` enters the kernel the way
-/// the memory says the CPU does ([`GuestMemory::fast32`]).
+/// with its vvar page under it, and record it: its base.
+/// `__kernel_vsyscall` enters the kernel the way the memory says the CPU
+/// does ([`GuestMemory::fast32`]).
 fn map_vdso32(mem: &mut GuestMemory, stack_bottom: u64) -> Result<u64, LoadError> {
     let base = stack_bottom - 2 * PAGE_SIZE;
     let image = crate::vcpu::vdso32::build_image(mem.fast32());
+    mem.map_vvar(base - crate::vcpu::vdso32::VVAR_BELOW)?;
     mem.map(base, PAGE_SIZE, Prot::rx())?;
     mem.write_init(base, &image)?;
     mem.mark_file_backed(base, PAGE_SIZE);

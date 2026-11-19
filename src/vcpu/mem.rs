@@ -1125,6 +1125,28 @@ impl GuestMemory {
     /// points at the same physical frames. Any existing mapping in the range is
     /// replaced.
     pub fn map_frames(&mut self, addr: u64, frames: &[u64], prot: Prot) -> Result<(), MemError> {
+        self.map_frames_as(addr, frames, prot, true)
+    }
+
+    /// Map the 64-bit vDSO's vvar frame — the clock calibration the host
+    /// writes — as a read-only private page at `addr`, for the 32-bit vDSO
+    /// to read: what Linux's `[vvar]` is. Private, like the image the
+    /// loader maps, so that a store to it (after an `mprotect`, or a
+    /// debugger's poke) copies the page instead of reaching the frame every
+    /// process reads its clock from; and kept by `MADV_DONTNEED`.
+    pub fn map_vvar(&mut self, addr: u64) -> Result<(), MemError> {
+        self.map_frames_as(addr, &[ctrl::vvar_frame()], Prot::READ, false)?;
+        self.mark_file_backed(addr, PAGE_SIZE);
+        Ok(())
+    }
+
+    fn map_frames_as(
+        &mut self,
+        addr: u64,
+        frames: &[u64],
+        prot: Prot,
+        shared: bool,
+    ) -> Result<(), MemError> {
         if frames.is_empty() {
             return Ok(());
         }
@@ -1154,7 +1176,7 @@ impl GuestMemory {
             self.mapped[p] = true;
             self.prot[p] = prot;
             self.file_backed[p] = false;
-            self.shared_anon[p] = true;
+            self.shared_anon[p] = shared;
         }
         drop(fa);
         self.icache_dirty |= prot.contains(Prot::EXEC);

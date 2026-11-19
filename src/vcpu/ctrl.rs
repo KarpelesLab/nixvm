@@ -413,6 +413,12 @@ pub fn write_vvar(
     phys.write(pa + vvar::BASE_WALL_NS, &base_wall_ns.to_le_bytes());
 }
 
+/// The physical frame of the vvar page, which the 32-bit vDSO maps too
+/// ([`super::mem::GuestMemory::map_vvar`]).
+pub(crate) fn vvar_frame() -> u64 {
+    frame_pa(VVAR_FIDX)
+}
+
 /// Map the shared control block, supervisor-only, at its fixed virtual addresses
 /// into `space`. Idempotent: mapping over an existing (e.g. CoW-cleared) leaf
 /// simply republishes the correct supervisor entry, and the reserved frames are
