@@ -120,15 +120,29 @@ fn layout(signo: i32, code: i32) -> Sil {
     if code < 0 {
         return Sil::Rt;
     }
-    if code == 0 || code == 0x80 {
+    // `SI_USER`, `SI_KERNEL` and above (a ptrace trap's `SIGTRAP | 0x80`,
+    // its event codes) are the kill layout; a code past the signal's own
+    // (`NSIGILL`, ...) is the poll one up to `NSIGPOLL`.
+    if code == 0 || code >= 0x80 {
         return Sil::Kill;
     }
-    match signo {
-        4 | 5 | 7 | 8 | 11 => Sil::Fault, // SIGILL SIGTRAP SIGBUS SIGFPE SIGSEGV
-        17 => Sil::Chld,
-        29 => Sil::Poll,
-        31 => Sil::Sys,
-        _ => Sil::Kill,
+    let (limit, sil) = match signo {
+        4 => (11, Sil::Fault),  // SIGILL
+        5 => (6, Sil::Fault),   // SIGTRAP
+        7 => (5, Sil::Fault),   // SIGBUS
+        8 => (15, Sil::Fault),  // SIGFPE
+        11 => (10, Sil::Fault), // SIGSEGV
+        17 => (6, Sil::Chld),
+        29 => (6, Sil::Poll),
+        31 => (2, Sil::Sys),
+        _ => (0, Sil::Kill),
+    };
+    if code <= limit {
+        sil
+    } else if code <= 6 {
+        Sil::Poll
+    } else {
+        Sil::Kill
     }
 }
 
