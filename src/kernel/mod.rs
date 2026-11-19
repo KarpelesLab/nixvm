@@ -5014,7 +5014,7 @@ impl Kernel {
             // the big `sh` lock cost an acquire/release on the hot path and
             // needless cross-thread contention under SMP.
             Sysno::ClockGettime => self.sys_clock_gettime(cx, args[0], args[1], mem),
-            Sysno::Gettimeofday => time::sys_gettimeofday(args[0], mem),
+            Sysno::Gettimeofday => time::sys_gettimeofday(args[0], args[1], mem),
             Sysno::ClockGetres => time::sys_clock_getres(args[1], mem),
             Sysno::Time => time::sys_time(args[0], mem),
             // everything else: a single `sh` lock, running the B1 syscall table.

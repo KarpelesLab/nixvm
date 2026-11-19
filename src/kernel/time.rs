@@ -19,8 +19,13 @@ fn host_now() -> std::time::Duration {
 }
 
 /// `gettimeofday(tv, tz)` — write `struct timeval { i64 tv_sec; i64 tv_usec }`
-/// (16 bytes) from the host clock. `tz` is obsolete and ignored.
-pub(super) fn sys_gettimeofday(tv: u64, mem: &mut GuestMemory) -> i64 {
+/// (16 bytes) from the host clock. `tz` is obsolete: it gets the kernel's
+/// `sys_tz`, which nothing here sets (`settimeofday` can't), so zeros — what
+/// the vDSOs write too.
+pub(super) fn sys_gettimeofday(tv: u64, tz: u64, mem: &mut GuestMemory) -> i64 {
+    if tz != 0 && mem.write(tz, &[0u8; 8]).is_err() {
+        return err(Errno::EFAULT);
+    }
     if tv == 0 {
         return 0;
     }
