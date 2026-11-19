@@ -951,7 +951,7 @@ impl Kernel {
             // stopped until a notify, which may have come already.
             let p = &mut sh.procs[idx].as_mut().unwrap().info;
             let t = p.ptrace.as_mut().unwrap();
-            if !t.seized || !t.stop.is_some_and(|s| s.event == EVENT_STOP) {
+            if !t.seized || t.stop.is_none_or(|s| s.event != EVENT_STOP) {
                 return err(Errno::EIO);
             }
             t.listening = true;
@@ -1155,17 +1155,13 @@ impl Kernel {
             let n = (addr - base) / word;
             let p = &mut sh.procs[idx].as_mut().unwrap().info;
             if req == PTRACE_PEEKUSER {
-                let v = p.debugregs.as_ref().map_or_else(
-                    || super::hwbp::DebugRegs::default().get(n),
-                    |d| d.get(n),
-                );
+                let v = p
+                    .debugregs
+                    .as_ref()
+                    .map_or_else(|| super::hwbp::DebugRegs::default().get(n), |d| d.get(n));
                 return Some(put(mem, &v.to_le_bytes()[..word as usize]));
             }
-            let v = if compat {
-                u64::from(data as u32)
-            } else {
-                data
-            };
+            let v = if compat { u64::from(data as u32) } else { data };
             let d = p.debugregs.get_or_insert_with(Default::default);
             return Some(match d.set(n, v) {
                 Ok(()) => 0,

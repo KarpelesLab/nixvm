@@ -82,7 +82,11 @@ fn parse(addr: u64, len: u8, ty: u8) -> Result<(), i64> {
 /// whether it's enabled (`decode_dr7`).
 fn decode_dr7(dr7: u64, i: usize) -> (u8, u8, bool) {
     let info = (dr7 >> (16 + 4 * i)) as u8;
-    ((info & 0xc) | 0x40, (info & 0x3) | 0x80, (dr7 >> (2 * i)) & 3 != 0)
+    (
+        (info & 0xc) | 0x40,
+        (info & 0x3) | 0x80,
+        (dr7 >> (2 * i)) & 3 != 0,
+    )
 }
 
 /// A task's debug registers.
@@ -169,15 +173,15 @@ impl DebugRegs {
     }
 
     fn apply_dr7(&mut self, data: u64) -> Result<(), i64> {
-        for i in 0..4 {
+        for (i, slot) in self.bps.iter_mut().enumerate() {
             let (len, ty, enabled) = decode_dr7(data, i);
-            let addr = match self.bps[i] {
+            let addr = match slot {
                 None if !enabled => continue,
                 None => 0,
                 Some(b) => b.addr,
             };
             parse(addr, len, ty)?;
-            self.bps[i] = Some(Bp {
+            *slot = Some(Bp {
                 addr,
                 len,
                 ty,

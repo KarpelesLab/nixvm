@@ -3887,7 +3887,11 @@ impl Kernel {
             Exit::DebugTrap { pc, dr6 } => {
                 // A single step or a debug-register hit: SIGTRAP, as above,
                 // and a debugger sees why in the virtual `DR6`.
-                let dr6 = cx.cur.debugregs.get_or_insert_with(Default::default).trap(dr6);
+                let dr6 = cx
+                    .cur
+                    .debugregs
+                    .get_or_insert_with(Default::default)
+                    .trap(dr6);
                 let fault = signal::Fault::debug_trap(pc, dr6);
                 if let Some(s) = self.ptrace_fault(cx, &fault, vcpu, mem) {
                     return s;
