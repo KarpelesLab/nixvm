@@ -151,6 +151,8 @@ const USER_DEBUGREG: u64 = 848;
 /// `sizeof(struct user_i387_ia32_struct)`, the `fsave` image.
 const I387_IA32_SIZE: usize = 108;
 const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+/// x86-64 `execveat`.
+const EXECVEAT: u64 = 322;
 
 /// What kind of stop a tracee is in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -283,6 +285,9 @@ pub(super) struct PtraceState {
     seccomp_trace: Option<u32>,
     /// `execve` succeeded; the thread id it had before.
     pub(super) execed: Option<i32>,
+    /// The `execve` (or `execveat`) a stop in the new image ends: its
+    /// number as called, and whether through the i386 entry.
+    exec_nr: Option<(u64, bool)>,
     /// As a zombie: the tracer has been told of the exit.
     exit_reported: bool,
 }
@@ -326,6 +331,7 @@ impl PtraceState {
             pending_event: None,
             seccomp_trace: None,
             execed: None,
+            exec_nr: None,
             exit_reported: false,
         }
     }
@@ -1736,8 +1742,11 @@ impl Kernel {
             return;
         };
         let mut regs = snapshot(arch, vcpu, phase, fs_base);
+        // In user mode no call is in progress, but for a stop at the end of
+        // an `execve` (in the new image), which is still in it.
+        let exec_nr = t.exec_nr.take();
         let nr = if phase == Phase::User {
-            u64::MAX
+            exec_nr.map_or(u64::MAX, |(nr, _)| nr)
         } else {
             t.sc_nr.unwrap_or_else(|| vcpu.syscall_nr())
         };
@@ -1754,7 +1763,11 @@ impl Kernel {
         t.a64_nr = nr;
         t.regs_dirty = false;
         t.apply_fp = false;
-        t.compat = arch == Arch::X86_64 && phase != Phase::User && vcpu.syscall_ia32();
+        t.compat = arch == Arch::X86_64
+            && match exec_nr {
+                Some((_, ia32)) => ia32,
+                None => phase != Phase::User && vcpu.syscall_ia32(),
+            };
         if arch == Arch::X86_64 {
             t.tls = std::array::from_fn(|i| vcpu.tls_desc(i));
             t.apply_tls = false;
@@ -2091,6 +2104,15 @@ impl Kernel {
             let execed = t.execed.take();
             t.end_syscall();
             t.ret_regs = None;
+            // `orig_rax` at the stops in the new image: the call made.
+            if execed.is_some() {
+                let nr = match cx.cur.last_syscall.0 {
+                    EXECVEAT if cx.ia32 => 358,
+                    _ if cx.ia32 => 11,
+                    nr => nr,
+                };
+                t.exec_nr = Some((nr, cx.ia32));
+            }
             let traced = t.tracer != 0;
             let exit_stop = traced && t.syscall_trace;
             let (options, seized) = (t.options, t.seized);
@@ -2146,7 +2168,13 @@ impl Kernel {
                 }
                 _ => {}
             }
+            if let Some(t) = cx.cur.ptrace.as_mut() {
+                t.exec_nr = None;
+            }
             if cx.cur.run == RunState::Traced {
+                // Back in user mode, it takes its signals (the old-style
+                // exec SIGTRAP) as soon as it's resumed.
+                cx.cur.signal_resume = true;
                 return Some(Serviced::Resume);
             }
             Self::ptrace_forget_if_idle(cx);
