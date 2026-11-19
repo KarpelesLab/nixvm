@@ -180,7 +180,8 @@ static void errno_checks(void) {
 static const uint32_t XA[4] = {0x11112222, 0x33334444, 0x55556666, 0x77778888};
 static const uint32_t XB[4] = {0x01234567, 0x89abcdef, 0xfedcba98, 0x76543210};
 
-static int fp_body(void) {
+// Ubuntu's i386 gcc targets plain i686, without SSE, unless asked.
+__attribute__((target("sse2"))) static int fp_body(void) {
   uint32_t o[4];
   unsigned short cw = 0x27f, after;
   __asm__ volatile("fldcw %0" ::"m"(cw));
