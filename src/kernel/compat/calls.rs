@@ -18,7 +18,7 @@ const IPC_64: u64 = 0x100;
 /// The x86-64 `siginfo_t` from the i386 one (`copy_siginfo_from_user32`):
 /// the three `int`s, then the union, which moves from offset 12 to 16 and
 /// widens its pointers and `long`s.
-pub(super) fn siginfo_widen(c: &[u8]) -> [u8; 128] {
+pub(in crate::kernel) fn siginfo_widen(c: &[u8]) -> [u8; 128] {
     let mut n = [0u8; 128];
     n[..12].copy_from_slice(&c[..12]);
     let (signo, code) = (r32(c, 0) as i32, r32(c, 8) as i32);

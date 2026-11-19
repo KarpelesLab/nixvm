@@ -1796,12 +1796,11 @@ fn twd_fxsr_to_i387(fx: &[u8]) -> u32 {
 /// status and tag words, the last instruction and operand, the eight
 /// registers in their 10-byte form, the status again and the `fxsr` magic
 /// (0: an `fxsave` image follows).
-fn fsave_header(fx: &[u8], cs: u16, ds: u16) -> [u8; 112] {
+pub(super) fn fsave_header(fx: &[u8], cs: u16, ds: u16) -> [u8; 112] {
     let mut h = [0u8; 112];
     let w32 = |h: &mut [u8; 112], o: usize, v: u32| h[o..o + 4].copy_from_slice(&v.to_le_bytes());
     let cwd = u32::from(u16::from_le_bytes([fx[0], fx[1]]));
     let swd = u32::from(u16::from_le_bytes([fx[2], fx[3]]));
-    let fop = u32::from(u16::from_le_bytes([fx[6], fx[7]]));
     w32(&mut h, 0, cwd | 0xffff_0000);
     w32(&mut h, 4, swd | 0xffff_0000);
     w32(&mut h, 8, twd_fxsr_to_i387(fx));
@@ -1810,7 +1809,9 @@ fn fsave_header(fx: &[u8], cs: u16, ds: u16) -> [u8; 112] {
         12,
         u32::from_le_bytes(fx[8..12].try_into().unwrap()),
     ); // fip
-    w32(&mut h, 16, u32::from(cs) | fop << 16); // fcs
+    // A 64-bit kernel's `fcs` is the task's `%cs` alone: the `fxsave`
+    // image (64-bit format) has no selector, and the opcode isn't put in.
+    w32(&mut h, 16, u32::from(cs)); // fcs
     w32(
         &mut h,
         20,

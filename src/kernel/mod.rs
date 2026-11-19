@@ -1464,15 +1464,7 @@ fn run_slice_smp(
         }
         // A tracer changed its registers while it was stopped in user mode.
         if let Some(t) = sh.procs[i].as_mut().and_then(|p| p.info.ptrace.as_mut()) {
-            if let Some(regs) = t.take_user_regs() {
-                ptrace::apply_user(kernel.arch, vcpu.as_mut(), &regs);
-            }
-            if let Some(fp) = t.take_fp_state() {
-                vcpu.set_fp_state(&fp);
-            }
-            if t.take_step() {
-                vcpu.set_single_step(true);
-            }
+            t.resume_user(kernel.arch, vcpu.as_mut());
         }
     }
     loop {
@@ -3054,15 +3046,7 @@ impl Kernel {
             };
             // A tracer changed its registers while it was stopped in user mode.
             if let Some(t) = cx.cur.ptrace.as_mut() {
-                if let Some(regs) = t.take_user_regs() {
-                    ptrace::apply_user(self.arch, vcpu.as_mut(), &regs);
-                }
-                if let Some(fp) = t.take_fp_state() {
-                    vcpu.set_fp_state(&fp);
-                }
-                if t.take_step() {
-                    vcpu.set_single_step(true);
-                }
+                t.resume_user(self.arch, vcpu.as_mut());
             }
             let mut guard = space_arc.lock().unwrap();
             cx.cur.cpu = 0;

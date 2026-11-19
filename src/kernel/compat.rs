@@ -21,7 +21,7 @@ use crate::abi::arch::{self};
 use crate::abi::errno::Errno;
 use crate::vcpu::mem::PAGE_SIZE;
 use crate::vcpu::{GuestMemory, Vcpu};
-pub(in crate::kernel) use calls::siginfo_narrow;
+pub(in crate::kernel) use calls::{siginfo_narrow, siginfo_widen};
 
 /// `__USER32_CS` and `__USER_DS`.
 const USER32_CS: u16 = 0x23;

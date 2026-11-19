@@ -204,15 +204,15 @@ pub enum Entry {
         ret: Ret,
     },
     /// A translation of its own; `nr` is the x86-64 call it amounts to, for
-    /// the embedder's policy and tracing (`u64::MAX` for none).
+    /// the embedder's policy (`u64::MAX` for none).
     Compat { nr: u64, how: Compat },
     /// Not a call a 64-bit kernel has: `ENOSYS`.
     Absent,
 }
 
 impl Entry {
-    /// The x86-64 call this one amounts to, for the embedder's policy,
-    /// seccomp and tracing; `None` for an absent one.
+    /// The x86-64 call this one amounts to, for the embedder's policy (a
+    /// tracer and seccomp see the i386 call); `None` for an absent one.
     #[must_use]
     pub const fn nr64(&self) -> Option<u64> {
         match *self {
@@ -1024,6 +1024,7 @@ pub const fn entry(nr: u64) -> Entry {
         15 => n(90, 0b0),        // chmod
         20 => n(39, 0b0),        // getpid
         21 => n(165, 0b0),       // mount
+        26 => n(101, 0b11),      // ptrace: compat_sys_ptrace
         27 => n(37, 0b0),        // alarm
         29 => n(34, 0b0),        // pause
         33 => n(21, 0b10),       // access
@@ -1237,9 +1238,8 @@ pub const fn entry(nr: u64) -> Entry {
         445 => n(445, 0b1),      // landlock_add_rule
         446 => n(446, 0b1),      // landlock_restrict_self
         // `vm86`, `vm86old`, the calls Linux removed or never had (`break`,
-        // `stty`, `ftime`, `lookup_dcookie`, ...), `ptrace` (whose 32-bit
-        // register and word layouts aren't translated), and numbers past
-        // the table.
+        // `stty`, `ftime`, `lookup_dcookie`, ...), and numbers past the
+        // table.
         _ => Entry::Absent,
     }
 }

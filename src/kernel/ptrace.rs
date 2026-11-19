@@ -41,6 +41,10 @@ const PTRACE_GETREGS: u64 = 12;
 const PTRACE_SETREGS: u64 = 13;
 const PTRACE_GETFPREGS: u64 = 14;
 const PTRACE_SETFPREGS: u64 = 15;
+const PTRACE_GETFPXREGS: u64 = 18;
+const PTRACE_SETFPXREGS: u64 = 19;
+const PTRACE_GET_THREAD_AREA: u64 = 25;
+const PTRACE_SET_THREAD_AREA: u64 = 26;
 const PTRACE_ATTACH: u64 = 16;
 const PTRACE_DETACH: u64 = 17;
 const PTRACE_SYSCALL: u64 = 24;
@@ -77,6 +81,11 @@ const EVENT_STOP: u32 = 128;
 // Regsets.
 const NT_PRSTATUS: u64 = 1;
 const NT_PRFPREG: u64 = 2;
+/// The i386 `fxsave` image (`user32_fxsr_struct`).
+const NT_PRXFPREG: u64 = 0x46e6_2b7f;
+/// The i386 GDT TLS entries, as three `struct user_desc`s.
+const NT_386_TLS: u64 = 0x200;
+const NT_X86_XSTATE: u64 = 0x202;
 const NT_ARM_SYSTEM_CALL: u64 = 0x404;
 
 const SIGKILL: u64 = 9;
@@ -119,6 +128,23 @@ const X86_EFLAGS: usize = 18;
 const X86_RSP: usize = 19;
 /// `sizeof(struct user_regs_struct)`.
 const X86_REGS_SIZE: usize = 27 * 8;
+const X86_CS: usize = 17;
+const X86_SS: usize = 20;
+/// `ds`, `es`, `fs`, `gs`, and the vcpu's segment numbers for them.
+const X86_DATA_SEGS: [(usize, usize); 4] = [(23, 3), (24, 0), (25, 4), (26, 5)];
+/// `user_regs_struct32` word ↔ `user_regs_struct` slot: `ebx`, `ecx`,
+/// `edx`, `esi`, `edi`, `ebp`, `eax`, `ds`, `es`, `fs`, `gs`, `orig_eax`,
+/// `eip`, `cs`, `eflags`, `esp`, `ss`.
+const X86_32_SLOTS: [usize; 17] = [
+    5, 11, 12, 13, 14, 4, 10, 23, 24, 25, 26, 15, 16, 17, 18, 19, 20,
+];
+/// `sizeof(struct user_regs_struct32)`.
+const X86_32_REGS_SIZE: usize = 17 * 4;
+/// `sizeof(struct user32)`, the `PEEKUSR` area of a 32-bit tracer.
+const USER32_SIZE: u64 = 284;
+/// `sizeof(struct user_i387_ia32_struct)`, the `fsave` image.
+const I387_IA32_SIZE: usize = 108;
+const AUDIT_ARCH_I386: u32 = 0x4000_0003;
 
 /// What kind of stop a tracee is in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -199,6 +225,14 @@ pub(super) struct PtraceState {
     fp: Vec<u8>,
     /// The tracer changed them: put them back before user code runs again.
     apply_fp: bool,
+    /// x86's three GDT TLS descriptors at the stop
+    /// (`PTRACE_GET_THREAD_AREA`).
+    tls: [u64; 3],
+    /// The tracer changed them: put them back before the task runs again.
+    apply_tls: bool,
+    /// The stop is in a call through the i386 entry (Linux's `TS_COMPAT`):
+    /// `orig_rax` is its i386 number, its arguments `%ebx`..`%ebp`.
+    compat: bool,
     /// Resumed by `PTRACE_SINGLESTEP` from a user-mode stop: arm a step
     /// before user code runs again.
     step: bool,
@@ -252,6 +286,9 @@ impl PtraceState {
             siginfo: [0; 128],
             fp: Vec::new(),
             apply_fp: false,
+            tls: [0; 3],
+            apply_tls: false,
+            compat: false,
             step: false,
             step_at_return: false,
             interrupt: false,
@@ -280,21 +317,32 @@ impl PtraceState {
         (self.tracer, self.options, self.seized, self.interrupt) = link;
     }
 
-    /// The registers to put back before the task runs user code again, if
-    /// its tracer changed them while it was stopped there.
-    pub(super) fn take_user_regs(&mut self) -> Option<[u64; NREGS]> {
-        std::mem::take(&mut self.apply_user).then_some(self.regs)
+    /// Before the task runs user code again: what its tracer changed while
+    /// it was stopped there (registers, FP state, TLS entries) goes back
+    /// into its vcpu, and a single step is armed if one was asked for.
+    pub(super) fn resume_user(&mut self, arch: Arch, vcpu: &mut dyn Vcpu) {
+        if std::mem::take(&mut self.apply_user) {
+            apply_user(arch, vcpu, &self.regs);
+        }
+        if std::mem::take(&mut self.apply_fp) {
+            vcpu.set_fp_state(&self.fp);
+        }
+        self.put_tls(vcpu);
+        if std::mem::take(&mut self.step) {
+            vcpu.set_single_step(true);
+        }
     }
 
-    /// The FP registers to put back before user code runs again, if the
-    /// tracer changed them.
-    pub(super) fn take_fp_state(&mut self) -> Option<Vec<u8>> {
-        std::mem::take(&mut self.apply_fp).then(|| self.fp.clone())
-    }
-
-    /// Whether to arm a single step before user code runs again.
-    pub(super) fn take_step(&mut self) -> bool {
-        std::mem::take(&mut self.step)
+    /// The TLS entries the tracer set (`PTRACE_SET_THREAD_AREA`), into the
+    /// vcpu (reloading a segment register that holds one).
+    fn put_tls(&mut self, vcpu: &mut dyn Vcpu) {
+        if std::mem::take(&mut self.apply_tls) {
+            for (i, &d) in self.tls.iter().enumerate() {
+                if vcpu.tls_desc(i) != d {
+                    vcpu.set_tls_desc(i, d);
+                }
+            }
+        }
     }
 
     /// Whether to arm a single step now that the syscall has returned.
@@ -322,6 +370,7 @@ impl PtraceState {
             && self.inject.is_none()
             && !self.apply_user
             && !self.apply_fp
+            && !self.apply_tls
             && !self.step
             && !self.step_at_return
             && !self.apply_gprs
@@ -398,6 +447,12 @@ fn snapshot(arch: Arch, vcpu: &mut dyn Vcpu, phase: Phase, fs_base: u64) -> [u64
                 r[X86_RIP] = vcpu.pc();
                 r[X86_EFLAGS] = vcpu.rflags();
                 r[X86_ORIG_RAX] = u64::MAX;
+            } else if vcpu.syscall_ia32() {
+                // `int $0x80` keeps the user's flags, and returns where
+                // `syscall_ip` says; `orig_rax` is the i386 number.
+                r[X86_RIP] = vcpu.syscall_ip();
+                r[X86_EFLAGS] = vcpu.rflags();
+                r[X86_ORIG_RAX] = vcpu.syscall_nr();
             } else {
                 // In a syscall the user rip and flags are where `syscall` put
                 // them (and where `sysret` takes them from).
@@ -406,10 +461,13 @@ fn snapshot(arch: Arch, vcpu: &mut dyn Vcpu, phase: Phase, fs_base: u64) -> [u64
                 r[X86_ORIG_RAX] = vcpu.syscall_nr();
             }
             let (cs, ss) = vcpu.user_segments();
-            r[17] = u64::from(cs);
-            r[20] = u64::from(ss);
+            r[X86_CS] = u64::from(cs);
+            r[X86_SS] = u64::from(ss);
             r[21] = fs_base;
             r[22] = vcpu.gs_base();
+            for (slot, seg) in X86_DATA_SEGS {
+                r[slot] = u64::from(vcpu.segment_selector(seg));
+            }
         }
         Arch::Aarch64 => {
             for (i, slot) in r.iter_mut().enumerate().take(31) {
@@ -427,16 +485,19 @@ fn snapshot(arch: Arch, vcpu: &mut dyn Vcpu, phase: Phase, fs_base: u64) -> [u64
 
 /// Put the tracer's register changes back into a vcpu that is in a syscall:
 /// the general registers (the syscall number and result are carried
-/// separately, and x86's `rcx`/`r11` hold the return rip and flags).
+/// separately, and after x86-64's `syscall` `rcx`/`r11` hold the return rip
+/// and flags; `int $0x80` leaves them the user's).
 fn apply_in_syscall(arch: Arch, vcpu: &mut dyn Vcpu, r: &[u64; NREGS]) {
     match arch {
         Arch::X86_64 => {
+            let ia32 = vcpu.syscall_ia32();
             for (slot, gpr) in X86_SLOTS {
-                if !matches!(slot, X86_RAX | X86_RCX | X86_R11) {
+                if slot != X86_RAX && (ia32 || !matches!(slot, X86_RCX | X86_R11)) {
                     vcpu.set_reg(gpr, r[slot]);
                 }
             }
             vcpu.set_sp(r[X86_RSP]);
+            put_data_segments(vcpu, r);
         }
         Arch::Aarch64 => {
             for (i, &v) in r.iter().enumerate().take(31) {
@@ -447,8 +508,19 @@ fn apply_in_syscall(arch: Arch, vcpu: &mut dyn Vcpu, r: &[u64; NREGS]) {
     }
 }
 
+/// The data segment registers the tracer changed (`set_segment_reg`); one
+/// the task can't load is left as it was.
+fn put_data_segments(vcpu: &mut dyn Vcpu, r: &[u64; NREGS]) {
+    for (slot, seg) in X86_DATA_SEGS {
+        let sel = r[slot] as u16;
+        if sel != vcpu.segment_selector(seg) {
+            vcpu.load_data_segment(seg, sel);
+        }
+    }
+}
+
 /// Put them back into a vcpu in user mode: everything.
-pub(super) fn apply_user(arch: Arch, vcpu: &mut dyn Vcpu, r: &[u64; NREGS]) {
+fn apply_user(arch: Arch, vcpu: &mut dyn Vcpu, r: &[u64; NREGS]) {
     match arch {
         Arch::X86_64 => {
             for (slot, gpr) in X86_SLOTS {
@@ -456,6 +528,13 @@ pub(super) fn apply_user(arch: Arch, vcpu: &mut dyn Vcpu, r: &[u64; NREGS]) {
             }
             vcpu.set_sp(r[X86_RSP]);
             vcpu.set_rflags(r[X86_EFLAGS]);
+            // A code or stack segment the tracer changed (to 32-bit code,
+            // say); a pair the task can't use is left as it was.
+            let (cs, ss) = (r[X86_CS] as u16, r[X86_SS] as u16);
+            if (cs, ss) != vcpu.user_segments() && cs != 0 && ss != 0 {
+                vcpu.set_user_segments(cs, ss);
+            }
+            put_data_segments(vcpu, r);
             vcpu.set_pc(r[X86_RIP]);
         }
         Arch::Aarch64 => {
@@ -507,9 +586,11 @@ impl PtraceState {
         match arch {
             Arch::X86_64 => {
                 // Keep the extended state the stop captured; replace the
-                // legacy region.
-                if self.fp.len() >= 512 {
+                // legacy region, which is in use now (`XFEATURE_MASK_FPSSE`
+                // in the header).
+                if self.fp.len() >= 520 {
                     self.fp[..512].copy_from_slice(&cur);
+                    self.fp[512] |= 3;
                 } else {
                     self.fp = cur;
                 }
@@ -523,6 +604,139 @@ impl PtraceState {
         }
         self.apply_fp = true;
     }
+
+    /// `getreg32`: the word at `off` in a 32-bit tracer's `struct user32`
+    /// (its registers, from the 64-bit ones; 0 past them).
+    fn getreg32(&self, off: u64) -> u32 {
+        let Some(&slot) = X86_32_SLOTS.get(off as usize / 4) else {
+            return 0;
+        };
+        let v = self.regs[slot];
+        if is_segment(slot) {
+            u32::from(v as u16)
+        } else {
+            v as u32
+        }
+    }
+
+    /// `putreg32`: a 32-bit tracer's write of the word at `off` (zero-
+    /// extended into the 64-bit register; a selector must be a user one,
+    /// and `%cs` and `%ss` not null). Past the registers it is ignored.
+    fn putreg32(&mut self, off: u64, v: u32) -> Result<(), i64> {
+        let Some(&slot) = X86_32_SLOTS.get(off as usize / 4) else {
+            return Ok(());
+        };
+        if is_segment(slot) {
+            let sel = v as u16;
+            if (sel != 0 && sel & 3 != 3) || (sel == 0 && matches!(slot, X86_CS | X86_SS)) {
+                return Err(err(Errno::EIO));
+            }
+            self.regs[slot] = u64::from(sel);
+        } else {
+            self.regs[slot] = u64::from(v);
+        }
+        self.regs_dirty = true;
+        Ok(())
+    }
+
+    /// `struct user_regs_struct32`.
+    fn regs32(&self) -> Vec<u8> {
+        (0..X86_32_REGS_SIZE as u64)
+            .step_by(4)
+            .flat_map(|off| self.getreg32(off).to_le_bytes())
+            .collect()
+    }
+
+    /// Write (a prefix of) `struct user_regs_struct32`, word by word.
+    fn set_regs32(&mut self, b: &[u8]) -> Result<(), i64> {
+        for (i, w) in b.as_chunks::<4>().0.iter().enumerate() {
+            self.putreg32(i as u64 * 4, u32::from_le_bytes(*w))?;
+        }
+        Ok(())
+    }
+
+    /// `struct user_i387_ia32_struct`, the `fsave` image a 32-bit tracer
+    /// sees (`convert_from_fxsr`).
+    fn fsave(&self) -> Vec<u8> {
+        let fx = fp_user(Arch::X86_64, &self.fp);
+        let (cs, ds) = (self.regs[X86_CS] as u16, self.regs[23] as u16);
+        super::signal::fsave_header(&fx, cs, ds)[..I387_IA32_SIZE].to_vec()
+    }
+
+    /// Write (a prefix of) the `fsave` image (`convert_to_fxsr`): the x87
+    /// state changes, the SSE state stays.
+    fn set_fsave(&mut self, user: &[u8]) {
+        let mut env = self.fsave();
+        let n = user.len().min(env.len());
+        env[..n].copy_from_slice(&user[..n]);
+        let word = |o: usize| u32::from_le_bytes(env[o..o + 4].try_into().unwrap());
+        let mut fx = fp_user(Arch::X86_64, &self.fp);
+        fx[0..2].copy_from_slice(&env[0..2]); // cwd
+        fx[2..4].copy_from_slice(&env[4..6]); // swd
+        fx[4..6].copy_from_slice(&twd_i387_to_fxsr(word(8) as u16).to_le_bytes());
+        fx[6..8].copy_from_slice(&((word(16) >> 16) as u16).to_le_bytes()); // fop
+        fx[8..16].copy_from_slice(&u64::from(word(12)).to_le_bytes()); // rip
+        fx[16..24].copy_from_slice(&u64::from(word(20)).to_le_bytes()); // rdp
+        for i in 0..8 {
+            fx[32 + i * 16..42 + i * 16].copy_from_slice(&env[28 + i * 10..38 + i * 10]);
+        }
+        self.set_fp_user(Arch::X86_64, &fx);
+    }
+
+    /// `NT_X86_XSTATE`: the `XSAVE` area in its standard form, with the
+    /// `XCR0` it was saved under in the software-reserved bytes
+    /// (`xstate_fx_sw_bytes`).
+    fn xstate(&self) -> Vec<u8> {
+        let size = crate::vcpu::X86_XSAVE_SIZE;
+        let mut x = vec![0u8; size];
+        if self.fp.len() >= size {
+            x.copy_from_slice(&self.fp[..size]);
+        } else {
+            x[..512].copy_from_slice(&fp_user(Arch::X86_64, &self.fp));
+        }
+        x[464..512].fill(0);
+        x[464..472].copy_from_slice(&XCR0.to_le_bytes());
+        x
+    }
+
+    /// Replace the `XSAVE` area (`copy_uabi_from_kernel_to_xstate`): all of
+    /// it at once (`EFAULT` otherwise), with no feature beyond `XCR0`, a
+    /// standard-form header and a valid `MXCSR` (`EINVAL` otherwise).
+    fn set_xstate(&mut self, x: &[u8]) -> Result<(), i64> {
+        if x.len() != crate::vcpu::X86_XSAVE_SIZE {
+            return Err(err(Errno::EFAULT));
+        }
+        let q = |o: usize| u64::from_le_bytes(x[o..o + 8].try_into().unwrap());
+        let mxcsr = u32::from_le_bytes(x[24..28].try_into().unwrap());
+        if q(512) & !XCR0 != 0 || q(520) != 0 || (528..576).step_by(8).any(|o| q(o) != 0) {
+            return Err(err(Errno::EINVAL));
+        }
+        if mxcsr & !0xffff != 0 {
+            return Err(err(Errno::EINVAL));
+        }
+        self.fp = x.to_vec();
+        self.apply_fp = true;
+        Ok(())
+    }
+}
+
+/// The `XSAVE` features the vcpus have (x87, SSE, AVX), as `XCR0`.
+const XCR0: u64 = 7;
+
+/// A `user_regs_struct` slot holding a segment selector.
+const fn is_segment(slot: usize) -> bool {
+    matches!(slot, X86_CS | X86_SS | 23..=26)
+}
+
+/// The abridged `fxsave` tag word (a bit a register: valid) from the
+/// `i387` one (`twd_i387_to_fxsr`).
+fn twd_i387_to_fxsr(twd: u16) -> u16 {
+    let mut tmp = u32::from(!twd);
+    tmp = (tmp | (tmp >> 1)) & 0x5555;
+    tmp = (tmp | (tmp >> 1)) & 0x3333;
+    tmp = (tmp | (tmp >> 2)) & 0x0f0f;
+    tmp = (tmp | (tmp >> 4)) & 0x00ff;
+    tmp as u16
 }
 
 /// A signal's `siginfo_t` as `PTRACE_GETSIGINFO` returns it.
@@ -635,10 +849,21 @@ impl Kernel {
             return err(Errno::ESRCH);
         }
         let arch = self.arch;
+        // Through the i386 entry (`compat_sys_ptrace`): words and the
+        // `user` area are 32-bit, and so are `siginfo`, the event message
+        // and the regset `iovec`.
+        let compat = cx.ia32 && arch == Arch::X86_64;
+        if arch == Arch::X86_64
+            && let Some(r) = Self::ptrace_x86(sh, idx, req, addr, data, compat, mem)
+        {
+            return r;
+        }
+        let word = if compat { 4 } else { 8 };
         match req {
             PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
-                let mut word = [0u8; 8];
-                match Self::tracee_mem(sh, cx, idx, mem, |m| m.read(addr, &mut word).is_ok()) {
+                let mut buf = [0u8; 8];
+                let w = &mut buf[..word];
+                match Self::tracee_mem(sh, cx, idx, mem, |m| m.read(addr, w).is_ok()) {
                     Some(true) => {}
                     Some(false) => return err(Errno::EIO),
                     None => {
@@ -646,14 +871,15 @@ impl Kernel {
                         return 0;
                     }
                 }
-                if mem.write(data, &word).is_err() {
+                if mem.write(data, &buf[..word]).is_err() {
                     return err(Errno::EFAULT);
                 }
                 0
             }
             PTRACE_POKETEXT | PTRACE_POKEDATA => {
-                let word = data.to_le_bytes();
-                match Self::tracee_mem(sh, cx, idx, mem, |m| m.write_init(addr, &word).is_ok()) {
+                let bytes = data.to_le_bytes();
+                let w = &bytes[..word];
+                match Self::tracee_mem(sh, cx, idx, mem, |m| m.write_init(addr, w).is_ok()) {
                     Some(true) => 0,
                     Some(false) => err(Errno::EIO),
                     None => {
@@ -661,38 +887,6 @@ impl Kernel {
                         0
                     }
                 }
-            }
-            PTRACE_PEEKUSER if arch == Arch::X86_64 => {
-                if addr % 8 != 0 || addr >= 1024 {
-                    return err(Errno::EIO);
-                }
-                let t = sh.procs[idx]
-                    .as_ref()
-                    .unwrap()
-                    .info
-                    .ptrace
-                    .as_ref()
-                    .unwrap();
-                let v = if (addr as usize) < X86_REGS_SIZE {
-                    t.regs[addr as usize / 8]
-                } else {
-                    0
-                };
-                if mem.write(data, &v.to_le_bytes()).is_err() {
-                    return err(Errno::EFAULT);
-                }
-                0
-            }
-            PTRACE_POKEUSER if arch == Arch::X86_64 => {
-                if addr % 8 != 0 || addr >= 1024 {
-                    return err(Errno::EIO);
-                }
-                let t = Self::tracee_state(sh, idx);
-                if (addr as usize) < X86_REGS_SIZE {
-                    t.regs[addr as usize / 8] = data;
-                    t.regs_dirty = true;
-                }
-                0
             }
             PTRACE_CONT | PTRACE_SYSCALL | PTRACE_SINGLESTEP | PTRACE_DETACH => {
                 if data > 64 {
@@ -715,46 +909,6 @@ impl Kernel {
                         }
                     }
                 }
-                0
-            }
-            PTRACE_GETREGS if arch == Arch::X86_64 => {
-                let t = sh.procs[idx]
-                    .as_ref()
-                    .unwrap()
-                    .info
-                    .ptrace
-                    .as_ref()
-                    .unwrap();
-                let bytes: Vec<u8> = t.regs[..27].iter().flat_map(|v| v.to_le_bytes()).collect();
-                if mem.write(data, &bytes).is_err() {
-                    return err(Errno::EFAULT);
-                }
-                0
-            }
-            PTRACE_SETREGS if arch == Arch::X86_64 => {
-                let Ok(bytes) = mem.read_vec(data, X86_REGS_SIZE) else {
-                    return err(Errno::EFAULT);
-                };
-                let t = Self::tracee_state(sh, idx);
-                for (i, c) in bytes.as_chunks::<8>().0.iter().enumerate() {
-                    t.regs[i] = u64::from_le_bytes(*c);
-                }
-                t.regs_dirty = true;
-                0
-            }
-            PTRACE_GETFPREGS if arch == Arch::X86_64 => {
-                let t = Self::tracee_state(sh, idx);
-                if mem.write(data, &fp_user(arch, &t.fp)).is_err() {
-                    return err(Errno::EFAULT);
-                }
-                0
-            }
-            PTRACE_SETFPREGS if arch == Arch::X86_64 => {
-                let mut buf = [0u8; 512];
-                if mem.read(data, &mut buf).is_err() {
-                    return err(Errno::EFAULT);
-                }
-                Self::tracee_state(sh, idx).set_fp_user(arch, &buf);
                 0
             }
             PTRACE_SETOPTIONS => {
@@ -780,7 +934,7 @@ impl Kernel {
                 if is_pid {
                     msg = self.visible_pid(cx, msg as i32) as u64;
                 }
-                if mem.write(data, &msg.to_le_bytes()).is_err() {
+                if mem.write(data, &msg.to_le_bytes()[..word]).is_err() {
                     return err(Errno::EFAULT);
                 }
                 0
@@ -789,7 +943,7 @@ impl Kernel {
                 let p = &sh.procs[idx].as_ref().unwrap().info;
                 let t = p.ptrace.as_ref().unwrap();
                 let stop = t.stop.unwrap();
-                let si = if stop.kind == StopKind::Signal {
+                let mut si = if stop.kind == StopKind::Signal {
                     t.siginfo
                 } else {
                     // A trap: what the kernel's own SIGTRAP carries.
@@ -802,6 +956,9 @@ impl Kernel {
                     };
                     siginfo_bytes(u64::from(SIGTRAP), Some(q))
                 };
+                if compat {
+                    si = super::compat::siginfo_narrow(&si);
+                }
                 if mem.write(data, &si).is_err() {
                     return err(Errno::EFAULT);
                 }
@@ -811,6 +968,9 @@ impl Kernel {
                 let mut si = [0u8; 128];
                 if mem.read(data, &mut si).is_err() {
                     return err(Errno::EFAULT);
+                }
+                if compat {
+                    si = super::compat::siginfo_widen(&si);
                 }
                 let t = Self::tracee_state(sh, idx);
                 if t.stop.is_some_and(|s| s.kind == StopKind::Signal) {
@@ -836,7 +996,7 @@ impl Kernel {
                 0
             }
             PTRACE_GETREGSET | PTRACE_SETREGSET => {
-                self.ptrace_regset(sh, idx, req, addr, data, mem)
+                self.ptrace_regset(sh, idx, req, addr, data, compat, mem)
             }
             PTRACE_GET_SYSCALL_INFO => {
                 let info = Self::syscall_info(arch, Self::tracee_state(sh, idx));
@@ -848,6 +1008,144 @@ impl Kernel {
             }
             _ => err(Errno::EIO),
         }
+    }
+
+    /// The x86 register and thread-area requests, for a 64-bit tracer or
+    /// (`compat`) a 32-bit one (`ia32_arch_ptrace`); `None` for the others.
+    fn ptrace_x86(
+        sh: &mut Shared,
+        idx: usize,
+        req: u64,
+        addr: u64,
+        data: u64,
+        compat: bool,
+        mem: &mut GuestMemory,
+    ) -> Option<i64> {
+        let arch = Arch::X86_64;
+        let t = Self::tracee_state(sh, idx);
+        let put = |mem: &mut GuestMemory, bytes: &[u8]| {
+            if mem.write(data, bytes).is_ok() {
+                0
+            } else {
+                err(Errno::EFAULT)
+            }
+        };
+        Some(match req {
+            PTRACE_PEEKUSER if compat => {
+                if addr & 3 != 0 || addr > USER32_SIZE {
+                    return Some(err(Errno::EIO));
+                }
+                put(mem, &t.getreg32(addr).to_le_bytes())
+            }
+            PTRACE_POKEUSER if compat => {
+                if addr & 3 != 0 || addr > USER32_SIZE {
+                    return Some(err(Errno::EIO));
+                }
+                match t.putreg32(addr, data as u32) {
+                    Ok(()) => 0,
+                    Err(e) => e,
+                }
+            }
+            PTRACE_PEEKUSER => {
+                if !addr.is_multiple_of(8) || addr >= 1024 {
+                    return Some(err(Errno::EIO));
+                }
+                let v = if (addr as usize) < X86_REGS_SIZE {
+                    t.regs[addr as usize / 8]
+                } else {
+                    0
+                };
+                put(mem, &v.to_le_bytes())
+            }
+            PTRACE_POKEUSER => {
+                if !addr.is_multiple_of(8) || addr >= 1024 {
+                    return Some(err(Errno::EIO));
+                }
+                if (addr as usize) < X86_REGS_SIZE {
+                    t.regs[addr as usize / 8] = data;
+                    t.regs_dirty = true;
+                }
+                0
+            }
+            PTRACE_GETREGS if compat => put(mem, &t.regs32()),
+            PTRACE_SETREGS if compat => {
+                let Ok(bytes) = mem.read_vec(data, X86_32_REGS_SIZE) else {
+                    return Some(err(Errno::EFAULT));
+                };
+                match t.set_regs32(&bytes) {
+                    Ok(()) => 0,
+                    Err(e) => e,
+                }
+            }
+            PTRACE_GETREGS => {
+                let bytes: Vec<u8> = t.regs[..27].iter().flat_map(|v| v.to_le_bytes()).collect();
+                put(mem, &bytes)
+            }
+            PTRACE_SETREGS => {
+                let Ok(bytes) = mem.read_vec(data, X86_REGS_SIZE) else {
+                    return Some(err(Errno::EFAULT));
+                };
+                for (i, c) in bytes.as_chunks::<8>().0.iter().enumerate() {
+                    t.regs[i] = u64::from_le_bytes(*c);
+                }
+                t.regs_dirty = true;
+                0
+            }
+            // The `fsave` image for a 32-bit tracer, the `fxsave` one for a
+            // 64-bit one (and `GETFPXREGS`, which only a 32-bit one has).
+            PTRACE_GETFPREGS if compat => put(mem, &t.fsave()),
+            PTRACE_SETFPREGS if compat => {
+                let Ok(env) = mem.read_vec(data, I387_IA32_SIZE) else {
+                    return Some(err(Errno::EFAULT));
+                };
+                t.set_fsave(&env);
+                0
+            }
+            PTRACE_GETFPREGS => put(mem, &fp_user(arch, &t.fp)),
+            PTRACE_GETFPXREGS if compat => put(mem, &fp_user(arch, &t.fp)),
+            PTRACE_SETFPREGS => {
+                let mut buf = [0u8; 512];
+                if mem.read(data, &mut buf).is_err() {
+                    return Some(err(Errno::EFAULT));
+                }
+                t.set_fp_user(arch, &buf);
+                0
+            }
+            PTRACE_SETFPXREGS if compat => {
+                let mut buf = [0u8; 512];
+                if mem.read(data, &mut buf).is_err() {
+                    return Some(err(Errno::EFAULT));
+                }
+                t.set_fp_user(arch, &buf);
+                0
+            }
+            // `addr` is the GDT entry (12-14), `data` a `struct user_desc`.
+            PTRACE_GET_THREAD_AREA | PTRACE_SET_THREAD_AREA => {
+                if addr as u32 > i32::MAX as u32 {
+                    return Some(err(Errno::EIO));
+                }
+                let entry = u64::from(addr as u32);
+                if req == PTRACE_GET_THREAD_AREA {
+                    match super::sys_misc::thread_area_get(&t.tls, entry) {
+                        Ok(desc) => put(mem, &desc),
+                        Err(e) => e,
+                    }
+                } else {
+                    let mut raw = [0u8; 16];
+                    if mem.read(data, &mut raw).is_err() {
+                        return Some(err(Errno::EFAULT));
+                    }
+                    match super::sys_misc::thread_area_set(&mut t.tls, entry, &raw) {
+                        Ok(()) => {
+                            t.apply_tls = true;
+                            0
+                        }
+                        Err(e) => e,
+                    }
+                }
+            }
+            _ => return None,
+        })
     }
 
     fn tracee_state(sh: &mut Shared, idx: usize) -> &mut PtraceState {
@@ -1038,7 +1336,11 @@ impl Kernel {
     }
 
     /// `PTRACE_GETREGSET`/`PTRACE_SETREGSET` (`addr` = the note type, `data` = an
-    /// iovec whose length is updated to what was transferred).
+    /// iovec whose length is updated to what was transferred): a 32-bit one
+    /// for a `compat` tracer. The regsets are those of the tracee's view
+    /// (`task_user_regset_view`): the i386 ones while it runs 32-bit code
+    /// (a `%cs` other than `__USER_CS`), whoever asks.
+    #[allow(clippy::too_many_arguments)]
     fn ptrace_regset(
         &self,
         sh: &mut Shared,
@@ -1046,22 +1348,50 @@ impl Kernel {
         req: u64,
         note: u64,
         iov: u64,
+        compat: bool,
         mem: &mut GuestMemory,
     ) -> i64 {
         let arch = self.arch;
-        let (Ok(base), Ok(len)) = (mem.read_u64(iov), mem.read_u64(iov + 8)) else {
+        let iovec = if compat {
+            mem.read_u32(iov)
+                .and_then(|b| Ok((u64::from(b), u64::from(mem.read_u32(iov + 4)?))))
+        } else {
+            mem.read_u64(iov)
+                .and_then(|b| Ok((b, mem.read_u64(iov + 8)?)))
+        };
+        let Ok((base, len)) = iovec else {
             return err(Errno::EFAULT);
         };
         let t = Self::tracee_state(sh, idx);
-        let mut buf: Vec<u8> = match (note, arch) {
+        let view32 = arch == Arch::X86_64 && t.regs[X86_CS] != 0x33;
+        // The regset and the size of its unit, which the length must be a
+        // multiple of.
+        let (mut buf, unit): (Vec<u8>, usize) = match (note, arch) {
+            (NT_PRSTATUS, Arch::X86_64) if view32 => (t.regs32(), 4),
             (NT_PRSTATUS, Arch::X86_64) => {
-                t.regs[..27].iter().flat_map(|v| v.to_le_bytes()).collect()
+                let regs = t.regs[..27].iter().flat_map(|v| v.to_le_bytes()).collect();
+                (regs, 8)
             }
-            (NT_PRSTATUS, Arch::Aarch64) => t.regs.iter().flat_map(|v| v.to_le_bytes()).collect(),
-            (NT_PRFPREG, _) => fp_user(arch, &t.fp),
-            (NT_ARM_SYSTEM_CALL, Arch::Aarch64) => (t.a64_nr as i32).to_le_bytes().to_vec(),
+            (NT_PRFPREG, Arch::X86_64) if view32 => (t.fsave(), 4),
+            (NT_PRXFPREG, Arch::X86_64) if view32 => (fp_user(arch, &t.fp), 4),
+            (NT_X86_XSTATE, Arch::X86_64) => (t.xstate(), 8),
+            (NT_386_TLS, Arch::X86_64) if view32 => {
+                let descs = (0..3u64).flat_map(|i| {
+                    super::sys_misc::thread_area_get(&t.tls, 12 + i).unwrap_or([0; 16])
+                });
+                (descs.collect(), 16)
+            }
+            (NT_PRSTATUS, Arch::Aarch64) => {
+                (t.regs.iter().flat_map(|v| v.to_le_bytes()).collect(), 1)
+            }
+            (NT_PRFPREG, Arch::X86_64) => (fp_user(arch, &t.fp), 8),
+            (NT_PRFPREG, _) => (fp_user(arch, &t.fp), 1),
+            (NT_ARM_SYSTEM_CALL, Arch::Aarch64) => ((t.a64_nr as i32).to_le_bytes().to_vec(), 1),
             _ => return err(Errno::EINVAL),
         };
+        if !(len as usize).is_multiple_of(unit) {
+            return err(Errno::EINVAL);
+        }
         let n = (len as usize).min(buf.len());
         if req == PTRACE_GETREGSET {
             if mem.write(base, &buf[..n]).is_err() {
@@ -1071,34 +1401,74 @@ impl Kernel {
             if mem.read(base, &mut buf[..n]).is_err() {
                 return err(Errno::EFAULT);
             }
-            match (note, arch) {
+            let r = match (note, arch) {
+                (NT_PRSTATUS, Arch::X86_64) if view32 => t.set_regs32(&buf[..n]),
                 (NT_PRSTATUS, _) => {
                     for (i, c) in buf[..n].as_chunks::<8>().0.iter().enumerate() {
                         t.regs[i] = u64::from_le_bytes(*c);
                     }
                     t.regs_dirty = true;
+                    Ok(())
                 }
-                (NT_PRFPREG, _) => t.set_fp_user(arch, &buf[..n]),
+                (NT_PRFPREG, _) if view32 => {
+                    t.set_fsave(&buf[..n]);
+                    Ok(())
+                }
+                (NT_PRFPREG | NT_PRXFPREG, _) => {
+                    t.set_fp_user(arch, &buf[..n]);
+                    Ok(())
+                }
+                (NT_X86_XSTATE, _) => t.set_xstate(&buf[..n]),
+                (NT_386_TLS, _) => {
+                    let mut tls = t.tls;
+                    let set = buf[..n]
+                        .as_chunks::<16>()
+                        .0
+                        .iter()
+                        .enumerate()
+                        .try_for_each(|(i, d)| {
+                            super::sys_misc::thread_area_set(&mut tls, 12 + i as u64, d)
+                        });
+                    set.map(|()| {
+                        t.tls = tls;
+                        t.apply_tls = true;
+                    })
+                }
                 (NT_ARM_SYSTEM_CALL, _) if n == 4 => {
                     t.a64_nr = i64::from(i32::from_le_bytes(buf[..4].try_into().unwrap())) as u64;
                     t.regs_dirty = true;
+                    Ok(())
                 }
-                _ => {}
+                _ => Ok(()),
+            };
+            if let Err(e) = r {
+                return e;
             }
-            let _ = arch;
         }
-        if mem.write(iov + 8, &(n as u64).to_le_bytes()).is_err() {
+        let wrote = if compat {
+            mem.write(iov + 4, &(n as u32).to_le_bytes())
+        } else {
+            mem.write(iov + 8, &(n as u64).to_le_bytes())
+        };
+        if wrote.is_err() {
             return err(Errno::EFAULT);
         }
         0
     }
 
-    /// `struct ptrace_syscall_info` for the stop `t` is in.
+    /// `struct ptrace_syscall_info` for the stop `t` is in: an i386 call's
+    /// is `AUDIT_ARCH_I386`, its arguments `%ebx`..`%ebp`.
     fn syscall_info(arch: Arch, t: &PtraceState) -> Vec<u8> {
         const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
         const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
         let r = &t.regs;
         let (audit, ip, sp, args) = match arch {
+            Arch::X86_64 if t.compat => (
+                AUDIT_ARCH_I386,
+                r[X86_RIP],
+                r[X86_RSP],
+                [r[5], r[11], r[12], r[13], r[14], r[4]],
+            ),
             Arch::X86_64 => (
                 AUDIT_ARCH_X86_64,
                 r[X86_RIP],
@@ -1131,9 +1501,18 @@ impl Kernel {
             }
             Some(StopKind::Exit) => {
                 info[0] = 2;
-                let rval = t.ret_reg(arch) as i64;
+                // `syscall_get_error`: an i386 call's error is its `%eax`,
+                // sign-extended.
+                let ret = t.ret_reg(arch);
+                let error = if t.compat {
+                    i64::from(ret as i32)
+                } else {
+                    ret as i64
+                };
+                let is_error = (-4095..0).contains(&error);
+                let rval = if is_error { error } else { ret as i64 };
                 info[24..32].copy_from_slice(&rval.to_le_bytes());
-                info[32] = u8::from((-4095..0).contains(&rval));
+                info[32] = u8::from(is_error);
                 33
             }
             Some(StopKind::Seccomp) => {
@@ -1188,6 +1567,11 @@ impl Kernel {
         t.a64_nr = nr;
         t.regs_dirty = false;
         t.apply_fp = false;
+        t.compat = arch == Arch::X86_64 && phase != Phase::User && vcpu.syscall_ia32();
+        if arch == Arch::X86_64 {
+            t.tls = std::array::from_fn(|i| vcpu.tls_desc(i));
+            t.apply_tls = false;
+        }
         t.fp = if matches!(kind, StopKind::Entry | StopKind::Exit) {
             Vec::new()
         } else {
@@ -1355,6 +1739,7 @@ impl Kernel {
             let regs = t.regs;
             apply_in_syscall(arch, vcpu, &regs);
         }
+        t.put_tls(vcpu);
         // A signal the tracer passed on, before the call starts: delivered now,
         // and the call made again after its handler.
         if t.sc_result.is_none() && t.inject.is_some() {
@@ -1409,6 +1794,13 @@ impl Kernel {
         let t = cx.cur.ptrace.as_mut().unwrap();
         let nr = t.sc_nr.unwrap_or_else(|| vcpu.syscall_nr());
         // PTRACE_O_TRACEEXIT: the exit is reported before it happens.
+        let nr = if vcpu.syscall_ia32() {
+            crate::abi::arch::i386::entry(nr & 0xffff_ffff)
+                .nr64()
+                .unwrap_or(u64::MAX)
+        } else {
+            nr
+        };
         let sys = crate::abi::arch::decode(arch, nr);
         if t.tracer != 0
             && t.options & O_TRACEEXIT != 0
@@ -1433,8 +1825,9 @@ impl Kernel {
             return Err(Serviced::Blocked);
         }
         let t = cx.cur.ptrace.as_ref().unwrap();
-        if t.sc_nr.is_some_and(|n| n as i64 == -1) {
-            // The tracer skipped it.
+        if t.sc_nr.is_some_and(|n| n as u32 == u32::MAX) {
+            // The tracer skipped it (the number is an `int`, so a 32-bit
+            // tracer's `orig_eax` of -1 does too).
             return Ok((t.sc_nr, Some(t.skip_ret as i64)));
         }
         Ok((t.sc_nr, None))

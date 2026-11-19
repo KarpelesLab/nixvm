@@ -585,6 +585,31 @@ impl Kernel {
     }
 }
 
+/// `PTRACE_GET_THREAD_AREA`'s `struct user_desc` for TLS entry `idx`
+/// (12-14) of a tracee whose three descriptors are `tls`, or `EINVAL`.
+pub(super) fn thread_area_get(tls: &[u64; 3], idx: u64) -> Result<[u8; 16], i64> {
+    let i = usize::try_from(idx).unwrap_or(usize::MAX);
+    if !(TLS_MIN..TLS_MIN + TLS_ENTRIES).contains(&i) {
+        return Err(err(Errno::EINVAL));
+    }
+    Ok(UserDesc::from_descriptor(idx as u32, tls[i - TLS_MIN]).to_bytes())
+}
+
+/// `PTRACE_SET_THREAD_AREA` (`do_set_thread_area` with no allocating): put
+/// the descriptor `raw` describes in TLS entry `idx` of `tls`, or `EINVAL`.
+pub(super) fn thread_area_set(tls: &mut [u64; 3], idx: u64, raw: &[u8; 16]) -> Result<(), i64> {
+    let info = UserDesc::parse(raw);
+    if !info.tls_okay() {
+        return Err(err(Errno::EINVAL));
+    }
+    let i = usize::try_from(idx).unwrap_or(usize::MAX);
+    if !(TLS_MIN..TLS_MIN + TLS_ENTRIES).contains(&i) {
+        return Err(err(Errno::EINVAL));
+    }
+    tls[i - TLS_MIN] = info.descriptor();
+    Ok(())
+}
+
 /// `GDT_ENTRY_TLS_MIN` and the number of TLS entries.
 const TLS_MIN: usize = crate::vcpu::ctrl::GDT_ENTRY_TLS_MIN;
 const TLS_ENTRIES: usize = crate::vcpu::ctrl::GDT_TLS_ENTRIES;
