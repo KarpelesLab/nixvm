@@ -11659,31 +11659,38 @@ impl Kernel {
             }
         }
 
-        let noreplace = flags & MAP_FIXED_NOREPLACE != 0 && addr != 0;
-        let base = if (flags & MAP_FIXED != 0 || noreplace) && addr != 0 {
-            let base = addr - addr % PAGE_SIZE;
-            // MAP_FIXED_NOREPLACE is atomic: if *any* page in the target range is
-            // already mapped, fail with EEXIST and disturb nothing (don't relocate
-            // and don't clobber). A free range is placed exactly at `base`.
-            if noreplace {
-                let end = base + len;
-                let mut p = base;
-                while p < end {
-                    if mem.page_prot(p).is_some() {
-                        return err(Errno::EEXIST);
-                    }
-                    p += PAGE_SIZE;
-                }
-            }
-            // Nothing goes past TASK_SIZE (`get_unmapped_area`'s ENOMEM).
-            if base
+        const MAP_32BIT: u64 = 0x40;
+        let noreplace = flags & MAP_FIXED_NOREPLACE != 0;
+        let base = if flags & MAP_FIXED != 0 || noreplace {
+            // `__get_unmapped_area`'s checks, in its order: nothing past
+            // TASK_SIZE (ENOMEM), a page-aligned address (EINVAL), and none
+            // below `mmap_min_addr` (EPERM: the first 64 KiB, which nixvm's
+            // address space doesn't have even for CAP_SYS_RAWIO).
+            if addr
                 .checked_add(len)
                 .is_none_or(|end| end > Self::task_size(mem))
             {
                 return err(Errno::ENOMEM);
             }
+            if !addr.is_multiple_of(PAGE_SIZE) {
+                return err(Errno::EINVAL);
+            }
+            if addr < mem.base() {
+                return err(Errno::EPERM);
+            }
+            // MAP_FIXED_NOREPLACE is atomic: if *any* page in the target range is
+            // already mapped, fail with EEXIST and disturb nothing (don't relocate
+            // and don't clobber). A free range is placed exactly at `addr`.
+            if noreplace && !mem_syscalls::range_is_free(mem, addr, addr + len) {
+                return err(Errno::EEXIST);
+            }
             // A fixed placement inside the arena is no longer free space.
-            sh.arena(cx).claim(base, len);
+            sh.arena(cx).claim(addr, len);
+            addr
+        } else if flags & MAP_32BIT != 0 && !cx.ia32 {
+            let Some(base) = self.place_32bit(sh, cx, addr, len, mem) else {
+                return err(Errno::ENOMEM);
+            };
             base
         } else {
             let Some(base) = self.place(sh, cx, addr, len, mem) else {
@@ -11875,13 +11882,16 @@ impl Kernel {
     }
 
     /// Where a mapping of `len` bytes goes that wasn't given a fixed place
-    /// (`get_unmapped_area`): what the arena hands out — below 4 GiB, as
-    /// Linux's `mmap_is_ia32`/`in_32bit_syscall` have it, for an i386
-    /// program (its arena is down there) and for an i386 system call from a
-    /// 64-bit one (the highest gap under [`crate::loader::IA32_STACK_TOP`]).
-    /// A 32-bit call's `hint` is taken when the range there is free and
-    /// below [`Self::task_size`] (`mmap_address_hint_valid`), as Linux's
-    /// top-down search does; a 64-bit call's still goes to the arena.
+    /// (`arch_get_unmapped_area_topdown`): at `hint` when the range there is
+    /// free, clear of the stack's guard gap and valid
+    /// (`mmap_address_hint_valid`: below [`Self::task_size`], and not across
+    /// the 47-bit boundary); otherwise what the arena hands out, from the top
+    /// down — below 4 GiB, as Linux's `mmap_is_ia32`/`in_32bit_syscall` have
+    /// it, for an i386 program (its arena is down there) and for an i386
+    /// system call from a 64-bit one (the highest gap under
+    /// [`crate::loader::IA32_STACK_TOP`]). Nothing here is above 47 bits,
+    /// where Linux goes only for a hint up there (5-level paging), as the
+    /// address space ends below them.
     pub(super) fn place(
         &self,
         sh: &mut Shared,
@@ -11891,8 +11901,7 @@ impl Kernel {
         mem: &GuestMemory,
     ) -> Option<u64> {
         let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-        if cx.ia32
-            && hint != 0
+        if hint != 0
             && let Some(at) = Self::hint_fits(cx, mem, hint, len)
         {
             sh.arena(cx).claim(at, len);
@@ -11908,21 +11917,67 @@ impl Kernel {
 
     /// `hint`, page-aligned and raised to the lowest address a mapping may
     /// have (`round_hint_to_min`), if `len` bytes there are free, end by
-    /// [`Self::task_size`], and keep clear of the stack and its guard gap.
+    /// [`Self::task_size`], don't cross the 47-bit boundary
+    /// (`DEFAULT_MAP_WINDOW`, the top of 4-level paging's user half), and
+    /// keep clear of the stack and its guard gap.
     fn hint_fits(cx: &ServiceCtx, mem: &GuestMemory, hint: u64, len: u64) -> Option<u64> {
+        /// `DEFAULT_MAP_WINDOW`: 47 bits, less a page.
+        const MAP_WINDOW: u64 = (1 << 47) - PAGE_SIZE;
         let at = page_down(hint).max(mem.base());
         let end = at.checked_add(len)?;
-        let stack_gap = cx.cur.stack_limit.saturating_sub(STACK_GUARD_GAP);
-        if end > Self::task_size(mem) || (end > stack_gap && at < mem.stack_top()) {
+        if end > Self::task_size(mem) || (at > MAP_WINDOW) != (end > MAP_WINDOW) {
             return None;
         }
-        let mut p = at;
-        while p < end {
-            if mem.page_prot(p).is_some() {
+        Self::clear_for_mapping(cx, mem, at, end).then_some(at)
+    }
+
+    /// Whether `[at, end)` is free and clear of the stack and its guard gap
+    /// (`vm_start_gap`), so a new mapping may go there.
+    fn clear_for_mapping(cx: &ServiceCtx, mem: &GuestMemory, at: u64, end: u64) -> bool {
+        let stack_gap = cx.cur.stack_limit.saturating_sub(STACK_GUARD_GAP);
+        !(end > stack_gap && at < mem.stack_top()) && mem_syscalls::range_is_free(mem, at, end)
+    }
+
+    /// Where a 64-bit call's `MAP_32BIT` mapping of `len` bytes goes (x86's
+    /// `arch_get_unmapped_area`, which the top-down search defers to for
+    /// it): at `hint` if it's free and the mapping ends by 2 GiB, else the
+    /// lowest gap in the 1-2 GiB window `find_start_end` gives it (with no
+    /// address randomization here), else nowhere (`ENOMEM`).
+    pub(super) fn place_32bit(
+        &self,
+        sh: &mut Shared,
+        cx: &mut ServiceCtx,
+        hint: u64,
+        len: u64,
+        mem: &GuestMemory,
+    ) -> Option<u64> {
+        const BEGIN: u64 = 0x4000_0000;
+        const END: u64 = 0x8000_0000;
+        let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        if len > END {
+            return None;
+        }
+        let fits = |at: u64| at + len <= END && Self::clear_for_mapping(cx, mem, at, at + len);
+        let hinted = page_down(hint).max(mem.base());
+        let at = if hint != 0 && fits(hinted) {
+            hinted
+        } else {
+            let mut at = BEGIN;
+            for r in mem.regions() {
+                if r.end <= at {
+                    continue;
+                }
+                if r.start >= at + len || at + len > END {
+                    break;
+                }
+                at = r.end.next_multiple_of(PAGE_SIZE);
+            }
+            if !fits(at) {
                 return None;
             }
-            p += PAGE_SIZE;
-        }
+            at
+        };
+        sh.arena(cx).claim(at, len);
         Some(at)
     }
 

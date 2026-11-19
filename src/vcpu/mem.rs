@@ -1861,6 +1861,34 @@ impl GuestMemory {
         self.mapped[p].then(|| self.prot[p])
     }
 
+    /// Whether `[start, end)` (page-aligned) lies in the address space with
+    /// no page of it mapped. A never-touched stretch is skipped a chunk at
+    /// a time, so a large range (a JIT's multi-GiB reservation) is cheap.
+    #[must_use]
+    pub fn range_unmapped(&self, start: u64, end: u64) -> bool {
+        const CHUNK: usize = PageVec::<bool>::CHUNK;
+        if start > end || start < self.base || end > self.base + self.size {
+            return false;
+        }
+        let first = ((start - self.base) / PAGE_SIZE) as usize;
+        let last = (end - self.base).div_ceil(PAGE_SIZE) as usize;
+        let mut p = first;
+        while p < last {
+            if p.is_multiple_of(CHUNK)
+                && p + CHUNK <= last
+                && self.mapped.uniform_chunk(p / CHUNK) == Some(false)
+            {
+                p += CHUNK;
+                continue;
+            }
+            if self.mapped[p] {
+                return false;
+            }
+            p += 1;
+        }
+        true
+    }
+
     /// Change protection on already-mapped pages covering `[addr, addr + len)`.
     pub fn protect(&mut self, addr: u64, len: u64, prot: Prot) -> Result<(), MemError> {
         if len == 0 {

@@ -46,16 +46,8 @@ fn range_is_mapped(mem: &GuestMemory, start: u64, end: u64) -> bool {
 /// Whether every page in `[start, end)` is unmapped (and thus in-bounds room we
 /// could grow a mapping into). A mapped or out-of-bounds page counts as "not
 /// free".
-fn range_is_free(mem: &GuestMemory, start: u64, end: u64) -> bool {
-    let (lo, hi) = (mem.base(), mem.base() + mem.size());
-    let mut p = start;
-    while p < end {
-        if p < lo || p >= hi || mem.page_prot(p).is_some() {
-            return false;
-        }
-        p += PAGE_SIZE;
-    }
-    true
+pub(super) fn range_is_free(mem: &GuestMemory, start: u64, end: u64) -> bool {
+    mem.range_unmapped(start, end)
 }
 
 impl Kernel {
