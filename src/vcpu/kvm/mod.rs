@@ -78,6 +78,17 @@ mod tests {
         }
     }
 
+    /// Run until the guest exits for itself: the preemption timer may break a
+    /// run on a loaded host before the guest gets anywhere, which is fine.
+    fn run_past_preemption(v: &mut Box<dyn crate::vcpu::Vcpu>, mem: &mut GuestMemory) -> Exit {
+        loop {
+            match v.run(mem).unwrap() {
+                Exit::Interrupted => continue,
+                exit => return exit,
+            }
+        }
+    }
+
     /// Drive a guest CPL3 program through the full `Vcpu` surface: two
     /// `syscall`s with a `set_syscall_ret` in between. Proves the
     /// syscall→LSTAR-trampoline→HLT trap, the number/argument reads off the
@@ -104,7 +115,7 @@ mod tests {
             .expect("create KVM vcpu");
 
         assert_eq!(
-            v.run(&mut mem).unwrap(),
+            run_past_preemption(&mut v, &mut mem),
             Exit::Syscall,
             "first syscall traps"
         );
@@ -112,7 +123,7 @@ mod tests {
         v.set_syscall_ret(1234);
 
         assert_eq!(
-            v.run(&mut mem).unwrap(),
+            run_past_preemption(&mut v, &mut mem),
             Exit::Syscall,
             "resumed to 2nd syscall"
         );
