@@ -322,7 +322,7 @@ static void test_sockets(void)
     c->cmsg_type = SCM_RIGHTS;
     c->cmsg_len = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(c), &p[1], sizeof(int));
-    CHECK(sendmsg(sv[0], &m, 0) == 2, "sendmsg");
+    CHECK(sendmsg(dg[0], &m, 0) == 2, "sendmsg");
     char got[4] = "";
     struct iovec rio = {got, sizeof got};
     union { char buf[CMSG_SPACE(sizeof(int))]; struct cmsghdr align; } ru;
@@ -331,7 +331,7 @@ static void test_sockets(void)
     rm.msg_iovlen = 1;
     rm.msg_control = ru.buf;
     rm.msg_controllen = sizeof ru.buf;
-    CHECK(recvmsg(sv[1], &rm, 0) == 2 && memcmp(got, "fd", 2) == 0, "recvmsg");
+    CHECK(recvmsg(dg[1], &rm, 0) == 2 && memcmp(got, "fd", 2) == 0, "recvmsg");
     struct cmsghdr *rc = CMSG_FIRSTHDR(&rm);
     CHECK(rc && rc->cmsg_type == SCM_RIGHTS && rc->cmsg_len == CMSG_LEN(sizeof(int)), "cmsg %p", (void *)rc);
     CHECK(rm.msg_controllen == CMSG_SPACE(sizeof(int)), "controllen %u", (unsigned)rm.msg_controllen);
