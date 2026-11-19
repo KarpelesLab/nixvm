@@ -3467,43 +3467,43 @@ impl Kernel {
                 // instead of running the call (again).
                 let (mut raw, mut done) = (vcpu.syscall_nr(), None);
                 // `int $0x80` (or a fast 32-bit entry): the i386 table, in a
-                // 64-bit task too. The policy, seccomp and a tracer see the
-                // x86-64 call it amounts to.
+                // 64-bit task too. A tracer and seccomp see the i386 call
+                // (its number, `%ebx`..`%ebp`, `AUDIT_ARCH_I386`); the
+                // embedder's policy sees the x86-64 call it amounts to.
                 cx.ia32 = vcpu.syscall_ia32();
-                let mut ia32 = None;
-                let mut regs32 = [0u64; 6];
-                if cx.ia32 {
-                    let entry = crate::abi::arch::i386::entry(raw);
-                    regs32 = vcpu.syscall_args();
-                    // The vDSO left a fast entry's sixth argument on the
-                    // stack (`__do_fast_syscall_32`).
-                    if vcpu.syscall_fast32() {
-                        // And `%ebp` holds it from here on, as Linux's
-                        // `regs->bp`: a restart through the vDSO's `int $0x80`
-                        // finds it there.
-                        match mem.read_u32(vcpu.sp()) {
-                            Ok(v) => {
-                                regs32[5] = u64::from(v);
-                                vcpu.set_reg(5, u64::from(v));
-                            }
-                            Err(_) => done = Some(err(Errno::EFAULT)),
-                        }
-                    }
-                    if let Some(nr) = entry.nr64() {
-                        ia32 = Some((raw, entry));
-                        raw = nr;
-                    } else {
-                        self.note_unsupported("i386 syscall", raw);
-                        done = Some(err(Errno::ENOSYS));
+                // The vDSO left a fast entry's sixth argument on the stack
+                // (`__do_fast_syscall_32`), and `%ebp` holds it from here on,
+                // as Linux's `regs->bp`: a tracer sees it there, and a restart
+                // through the vDSO's `int $0x80` finds it there. A fault
+                // reading it fails the call before anything sees it.
+                if cx.ia32 && vcpu.syscall_fast32() {
+                    match mem.read_u32(vcpu.sp()) {
+                        Ok(v) => vcpu.set_reg(5, u64::from(v)),
+                        Err(_) => done = Some(err(Errno::EFAULT)),
                     }
                 }
-                if cx.cur.ptrace.is_some() {
+                if cx.cur.ptrace.is_some() && done.is_none() {
                     match self.ptrace_syscall_enter(cx, vcpu, mem) {
                         Ok((nr, result)) => {
                             raw = nr.unwrap_or(raw);
                             done = result;
                         }
                         Err(flow) => return flow,
+                    }
+                }
+                // The i386 call, as the tracer left it (`(int)orig_ax`).
+                let mut ia32 = None;
+                let mut regs32 = [0u64; 6];
+                if cx.ia32 {
+                    let nr32 = raw & 0xffff_ffff;
+                    regs32 = vcpu.syscall_args();
+                    let entry = crate::abi::arch::i386::entry(nr32);
+                    if let Some(nr) = entry.nr64() {
+                        ia32 = Some((nr32, entry));
+                        raw = nr;
+                    } else if done.is_none() {
+                        self.note_unsupported("i386 syscall", nr32);
+                        done = Some(err(Errno::ENOSYS));
                     }
                 }
                 let sys = arch::decode(self.arch, raw);
@@ -3532,7 +3532,16 @@ impl Kernel {
                 {
                     Some(r)
                 } else if cx.cur.seccomp.active() && Self::ptrace_seccomp_pending(cx) {
-                    let v = self.seccomp_check(cx, sys, raw, &args, vcpu.syscall_ip(), mem);
+                    let ip = vcpu.syscall_ip();
+                    let v = match ia32 {
+                        // `syscall_get_arguments` of a compat task: the
+                        // registers whole.
+                        Some((nr32, _)) => {
+                            let a = [3, 1, 2, 6, 7, 5].map(|r| vcpu.reg(r));
+                            self.seccomp_check_as(cx, sys, nr32, &a, ip, true, mem)
+                        }
+                        None => self.seccomp_check(cx, sys, raw, &args, ip, mem),
+                    };
                     // `SECCOMP_RET_TRACE`: the tracer gets the call first.
                     if self.ptrace_seccomp_stop(cx, vcpu) {
                         return Serviced::Blocked;
@@ -3543,11 +3552,7 @@ impl Kernel {
                 };
                 let mut ret = match (verdict, ia32) {
                     (Some(r), _) => r,
-                    // A tracer may have changed the call: then it's that
-                    // x86-64 one.
-                    (None, Some((_, entry))) if entry.nr64() == Some(raw) => {
-                        self.ia32_call(cx, entry, regs32, false, vcpu, mem)
-                    }
+                    (None, Some((_, entry))) => self.ia32_call(cx, entry, regs32, false, vcpu, mem),
                     (None, _) => self.dispatch(cx, sys, raw, &args, vcpu, mem),
                 };
                 // A syscall that wants to block but has a signal with a real

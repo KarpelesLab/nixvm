@@ -69,6 +69,7 @@ const SECCOMP_RET_DATA: u32 = 0x0000_ffff;
 /// `AUDIT_ARCH_*` values reported in `seccomp_data.arch`.
 const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
 const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
+const AUDIT_ARCH_I386: u32 = 0x4000_0003;
 /// The longest program Linux accepts (`BPF_MAXINSNS`).
 const BPF_MAXINSNS: usize = 4096;
 /// The most instructions a syscall may run through across all of a task's
@@ -810,14 +811,38 @@ impl Kernel {
         pc: u64,
         mem: &mut GuestMemory,
     ) -> Option<i64> {
+        self.seccomp_check_as(cx, sys, raw, args, pc, false, mem)
+    }
+
+    /// [`Kernel::seccomp_check`] for a call through the i386 entry when
+    /// `compat`: `raw` is its i386 number and `args` the registers it came
+    /// in (`%ebx`..`%ebp`), and the filters see `AUDIT_ARCH_I386`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn seccomp_check_as(
+        &self,
+        cx: &mut ServiceCtx,
+        sys: crate::abi::arch::Sysno,
+        raw: u64,
+        args: &[u64; 6],
+        pc: u64,
+        compat: bool,
+        mem: &mut GuestMemory,
+    ) -> Option<i64> {
         use crate::abi::arch::Sysno;
         const SIGKILL: i32 = 9;
         const SYS_SECCOMP: i32 = 1;
         if cx.cur.seccomp.mode == SECCOMP_MODE_STRICT {
-            if matches!(
-                sys,
-                Sysno::Read | Sysno::Write | Sysno::Exit | Sysno::RtSigreturn
-            ) {
+            // `mode1_syscalls_32` for an i386 call: `read`, `write`, `exit`
+            // and the old `sigreturn` (not `rt_sigreturn`).
+            let allowed = if compat {
+                matches!(raw, 3 | 4 | 1 | 119)
+            } else {
+                matches!(
+                    sys,
+                    Sysno::Read | Sysno::Write | Sysno::Exit | Sysno::RtSigreturn
+                )
+            };
+            if allowed {
                 return None;
             }
             // `do_exit(SIGKILL)`: the thread, not its siblings.
@@ -833,6 +858,7 @@ impl Kernel {
             return self.seccomp_notif_wait(cx, w);
         }
         let arch = match self.arch {
+            _ if compat => AUDIT_ARCH_I386,
             Arch::X86_64 => AUDIT_ARCH_X86_64,
             Arch::Aarch64 => AUDIT_ARCH_AARCH64,
         };
