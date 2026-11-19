@@ -127,6 +127,163 @@ static void test_auxv_vdso(void)
     }
 }
 
+/* The vDSO's symbols, found as musl finds them: through DT_HASH, matching
+ * the version by name in the version definitions. */
+static void *vdso_sym(const char *ver, const char *name)
+{
+    unsigned long base = getauxval(AT_SYSINFO_EHDR);
+    if (!base)
+        return NULL;
+    const unsigned char *b = (const unsigned char *)base;
+    uint32_t phoff = *(const uint32_t *)(b + 28);
+    uint16_t phnum = *(const uint16_t *)(b + 44);
+    const uint32_t *dyn = NULL;
+    uint32_t load = 0;
+    for (int i = 0; i < phnum; i++) {
+        const uint32_t *ph = (const uint32_t *)(b + phoff + i * 32);
+        if (ph[0] == 1)
+            load = ph[1] - ph[2]; /* p_offset - p_vaddr */
+        if (ph[0] == 2)
+            dyn = (const uint32_t *)(b + ph[1]);
+    }
+    if (!dyn)
+        return NULL;
+    const uint32_t *hash = NULL, *syms = NULL;
+    const char *strs = NULL;
+    const uint16_t *versym = NULL;
+    const unsigned char *verdef = NULL;
+    for (; dyn[0]; dyn += 2) {
+        const unsigned char *at = b + dyn[1] + load;
+        switch (dyn[0]) {
+        case 4: hash = (const uint32_t *)at; break;
+        case 5: strs = (const char *)at; break;
+        case 6: syms = (const uint32_t *)at; break;
+        case 0x6ffffff0: versym = (const uint16_t *)at; break;
+        case 0x6ffffffc: verdef = at; break;
+        }
+    }
+    if (!hash || !syms || !strs || !versym || !verdef)
+        return NULL;
+    for (uint32_t i = 1; i < hash[1]; i++) {
+        const uint32_t *sym = syms + i * 4;
+        if (strcmp(strs + sym[0], name) != 0)
+            continue;
+        uint16_t want = versym[i] & 0x7fff;
+        for (const unsigned char *d = verdef;; d += *(const uint32_t *)(d + 16)) {
+            if (*(const uint16_t *)(d + 4) == want) {
+                const uint32_t *aux = (const uint32_t *)(d + *(const uint32_t *)(d + 12));
+                if (strcmp(strs + aux[0], ver) == 0)
+                    return (void *)(base + sym[1]);
+                break;
+            }
+            if (*(const uint32_t *)(d + 16) == 0)
+                break;
+        }
+    }
+    return NULL;
+}
+
+struct ts32 { int32_t s, ns; };
+struct ts64 { int64_t s, ns; };
+struct tv32 { int32_t s, us; };
+
+static long long ns_of(long long s, long long ns) { return s * 1000000000LL + ns; }
+
+/* What the vDSO's clock functions say agrees with the system calls, for the
+ * clocks it computes and the ones it hands to the kernel. */
+static void test_vdso_clocks(void)
+{
+    int (*cgt)(int, struct ts32 *) = vdso_sym("LINUX_2.6", "__vdso_clock_gettime");
+    int (*cgt64)(int, struct ts64 *) = vdso_sym("LINUX_2.6", "__vdso_clock_gettime64");
+    int (*gtod)(struct tv32 *, struct timezone *) = vdso_sym("LINUX_2.6", "__vdso_gettimeofday");
+    int32_t (*tm)(int32_t *) = vdso_sym("LINUX_2.6", "__vdso_time");
+    int (*getres)(int, struct ts32 *) = vdso_sym("LINUX_2.6", "__vdso_clock_getres");
+    int (*getcpu)(unsigned *, unsigned *, void *) = vdso_sym("LINUX_2.6", "__vdso_getcpu");
+    CHECK(cgt && cgt64 && gtod && tm && getres && getcpu, "LINUX_2.6 symbols %p %p %p %p %p %p", cgt, cgt64,
+          gtod, tm, getres, getcpu);
+    CHECK(vdso_sym("LINUX_2.5", "__kernel_vsyscall") == (void *)getauxval(AT_SYSINFO),
+          "__kernel_vsyscall@LINUX_2.5");
+    CHECK(vdso_sym("LINUX_2.5", "__vdso_clock_gettime") == NULL, "no __vdso_clock_gettime@LINUX_2.5");
+    if (!(cgt && cgt64 && gtod && tm && getres && getcpu))
+        return;
+    /* Each clock: the vDSO's reading falls between two system calls' (a
+     * coarse clock may lag the fine one it is compared with by a tick). */
+    static const int clocks[] = {CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_PROCESS_CPUTIME_ID,
+                                 CLOCK_THREAD_CPUTIME_ID, CLOCK_MONOTONIC_RAW, CLOCK_REALTIME_COARSE,
+                                 CLOCK_MONOTONIC_COARSE, CLOCK_BOOTTIME};
+    for (unsigned i = 0; i < sizeof clocks / sizeof clocks[0]; i++) {
+        int c = clocks[i];
+        long long slack = c == CLOCK_REALTIME_COARSE || c == CLOCK_MONOTONIC_COARSE ? 20000000 : 2000000;
+        struct ts64 a, v64, z;
+        struct ts32 v;
+        CHECK(syscall(403, c, &a) == 0, "clock_gettime64(%d)", c);
+        int r = cgt(c, &v);
+        int r64 = cgt64(c, &v64);
+        CHECK(syscall(403, c, &z) == 0, "clock_gettime64(%d)", c);
+        CHECK(r == 0 && r64 == 0, "vDSO clock %d: %d %d", c, r, r64);
+        long long lo = ns_of(a.s, a.ns) - slack, hi = ns_of(z.s, z.ns) + slack;
+        long long t = ns_of(v.s, v.ns), t64 = ns_of(v64.s, v64.ns);
+        CHECK(v.ns >= 0 && v.ns < 1000000000 && t >= lo && t <= hi, "clock %d: vDSO %lld, system calls %lld..%lld",
+              c, t, lo + slack, hi - slack);
+        CHECK(v64.ns >= 0 && v64.ns < 1000000000 && t64 >= lo && t64 <= hi,
+              "clock %d: vDSO64 %lld, system calls %lld..%lld", c, t64, lo + slack, hi - slack);
+        struct ts32 rs = {-1, -1}, rk = {-2, -2};
+        CHECK(getres(c, &rs) == 0 && syscall(SYS_clock_getres, c, &rk) == 0 && rs.s == rk.s && rs.ns == rk.ns,
+              "clock_getres(%d): vDSO %d.%09d, system call %d.%09d", c, rs.s, rs.ns, rk.s, rk.ns);
+    }
+    /* A clock the vDSO doesn't know goes to the kernel, and its answer comes
+     * back as the system call gave it (-EINVAL on Linux). */
+    struct ts32 v;
+    struct ts64 v64;
+    int bad[3] = {cgt(100, &v), cgt64(100, &v64), getres(100, &v)};
+    long k0 = raw_int80(SYS_clock_gettime, 100, (long)&v, 0), k1 = raw_int80(403, 100, (long)&v64, 0);
+    long k2 = raw_int80(SYS_clock_getres, 100, (long)&v, 0);
+    CHECK(bad[0] == k0 && bad[1] == k1 && bad[2] == k2, "clock 100: vDSO %d %d %d, system calls %ld %ld %ld", bad[0],
+          bad[1], bad[2], k0, k1, k2);
+    struct tv32 tv, k;
+    struct timezone tz = {77, 77}, ktz = {78, 78};
+    CHECK(syscall(SYS_gettimeofday, &k, &ktz) == 0, "gettimeofday");
+    CHECK(gtod(&tv, &tz) == 0 && tz.tz_minuteswest == ktz.tz_minuteswest && tz.tz_dsttime == ktz.tz_dsttime,
+          "vDSO gettimeofday: tz %d/%d, system call %d/%d", tz.tz_minuteswest, tz.tz_dsttime, ktz.tz_minuteswest,
+          ktz.tz_dsttime);
+    long long d = ((long long)tv.s - k.s) * 1000000 + tv.us - k.us;
+    CHECK(tv.us >= 0 && tv.us < 1000000 && d >= -2000 && d < 1000000, "gettimeofday: vDSO %d.%06d, system call %d.%06d",
+          tv.s, tv.us, k.s, k.us);
+    CHECK(gtod(NULL, NULL) == 0, "gettimeofday(NULL, NULL)");
+    int32_t t1 = 0, t0 = (int32_t)syscall(SYS_time, NULL);
+    int32_t t = tm(&t1);
+    CHECK(t == t1 && t >= t0 && t <= t0 + 1 && tm(NULL) >= t, "time: vDSO %d, system call %d", t, t0);
+    unsigned cpu = 99, node = 99, kc = 98, kn = 98;
+    CHECK(getcpu(&cpu, &node, NULL) == 0 && syscall(SYS_getcpu, &kc, &kn, NULL) == 0 && node == kn,
+          "getcpu: vDSO %u/%u, system call %u/%u", cpu, node, kc, kn);
+    /* A fork child shares the clock page. */
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct ts64 a, b;
+        syscall(403, CLOCK_MONOTONIC, &a);
+        cgt64(CLOCK_MONOTONIC, &b);
+        _exit(ns_of(b.s, b.ns) >= ns_of(a.s, a.ns) - 2000000 ? 0 : 1);
+    }
+    int st = -1;
+    CHECK(pid > 0 && waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0,
+          "the vDSO clock in a fork child: %#x", st);
+    /* /proc/self/maps names it, under the vDSO. */
+    FILE *f = fopen("/proc/self/maps", "r");
+    char line[256];
+    unsigned long vvar = 0, vdso = 0, s0, e0;
+    while (f && fgets(line, sizeof line, f)) {
+        if (sscanf(line, "%lx-%lx", &s0, &e0) != 2)
+            continue;
+        if (strstr(line, "[vvar]"))
+            vvar = s0;
+        if (strstr(line, "[vdso]"))
+            vdso = s0;
+    }
+    if (f)
+        fclose(f);
+    CHECK(vdso == getauxval(AT_SYSINFO_EHDR) && vvar && vvar < vdso, "[vvar] %#lx [vdso] %#lx", vvar, vdso);
+}
+
 static void test_files(void)
 {
     char path[] = "/tmp/ia32XXXXXX";
@@ -793,11 +950,14 @@ int main(int argc, char **argv)
             test_files();
         if (strcmp(argv[2], "ldt") == 0)
             test_ldt();
+        if (strcmp(argv[2], "vdso") == 0)
+            test_vdso_clocks();
         printf(failures ? "FAILED\n" : "PASS\n");
         return failures != 0;
     }
     test_mode();
     test_auxv_vdso();
+    test_vdso_clocks();
     test_files();
     test_time();
     test_limits_info();
