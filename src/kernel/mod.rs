@@ -11079,6 +11079,10 @@ impl Kernel {
         let Some(rel) = read_path(mem, pathptr) else {
             return err(Errno::EFAULT);
         };
+        // An empty name names nothing (`getname`).
+        if rel.is_empty() {
+            return err(Errno::ENOENT);
+        }
         let abs = match self.follow_or_eloop(vfs, cx, &self.resolve_path(cx, AT_FDCWD, &rel)) {
             Ok(p) => p,
             Err(e) => return e,
