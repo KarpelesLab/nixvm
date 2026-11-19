@@ -1075,6 +1075,7 @@ impl std::fmt::Debug for Dgram {
             .field("host", &self.host.is_some())
             .field("icmp", &self.icmp)
             .field("groups", &self.groups)
+            .field("peer_cred", &self.peer_cred)
             .finish()
     }
 }
@@ -4047,9 +4048,8 @@ impl Kernel {
             };
             (pid, c.uid, c.gid)
         });
-        let pidfd = sender
-            .filter(|_| passpidfd)
-            .map(|c| c.filter(|c| c.pid != 0));
+        let passpidfd = passpidfd && sender.is_some();
+        let pidfd_for = sender.flatten().filter(|c| passpidfd && c.pid != 0);
         self.emit_scm_rights(
             net,
             cx,
@@ -4058,7 +4058,8 @@ impl Kernel {
             flags,
             scm_fds,
             creds,
-            pidfd,
+            passpidfd,
+            pidfd_for,
             &mut msg_flags,
             mem,
         );
@@ -4076,9 +4077,9 @@ impl Kernel {
     /// `SCM_CREDENTIALS` first (cut short if it doesn't fit), then as many
     /// descriptors as fit; the rest are closed and `MSG_CTRUNC` is set, as it
     /// is for anything that came with no control buffer to take it. Then,
-    /// with `SO_PASSPIDFD` (`pidfd` is `Some`), an `SCM_PIDFD` for the
-    /// sender, if the message has one: whole or not at all (`MSG_CTRUNC`
-    /// and no descriptor when there's no room for it). Always writes
+    /// with `SO_PASSPIDFD` (`passpidfd`), an `SCM_PIDFD` for the sender
+    /// (`pidfd_for`), if the message has one: whole or not at all
+    /// (`MSG_CTRUNC` and no descriptor when there's no room for it). Always writes
     /// `msg_controllen` (offset 40), the room used.
     #[allow(clippy::too_many_arguments)]
     fn emit_scm_rights(
@@ -4090,12 +4091,13 @@ impl Kernel {
         flags: u64,
         scm_fds: Vec<Fd>,
         creds: Option<(i32, u32, u32)>,
-        pidfd: Option<Option<Ucred>>,
+        passpidfd: bool,
+        pidfd_for: Option<Ucred>,
         msg_flags: &mut u64,
         mem: &mut GuestMemory,
     ) {
         if hdr.control == 0 {
-            if creds.is_some() || pidfd.is_some() || !scm_fds.is_empty() {
+            if creds.is_some() || passpidfd || !scm_fds.is_empty() {
                 *msg_flags |= MSG_CTRUNC;
             }
             for fd in &scm_fds {
@@ -4136,11 +4138,11 @@ impl Kernel {
             used = self.emit_rights(net, cx, hdr, flags, scm_fds, used, msg_flags, mem);
         }
         // SCM_PIDFD last: `scm_pidfd_recv` wants room for all of it.
-        if let Some(sender) = pidfd {
+        if passpidfd {
             let room = total - used;
             if room < CMSG_HDR_LEN + 4 {
                 *msg_flags |= MSG_CTRUNC;
-            } else if let Some(c) = sender {
+            } else if let Some(c) = pidfd_for {
                 let fd = self.new_pidfd(cx, c.pid, c.life.as_ref());
                 let mut cbuf = Vec::with_capacity(CMSG_HDR_LEN + 4);
                 cbuf.extend_from_slice(&((CMSG_HDR_LEN + 4) as u64).to_le_bytes());

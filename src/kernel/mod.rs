@@ -11976,6 +11976,7 @@ impl Kernel {
     /// it): at `hint` if it's free and the mapping ends by 2 GiB, else the
     /// lowest gap in the 1-2 GiB window `find_start_end` gives it (with no
     /// address randomization here), else nowhere (`ENOMEM`).
+    #[allow(clippy::unused_self)]
     pub(super) fn place_32bit(
         &self,
         sh: &mut Shared,
