@@ -167,6 +167,9 @@ pub(super) enum StopKind {
     Seccomp,
     /// Any other `PTRACE_EVENT_*` stop.
     Event,
+    /// A group stop of a task traced the old way (not seized): reported as
+    /// the stop signal, no siginfo, a signal resuming it dropped.
+    Group,
 }
 
 /// Where the vcpu is while stopped, which decides what resuming means.
@@ -264,6 +267,9 @@ pub(super) struct PtraceState {
     listening: bool,
     /// A signal the tracer passed on, delivered without stopping again.
     pub(super) inject: Option<(u64, QueuedSig)>,
+    /// A stop signal was dequeued for the tracer and no `SIGCONT` came since
+    /// (Linux's `JOBCTL_STOP_DEQUEUED`): passed on, it stops the task.
+    pub(super) stop_dequeued: bool,
     // ---- how far the current syscall got ----
     /// Past its entry stop (or the point where there would be one).
     sc_entered: bool,
@@ -321,6 +327,7 @@ impl PtraceState {
             notify: false,
             listening: false,
             inject: None,
+            stop_dequeued: false,
             sc_entered: false,
             sc_nr: None,
             skip_ret: ENOSYS,
@@ -1055,6 +1062,10 @@ impl Kernel {
                 let p = &sh.procs[idx].as_ref().unwrap().info;
                 let t = p.ptrace.as_ref().unwrap();
                 let stop = t.stop.unwrap();
+                // A group stop has none (`last_siginfo` is NULL).
+                if stop.kind == StopKind::Group {
+                    return err(Errno::EINVAL);
+                }
                 let mut si = if stop.kind == StopKind::Signal {
                     t.siginfo
                 } else {
@@ -1086,6 +1097,9 @@ impl Kernel {
                     si = super::compat::siginfo_widen(&si);
                 }
                 let t = Self::tracee_state(sh, idx);
+                if t.stop.is_some_and(|s| s.kind == StopKind::Group) {
+                    return err(Errno::EINVAL);
+                }
                 if t.stop.is_some_and(|s| s.kind == StopKind::Signal) {
                     t.siginfo = si;
                 }
@@ -1881,7 +1895,11 @@ impl Kernel {
         if more {
             cx.cur.pending |= 1 << (sig - 1);
         }
-        cx.cur.ptrace.as_mut()?.siginfo = siginfo_bytes(sig, info);
+        let t = cx.cur.ptrace.as_mut()?;
+        t.siginfo = siginfo_bytes(sig, info);
+        if super::signal::is_stop_signal(sig) {
+            t.stop_dequeued = true;
+        }
         Some(sig)
     }
 
@@ -2241,6 +2259,40 @@ impl Kernel {
         if cx.cur.ptrace.as_ref().is_some_and(|t| t.idle()) {
             cx.cur.ptrace = None;
         }
+    }
+
+    /// A traced task takes stop signal `sig` (`do_signal_stop`): it stops for
+    /// its tracer instead (`do_jobctl_trap`) — `PTRACE_EVENT_STOP` if
+    /// seized, a stop reported as `sig` otherwise — where it is: in a call
+    /// still to run (`Before`) or in user mode. A stop signal its tracer
+    /// passed on after a `SIGCONT` came does nothing (`JOBCTL_STOP_DEQUEUED`
+    /// cleared): `Some(false)`. `None` if it isn't traced.
+    pub(super) fn ptrace_group_stop(
+        &self,
+        cx: &mut ServiceCtx,
+        vcpu: &mut dyn Vcpu,
+        sig: u64,
+    ) -> Option<bool> {
+        let t = cx.cur.ptrace.as_mut()?;
+        if t.tracer == 0 {
+            return None;
+        }
+        if !std::mem::take(&mut t.stop_dequeued) {
+            return Some(false);
+        }
+        let (kind, event) = if t.seized {
+            (StopKind::Event, EVENT_STOP)
+        } else {
+            (StopKind::Group, 0)
+        };
+        let phase = if cx.block || cx.restart_syscall {
+            Phase::Before
+        } else {
+            Phase::User
+        };
+        self.ptrace_stop(cx, vcpu, kind, sig as u32, event, phase, None);
+        cx.cur.signal_resume = phase == Phase::User;
+        Some(true)
     }
 
     /// A stop at a preemption point (`PTRACE_INTERRUPT` of a task computing in

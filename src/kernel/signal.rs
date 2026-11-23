@@ -937,6 +937,14 @@ impl Kernel {
         if sig == SIGSTOP
             || (is_stop_signal(sig) && cx.cur.handlers.get(sig as usize).handler == SIG_DFL)
         {
+            // A traced task stops for its tracer instead.
+            if let Some(stopped) = self.ptrace_group_stop(cx, vcpu, sig) {
+                if !stopped {
+                    return None;
+                }
+                cx.cur.pending &= !CONT_SIG_BIT;
+                return Some(false);
+            }
             cx.cur.run = RunState::Stopped(sig as i32);
             cx.cur.stop_reported = false;
             // Out of a blocked or restarting call, the call itself comes
@@ -1695,6 +1703,10 @@ fn is_default_ignored(sig: u64) -> bool {
 fn apply_stop_cont(info: &mut super::ProcInfo, sig: u64) -> Option<i32> {
     if sig == SIGCONT {
         info.pending &= !STOP_SIG_BITS; // a pending stop is cancelled by SIGCONT
+        // So is one a tracer has yet to pass on.
+        if let Some(t) = info.ptrace.as_mut() {
+            t.stop_dequeued = false;
+        }
         Kernel::ptrace_trap_notify(info);
         if matches!(info.run, RunState::Stopped(_)) {
             info.run = RunState::Running;
