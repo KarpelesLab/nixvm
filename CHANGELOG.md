@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/KarpelesLab/nixvm/compare/v0.0.9...v0.0.10) - 2026-11-23
+
+### Other
+
+- an access the page tables allow by now is run again
+- shared file mappings belong to the address space, not the task
+- a reaped child's CPU time is its whole process's
+- a MAP_FIXED mapping over backed pages flushes the TLB
+- the address space starts at 0, so the low 64 KiB can be mapped
+- vm.mmap_min_addr, and below it CAP_SYS_RAWIO, as cap_mmap_addr has it
+- SO_PASSRIGHTS, an AF_UNIX end that refuses SCM_RIGHTS (Linux 6.16)
+- cpu_timers, CPU-time timers and itimers against Linux
+- CPU-clock timers expire on CPU time, as posix-cpu-timers.c has them
+- a call interrupted under a tracer that detaches still restarts
+- ptrace_regs watches where the KVM guest keeps its supervisor pages
+- a debugger's breakpoint on the guest's supervisor pages stays off
+- ptrace_regs checks restarts, kernel accesses to watched memory, per-thread watchpoints
+- an interrupted traced call returns -ERESTART*, restarted from where rip is then
+- a new task reads its parent's DR6 and DR7, and what Linux leaves out
+- a traced task's group stop is a stop for its tracer
+
 ## [0.0.9](https://github.com/KarpelesLab/nixvm/compare/v0.0.8...v0.0.9) - 2026-11-19
 
 ### Other
