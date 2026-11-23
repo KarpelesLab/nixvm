@@ -103,7 +103,9 @@ int main(void) {
     printf("a fair task beside a FIFO hog: %.3f s of CPU in its first 0.3 s, %.3f s in 2.2 s\n",
            early, total);
     CHECK(early < 0.03);
-    CHECK(total > 0.04 && total < 0.4);
+    // (One window can fall in the 2.2 s, and the hog's time slice may run
+    // 10 ms into it before the fair task gets the CPU: 40 ms, give or take.)
+    CHECK(total > 0.03 && total < 0.4);
 
     // Among FIFO tasks of one priority, the first runs until it yields.
     set_policy(0, SCHED_FIFO, 10);

@@ -56,6 +56,7 @@ const PROGRAMS: &[&str] = &[
     "ptrace_regs",
     "clocks",
     "mmap_place",
+    "cpu_timers",
 ];
 
 /// i386 programs (`gcc -m32 -static`), which the VM runs as ELFCLASS32
