@@ -1099,6 +1099,10 @@ const SIGPIPE: u64 = 13;
 /// Sent to a process's parent when a child terminates (so a blocked `wait`
 /// wakes to reap it).
 const SIGCHLD: u64 = 17;
+/// `vm.mmap_min_addr` at boot (`CONFIG_DEFAULT_MMAP_MIN_ADDR`): the low
+/// 64 KiB, which then only a task with `CAP_SYS_RAWIO` may map.
+const DEFAULT_MMAP_MIN_ADDR: u64 = 0x1_0000;
+
 /// `RLIMIT_CPU`'s soft limit was passed.
 const SIGXCPU: u64 = 24;
 /// A write went past `RLIMIT_FSIZE`.
@@ -1935,6 +1939,10 @@ pub struct Kernel {
     max_open_files: AtomicUsize,
     /// `/proc/sys/kernel/seccomp/actions_logged`, as `SECCOMP_LOG_*` bits.
     seccomp_logged: std::sync::atomic::AtomicU32,
+    /// `/proc/sys/vm/mmap_min_addr` (Linux's `dac_mmap_min_addr`): what a
+    /// task without `CAP_SYS_RAWIO` may not map below, and what a hint is
+    /// raised to (see [`Kernel::may_map_at`]).
+    mmap_min_addr: AtomicU64,
     arch: Arch,
     /// Interactive mode (the browser terminal): guest reads of fd 0 draw from
     /// `Shared::stdin_buf` and *block* (re-trap) when it is empty rather than
@@ -2704,6 +2712,7 @@ impl Kernel {
             cgroup_mounted: std::sync::atomic::AtomicBool::new(cgroup_mounted),
             max_open_files: AtomicUsize::new(limits.open_files as usize),
             seccomp_logged: std::sync::atomic::AtomicU32::new(seccomp::DEFAULT_LOGGED),
+            mmap_min_addr: AtomicU64::new(DEFAULT_MMAP_MIN_ADDR),
             arch,
             trace: crate::env::is_set("NIXVM_TRACE"),
             notice_sink: None,
@@ -11856,8 +11865,7 @@ impl Kernel {
         let base = if flags & MAP_FIXED != 0 || noreplace {
             // `__get_unmapped_area`'s checks, in its order: nothing past
             // TASK_SIZE (ENOMEM), a page-aligned address (EINVAL), and none
-            // below `mmap_min_addr` (EPERM: the first 64 KiB, which nixvm's
-            // address space doesn't have even for CAP_SYS_RAWIO).
+            // below `vm.mmap_min_addr` without CAP_SYS_RAWIO (EPERM).
             if addr
                 .checked_add(len)
                 .is_none_or(|end| end > Self::task_size(mem))
@@ -11867,7 +11875,7 @@ impl Kernel {
             if !addr.is_multiple_of(PAGE_SIZE) {
                 return err(Errno::EINVAL);
             }
-            if addr < mem.base() {
+            if addr < mem.base() || !self.may_map_at(cx, addr) {
                 return err(Errno::EPERM);
             }
             // MAP_FIXED_NOREPLACE is atomic: if *any* page in the target range is
@@ -12093,8 +12101,8 @@ impl Kernel {
         mem: &GuestMemory,
     ) -> Option<u64> {
         let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-        if hint != 0
-            && let Some(at) = Self::hint_fits(cx, mem, hint, len)
+        if let Some(at) = self.hint_floor(hint, mem)
+            && let Some(at) = Self::hint_fits(cx, mem, at, len)
         {
             sh.arena(cx).claim(at, len);
             return Some(at);
@@ -12107,15 +12115,36 @@ impl Kernel {
         self.alloc_mmap(sh, cx, len)
     }
 
-    /// `hint`, page-aligned and raised to the lowest address a mapping may
-    /// have (`round_hint_to_min`), if `len` bytes there are free, end by
-    /// [`Self::task_size`], don't cross the 47-bit boundary
+    /// Whether the caller may map at `addr`, as Linux's `cap_mmap_addr` has
+    /// it: below `vm.mmap_min_addr` only with `CAP_SYS_RAWIO` over the whole
+    /// machine.
+    pub(super) fn may_map_at(&self, cx: &ServiceCtx, addr: u64) -> bool {
+        addr >= self
+            .mmap_min_addr
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || cx.cur.host_capable(caps::CAP_SYS_RAWIO)
+    }
+
+    /// Where a mapping hinted at `hint` is tried (`round_hint_to_min`):
+    /// page-aligned, and raised to `vm.mmap_min_addr` (and the start of the
+    /// address space) when below it; `None` for no hint, or one that is
+    /// null once aligned.
+    pub(super) fn hint_floor(&self, hint: u64, mem: &GuestMemory) -> Option<u64> {
+        let hint = page_down(hint);
+        let min = self
+            .mmap_min_addr
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .next_multiple_of(PAGE_SIZE);
+        (hint != 0).then(|| hint.max(min).max(mem.base()))
+    }
+
+    /// `at` (a hint, as [`Self::hint_floor`] makes it), if `len` bytes there
+    /// are free, end by [`Self::task_size`], don't cross the 47-bit boundary
     /// (`DEFAULT_MAP_WINDOW`, the top of 4-level paging's user half), and
     /// keep clear of the stack and its guard gap.
-    fn hint_fits(cx: &ServiceCtx, mem: &GuestMemory, hint: u64, len: u64) -> Option<u64> {
+    fn hint_fits(cx: &ServiceCtx, mem: &GuestMemory, at: u64, len: u64) -> Option<u64> {
         /// `DEFAULT_MAP_WINDOW`: 47 bits, less a page.
         const MAP_WINDOW: u64 = (1 << 47) - PAGE_SIZE;
-        let at = page_down(hint).max(mem.base());
         let end = at.checked_add(len)?;
         if end > Self::task_size(mem) || (at > MAP_WINDOW) != (end > MAP_WINDOW) {
             return None;
@@ -12151,8 +12180,9 @@ impl Kernel {
             return None;
         }
         let fits = |at: u64| at + len <= END && Self::clear_for_mapping(cx, mem, at, at + len);
-        let hinted = page_down(hint).max(mem.base());
-        let at = if hint != 0 && fits(hinted) {
+        let at = if let Some(hinted) = self.hint_floor(hint, mem)
+            && fits(hinted)
+        {
             hinted
         } else {
             let mut at = BEGIN;

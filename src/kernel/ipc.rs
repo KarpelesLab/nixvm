@@ -1126,6 +1126,10 @@ impl Kernel {
                     p += PAGE_SIZE;
                 }
             }
+            // Below `vm.mmap_min_addr`, as `mmap` (`security_mmap_addr`).
+            if base < mem.base() || !self.may_map_at(cx, base) {
+                return err(Errno::EPERM);
+            }
             sh.arena(cx).claim(base, len);
             base
         };

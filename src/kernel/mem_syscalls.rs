@@ -119,6 +119,10 @@ impl Kernel {
             if new_addr < old_addr + old_size && old_addr < new_addr + new_size {
                 return err(Errno::EINVAL); // overlapping ranges
             }
+            // Below `vm.mmap_min_addr`, as `mmap` (`security_mmap_addr`).
+            if new_addr < mem.base() || !self.may_map_at(cx, new_addr) {
+                return err(Errno::EPERM);
+            }
             sh.arena(cx).claim(new_addr, new_size);
             if let Err(e) = self.mremap_move(
                 cx, old_addr, old_size, new_addr, new_size, prot, dontunmap, mem,
@@ -395,6 +399,69 @@ impl Kernel {
     }
 }
 
+impl Kernel {
+    /// A write to `/proc/sys/vm/mmap_min_addr`, as Linux's
+    /// `mmap_min_addr_handler`: `CAP_SYS_RAWIO` (over the whole machine) or
+    /// `EPERM`, then one unsigned number as `proc_doulongvec_minmax` reads
+    /// it (decimal, octal or hex, after any white space, and ending at white
+    /// space): `EINVAL` for anything else. Returns the bytes taken.
+    pub(super) fn write_mmap_min_addr(
+        &self,
+        cx: &ServiceCtx,
+        buf: u64,
+        count: u64,
+        mem: &GuestMemory,
+    ) -> i64 {
+        if !cx.cur.host_capable(super::caps::CAP_SYS_RAWIO) {
+            return err(Errno::EPERM);
+        }
+        let Ok(bytes) = mem.read_vec(buf, count.min(4096) as usize) else {
+            return err(Errno::EFAULT);
+        };
+        match parse_sysctl_ulong(&bytes) {
+            Some((v, taken)) => {
+                self.mmap_min_addr
+                    .store(v, std::sync::atomic::Ordering::Relaxed);
+                taken as i64
+            }
+            None => err(Errno::EINVAL),
+        }
+    }
+}
+
+/// The first number of a sysctl write, as `proc_doulongvec_minmax` reads
+/// one value: white space skipped, an unsigned number in C's notation
+/// (`0x` hex, leading-`0` octal), then white space or the end. Returns it
+/// and how many bytes the write took (the trailing white space too).
+fn parse_sysctl_ulong(text: &[u8]) -> Option<(u64, usize)> {
+    let space = |c: &u8| matches!(c, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r');
+    let start = text.iter().position(|c| !space(c))?;
+    let rest = &text[start..];
+    // `proc_get_long` reads at most 22 characters of it.
+    let len = rest
+        .iter()
+        .take(22)
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .count();
+    let word = std::str::from_utf8(&rest[..len]).ok()?;
+    if rest
+        .get(len)
+        .is_some_and(|c| !matches!(c, b' ' | b'\t' | b'\n'))
+    {
+        return None;
+    }
+    let value = if let Some(hex) = word.strip_prefix("0x").or_else(|| word.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()?
+    } else if word.len() > 1 && word.starts_with('0') {
+        u64::from_str_radix(&word[1..], 8).ok()?
+    } else {
+        word.parse().ok()?
+    };
+    let end = start + len;
+    let trailing = text[end..].iter().take_while(|c| space(c)).count();
+    Some((value, end + trailing))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +469,17 @@ mod tests {
     use crate::abi::arch::Sysno;
     use crate::fs::{MountTable, TmpFs};
     use crate::vcpu::mem::MemError;
+
+    #[test]
+    fn a_sysctl_number_reads_as_proc_doulongvec_minmax_reads_it() {
+        assert_eq!(parse_sysctl_ulong(b"4096\n"), Some((4096, 5)));
+        assert_eq!(parse_sysctl_ulong(b"  0x1000"), Some((4096, 8)));
+        assert_eq!(parse_sysctl_ulong(b"010 20\n"), Some((8, 4)));
+        assert_eq!(parse_sysctl_ulong(b"0"), Some((0, 1)));
+        for bad in [&b"-1"[..], b"4k", b"\n", b"", b"99999999999999999999999"] {
+            assert_eq!(parse_sysctl_ulong(bad), None, "{bad:?}");
+        }
+    }
     use crate::vcpu::{Exit, Vcpu, VcpuError};
 
     const PAGE: u64 = PAGE_SIZE;

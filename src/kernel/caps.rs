@@ -31,6 +31,7 @@ pub(super) const CAP_SETPCAP: u32 = 8;
 const CAP_LINUX_IMMUTABLE: u32 = 9;
 pub(super) const CAP_NET_ADMIN: u32 = 12;
 pub(super) const CAP_IPC_LOCK: u32 = 14;
+pub(super) const CAP_SYS_RAWIO: u32 = 17;
 pub(super) const CAP_SYS_CHROOT: u32 = 18;
 pub(super) const CAP_SYS_ADMIN: u32 = 21;
 pub(super) const CAP_SYS_NICE: u32 = 23;

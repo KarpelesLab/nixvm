@@ -643,6 +643,10 @@ impl Kernel {
                 self.seccomp_logged
                     .load(std::sync::atomic::Ordering::Relaxed),
             )),
+            mmap_min_addr: Some(
+                self.mmap_min_addr
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
             maps: String::new(),
         }
     }

@@ -594,6 +594,9 @@ impl Kernel {
         if rest == "sys/kernel/seccomp/actions_logged" {
             return Some(self.write_seccomp_logged(cx, buf, count, mem));
         }
+        if rest == "sys/vm/mmap_min_addr" {
+            return Some(self.write_mmap_min_addr(cx, buf, count, mem));
+        }
         let (who, file) = rest.split_once('/')?;
         if !matches!(file, "uid_map" | "gid_map" | "setgroups" | "timens_offsets") {
             return None;

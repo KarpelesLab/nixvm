@@ -92,6 +92,7 @@ const PATHS: &[&str] = &[
     "sys/vm",
     "sys/vm/overcommit_memory",
     "sys/vm/max_map_count",
+    "sys/vm/mmap_min_addr",
     "sys/fs",
     "sys/fs/file-max",
     "sys/fs/nr_open",
@@ -419,7 +420,7 @@ const SYS_NET_CORE_FILES: &[&str] = &["somaxconn"];
 const SYS_NET_IPV4_FILES: &[&str] = &["tcp_rmem", "tcp_wmem", "ip_local_port_range"];
 
 /// Tunables exposed under `sys/vm/`.
-const SYS_VM_FILES: &[&str] = &["overcommit_memory", "max_map_count"];
+const SYS_VM_FILES: &[&str] = &["overcommit_memory", "max_map_count", "mmap_min_addr"];
 
 /// Tunables exposed under `sys/fs/`.
 const SYS_FS_FILES: &[&str] = &["file-max", "nr_open"];
@@ -796,6 +797,9 @@ pub struct ProcData {
     /// `sys/kernel/seccomp/actions_logged`'s body; `None` until the kernel
     /// has said (Linux's default is shown then).
     pub seccomp_logged: Option<String>,
+    /// `sys/vm/mmap_min_addr`; `None` until the kernel has said (Linux's
+    /// default is shown then).
+    pub mmap_min_addr: Option<u64>,
 }
 
 impl Default for ProcData {
@@ -836,6 +840,7 @@ impl Default for ProcData {
             auxv: Vec::new(),
             arch: None,
             seccomp_logged: None,
+            mmap_min_addr: None,
             syscall: String::new(),
         }
     }
@@ -887,6 +892,8 @@ pub struct ProcSelf {
     pub syscall: String,
     /// `sys/kernel/seccomp/actions_logged`.
     pub seccomp_logged: Option<String>,
+    /// `sys/vm/mmap_min_addr`.
+    pub mmap_min_addr: Option<u64>,
     /// Body of `self/maps`; empty for the fixed text.
     pub maps: String,
 }
@@ -963,6 +970,7 @@ impl ProcFs {
         d.auxv = live.auxv;
         d.syscall = live.syscall;
         d.seccomp_logged = live.seccomp_logged;
+        d.mmap_min_addr = live.mmap_min_addr;
         // (Only rendered when a maps file is opened: kept until the next one.)
         if !live.maps.is_empty() {
             d.maps = live.maps;
@@ -1108,6 +1116,10 @@ impl ProcFs {
             "sys/kernel/seccomp/actions_logged" if self.data.seccomp_logged.is_some() => {
                 let names = self.data.seccomp_logged.as_deref().unwrap_or_default();
                 return Some(format!("{names}\n").into_bytes());
+            }
+            "sys/vm/mmap_min_addr" if self.data.mmap_min_addr.is_some() => {
+                let v = self.data.mmap_min_addr.unwrap_or_default();
+                return Some(format!("{v}\n").into_bytes());
             }
             "sys/kernel/domainname" if !self.data.domainname.is_empty() => {
                 return Some(format!("{}\n", self.data.domainname).into_bytes());
@@ -1259,6 +1271,7 @@ fn static_content(rel: &str) -> Option<&'static [u8]> {
         "sys/net/ipv4/ip_local_port_range" => IP_LOCAL_PORT_RANGE,
         "sys/vm/overcommit_memory" => OVERCOMMIT_MEMORY,
         "sys/vm/max_map_count" => MAX_MAP_COUNT,
+        "sys/vm/mmap_min_addr" => "65536\n",
         "sys/fs/file-max" => FILE_MAX,
         "sys/fs/inotify/max_user_watches" | "sys/user/max_inotify_watches" => "524288\n",
         "sys/fs/inotify/max_user_instances" | "sys/user/max_inotify_instances" => "128\n",
@@ -2115,6 +2128,7 @@ mod tests {
             arch: None,
             syscall: String::new(),
             seccomp_logged: None,
+            mmap_min_addr: None,
         }
     }
 
@@ -2276,6 +2290,7 @@ mod tests {
             arch: None,
             syscall: String::new(),
             seccomp_logged: None,
+            mmap_min_addr: None,
             maps: String::new(),
         });
         assert_eq!(read_all(&mut fs, "self/auxv").len(), 16);
