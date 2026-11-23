@@ -859,6 +859,14 @@ struct Creds {
 }
 
 impl ProcInfo {
+    /// What reaping this (dead) process adds to its parent's children's CPU
+    /// time, and what `wait4` reports in its rusage (Linux's `RUSAGE_BOTH`):
+    /// all its threads' time, those that exited before the leader too, and
+    /// its own reaped children's.
+    fn reaped_cpu_ns(&self) -> u128 {
+        self.rlimits.cpu_ns().max(self.cpu_ns) + self.child_cpu_ns
+    }
+
     /// Held back by a frozen cgroup, or one whose `cpu.max` quota is used up
     /// for now: not to be scheduled. A task with `SIGKILL` pending runs anyway,
     /// to die, as Linux's freezer lets it.
@@ -7056,7 +7064,7 @@ impl Kernel {
                             && !p.info.in_flight
                             && (p.info.tracer() == 0 || p.info.tracer() == cur) =>
                     {
-                        zombie = Some((p.info.pid, code, p.info.cpu_ns));
+                        zombie = Some((p.info.pid, code, p.info.reaped_cpu_ns()));
                     }
                     RunState::Stopped(sig) if !p.info.stop_reported && stopped.is_none() => {
                         stopped = Some((p.info.pid, sig));
@@ -7214,7 +7222,7 @@ impl Kernel {
                             && !p.info.in_flight
                             && (p.info.tracer() == 0 || p.info.tracer() == cur) =>
                     {
-                        zombie = Some((p.info.pid, code, p.info.cpu_ns));
+                        zombie = Some((p.info.pid, code, p.info.reaped_cpu_ns()));
                     }
                     RunState::Stopped(sig) if !p.info.stop_reported && stopped.is_none() => {
                         stopped = Some((p.info.pid, sig));
