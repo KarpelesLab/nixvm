@@ -51,6 +51,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/signalfd.h>
@@ -723,6 +724,28 @@ static int kernel_access_body(void) {
   return 0;
 }
 
+/* Faults pages in, makes calls, and takes a signal. */
+static volatile sig_atomic_t fault_sigs;
+static void on_fault_sig(int sig) {
+  (void)sig;
+  fault_sigs++;
+}
+
+static int fault_body(void) {
+  signal(SIGUSR1, on_fault_sig);
+  for (int i = 0; i < 32; i++) {
+    char *p = mmap(0, 4096, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED)
+      return 1;
+    p[0] = 1;
+    getppid();
+    munmap(p, 4096);
+  }
+  raise(SIGUSR1);
+  return fault_sigs == 1 ? 0 : 2;
+}
+
 static void kernel_access_checks(void) {
   pid_t c = traced(kernel_access_body);
   /* An 8-byte write watchpoint on kbuf, a 4-byte read/write one on kts. */
@@ -753,6 +776,19 @@ static void kernel_access_checks(void) {
   ptrace(PTRACE_CONT, c, 0, 0);
   hit(c, TRAP_HWBKPT, 0, 0xffff0ff1, "the task's own write");
   CHECK(finish(c) == 0, "kernel access run");
+
+  /* Read/write watchpoints and an execute breakpoint high in the user half,
+   * where the task has nothing (nixvm keeps its KVM guest's own descriptor
+   * tables, trampolines and kernel stack there): they never fire, however
+   * many faults and calls the task makes. */
+  c = traced(fault_body);
+  unsigned long top = (1ul << 47) - (16ul << 20);
+  poke_dr(c, 0, top + 0x47ff8);
+  poke_dr(c, 1, top + 0x42000);
+  poke_dr(c, 2, top + 0x45000);
+  poke_dr(c, 3, top + 0x43000);
+  CHECK(poke_dr(c, 7, 0x55 | 0x0bbb0000ul) == 0, "high DR7: %m");
+  CHECK(finish(c) == 0, "a watchpoint where nothing is mapped fired");
 }
 
 /* ---- restarting an interrupted call --------------------------------------- */
