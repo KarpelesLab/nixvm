@@ -180,6 +180,11 @@ const INITIAL_STACK_MAP: u64 = 256 * 1024;
 
 // ---- public API ----------------------------------------------------------
 
+/// The lowest address a program is loaded at: Linux's default
+/// `vm.mmap_min_addr`, below which the address space (which starts at 0) is
+/// left to programs that ask for it.
+pub const LOAD_FLOOR: u64 = 0x1_0000;
+
 /// The top of an i386 process's address space and its stack
 /// (`IA32_PAGE_OFFSET`, `STACK_TOP` for a compat task): just under 4 GiB.
 pub const IA32_STACK_TOP: u64 = 0xFFFF_E000;
@@ -336,7 +341,7 @@ fn loader_bias(mem: &GuestMemory, elf: &[u8], ehdr: &Ehdr) -> Result<u64, LoadEr
             align = align.max(a);
         }
     }
-    let base = mem.base();
+    let base = mem.base().max(LOAD_FLOOR);
     let top = stack_top(mem, ehdr) - stack_size(mem.size());
     let bias = round_up(base + (top - base) / 2, align);
     // Room for the image plus as much again for its brk, or the old place.
@@ -523,7 +528,7 @@ pub fn load_dynamic(
     // An i386 PIE goes at `ELF_ET_DYN_BASE` for a compat task (4 MiB).
     let exe_bias = match exe_hdr.e_type {
         ET_DYN if exe_hdr.class32 => mem.base().max(0x40_0000),
-        ET_DYN => mem.base(),
+        ET_DYN => mem.base().max(LOAD_FLOOR),
         _ => 0,
     };
     let exe_map = map_image(mem, exe, &exe_hdr, exe_bias)?;

@@ -41,8 +41,12 @@ use std::sync::{Arc, Mutex};
 /// Guest page size advertised to the guest (`AT_PAGESZ`, `sysconf(_SC_PAGESIZE)`).
 pub const PAGE_SIZE: u64 = 4096;
 
-/// Where a process address space starts ([`GuestMemory::with_default_layout`]).
-pub const DEFAULT_GUEST_BASE: u64 = 0x1_0000;
+/// Where a process address space starts ([`GuestMemory::with_default_layout`]):
+/// at 0, as on Linux, where nothing is mapped unless a task asks for it —
+/// below `vm.mmap_min_addr` (64 KiB) only one with `CAP_SYS_RAWIO`, as
+/// Wine and DOS emulators do for real-mode memory. Programs are loaded from
+/// [`crate::loader::LOAD_FLOOR`] up.
+pub const DEFAULT_GUEST_BASE: u64 = 0;
 
 /// The virtual extent of a process address space
 /// ([`GuestMemory::with_default_layout`]), decoupled from the physical RAM
@@ -117,8 +121,9 @@ pub enum MemError {
 }
 
 impl MemError {
-    /// The guest address the fault is attributed to. For page-granular faults
-    /// (`Unmapped`, `Protection`) this is the base of the *offending* page.
+    /// The guest address the fault is attributed to: for an access the
+    /// pages refuse (`Unmapped`, `Protection`), its first byte on the
+    /// offending page.
     #[must_use]
     pub fn fault_addr(&self) -> u64 {
         match self {
@@ -2000,12 +2005,15 @@ impl GuestMemory {
         }
         let (first, last) = self.page_range(addr, len)?;
         for p in first..=last {
+            // The first byte of the access the page refuses, as the CPU
+            // reports it (`si_addr`).
+            let at = self.page_base(p).max(addr);
             if !self.mapped[p] {
-                return Err(MemError::Unmapped(self.page_base(p)));
+                return Err(MemError::Unmapped(at));
             }
             if !self.prot[p].contains(need) {
                 return Err(MemError::Protection {
-                    addr: self.page_base(p),
+                    addr: at,
                     needed: need,
                 });
             }

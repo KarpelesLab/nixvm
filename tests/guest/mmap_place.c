@@ -9,6 +9,13 @@
  * order: ENOMEM past TASK_SIZE, EINVAL unaligned, EPERM below mmap_min_addr,
  * then EEXIST over a mapping.
  *
+ * Below vm.mmap_min_addr (security/min_addr.c, cap_mmap_addr): only a task
+ * with CAP_SYS_RAWIO maps there, page 0 included, which root may (unless an
+ * LSM such as SELinux says otherwise); writing the sysctl wants
+ * CAP_SYS_RAWIO too, and once it is lowered a task without it maps down to
+ * the new value, and has its hints raised only to it. Run as root it lowers
+ * the sysctl for a moment and puts it back.
+ *
  * MAP_32BIT and the 47-bit rule are x86-64's; the rest is checked on any
  * architecture.
  *
@@ -19,7 +26,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <linux/capability.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int failures;
@@ -276,6 +287,109 @@ static void test_fixed(void)
     }
 }
 
+#define MIN_ADDR "/proc/sys/vm/mmap_min_addr"
+
+/* Write `text` to vm.mmap_min_addr: what write() returned, or -errno. */
+static long set_min_addr(const char *text)
+{
+    int fd = open(MIN_ADDR, O_WRONLY);
+    if (fd < 0)
+        return -errno;
+    long r = write(fd, text, strlen(text));
+    if (r < 0)
+        r = -errno;
+    close(fd);
+    return r;
+}
+
+/* Drop CAP_SYS_RAWIO from this process's effective set. */
+static void drop_rawio(void)
+{
+    struct __user_cap_header_struct h = {_LINUX_CAPABILITY_VERSION_3, 0};
+    struct __user_cap_data_struct d[2];
+    if (syscall(SYS_capget, &h, d) != 0)
+        _exit(90);
+    d[0].effective &= ~(1u << 17);
+    if (syscall(SYS_capset, &h, d) != 0)
+        _exit(91);
+}
+
+/* In a child without CAP_SYS_RAWIO, with vm.mmap_min_addr at `min`: what
+ * it may map. Exits 0 if all is as Linux has it. */
+static int child_without_rawio(unsigned long min)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        drop_rawio();
+        if (rawio())
+            _exit(92);
+        errno = 0;
+        if (map((void *)(min - PG), PG, MAP_FIXED) != MAP_FAILED || errno != EPERM)
+            _exit(1);
+        if (map((void *)(min - PG), PG, MAP_FIXED_NOREPLACE) != MAP_FAILED || errno != EPERM)
+            _exit(2);
+        void *p = map((void *)min, PG, MAP_FIXED);
+        if (p != (void *)min)
+            _exit(3);
+        munmap(p, PG);
+        /* A hint below it is raised to it. */
+        p = map((void *)PG, PG, 0);
+        if (p != (void *)min)
+            _exit(4);
+        munmap(p, PG);
+        /* And the sysctl is CAP_SYS_RAWIO's to write. */
+        if (set_min_addr("0\n") != -EPERM)
+            _exit(5);
+        _exit(0);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : 100 + WTERMSIG(st);
+}
+
+static void test_min_addr(void)
+{
+    char was[32] = "";
+    int fd = open(MIN_ADDR, O_RDONLY);
+    CHECK(fd >= 0, "no " MIN_ADDR);
+    if (fd < 0)
+        return;
+    CHECK(read(fd, was, sizeof was - 1) > 0, "read " MIN_ADDR);
+    close(fd);
+    unsigned long min = strtoul(was, NULL, 10);
+    if (!rawio()) {
+        /* Not ours to change. */
+        long r = set_min_addr("0\n");
+        CHECK(r == -EACCES || r == -EPERM, "an unprivileged write to " MIN_ADDR ": %ld", r);
+        return;
+    }
+    /* CAP_SYS_RAWIO maps below it, page 0 too. */
+    void *p = mmap((void *)PG, 15 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    CHECK(p == (void *)PG, "MAP_FIXED at a page, with CAP_SYS_RAWIO: %p", p);
+    if (p == (void *)PG) {
+        *(volatile int *)(PG + 0x10) = 42;
+        CHECK(*(volatile int *)(PG + 0x10) == 42, "the low page holds what it's given");
+        munmap(p, 15 * PG);
+    }
+    p = map(NULL, PG, MAP_FIXED_NOREPLACE);
+    CHECK(p == NULL, "MAP_FIXED_NOREPLACE at 0, with CAP_SYS_RAWIO: %p", p);
+    if (p == NULL)
+        munmap(NULL, PG);
+    if (min >= 2 * PG)
+        CHECK(child_without_rawio(min) == 0, "without CAP_SYS_RAWIO at %lu: %d", min, child_without_rawio(min));
+    /* Lowered, it lets a task without CAP_SYS_RAWIO go lower; the rest is
+     * still refused. */
+    CHECK(set_min_addr("8192\n") == 5, "lower " MIN_ADDR);
+    CHECK(min_addr() == 8192, "read back %lu", min_addr());
+    CHECK(child_without_rawio(8192) == 0, "without CAP_SYS_RAWIO at 8192: %d", child_without_rawio(8192));
+    CHECK(set_min_addr("0x3000") == 6 && min_addr() == 0x3000, "a hex value: %lu", min_addr());
+    CHECK(set_min_addr("  010000 \n") == 10 && min_addr() == 4096, "an octal one: %lu", min_addr());
+    CHECK(set_min_addr("-1\n") == -EINVAL && set_min_addr("4k\n") == -EINVAL && set_min_addr("\n") == -EINVAL,
+          "bad values");
+    CHECK(min_addr() == 4096, "a bad value changes nothing: %lu", min_addr());
+    CHECK(set_min_addr(was) == (long)strlen(was) && min_addr() == min, "put back %s", was);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -284,6 +398,7 @@ int main(void)
 #endif
     test_hints();
     test_fixed();
+    test_min_addr();
     if (failures) {
         printf("%d failures\n", failures);
         return 1;
