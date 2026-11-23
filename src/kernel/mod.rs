@@ -1803,6 +1803,9 @@ pub(super) struct ServiceCtx {
     /// Set by a handler when the syscall would block (re-trap it later). (Was
     /// `Kernel::block`.)
     block: bool,
+    /// The `sendmsg` being serviced passes descriptors (`SCM_RIGHTS`), which
+    /// the receiving end may refuse (`SO_PASSRIGHTS`).
+    scm_rights: bool,
     /// Set by `sched_yield`: end this task's slice but leave it *runnable*.
     /// Distinct from `block` (which parks the task until a wake) — a yielding
     /// task wants to go around again, just not before its siblings do. Without
@@ -1864,6 +1867,7 @@ impl ServiceCtx {
         Self {
             cur: ProcInfo::default(),
             block: false,
+            scm_rights: false,
             yield_now: false,
             exec_ok: false,
             restartable: true,

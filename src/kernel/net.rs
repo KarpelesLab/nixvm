@@ -391,6 +391,9 @@ const SCM_CREDENTIALS: i32 = 2;
 const SCM_PIDFD: i32 = 4;
 const SO_PASSCRED: u64 = 16;
 const SO_PASSPIDFD: u64 = 76;
+/// Whether an `AF_UNIX` socket takes `SCM_RIGHTS` (Linux 6.16): on unless
+/// turned off, and then a sender's descriptors are refused (`EPERM`).
+const SO_PASSRIGHTS: u64 = 83;
 const SO_PEERPIDFD: u64 = 77;
 /// Size of a 64-bit `struct cmsghdr`: `cmsg_len`(size_t,8) + `cmsg_level`(int,4)
 /// + `cmsg_type`(int,4). `CMSG_DATA` follows immediately (already 8-aligned).
@@ -581,6 +584,9 @@ struct Sock {
     /// The `AF_UNIX` name this socket is bound to, as it was given (an
     /// abstract one with its leading NUL): what its datagrams come from.
     unix_name: Option<String>,
+    /// `SO_PASSRIGHTS` turned off, for each end (a connection's two ends
+    /// are one `Sock`): that end refuses `SCM_RIGHTS`.
+    rights_off: [bool; 2],
 }
 
 impl Sock {
@@ -599,6 +605,7 @@ impl Sock {
             inflight: [0; 2],
             seqpacket: false,
             unix_name: None,
+            rights_off: [false; 2],
         }
     }
 
@@ -1984,6 +1991,10 @@ impl Kernel {
         if td.pair_peer.is_some_and(|p| p != sock) {
             return err(Errno::EPERM);
         }
+        // Nor does one that takes no descriptors get any (`SO_PASSRIGHTS`).
+        if !fds.is_empty() && net.socks[tgt].rights_off[0] {
+            return err(Errno::EPERM);
+        }
         if net.unix_dgram_full(sock, tgt, data.len()) {
             if net.socks[sock].nonblock || cx.dontwait {
                 return err(Errno::EAGAIN);
@@ -2572,6 +2583,9 @@ impl Kernel {
         let mut pair = Pair::new();
         pair.cred = [Ucred::of(cx), listener_cred];
         pair.nonblock[0] = net.socks[sock].nonblock;
+        // The accepted end takes the listener's `SO_PASSRIGHTS`, as Linux's
+        // new socket takes its `sk_scm_recv_flags`.
+        net.socks[sock].rights_off[1] = net.socks[lidx].rights_off[0];
         if net.socks[sock].seqpacket {
             pair.msgs = Some([VecDeque::new(), VecDeque::new()]);
         }
@@ -2953,7 +2967,7 @@ impl Kernel {
         optlen: u64,
         mem: &GuestMemory,
     ) -> i64 {
-        let Some((sock, _)) = self.sock_of(cx, fd) else {
+        let Some((sock, end)) = self.sock_of(cx, fd) else {
             return err(Errno::ENOTSOCK);
         };
         // An option Linux doesn't know is ENOPROTOOPT; the read-only ones
@@ -2972,6 +2986,20 @@ impl Kernel {
         }
         if let Some(errno) = super::sockopt::refused(level, optname) {
             return err(errno);
+        }
+        // SO_PASSRIGHTS, AF_UNIX's alone, is each end's own.
+        if (level, optname) == (SOL_SOCKET, SO_PASSRIGHTS) {
+            if optlen < 4 {
+                return err(Errno::EINVAL);
+            }
+            let Ok(val) = mem.read_u32(optval) else {
+                return err(Errno::EFAULT);
+            };
+            if net.socks[sock].domain != AF_UNIX {
+                return err(Errno::EOPNOTSUPP);
+            }
+            net.socks[sock].rights_off[end] = val == 0;
+            return 0;
         }
         // SO_PASSPIDFD is AF_UNIX's alone.
         if (level, optname) == (SOL_SOCKET, SO_PASSPIDFD) && net.socks[sock].domain != AF_UNIX {
@@ -3213,6 +3241,14 @@ impl Kernel {
                 // SO_PASSPIDFD is AF_UNIX's alone.
                 SO_PASSPIDFD if net.socks[sock].domain != AF_UNIX => {
                     return err(Errno::EOPNOTSUPP);
+                }
+                // So is SO_PASSRIGHTS, on unless turned off.
+                SO_PASSRIGHTS => {
+                    if net.socks[sock].domain != AF_UNIX {
+                        return err(Errno::EOPNOTSUPP);
+                    }
+                    let on = i32::from(!net.socks[sock].rights_off[end]);
+                    return write_optval(mem, optval, optlen_ptr, &on.to_le_bytes());
                 }
                 // SO_PEERPIDFD: a pidfd for the process SO_PEERCRED names.
                 SO_PEERPIDFD => {
@@ -3819,6 +3855,7 @@ impl Kernel {
             };
             return self.unix_dgram_send(net, cx, sock, &data, dest.as_deref(), &passed, cred);
         }
+        cx.scm_rights = !passed.is_empty();
         let r = self.send_bytes(
             net,
             cx,
@@ -3829,6 +3866,7 @@ impl Kernel {
             flags & MSG_NOSIGNAL != 0,
             mem,
         );
+        cx.scm_rights = false;
         // On a successful send over a connected AF_UNIX stream pair, queue the
         // passed fds as ancillary data riding the just-written bytes: bump each
         // backing ref (the in-flight duplicate) and record the stream offset the
@@ -4768,6 +4806,10 @@ impl Kernel {
         }
         // Linux doubles SO_SNDBUF for its bookkeeping, and so reports it.
         let capacity = net.socks[sock].opts.sndbuf.saturating_mul(2) as usize;
+        // Descriptors ride this send, and the other end takes none
+        // (`SO_PASSRIGHTS` off): refused, once there is room to send, as
+        // Linux checks it once it has the message's buffer.
+        let refused = cx.scm_rights && net.socks[sock].rights_off[1 - end.min(1)];
         match &mut net.socks[sock].kind {
             Kind::Pair(p) => {
                 p.sender[1 - end] = Ucred::scm_of(cx);
@@ -4791,6 +4833,9 @@ impl Kernel {
                         cx.block = true;
                         return 0;
                     }
+                    if refused {
+                        return err(Errno::EPERM);
+                    }
                     // An empty message is a message too.
                     m[1 - end].push_back((data.len(), false));
                     p.to[1 - end].extend(data.iter().copied());
@@ -4801,6 +4846,10 @@ impl Kernel {
                 let done = (cx.cur.io_progress as usize).min(data.len());
                 let room = capacity.saturating_sub(p.to[1 - end].len());
                 let n = room.min(data.len() - done);
+                // (The descriptors go with the first bytes.)
+                if refused && done == 0 && n > 0 {
+                    return err(Errno::EPERM);
+                }
                 p.to[1 - end].extend(data[done..done + n].iter().copied());
                 let done = done + n;
                 if done == data.len() {

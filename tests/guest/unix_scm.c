@@ -7,7 +7,10 @@
  * descriptors living until received or their queue goes away, a socket sent
  * over itself included; sendmmsg/recvmmsg with control data; and SCM_PIDFD
  * with SO_PASSPIDFD (after the other messages, whole or not at all, for a
- * sender alive or gone) and SO_PEERPIDFD. */
+ * sender alive or gone) and SO_PEERPIDFD; and SO_PASSRIGHTS (Linux 6.16): on
+ * by default, each end's own, an accepted socket's from its listener, and
+ * when it is off the sender of descriptors gets EPERM, on stream, datagram
+ * and seqpacket sockets alike. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -36,6 +39,9 @@
 #endif
 #ifndef P_PIDFD
 #define P_PIDFD 3
+#endif
+#ifndef SO_PASSRIGHTS
+#define SO_PASSRIGHTS 83
 #endif
 
 #define CHECK(c) do { if (!(c)) { printf("FAIL: %s (line %d, errno %d)\n", #c, __LINE__, errno); exit(1); } } while (0)
@@ -914,6 +920,112 @@ static void test_mmsg(void)
   printf("sendmmsg/recvmmsg carry each message's own fds\n");
 }
 
+static int passrights(int s)
+{
+  int v = -1;
+  socklen_t l = sizeof v;
+  if (getsockopt(s, SOL_SOCKET, SO_PASSRIGHTS, &v, &l) != 0)
+    return -errno;
+  return l == sizeof v ? v : -1000;
+}
+
+static int set_passrights(int s, int v)
+{
+  return setsockopt(s, SOL_SOCKET, SO_PASSRIGHTS, &v, sizeof v) == 0 ? 0 : -errno;
+}
+
+/* Whether nothing is queued on `s`. */
+static int nothing_queued(int s)
+{
+  char c;
+  return recv(s, &c, 1, MSG_DONTWAIT) == -1 && errno == EAGAIN;
+}
+
+static void test_passrights(const char *dir)
+{
+  int p[2];
+  CHECK(pipe(p) == 0);
+  /* Only AF_UNIX has it, and it takes an int. */
+  int udp = socket(AF_INET, SOCK_DGRAM, 0);
+  CHECK(udp >= 0);
+  CHECK(passrights(udp) == -EOPNOTSUPP);
+  CHECK(set_passrights(udp, 0) == -EOPNOTSUPP);
+  close(udp);
+  static const int types[] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET};
+  for (int t = 0; t < 3; t++) {
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, types[t], 0, sv) == 0);
+    CHECK(passrights(sv[0]) == 1 && passrights(sv[1]) == 1);
+    short half = 0;
+    CHECK(setsockopt(sv[1], SOL_SOCKET, SO_PASSRIGHTS, &half, sizeof half) == -1 && errno == EINVAL);
+    /* Off on one end: descriptors to it are refused, nothing is queued, and
+     * data alone still goes. */
+    CHECK(set_passrights(sv[1], 0) == 0);
+    CHECK(passrights(sv[1]) == 0 && passrights(sv[0]) == 1);
+    errno = 0;
+    CHECK(send_fds(sv[0], "x", 1, &p[0], 1, NULL, 0) == -1 && errno == EPERM);
+    CHECK(nothing_queued(sv[1]));
+    CHECK(send_fds(sv[0], "y", 1, NULL, 0, NULL, 0) == 1);
+    char buf[4];
+    struct got g = recv_fds(sv[1], buf, sizeof buf, 64, 0);
+    CHECK(g.n == 1 && buf[0] == 'y' && g.nfds == 0);
+    /* The other end still takes them. */
+    CHECK(send_fds(sv[1], "z", 1, &p[0], 1, NULL, 0) == 1);
+    g = recv_fds(sv[0], buf, sizeof buf, 64, 0);
+    CHECK(g.n == 1 && g.nfds == 1 && same_pipe(p[1], g.fds[0]));
+    close(g.fds[0]);
+    /* On again (any non-zero value). */
+    CHECK(set_passrights(sv[1], 7) == 0 && passrights(sv[1]) == 1);
+    CHECK(send_fds(sv[0], "w", 1, &p[0], 1, NULL, 0) == 1);
+    g = recv_fds(sv[1], buf, sizeof buf, 64, 0);
+    CHECK(g.n == 1 && g.nfds == 1);
+    close(g.fds[0]);
+    close(sv[0]);
+    close(sv[1]);
+  }
+  /* An accepted connection takes its listener's setting; the connecting
+   * socket keeps its own. */
+  for (int t = 0; t < 3; t += 2) {
+    struct sockaddr_un a = {.sun_family = AF_UNIX};
+    snprintf(a.sun_path, sizeof a.sun_path, "%s/rights%d", dir, t);
+    int l = socket(AF_UNIX, types[t], 0);
+    CHECK(l >= 0);
+    CHECK(bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 4) == 0);
+    CHECK(set_passrights(l, 0) == 0);
+    int c = socket(AF_UNIX, types[t], 0);
+    CHECK(connect(c, (struct sockaddr *)&a, sizeof a) == 0);
+    int s = accept(l, NULL, NULL);
+    CHECK(s >= 0);
+    CHECK(passrights(s) == 0 && passrights(c) == 1);
+    CHECK(send_fds(c, "x", 1, &p[0], 1, NULL, 0) == -1 && errno == EPERM);
+    CHECK(send_fds(s, "x", 1, &p[0], 1, NULL, 0) == 1);
+    char buf[4];
+    struct got g = recv_fds(c, buf, sizeof buf, 64, 0);
+    CHECK(g.n == 1 && g.nfds == 1);
+    close(g.fds[0]);
+    close(c);
+    close(s);
+    close(l);
+    unlink(a.sun_path);
+  }
+  /* A named datagram socket that takes none refuses them from anyone. */
+  struct sockaddr_un a = {.sun_family = AF_UNIX};
+  snprintf(a.sun_path, sizeof a.sun_path, "%s/rightsd", dir);
+  int r = socket(AF_UNIX, SOCK_DGRAM, 0);
+  CHECK(r >= 0 && bind(r, (struct sockaddr *)&a, sizeof a) == 0);
+  CHECK(set_passrights(r, 0) == 0);
+  int w = socket(AF_UNIX, SOCK_DGRAM, 0);
+  CHECK(w >= 0);
+  CHECK(send_fds(w, "x", 1, &p[0], 1, &a, sizeof a) == -1 && errno == EPERM);
+  CHECK(nothing_queued(r));
+  CHECK(send_fds(w, "y", 1, NULL, 0, &a, sizeof a) == 1);
+  close(w);
+  close(r);
+  unlink(a.sun_path);
+  close(p[0]);
+  close(p[1]);
+}
+
 int main(void)
 {
   char dir[64];
@@ -928,6 +1040,7 @@ int main(void)
   test_lifetime();
   test_mmsg();
   test_pidfd();
+  test_passrights(dir);
   rmdir(dir);
   puts("PASS");
   return 0;

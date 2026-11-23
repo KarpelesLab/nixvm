@@ -33,10 +33,12 @@ const SOL_NETLINK: u64 = 270;
 #[allow(clippy::match_same_arms)] // a table: one arm per level, kept separate
 pub(super) fn known(level: u64, optname: u64) -> bool {
     match level {
-        // SO_DEBUG .. SO_PEERPIDFD, minus the never-assigned 54 and 58.
+        // SO_DEBUG .. SO_PEERPIDFD, minus the never-assigned 54 and 58; and
+        // SO_PASSRIGHTS.
         SOL_SOCKET => {
             (1..=21).contains(&optname)
                 || ((25..=77).contains(&optname) && optname != 54 && optname != 58)
+                || optname == 83
         }
         // IP_TOS .. IP_LOCAL_PORT_RANGE (with the multicast block).
         SOL_IP => (1..=27).contains(&optname) || (32..=51).contains(&optname),
