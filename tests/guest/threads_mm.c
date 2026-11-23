@@ -1,7 +1,9 @@
 /* A process's threads share one address space: the program break, and every
  * mapping change. A thread mustn't see a stale break (and grow the heap over
  * memory another thread's malloc handed out), nor keep using a page another
- * thread unmapped or replaced while it slept. */
+ * thread unmapped or replaced while it slept. A shared file mapping is the
+ * process's too: one thread maps a file and stores into it, another unmaps
+ * it (Go's linker on Windows, through Wine), and the stores are the file's. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
@@ -9,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -49,6 +52,26 @@ static void *reader(void *a) {
   while (stage != 2) pthread_cond_wait(&cv, &mu);
   pthread_mutex_unlock(&mu);
   seen_after = page[0];
+  return 0;
+}
+
+static char *shared_map;
+static size_t shared_len;
+static int mapped, reused;
+
+/* Map the file and fill it, then stay until the main thread has unmapped
+ * it and put fresh memory there: this thread's exit mustn't write that
+ * memory over the file either. */
+static void *map_and_fill(void *arg) {
+  int fd = *(int *)arg;
+  shared_map = mmap(0, shared_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (shared_map != MAP_FAILED)
+    for (size_t i = 0; i < shared_len; i++) shared_map[i] = (char)(i % 251);
+  pthread_mutex_lock(&mu);
+  mapped = 1;
+  pthread_cond_broadcast(&cv);
+  while (!reused) pthread_cond_wait(&cv, &mu);
+  pthread_mutex_unlock(&mu);
   return 0;
 }
 
@@ -101,6 +124,33 @@ int main(void) {
   printf("the other thread read %c, then %c after the page was replaced\n", seen_before, seen_after);
   CHECK(seen_before == 'A' && seen_after == 'B');
   puts("a page replaced while a thread slept is the new page there");
+
+  char tmpl[] = "/tmp/threads_mm.XXXXXX";
+  int fd = mkstemp(tmpl);
+  CHECK(fd >= 0);
+  unlink(tmpl);
+  shared_len = 64 * pg;
+  CHECK(ftruncate(fd, shared_len) == 0);
+  CHECK(pthread_create(&t, 0, map_and_fill, &fd) == 0);
+  pthread_mutex_lock(&mu);
+  while (!mapped) pthread_cond_wait(&cv, &mu);
+  pthread_mutex_unlock(&mu);
+  CHECK(shared_map != MAP_FAILED);
+  CHECK(munmap(shared_map, shared_len) == 0);
+  CHECK(mmap(shared_map, shared_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == shared_map);
+  pthread_mutex_lock(&mu);
+  reused = 1;
+  pthread_cond_broadcast(&cv);
+  pthread_mutex_unlock(&mu);
+  CHECK(pthread_join(t, 0) == 0);
+  char *back = malloc(shared_len);
+  CHECK(pread(fd, back, shared_len, 0) == (ssize_t)shared_len);
+  size_t wrong = 0;
+  for (size_t i = 0; i < shared_len; i++) wrong += back[i] != (char)(i % 251);
+  if (wrong) printf("%zu of %zu bytes didn't reach the file\n", wrong, shared_len);
+  CHECK(wrong == 0);
+  close(fd);
+  puts("a shared file mapping one thread filled and another unmapped kept its stores");
   puts("PASS");
   return 0;
 }

@@ -518,8 +518,9 @@ struct ProcInfo {
     /// on `munmap`/`msync`/exit. This is how `apk` (and `install`, `cp
     /// --sparse`, …) writes large extracted files: create → `ftruncate` →
     /// `mmap(MAP_SHARED, PROT_WRITE)` → memcpy → `munmap`. Without write-back
-    /// the file stays zero-filled at the right size.
-    shared_maps: Vec<SharedMap>,
+    /// the file stays zero-filled at the right size. They belong to the
+    /// address space: every task sharing it (`CLONE_VM`) shares the list.
+    shared_maps: SharedMaps,
     /// Absolute wall-clock deadline (ns since the UNIX epoch) at which a timed
     /// wait (`poll`/`ppoll`/`epoll_pwait` with a finite timeout) gives up and
     /// returns 0. `None` when the task holds no timed wait. Set on the first
@@ -744,6 +745,28 @@ struct SharedMap {
     offset: u64,
 }
 
+/// An address space's [`SharedMap`]s, shared by the tasks that share the
+/// address space: a thread may `munmap` or `msync` what another mapped (Go's
+/// linker maps its output on one thread and unmaps it on another), and the
+/// write-back must find it. A leaf lock: nothing is taken while holding it.
+#[derive(Clone, Debug, Default)]
+struct SharedMaps(Arc<Mutex<Vec<SharedMap>>>);
+
+impl SharedMaps {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<SharedMap>> {
+        self.0.lock().unwrap()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// The same mappings, for a new address space (a fork child's).
+    fn private_copy(&self) -> Self {
+        Self(Arc::new(Mutex::new(self.lock().clone())))
+    }
+}
+
 impl Default for ProcInfo {
     fn default() -> Self {
         Self {
@@ -785,7 +808,7 @@ impl Default for ProcInfo {
             sid: 0,
             parked: false,
             frozen: false,
-            shared_maps: Vec::new(),
+            shared_maps: SharedMaps::default(),
             wake_deadline: None,
             cpu_sleep: None,
             blocked_step: false,
@@ -6411,6 +6434,11 @@ impl Kernel {
         } else {
             sh.next_mm_slot()
         };
+        // Its shared file mappings are the address space's: a thread shares
+        // them, a fork child has copies of its own.
+        if !share_vm {
+            info.shared_maps = info.shared_maps.private_copy();
+        }
 
         info.clear_child_tid = if flags & CLONE_CHILD_CLEARTID != 0 {
             child_tid
@@ -6887,9 +6915,10 @@ impl Kernel {
         // or the exit-time flush would write whatever the *new* image later
         // maps at those addresses back over the files.
         if !cx.cur.shared_maps.is_empty() {
-            self.flush_shared_maps(vfs, cx, 0, 0, mem);
-            cx.cur.shared_maps.clear();
+            self.flush_shared_maps(vfs, cx, (0, 0), false, mem);
         }
+        // (A vfork parent keeps its own: this task leaves the list.)
+        cx.cur.shared_maps = SharedMaps::default();
         // Replace the image *in place*: tear down the old page tables (returning
         // their frames to the shared pool) and rebuild within the SAME pool, so
         // the one KVM memslot stays valid and the process just gets a new cr3.
@@ -7698,7 +7727,7 @@ impl Kernel {
         // the rest of teardown.
         if !cx.cur.shared_maps.is_empty() {
             let mut vfs = self.vfs_for(cx);
-            self.flush_shared_maps(&mut vfs, cx, 0, 0, mem);
+            self.flush_shared_maps(&mut vfs, cx, (0, 0), false, mem);
         }
         let ctid = cx.cur.clear_child_tid;
         let mm = cx.cur.mm;
@@ -7946,7 +7975,7 @@ impl Kernel {
         // scoped so the tail `sys_exit` can re-acquire vfs without a re-lock).
         if !cx.cur.shared_maps.is_empty() {
             let mut vfs = self.vfs_for(cx);
-            self.flush_shared_maps(&mut vfs, cx, 0, 0, mem);
+            self.flush_shared_maps(&mut vfs, cx, (0, 0), false, mem);
         }
         let tgid = cx.cur.tgid;
         // Zombify every sibling and note the distinct fd-table ids they used.
@@ -11976,7 +12005,7 @@ impl Kernel {
             // A shared mapping that can store into a file kept elsewhere is
             // written back to it (a shared-memory file's pages are the file).
             if shared && maywrite && !shmem {
-                cx.cur.shared_maps.push(SharedMap {
+                cx.cur.shared_maps.lock().push(SharedMap {
                     base,
                     len,
                     path: path.clone(),
@@ -12033,24 +12062,29 @@ impl Kernel {
     /// Flush any writable `MAP_SHARED` file mappings overlapping `[addr, addr +
     /// len)` back to their backing files (their guest memory is the source of
     /// truth). `len == 0` flushes every shared mapping (process teardown).
+    /// With `forget` (an unmapping), the list drops the mappings it covered.
     #[allow(clippy::unused_self)]
     fn flush_shared_maps(
         &self,
         vfs: &mut MountTable,
         cx: &mut ServiceCtx,
-        addr: u64,
-        len: u64,
+        (addr, len): (u64, u64),
+        forget: bool,
         mem: &GuestMemory,
     ) {
         let hit_all = len == 0;
         let (lo, hi) = (addr, addr.saturating_add(len));
-        // Take the list out to avoid borrowing `self` twice; retained maps go back.
-        let maps = std::mem::take(&mut cx.cur.shared_maps);
+        let overlaps = |m: &SharedMap| hit_all || (m.base < hi && m.base + m.len > lo);
+        // Copied out: the list's lock is a leaf, not held across the writes.
+        let maps: Vec<SharedMap> = cx
+            .cur
+            .shared_maps
+            .lock()
+            .iter()
+            .filter(|m| overlaps(m))
+            .cloned()
+            .collect();
         for m in &maps {
-            let overlaps = hit_all || (m.base < hi && m.base + m.len > lo);
-            if !overlaps {
-                continue;
-            }
             // Don't grow the file past its real size (the mapping is page-
             // rounded, but the file was `ftruncate`d to the exact length).
             let file_size = vfs.stat(&m.path).map_or(m.len, |a| a.size);
@@ -12062,12 +12096,9 @@ impl Kernel {
                 let _ = vfs.write_at(&m.path, m.offset, &bytes);
             }
         }
-        // A partial munmap keeps mappings it didn't cover; a full flush drops all.
-        if !hit_all {
-            cx.cur.shared_maps = maps
-                .into_iter()
-                .filter(|m| !(m.base < hi && m.base + m.len > lo))
-                .collect();
+        // An unmapping forgets what it covered (a partial one keeps the rest).
+        if forget {
+            cx.cur.shared_maps.lock().retain(|m| !overlaps(m));
         }
     }
 
@@ -12245,7 +12276,7 @@ impl Kernel {
         // `sh` is held (dispatch_shared) → acquire `vfs` in the mandated order.
         if !cx.cur.shared_maps.is_empty() {
             let mut vfs = self.vfs_for(cx);
-            self.flush_shared_maps(&mut vfs, cx, base, len, mem);
+            self.flush_shared_maps(&mut vfs, cx, (base, len), true, mem);
         }
         let _ = mem.unmap(base, len);
         // Unmapping a SysV shared-memory attachment detaches it, and a shared
@@ -12283,10 +12314,9 @@ impl Kernel {
         }
         if !cx.cur.shared_maps.is_empty() {
             let len = len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
-            // msync flushes but keeps the mapping — re-add after the flush.
-            let saved = cx.cur.shared_maps.clone();
-            self.flush_shared_maps(vfs, cx, addr - addr % PAGE_SIZE, len.max(PAGE_SIZE), mem);
-            cx.cur.shared_maps = saved;
+            // msync flushes but keeps the mapping.
+            let range = (addr - addr % PAGE_SIZE, len.max(PAGE_SIZE));
+            self.flush_shared_maps(vfs, cx, range, false, mem);
         }
         0
     }

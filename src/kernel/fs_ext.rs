@@ -360,16 +360,22 @@ impl Kernel {
                 _ => None,
             });
         let dirs = sh.cwd_tables.iter().flatten().map(|fs| fs.cwd.as_str());
-        let maps = sh
+        let map_paths: Vec<String> = sh
             .procs
             .iter()
             .flatten()
-            .flat_map(|p| p.info.shared_maps.iter())
-            .chain(cx.cur.shared_maps.iter())
-            .map(|m| m.path.as_str());
+            .map(|p| &p.info.shared_maps)
+            .chain([&cx.cur.shared_maps])
+            .flat_map(|maps| {
+                maps.lock()
+                    .iter()
+                    .map(|m| m.path.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         let in_use: Vec<&str> = open
             .chain(dirs)
-            .chain(maps)
+            .chain(map_paths.iter().map(String::as_str))
             .chain([cx.cur.cwd.as_str()])
             .collect();
         vfs.collect_detached(&in_use);
@@ -390,7 +396,7 @@ impl Kernel {
                 Fd::File { path, .. } | Fd::Dir { path, .. } => Some(path.clone()),
                 _ => None,
             })
-            .chain(cx.cur.shared_maps.iter().map(|m| m.path.clone()))
+            .chain(cx.cur.shared_maps.lock().iter().map(|m| m.path.clone()))
             .collect();
         paths.sort();
         paths.dedup();
@@ -403,7 +409,7 @@ impl Kernel {
             .collect();
         let translate = |p: &str| moved.get(p).cloned().unwrap_or_else(|| p.to_string());
         cx.cur.fds.rewrite_paths(&translate);
-        for m in &mut cx.cur.shared_maps {
+        for m in cx.cur.shared_maps.lock().iter_mut() {
             m.path = translate(&m.path);
         }
         Self::collect_unused_hidden_mounts(sh, cx, &mut vfs);

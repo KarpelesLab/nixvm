@@ -256,7 +256,7 @@ impl Kernel {
         if new_size > keep {
             self.mremap_extend(cx, new + keep, new_size - keep, prot, mem)?;
         }
-        for m in &mut cx.cur.shared_maps {
+        for m in cx.cur.shared_maps.lock().iter_mut() {
             if m.base == old {
                 m.base = new;
                 m.len = m.len.min(new_size);
