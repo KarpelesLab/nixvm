@@ -1626,12 +1626,28 @@ impl Vcpu for KvmVcpu {
     }
 
     fn set_debug_regs(&mut self, dr: &[u64; 8]) -> bool {
+        // Bit 10 always reads as one; only the enables and the R/W and LEN
+        // fields are the debugger's (no GD, LE or GE).
+        let mut dr7 = dr[7] & 0xffff_00ff;
+        // A breakpoint on the guest's own supervisor pages, which sit in the
+        // user half here (where on Linux nothing is mapped, so it would
+        // never fire), would fire at CPL0 in the trampolines and exception
+        // entry: it stays off.
+        for (i, &addr) in dr[..4].iter().enumerate() {
+            let len = match (dr7 >> (18 + 4 * i)) & 3 {
+                0 => 1,
+                1 => 2,
+                2 => 8,
+                _ => 4,
+            };
+            if crate::vcpu::ctrl::supervisor_range(addr, len) {
+                dr7 &= !(3 << (2 * i));
+            }
+        }
         let d = sys::kvm_debugregs {
             db: [dr[0], dr[1], dr[2], dr[3]],
             dr6: DR6_CLEAR,
-            // Bit 10 always reads as one; only the enables and the R/W and
-            // LEN fields are the debugger's (no GD, LE or GE).
-            dr7: (dr[7] & 0xffff_00ff) | 0x400,
+            dr7: dr7 | 0x400,
             ..sys::kvm_debugregs::default()
         };
         // SAFETY: valid struct pointer; the fd is live.

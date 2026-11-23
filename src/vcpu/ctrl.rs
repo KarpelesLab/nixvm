@@ -95,6 +95,17 @@ pub const KSTACK_PAGE_VA: u64 = CTRL_GPA + KSTACK_OFF;
 /// pages.
 pub const LDT_VA: u64 = CTRL_GPA + 0x10_0000;
 
+/// Whether `[addr, addr + len)` touches a supervisor-only page of the control
+/// block (the GDT, trampolines, IDT, TSS, kernel stack, LDT), which the guest
+/// itself reaches only at CPL0. The vDSO and vvar pages, user pages in the
+/// same window, aren't: a guest debugger may watch those.
+#[cfg_attr(not(all(nixvm_linux, target_arch = "x86_64")), allow(dead_code))] // KVM-only
+pub fn supervisor_range(addr: u64, len: u64) -> bool {
+    let end = addr.saturating_add(len);
+    let overlaps = |lo: u64, hi: u64| addr < hi && end > lo;
+    overlaps(CTRL_GPA + GDT_OFF, CTRL_GPA + VDSO_OFF) || overlaps(LDT_VA, LDT_VA + 16 * 4096)
+}
+
 /// Virtual base of the vDSO ELF image (user-readable/executable) — the value the
 /// loader advertises as `AT_SYSINFO_EHDR`. See [`super::vdso`].
 pub const VDSO_VA: u64 = CTRL_GPA + VDSO_OFF;
