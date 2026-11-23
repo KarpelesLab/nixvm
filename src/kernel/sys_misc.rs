@@ -6,7 +6,7 @@
 //! ignores the exact values, so a believable constant answer is enough.
 
 use super::caps::{CAP_SETGID, CAP_SETUID};
-use super::{Kernel, ServiceCtx, Shared, err};
+use super::{Kernel, ServiceCtx, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
@@ -823,11 +823,10 @@ impl Kernel {
     /// so the two agree — landing in `ru_utime` (we don't split guest user vs.
     /// system time); the remaining counters (maxrss, faults, context switches)
     /// stay zero. `RUSAGE_CHILDREN` reports nothing (child accounting isn't
-    /// tracked). Called with `sh` held (the B1 dispatch table).
+    /// tracked).
     #[allow(clippy::unused_self)]
     pub(super) fn sys_getrusage(
         &self,
-        sh: &Shared,
         cx: &ServiceCtx,
         who: u64,
         buf: u64,
@@ -837,9 +836,9 @@ impl Kernel {
         // RUSAGE_THREAD(1). Read it via `as i32` so a `-1` the guest passed as a
         // zero-extended `0xFFFF_FFFF` is recognized.
         let cpu_ns = match who as i32 {
-            1 => cx.cur.cpu_ns,                 // RUSAGE_THREAD
-            -1 => cx.cur.child_cpu_ns,          // RUSAGE_CHILDREN: reaped children's CPU
-            _ => super::process_cpu_ns(sh, cx), // RUSAGE_SELF (0) and anything else
+            1 => cx.cur.cpu_ns,             // RUSAGE_THREAD
+            -1 => cx.cur.child_cpu_ns,      // RUSAGE_CHILDREN: reaped children's CPU
+            _ => super::process_cpu_ns(cx), // RUSAGE_SELF (0) and anything else
         };
         if mem.write(buf, &super::rusage_bytes(cpu_ns)).is_err() {
             return err(Errno::EFAULT);
@@ -851,19 +850,12 @@ impl Kernel {
     /// ticks) and return elapsed real time in ticks. Ticks are `USER_HZ` = 100 Hz
     /// (10 ms), as on Linux. `tms_utime` carries the process CPU time (the same
     /// per-task accounting as `getrusage`/`clock_gettime`); system and children
-    /// fields are zero. Called with `sh` held.
+    /// fields are zero.
     #[allow(clippy::unused_self)]
-    pub(super) fn sys_times(
-        &self,
-        sh: &Shared,
-        cx: &ServiceCtx,
-        buf: u64,
-        mem: &mut GuestMemory,
-    ) -> i64 {
+    pub(super) fn sys_times(&self, cx: &ServiceCtx, buf: u64, mem: &mut GuestMemory) -> i64 {
         const TICK_NS: u128 = 10_000_000; // 1 tick = 10 ms (USER_HZ = 100)
         let mut tms = [0u8; 32];
-        tms[0..8]
-            .copy_from_slice(&((super::process_cpu_ns(sh, cx) / TICK_NS) as i64).to_le_bytes()); // tms_utime
+        tms[0..8].copy_from_slice(&((super::process_cpu_ns(cx) / TICK_NS) as i64).to_le_bytes()); // tms_utime
         // tms_stime stays zero; tms_cutime carries reaped children's CPU.
         tms[16..24].copy_from_slice(&((cx.cur.child_cpu_ns / TICK_NS) as i64).to_le_bytes()); // tms_cutime
         // tms_cstime stays zero.

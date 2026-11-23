@@ -282,12 +282,13 @@ impl Kernel {
                 .flatten()
                 .find(|p| p.info.pid == tid)
                 .map(|p| p.info.cpu_ns),
-            CpuOf::Group(tgid) if tgid == cx.cur.tgid => Some(super::process_cpu_ns(sh, cx)),
-            CpuOf::Group(tgid) => {
-                let mut members = sh.procs.iter().flatten().filter(|p| p.info.tgid == tgid);
-                let first = members.next()?;
-                Some(first.info.cpu_ns + members.map(|p| p.info.cpu_ns).sum::<u128>())
-            }
+            CpuOf::Group(tgid) if tgid == cx.cur.tgid => Some(super::process_cpu_ns(cx)),
+            CpuOf::Group(tgid) => sh
+                .procs
+                .iter()
+                .flatten()
+                .find(|p| p.info.tgid == tgid)
+                .map(|p| p.info.rlimits.cpu_ns()),
         }
     }
 

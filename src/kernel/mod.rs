@@ -32,6 +32,7 @@ mod attrs;
 mod caps;
 mod cgroup;
 mod compat;
+mod cputimer;
 #[cfg(feature = "gpu")]
 mod drm;
 pub mod egress;
@@ -146,10 +147,12 @@ impl SigHand {
     }
 }
 
-/// A process's resource limits and the CPU time they're measured against. Like
-/// [`SigHand`], cloning the handle shares it: limits belong to the whole thread
-/// group, so a thread's `setrlimit` applies to its siblings, and a thread's CPU
-/// time counts for all of them. A new process gets [`RLimits::private_copy`].
+/// A process's resource limits and the CPU time they're measured against, and
+/// the timers on that CPU time (Linux keeps all three in its `signal_struct`).
+/// Like [`SigHand`], cloning the handle shares it: limits belong to the whole
+/// thread group, so a thread's `setrlimit` applies to its siblings, and a
+/// thread's CPU time counts for all of them. A new process gets
+/// [`RLimits::private_copy`].
 #[derive(Clone, Debug)]
 struct RLimits(Arc<RLimitState>);
 
@@ -157,10 +160,15 @@ struct RLimits(Arc<RLimitState>);
 struct RLimitState {
     /// `(soft, hard)` for each resource.
     limits: Mutex<[(u64, u64); sys_misc::RLIM_NLIMITS]>,
-    /// CPU time used by the thread group, in nanoseconds.
+    /// CPU time used by the thread group, in nanoseconds: its threads', the
+    /// exited ones' included.
     cpu_ns: AtomicU64,
-    /// When `RLIMIT_CPU`'s next `SIGXCPU` is due, in nanoseconds of CPU time.
-    next_xcpu_ns: AtomicU64,
+    /// The CPU time (ns) at which `RLIMIT_CPU` next calls for a signal: its
+    /// soft limit's, or the hard one's; `u64::MAX` for none. Kept with the
+    /// limits, under their lock.
+    xcpu_due_ns: AtomicU64,
+    /// The timers on the group's CPU clocks, and `ITIMER_VIRTUAL`/`ITIMER_PROF`.
+    timers: cputimer::CpuTimers,
 }
 
 impl Default for RLimits {
@@ -169,12 +177,32 @@ impl Default for RLimits {
     }
 }
 
+/// When `RLIMIT_CPU`'s `(soft, hard)` limit (in seconds) next calls for a
+/// signal, in nanoseconds of CPU time.
+fn xcpu_due((soft, hard): (u64, u64)) -> u64 {
+    const NS_PER_SEC: u64 = 1_000_000_000;
+    let ns = |s: u64| {
+        if s == sys_misc::RLIM_INFINITY {
+            u64::MAX
+        } else {
+            s.saturating_mul(NS_PER_SEC)
+        }
+    };
+    // Linux checks neither limit while the soft one is infinite.
+    if soft == sys_misc::RLIM_INFINITY {
+        return u64::MAX;
+    }
+    ns(soft).min(ns(hard))
+}
+
 impl RLimits {
     fn with_limits(limits: [(u64, u64); sys_misc::RLIM_NLIMITS]) -> Self {
+        let due = xcpu_due(limits[sys_misc::RLIMIT_CPU as usize]);
         Self(Arc::new(RLimitState {
             limits: Mutex::new(limits),
             cpu_ns: AtomicU64::new(0),
-            next_xcpu_ns: AtomicU64::new(0),
+            xcpu_due_ns: AtomicU64::new(due),
+            timers: cputimer::CpuTimers::default(),
         }))
     }
 
@@ -189,42 +217,58 @@ impl RLimits {
     }
 
     fn set(&self, resource: u64, limit: (u64, u64)) {
-        self.0.limits.lock().unwrap()[resource as usize] = limit;
+        let mut limits = self.0.limits.lock().unwrap();
+        limits[resource as usize] = limit;
+        if resource == sys_misc::RLIMIT_CPU {
+            self.0
+                .xcpu_due_ns
+                .store(xcpu_due(limit), std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
-    /// The same limits, for a new process: its CPU time starts from zero.
+    /// The same limits, for a new process: its CPU time starts from zero,
+    /// with no timers on it.
     fn private_copy(&self) -> Self {
         Self::with_limits(*self.0.limits.lock().unwrap())
     }
 
-    /// Add `ns` of CPU time and say which signal `RLIMIT_CPU` now calls for:
-    /// `SIGKILL` past the hard limit, and past the soft limit `SIGXCPU` once per
-    /// second of CPU time used.
-    fn charge_cpu(&self, ns: u64) -> Option<u64> {
+    /// The CPU time (ns) the thread group has used.
+    fn cpu_ns(&self) -> u128 {
+        u128::from(self.0.cpu_ns.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The group's CPU-time timers.
+    fn cpu_timers(&self) -> &cputimer::CpuTimers {
+        &self.0.timers
+    }
+
+    /// Add `ns` of CPU time and say which signal `RLIMIT_CPU` now calls for,
+    /// as Linux's `check_process_timers`: `SIGKILL` at the hard limit, and at
+    /// the soft limit `SIGXCPU`, with the soft limit then raised by a second
+    /// so the next one comes a second of CPU time later. Also returns the
+    /// group's CPU time now.
+    fn charge_cpu(&self, ns: u64) -> (u64, Option<u64>) {
         const NS_PER_SEC: u64 = 1_000_000_000;
-        let used = self
-            .0
-            .cpu_ns
-            .fetch_add(ns, std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(ns);
-        let (soft, hard) = self.get(sys_misc::RLIMIT_CPU);
-        if hard != sys_misc::RLIM_INFINITY && used / NS_PER_SEC >= hard {
-            return Some(9); // SIGKILL
+        use std::sync::atomic::Ordering::Relaxed;
+        let used = self.0.cpu_ns.fetch_add(ns, Relaxed).saturating_add(ns);
+        if used < self.0.xcpu_due_ns.load(Relaxed) {
+            return (used, None);
         }
-        if soft == sys_misc::RLIM_INFINITY || used / NS_PER_SEC < soft {
-            return None;
-        }
-        let due = self
-            .0
-            .next_xcpu_ns
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if used < due {
-            return None;
-        }
-        self.0
-            .next_xcpu_ns
-            .store(used + NS_PER_SEC, std::sync::atomic::Ordering::Relaxed);
-        Some(SIGXCPU)
+        let mut limits = self.0.limits.lock().unwrap();
+        let cpu = &mut limits[sys_misc::RLIMIT_CPU as usize];
+        let (soft, hard) = *cpu;
+        let sig = if soft == sys_misc::RLIM_INFINITY {
+            None
+        } else if hard != sys_misc::RLIM_INFINITY && used >= hard.saturating_mul(NS_PER_SEC) {
+            Some(9) // SIGKILL
+        } else if used >= soft.saturating_mul(NS_PER_SEC) {
+            cpu.0 = soft + 1;
+            Some(SIGXCPU)
+        } else {
+            None
+        };
+        self.0.xcpu_due_ns.store(xcpu_due(*cpu), Relaxed);
+        (used, sig)
     }
 }
 
@@ -488,6 +532,8 @@ struct ProcInfo {
     /// waits for, kept across re-traps as [`Self::wake_deadline`] keeps a
     /// timed wait's (which then holds when to look again).
     cpu_sleep: Option<u128>,
+    /// Its last step ended blocked in a syscall (see [`Kernel::charge_step`]).
+    blocked_step: bool,
     /// Bytes a blocked pipe or socket write has already queued, so the re-run of
     /// the syscall continues rather than starting over. 0 outside such a write.
     io_progress: u64,
@@ -742,6 +788,7 @@ impl Default for ProcInfo {
             shared_maps: Vec::new(),
             wake_deadline: None,
             cpu_sleep: None,
+            blocked_step: false,
             io_progress: 0,
             last_syscall: (0, [0; 6], 0, 0),
             fifo_wait: None,
@@ -898,20 +945,26 @@ impl ProcInfo {
     fn take_siginfo(&mut self, sig: u64) -> (Option<QueuedSig>, bool) {
         if sig >= SIGRTMIN {
             if let Some(q) = self.rt_queue.get_mut(&(sig as u32)) {
-                let info = q.pop_front();
+                let mut info = q.pop_front();
                 let more = !q.is_empty();
                 if !more {
                     self.rt_queue.remove(&(sig as u32));
+                }
+                if let Some(q) = &mut info {
+                    ptimer::delivered(self, q);
                 }
                 return (info, more);
             }
             return (None, false);
         }
-        let info = if (sig as usize) < NSIG_SLOTS {
+        let mut info = if (sig as usize) < NSIG_SLOTS {
             self.queued_siginfo[sig as usize].take()
         } else {
             None
         };
+        if let Some(q) = &mut info {
+            ptimer::delivered(self, q);
+        }
         (info, false)
     }
 
@@ -3361,9 +3414,7 @@ impl Kernel {
             let delta = crate::clock::now_monotonic()
                 .as_nanos()
                 .saturating_sub(step_start);
-            cx.cur.cpu_ns = cx.cur.cpu_ns.saturating_add(delta);
-            charge_vruntime(&mut cx.cur, delta);
-            self.charge_cpu_time(cx, delta);
+            self.charge_step(cx, matches!(flow, Serviced::Blocked), delta, io_before);
             match flow {
                 Serviced::SetRet => {
                     // The result was already written to the vcpu inside `service`
@@ -4417,29 +4468,29 @@ impl Kernel {
             let rt_lens: BTreeMap<u32, usize> =
                 cx.cur.rt_queue.iter().map(|(&s, q)| (s, q.len())).collect();
             let link = cx.cur.ptrace.as_ref().map(|t| t.link());
+            let timers = cx.cur.ptimers.clone();
             (
                 proc,
                 cx,
                 (pending, synced),
                 ppid,
                 frozen,
-                (cpu, link),
+                (cpu, link, timers),
                 rt_lens,
             )
         };
-        let (out_cpu, out_link) = out_cpu;
+        let (out_cpu, out_link, out_timers) = out_cpu;
         if cx.cur.alarm_deadline.is_some() || !cx.cur.ptimers.is_empty() {
             fire_timers_if_due(&mut cx.cur, poll::now_ns());
         }
+        let io_before = cx.cur.io_progress;
         let flow = self.service(&mut cx, exit, vcpu, mem);
         // Charge this step's wall time (run + service) to the task's CPU total,
         // and its nice-weighted share to the fair-scheduling virtual runtime.
         let delta = crate::clock::now_monotonic()
             .as_nanos()
             .saturating_sub(step_start);
-        cx.cur.cpu_ns = cx.cur.cpu_ns.saturating_add(delta);
-        charge_vruntime(&mut cx.cur, delta);
-        self.charge_cpu_time(&mut cx, delta);
+        self.charge_step(&mut cx, matches!(flow, Serviced::Blocked), delta, io_before);
         let stopped;
         let traced = cx.cur.run == RunState::Traced;
         let mut killed = false;
@@ -4473,6 +4524,9 @@ impl Kernel {
                 if stand_in.info.frozen != out_frozen {
                     cx.cur.frozen = stand_in.info.frozen;
                 }
+                // Its POSIX timers, which its process's other threads
+                // create, set and delete too.
+                ptimer::fold_stand_in(&mut cx.cur.ptimers, &out_timers, &stand_in.info.ptimers);
                 // A tracer attached, detached, set options or asked for a stop.
                 let link = stand_in.info.ptrace.as_ref().map(|t| t.link());
                 if link != out_link
@@ -5818,9 +5872,9 @@ impl Kernel {
             }
             Sysno::SchedGetPriorityMax => self.sys_sched_priority_bound(args[0], true),
             Sysno::SchedGetPriorityMin => self.sys_sched_priority_bound(args[0], false),
-            Sysno::Getrusage => self.sys_getrusage(sh, cx, args[0], args[1], mem),
+            Sysno::Getrusage => self.sys_getrusage(cx, args[0], args[1], mem),
             Sysno::Sysinfo => sys_misc::sys_sysinfo(args[0], mem),
-            Sysno::Times => self.sys_times(sh, cx, args[0], mem),
+            Sysno::Times => self.sys_times(cx, args[0], mem),
             Sysno::Getcpu => sys_misc::sys_getcpu(cx.cur.cpu, args[0], args[1], mem),
             Sysno::Capget => self.sys_capget(sh, cx, args[0], args[1], mem),
             Sysno::Capset => self.sys_capset(cx, args[0], args[1], mem),
@@ -6797,7 +6851,9 @@ impl Kernel {
         // POSIX timers are destroyed by execve (an ITIMER_REAL survives it), as
         // are the per-image registrations: rseq, the robust list, mseal seals
         // and membarrier registrations (they describe the old address space).
-        cx.cur.ptimers.clear();
+        for t in std::mem::take(&mut cx.cur.ptimers) {
+            t.forget();
+        }
         cx.cur.rseq = None;
         cx.cur.robust_list = 0;
         let mm = cx.cur.mm;
@@ -7612,6 +7668,10 @@ impl Kernel {
         self.abandon_fifo_wait(cx);
         // It stops using its seccomp filters (and waiting on a supervisor).
         seccomp::release(&mut cx.cur);
+        // The timers on its CPU clock expire no more, and those it holds go
+        // to another thread (or, the process's last, with it).
+        cx.cur.rlimits.cpu_timers().thread_gone(cx.cur.pid);
+        ptimer::exit_timers(sh, cx);
         // Flush any un-munmap'd writable shared file mappings first. `sh` is
         // held; scope `vfs` to just the flush (sh→vfs order), dropping it before
         // the rest of teardown.
@@ -9752,15 +9812,48 @@ impl Kernel {
         }
     }
 
+    /// Charge a step of `delta` ns (guest run and syscall service), which
+    /// ended `blocked` or not, to the task: its nice-weighted share to its
+    /// fair-scheduling virtual runtime, and the time to its CPU time — unless
+    /// it only looked again at the wait it was blocked in and blocked again
+    /// (the schedulers re-run a blocked call to see whether it can go on):
+    /// that task is asleep, which Linux charges no CPU time, and an idle
+    /// thread's clock shouldn't run on its waker's every move.
+    fn charge_step(&self, cx: &mut ServiceCtx, blocked: bool, delta: u128, io_before: u64) {
+        // (Not one re-run for a lock another CPU held: that one is busy.)
+        let blocked = blocked && !cx.yield_now;
+        let asleep = blocked && cx.cur.blocked_step && cx.cur.io_progress == io_before;
+        cx.cur.blocked_step = blocked;
+        charge_vruntime(&mut cx.cur, delta);
+        let cpu = if asleep { 0 } else { delta };
+        cx.cur.cpu_ns = cx.cur.cpu_ns.saturating_add(cpu);
+        self.charge_cpu_time(cx, cpu);
+    }
+
     fn charge_cpu_time(&self, cx: &mut ServiceCtx, ns: u128) {
         let ns = u64::try_from(ns).unwrap_or(u64::MAX);
         self.total_cpu_ns
             .fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
-        if let Some(sig) = cx.cur.rlimits.charge_cpu(ns) {
-            cx.cur.raise(sig);
+        let (used, sig) = cx.cur.rlimits.charge_cpu(ns);
+        let mut raised = sig.is_some_and(|sig| cx.cur.raise(sig));
+        let thread_ns = u64::try_from(cx.cur.cpu_ns).unwrap_or(u64::MAX);
+        if let Some(due) = cx
+            .cur
+            .rlimits
+            .cpu_timers()
+            .charge(used, cx.cur.pid, thread_ns)
+        {
+            raised |= self.cpu_timers_due(cx, due);
         }
         if let Some(sig) = charge_rt_time(&mut cx.cur, ns, cx.block) {
-            cx.cur.raise(sig);
+            raised |= cx.cur.raise(sig);
+        }
+        // A signal this step's CPU time called for interrupts the call it
+        // ended blocked in: the task runs again to take it, rather than
+        // sleeping on with it pending.
+        if raised && cx.block {
+            cx.block = false;
+            cx.yield_now = true;
         }
         // A real-time task that blocked or yielded goes to the back of its
         // queue, and so does a `SCHED_RR` one whose time slice is used up,
@@ -9781,6 +9874,35 @@ impl Kernel {
         if self.cpu_quotas.load(std::sync::atomic::Ordering::Relaxed) > 0 {
             self.cgroup_charge_cpu(cx, ns);
         }
+    }
+
+    /// Act on what the CPU time just charged made due: the itimers' signals
+    /// for this process, and the POSIX timers that expired, each taken by
+    /// the task holding it — this one now, another woken to (see
+    /// [`cputimer`]). Returns whether a signal is now pending here.
+    fn cpu_timers_due(&self, cx: &mut ServiceCtx, due: cputimer::Due) -> bool {
+        let mut raised = false;
+        for sig in due.signals {
+            raised |= cx.cur.raise(sig);
+        }
+        let mut others = due.owners;
+        if let Some(i) = others.iter().position(|&o| o == cx.cur.pid) {
+            others.swap_remove(i);
+            let before = cx.cur.pending;
+            ptimer::fire_ptimers(&mut cx.cur, poll::now_ns());
+            raised |= cx.cur.pending != before;
+        }
+        if !others.is_empty() {
+            let mut sh = self.shared.lock().unwrap();
+            for p in sh.procs.iter_mut().flatten() {
+                if others.contains(&p.info.pid) && !matches!(p.info.run, RunState::Zombie(_)) {
+                    p.info.parked = false;
+                    p.info.kick.kick();
+                }
+            }
+            sh.wakes = sh.wakes.wrapping_add(1);
+        }
+        raised
     }
 
     /// `ioctl(fd, request, arg)` — only the fd-flag requests that work on any fd
@@ -12322,10 +12444,13 @@ impl Kernel {
         i64::try_from(remaining).unwrap_or(i64::MAX)
     }
 
-    /// `setitimer(which, new, old)` / `getitimer(which, old)` — only `ITIMER_REAL`
-    /// (which 0) is modeled (it posts `SIGALRM`); the CPU-time timers (`ITIMER_
-    /// VIRTUAL`/`PROF`) are accepted as no-ops. `struct itimerval` is two
-    /// `timeval`s: `it_interval` then `it_value`, each `{ i64 tv_sec; i64 tv_usec }`.
+    /// `setitimer(which, new, old)`, as Linux's: `ITIMER_REAL` posts
+    /// `SIGALRM` after wall time, `ITIMER_VIRTUAL` (`SIGVTALRM`) and
+    /// `ITIMER_PROF` (`SIGPROF`) after the process's CPU time (see
+    /// [`cputimer`]). `struct itimerval` is two `timeval`s, `it_interval`
+    /// then `it_value`, each `{ i64 tv_sec; i64 tv_usec }`; a null `new`
+    /// disarms the timer, as Linux still allows.
+    #[allow(clippy::unused_self)]
     fn sys_setitimer(
         &self,
         cx: &mut ServiceCtx,
@@ -12334,72 +12459,79 @@ impl Kernel {
         old: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        const ITIMER_REAL: u64 = 0;
-        let now = poll::now_ns();
-        // Report the previous timer into `old` if requested (only ITIMER_REAL is
-        // modeled; VIRTUAL/PROF read back as disarmed).
-        if old != 0
-            && self
-                .write_itimer(cx, old, now, which == ITIMER_REAL, mem)
-                .is_err()
-        {
-            return err(Errno::EFAULT);
-        }
-        if which != ITIMER_REAL {
-            return 0; // VIRTUAL/PROF not modeled
-        }
-        if new == 0 {
-            return 0; // query only
-        }
-        let (Ok(int_s), Ok(int_us), Ok(val_s), Ok(val_us)) = (
-            mem.read_u64(new),
-            mem.read_u64(new + 8),
-            mem.read_u64(new + 16),
-            mem.read_u64(new + 24),
-        ) else {
-            return err(Errno::EFAULT);
+        let set = if new == 0 {
+            cputimer::Setting::default()
+        } else {
+            let Ok(raw) = mem.read_vec(new, 32) else {
+                return err(Errno::EFAULT);
+            };
+            let word = |o: usize| i64::from_le_bytes(raw[o..o + 8].try_into().unwrap());
+            let tv = |o: usize| {
+                let (sec, usec) = (word(o), word(o + 8));
+                (sec >= 0 && (0..1_000_000).contains(&usec))
+                    .then(|| (sec as u64).saturating_mul(1_000_000_000) + usec as u64 * 1_000)
+            };
+            let (Some(interval), Some(value)) = (tv(0), tv(16)) else {
+                return err(Errno::EINVAL);
+            };
+            cputimer::Setting { value, interval }
         };
-        let interval = u128::from(int_s) * 1_000_000_000 + u128::from(int_us) * 1_000;
-        let value = u128::from(val_s) * 1_000_000_000 + u128::from(val_us) * 1_000;
-        cx.cur.alarm_interval_ns = interval;
-        cx.cur.alarm_deadline = if value == 0 { None } else { Some(now + value) };
+        let was = match which {
+            ITIMER_REAL => {
+                let now = poll::now_ns();
+                let was = Self::real_itimer(cx, now);
+                cx.cur.alarm_deadline = (set.value != 0).then(|| now + u128::from(set.value));
+                cx.cur.alarm_interval_ns = if set.value == 0 {
+                    0
+                } else {
+                    u128::from(set.interval)
+                };
+                was
+            }
+            ITIMER_VIRTUAL | ITIMER_PROF => {
+                let now = u64::try_from(process_cpu_ns(cx)).unwrap_or(u64::MAX);
+                cx.cur
+                    .rlimits
+                    .cpu_timers()
+                    .set_itimer(which as usize - 1, now, set)
+            }
+            _ => return err(Errno::EINVAL),
+        };
+        if old != 0 && mem.write(old, &itimerval_bytes(was)).is_err() {
+            return err(Errno::EFAULT);
+        }
         0
     }
 
-    /// Shared helper: write the current `ITIMER_REAL` state as a `struct itimerval`
-    /// at `dst` (`it_interval`, then remaining `it_value`).
-    #[allow(clippy::unused_self)]
-    fn write_itimer(
-        &self,
-        cx: &ServiceCtx,
-        dst: u64,
-        now: u128,
-        is_real: bool,
-        mem: &mut GuestMemory,
-    ) -> Result<(), ()> {
-        let mut b = [0u8; 32];
-        // Only ITIMER_REAL is modeled; the CPU-time timers read back as disarmed.
-        if is_real {
-            let remaining = cx.cur.alarm_deadline.map_or(0, |dl| dl.saturating_sub(now));
-            let put = |b: &mut [u8; 32], off: usize, ns: u128| {
-                b[off..off + 8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_le_bytes());
-                b[off + 8..off + 16]
-                    .copy_from_slice(&((ns % 1_000_000_000 / 1_000) as i64).to_le_bytes());
-            };
-            put(&mut b, 0, cx.cur.alarm_interval_ns); // it_interval
-            put(&mut b, 16, remaining); // it_value
+    /// `ITIMER_REAL`'s setting at `now`: the time left (at least a
+    /// microsecond while armed, as Linux's `itimer_get_remtime`) and the
+    /// interval.
+    fn real_itimer(cx: &ServiceCtx, now: u128) -> cputimer::Setting {
+        let ns = |v: u128| u64::try_from(v).unwrap_or(u64::MAX);
+        match cx.cur.alarm_deadline {
+            Some(dl) => cputimer::Setting {
+                value: ns(dl.saturating_sub(now).max(1_000)),
+                interval: ns(cx.cur.alarm_interval_ns),
+            },
+            None => cputimer::Setting::default(),
         }
-        mem.write(dst, &b).map_err(|_| ())
     }
 
     /// `getitimer(which, curr)` — write the current timer to `curr`.
+    #[allow(clippy::unused_self)]
     fn sys_getitimer(&self, cx: &ServiceCtx, which: u64, curr: u64, mem: &mut GuestMemory) -> i64 {
-        const ITIMER_REAL: u64 = 0;
-        if curr != 0
-            && self
-                .write_itimer(cx, curr, poll::now_ns(), which == ITIMER_REAL, mem)
-                .is_err()
-        {
+        let now = match which {
+            ITIMER_REAL => Self::real_itimer(cx, poll::now_ns()),
+            ITIMER_VIRTUAL | ITIMER_PROF => {
+                let now = u64::try_from(process_cpu_ns(cx)).unwrap_or(u64::MAX);
+                cx.cur
+                    .rlimits
+                    .cpu_timers()
+                    .get_itimer(which as usize - 1, now)
+            }
+            _ => return err(Errno::EINVAL),
+        };
+        if mem.write(curr, &itimerval_bytes(now)).is_err() {
             return err(Errno::EFAULT);
         }
         0
@@ -12583,21 +12715,27 @@ impl Kernel {
     }
 }
 
-/// CPU time (ns) of `cx`'s whole thread group — this task plus its checked-in
-/// siblings sharing its `tgid`. `cx.cur` is out of `sh.procs` during its slice,
-/// so it is added explicitly (and the stand-in the SMP scheduler leaves in its
-/// place skipped, or it would count twice). Shared by
-/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`, `getrusage`, and `times` so all
-/// three agree.
-fn process_cpu_ns(sh: &Shared, cx: &ServiceCtx) -> u128 {
-    let tgid = cx.cur.tgid;
-    cx.cur.cpu_ns
-        + sh.procs
-            .iter()
-            .flatten()
-            .filter(|p| p.info.tgid == tgid && p.info.pid != cx.cur.pid)
-            .map(|p| p.info.cpu_ns)
-            .sum::<u128>()
+/// CPU time (ns) of `cx`'s whole thread group: its threads', the exited ones'
+/// included, as Linux's `thread_group_cputime` sums it. Shared by
+/// `clock_gettime(CLOCK_PROCESS_CPUTIME_ID)`, `getrusage`, `times` and the
+/// process CPU timers, so all agree.
+fn process_cpu_ns(cx: &ServiceCtx) -> u128 {
+    cx.cur.rlimits.cpu_ns()
+}
+
+const ITIMER_REAL: u64 = 0;
+const ITIMER_VIRTUAL: u64 = 1;
+const ITIMER_PROF: u64 = 2;
+
+/// A `struct itimerval` (`it_interval`, then `it_value`, each a 64-bit
+/// `timeval`) holding `s`, its nanoseconds cut to microseconds.
+fn itimerval_bytes(s: cputimer::Setting) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    for (off, ns) in [(0, s.interval), (16, s.value)] {
+        b[off..off + 8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_le_bytes());
+        b[off + 8..off + 16].copy_from_slice(&((ns % 1_000_000_000 / 1_000) as i64).to_le_bytes());
+    }
+    b
 }
 
 /// Fire every real-time timer of `info` due at `now`: `ITIMER_REAL` and the
@@ -14771,11 +14909,13 @@ mod tests {
         const SEC: u64 = 1_000_000_000;
         let limits = RLimits::default();
         limits.set(sys_misc::RLIMIT_CPU, (2, 4));
-        assert_eq!(limits.charge_cpu(SEC), None);
-        assert_eq!(limits.charge_cpu(SEC), Some(SIGXCPU));
-        assert_eq!(limits.charge_cpu(SEC / 2), None, "not again this second");
-        assert_eq!(limits.charge_cpu(SEC / 2), Some(SIGXCPU));
-        assert_eq!(limits.charge_cpu(SEC), Some(9));
+        assert_eq!(limits.charge_cpu(SEC), (SEC, None));
+        assert_eq!(limits.charge_cpu(SEC).1, Some(SIGXCPU));
+        // The soft limit moves on a second, as getrlimit then shows.
+        assert_eq!(limits.get(sys_misc::RLIMIT_CPU), (3, 4));
+        assert_eq!(limits.charge_cpu(SEC / 2).1, None, "not again this second");
+        assert_eq!(limits.charge_cpu(SEC / 2).1, Some(SIGXCPU));
+        assert_eq!(limits.charge_cpu(SEC).1, Some(9));
     }
 
     #[test]
@@ -15366,10 +15506,10 @@ mod tests {
         mem.map(buf, PAGE, Prot::rw()).unwrap();
         // Give the task some accounted CPU so getrusage/times report it.
         cx.cur.cpu_ns = 250_000_000; // 250 ms
-        let sh = k.shared.lock().unwrap();
+        cx.cur.rlimits.charge_cpu(250_000_000);
         // getrusage(RUSAGE_SELF): ru_utime carries the CPU time (not the old
         // all-zeros, not wall time).
-        assert_eq!(k.sys_getrusage(&sh, &cx, 0, buf, &mut mem), 0);
+        assert_eq!(k.sys_getrusage(&cx, 0, buf, &mut mem), 0);
         let ru = mem.read_vec(buf, 144).unwrap();
         let sec = i64::from_le_bytes(ru[0..8].try_into().unwrap());
         let usec = i64::from_le_bytes(ru[8..16].try_into().unwrap());
@@ -15377,7 +15517,7 @@ mod tests {
         assert_eq!(usec, 250_000, "ru_utime microseconds reflect cpu_ns");
         // times(): tms_utime carries the CPU time in ticks (250 ms = 25 ticks),
         // the return (real elapsed ticks) is non-negative.
-        let ret = k.sys_times(&sh, &cx, buf, &mut mem);
+        let ret = k.sys_times(&cx, buf, &mut mem);
         assert!(ret >= 0, "times returns elapsed ticks");
         let tms = mem.read_vec(buf, 32).unwrap();
         assert_eq!(
