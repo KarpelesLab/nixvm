@@ -3502,6 +3502,13 @@ impl Kernel {
         vcpu: &mut dyn Vcpu,
         mem: &mut GuestMemory,
     ) -> Serviced {
+        // Back in the kernel from user mode (not just continued out of a stop
+        // in signal delivery): no call is on its way back any more.
+        if !(matches!(exit, Exit::Interrupted) && cx.cur.signal_resume)
+            && let Some(t) = cx.cur.ptrace.as_mut()
+        {
+            t.ret_nr = None;
+        }
         match exit {
             Exit::Syscall => {
                 cx.block = false;
@@ -3610,7 +3617,22 @@ impl Kernel {
                 // (A seccomp notification its supervisor has received, under a
                 // `WAIT_KILLABLE_RECV` filter, waits on through all but a fatal
                 // signal.)
-                if cx.block
+                if cx.block && self.ptrace_interrupted(cx, sys) {
+                    // A traced call: it ends with `-ERESTART*` (or `-EINTR`)
+                    // for its tracer to see, and the delivery that follows
+                    // decides (see `Kernel::syscall_restart`).
+                    let done = std::mem::take(&mut cx.cur.io_progress);
+                    ret = if done > 0 {
+                        done as i64
+                    } else {
+                        signal::interrupted_code(sys, cx.restartable)
+                    };
+                    cx.cur.futex_wait = None;
+                    cx.cur.futex_waitv.clear();
+                    cx.cur.futex_pi = false;
+                    cx.cur.futex_woken = false;
+                    self.abandon_fifo_wait(cx);
+                } else if cx.block
                     && !cx.cur.seccomp.killable_wait()
                     && let Some(sig) = self.first_handled_signal(cx)
                 {
@@ -3642,6 +3664,15 @@ impl Kernel {
                         cx.cur.futex_woken = false;
                         self.abandon_fifo_wait(cx);
                     }
+                }
+                // `rt_sigsuspend` ends with `-ERESTARTNOHAND`, which is what a
+                // tracer sees (an untraced task's handler never does).
+                if sys == Sysno::RtSigsuspend
+                    && ret == err(Errno::EINTR)
+                    && self.arch == Arch::X86_64
+                    && cx.cur.ptrace.as_ref().is_some_and(|t| t.tracer != 0)
+                {
+                    ret = -signal::ERESTARTNOHAND;
                 }
                 // A traced task's tracer may stop it once more before the result
                 // goes back (an event, the syscall-exit stop, a signal), and may

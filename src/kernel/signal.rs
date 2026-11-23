@@ -872,15 +872,27 @@ impl Kernel {
         // A traced task: a signal its tracer passed on is acted on here; any
         // other stops it for the tracer first.
         if cx.cur.ptrace.is_some() {
+            // A handler entered on the way to user mode doesn't end it there:
+            // the next signal stops the task right away, as Linux's loop
+            // back into `get_signal` does (its registers then the handler's,
+            // its `orig_rax` still the call's).
+            let mut entered = false;
             loop {
                 match self.ptrace_signal_delivery(cx, vcpu) {
-                    Err(()) => return false,
+                    Err(()) => return entered,
+                    Ok(None) if entered => return true,
                     Ok(None) => break,
-                    Ok(Some(sig)) => {
-                        if let Some(r) = self.act_on_signal(cx, sig, vcpu, mem) {
-                            return r;
+                    Ok(Some(sig)) => match self.act_on_signal(cx, sig, vcpu, mem) {
+                        Some(true)
+                            if !cx.block
+                                && !cx.restart_syscall
+                                && cx.cur.run == RunState::Running =>
+                        {
+                            entered = true;
                         }
-                    }
+                        Some(r) => return r,
+                        None => {}
+                    },
                 }
             }
         }
@@ -903,6 +915,10 @@ impl Kernel {
         // mask, so this is skipped).
         if let Some(prev) = cx.cur.sigsuspend_prev.take() {
             cx.cur.blocked = prev;
+        }
+        // A traced call's `-ERESTART*` with no handler to run: it restarts.
+        if self.arch == Arch::X86_64 && !cx.block && cx.cur.run == RunState::Running {
+            Self::syscall_restart(cx, vcpu, None);
         }
         false
     }
@@ -1017,6 +1033,103 @@ impl Kernel {
                 break;
             }
         }
+    }
+}
+
+// ---- restarting a traced task's interrupted call (x86) -------------------
+//
+// Linux ends a call a signal interrupts with one of the kernel-internal
+// `-ERESTART*` codes, which is what a tracer sees in `rax` at the call's exit
+// stop and at the signal-delivery stop after it. Only as the signal is
+// delivered (`handle_signal`) or found to need no handler
+// (`arch_do_signal_or_restart`) does that become `-EINTR` or a restart: `rax`
+// back to `orig_rax` and `rip` two bytes back, onto the `syscall` (or
+// `int $0x80`) — two bytes back from wherever `rip` is *then*, after anything a
+// tracer changed. nixvm does the same for a traced x86 task (see
+// `Kernel::ptrace_interrupted`); an untraced one restarts its own way
+// (`ServiceCtx::restart_syscall`), which nothing can tell apart.
+
+/// `-ERESTARTSYS`: restart unless a handler without `SA_RESTART` runs.
+const ERESTARTSYS: i64 = 512;
+/// `-ERESTARTNOINTR`: always restart.
+const ERESTARTNOINTR: i64 = 513;
+/// `-ERESTARTNOHAND`: restart unless a handler runs.
+pub(super) const ERESTARTNOHAND: i64 = 514;
+/// `-ERESTART_RESTARTBLOCK`: through `restart_syscall` unless a handler runs.
+const ERESTART_RESTARTBLOCK: i64 = 516;
+/// `__NR_restart_syscall`, and the i386 one.
+const NR_RESTART_SYSCALL: u64 = 219;
+const NR_IA32_RESTART_SYSCALL: u64 = 0;
+
+/// What a traced call a signal interrupted returns, as Linux's would: the
+/// calls nixvm restarts after an `SA_RESTART` handler (`restartable`) end with
+/// `-ERESTARTSYS`; of the rest, those Linux fails outright with `-EINTR`
+/// (`sigtimedwait`, `epoll_wait`, `semop`), the others (`pause`, `select`,
+/// `poll`, `msgrcv`…) with `-ERESTARTNOHAND`.
+pub(super) fn interrupted_code(sys: crate::abi::arch::Sysno, restartable: bool) -> i64 {
+    use crate::abi::arch::Sysno;
+    if restartable {
+        return -ERESTARTSYS;
+    }
+    match sys {
+        Sysno::RtSigtimedwait
+        | Sysno::EpollWait
+        | Sysno::EpollPwait
+        | Sysno::EpollPwait2
+        | Sysno::Semop
+        | Sysno::Semtimedop => err(Errno::EINTR),
+        _ => -ERESTARTNOHAND,
+    }
+}
+
+impl Kernel {
+    /// x86, a traced task on its way back from a call (`PtraceState::ret_nr`,
+    /// its `orig_rax` then): what Linux does with a `-ERESTART*` result as it
+    /// runs a handler (`handler` is `Some(SA_RESTART set)`, `handle_signal`)
+    /// or finds no signal to run one for (`None`,
+    /// `arch_do_signal_or_restart`) — read from the registers as they are now,
+    /// a tracer's changes included: `-EINTR`, or a restart of the call
+    /// (`orig_rax` back in `rax`, `rip` back over the 2-byte instruction).
+    /// Nothing for a call that isn't one (`orig_rax` -1) or a result that
+    /// isn't one of those.
+    pub(super) fn syscall_restart(
+        cx: &mut ServiceCtx,
+        vcpu: &mut dyn crate::vcpu::Vcpu,
+        handler: Option<bool>,
+    ) {
+        let Some((nr, compat)) = cx.cur.ptrace.as_ref().and_then(|t| t.ret_nr) else {
+            return;
+        };
+        // `syscall_get_nr` and `syscall_get_error`: a compat task's are its
+        // 32-bit registers, sign-extended.
+        let signed = |v: u64| {
+            if compat {
+                i64::from(v as i32)
+            } else {
+                v as i64
+            }
+        };
+        if signed(nr) == -1 {
+            return;
+        }
+        let rax = match (-signed(vcpu.reg(0)), handler) {
+            (ERESTARTNOHAND | ERESTART_RESTARTBLOCK, Some(_)) | (ERESTARTSYS, Some(false)) => {
+                vcpu.set_reg(0, err(Errno::EINTR) as u64);
+                return;
+            }
+            (ERESTARTSYS, Some(true))
+            | (ERESTARTNOINTR, _)
+            | (ERESTARTSYS | ERESTARTNOHAND, None) => nr,
+            (ERESTART_RESTARTBLOCK, None) if compat => NR_IA32_RESTART_SYSCALL,
+            (ERESTART_RESTARTBLOCK, None) => NR_RESTART_SYSCALL,
+            _ => return,
+        };
+        // Back in user mode first (KVM: the trampoline's `sysretq` done), so
+        // `rip` is where the call returns to.
+        vcpu.settle_syscall_return();
+        vcpu.set_reg(0, rax);
+        let pc = vcpu.pc();
+        vcpu.set_pc(pc.wrapping_sub(2));
     }
 }
 
@@ -1162,6 +1275,9 @@ impl Kernel {
         // rewind is needed. x8 still holds the syscall number for the re-issue.
         if cx.restart_syscall && self.arch == Arch::X86_64 {
             vcpu.set_pc(syscall_pc);
+        } else if self.arch == Arch::X86_64 {
+            // A traced call's `-ERESTART*`, as `handle_signal` reads it.
+            Self::syscall_restart(cx, vcpu, Some(act.flags & super::SA_RESTART != 0));
         }
         // Carry the siginfo the sender queued (sigqueue's si_value/si_code, or a
         // sender pid); a bare `kill`/on-exit SIGCHLD leaves it SI_USER (all 0).

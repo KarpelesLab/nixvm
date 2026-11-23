@@ -291,9 +291,15 @@ pub(super) struct PtraceState {
     seccomp_trace: Option<u32>,
     /// `execve` succeeded; the thread id it had before.
     pub(super) execed: Option<i32>,
-    /// The `execve` (or `execveat`) a stop in the new image ends: its
-    /// number as called, and whether through the i386 entry.
-    exec_nr: Option<(u64, bool)>,
+    /// x86: the call the task is on its way back to user mode from (Linux's
+    /// `orig_ax`, still the call's number until the task enters the kernel
+    /// again): its number, and whether through the i386 entry. The stops
+    /// after the call's own show it (a second signal's, an `execve`'s
+    /// `SIGTRAP` in the new image), a tracer can change it there, and a
+    /// result of `-ERESTART*` restarts it ([`Kernel::syscall_restart`]).
+    /// `None` once user code runs (or after `rt_sigreturn`, which makes it
+    /// -1).
+    pub(super) ret_nr: Option<(u64, bool)>,
     /// As a zombie: the tracer has been told of the exit.
     exit_reported: bool,
 }
@@ -338,7 +344,7 @@ impl PtraceState {
             pending_event: None,
             seccomp_trace: None,
             execed: None,
-            exec_nr: None,
+            ret_nr: None,
             exit_reported: false,
         }
     }
@@ -1479,8 +1485,20 @@ impl Kernel {
             Phase::Done => {
                 t.sc_result = Some(t.ret_reg(arch) as i64);
                 t.apply_gprs = t.regs_dirty;
+                // A changed `orig_rax` is the call it returns from: what the
+                // next stops show, and what a restart runs (or -1: none).
+                if t.regs_dirty && arch == Arch::X86_64 {
+                    t.sc_nr = Some(t.sys_nr(arch));
+                }
             }
-            Phase::User => t.apply_user = t.regs_dirty,
+            Phase::User => {
+                t.apply_user = t.regs_dirty;
+                if t.regs_dirty
+                    && let Some((_, compat)) = t.ret_nr
+                {
+                    t.ret_nr = Some((t.sys_nr(arch), compat));
+                }
+            }
         }
         if stop.phase != Phase::User && t.regs_dirty && arch == Arch::X86_64 {
             let r = &t.regs;
@@ -1754,9 +1772,9 @@ impl Kernel {
         let mut regs = snapshot(arch, vcpu, phase, fs_base);
         // In user mode no call is in progress, but for a stop at the end of
         // an `execve` (in the new image), which is still in it.
-        let exec_nr = t.exec_nr.take();
+        let ret_nr = t.ret_nr;
         let nr = if phase == Phase::User {
-            exec_nr.map_or(u64::MAX, |(nr, _)| nr)
+            ret_nr.map_or(u64::MAX, |(nr, _)| nr)
         } else {
             t.sc_nr.unwrap_or_else(|| vcpu.syscall_nr())
         };
@@ -1774,7 +1792,7 @@ impl Kernel {
         t.regs_dirty = false;
         t.apply_fp = false;
         t.compat = arch == Arch::X86_64
-            && match exec_nr {
+            && match ret_nr {
                 Some((_, ia32)) => ia32,
                 None => phase != Phase::User && vcpu.syscall_ia32(),
             };
@@ -2118,15 +2136,16 @@ impl Kernel {
             let execed = t.execed.take();
             t.end_syscall();
             t.ret_regs = None;
-            // `orig_rax` at the stops in the new image: the call made.
-            if execed.is_some() {
+            // `orig_rax` at the stops in the new image: the call made; after
+            // `rt_sigreturn`, -1 (`restore_sigcontext`).
+            t.ret_nr = execed.map(|_| {
                 let nr = match cx.cur.last_syscall.0 {
                     EXECVEAT if cx.ia32 => 358,
                     _ if cx.ia32 => 11,
                     nr => nr,
                 };
-                t.exec_nr = Some((nr, cx.ia32));
-            }
+                (nr, cx.ia32)
+            });
             let traced = t.tracer != 0;
             let exit_stop = traced && t.syscall_trace;
             let (options, seized) = (t.options, t.seized);
@@ -2181,9 +2200,6 @@ impl Kernel {
                     self.ptrace_stop(cx, vcpu, StopKind::Exit, exit.sig, 0, Phase::User, None);
                 }
                 _ => {}
-            }
-            if let Some(t) = cx.cur.ptrace.as_mut() {
-                t.exec_nr = None;
             }
             if cx.cur.run == RunState::Traced {
                 // Back in user mode, it takes its signals (the old-style
@@ -2248,9 +2264,49 @@ impl Kernel {
         }
         let t = cx.cur.ptrace.as_mut().unwrap();
         *ret = t.sc_result.take().unwrap_or(*ret);
+        if self.arch == Arch::X86_64 {
+            let nr = t.sc_nr.unwrap_or_else(|| vcpu.syscall_nr());
+            t.ret_nr = Some((nr, vcpu.syscall_ia32()));
+        }
         t.end_syscall();
         Self::ptrace_forget_if_idle(cx);
         None
+    }
+
+    /// A traced x86 call `sys` that would block, with a signal pending that
+    /// it may take: Linux's sleep ends for any signal a tracer is to see
+    /// (`sig_ignored` is never true of a traced task's), and the call
+    /// returns its `-ERESTART*` to the exit and signal-delivery stops, the
+    /// restart decided only as the signal is delivered (see
+    /// [`Kernel::syscall_restart`]). Whether it ends so (`cx.block` then
+    /// cleared). Not a wait that only a fatal signal ends, and not a timed
+    /// one Linux would resume through `restart_syscall` (`nanosleep`, a
+    /// `poll` with a timeout): those stop for the signal still in the call,
+    /// and go on with the time that's left.
+    pub(super) fn ptrace_interrupted(
+        &self,
+        cx: &mut ServiceCtx,
+        sys: crate::abi::arch::Sysno,
+    ) -> bool {
+        if self.arch != Arch::X86_64
+            || cx.cur.ptrace.as_ref().is_none_or(|t| t.tracer == 0)
+            || cx.cur.seccomp.killable_wait()
+            || cx.cur.pending & !cx.cur.blocked == 0
+        {
+            return false;
+        }
+        let timed = cx.cur.wake_deadline.is_some() || cx.cur.cpu_sleep.is_some();
+        if timed
+            && super::signal::interrupted_code(sys, cx.restartable)
+                == -super::signal::ERESTARTNOHAND
+        {
+            return false;
+        }
+        cx.block = false;
+        // A seccomp notification being waited on is dropped: a restart makes
+        // a fresh one.
+        super::seccomp::abandon(&mut cx.cur.seccomp);
+        true
     }
 
     /// Drop the ptrace state of a task no longer traced and with nothing left
