@@ -1,6 +1,9 @@
 /* madvise(MADV_DONTNEED) on private anonymous memory: the pages read zeros
  * afterwards, whatever their protection was — runtimes discard PROT_NONE
- * pages and later make them writable again, expecting fresh zeros. */
+ * pages and later make them writable again, expecting fresh zeros.
+ * And the other way to discard: a MAP_FIXED mapping over pages just written
+ * (Wine decommits that way, a PROT_NONE mapping it later mprotects back)
+ * reads zeros too, not what a stale TLB entry still points at. */
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +48,18 @@ int main(void) {
   CHECK(madvise(s, pg, MADV_DONTNEED) == 0);
   CHECK(s[0] == 0x33 && s[pg - 1] == 0x33);
   puts("a shared page keeps its contents");
+
+  CHECK(mprotect(p, n, PROT_READ | PROT_WRITE) == 0);
+  for (int round = 0; round < 50; round++) {
+    memset(p, 0x5a, n);
+    CHECK(mmap(p, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == p);
+    CHECK(mprotect(p, n, PROT_READ | PROT_WRITE) == 0);
+    CHECK(all_zero(p, n));
+    memset(p, 0x5a, n);
+    CHECK(mmap(p, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == p);
+    CHECK(all_zero(p, n));
+  }
+  puts("pages mapped over with MAP_FIXED read zeros");
   puts("PASS");
   return 0;
 }

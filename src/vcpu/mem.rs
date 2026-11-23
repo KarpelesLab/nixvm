@@ -978,10 +978,14 @@ impl GuestMemory {
         let mut fa = lock_fa(&self.fa, self.memcg);
         for p in first..=last {
             // Fresh mapping: drop any existing backing so the page reads as zero.
+            // A vcpu may still hold the old leaf in its TLB (Wine decommits by
+            // mapping PROT_NONE over committed memory), and the freed frame
+            // goes to the next fault anywhere.
             if self.mapped[p] {
                 let va = self.base + (p as u64) * PAGE_SIZE;
                 if let Some(frame) = self.space.unmap(va, &mut fa, &self.phys) {
                     fa.free(frame);
+                    mark_tlb_dirty!(self);
                 }
             }
             self.mapped_count += usize::from(!self.mapped[p]);
