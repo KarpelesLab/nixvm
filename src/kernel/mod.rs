@@ -3506,8 +3506,9 @@ impl Kernel {
         // in signal delivery): no call is on its way back any more.
         if !(matches!(exit, Exit::Interrupted) && cx.cur.signal_resume)
             && let Some(t) = cx.cur.ptrace.as_mut()
+            && t.ret_nr.take().is_some()
         {
-            t.ret_nr = None;
+            Self::ptrace_forget_if_idle(cx);
         }
         match exit {
             Exit::Syscall => {

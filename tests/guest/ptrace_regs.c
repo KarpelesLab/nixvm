@@ -910,7 +910,29 @@ static int pause_body(void) {
   return r == -1 && errno == EINTR && rs_handled == 1 ? 0 : 1;
 }
 
+/* A tracer that detaches at the exit stop: the read still restarts after
+ * the handler. */
+static void restart_detach(void) {
+  rs_mode = RS_PASS;
+  CHECK(pipe(rs_pipe) == 0, "pipe: %m");
+  pid_t c = traced(restart_body);
+  CHECK(to_entry(c, __NR_read), "detach: no read entry stop");
+  ptrace(PTRACE_SYSCALL, c, 0, 0);
+  usleep(20000);
+  kill(c, SIGUSR1);
+  int st = wait_for(c);
+  CHECK(st >> 8 == (SIGTRAP | 0x80), "detach: exit stop %#x", st);
+  ptrace(PTRACE_DETACH, c, 0, 0);
+  usleep(20000);
+  CHECK(write(rs_pipe[1], "12345678", 8) == 8, "write: %m");
+  st = wait_for(c);
+  CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "detach: the read: %#x", st);
+  close(rs_pipe[0]);
+  close(rs_pipe[1]);
+}
+
 static void restart_checks(void) {
+  restart_detach();
   restart_case(RS_PASS);
   restart_case(RS_PASS | RS_MOVE);
   restart_case(RS_MOVE);

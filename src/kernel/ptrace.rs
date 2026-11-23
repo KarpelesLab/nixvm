@@ -465,6 +465,7 @@ impl PtraceState {
             && !self.apply_gprs
             && !self.sc_entered
             && self.sc_result.is_none()
+            && self.ret_nr.is_none()
     }
 
     fn sys_nr(&self, arch: Arch) -> u64 {
@@ -2311,7 +2312,7 @@ impl Kernel {
 
     /// Drop the ptrace state of a task no longer traced and with nothing left
     /// in progress.
-    fn ptrace_forget_if_idle(cx: &mut ServiceCtx) {
+    pub(super) fn ptrace_forget_if_idle(cx: &mut ServiceCtx) {
         if cx.cur.ptrace.as_ref().is_some_and(|t| t.idle()) {
             cx.cur.ptrace = None;
         }
