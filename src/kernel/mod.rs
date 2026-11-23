@@ -3914,9 +3914,14 @@ impl Kernel {
                     self.die_of_signal(cx, 7, mem); // SIGBUS
                     return Serviced::Ended;
                 }
+                // (Or the page is fine by now: a sibling thread backed it, or
+                // made it accessible, between this fault and its handling —
+                // under SMP the address space's lock isn't held across both.
+                // As on Linux, the access is just run again.)
                 if file == crate::vcpu::FileFault::Resolved
                     || mem.demand_fault(addr)
                     || mem.cow_fault(addr, write)
+                    || mem.access_allowed(addr, write, addr == vcpu.pc())
                 {
                     vcpu.flush_tlb();
                     Serviced::Resume

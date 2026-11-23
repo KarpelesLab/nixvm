@@ -3,10 +3,14 @@
  * memory another thread's malloc handed out), nor keep using a page another
  * thread unmapped or replaced while it slept. A shared file mapping is the
  * process's too: one thread maps a file and stores into it, another unmaps
- * it (Go's linker on Windows, through Wine), and the stores are the file's. */
+ * it (Go's linker on Windows, through Wine), and the stores are the file's.
+ * And threads first touching the same fresh pages at once each get to read
+ * them, however their faults interleave (Go's garbage collector, on several
+ * CPUs: the slower fault found the page already there and was a SIGSEGV). */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,6 +77,25 @@ static void *map_and_fill(void *arg) {
   while (!reused) pthread_cond_wait(&cv, &mu);
   pthread_mutex_unlock(&mu);
   return 0;
+}
+
+#define TOUCHERS 3
+#define FRESH_PAGES 256
+static char *volatile fresh;
+static atomic_int fresh_round, fresh_done;
+
+static void *toucher(void *arg) {
+  long id = (long)arg;
+  int seen = 0;
+  unsigned sum = 0;
+  for (;;) {
+    while (atomic_load(&fresh_round) == seen) ;
+    seen = atomic_load(&fresh_round);
+    if (seen < 0) break;
+    for (long i = 0; i < FRESH_PAGES; i++) sum += fresh[i * 4096 + id * 8];
+    atomic_fetch_add(&fresh_done, 1);
+  }
+  return (void *)(uintptr_t)sum;
 }
 
 int main(void) {
@@ -151,6 +174,20 @@ int main(void) {
   CHECK(wrong == 0);
   close(fd);
   puts("a shared file mapping one thread filled and another unmapped kept its stores");
+
+  pthread_t tt[TOUCHERS];
+  for (long i = 0; i < TOUCHERS; i++) CHECK(pthread_create(&tt[i], 0, toucher, (void *)i) == 0);
+  for (int round = 1; round <= 20; round++) {
+    fresh = mmap(0, FRESH_PAGES * 4096L, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(fresh != MAP_FAILED);
+    atomic_store(&fresh_done, 0);
+    atomic_store(&fresh_round, round);
+    while (atomic_load(&fresh_done) != TOUCHERS) ;
+    CHECK(munmap(fresh, FRESH_PAGES * 4096L) == 0);
+  }
+  atomic_store(&fresh_round, -1);
+  for (int i = 0; i < TOUCHERS; i++) CHECK(pthread_join(tt[i], 0) == 0);
+  puts("threads touching the same fresh pages at once all read them");
   puts("PASS");
   return 0;
 }

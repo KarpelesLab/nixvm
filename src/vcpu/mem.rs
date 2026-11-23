@@ -1862,6 +1862,27 @@ impl GuestMemory {
         self.space.translate(page, &self.phys).is_some()
     }
 
+    /// Whether a user access to `addr` (a store with `write`, an instruction
+    /// fetch with `exec`) would go through as the page tables are now: the
+    /// page is mapped for it and has a frame whose leaf allows it. A fault on
+    /// such a page was spurious — what it faulted on has changed since.
+    #[must_use]
+    pub fn access_allowed(&self, addr: u64, write: bool, exec: bool) -> bool {
+        let need = if write {
+            Prot::WRITE
+        } else if exec {
+            Prot::EXEC
+        } else {
+            Prot::READ
+        };
+        let page = addr - addr % PAGE_SIZE;
+        self.page_prot(addr).is_some_and(|p| p.contains(need))
+            && self
+                .space
+                .translate(page, &self.phys)
+                .is_some_and(|t| !t.supervisor && t.prot.contains(need))
+    }
+
     /// The effective (intended) protection of the page containing `addr`, or
     /// `None` if unmapped.
     #[must_use]
