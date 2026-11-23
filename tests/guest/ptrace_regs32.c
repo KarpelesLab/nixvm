@@ -9,7 +9,12 @@
  *    a changed eflags is the one the task gets back.
  *  - struct user32's u_debugreg: what the registers read as, the writes
  *    Linux refuses, an execute breakpoint and a write watchpoint (SIGTRAP
- *    with TRAP_HWBKPT, DR6 saying which), and a single step's DR6.
+ *    with TRAP_HWBKPT, DR6 saying which), and a single step's DR6; the
+ *    kernel's read() into watched memory doesn't trap.
+ *  - An int $0x80 read a signal interrupts: -ERESTARTSYS at its stops,
+ *    restarted two bytes back from where the tracer left eip; libc's read
+ *    (the vDSO's entry) restarts too.
+ *  - A second signal's stop on the way back from a call shows the call.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -50,6 +55,16 @@ static int failures;
 static long int80(long nr) {
   long r;
   __asm__ volatile("int $0x80" : "=a"(r) : "a"(nr) : "memory");
+  return r;
+}
+
+/* With three arguments (%ebx through %edi, which PIC code keeps). */
+static long int80r(long nr, long a, long b, long c) {
+  long r;
+  __asm__ volatile("xchg %%edi, %%ebx\n\tint $0x80\n\txchg %%edi, %%ebx"
+                   : "=a"(r)
+                   : "a"(nr), "D"(a), "c"(b), "d"(c)
+                   : "memory");
   return r;
 }
 
@@ -372,12 +387,205 @@ static void dr_checks(void) {
   CHECK(finish(c) == 0, "breakpoint run");
 }
 
+/* ---- a watchpoint and the kernel's accesses -------------------------------- */
+
+static volatile uint32_t kbuf[2];
+
+static int kernel_access_body(void) {
+  int p[2];
+  if (pipe(p) != 0 || write(p[1], "abcd", 4) != 4)
+    return 1;
+  if (int80r(3, p[0], (long)kbuf, 4) != 4) /* read: the kernel writes kbuf */
+    return 2;
+  int80(64);
+  kbuf[0] = 5;
+  return 0;
+}
+
+static void kernel_access_checks(void) {
+  pid_t c = traced(kernel_access_body);
+  poke_dr(c, 0, (unsigned long)kbuf);
+  CHECK(poke_dr(c, 7, 0xd0001) == 0, "DR7: %m");
+  poke_dr(c, 6, 0);
+  /* Nothing for the read (perf's exclude_kernel): the next stop is the
+   * getppid's, DR6 as it was. */
+  CHECK(to_entry(c, 64), "no getppid entry stop");
+  CHECK(peek_dr(c, 6) == 0, "DR6 %#lx after the read", peek_dr(c, 6));
+  CHECK(to_exit(c), "no getppid exit stop");
+  ptrace(PTRACE_CONT, c, 0, 0);
+  hit(c, TRAP_HWBKPT, 0, 0xffff0ff1, "the task's own write");
+  CHECK(finish(c) == 0, "kernel access run");
+}
+
+/* ---- restarting an interrupted call ---------------------------------------- */
+
+/* rs_read(fd, buf, n): read by the int $0x80 at rs_site; rs_alt is another,
+ * which notes it ran. */
+long rs_read(long fd, void *buf, long n);
+extern char rs_site[], rs_alt[];
+volatile long rs_via_alt;
+__asm__(".text\n"
+        ".globl rs_read\n"
+        "rs_read:\n"
+        "  push %ebx\n"
+        "  mov 8(%esp), %ebx\n"
+        "  mov 12(%esp), %ecx\n"
+        "  mov 16(%esp), %edx\n"
+        "  mov $3, %eax\n"
+        ".globl rs_site\n"
+        "rs_site:\n"
+        "  int $0x80\n"
+        "  pop %ebx\n"
+        "  ret\n"
+        ".globl rs_alt\n"
+        "rs_alt:\n"
+        "  int $0x80\n"
+        "  movl $1, rs_via_alt\n"
+        "  pop %ebx\n"
+        "  ret\n");
+
+#define RS_PASS 1  /* the tracer passes the signal on (else drops it) */
+#define RS_MOVE 2  /* it moves eip at the exit stop, to after rs_alt */
+#define RS_PLAIN 4 /* the handler is without SA_RESTART */
+#define RS_LIBC 8  /* the read is libc's (the vDSO's entry) */
+
+static int rs_pipe[2], rs_mode;
+static volatile int rs_handled;
+static void rs_on_usr1(int sig) {
+  (void)sig;
+  rs_handled++;
+}
+
+static int restart_body(void) {
+  struct sigaction sa = {.sa_handler = rs_on_usr1};
+  sa.sa_flags = rs_mode & RS_PLAIN ? 0 : SA_RESTART;
+  sigaction(SIGUSR1, &sa, 0);
+  char b[8];
+  long r = rs_mode & RS_LIBC ? syscall(SYS_read, rs_pipe[0], b, 8)
+                             : rs_read(rs_pipe[0], b, 8);
+  int pass = rs_mode & RS_PASS;
+  int intr = pass && rs_mode & RS_PLAIN;
+  int bad = 0;
+  if (rs_mode & RS_LIBC ? (intr ? r != -1 || errno != EINTR : r != 8)
+                        : r != (intr ? -EINTR : 8))
+    bad |= 1;
+  if (rs_via_alt != !!(rs_mode & RS_MOVE))
+    bad |= 2;
+  if (rs_handled != !!pass)
+    bad |= 4;
+  return bad;
+}
+
+static void restart_case(int mode) {
+  rs_mode = mode;
+  CHECK(pipe(rs_pipe) == 0, "pipe: %m");
+  pid_t c = traced(restart_body);
+  CHECK(to_entry(c, 3), "mode %d: no read entry stop", mode);
+  struct user_regs_struct r;
+  ptrace(PTRACE_GETREGS, c, 0, &r);
+  long site = r.eip;
+  ptrace(PTRACE_SYSCALL, c, 0, 0);
+  usleep(20000);
+  kill(c, SIGUSR1);
+  int st = wait_for(c);
+  ptrace(PTRACE_GETREGS, c, 0, &r);
+  CHECK(st >> 8 == (SIGTRAP | 0x80) && r.orig_eax == 3 && r.eax == -512 &&
+            r.eip == site,
+        "mode %d: interrupted read's exit stop %#x orig_eax %ld eax %ld eip "
+        "%#lx",
+        mode, st, r.orig_eax, r.eax, r.eip);
+  if (mode & RS_MOVE) {
+    r.eip = site = (long)rs_alt + 2;
+    ptrace(PTRACE_SETREGS, c, 0, &r);
+  }
+  ptrace(PTRACE_SYSCALL, c, 0, 0);
+  st = wait_for(c);
+  ptrace(PTRACE_GETREGS, c, 0, &r);
+  CHECK(st >> 8 == SIGUSR1 && r.orig_eax == 3 && r.eax == -512 &&
+            r.eip == site,
+        "mode %d: signal stop %#x orig_eax %ld eax %ld eip %#lx", mode, st,
+        r.orig_eax, r.eax, r.eip);
+  /* Restarted two bytes back from where it is: the read's next entry stop
+   * is where it was. */
+  int restarts = !(mode & RS_PASS && mode & RS_PLAIN);
+  int sig = mode & RS_PASS ? SIGUSR1 : 0, again = 0;
+  for (int i = 0; restarts && i < 100; i++) {
+    ptrace(PTRACE_SYSCALL, c, 0, sig);
+    sig = 0;
+    st = wait_for(c);
+    if (!WIFSTOPPED(st))
+      break;
+    ptrace(PTRACE_GETREGS, c, 0, &r);
+    if (st >> 8 == (SIGTRAP | 0x80) && r.orig_eax == 3 && r.eax == -ENOSYS) {
+      CHECK(r.eip == site, "mode %d: restarted at %#lx, want %#lx", mode,
+            r.eip, site);
+      again = 1;
+      break;
+    }
+  }
+  CHECK(again || !restarts, "mode %d: the read didn't start again", mode);
+  CHECK(write(rs_pipe[1], "12345678", 8) == 8, "write: %m");
+  int bad = finish_with(c, sig);
+  CHECK(bad == 0, "mode %d: the read: %d", mode, bad);
+  close(rs_pipe[0]);
+  close(rs_pipe[1]);
+}
+
+static void restart_checks(void) {
+  restart_case(RS_PASS);
+  restart_case(RS_PASS | RS_MOVE);
+  restart_case(RS_MOVE);
+  restart_case(RS_PASS | RS_PLAIN);
+  restart_case(RS_LIBC);
+  restart_case(RS_LIBC | RS_PASS);
+  restart_case(RS_LIBC | RS_PASS | RS_PLAIN);
+}
+
+/* ---- a second signal on the way back from a call --------------------------- */
+
+static void on_usr1(int sig) { (void)sig; }
+static void on_usr2(int sig) { (void)sig; }
+
+static int two_signals_body(void) {
+  signal(SIGUSR1, on_usr1);
+  signal(SIGUSR2, on_usr2);
+  sigset_t s;
+  sigemptyset(&s);
+  sigaddset(&s, SIGUSR1);
+  sigaddset(&s, SIGUSR2);
+  sigprocmask(SIG_BLOCK, &s, 0);
+  kill(getpid(), SIGUSR1);
+  kill(getpid(), SIGUSR2);
+  int80r(126, SIG_UNBLOCK, (long)&s, 0); /* sigprocmask */
+  return 0;
+}
+
+static void signal_stop_checks(void) {
+  pid_t c = traced(two_signals_body);
+  ptrace(PTRACE_CONT, c, 0, 0);
+  int st = wait_for(c);
+  struct user_regs_struct r;
+  ptrace(PTRACE_GETREGS, c, 0, &r);
+  CHECK(st >> 8 == SIGUSR1 && r.orig_eax == 126,
+        "first signal stop %#x orig_eax %ld", st, r.orig_eax);
+  ptrace(PTRACE_CONT, c, 0, SIGUSR1);
+  st = wait_for(c);
+  ptrace(PTRACE_GETREGS, c, 0, &r);
+  CHECK(st >> 8 == SIGUSR2 && r.orig_eax == 126 && r.eip == (long)on_usr1,
+        "second signal stop %#x orig_eax %ld eip %#lx", st, r.orig_eax,
+        r.eip);
+  CHECK(finish_with(c, SIGUSR2) == 0, "signal stops run");
+}
+
 int main(void) {
   setvbuf(stdout, 0, _IONBF, 0);
   errno_checks();
   fp_checks();
   eip_checks();
   dr_checks();
+  kernel_access_checks();
+  restart_checks();
+  signal_stop_checks();
   if (failures == 0)
     printf("PASS\n");
   return failures != 0;
