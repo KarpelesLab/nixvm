@@ -6158,8 +6158,9 @@ impl Kernel {
         info.queued_siginfo = [None; NSIG_SLOTS];
         info.rt_queue = BTreeMap::new();
         info.signal_resume = false;
-        // Nor a debugger's breakpoints (`copy_thread`).
-        info.debugregs = None;
+        // Nor a debugger's breakpoints (`copy_thread`); DR6 and DR7 read
+        // as they did (the rest of the thread struct is copied).
+        info.debugregs = info.debugregs.take().map(|d| Box::new(d.for_child()));
         info.sigsuspend_prev = None;
         info.wake_deadline = None;
         info.alarm_deadline = None;

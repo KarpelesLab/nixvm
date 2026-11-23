@@ -10,8 +10,22 @@
 //! which reports a hit as [`crate::vcpu::Exit::DebugTrap`].
 //!
 //! They belong to the task, not to its tracer: they stay across a detach,
-//! a new task starts without any (`copy_thread`), and `execve` drops them
-//! (`flush_thread`).
+//! a new task starts without any (`copy_thread`, though `DR6` and `DR7`
+//! read as its parent's), and `execve` drops them (`flush_thread`).
+//!
+//! As on Linux they're user breakpoints only (perf's `exclude_kernel`): the
+//! kernel's own accesses to watched memory — `read` filling a buffer, a
+//! signal frame written to the stack — neither stop the task nor set a `DR6`
+//! bit (`perf_exclude_event` drops the hit `hw_breakpoint_handler` sees, so
+//! `ptrace_triggered` never runs). nixvm's copies to and from guest memory
+//! are the host's, which the guest's debug registers never see, so that
+//! costs nothing.
+//!
+//! AMD's range breakpoints (`BPEXT`, the `DR0..DR3` address masks) aren't
+//! here because ptrace can't make one: `ptrace_fill_bp_fields` takes its
+//! length from the `DR7` LEN field (`arch_bp_generic_fields`: 1, 2, 4 or 8
+//! bytes), and only a `perf_event_open` breakpoint with a longer `bp_len`
+//! gets an address mask (`arch_build_bp_info`, `amd_set_dr_addr_mask`).
 
 use super::err;
 use crate::abi::errno::Errno;
@@ -203,6 +217,19 @@ impl DebugRegs {
             }
         }
         dr
+    }
+
+    /// What a new task gets (`copy_thread`, after `dup_task_struct` copied
+    /// the thread struct): no breakpoints, but the virtual `DR6` and the
+    /// `DR7` its parent's read as. A first address written makes a disabled
+    /// breakpoint as ever; `DR7` written again enables it.
+    pub(super) fn for_child(&self) -> Self {
+        Self {
+            bps: [None; 4],
+            virtual_dr6: self.virtual_dr6,
+            dr7: self.dr7,
+            dirty: false,
+        }
     }
 
     /// Whether any breakpoint is enabled.
